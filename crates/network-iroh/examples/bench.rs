@@ -15,7 +15,10 @@
 //! ```
 //!
 //! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
-//! to measure what an iroh path timer setting costs an idle connection.
+//! to measure what an iroh path timer setting costs an idle connection, and
+//! `--redial-attempts` to set how often a relayed peer is re-dialed.
+//! `delayed-idle --blocked` measures the connections after every one has
+//! fallen back to the relay.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -128,6 +131,10 @@ struct PathTimers {
     /// Interval of the keep alive that holds each path open, in milliseconds.
     #[arg(long)]
     path_keep_alive_ms: Option<u64>,
+    /// Re-dials of a peer while its connection stays relayed; zero turns
+    /// re-dialing off.
+    #[arg(long)]
+    redial_attempts: Option<u32>,
 }
 
 impl PathTimers {
@@ -138,12 +145,16 @@ impl PathTimers {
         if let Some(ms) = self.path_keep_alive_ms {
             config.path_keep_alive = Duration::from_millis(ms);
         }
+        if let Some(attempts) = self.redial_attempts {
+            config.redial.attempts = attempts;
+        }
     }
 
     fn report(self) -> Value {
         json!({
             "path_idle_ms": self.path_idle_ms,
             "path_keep_alive_ms": self.path_keep_alive_ms,
+            "redial_attempts": self.redial_attempts,
         })
     }
 }
@@ -190,6 +201,10 @@ enum Command {
         rtt_ms: u64,
         #[arg(long, default_value_t = 180)]
         secs: u64,
+        /// Block every bridge once the connections are direct, and measure
+        /// them after they have fallen back to the relay.
+        #[arg(long)]
+        blocked: bool,
         #[command(flatten)]
         timers: PathTimers,
     },
@@ -887,7 +902,13 @@ impl DelayedStar {
 /// Idle iroh connections from a hub to `connections` peers over a
 /// [`DelayedStar`]. Bytes are the hub's; CPU is the whole process, every
 /// peer, bridge and the relay included.
-async fn delayed_idle(connections: u32, rtt: Duration, watch: Duration, timers: PathTimers) {
+async fn delayed_idle(
+    connections: u32,
+    rtt: Duration,
+    watch: Duration,
+    blocked: bool,
+    timers: PathTimers,
+) {
     let DelayedStar {
         hub,
         peers,
@@ -895,16 +916,17 @@ async fn delayed_idle(connections: u32, rtt: Duration, watch: Duration, timers: 
         _relay,
     } = DelayedStar::bind(connections, rtt, timers).await;
 
-    let direct = || {
+    let on = |kind: PathKind| {
         peers
             .iter()
             .filter(|peer| {
                 hub.path_status(peer.local_endpoint_id())
                     .and_then(|status| status.kind)
-                    == Some(PathKind::Direct)
+                    == Some(kind)
             })
             .count()
     };
+    let direct = || on(PathKind::Direct);
     let link_start = Instant::now();
     let _ = timeout(MESH_BUDGET, async {
         while direct() < peers.len() {
@@ -914,6 +936,17 @@ async fn delayed_idle(connections: u32, rtt: Duration, watch: Duration, timers: 
     .await;
     let link_secs = link_start.elapsed().as_secs_f64();
     let linked_direct = direct();
+    if blocked {
+        for bridge in &bridges {
+            bridge.set_open(false);
+        }
+        let _ = timeout(MESH_BUDGET, async {
+            while on(PathKind::Relayed) < peers.len() {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+    }
     sleep(Duration::from_secs(10)).await;
 
     let punches = |peers: &[Arc<IrohAdapter>]| {
@@ -961,6 +994,8 @@ async fn delayed_idle(connections: u32, rtt: Duration, watch: Duration, timers: 
             "hub_bytes_per_sec_per_connection": per_connection(connection_bytes),
             "hub_direct_bytes_per_sec_per_connection": per_connection(direct_bytes),
             "hub_relay_bytes_per_sec_per_connection": per_connection(relay_bytes),
+            "blocked": blocked,
+            "relayed_at_end": on(PathKind::Relayed),
             "hole_punch_rounds": punches(&peers) - punches_before,
             "redials": redials(&peers) - redials_before,
             "fallbacks": fallbacks,
@@ -1042,12 +1077,14 @@ async fn main() {
             connections,
             rtt_ms,
             secs,
+            blocked,
             timers,
         } => {
             delayed_idle(
                 connections,
                 Duration::from_millis(rtt_ms),
                 Duration::from_secs(secs),
+                blocked,
                 timers,
             )
             .await;
