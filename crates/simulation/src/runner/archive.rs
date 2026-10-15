@@ -7,29 +7,53 @@
 //! committed block per shard, encoded, taken from whichever replica
 //! committed it first and walked often enough that every height is taken
 //! before any replica's floor passes it.
+//!
+//! In a run that permits forks, a replica that commits a different block
+//! at an archived height replaces it, once. A halt recovery's fresh
+//! committee builds above the tip it harvested, at heights where the
+//! replaced committee committed a tail nobody served it, and the shard's
+//! chain is the one that goes on. A replica committing yet another block
+//! at a height already replaced holds a tail the chain left behind, and
+//! is abandoned rather than flipping the height back. A run that does not
+//! permit forks panics on a differing block instead.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_storage::ShardChainReader;
-use hyperscale_types::{BlockHeight, CertifiedBlock, ShardId, Verified};
+use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, ShardId, Verified};
 
 use super::SimulationRunner;
 use crate::NodeIndex;
 
+/// One archived block: its hash, and its encoding.
+type Archived = (BlockHash, Arc<[u8]>);
+
 /// One encoded block per committed `(shard, height)`.
 #[derive(Default)]
 pub struct ChainArchive {
-    blocks: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<[u8]>>>,
+    blocks: BTreeMap<ShardId, BTreeMap<BlockHeight, Archived>>,
     /// Highest height walked per `(host, shard)` store.
     walked: BTreeMap<(NodeIndex, ShardId), BlockHeight>,
+    /// The heights whose first archived block the shard's chain replaced.
+    replaced: BTreeSet<(ShardId, BlockHeight)>,
+    /// The `(host, shard)` stores holding a block the shard's chain
+    /// replaced.
+    abandoned: BTreeSet<(NodeIndex, ShardId)>,
 }
 
 impl ChainArchive {
     /// Take every height each store committed since the last walk.
+    ///
+    /// # Panics
+    ///
+    /// If a store committed a block differing from the archived one at a
+    /// height, in a run that does not permit forks.
     pub(super) fn record(&mut self, runner: &SimulationRunner) {
+        let forks_permitted = runner.invariants.forks_permitted();
+        let mut replaced = Vec::new();
         for host in 0..runner.num_hosts() {
             for shard in runner.hosted_shards_of(host) {
                 let Some(store) = runner.hosts_shard(host, shard) else {
@@ -52,7 +76,33 @@ impl ChainArchive {
                 let archived = self.blocks.entry(shard).or_default();
                 let mut height = from;
                 while height <= committed {
-                    if let Entry::Vacant(slot) = archived.entry(height) {
+                    let hash = store
+                        .get_block_metadata(height)
+                        .map(|meta| meta.header().hash());
+                    let stale = match archived.entry(height) {
+                        Entry::Vacant(_) => true,
+                        Entry::Occupied(slot) => {
+                            let kept = slot.get().0;
+                            match hash {
+                                Some(hash) if hash != kept => {
+                                    assert!(
+                                        forks_permitted,
+                                        "host {host} committed {shard:?} at {height:?} as \
+                                         {hash:?}, but the archive holds {kept:?}"
+                                    );
+                                    if self.replaced.insert((shard, height)) {
+                                        replaced.push((shard, height, kept));
+                                        true
+                                    } else {
+                                        self.abandoned.insert((host, shard));
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            }
+                        }
+                    };
+                    if stale {
                         let certified = store.get_block(height).unwrap_or_else(|| {
                             panic!(
                                 "host {host} committed {shard:?} at {height:?}, at or above its \
@@ -60,12 +110,31 @@ impl ChainArchive {
                             )
                         });
                         let bytes = to_vec(&*certified).expect("a committed block encodes");
-                        slot.insert(Arc::from(bytes));
+                        archived.insert(height, (certified.block().hash(), Arc::from(bytes)));
                     }
                     height = height.next();
                 }
             }
         }
+        for (shard, height, kept) in replaced {
+            for host in 0..runner.num_hosts() {
+                let held = runner
+                    .hosts_shard(host, shard)
+                    .and_then(|store| store.get_block_metadata(height))
+                    .map(|meta| meta.header().hash());
+                if held == Some(kept) {
+                    self.abandoned.insert((host, shard));
+                }
+            }
+        }
+    }
+
+    /// Whether `host`'s store of `shard` committed a block the shard's
+    /// chain replaced: a replica of a committee a halt recovery replaced,
+    /// holding a tail the fresh committee never harvested.
+    #[must_use]
+    pub fn abandoned(&self, host: NodeIndex, shard: ShardId) -> bool {
+        self.abandoned.contains(&(host, shard))
     }
 
     /// `shard`'s archived chain.
@@ -79,7 +148,7 @@ impl ChainArchive {
 
 /// One shard's archived blocks.
 pub struct ArchivedChain<'a> {
-    blocks: Option<&'a BTreeMap<BlockHeight, Arc<[u8]>>>,
+    blocks: Option<&'a BTreeMap<BlockHeight, Archived>>,
 }
 
 impl ArchivedChain<'_> {
@@ -106,7 +175,7 @@ impl ArchivedChain<'_> {
     /// If an archived block no longer decodes.
     #[must_use]
     pub fn block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
-        let bytes = self.blocks?.get(&height)?;
+        let (_, bytes) = self.blocks?.get(&height)?;
         let certified: CertifiedBlock = from_slice(bytes).expect("an archived block decodes");
         Some(Verified::<CertifiedBlock>::from_persisted(certified))
     }

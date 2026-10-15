@@ -286,9 +286,7 @@ pub fn halt_straddler_setup() -> HaltStraddlerSetup {
     let halting = ShardId::leaf(1, 0);
     let surviving = ShardId::leaf(1, 1);
 
-    let mut accounts = Vec::new();
-    ballast(halting, 2, HALT_RECOVERY_BULK, &mut accounts);
-    ballast(surviving, 2, HALT_RECOVERY_BULK, &mut accounts);
+    let mut accounts = halt_recovery_ballast();
 
     let mut taken = Vec::new();
     let mut leg = |from, to| payment_leg(from, to, 2, &mut taken, &mut accounts);
@@ -304,6 +302,60 @@ pub fn halt_straddler_setup() -> HaltStraddlerSetup {
         accounts,
         straddlers,
         post_recovery,
+    }
+}
+
+/// Both children of the root ballasted into the halt-recovery stable band,
+/// as [`halt_straddler_setup`] describes.
+fn halt_recovery_ballast() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = Vec::new();
+    ballast(ShardId::leaf(1, 0), 2, HALT_RECOVERY_BULK, &mut accounts);
+    ballast(ShardId::leaf(1, 1), 2, HALT_RECOVERY_BULK, &mut accounts);
+    accounts
+}
+
+/// The genesis funding and accounts for a harvested tick run over a
+/// tick the recovery discards.
+pub struct HarvestedTickSetup {
+    /// Genesis accounts: the halt-recovery ballast plus the four below.
+    pub accounts: Vec<(PrincipalAddr, u128)>,
+    /// On the halting shard: pays its own payment, and the fee of the
+    /// transfer into the halting shard.
+    pub(crate) payer: (Ed25519PrivateKey, PrincipalAddr),
+    /// On the halting shard: the payer's own payment's recipient.
+    pub(crate) beneficiary: PrincipalAddr,
+    /// On the surviving shard: the transfer's source, whose withdrawal
+    /// escrows to the halting shard.
+    pub(crate) source: (Ed25519PrivateKey, PrincipalAddr),
+    /// On the halting shard: the transfer's recipient, whose deposit is
+    /// the transfer's core.
+    pub(crate) recipient: PrincipalAddr,
+}
+
+/// Build the harvested-tick genesis: the halt-recovery ballast, a payer
+/// and a recipient on the halting shard `leaf(1, 0)` for each of its two
+/// transactions, and the transfer's source on the survivor.
+#[must_use]
+pub fn harvested_tick_setup() -> HarvestedTickSetup {
+    let (halting, surviving) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+    let mut accounts = halt_recovery_ballast();
+    let mut taken = Vec::new();
+    let payer = account_routing_to_n(halting, 2, &mut taken);
+    let (_, beneficiary) = account_routing_to_n(halting, 2, &mut taken);
+    let source = account_routing_to_n(surviving, 2, &mut taken);
+    let (_, recipient) = account_routing_to_n(halting, 2, &mut taken);
+    accounts.extend([
+        (payer.1, 10_000),
+        (beneficiary, 10),
+        (source.1, 10_000),
+        (recipient, 10),
+    ]);
+    HarvestedTickSetup {
+        accounts,
+        payer,
+        beneficiary,
+        source,
+        recipient,
     }
 }
 
@@ -1557,6 +1609,52 @@ pub(crate) fn build_bounded_transfer_tx<S: AccountSigner>(
         account::deposit(b, to, funds.min(amount))
     });
     Transaction::new(envelope(graph, payer, validity))
+}
+
+/// [`build_bounded_transfer_tx`] with its fee paid by `sponsor`, which
+/// attests the root first: the fee reserves and burns against the
+/// sponsor's vault, on whichever shard holds it.
+///
+/// # Panics
+///
+/// As [`build_transfer_tx`].
+#[must_use]
+pub(crate) fn build_sponsored_bounded_transfer_tx(
+    sponsor: &Ed25519PrivateKey,
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let client = client();
+    let chain = client.records();
+    let mut root = IntentBuilder::new(
+        &chain,
+        &ProtocolHasher,
+        account_address(&payer.public_key().0),
+        scenario_header(validity),
+    );
+    let transfer = |b: &mut TypedBuilder<'_>| -> Result<(), TypedError> {
+        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+        account::deposit(b, to, funds.min(amount))
+    };
+    transfer(&mut root).expect("the stdlib account answers a transfer");
+    let mut tree = root.build().expect("the intent declares no hole");
+    let signers = [sponsor, payer];
+    tree.root.attested_by =
+        Capped::new(signers.iter().map(|signer| principal_of(*signer)).collect())
+            .expect("two attesters at most");
+    Transaction::new(client.sign_tree(
+        &tree,
+        &signers,
+        Terms {
+            max_fee: MAX_FEE,
+            ceilings: Ceilings::Guessed,
+            priority_bp: 0,
+            message: Vec::new(),
+        },
+    ))
 }
 
 /// Build a transfer signing `priority_bp` over the table price.

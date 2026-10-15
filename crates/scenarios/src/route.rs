@@ -27,6 +27,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
 
+use crate::faults::{await_halt_recovery, freeze_shard};
 use crate::straddler::{
     isolate_crossing_intake, isolate_ec_intake, isolate_provision_intake, isolate_pushed_readings,
     isolate_state_reads,
@@ -1287,6 +1288,121 @@ fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePaye
     if payer == FeePayer::Sponsor {
         fee.assert_sponsor_charged_once(c);
     }
+}
+
+/// A route's core held through a halt of its first venue's shard is
+/// aborted on both venues past the recovery, and the trader's escrowed
+/// input is released.
+///
+/// The core is held on both venues, their certificates cut, and stands
+/// on the first venue's shard through a halt and its committee redraw.
+/// The recovery's crossing block releases the row, and the recovered
+/// shard aborts it from its deadline: the row goes and the chain reads
+/// the route `Aborted`.
+///
+/// The abort is certified by the fresh committee, at an anchor past the
+/// recovery's bridge, so once the cut lifts the surviving venue's shard
+/// verifies it: its stated core ends `Aborted` as well. The trader's
+/// escrowed input is then answered, and both resources settle.
+///
+/// # Panics
+///
+/// Panics if the core is never held on both venues, the halt or its
+/// recovery misses a budget, either venue's shard does not end the core
+/// by an abort, the trader's input stays locked, or either resource
+/// does not settle.
+pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
+    C: FaultableCluster,
+>(
+    c: &mut C,
+) {
+    let (halted, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let sponsor = sponsor(&mut taken);
+    let (key, trader) = &traders[0];
+    let row = |c: &C, shard: ShardId, tx: TxHash| {
+        c.member_rows(shard).and_then(|rows| rows.get(&tx).copied())
+    };
+    let cut = [
+        isolate_ec_intake(c, halted, survivor),
+        isolate_ec_intake(c, survivor, halted),
+    ];
+    let (protocol_resource, units) =
+        route_worlds(c, &first, &second, accounts(&traders).chain([sponsor.1]));
+    let mut charges = Charges::default();
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = charges.submit(c, route);
+    let held_on = |c: &C, shard: ShardId| {
+        matches!(
+            row(c, shard, hash),
+            Some(RowState::InFlight { .. } | RowState::Stated { .. })
+        )
+    };
+    assert!(
+        c.run_until(epochs(8), |c| held_on(c, halted) && held_on(c, survivor)),
+        "the route's core must be held on both venues: {:?} {:?}",
+        row(c, halted, hash),
+        row(c, survivor, hash),
+    );
+    // The recovery's frontier is the last boundary the beacon attested,
+    // so the tick holding the core has to stand through one.
+    c.run_until(epochs(2), |_| false);
+
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    await_halt_recovery(c, &halt);
+
+    let aborted_on = |c: &C, shard: ShardId| {
+        row(c, shard, hash).is_none()
+            && matches!(
+                c.chain_fate(shard, hash).1,
+                Some((_, TransactionDecision::Aborted))
+            )
+    };
+    assert!(
+        c.run_until(epochs(6), |c| aborted_on(c, halted)),
+        "the recovered shard ends the route's core by an abort: {:?} {:?}",
+        row(c, halted, hash),
+        c.chain_fate(halted, hash),
+    );
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(6), |c| aborted_on(c, survivor)),
+        "the survivor verifies the recovered shard's abort and ends its core by it: {:?} {:?}",
+        row(c, survivor, hash),
+        c.chain_fate(survivor, hash),
+    );
+    assert!(
+        c.run_until(epochs(6), |c| protocol_resource
+            .locked(c, &charges)
+            .is_empty()),
+        "the trader's escrowed input is released: {:?}",
+        protocol_resource.locked(c, &charges),
+    );
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a core aborted on both venues past a halt",
+    );
+    units.assert_settled(
+        c,
+        &Charges::default(),
+        "a core aborted on both venues past a halt",
+    );
 }
 
 /// A held route's fee hold, and what its sponsor held before.

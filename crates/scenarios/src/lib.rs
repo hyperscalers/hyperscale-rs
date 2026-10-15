@@ -60,6 +60,7 @@ pub use execution::{
 pub use faults::{
     a_fresh_committee_recovered_again_before_its_crossing_folds,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
+    a_harvested_tick_over_a_discarded_tick_settles_nothing,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_is_inert,
     cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
@@ -102,7 +103,9 @@ pub use reshape::{
 };
 pub use route::{
     Certificates, CoreLoad, FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport,
-    SECOND_VENUE_SHARD, TRADER_SHARD, a_crossing_the_consumer_refuses_is_declined,
+    SECOND_VENUE_SHARD, TRADER_SHARD,
+    a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released,
+    a_crossing_the_consumer_refuses_is_declined,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
@@ -151,9 +154,10 @@ pub use straddler::{
     surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
-    Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle, FaultableCluster, Nemesis,
-    ScenarioConfig, assume, committees_on_separate_hosts, conservation, discard, epochs,
-    grow_and_hold, grow_to, query, submission_shards, tx, vote_reshape_threshold, wait,
+    BlockServingCap, Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle,
+    FaultableCluster, Nemesis, ScenarioConfig, assume, committees_on_separate_hosts, conservation,
+    discard, epochs, grow_and_hold, grow_to, query, submission_shards, tx, vote_reshape_threshold,
+    wait,
 };
 pub use swarm::{SWARM_ACCOUNTS, transfers_survive_a_nemesis};
 pub use transactions::livelock_resolves_promptly;

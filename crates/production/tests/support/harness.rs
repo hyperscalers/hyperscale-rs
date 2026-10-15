@@ -20,7 +20,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
-use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
+use hyperscale_network_libp2p::fault::{DropSpec, HostId, Rewrite, RuleHandle};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
@@ -689,6 +689,20 @@ impl Harness {
             .collect()
     }
 
+    /// Install `rewrite` over the answers host `host` serves for requests of
+    /// `type_id`.
+    pub fn fault_install_response_rewrite(
+        &self,
+        host: usize,
+        type_id: &'static str,
+        rewrite: Rewrite,
+    ) -> RuleHandle {
+        self.hosts[host]
+            .adapter
+            .fault_gate()
+            .install_response_rewrite(type_id, rewrite)
+    }
+
     /// Partition host groups `a` and `b` — each side blocks the other, so both
     /// outbound unicast and inbound gossip are cut in both directions.
     pub fn fault_partition(&self, a: &[usize], b: &[usize]) {
@@ -741,7 +755,8 @@ impl Harness {
         }
     }
 
-    /// Remove every installed drop rule on every host, leaving partitions intact.
+    /// Remove every installed drop rule and rewrite on every host, leaving
+    /// partitions intact.
     pub fn fault_clear_all(&self) {
         for h in &self.hosts {
             h.adapter.fault_gate().clear_faults();

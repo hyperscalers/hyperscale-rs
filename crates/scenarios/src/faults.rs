@@ -9,21 +9,23 @@ use hyperscale_engine::tick_select::{awaited_core, member_of};
 use hyperscale_storage::{RowState, committed_tx_cell_key};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, Joins, MAX_STANDING_TOWARD_SHARD,
-    MAX_TXS_PER_BLOCK, PrincipalAddr, SWEEP_BUCKET_MS, ShardId, ShardTrie, StateRoot,
-    TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, Joins,
+    MAX_STANDING_TOWARD_SHARD, MAX_TXS_PER_BLOCK, PrincipalAddr, SWEEP_BUCKET_MS, ShardId,
+    ShardTrie, StateRoot, TimestampRange, TransactionDecision, TransactionStatus, TxHash,
+    ValidatorId, WeightedTimestamp, Window,
 };
 use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, sponsor, stand_up_venues, traders};
-use crate::straddler::{STRADDLER_PAYMENT, chain_settled};
+use crate::straddler::{STRADDLER_PAYMENT, chain_settled, isolate_crossing_intake};
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::{FaultableCluster, report_crossing_measures};
 use crate::support::query::{beacon_epoch, clock, epoch_duration_ms, vault_balance};
 use crate::support::tx::{
-    HALT_STRADDLER_BATCH, PaymentLeg, account_shard, build_composed_tx, build_probe_transfer_tx,
-    build_route_tx, build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup,
+    HALT_STRADDLER_BATCH, HarvestedTickSetup, PaymentLeg, account_shard, build_composed_tx,
+    build_probe_transfer_tx, build_route_tx, build_sponsored_bounded_transfer_tx,
+    build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup, harvested_tick_setup,
     payment_request_for, validity_around,
 };
 use crate::support::wait::{
@@ -794,6 +796,313 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     report_crossing_measures(c, "halted_shard_straddler_atomic");
 }
 
+/// What each transaction of [`a_harvested_tick_over_a_discarded_tick_settles_nothing`]
+/// moves.
+const HARVESTED_PAYMENT: u128 = 100;
+
+/// A tick the recovered shard harvests, run over a tick its recovery
+/// discards, settles nothing there.
+///
+/// The halting shard's execution votes are cut among its own hosts, so
+/// no tick of it certifies. Under the cut it commits `j`, a payment its
+/// payer makes on the shard, and the beacon records a boundary above
+/// `j`: the recovery's frontier will stand at or above it. It then
+/// commits `K`, a transfer escrowed on the survivor into a deposit on
+/// the halting shard whose fee the same payer pays, and names it in a
+/// tick above `j`'s, so `K` runs over the vault `j` spent. The cut lifts
+/// until both ticks certify, while the survivor is kept from reading the
+/// halting shard's crossings, and every host serving the shard is capped
+/// to serve no block above `K`'s tick, so the fresh committee harvests a
+/// tip holding `K` in flight and the tail holding both finalizations is
+/// lost unread. The shard then halts and recovers.
+///
+/// Past the crossing block no tick row stands on the recovered shard,
+/// and every row the crossing released ends by its clock: `j` by its
+/// abort, and `K`, a row its own shard settles alone, by its fate once
+/// its leg entry window closes, which settles as an abort. The budget
+/// for both is the epochs to that close and four more. The survivor's
+/// escrow is never both delivered to the recipient and credited back to
+/// its source, and the world settles.
+///
+/// Requires [`harvested_tick_setup`] at genesis and two committees'
+/// worth of pool surplus.
+///
+/// [`harvested_tick_setup`]: crate::tx::harvested_tick_setup
+///
+/// # Panics
+///
+/// Panics if either transaction misses a budget to commit, the beacon
+/// records no boundary above `j`, `K` is never named in a tick or no
+/// longer stands in flight in it when the cut lifts, the ticks never
+/// certify, the cap never refuses a block or the survivor never asks for
+/// the tail, the recovery's frontier does not separate `j` from `K`'s
+/// tick, the halt or its recovery misses a lifecycle budget, a tick row
+/// stands past the crossing or a released row outlives its budget, `j`
+/// or `K` settles other than as an abort, the escrow is both delivered
+/// and credited back, or the world does not settle.
+pub fn a_harvested_tick_over_a_discarded_tick_settles_nothing<C: FaultableCluster>(c: &mut C) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = harvested_tick_setup();
+    split_lifecycle(c);
+    let (_, payer) = &setup.payer;
+    let (_, source) = &setup.source;
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [*payer, setup.beneficiary, *source, setup.recipient].map(PrincipalAddr::address),
+        [],
+    );
+    let mut charges = Charges::default();
+
+    let hosts = c.committee_hosts(halted);
+    let UncertifiedTicks {
+        j,
+        j_at,
+        k,
+        k_at,
+        k_lapse,
+    } = commit_over_uncertified_ticks(c, halted, &setup, &mut charges, &hosts);
+
+    // Nothing certifies under the cut, so `K` stands in flight in every
+    // block from its tick up: the tip the cap leaves the harvest holds it.
+    assert!(
+        tick_of(c, halted, k) == Some(k_at),
+        "the transfer must stand in flight in its tick at {k_at:?} as the cut lifts: {:?}",
+        c.member_rows(halted).and_then(|rows| rows.get(&k).copied()),
+    );
+
+    // Both ticks certify once the votes flow, and their finalizations
+    // land above `K`'s tick, in the tail the cap keeps from the harvest.
+    // The survivor reads none of that tail: a counterpart that read it
+    // before the recovery discarded it is torn, which is the recovery's
+    // stated residual and not what this asserts.
+    c.clear_drops();
+    let tail_unread = isolate_crossing_intake(c, survivor, halted);
+    let in_flight = |c: &C, tx: TxHash| tick_of(c, halted, tx).is_some();
+    assert!(
+        c.run_until(epochs(2), |c| !in_flight(c, j) && !in_flight(c, k)),
+        "both ticks must certify once the votes flow",
+    );
+    let cap = c.cap_block_serving(halted, k_at);
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    await_halt_recovery(c, &halt);
+    assert!(
+        cap.fired() > 0,
+        "the harvest must have been refused a block above {k_at:?}",
+    );
+    assert!(
+        tail_unread.fired() > 0,
+        "the survivor must actually have been kept from reading the tail",
+    );
+    c.clear_drops();
+
+    let frontier = c
+        .beacon_state()
+        .and_then(|state| state.latest_completed_recovery(halted))
+        .expect("a cleared recovery leaves its completed record")
+        .attested_frontier;
+    assert!(
+        j_at <= frontier && frontier < k_at,
+        "the recovery's frontier {frontier:?} must stand at or above the payer's payment \
+         at {j_at:?} and below the transfer's tick at {k_at:?}",
+    );
+
+    assert_discarded_ticks_end(c, halted, k_at, k_lapse, j, k);
+
+    let delivered_and_returned = |c: &C| {
+        vault_balance(c, halted, setup.recipient) == 10 + HARVESTED_PAYMENT
+            && vault_balance(c, survivor, *source) == 10_000
+    };
+    assert!(
+        !delivered_and_returned(c),
+        "the escrow is both delivered and credited back",
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a harvested tick over a discarded tick",
+    );
+    assert!(
+        !delivered_and_returned(c),
+        "the escrow is both delivered and credited back",
+    );
+}
+
+/// What [`commit_over_uncertified_ticks`] leaves on the halting shard.
+struct UncertifiedTicks {
+    /// The payer's own payment, and the height that committed it.
+    j: TxHash,
+    j_at: BlockHeight,
+    /// The transfer, the height of the tick it stands in flight in, and
+    /// the close of its leg entry window, at which its row is fated once
+    /// a recovery releases it.
+    k: TxHash,
+    k_at: BlockHeight,
+    k_lapse: WeightedTimestamp,
+}
+
+/// The tick `tx` stands in flight in on `shard`, if it does.
+fn tick_of<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
+    match c.member_rows(shard)?.get(&tx)? {
+        RowState::InFlight { tick, .. } => Some(*tick),
+        _ => None,
+    }
+}
+
+/// Commit [`a_harvested_tick_over_a_discarded_tick_settles_nothing`]'s
+/// `j` and `K` on `halted`, with its execution votes cut among `hosts` so
+/// neither certifies, with a boundary the beacon recorded between them,
+/// and with `K` named in a tick.
+fn commit_over_uncertified_ticks<C: FaultableCluster>(
+    c: &mut C,
+    halted: ShardId,
+    setup: &HarvestedTickSetup,
+    charges: &mut Charges,
+    hosts: &[usize],
+) -> UncertifiedTicks {
+    let (payer_key, payer) = &setup.payer;
+    let (source_key, source) = &setup.source;
+    let votes = c.drop_type_between(hosts, hosts, "execution.vote");
+
+    let j = charges.submit(
+        c,
+        build_transfer_tx(
+            payer_key,
+            *payer,
+            setup.beneficiary,
+            HARVESTED_PAYMENT,
+            validity_around(c.now()),
+        ),
+    );
+    assert!(
+        c.run_until(epochs(4), |c| c.chain_fate(halted, j).0.is_some()),
+        "the payer's own payment must commit on its shard",
+    );
+    let j_at = c.chain_fate(halted, j).0.expect("committed above");
+    let recorded = |c: &C| {
+        c.beacon_state().and_then(|state| {
+            state
+                .boundaries
+                .get(&halted)
+                .map(|boundary| boundary.height)
+        })
+    };
+    assert!(
+        c.run_until(epochs(4), |c| recorded(c)
+            .is_some_and(|height| height >= j_at)),
+        "the beacon must record a boundary of the halting shard at or above {j_at:?}",
+    );
+
+    let k_validity = validity_around(c.now());
+    let k = charges.submit(
+        c,
+        build_sponsored_bounded_transfer_tx(
+            payer_key,
+            source_key,
+            *source,
+            setup.recipient,
+            HARVESTED_PAYMENT,
+            k_validity,
+        ),
+    );
+    assert!(
+        c.run_until(epochs(4), |c| c.chain_fate(halted, k).0.is_some()),
+        "the transfer must commit on the halting shard",
+    );
+    assert!(
+        c.run_until(epochs(2), |c| tick_of(c, halted, k).is_some()),
+        "the transfer must be named in a tick: {:?}",
+        c.member_rows(halted).and_then(|rows| rows.get(&k).copied()),
+    );
+    let k_at = tick_of(c, halted, k).expect("named above");
+    assert!(
+        votes.fired() > 0,
+        "the halting shard's execution votes must actually have been cut",
+    );
+
+    UncertifiedTicks {
+        j,
+        j_at,
+        k,
+        k_at,
+        k_lapse: Window::LegEntry
+            .of(Deadline::of(k_validity.end_timestamp_exclusive))
+            .end,
+    }
+}
+
+/// Assert that no tick row at or below `k_at`, the harvested tip, stands
+/// on the recovered `halted`, that every row its crossing released ends
+/// by `k_lapse`, the close of `k`'s leg entry window, and four epochs on,
+/// and that `j` and `k` both settle there as an abort.
+fn assert_discarded_ticks_end<C: Cluster>(
+    c: &mut C,
+    halted: ShardId,
+    k_at: BlockHeight,
+    k_lapse: WeightedTimestamp,
+    j: TxHash,
+    k: TxHash,
+) {
+    let rows = c
+        .member_rows(halted)
+        .expect("the harness reads the recovered shard's member rows");
+    let standing: Vec<_> = rows
+        .iter()
+        .filter(|(_, row)| {
+            matches!(row, RowState::InFlight { tick, .. } | RowState::Stated { tick, .. }
+                if *tick <= k_at)
+        })
+        .collect();
+    assert!(
+        standing.is_empty(),
+        "no tick row at or below the harvested tip stands past the crossing: {standing:?}",
+    );
+    let released = |c: &C| {
+        c.member_rows(halted).is_some_and(|rows| {
+            rows.values()
+                .any(|row| matches!(row, RowState::Released { .. }))
+        })
+    };
+    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let to_lapse = k_lapse.as_millis().saturating_sub(clock(c).as_millis());
+    let budget = epochs(
+        u32::try_from(to_lapse.div_ceil(epoch_ms) + 4).expect("a leg entry window of epochs"),
+    );
+    assert!(
+        c.run_until(budget, |c| !released(c)),
+        "every row the crossing released must end by its clock, the transfer's leg entry \
+         window closing at {k_lapse:?}: {:?}",
+        c.member_rows(halted),
+    );
+
+    let ended = |c: &C, tx: TxHash| {
+        c.member_rows(halted)
+            .is_some_and(|rows| !rows.contains_key(&tx))
+    };
+    assert!(
+        ended(c, j)
+            && matches!(
+                c.chain_fate(halted, j).1,
+                Some((_, TransactionDecision::Aborted))
+            ),
+        "the payer's own payment ends by its abort: {:?}, row {:?}",
+        c.chain_fate(halted, j),
+        c.member_rows(halted).and_then(|rows| rows.get(&j).copied()),
+    );
+    assert!(
+        ended(c, k)
+            && matches!(
+                c.chain_fate(halted, k).1,
+                Some((_, TransactionDecision::Aborted))
+            ),
+        "the transfer ends on the recovered shard by its fate, settled as an abort: {:?}, \
+         row {:?}",
+        c.chain_fate(halted, k),
+        c.member_rows(halted).and_then(|rows| rows.get(&k).copied()),
+    );
+}
+
 /// A halted shard's recovery lands on retained and fresh hosts alike, and
 /// every replica agrees on what the recovered shard runs.
 ///
@@ -1146,7 +1455,7 @@ fn fate_including_freeze<C: Cluster>(
 /// A staged shard freeze: the fault rules are installed and the shard has
 /// verifiably stopped committing. Carries the observations
 /// [`await_halt_recovery`] asserts against.
-struct StagedHalt {
+pub struct StagedHalt {
     /// The frozen shard.
     shard: ShardId,
     /// Its live sibling, asserted to keep committing through the halt.
@@ -1178,7 +1487,7 @@ struct StagedHalt {
 ///
 /// `at_freeze_edge` runs just before the votes stop — the last instant new
 /// work enters the shard's pipeline with any chance to commit.
-fn freeze_shard<C: FaultableCluster>(
+pub fn freeze_shard<C: FaultableCluster>(
     c: &mut C,
     shard: ShardId,
     sibling: ShardId,
@@ -1237,7 +1546,7 @@ fn freeze_shard<C: FaultableCluster>(
 /// Drive a staged freeze through detection, committee redraw, resume, and
 /// record clear, asserting the beacon and the sibling shard stay live
 /// throughout.
-fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
+pub fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
     let seated_at = await_recovery_draw(c, halt);
     await_recovery_resume(c, halt, seated_at);
 }

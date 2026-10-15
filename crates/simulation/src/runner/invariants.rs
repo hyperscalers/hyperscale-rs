@@ -59,6 +59,10 @@ impl Invariants {
         self.forks_permitted = true;
     }
 
+    pub const fn forks_permitted(&self) -> bool {
+        self.forks_permitted
+    }
+
     /// Walk every store's newly committed heights and every host's latest
     /// beacon block against what the other replicas committed.
     pub fn check(&mut self, runner: &SimulationRunner) {

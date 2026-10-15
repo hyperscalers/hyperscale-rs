@@ -25,6 +25,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::adapter::{Libp2pAdapter, NOTIFY_PROTOCOL, request_protocol};
+use crate::fault_gate::FaultState;
 use crate::stream_framing::{self, FrameError, MAX_FRAME_SIZE};
 
 /// Timeout for reading requests and writing responses on streams.
@@ -228,6 +229,8 @@ struct InboundRouter {
     per_peer: Arc<DashMap<PeerId, AtomicUsize>>,
     /// Per-peer failure rate tracking for cooldown.
     per_peer_failures: Arc<DashMap<PeerId, PeerRateState>>,
+    /// The host's fault gate, which may rewrite what a handler answers.
+    fault_gate: Arc<FaultState>,
 }
 
 impl InboundRouter {
@@ -240,6 +243,7 @@ impl InboundRouter {
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: Arc::new(DashMap::new()),
             per_peer_failures: Arc::new(DashMap::new()),
+            fault_gate: adapter.shared_fault_gate(),
         });
 
         // ── Request accept loops (one per hosted shard) ──
@@ -481,9 +485,16 @@ impl InboundRouter {
             // Handlers like provision.request do heavy work (merkle proof
             // generation) that would starve the async runtime if run on a
             // worker thread.
-            let response_bytes = spawn_blocking(move || handler(&wire_payload))
-                .await
-                .expect("request handler task panicked");
+            let (asked, answer) = spawn_blocking(move || {
+                let answer = handler(&wire_payload);
+                (wire_payload, answer)
+            })
+            .await
+            .expect("request handler task panicked");
+            let response_bytes = self
+                .fault_gate
+                .rewrite_response(peer, &type_id, &asked, answer);
+            drop(asked);
 
             // Write length-prefixed compressed response with timeout.
             let resp_wire_bytes = timeout(
@@ -675,6 +686,7 @@ mod tests {
             global_semaphore: Arc::new(Semaphore::new(global_cap)),
             per_peer: Arc::new(DashMap::new()),
             per_peer_failures: Arc::new(DashMap::new()),
+            fault_gate: Arc::new(FaultState::new()),
         })
     }
 

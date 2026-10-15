@@ -10,8 +10,12 @@
 //! [`drop_type`]: FaultableCluster::drop_type
 
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use hyperscale_hbor::{from_slice, to_vec};
+use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     BlockHeight, MAX_CLAIMS_BYTES, MAX_STATE_CLAIMS_BYTES, ShardId, StateRoot, ValidatorId,
@@ -83,6 +87,14 @@ pub trait FaultableCluster: Cluster {
         to: &[usize],
         type_id: &'static str,
     ) -> FaultHandle;
+
+    /// Make every host serving `shard`'s live committee answer a block
+    /// sync for a block of `shard` above `height` as not found, until
+    /// [`clear_drops`](Self::clear_drops). A requester syncing the shard
+    /// from those hosts reaches `height` and no further; a host answering
+    /// its own requests in-process is not capped. The handle counts the
+    /// blocks refused.
+    fn cap_block_serving(&mut self, shard: ShardId, height: BlockHeight) -> FaultHandle;
 
     /// The host running `validator`, or `None` when no host runs it.
     fn host_of(&self, validator: ValidatorId) -> Option<usize>;
@@ -175,6 +187,62 @@ pub trait FaultableCluster: Cluster {
 
     /// Read how many observations a cluster-wide histogram holds.
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
+}
+
+/// What a host under [`FaultableCluster::cap_block_serving`] answers a
+/// block sync with: not found for a block of `shard` above `height`, and
+/// the honest answer for anything else.
+#[derive(Clone)]
+pub struct BlockServingCap {
+    shard: ShardId,
+    height: BlockHeight,
+    refused: Arc<AtomicU64>,
+    not_found: Arc<[u8]>,
+}
+
+impl BlockServingCap {
+    /// A cap on `shard`'s blocks above `height`, having refused none.
+    ///
+    /// # Panics
+    ///
+    /// If a not-found block response does not encode.
+    #[must_use]
+    pub fn new(shard: ShardId, height: BlockHeight) -> Self {
+        let not_found =
+            to_vec(&GetBlockResponse::not_found()).expect("a not-found block response encodes");
+        Self {
+            shard,
+            height,
+            refused: Arc::new(AtomicU64::new(0)),
+            not_found: Arc::from(not_found),
+        }
+    }
+
+    /// The bytes to answer with in place of `honest`, a `block.request`
+    /// handler's own answer. An answer that is no block response, such as
+    /// the empty one a failed handler sends, passes untouched.
+    #[must_use]
+    pub fn answer(&self, honest: &[u8]) -> Vec<u8> {
+        let Ok(response) = from_slice::<GetBlockResponse>(honest) else {
+            return honest.to_vec();
+        };
+        let capped = response.block().is_some_and(|block| {
+            block.header().shard_id() == self.shard && block.header().height() > self.height
+        });
+        if !capped {
+            return honest.to_vec();
+        }
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        self.not_found.to_vec()
+    }
+
+    /// A handle counting the blocks this cap refused, on every host it is
+    /// installed on.
+    #[must_use]
+    pub fn handle(&self) -> FaultHandle {
+        let refused = Arc::clone(&self.refused);
+        FaultHandle::new(move || refused.load(Ordering::Relaxed))
+    }
 }
 
 /// What a crash takes with it.

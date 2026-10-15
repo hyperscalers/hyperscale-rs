@@ -27,8 +27,8 @@ use hyperscale_scenarios::query::{
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster, ScenarioConfig,
-    grow_and_hold, submission_shards,
+    BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
+    ScenarioConfig, grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -566,13 +566,12 @@ impl SimCluster {
     /// returns, given the request's bytes and the answer it was about to
     /// send.
     ///
-    /// The byzantine seam, and sim-only for the same reason
-    /// [`Self::restart_host`] is: the portable surface is the
-    /// intersection of what both harnesses do, and a host that answers
-    /// wrongly is a transport the libp2p gate has no hook for. A drop
-    /// rule can only make a responder silent, which every fetch path has
-    /// a fallback for; what an evidence check is exercised by is a
-    /// well-formed answer that says the wrong thing.
+    /// The byzantine seam, and sim-only: the portable surface offers only
+    /// the one rewrite both harnesses install,
+    /// [`FaultableCluster::cap_block_serving`]. A drop rule can only make
+    /// a responder silent, which every fetch path has a fallback for;
+    /// what an evidence check is exercised by is a well-formed answer
+    /// that says the wrong thing.
     pub fn rewrite_responses(
         &mut self,
         host: usize,
@@ -876,8 +875,14 @@ impl Cluster for SimCluster {
     }
 
     fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {
+        // A replica holding a tail its shard's chain replaced reports what
+        // it decided off that tail, which the shard discarded.
         (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.tx_status_entry(host, &tx))
+            .filter_map(|host| {
+                self.runner
+                    .tx_status_entry(host, &tx)
+                    .filter(|(_, shard)| !self.runner.archive().abandoned(host, *shard))
+            })
             .collect()
     }
 
@@ -1166,6 +1171,19 @@ impl FaultableCluster for SimCluster {
             .map(|&validator| self.runner.withhold(validator, withheld))
             .collect();
         FaultHandle::new(move || signers.iter().map(|signer| signer.refused()).sum())
+    }
+
+    fn cap_block_serving(&mut self, shard: ShardId, height: BlockHeight) -> FaultHandle {
+        let cap = BlockServingCap::new(shard, height);
+        for host in self.committee_hosts(shard) {
+            let cap = cap.clone();
+            let _ = self.runner.network_mut().rewrite_responses(
+                host_index(host),
+                "block.request",
+                Arc::new(move |_asked: &[u8], honest: &[u8]| cap.answer(honest)),
+            );
+        }
+        cap.handle()
     }
 
     fn host_of(&self, validator: ValidatorId) -> Option<usize> {

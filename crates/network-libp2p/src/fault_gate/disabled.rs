@@ -37,6 +37,19 @@ impl FaultState {
         false
     }
 
+    /// Answers with exactly what the handler answered.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn rewrite_response(
+        &self,
+        _peer: PeerId,
+        _type_id: &str,
+        _asked: &[u8],
+        answer: Vec<u8>,
+    ) -> Vec<u8> {
+        answer
+    }
+
     /// Never suppresses an inbound gossip message.
     #[inline]
     #[must_use]

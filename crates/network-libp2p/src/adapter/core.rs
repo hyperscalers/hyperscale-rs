@@ -642,6 +642,11 @@ impl Libp2pAdapter {
         &self.fault_gate
     }
 
+    /// The fault gate, shared with a seam that outlives this borrow.
+    pub(crate) fn shared_fault_gate(&self) -> Arc<FaultState> {
+        Arc::clone(&self.fault_gate)
+    }
+
     /// Configure the fault gate: this host's id and the full `PeerId → HostId`
     /// map. The harness calls this once before installing faults.
     #[cfg(feature = "test-utils")]

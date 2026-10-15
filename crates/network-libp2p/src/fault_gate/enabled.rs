@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use hyperscale_network::fault::{
-    Decision, DropSpec, Engine, HostId, MessageContext, RuleHandle, Tier,
+    Decision, DropSpec, Engine, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
 use libp2p::PeerId;
 use parking_lot::Mutex;
@@ -146,6 +146,31 @@ impl FaultState {
             ) == Decision::Drop
     }
 
+    /// The bytes this host answers `peer`'s request with: `answer`, the
+    /// handler's own, unless a rewrite installed on this host matches.
+    /// `asked` is the request the answer is for.
+    #[must_use]
+    pub(crate) fn rewrite_response(
+        &self,
+        peer: PeerId,
+        type_id: &str,
+        asked: &[u8],
+        answer: Vec<u8>,
+    ) -> Vec<u8> {
+        let sender = self.self_host();
+        let recipient = self.host_of(&peer).unwrap_or(sender);
+        self.engine.lock().rewrite(
+            &MessageContext {
+                sender,
+                recipient,
+                type_id,
+                tier: Tier::Response,
+            },
+            asked,
+            answer,
+        )
+    }
+
     // ── Control (driven by the harness through the adapter gate) ─────────
 
     /// Install a drop rule; returns its handle.
@@ -154,12 +179,27 @@ impl FaultState {
         self.engine.lock().install_spec(spec)
     }
 
+    /// Install a rewrite over the answers this host serves for requests
+    /// of `type_id`; returns its handle.
+    #[must_use]
+    pub fn install_response_rewrite(&self, type_id: &'static str, rewrite: Rewrite) -> RuleHandle {
+        self.engine.lock().install_rewrite(
+            &DropSpec {
+                type_id: Some(type_id),
+                tier: Some(Tier::Response),
+                ..DropSpec::default()
+            },
+            rewrite,
+        )
+    }
+
     /// Remove a previously installed drop rule.
     pub fn remove_fault(&self, handle: &RuleHandle) {
         self.engine.lock().remove(handle);
     }
 
-    /// Remove every installed drop rule (leaves partitions intact).
+    /// Remove every installed drop rule and rewrite (leaves partitions
+    /// intact).
     pub fn clear_faults(&self) {
         self.engine.lock().clear();
     }

@@ -20,7 +20,7 @@ use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::RanAs;
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
+    BlockServingCap, Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
     submission_shards,
 };
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
@@ -554,6 +554,19 @@ impl FaultableCluster for ProdCluster {
             }
         }
         FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn cap_block_serving(&mut self, shard: ShardId, height: BlockHeight) -> FaultHandle {
+        let cap = BlockServingCap::new(shard, height);
+        for host in self.inner.hosts_serving(shard) {
+            let cap = cap.clone();
+            let _ = self.inner.fault_install_response_rewrite(
+                host,
+                "block.request",
+                Arc::new(move |_asked: &[u8], honest: &[u8]| cap.answer(honest)),
+            );
+        }
+        cap.handle()
     }
 
     fn host_of(&self, validator: ValidatorId) -> Option<usize> {

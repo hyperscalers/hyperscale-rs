@@ -20,18 +20,20 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
     cross_shard_genesis_accounts, genesis_accounts, halt_recovery_split_bytes,
-    halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
-    merge_convergence_setup, merge_split_bytes, merge_straddler_setup, native_pq_genesis_accounts,
-    nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
-    probe_train_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
-    securify_genesis_accounts, shared_recipient_genesis_accounts, split_issuer_straddler_setup,
-    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
-    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    halt_straddler_setup, harvested_tick_setup, insolvent_genesis_accounts,
+    livelock_genesis_accounts, merge_convergence_setup, merge_split_bytes, merge_straddler_setup,
+    native_pq_genesis_accounts, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
+    participant_sweep_genesis_accounts, probe_train_genesis_accounts, remote_delegator,
+    reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
+    split_issuer_straddler_setup, split_straddler_setup, staking_genesis_accounts,
+    stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
+    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
     LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend,
     VENUE_SHARD, WIDE_VENUE_SHARD, a_consumer_never_committing_declines_a_pushed_record,
+    a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released,
     a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
@@ -41,6 +43,7 @@ use hyperscale_scenarios::{
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
     a_fee_hold_stands_until_its_burn, a_fresh_committee_recovered_again_before_its_crossing_folds,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
+    a_harvested_tick_over_a_discarded_tick_settles_nothing,
     a_healed_network_delivers_past_the_old_window,
     a_held_core_keeps_its_sponsors_hold_until_it_aborts,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
@@ -1355,6 +1358,28 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
     dedicated_route_cluster(&route_genesis_accounts())
 }
 
+/// On a route cluster with a second cohort of pool surplus, the committee
+/// the halted venue's shard is redrawn from.
+fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released_at_seed(seed: u64) {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 24,
+            ..cross_shard_config()
+        },
+        seed,
+        &route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released);
+}
+
+seeded!(
+    a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released_at_seed:
+    seed_7 = 7,
+    seed_42 = 42,
+);
+
 /// [`route_cluster_on_dedicated_hosts`] over `accounts`.
 fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
     SimCluster::with_grown_packages_on_dedicated_pool_hosts(
@@ -1960,6 +1985,33 @@ fn halted_shard_straddler_atomic_at_seed(seed: u64) {
 
 seeded!(
     halted_shard_straddler_atomic_at_seed:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+    seed_2027 = 2027,
+    seed_45 = 45,
+);
+
+/// A harvested tick over a discarded tick at `seed`, on dedicated pool
+/// hosts, so the fresh committee seats the shard afresh and harvests it
+/// over the network, where the serving cap reaches it.
+fn a_harvested_tick_over_a_discarded_tick_settles_nothing_at_seed(seed: u64) {
+    let setup = harvested_tick_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        seed,
+        &setup.accounts,
+    );
+    // The fresh chain builds above the harvested tip, at heights the
+    // retained replicas committed the tail nobody served.
+    cluster.runner_mut().permit_forks();
+    cluster.run_faultable(a_harvested_tick_over_a_discarded_tick_settles_nothing);
+}
+
+seeded!(
+    a_harvested_tick_over_a_discarded_tick_settles_nothing_at_seed:
     seed_7 = 7,
     seed_11 = 11,
     seed_42 = 42,
