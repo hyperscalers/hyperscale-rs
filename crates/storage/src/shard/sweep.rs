@@ -1187,7 +1187,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
         )
-        .reserving(1)
+        .charging(1)
         .awaiting([peer])
         .as_role(Role::Core);
         let half = stating_half_on(shard, BlockHeight::new(2), vec![yes], Vec::new());

@@ -637,14 +637,14 @@ pub mod tests {
         ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
         StatedTerms, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
         TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
-        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, Verify, VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
+        UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify,
+        VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
         state_claims_admit_block, test_utils, verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
     use super::*;
-    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures, departures_cut_at};
+    use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use crate::admission::{
         FinalizationsFold, FinalizationsSection, Section, StateClaimsFold, StateClaimsSection,
         standing_toward,
@@ -674,8 +674,7 @@ pub mod tests {
 
     /// A half settles only members its own tick holds in flight in that
     /// half: one the rows never named, one a discard let go of, and one
-    /// held in the other half are refused. A member no committing block
-    /// reserved a place for — a reclaim — holds no row and needs none.
+    /// held in the other half are refused.
     #[test]
     fn a_half_settles_only_members_its_tick_holds_in_that_half() {
         let tx = TxHash::from(Hash::from_bytes(b"held member"));
@@ -688,7 +687,7 @@ pub mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )
-                .reserving(0),
+                .charging(0),
             ],
         );
         let settles = |against: &Against, fw: &Finalization| {
@@ -722,13 +721,6 @@ pub mod tests {
             },
         );
         assert_eq!(settles(&against, &reserved), Ok(()));
-
-        let reclaim = test_utils::make_settling_finalization(BlockHeight::new(2), tx);
-        assert_eq!(
-            settles(&plain(), &reclaim),
-            Ok(()),
-            "a reclaim holds no row"
-        );
     }
 
     /// `tx`'s row standing in `state`, committed at height 1.
@@ -775,7 +767,7 @@ pub mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )
-                .reserving(0)
+                .charging(0)
                 .as_role(Role::Core)
             })
             .collect();
@@ -839,11 +831,11 @@ pub mod tests {
         against
     }
 
-    /// A core member's outcome in a reserved place, charged `share`.
+    /// A core member's outcome, charged `share`, awaiting another shard.
     fn core_outcome(tx: TxHash, outcome: ExecutionOutcome, share: u128) -> TxOutcome {
         use hyperscale_types::Role;
         TxOutcome::new(tx, outcome)
-            .reserving(share)
+            .charging(share)
             .awaiting([ShardId::leaf(1, 1)])
             .as_role(Role::Core)
     }
@@ -1026,29 +1018,16 @@ pub mod tests {
         );
     }
 
-    /// Every outcome of a stating half holds a place its committing
-    /// block reserved, and stands over a row of its own: a yes or a
-    /// refusal with no reserved place is refused, as is a yes over a row
-    /// no counterpart shares, one its tick does not hold, and one the
-    /// determined half settles.
+    /// Every outcome of a stating half stands over a row of its own: a
+    /// yes over a row no counterpart shares, one its tick does not hold,
+    /// and one the determined half settles are refused.
     #[test]
-    fn a_stating_half_naming_an_unreserved_outcome_is_refused() {
+    fn a_stating_half_naming_an_unheld_outcome_is_refused() {
         let (held, stranger) = (
             TxHash::from(Hash::from_bytes(b"held core")),
             TxHash::from(Hash::from_bytes(b"a stranger")),
         );
         let against = holding_in_flight(&[held]);
-        let unreserved =
-            |outcome| vec![TxOutcome::new(held, outcome).awaiting([ShardId::leaf(1, 1)])];
-        let err = settles(&against, &stating_at(2, unreserved(succeeded()))).unwrap_err();
-        assert!(err.contains("reserved a place for"), "{err}");
-        let err = settles(
-            &against,
-            &stating_at(2, unreserved(ExecutionOutcome::Failed)),
-        )
-        .unwrap_err();
-        assert!(err.contains("reserved a place for"), "{err}");
-
         let err = settles(&against, &stating_yes(2, &[stranger])).unwrap_err();
         assert!(
             err.contains("does not hold in flight beside a counterpart"),
@@ -2328,7 +2307,6 @@ pub mod tests {
                 deleted: standing,
                 stated: Vec::new(),
                 accepted: Vec::new(),
-                reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(against.local_shard)
         });
@@ -2832,7 +2810,6 @@ pub mod tests {
                 committee_anchor: WeightedTimestamp::ZERO,
             },
             reach: Capped::from_array([route(0x00), route(0xC0)]),
-            escrowed: Capped::empty(),
         }
     }
 
@@ -2993,58 +2970,6 @@ pub mod tests {
         assert_eq!(from_deep, refusal(shallow));
     }
 
-    /// A departure names a crossing off this shard's leaf only where the
-    /// departed shard was the one to take it: it held the consumer's
-    /// route, and the transaction's deadline had passed by the cut. A
-    /// record may name such crossings and nothing else.
-    #[test]
-    fn a_crossing_named_off_its_leaf_is_held_to_its_party_rule() {
-        const CUT_MS: u64 = 60_000;
-        let (left, right) = ShardId::ROOT.children();
-        let (survivors_left, survivors_right) = (left.children(), right.children());
-        let schedule = departures_cut_at(
-            CUT_MS,
-            &[left, right],
-            &[
-                survivors_left.0,
-                survivors_left.1,
-                survivors_right.0,
-                survivors_right.1,
-            ],
-            None,
-        );
-        let mut against = Against::schedule(topology_snapshot(), schedule);
-        against.anchor = WeightedTimestamp::from_millis(CUT_MS + 500);
-        against.local_shard = survivors_right.0;
-
-        let crossing = |consumer: u8, validity_end: u64| UnclaimedCrossing {
-            record: SubstateKey {
-                owner: Address::new([0x80; 31], AddressClass::Component),
-                local: LocalKey([1; 16]),
-            },
-            tx: TxHash::from(Hash::from_bytes(&[7; 32])),
-            consumer: RoutePrefix::of(Address::new([consumer; 31], AddressClass::Component)),
-            validity_end: WeightedTimestamp::from_millis(validity_end),
-        };
-        let held = |crossing: UnclaimedCrossing| {
-            let records = vec![
-                AbandonmentRecord::new(left, WeightedTimestamp::from_millis(CUT_MS), [])
-                    .with_unclaimed([crossing]),
-            ];
-            let root = AbandonmentRoot::over(&records);
-            admit(&against, &block_with_verdicts(records, root))
-        };
-
-        assert!(
-            held(crossing(0x00, 10_000)).is_ok(),
-            "the departed half held the consumer's route past the deadline",
-        );
-        let err = held(crossing(0x00, 50_000)).unwrap_err();
-        assert!(err.contains("was not the one to take"), "{err}");
-        let err = held(crossing(0xC0, 10_000)).unwrap_err();
-        assert!(err.contains("was not the one to take"), "{err}");
-    }
-
     /// The budget is one across every record a block carries, and it is
     /// spent in bytes: a name costs its reach as well as itself, so a
     /// section well under the drain's count can still be several frames
@@ -3186,12 +3111,12 @@ pub mod tests {
                     TxHash::from(Hash::from_bytes(b"one")),
                     ExecutionOutcome::Failed,
                 )
-                .reserving(charged),
+                .charging(charged),
                 TxOutcome::new(
                     TxHash::from(Hash::from_bytes(b"two")),
                     ExecutionOutcome::Failed,
                 )
-                .reserving(charged),
+                .charging(charged),
             ],
         );
         let block = block_with_certificates(BlockHeight::new(1), vec![Arc::new(aborted)]);
@@ -3345,7 +3270,7 @@ pub mod tests {
     fn no_resolutions(block: &Block, dedup_index: CommitDedupIndex) -> Result<(), String> {
         let mut against = after_departures();
         against.dedup = dedup_index;
-        admit(&against, block)
+        admit_settling(&mut against, block)
     }
 
     #[test]
@@ -3521,8 +3446,22 @@ pub mod tests {
         );
     }
 
-    /// A block settling `determined` (as determined halves) and `legs`
-    /// (as legs halves).
+    /// The one member a determined half of [`block_settling`] at
+    /// `height` settles.
+    fn settled_at(height: u64) -> TxHash {
+        TxHash::from(Hash::from_bytes(&height.to_be_bytes()))
+    }
+
+    /// Admit `block`, a block of [`block_settling`], against `against`
+    /// holding the rows its determined halves settle.
+    fn admit_settling(against: &mut Against, block: &Block) -> Result<(), String> {
+        against.holding_settled(block.certificates());
+        admit(against, block)
+    }
+
+    /// A block settling `determined` (as determined halves), each over
+    /// its one member [`settled_at`] its height, and `legs` (as legs
+    /// halves).
     fn block_settling(determined: &[u64], legs: &[u64]) -> Block {
         block_settling_ticks_of(ShardId::ROOT, determined, legs)
     }
@@ -3530,16 +3469,40 @@ pub mod tests {
     /// [`block_settling`] over ticks of `shard`.
     fn block_settling_ticks_of(shard: ShardId, determined: &[u64], legs: &[u64]) -> Block {
         use hyperscale_types::{
-            AggregateSignature, ExecutionCertificate, GlobalReceiptRoot, SignerBitfield, TickHalf,
-            TickId,
+            AggregateSignature, ConsensusReceipt, ExecutionCertificate, GlobalReceiptRoot,
+            SignerBitfield, StoredReceipt, TickHalf, TickId, compute_global_receipt_root,
         };
         let half = |height: u64, half: TickHalf| {
             let tick_id = TickId::new(shard, BlockHeight::new(height));
+            let outcomes: Vec<TxOutcome> = if half == TickHalf::Determined {
+                vec![alone(settled_at(height))]
+            } else {
+                Vec::new()
+            };
+            let receipts: Vec<StoredReceipt> = outcomes
+                .iter()
+                .map(|outcome| {
+                    StoredReceipt::new(
+                        outcome.tx_hash(),
+                        Arc::new(ConsensusReceipt::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                            writes: StateWrites::default(),
+                            beacon_witness_events: Capped::empty(),
+                            events: Capped::empty(),
+                        }),
+                    )
+                })
+                .collect();
+            let root = if outcomes.is_empty() {
+                GlobalReceiptRoot::ZERO
+            } else {
+                compute_global_receipt_root(&outcomes)
+            };
             let ec = ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(height),
-                GlobalReceiptRoot::ZERO,
-                Capped::empty(),
+                root,
+                Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             );
@@ -3547,7 +3510,7 @@ pub mod tests {
                 tick_id,
                 half,
                 &Capped::from_array([Arc::new(ec)]),
-                Capped::empty(),
+                Capped::new(receipts).expect("a list written out in a test"),
             )))
         };
         let certificates: Vec<_> = determined
@@ -3585,24 +3548,36 @@ pub mod tests {
     #[test]
     fn a_determined_half_below_the_parent_frontier_is_refused() {
         // The parent settled tick 2. This block offers tick 1.
-        let err = admit(&above_frontier(2), &block_settling(&[1], &[])).unwrap_err();
+        let err = admit_settling(&mut above_frontier(2), &block_settling(&[1], &[])).unwrap_err();
         assert!(err.contains("at or below the frontier"), "{err}");
     }
 
     /// Determined halves within one block must rise, or the receipts
-    /// apply in the order the block lists them and invert inside it.
+    /// apply in the order the block lists them and invert inside it. The
+    /// later tick listed first settles past the earlier one, which still
+    /// owes its half.
     #[test]
     fn determined_halves_must_rise_within_a_block() {
-        let err = admit(&above_frontier(3), &block_settling(&[6, 4], &[])).unwrap_err();
-        assert!(err.contains("at or below the frontier"), "{err}");
-        assert!(admit(&above_frontier(3), &block_settling(&[4, 6], &[])).is_ok());
+        let err =
+            admit_settling(&mut above_frontier(3), &block_settling(&[6, 4], &[])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+        assert!(admit_settling(&mut above_frontier(3), &block_settling(&[4, 6], &[])).is_ok());
     }
 
     /// Admission above `frontier` with the chain owing determined
-    /// halves for `owed`.
+    /// halves for `owed`: a tick row at each, flagged as owing its half.
     fn owing(frontier: u64, owed: &[u64]) -> Against {
+        use hyperscale_storage::TickRow;
         let mut against = above_frontier(frontier);
-        against.owed_determined = owed.iter().map(|h| BlockHeight::new(*h)).collect();
+        for &height in owed {
+            against.members.ticks.insert(
+                BlockHeight::new(height),
+                TickRow {
+                    determined_unsettled: true,
+                    ..TickRow::default()
+                },
+            );
+        }
         against
     }
 
@@ -3615,7 +3590,7 @@ pub mod tests {
     /// its members committed and never finalized.
     #[test]
     fn a_determined_half_may_not_settle_past_a_tick_still_owing_one() {
-        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
+        let err = admit_settling(&mut owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
         assert!(err.contains("still owes"), "{err}");
     }
 
@@ -3624,7 +3599,7 @@ pub mod tests {
     /// later one.
     #[test]
     fn a_block_carrying_the_owed_half_first_carries_the_later_one_too() {
-        assert!(admit(&owing(3, &[4]), &block_settling(&[4, 6], &[])).is_ok());
+        assert!(admit_settling(&mut owing(3, &[4]), &block_settling(&[4, 6], &[])).is_ok());
     }
 
     /// The rule measures the gap and nothing else: a tick owed at or
@@ -3632,27 +3607,8 @@ pub mod tests {
     /// above the half being admitted has not been skipped.
     #[test]
     fn only_a_tick_between_the_frontier_and_the_half_is_a_skip() {
-        assert!(admit(&owing(4, &[4]), &block_settling(&[6], &[])).is_ok());
-        assert!(admit(&owing(3, &[9]), &block_settling(&[6], &[])).is_ok());
-    }
-
-    /// A validator that never composed the earlier tick owes nothing for
-    /// it and enforces nothing — it offers and accepts the later half in
-    /// good faith, and the composing quorum is what refuses the block.
-    #[test]
-    fn a_validator_holding_no_owed_tick_judges_only_the_frontier() {
-        assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
-    }
-
-    /// The node-local owed set only refuses: empty, it admits nothing
-    /// the committed frontier rule refuses on its own, and populated, it
-    /// refuses the skip.
-    #[test]
-    fn owed_determined_only_refuses() {
-        let err = admit(&owing(3, &[]), &block_settling(&[2], &[])).unwrap_err();
-        assert!(err.contains("at or below the frontier"), "{err}");
-        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
-        assert!(err.contains("still owes"), "{err}");
+        assert!(admit_settling(&mut owing(4, &[4]), &block_settling(&[6], &[])).is_ok());
+        assert!(admit_settling(&mut owing(3, &[9]), &block_settling(&[6], &[])).is_ok());
     }
 
     /// A legs half waits for every determined half the chain owes at or
@@ -3662,30 +3618,29 @@ pub mod tests {
     #[test]
     fn a_legs_half_does_not_settle_ahead_of_a_determined_credit() {
         // An earlier tick still owes its determined half.
-        let earlier = admit(&owing(3, &[4]), &block_settling(&[], &[5]));
+        let earlier = admit_settling(&mut owing(3, &[4]), &block_settling(&[], &[5]));
         assert!(
             earlier.is_err(),
             "the legs half of tick 5 is admitted while tick 4 owes its determined half"
         );
         // The half's own tick owes one.
-        let same = admit(&owing(3, &[5]), &block_settling(&[], &[5]));
+        let same = admit_settling(&mut owing(3, &[5]), &block_settling(&[], &[5]));
         assert!(
             same.is_err(),
             "the legs half of tick 5 is admitted while tick 5 owes its determined half"
         );
         // The block that settles the owed half first carries the legs
         // half behind it.
-        assert!(admit(&owing(3, &[4]), &block_settling(&[4], &[5])).is_ok());
-        assert!(admit(&owing(3, &[5]), &block_settling(&[5], &[5])).is_ok());
+        assert!(admit_settling(&mut owing(3, &[4]), &block_settling(&[4], &[5])).is_ok());
+        assert!(admit_settling(&mut owing(3, &[5]), &block_settling(&[5], &[5])).is_ok());
         // Settling one owed half does not release a legs half past
         // another.
-        let err = admit(&owing(3, &[4, 5]), &block_settling(&[4], &[5])).unwrap_err();
+        let err = admit_settling(&mut owing(3, &[4, 5]), &block_settling(&[4], &[5])).unwrap_err();
         assert!(err.contains("still owes"), "{err}");
     }
 
     /// The legs half of the tick at `height` over a certificate attesting
-    /// `tx` succeeded as a leg in a place its tick reserved, with the
-    /// receipt stating what it left.
+    /// `tx` succeeded as a leg, with the receipt stating what it left.
     fn legs_leaving(height: u64, tx: TxHash, writes: StateWrites) -> Finalization {
         use hyperscale_types::{
             ConsensusReceipt, ExecutionCertificate, Role, StoredReceipt, TickHalf,
@@ -3699,7 +3654,7 @@ pub mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )
-            .reserving(0)
+            .charging(0)
             .as_role(Role::Leg),
         ];
         let receipt = StoredReceipt::new(
@@ -3790,7 +3745,7 @@ pub mod tests {
         // Behind it the block is admitted, and the cell commits at what
         // the later tick wrote.
         let ordered = carrying(&[&earlier, &later]);
-        assert_eq!(admit(&against, &ordered), Ok(()));
+        assert_eq!(admit_settling(&mut against, &ordered), Ok(()));
         assert_eq!(cell_after_committing(&ordered, cell), Some(vec![5]));
     }
 
@@ -3799,11 +3754,11 @@ pub mod tests {
     /// determined half up to its tick has settled.
     #[test]
     fn a_legs_half_at_or_below_the_frontier_is_admitted() {
-        assert!(admit(&owing(7, &[9]), &block_settling(&[], &[5])).is_ok());
-        assert!(admit(&owing(7, &[5]), &block_settling(&[], &[5])).is_ok());
-        assert!(admit(&owing(7, &[5, 9]), &block_settling(&[], &[7])).is_ok());
+        assert!(admit_settling(&mut owing(7, &[9]), &block_settling(&[], &[5])).is_ok());
+        assert!(admit_settling(&mut owing(7, &[5]), &block_settling(&[], &[5])).is_ok());
+        assert!(admit_settling(&mut owing(7, &[5, 9]), &block_settling(&[], &[7])).is_ok());
         // A tick owed above the half holds a later half and not this one.
-        assert!(admit(&owing(3, &[9]), &block_settling(&[], &[5])).is_ok());
+        assert!(admit_settling(&mut owing(3, &[9]), &block_settling(&[], &[5])).is_ok());
     }
 
     /// A parent whose frontier cannot be read leaves the order unjudged
@@ -3813,8 +3768,8 @@ pub mod tests {
     fn an_unreadable_frontier_judges_no_half() {
         let mut against = owing(3, &[4]);
         against.parent_settled_frontier = None;
-        assert!(admit(&against, &block_settling(&[], &[5])).is_ok());
-        assert!(admit(&against, &block_settling(&[6], &[])).is_ok());
+        assert!(admit_settling(&mut against, &block_settling(&[], &[5])).is_ok());
+        assert!(admit_settling(&mut against, &block_settling(&[6], &[])).is_ok());
     }
 
     /// What a proposer selects, a voter reading the same rows admits in
@@ -3823,7 +3778,8 @@ pub mod tests {
     /// it rides.
     #[test]
     fn a_voter_admits_the_halves_a_proposer_selects() {
-        let against = owing(3, &[4, 6]);
+        let mut against = owing(3, &[4, 6]);
+        against.holding_settled(block_settling(&[4, 6], &[]).certificates());
         let ctx = against.ctx();
         let offered = |determined: &[u64], legs: &[u64]| {
             block_settling(determined, legs).certificates().to_vec()
@@ -3865,51 +3821,10 @@ pub mod tests {
         );
     }
 
-    /// A reclaim's determined half is refused at or below the frontier
-    /// like any other, and a tick running nothing but reclaims is owed in
-    /// no row: only a voter whose own execution reported the tick holds a
-    /// later half behind it. One without the report admits the later
-    /// half, and the reclaim's is refused from then on.
-    #[test]
-    fn a_reclaims_half_is_still_refused_at_or_below_the_frontier() {
-        let reclaim = test_utils::finalization_of(
-            BlockHeight::new(4),
-            vec![TxOutcome::new(
-                TxHash::from(Hash::from_bytes(b"a reclaim")),
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )],
-        );
-        let settles = |against: &Against, fw: &Finalization| {
-            let ctx = against.ctx();
-            FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
-        };
-        // No row holds a reclaim, and above the frontier it settles.
-        assert!(settles(&above_frontier(3), &reclaim).is_ok());
-
-        // A voter that composed the reclaim's tick holds tick 6 behind it.
-        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
-        assert!(err.contains("still owes"), "{err}");
-
-        // A voter that did not reads no row owing it and admits tick 6,
-        // and under the frontier that leaves the reclaim is refused.
-        assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
-        let err = settles(&above_frontier(6), &reclaim).unwrap_err();
-        assert!(err.contains("at or below the frontier"), "{err}");
-    }
-
-    /// A member's success in a place its committing block reserved,
-    /// awaiting no other shard: what a determined half settles of a row.
+    /// A member's success awaiting no other shard: what a determined half
+    /// settles of a row.
     fn alone(tx: TxHash) -> TxOutcome {
-        TxOutcome::new(tx, succeeded()).reserving(0)
-    }
-
-    /// A reclaim's success: a member no committing block reserved a
-    /// place for, which no row holds.
-    fn reclaiming(tx: TxHash) -> TxOutcome {
-        use hyperscale_types::Role;
-        TxOutcome::new(tx, succeeded()).as_role(Role::Settling)
+        TxOutcome::new(tx, succeeded()).charging(0)
     }
 
     /// The determined half of tick 2 on a certificate attesting
@@ -4056,18 +3971,17 @@ pub mod tests {
         }
     }
 
-    /// The rule counts rows and nothing else, so it admits every whole
-    /// half: one over rows alone, one over rows and the reclaims seated
-    /// beside them, one over nothing but reclaims, whose tick holds no
-    /// row for the half and may hold no tick row at all, and the copy of
-    /// any of them a later committee re-attested.
+    /// A determined half is whole over its outcomes: every one stands
+    /// over a row its tick holds for the half, and together they number
+    /// those rows. A half over its rows is admitted, and so is the copy a
+    /// later committee re-attested; one carrying an outcome beside them
+    /// that no row holds is refused.
     #[test]
-    fn a_whole_determined_half_is_admitted_whatever_its_tick_seats() {
-        let (first, second, reclaim, core) = (
+    fn a_determined_half_is_whole_over_every_outcome_it_carries() {
+        let (first, second, stranger) = (
             TxHash::from(Hash::from_bytes(b"first alone")),
             TxHash::from(Hash::from_bytes(b"second alone")),
-            TxHash::from(Hash::from_bytes(b"a reclaim")),
-            TxHash::from(Hash::from_bytes(b"first core")),
+            TxHash::from(Hash::from_bytes(b"no row")),
         );
         let whole = |outcomes: Vec<TxOutcome>| {
             let names: Vec<TxHash> = outcomes.iter().map(TxOutcome::tx_hash).collect();
@@ -4075,51 +3989,59 @@ pub mod tests {
         };
 
         let rows = holding_alone(&[first, second]);
-        assert_eq!(
-            settles(&rows, &whole(vec![alone(first), alone(second)])),
-            Ok(())
-        );
-        assert_eq!(
-            settles(
-                &rows,
-                &whole(vec![alone(first), reclaiming(reclaim), alone(second)]),
-            ),
-            Ok(()),
-        );
-        assert_eq!(
-            settles(&holding_alone(&[]), &whole(vec![reclaiming(reclaim)])),
-            Ok(()),
+        let held = whole(vec![alone(first), alone(second)]);
+        assert_eq!(settles(&rows, &held), Ok(()));
+        let err = settles(
+            &rows,
+            &whole(vec![alone(first), alone(stranger), alone(second)]),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not hold for its Determined half"),
+            "{err}"
         );
 
-        // A tick of members a counterpart shares and one reclaim: its
-        // tick row owes no determined half and lists no row for one.
-        let mut shared = holding_in_flight(&[core]);
-        shared.parent_settled_frontier = Some(BlockHeight::new(1));
-        assert_eq!(settles(&shared, &whole(vec![reclaiming(reclaim)])), Ok(()));
-        // The same certificate carries the shared member's outcome,
-        // which the half projects away.
-        assert_eq!(
-            settles(
-                &shared,
-                &determined_projected(
-                    vec![core_outcome(core, succeeded(), 3), reclaiming(reclaim)],
-                    &[reclaim],
-                ),
-            ),
-            Ok(()),
-        );
-
-        let held = whole(vec![alone(first), reclaiming(reclaim), alone(second)]);
-        let later = determined_projected_at(
-            9,
-            vec![alone(first), reclaiming(reclaim), alone(second)],
-            &[first, reclaim, second],
-        );
+        let later = determined_projected_at(9, vec![alone(first), alone(second)], &[first, second]);
         let reanchored = held
             .reanchored(&Verified::new_unchecked_for_test(later.local_ec().clone()))
             .expect("the same outcomes under the same root at a later anchor");
         assert_ne!(reanchored.receipt_hash(), held.receipt_hash());
         assert_eq!(settles(&rows, &reanchored), Ok(()));
+    }
+
+    /// A determined half settling no row is refused: over an outcome no
+    /// row holds, and over no outcome at all.
+    #[test]
+    fn a_determined_half_over_no_row_is_refused() {
+        use hyperscale_types::{ExecutionCertificate, GlobalReceiptRoot, TickHalf};
+        let stranger = TxHash::from(Hash::from_bytes(b"no row"));
+        let err = settles(
+            &holding_alone(&[]),
+            &determined_projected(vec![alone(stranger)], &[stranger]),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not hold for its Determined half"),
+            "{err}"
+        );
+
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let empty = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(2),
+            GlobalReceiptRoot::ZERO,
+            Capped::empty(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let none = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            &Capped::from_array([Arc::new(empty)]),
+            Capped::empty(),
+        );
+        let err = settles(&holding_alone(&[]), &none).unwrap_err();
+        assert!(err.contains("settles no member of tick 2"), "{err}");
     }
 
     /// What stands once a block at height 3 offered `half` commits over
@@ -4138,7 +4060,6 @@ pub mod tests {
         let halves: &[&Finalization] = if carried { &one } else { &[] };
         let mut later = after_committing(against, halves);
         later.parent_settled_frontier = frontier;
-        later.owed_determined = later.members.owed_determined();
         later
     }
 
@@ -4189,24 +4110,20 @@ pub mod tests {
     /// A row a tick holds for its determined half is settled by one:
     /// while it stands in flight its tick owes the half, and the whole
     /// half is admitted. So no block leaves a member standing behind a
-    /// determined half that named a tick-mate, or named only a reclaim
-    /// seated beside it.
+    /// determined half that named a tick-mate.
     #[test]
     fn a_member_left_out_of_a_determined_half_is_still_settled_by_one() {
-        let (first, second, reclaim) = (
+        let (first, second) = (
             TxHash::from(Hash::from_bytes(b"first alone")),
             TxHash::from(Hash::from_bytes(b"second alone")),
-            TxHash::from(Hash::from_bytes(b"a reclaim")),
         );
         let two_rows = || vec![alone(first), alone(second)];
-        let row_and_reclaim = || vec![alone(first), reclaiming(reclaim)];
         assert_eq!(
             [
                 stranded_by(&two_rows, &[first, second], &[first, second]),
                 stranded_by(&two_rows, &[first, second], &[first]),
-                stranded_by(&row_and_reclaim, &[first], &[reclaim]),
             ],
-            [None, None, None],
+            [None, None],
         );
     }
 
@@ -4306,7 +4223,6 @@ pub mod tests {
     /// determined halves they owe.
     fn over(rows: &MemberIndex) -> Against {
         let mut against = above_frontier(1);
-        against.owed_determined = rows.owed_determined();
         against.members = rows.clone();
         against
     }
@@ -4597,10 +4513,8 @@ pub mod tests {
     /// A half certified below a bridge of this shard's recovery is
     /// refused in every block anchored at or past the bridge, while the
     /// recovery is pending and once its record has cleared: a determined
-    /// half over the rows its tick still holds, and one projected to its
-    /// reclaims, which holds no row and which the row rules admit over a
-    /// tick the crossing block discarded. Below the bridge, and on a
-    /// shard no recovery is recorded for, both are admitted.
+    /// half over the rows its tick still holds. Below the bridge, and on
+    /// a shard no recovery is recorded for, it is admitted.
     #[test]
     fn a_half_certified_below_the_bridge_is_refused_in_every_block_past_it() {
         use hyperscale_types::{
@@ -4608,13 +4522,8 @@ pub mod tests {
             TopologySnapshot,
         };
 
-        let (member, reclaim) = (
-            TxHash::from(Hash::from_bytes(b"first alone")),
-            TxHash::from(Hash::from_bytes(b"a reclaim")),
-        );
-        let outcomes = || vec![alone(member), reclaiming(reclaim)];
-        let whole = determined_projected_at(20_500, outcomes(), &[member, reclaim]);
-        let rowless = determined_projected_at(20_500, outcomes(), &[reclaim]);
+        let member = TxHash::from(Hash::from_bytes(b"first alone"));
+        let whole = determined_projected_at(20_500, vec![alone(member)], &[member]);
         let recovered = |recovery: Option<bool>| {
             let mut snapshot = TopologySnapshot::new(
                 NetworkDefinition::simulator(),
@@ -4657,85 +4566,26 @@ pub mod tests {
             against
         };
 
-        for (rows, half) in [(&[member][..], &whole), (&[][..], &rowless)] {
-            for recovery in [Some(true), Some(false), None] {
-                assert_eq!(
-                    settles(&against(recovery, rows, 20_900), half),
-                    Ok(()),
-                    "below the bridge, recovery {recovery:?}",
-                );
-                for anchor_ms in [21_000, 21_100, 59_000] {
-                    let admitted = settles(&against(recovery, rows, anchor_ms), half);
-                    if recovery.is_some() {
-                        assert!(
-                            admitted
-                                .as_ref()
-                                .is_err_and(|err| err.contains("below a recovery bridge")),
-                            "at {anchor_ms}, recovery {recovery:?}: {admitted:?}",
-                        );
-                    } else {
-                        assert_eq!(admitted, Ok(()), "at {anchor_ms} with no recovery");
-                    }
+        for recovery in [Some(true), Some(false), None] {
+            assert_eq!(
+                settles(&against(recovery, &[member], 20_900), &whole),
+                Ok(()),
+                "below the bridge, recovery {recovery:?}",
+            );
+            for anchor_ms in [21_000, 21_100, 59_000] {
+                let admitted = settles(&against(recovery, &[member], anchor_ms), &whole);
+                if recovery.is_some() {
+                    assert!(
+                        admitted
+                            .as_ref()
+                            .is_err_and(|err| err.contains("below a recovery bridge")),
+                        "at {anchor_ms}, recovery {recovery:?}: {admitted:?}",
+                    );
+                } else {
+                    assert_eq!(admitted, Ok(()), "at {anchor_ms} with no recovery");
                 }
             }
         }
-    }
-
-    /// A determined half naming a reclaim and none of the rows its tick
-    /// holds for it is refused: it would carry the frontier to the tick
-    /// and clear the half the tick's row owes, with every row standing.
-    #[test]
-    fn a_determined_half_settling_a_reclaim_without_its_ticks_rows_is_refused() {
-        let (member, reclaim) = (
-            TxHash::from(Hash::from_bytes(b"first alone")),
-            TxHash::from(Hash::from_bytes(b"a reclaim")),
-        );
-        let mixed = || vec![alone(member), reclaiming(reclaim)];
-        let against = holding_alone(&[member]);
-        assert_eq!(
-            settles(&against, &determined_projected(mixed(), &[member, reclaim])),
-            Ok(()),
-        );
-        let err = settles(&against, &determined_projected(mixed(), &[reclaim])).unwrap_err();
-        assert!(
-            err.contains("covers 0 members of tick 2, which holds 1 for its Determined half"),
-            "{err}",
-        );
-    }
-
-    /// A determined half is whole over the reclaims of its tick as it is
-    /// over the rows: one leaving a reclaim out carries the frontier to
-    /// the tick, where the reclaim's own half is refused, and the ledger
-    /// entry the tick took the reclaim from composes it into no later
-    /// tick. A reclaim holds no row and no line names it, so the rows a
-    /// voter reads cannot count it.
-    #[test]
-    #[ignore = "pins an open defect"]
-    fn a_determined_half_leaving_out_a_reclaim_is_refused() {
-        let (member, reclaim, other) = (
-            TxHash::from(Hash::from_bytes(b"first alone")),
-            TxHash::from(Hash::from_bytes(b"a reclaim")),
-            TxHash::from(Hash::from_bytes(b"another reclaim")),
-        );
-        let reclaims = || vec![reclaiming(reclaim), reclaiming(other)];
-        let mixed = || vec![alone(member), reclaiming(reclaim)];
-        let refused = |rows: &[TxHash], outcomes: Vec<TxOutcome>, kept: &[TxHash]| {
-            settles(&holding_alone(rows), &determined_projected(outcomes, kept)).is_err()
-        };
-        assert_eq!(
-            [
-                ("one of two reclaims", refused(&[], reclaims(), &[reclaim])),
-                (
-                    "the row without the reclaim",
-                    refused(&[member], mixed(), &[member]),
-                ),
-            ]
-            .map(|(half, refused)| (half, if refused { "refused" } else { "admitted" })),
-            [
-                ("one of two reclaims", "refused"),
-                ("the row without the reclaim", "refused"),
-            ],
-        );
     }
 
     /// A voter whose dedup index is fresh — after a halt recovery past f,
@@ -4768,19 +4618,22 @@ pub mod tests {
     /// which never advances one.
     #[test]
     fn a_legs_half_settles_whatever_the_frontier_says() {
-        assert!(admit(&above_frontier(7), &block_settling(&[], &[1])).is_ok());
-        assert!(admit(&above_frontier(7), &block_settling(&[8], &[1])).is_ok());
+        assert!(admit_settling(&mut above_frontier(7), &block_settling(&[], &[1])).is_ok());
+        assert!(admit_settling(&mut above_frontier(7), &block_settling(&[8], &[1])).is_ok());
     }
 
     /// A certificate anchored before the chain's origin names a tick on
     /// a predecessor and is refused outright.
     #[test]
     fn a_certificate_anchored_before_the_origin_is_refused() {
-        let mut against = above_frontier(0);
-        against.chain_origin = WeightedTimestamp::from_millis(5);
-        let err = admit(&against, &block_settling(&[4], &[])).unwrap_err();
+        let since_origin = || {
+            let mut against = above_frontier(0);
+            against.chain_origin = WeightedTimestamp::from_millis(5);
+            against
+        };
+        let err = admit_settling(&mut since_origin(), &block_settling(&[4], &[])).unwrap_err();
         assert!(err.contains("predates this chain's origin"), "{err}");
-        assert!(admit(&against, &block_settling(&[6], &[])).is_ok());
+        assert!(admit_settling(&mut since_origin(), &block_settling(&[6], &[])).is_ok());
     }
 
     /// A block settles ticks of its own chain and no other's. A sibling's
@@ -4790,11 +4643,10 @@ pub mod tests {
     #[test]
     fn a_finalization_of_another_shards_tick_is_refused() {
         let (local, sibling) = ShardId::ROOT.children();
-        let mut against = above_frontier(0);
-        against.local_shard = local;
-        against.chain_origin = WeightedTimestamp::from_millis(5);
-
         for (determined, legs) in [(&[6][..], &[][..]), (&[][..], &[6][..])] {
+            let mut against = above_frontier(0);
+            against.local_shard = local;
+            against.chain_origin = WeightedTimestamp::from_millis(5);
             let err = admit(
                 &against,
                 &block_settling_ticks_of(sibling, determined, legs),
@@ -4802,7 +4654,11 @@ pub mod tests {
             .unwrap_err();
             assert!(err.contains("names a tick of another shard"), "{err}");
             assert!(
-                admit(&against, &block_settling_ticks_of(local, determined, legs)).is_ok(),
+                admit_settling(
+                    &mut against,
+                    &block_settling_ticks_of(local, determined, legs)
+                )
+                .is_ok(),
                 "the same half of this chain's own tick is carried",
             );
         }

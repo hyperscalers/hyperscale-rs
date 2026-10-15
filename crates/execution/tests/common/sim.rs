@@ -709,8 +709,8 @@ impl ExecutionSim {
         let mut taken: BTreeMap<SubstateKey, u128> = BTreeMap::new();
         let executed: Vec<ExecutedTx> = requests
             .iter()
-            .filter_map(|request| {
-                let tx = request.transaction.as_ref()?;
+            .map(|request| {
+                let tx = &request.transaction;
                 let spend = self.spending.get(&request.tx_hash).map(|vault| {
                     let held: u128 = holds
                         .get(vault)
@@ -730,15 +730,15 @@ impl ExecutionSim {
                     *taken += spendable;
                     (*vault, spendable)
                 });
-                Some(stub_execute(
+                stub_execute(
                     &snapshot,
                     trie,
                     self.local_shard,
                     request.tx_hash,
                     tx,
-                    request.runs.abortable(),
+                    request.member.abortable(),
                     spend,
-                ))
+                )
             })
             .collect();
         let mut output = TickOutput::default();

@@ -492,7 +492,7 @@ mod tests {
         state.admit(
             test_transaction(tx_seed).hash(),
             Membership::whole(BTreeSet::from([shard()])),
-            Some(1),
+            1,
             Joins::Executes,
         );
         state

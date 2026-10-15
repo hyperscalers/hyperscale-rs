@@ -266,7 +266,7 @@ pub(crate) fn crossing_cells<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> Ve
 /// A record is value the producing shard holds for a crossing its
 /// consumer has **not** claimed; past the claim the value is in the
 /// recipient's vault and the leaf is a receipt awaiting deletion. The
-/// two overlap for as long as the retirement takes to be composed, and
+/// two overlap until the producer's fold retires the record, and
 /// counting both would find a payment twice.
 pub(crate) fn owed_at<C: Cluster + ?Sized>(
     c: &C,
@@ -478,8 +478,7 @@ pub fn chain_fate(
 ///
 /// A chain burns a transaction's price beside the deletion of its member
 /// row: in the block carrying the finalization of the member that held
-/// the row, whose outcome is `reserved`, or in the block whose manifest
-/// fates it.
+/// the row, or in the block whose manifest fates it.
 #[must_use]
 pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight> {
     let tip = store.tip();
@@ -489,8 +488,7 @@ pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight
             let block = certified.block();
             let settled = block.certificates().iter().any(|fw| {
                 let fw = fw.as_unverified();
-                fw.settled_outcomes()
-                    .any(|outcome| outcome.tx_hash() == tx && outcome.reserved())
+                fw.settled_outcomes().any(|outcome| outcome.tx_hash() == tx)
             });
             let fated = block
                 .tick_manifest()
@@ -515,8 +513,7 @@ pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight
 pub struct ChainMentions {
     /// Every inclusion of one in a block's transactions.
     pub(crate) committed: Vec<(TxHash, BlockHeight)>,
-    /// Every finalization deciding one: of a member that ran, or of the
-    /// reclaim of a leg.
+    /// Every finalization deciding one.
     pub(crate) finalized: Vec<(TxHash, BlockHeight)>,
     /// Every fate a manifest names for one.
     pub(crate) fated: Vec<(TxHash, BlockHeight)>,
@@ -528,8 +525,8 @@ pub struct ChainMentions {
     /// Every claim naming one as a member whose verdict cells it holds:
     /// where a reading of a sibling's verdict on it rode.
     pub(crate) heard: Vec<(TxHash, BlockHeight)>,
-    /// Every finalization settling one whose outcome is reserved: with
-    /// its fates, where the chain burned its price.
+    /// Every finalization settling one: with its fates, where the chain
+    /// burned its price.
     pub(crate) burned: Vec<(TxHash, BlockHeight)>,
     /// Every abandonment record naming one.
     pub(crate) named_unsettled: Vec<(TxHash, BlockHeight)>,
@@ -563,7 +560,6 @@ pub fn chain_mentions(
                 mentions.burned.extend(
                     fw.as_unverified()
                         .settled_outcomes()
-                        .filter(|outcome| outcome.reserved())
                         .filter_map(|outcome| at(outcome.tx_hash())),
                 );
                 mentions.stated.extend(
@@ -869,8 +865,7 @@ pub struct RanAs {
     /// for a leg that succeeded and for a delivering member.
     pub(crate) decides: bool,
     /// Whether the transaction reached beyond this shard. False for a
-    /// member this shard composed for itself — a reclaim or a
-    /// retirement.
+    /// whole member whose settlement awaited no other shard.
     pub(crate) reaches_beyond: bool,
     /// Whether the shard attested that the member completed here,
     /// whatever its counterparts then made of the transaction.
@@ -878,9 +873,8 @@ pub struct RanAs {
 }
 
 impl RanAs {
-    /// Whether this is a member the shard composed for itself off
-    /// committed evidence — a reclaim or a retirement — rather than one
-    /// the transaction's own admission put there.
+    /// Whether this outcome names no shard beyond this one, so no
+    /// counterpart could ask about it.
     #[must_use]
     pub(crate) const fn is_local_only(&self) -> bool {
         !self.reaches_beyond
@@ -892,7 +886,7 @@ impl RanAs {
 ///
 /// Empty until a finalization whose local certificate names `tx` has
 /// committed, and more than one entry where the shard ran a member and
-/// later composed a reclaim or a retirement for the same transaction.
+/// later abandoned it.
 #[must_use]
 pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
     let tip = store.tip();

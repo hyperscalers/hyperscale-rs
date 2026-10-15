@@ -391,9 +391,8 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("batches_unavailable", None, 1);
     }
 
-    fn record_reclaim_probe_answered(&self, present: bool) {
-        let label = if present { "present" } else { "absent" };
-        self.inc("reclaim_probes_answered", Some(label), 1);
+    fn record_sibling_absence_read(&self) {
+        self.inc("sibling_absences_read", None, 1);
     }
 
     fn record_reclaim_folded(&self, records: usize) {
@@ -404,8 +403,8 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("declines_folded", None, records as u64);
     }
 
-    fn record_reclaim_probe_pending(&self) {
-        self.inc("reclaim_probes_pending", None, 1);
+    fn record_sibling_question_pending(&self) {
+        self.inc("sibling_questions_pending", None, 1);
     }
 
     fn record_hold_contentions(&self, pairs: usize) {
@@ -681,10 +680,10 @@ mod tests {
     #[test]
     fn an_unlabelled_read_sums_a_labelled_counter() {
         let r = MemoryRecorder::new();
-        r.record_reclaim_probe_answered(true);
-        r.record_reclaim_probe_answered(false);
-        assert_eq!(r.counter("reclaim_probes_answered", None), 2);
-        assert_eq!(r.counter("reclaim_probes_answered", Some("present")), 1);
+        r.record_fetch_started("transaction");
+        r.record_fetch_started("provision");
+        assert_eq!(r.counter("fetch_started", None), 2);
+        assert_eq!(r.counter("fetch_started", Some("transaction")), 1);
     }
 
     #[test]

@@ -1470,13 +1470,8 @@ fn a_route_cut_off_across_its_deadline_is_not_reclaimed_sim() {
     cluster.run_faultable(a_route_cut_off_across_its_deadline_is_not_reclaimed);
 }
 
-/// A second seat of [`a_route_cut_off_across_its_deadline_is_not_reclaimed`].
-///
-/// Whether the first venue obtains its core sibling's verdict before the
-/// retirement is certified is a race the cluster's seat decides, and 42
-/// wins it. This seed loses it, which is what a transaction index holding
-/// one certificate per transaction turns into a permanent strand of the
-/// route's input.
+/// A second seat of [`a_route_cut_off_across_its_deadline_is_not_reclaimed`],
+/// on seed 19.
 #[test]
 fn a_route_cut_off_across_its_deadline_is_not_reclaimed_seed_19_sim() {
     let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(

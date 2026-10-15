@@ -683,11 +683,12 @@ fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
 /// The fold records the names a finalization *decided*, as the live
 /// index does.
 ///
-/// A leg's finalization names its transaction without resolving it, and
-/// the reclaim's finalization naming it later is the one neither may
-/// refuse. A window that took the bare name would hold it for the
-/// retention span, so a restarted replica would refuse the reclaim — and
-/// every abandoning record naming it — while its peers admitted both.
+/// A leg's finalization names its transaction without resolving it, so
+/// a deciding outcome naming it later is one neither may refuse. A
+/// window that took the bare name would hold it for the retention span,
+/// so a restarted replica would refuse that outcome, and every
+/// abandoning record naming the transaction, while its peers admitted
+/// both.
 ///
 /// The rebuild twin of `a_leg_finalization_does_not_resolve_its_transaction`.
 #[test]

@@ -16,7 +16,6 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::legs::Runs;
 use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
@@ -100,7 +99,7 @@ pub fn accumulate_tick_output(
     // moment it executes.
     let abortable: HashSet<TxHash> = requests
         .iter()
-        .filter(|r| r.runs.abortable())
+        .filter(|r| r.member.abortable())
         .map(|r| r.tx_hash)
         .collect();
     let (beyond, local): (Vec<&ExecutedTx>, Vec<&ExecutedTx>) = ordered
@@ -125,13 +124,6 @@ pub fn accumulate_tick_output(
             members.push((tx.tx_hash, writes));
         }
     }
-    // A reclaim is seated by no line, so nothing committed holds a later
-    // tick's half behind the one that settles it.
-    output.rowless = requests
-        .iter()
-        .filter(|r| matches!(r.runs, Runs::Reclaim { .. }))
-        .map(|r| r.tx_hash)
-        .collect();
     output.determined = members;
 
     output.provisional = beyond
@@ -175,8 +167,7 @@ fn granted_reservations(
     requests
         .iter()
         .find(|r| r.tx_hash == executed.tx_hash)
-        .and_then(CrossShardExecutionRequest::shape)
-        .map_or_default(|(_, body)| declared_reservations(&body.routing().declared_modes))
+        .map_or_default(|r| declared_reservations(&r.transaction.routing().declared_modes))
 }
 
 /// What a leg declaring `declared` holds by cell once it completes.
@@ -296,12 +287,10 @@ where
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
             let view_snap = view.snapshot();
             // From the same view as the baseline, so a leg's debit and
-            // the hold standing for it are never both visible, neither
-            // are a burn and the fee hold it came out of, and an
-            // unsettled credit is withheld exactly while it is read.
+            // the hold standing for it are never both visible, nor are a
+            // burn and the fee hold it came out of.
             let holds = view.holds();
             let fee_holds = view.fee_holds(&included, &shard_prefix_path(ctx.shard));
-            let unsettled_credits = view.unsettled_credits();
             let tick_ctx = TickBatchContext {
                 local_shard: ctx.shard,
                 shard_trie,
@@ -309,17 +298,16 @@ where
                 env,
                 holds: &holds,
                 fee_holds: &fee_holds,
-                unsettled_credits: &unsettled_credits,
             };
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()
                 .map(|r| TickTxInput {
                     tx_hash: r.tx_hash,
-                    transaction: r.transaction.as_ref(),
+                    transaction: &r.transaction,
                     provisions: &r.provisions,
                     clock: r.clock,
                     prices: r.prices,
-                    runs: r.runs.clone(),
+                    member: r.member.clone(),
                     arrivals: &r.arrivals,
                 })
                 .collect();

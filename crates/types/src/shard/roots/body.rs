@@ -263,7 +263,7 @@ mod tests {
                 receipt_hash: effects,
             },
         )
-        .reserving(3)
+        .charging(3)
         .awaiting([ShardId::leaf(1, 1)])
         .as_role(Role::Core);
         let carrying = |receipts: Vec<StoredReceipt>| {

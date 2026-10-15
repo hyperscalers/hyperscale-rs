@@ -4,11 +4,11 @@
 //! about, and they must not be able to disagree. The vote fence holds a
 //! block's state proofs to the anchors this validator has proven; the
 //! execution coordinator gates a cross-shard execution certificate on
-//! its source block being proven, and anchors a reclaim probe at the
-//! newest proven header a window licenses that stands at the chain's
-//! clock. Two mirrors of one fact would let a bundle pass the fence
-//! against an anchor the prober would never have chosen, and the
-//! difference between them would be nobody's to notice.
+//! its source block being proven, and anchors a question to a core
+//! member's sibling at the newest proven header a window licenses that
+//! stands at the chain's clock. Two mirrors of one fact would let a
+//! bundle pass the fence against an anchor the prober would never have
+//! chosen, and the difference between them would be nobody's to notice.
 //!
 //! # Why a projection rather than the header store
 //!

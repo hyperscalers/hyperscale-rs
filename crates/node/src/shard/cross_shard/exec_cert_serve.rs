@@ -18,14 +18,13 @@ use hyperscale_types::{ExecutionCertificate, TxHash};
 /// commit, at which point storage is the authoritative source.
 ///
 /// Both tiers are read for every transaction asked about, not the chain
-/// only on a cache miss. A shard certifies one transaction more than
-/// once — its verdict, and then the retirement, reclaim or abandonment
-/// that settles what the verdict left — so the two tiers can hold
-/// different certificates for it, and which one answers the asker's
-/// question is not something either tier knows. Answering with the one
-/// that happened to be found leaves a counterpart waiting on a verdict
-/// holding a retirement that covers nothing its tick awaits, and asking
-/// again gets the same answer for as long as it asks.
+/// only on a cache miss. A shard can certify one transaction more than
+/// once — in the tick that ran it, and then in an abandonment that
+/// settles what the run left — so the two tiers can hold different
+/// certificates for it, and which one answers the asker's question is
+/// not something either tier knows. Answering with the one that
+/// happened to be found would give the same answer for as long as the
+/// asker asks.
 ///
 /// The request names transactions, and one certificate covers a whole
 /// batch of them, so several requested transactions commonly resolve to
@@ -151,13 +150,12 @@ mod tests {
     /// A transaction this shard certified twice is answered with both,
     /// whichever tier each is in.
     ///
-    /// The verdict's certificate leaves the cache when its finalization
-    /// commits and stays on the chain; whatever settles what the verdict
-    /// left is certified later and is in the cache. Reading the chain
-    /// only on a cache miss answers a counterpart waiting on the verdict
-    /// with the settling certificate alone, which covers nothing its tick
-    /// awaits — and asking again gets the same answer for as long as it
-    /// asks.
+    /// A certificate leaves the cache when its finalization commits and
+    /// stays on the chain, so a later certificate for the same
+    /// transaction can be in the cache while the earlier is on the chain.
+    /// Reading the chain only on a cache miss answers with the cached
+    /// certificate alone, and asking again gets the same answer for as
+    /// long as the asker asks.
     #[test]
     fn both_tiers_answer_for_a_transaction_certified_twice() {
         let tx_hash = TxHash::from(Hash::from_bytes(&[3u8; 32]));

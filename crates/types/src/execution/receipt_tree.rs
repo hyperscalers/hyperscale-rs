@@ -72,7 +72,7 @@ mod reservation_tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
         )
-        .reserving(reserved)
+        .charging(reserved)
     }
 
     /// What a transaction reserved is signed content like what it cost.
@@ -118,12 +118,12 @@ mod tests {
     }
 
     /// Whether an outcome is the transaction's own execution is under
-    /// the signed leaf: a reclaim's success and a single-shard core's
-    /// are otherwise identical bytes.
+    /// the signed leaf: a settling member's success and a single-shard
+    /// core's are otherwise identical bytes.
     #[test]
     fn a_member_that_settles_leafs_differently() {
         let outcome = TxOutcome::new(
-            TxHash::from(Hash::from_bytes(b"reclaim")),
+            TxHash::from(Hash::from_bytes(b"settling")),
             ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
@@ -149,7 +149,7 @@ mod tests {
     fn leaf_covers_the_charge_on_a_refusal_settling_outcome() {
         let refusal = GlobalReceiptHash::from_raw(Hash::from_bytes(b"refusal"));
         let outcome = |charged| {
-            TxOutcome::with_refusal(tx_hash(), ExecutionOutcome::Failed, refusal).reserving(charged)
+            TxOutcome::with_refusal(tx_hash(), ExecutionOutcome::Failed, refusal).charging(charged)
         };
         assert_ne!(
             tx_outcome_leaf(&outcome(7)),

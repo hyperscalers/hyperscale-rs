@@ -92,9 +92,9 @@ pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 
 /// Column family for the consensus portion of stored receipts, keyed by
-/// the transaction and the receipt's own hash: one transaction settles
-/// more than one receipt on a shard — its effects, then a reclaim or a
-/// refund — and each block that settled one rebuilds with its own.
+/// the transaction and the receipt's own hash, which is what each
+/// finalization names, so each block that settled one rebuilds with its
+/// own.
 pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 
 /// Column family indexing every finalization of this shard's carrying an
@@ -737,10 +737,10 @@ impl DbCodec<(TxHash, FinalizationHash)> for TxFinalizationKeyCodec {
 }
 
 /// Every finalization of this shard's carrying an outcome for a
-/// transaction, not the newest: a shard certifies one transaction its
-/// verdict and then again whatever settles what the verdict left — a
-/// retirement, a reclaim, an abandonment — and a counterpart fetching by
-/// transaction cannot name which of them it wants. See
+/// transaction, not the newest: a shard can certify one transaction in
+/// the tick that ran it and again in an abandonment that settles what
+/// the run left, and a counterpart fetching by transaction cannot name
+/// which of them it wants. See
 /// [`TX_FINALIZATIONS_CF`].
 pub struct TxFinalizationsCf;
 impl TypedCf for TxFinalizationsCf {

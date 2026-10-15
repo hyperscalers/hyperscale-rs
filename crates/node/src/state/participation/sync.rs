@@ -214,7 +214,6 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
@@ -379,28 +378,6 @@ mod tests {
         )
     }
 
-    /// The replay settles the tip once, so a restarted voter mirrors the
-    /// fold's owed determined ticks into consensus before its first live
-    /// commit, and refuses a skipped tick from boot.
-    #[test]
-    fn a_restored_replica_mirrors_the_owed_determined_ticks_before_any_live_commit() {
-        let (recovered, tip) = replay_window(3);
-        let TestNode { mut node, .. } = TestNode::builder().recovered(recovered).build();
-        assert!(node.shard_coordinator().owed_determined().is_empty());
-
-        let _ = restore(&mut node, 3, tip);
-
-        assert_eq!(
-            node.shard_coordinator().owed_determined(),
-            &BTreeSet::from([
-                BlockHeight::new(1),
-                BlockHeight::new(2),
-                BlockHeight::new(3)
-            ]),
-            "each replayed tick's determined half is owed until a block settles it",
-        );
-    }
-
     /// A replay feeds only the execution fold and the tip: none of the
     /// hooks the live commit stream feeds. The mempool marks a block's
     /// transactions committed off that stream, so a live commit of the
@@ -449,10 +426,5 @@ mod tests {
                 "a replay ran a live hook: {action:?}",
             );
         }
-        assert_eq!(
-            node.shard_coordinator().owed_determined().len(),
-            20,
-            "and it settled the tip over the last replayed block",
-        );
     }
 }

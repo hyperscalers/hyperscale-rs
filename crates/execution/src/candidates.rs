@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_engine::legs::{Classified, Member, Runs};
+use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_engine::tick_select::{
     CommittedInputs, Judged, ManifestBudget, Nameable, ProvisionalCells, Standing, readiness,
     select_members, terms_of_member,
@@ -308,7 +308,7 @@ impl TickCandidates {
             admitted.push(Admitted {
                 request: CrossShardExecutionRequest {
                     tx_hash: *tx_hash,
-                    transaction: Some(Arc::clone(&candidate.tx)),
+                    transaction: Arc::clone(&candidate.tx),
                     provisions: if reaches_beyond {
                         provisioning.provisions_for(*tx_hash)
                     } else {
@@ -318,7 +318,7 @@ impl TickCandidates {
                     // Resolved against that clock once the schedule is
                     // in hand, where the member is seated.
                     prices: PriceTable::GENESIS,
-                    runs: Runs::Shape(candidate.member.clone()),
+                    member: candidate.member.clone(),
                     arrivals,
                 },
                 membership: Membership::of(&candidate.member),
@@ -531,7 +531,7 @@ mod tests {
             &BTreeSet::from([local, venue])
         );
         assert!(
-            admitted[0].request.runs.reaches_beyond(),
+            admitted[0].request.member.reaches_beyond(),
             "reach is what the request carries"
         );
     }

@@ -32,17 +32,17 @@ use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, UnsettledCredits, Verified, WeightedTimestamp, compute_merkle_root,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics, whole_work,
 };
 use hyperscale_vm_effects::{
-    Admitted, Answered, ChainRecords, CrossingCell, CrossingId, Declaration, DeclaredAccess,
-    IntentRecord, PackageHash, Terms, fee_hold_key, legs_of, package_hash,
+    Admitted, Answered, ChainRecords, CrossingId, Declaration, DeclaredAccess, IntentRecord,
+    PackageHash, fee_hold_key, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
-    AmountLedger, Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn,
-    FeeHolds, Job, LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, StoreError, Substates,
-    WithheldCredits, execute_batch,
+    AmountLedger, Baseline, BatchError, BatchTx, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
+    LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, StoreError, Substates, WithheldCredits,
+    execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -51,7 +51,7 @@ use hyperscale_vm_types::{
 
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
-use crate::legs::{Member, Runs, Unclaimable, never_answer};
+use crate::legs::{Member, never_answer};
 use crate::receipt::witness_root;
 use crate::records::BatchRecords;
 use crate::sharding::{owned_by, writes_root};
@@ -67,8 +67,7 @@ pub struct PreparedTx {
     /// What the kernel does for this member: walk the lowered
     /// invocations, in manifest node order, under the plan saying which
     /// of them this shard runs — envelope trees lower into one flat
-    /// list, so nothing downstream sees intent structure — or settle
-    /// the records a settlement names.
+    /// list, so nothing downstream sees intent structure.
     pub(crate) job: Job,
     /// The routed declaration, both views: the folded set scheduling
     /// reads, and the clause order the capability table is built in —
@@ -84,8 +83,7 @@ pub struct PreparedTx {
     /// which the kernel meters that node's events against and the
     /// declaration priced as retention.
     pub(crate) event_bytes: Vec<u32>,
-    /// What the transaction declares it may consume, whole. A settlement
-    /// is the batch's own and declares nothing.
+    /// What the transaction declares it may consume, whole.
     pub(crate) work: DeclaredWork,
     /// The owners this shard judges — with the job's plan, the one part
     /// of an entry that differs per participant.
@@ -157,10 +155,6 @@ pub struct TickBaseline {
     /// reach, its own members named apart. Empty for a baseline with
     /// nothing committed over it — a preview.
     pub(crate) fee_holds: BTreeMap<SubstateKey, FeeHolds>,
-    /// What these cells carry of credits not yet settled under them,
-    /// which no member of the batch may spend. Empty for a baseline of
-    /// settled state alone — a preview.
-    pub(crate) unsettled_credits: UnsettledCredits,
 }
 
 impl Substates for TickBaseline {
@@ -206,11 +200,8 @@ impl Baseline for TickBaseline {
         self.fee_holds.get(&key).cloned().unwrap_or_default()
     }
 
-    fn withheld_credits(&self, key: SubstateKey) -> WithheldCredits {
-        WithheldCredits {
-            members: BTreeMap::new(),
-            rest: self.unsettled_credits.get(&key).copied().unwrap_or(0),
-        }
+    fn withheld_credits(&self, _key: SubstateKey) -> WithheldCredits {
+        WithheldCredits::default()
     }
 }
 
@@ -591,101 +582,9 @@ impl Executor {
             )
             .map_err(|defect| format!("no plan for this shard: {defect}"))?;
         declare_crossing_cells(&mut entry.declaration, &plan.legs)?;
-        let Job::Manifest { calls, .. } = entry.job else {
-            return Err("a prepared transaction walks its manifest".to_string());
-        };
-        entry.job = Job::Manifest {
-            calls,
-            legs: plan.legs,
-        };
+        entry.job.legs = plan.legs;
         entry.judges = plan.judges;
         Ok(entry)
-    }
-
-    /// Lower a reclaim: the records it takes back, read off the
-    /// snapshot, each declared with the cell its value goes back to.
-    ///
-    /// A record that is not there is skipped, not refused: the commit
-    /// fold removes a record once its consumer's `Taken` is read
-    /// present, and a member admitted for several records is one
-    /// member, so one of them having been settled that way in between
-    /// is not a reason to strand the rest. So is evidence that does not
-    /// bind to the record read: a record may be named once per piece of
-    /// evidence, and it is taken back once, on the first that binds. A
-    /// record naming nobody to
-    /// credit is left standing too: an outbound leg consumes it, so
-    /// nothing takes it back, and it holds the value for a consumer that
-    /// may still run. A member with nothing left is refused.
-    ///
-    /// The scope is this shard's own subtree, whatever the transaction's
-    /// placement was. Every cell a reclaim touches sits under the
-    /// record's owner, which is a prefix this shard holds or the record
-    /// would not be here; and a batch of reclaims alone reaches beyond
-    /// nothing, so its writes are unfiltered — a credit to a cell owned
-    /// elsewhere has to trap here rather than land in a store that does
-    /// not own it.
-    fn prepare_reclaim(
-        records: &[(SubstateKey, Unclaimable)],
-        ctx: &TickBatchContext<'_>,
-        snapshot: &(dyn Substates + Sync),
-    ) -> Result<PreparedTx, String> {
-        if records.is_empty() {
-            return Err("this shard has no record to reclaim".to_string());
-        }
-        let mut disposals = Vec::with_capacity(records.len());
-        let mut declaration = Declaration::default();
-        for (key, evidence) in records {
-            if disposals
-                .iter()
-                .any(|disposal: &Disposal| disposal.record == *key)
-            {
-                continue;
-            }
-            let Some(record) = read_record(snapshot, *key) else {
-                continue;
-            };
-            let Terms::Escrowed { credit } = record.terms else {
-                continue;
-            };
-            if !evidence.binds(*key, &record) {
-                continue;
-            }
-            let mut declare_here = |effect, holds| {
-                declare(&mut declaration, effect, holds).map_err(|conflict| {
-                    format!("reclaimed cell contradicts the declaration: {conflict}")
-                })
-            };
-            declare_here(
-                Effect {
-                    target: EffectTarget::Point(*key),
-                    mode: Mode::Write { moves: Moves::Both },
-                },
-                None,
-            )?;
-            declare_here(
-                Effect {
-                    target: EffectTarget::Point(credit),
-                    mode: Mode::Delta { moves: Moves::Both },
-                },
-                Some(record.resource),
-            )?;
-            disposals.push(Disposal { record: *key });
-        }
-        if disposals.is_empty() {
-            return Err("no record here is this member's to take back".to_string());
-        }
-        let trie = ctx.shard_trie.clone();
-        let local = ctx.local_shard;
-        Ok(PreparedTx {
-            job: Job::Records(disposals),
-            declaration,
-            nullifiers: Vec::new(),
-            gas_limits: Vec::new(),
-            // A reclaim invokes no node, so nothing of it emits.
-            event_bytes: Vec::new(),
-            work: DeclaredWork::ZERO,
-            judges: OwnerSet::of(move |owner| trie.shard_for_prefix(owner) == local),
-        })
     }
 
     /// [`Self::prepare`], keeping the admitted form it lowered from.
@@ -745,7 +644,7 @@ impl Executor {
             PreparedTx {
                 // Whole until the batch pipeline plans the member for its
                 // shard; a preview never divides.
-                job: Job::Manifest {
+                job: Job {
                     calls,
                     legs: LegPlan::whole(0),
                 },
@@ -1133,8 +1032,7 @@ pub fn build_refusal_receipt(
 /// given. The keys name the edge and no transaction, so either may hold
 /// what another transaction answered a record that stood at this edge
 /// before: that answers nothing here, and the `Never` is written, over
-/// it where it stands at the decline key. Nothing for a member that
-/// runs no shape.
+/// it where it stands at the decline key.
 fn never_answers(
     input: Option<&TickTxInput<'_>>,
     tx_hash: TxHash,
@@ -1143,8 +1041,8 @@ fn never_answers(
     cell: impl Fn(SubstateKey) -> Option<Vec<u8>>,
 ) -> Vec<(SubstateKey, Vec<u8>)> {
     let Some(TickTxInput {
-        runs: Runs::Shape(member),
-        transaction: Some(transaction),
+        member,
+        transaction,
         ..
     }) = input
     else {
@@ -1356,7 +1254,7 @@ fn assemble_executed_tx(
     fee: Option<(PayerFee, u128)>,
     input: Option<&TickTxInput<'_>>,
 ) -> ExecutedTx {
-    let runs = input.map(|input| &input.runs);
+    let member = input.map(|input| &input.member);
     let BatchInputs { base, locality, .. } = inputs;
     let tx_hash = vm_tx;
     let completed = matches!(receipt.outcome, Outcome::Completed { .. });
@@ -1387,7 +1285,7 @@ fn assemble_executed_tx(
     // its own outcome, or later, by a counterpart's verdict. A
     // multi-core consumer that completed here, holds no vault and is
     // refused by a sibling still names a receipt carrying its `Never`.
-    let nevers = if completed && !runs.is_some_and(Runs::abortable) {
+    let nevers = if completed && !member.is_some_and(Member::abortable) {
         Vec::new()
     } else {
         never_answers(input, tx_hash, ctx.local_shard, locality, |key| {
@@ -1495,26 +1393,14 @@ fn assemble_executed_tx(
 }
 
 /// One member of a tick's batch: what its receipt is keyed by, and the
-/// body it runs over if it runs one.
-///
-/// A housekeeping member has none. Its cells are named by the record
-/// leaves its `Runs` arm carries, which is what lets a reshape successor
-/// compose one at all — the transaction is a name, not an input.
+/// body it runs over.
 struct BatchMember {
     tx_hash: TxHash,
-    body: Option<Arc<Verified<Transaction>>>,
+    body: Arc<Verified<Transaction>>,
     /// The table this member's committing block anchored to: what its
     /// fee is weighed at, carried per member because that is the grain
     /// the anchor has.
     prices: PriceTable,
-}
-
-/// The record a leaf holds, or nothing where the cell is absent or is
-/// not one.
-fn read_record(snapshot: &(dyn Substates + Sync), key: SubstateKey) -> Option<CrossingCell> {
-    snapshot
-        .cell(key)
-        .and_then(|bytes| CrossingCell::from_bytes(&bytes))
 }
 
 impl Executor {
@@ -1537,7 +1423,7 @@ impl Executor {
             .iter()
             .map(|i| BatchMember {
                 tx_hash: i.tx_hash,
-                body: i.transaction.map(Arc::clone),
+                body: Arc::clone(i.transaction),
                 prices: i.prices,
             })
             .collect();
@@ -1556,7 +1442,7 @@ impl Executor {
         // local subtree; a batch of genuinely single-shard members owns
         // every key it declares and total locality is the same filter
         // without the trie walk.
-        let locality = if inputs.iter().all(|i| !i.runs.reaches_beyond()) {
+        let locality = if inputs.iter().all(|i| !i.member.reaches_beyond()) {
             OwnerSet::whole()
         } else {
             let trie = ctx.shard_trie.clone();
@@ -1568,7 +1454,7 @@ impl Executor {
         let publishes: BTreeMap<TxHash, (PrincipalAddr, Vec<u8>)> = members
             .iter()
             .filter_map(|member| {
-                let tx = member.body.as_ref()?;
+                let tx = &member.body;
                 let artifact = tx.body().artifact.as_ref()?;
                 Some((member.tx_hash, (tx.terms().fee_payer, artifact.to_vec())))
             })
@@ -1597,19 +1483,16 @@ impl Executor {
             }
             // What this shard runs of the member: the whole shape unless
             // the coordinator froze a division, and then the legs its
-            // placement gives it — or, for a settlement, no node at all.
-            // A plan that cannot be built is a deterministic refusal like
-            // a derivation that cannot be — every replica reads the same
-            // legs and the same arrivals.
-            let planned = match &input.runs {
-                Runs::Reclaim { records, .. } => Self::prepare_reclaim(records, ctx, snapshot),
-                Runs::Shape(shape) => input
-                    .transaction
-                    .ok_or_else(|| "a member running a shape holds no body".to_string())
-                    .and_then(|tx| {
-                        Self::prepare_shape(tx, &records, &self.world.cache, shape, input.arrivals)
-                    }),
-            };
+            // placement gives it. A plan that cannot be built is a
+            // deterministic refusal like a derivation that cannot be —
+            // every replica reads the same legs and the same arrivals.
+            let planned = Self::prepare_shape(
+                input.transaction,
+                &records,
+                &self.world.cache,
+                &input.member,
+                input.arrivals,
+            );
             match planned {
                 Ok(entry) => {
                     record_transaction_executed();
@@ -1661,7 +1544,7 @@ impl Executor {
         // shard's cell out of this shard's store is nondeterministic —
         // members disagree on what they hold outside their own subtree,
         // and a split baseline splits the tick's receipt roots.
-        for tx in members.iter().filter_map(|member| member.body.as_ref()) {
+        for tx in members.iter().map(|member| &member.body) {
             let key = tx.fee_vault();
             if ctx.shard_trie.shard_for_prefix(key.owner) == ctx.local_shard
                 && let Some(value) = snapshot.cell(key)
@@ -1676,24 +1559,15 @@ impl Executor {
         // decide fee ownership, because the single-shard arm's
         // `OwnerSet::whole()` would claim payers whose vaults live on
         // shards this tick never engaged.
-        //
-        // Only a member running its shape charges. A reclaim settles no
-        // price whatever its outcome: the transaction's price is burned
-        // beside the deletion of its member row, by the finalization of
-        // the member that ran or by the row's fate, and a reclaim deletes
-        // no row. Its fee hold, where one stands, stands under every
-        // other member of the batch.
         let fee_by_tx: BTreeMap<TxHash, PayerFee> = members
             .iter()
             .filter_map(|member| {
-                let tx = member.body.as_ref()?;
+                let tx = &member.body;
                 let vault = tx.fee_vault();
                 if ctx.shard_trie.shard_for_prefix(vault.owner) != ctx.local_shard {
                     return None;
                 }
-                let Runs::Shape(shape) = &shapes.get(&tx.hash())?.runs else {
-                    return None;
-                };
+                let shape = &shapes.get(&tx.hash())?.member;
                 Some((
                     tx.hash(),
                     PayerFee {
@@ -1720,12 +1594,6 @@ impl Executor {
             .filter(|(key, _)| here(key))
             .map(|(key, held)| (*key, held.clone()))
             .collect();
-        base.unsettled_credits = ctx
-            .unsettled_credits
-            .iter()
-            .filter(|(key, _)| here(key))
-            .map(|(key, credit)| (*key, *credit))
-            .collect();
         // The fee holds standing on every protocol vault the batch can
         // debit: each payer's, and each one a member declares. Named by
         // key and not by what the baseline holds, because a vault at
@@ -1733,8 +1601,7 @@ impl Executor {
         // on it in this batch is spoken for by them.
         let floored: BTreeSet<SubstateKey> = members
             .iter()
-            .filter_map(|member| member.body.as_ref())
-            .map(|tx| tx.fee_vault())
+            .map(|member| member.body.fee_vault())
             .chain(
                 prepared
                     .values()
@@ -1807,7 +1674,7 @@ impl Executor {
                     // batch-mate cannot settle without it.
                     shapes
                         .get(vm_tx)
-                        .is_none_or(|member| member.runs.credits_withheld()),
+                        .is_none_or(|input| input.member.abortable()),
                 )
             })
             .collect();
@@ -1968,9 +1835,7 @@ impl Executor {
                     // reserved for it and dispatched it, and it settles
                     // the same price apart, as every attempt that applied
                     // no effects does: what the charge pass found the
-                    // floor to leave of it. A reclaim with nothing to
-                    // reclaim has no payer here and no answers to write,
-                    // so it names no refusal receipt at all.
+                    // floor to leave of it.
                     let fee = fee_by_tx.get(&vm_tx).copied();
                     let charged = apart(&vm_tx);
                     let cached = CachedOutput::failed(vm_metadata(charged, Some(reason)));
@@ -2036,11 +1901,11 @@ impl Executor {
             .iter()
             .map(|tx| TickTxInput {
                 tx_hash: tx.hash(),
-                transaction: Some(tx),
+                transaction: tx,
                 provisions: &[],
                 clock: ctx.tick_ts,
                 prices,
-                runs: Runs::Shape(Member::whole(ctx.local_shard)),
+                member: Member::whole(ctx.local_shard),
                 arrivals: &[],
             })
             .collect();
@@ -2071,197 +1936,11 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::NoFeeHolds;
-    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
-    use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::{AbortReason, encode_amount};
 
     use super::*;
-    use crate::TickEnvironment;
     use crate::genesis::vault_key;
-
-    /// One escrowed record standing in a tick's baseline: its crossing,
-    /// its key, its value, the cell it credits and the baseline.
-    struct Standing {
-        id: CrossingId,
-        record_key: SubstateKey,
-        record: CrossingCell,
-        credit: SubstateKey,
-        snapshot: TickBaseline,
-    }
-
-    fn standing_record() -> Standing {
-        let owner = Address::new([5; 31], AddressClass::Component);
-        let credit = SubstateKey {
-            owner,
-            local: LocalKey([6; 16]),
-        };
-        let id = CrossingId {
-            producer: owner,
-            consumer: Address::new([8; 31], AddressClass::Component),
-            intent: IntentHash(Hash32([7; 32])),
-            local: 0,
-            output: 0,
-        };
-        let record_key = id.record_key(&ProtocolHasher);
-        let record = id.cell(
-            TxHash::from(Hash::from_bytes(b"issuer")),
-            *PROTOCOL_RESOURCE,
-            10,
-            1_000,
-            Terms::Escrowed { credit },
-        );
-        let snapshot = TickBaseline {
-            cells: BTreeMap::from([(record_key, record.to_bytes())]),
-            ..Default::default()
-        };
-        Standing {
-            id,
-            record_key,
-            record,
-            credit,
-            snapshot,
-        }
-    }
-
-    /// Lower a reclaim of `records` against `standing`'s baseline, on
-    /// the one shard of a single-shard trie.
-    fn reclaiming(
-        standing: &Standing,
-        records: &[(SubstateKey, Unclaimable)],
-    ) -> Result<PreparedTx, String> {
-        let trie = ShardTrie::single();
-        let ctx = TickBatchContext {
-            local_shard: ShardId::ROOT,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-            fee_holds: &NoFeeHolds,
-            unsettled_credits: &UnsettledCredits::new(),
-        };
-        Executor::prepare_reclaim(records, &ctx, &standing.snapshot)
-    }
-
-    /// A reclaim declares the record and the credit, and nothing else:
-    /// the record `Write`, so its removal and any second settlement share
-    /// a conflict group, and the credit `Delta`, so the kernel holds a
-    /// movement handle on the cell the value returns to.
-    #[test]
-    fn a_reclaim_declares_the_record_and_the_credit_alone() {
-        let standing = standing_record();
-        let (record_key, credit) = (standing.record_key, standing.credit);
-
-        // A record the commit fold has already removed is skipped,
-        // and the one still standing is taken back alone.
-        let gone = SubstateKey {
-            owner: record_key.owner,
-            local: LocalKey([9; 16]),
-        };
-        let issuer = Unclaimable::IssuedBy {
-            tx: standing.record.tx,
-        };
-        let prepared = reclaiming(&standing, &[(record_key, issuer), (gone, issuer)])
-            .expect("an unclaimed escrowed record is taken back");
-
-        let Job::Records(disposals) = &prepared.job else {
-            panic!("a reclaim is a records job: {:?}", prepared.job);
-        };
-        assert_eq!(disposals, &[Disposal { record: record_key }]);
-        assert!(
-            reclaiming(&standing, &[(gone, issuer)]).is_err(),
-            "a reclaim with nothing left to take back is refused",
-        );
-        let stranger = Unclaimable::IssuedBy {
-            tx: TxHash::from(Hash::from_bytes(b"stranger")),
-        };
-        assert!(
-            reclaiming(&standing, &[(record_key, stranger)]).is_err(),
-            "a departure naming another transaction moves nothing",
-        );
-        let twice = reclaiming(&standing, &[(record_key, stranger), (record_key, issuer)])
-            .expect("the evidence that binds takes the record back");
-        assert!(
-            matches!(&twice.job, Job::Records(taken) if taken == disposals),
-            "a record named once per piece of evidence is taken back once: {:?}",
-            twice.job,
-        );
-        let declared: Vec<Effect> = prepared.declaration.set.iter().collect();
-        assert_eq!(declared.len(), 2, "{declared:?}");
-        assert!(declared.contains(&Effect {
-            target: EffectTarget::Point(record_key),
-            mode: Mode::Write { moves: Moves::Both },
-        }));
-        assert!(declared.contains(&Effect {
-            target: EffectTarget::Point(credit),
-            mode: Mode::Delta { moves: Moves::Both },
-        }));
-    }
-
-    /// A `Never` binds to the record it is carried with only where it
-    /// was read at the decline cell the record's crossing derives and
-    /// stated an answer of the record's own transaction: its refusal,
-    /// seen, or its abandonment, unseen. The decline cell names the edge
-    /// and no transaction, so the same cell can state what an earlier
-    /// transaction's consumer answered a record that stood at this key
-    /// before, and that takes nothing back.
-    #[test]
-    fn a_never_binds_to_the_record_of_its_own_transaction() {
-        let standing = standing_record();
-        let (id, record_key, record) = (standing.id, standing.record_key, &standing.record);
-        let never_of = |crossing: CrossingId, value: Vec<u8>| Unclaimable::Never {
-            read: crossing.answer_key(&ProtocolHasher, Answered::Never),
-            stated: jmt_value_hash(&value),
-        };
-        let refused = |crossing: CrossingId, tx: TxHash, end: u64| {
-            never_of(
-                crossing,
-                crossing.answer(tx, Answered::Never, end).to_bytes(),
-            )
-        };
-        let end = record.validity_end_ms;
-        assert!(
-            reclaiming(&standing, &[(record_key, refused(id, record.tx, end))]).is_ok(),
-            "its own consumer's refusal takes it back",
-        );
-        let abandoned = never_of(id, id.unseen_never(record.tx, end).to_bytes());
-        assert!(
-            reclaiming(&standing, &[(record_key, abandoned)]).is_ok(),
-            "and so does its own consumer's abandonment",
-        );
-        let other = CrossingId { output: 1, ..id };
-        assert!(
-            reclaiming(&standing, &[(record_key, refused(other, record.tx, end))]).is_err(),
-            "another crossing's refusal carried with this key moves nothing",
-        );
-
-        let earlier = TxHash::from(Hash::from_bytes(b"an earlier transaction"));
-        for (name, old) in [
-            ("refusal", refused(id, earlier, end)),
-            (
-                "abandonment",
-                never_of(id, id.unseen_never(earlier, end).to_bytes()),
-            ),
-            (
-                "refusal restated under another validity end",
-                refused(id, record.tx, end + 1),
-            ),
-        ] {
-            assert!(
-                reclaiming(&standing, &[(record_key, old)]).is_err(),
-                "an earlier transaction's {name} at the same decline key moves nothing",
-            );
-            assert!(
-                reclaiming(
-                    &standing,
-                    &[(record_key, old), (record_key, refused(id, record.tx, end))],
-                )
-                .is_ok(),
-                "and does not shadow the record's own decline carried beside it",
-            );
-        }
-    }
 
     /// Every bound the preparation fixed reaches the entry the kernel
     /// runs. A bound left behind here is one the kernel never applies,
@@ -2271,7 +1950,7 @@ mod tests {
     #[test]
     fn the_batch_entry_carries_every_bound_the_preparation_fixed() {
         let prepared = PreparedTx {
-            job: Job::Manifest {
+            job: Job {
                 calls: Vec::new(),
                 legs: LegPlan::whole(0),
             },
@@ -2301,7 +1980,6 @@ mod tests {
         assert_eq!(entry.event_bytes, prepared.event_bytes);
         assert_eq!(entry.fee.as_ref().map(|burn| burn.amount), Some(11));
         assert!(entry.credits_withheld);
-        assert!(matches!(entry.job, Job::Manifest { .. }));
     }
 
     /// One price, whatever refused it. A completed run carries the burn

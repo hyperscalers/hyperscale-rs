@@ -24,23 +24,22 @@ use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
     BlockHeight, CollectionId, CommittedAt, Crossings, Deadline, DeclaredKey, DeclaredRange,
-    DiscardCause, ENGAGEMENT_BYTES, ESCROWED_RECORD_BYTES, ElidedCertifiedBlock, Engagement,
-    Finalization, FinalizationHash, Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES,
-    MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES,
-    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
-    MerkleInclusionProof, ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate,
-    ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES,
-    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM,
-    SchemeId, SectionRoots, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot, Stated,
-    StatedTerms, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
-    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TerminalLines, TickId, TickLine,
-    TickManifest, Transaction, TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnclaimedCrossing,
-    UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources, evidence_admits_block,
-    shard_prefix_path, state_claims_admit_block, tick_manifest_admits_block,
+    DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement, Finalization,
+    FinalizationHash, Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
+    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES, MAX_TICK_LINES_PER_BLOCK,
+    MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof,
+    ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
+    Reserves, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, SectionRoots, Settlement, ShardId,
+    SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES,
+    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
+    TerminalLines, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash,
+    UNSETTLED_TX_BYTES, UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources,
+    evidence_admits_block, shard_prefix_path, state_claims_admit_block, tick_manifest_admits_block,
     tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
@@ -135,7 +134,6 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
                 .collect(),
         )
         .expect("a reach written out in a test"),
-        escrowed: Capped::empty(),
     }
 }
 
@@ -146,24 +144,12 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
 /// fixed half into the reach cannot be absorbed by slack in the other.
 #[test]
 fn a_names_weight_bounds_its_encoding() {
-    for (routes, records) in [(0, 0), (1, 1), (2, 2), (6, 0), (64, 128), (512, 128)] {
-        let name = UnsettledTx {
-            escrowed: Capped::new(
-                (0..records)
-                    .map(|at| SubstateKey {
-                        owner: Address::new([0xFF; 31], AddressClass::Component),
-                        local: LocalKey(u128::MAX.wrapping_sub(at).to_be_bytes()),
-                    })
-                    .collect(),
-            )
-            .expect("a list under the cap"),
-            ..name(1, routes)
-        };
+    for routes in [0, 1, 2, 6, 64, 512] {
+        let name = name(1, routes);
         let encoded = hbor_to_vec(&name).expect("a name encodes");
         assert!(
             encoded.len() <= name.wire_weight(),
-            "a name reaching {routes} routes with {records} records encodes to {} bytes, over the \
-             {} its weight claims",
+            "a name reaching {routes} routes encodes to {} bytes, over the {} its weight claims",
             encoded.len(),
             name.wire_weight(),
         );
@@ -177,16 +163,6 @@ fn a_names_weight_bounds_its_encoding() {
         name(1, 4).wire_weight() - name(1, 3).wire_weight(),
         ROUTE_PREFIX_BYTES,
         "and one route more costs one route",
-    );
-    assert_eq!(
-        UnsettledTx {
-            escrowed: Capped::from_array([key(2)]),
-            ..name(1, 0)
-        }
-        .wire_weight()
-            - name(1, 0).wire_weight(),
-        ESCROWED_RECORD_BYTES,
-        "and one escrowed record costs one key",
     );
 }
 
@@ -215,33 +191,6 @@ fn a_records_weight_bounds_its_encoding() {
     let empty = AbandonmentRecord::new(deep, WeightedTimestamp::ZERO, []);
     assert_eq!(empty.wire_weight(), ABANDONMENT_RECORD_BYTES);
     assert!(hbor_to_vec(&empty).expect("encodes").len() <= ABANDONMENT_RECORD_BYTES);
-
-    // A crossing named off its leaf costs its fixed width, at the widest
-    // values each term encodes to.
-    for crossings in [1usize, 2, 64] {
-        let record = AbandonmentRecord::new(
-            deep,
-            WeightedTimestamp::from_millis(u64::MAX),
-            (0..crossings).map(|at| name(u8::try_from(at % 256).expect("masked"), 64)),
-        )
-        .with_unclaimed((0..crossings).map(|at| UnclaimedCrossing {
-            record: SubstateKey {
-                owner: Address::new([0xFF; 31], AddressClass::Component),
-                local: LocalKey(u128::MAX.wrapping_sub(at as u128).to_be_bytes()),
-            },
-            tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
-            consumer: RoutePrefix::of(Address::new([0xFF; 31], AddressClass::Component)),
-            validity_end: WeightedTimestamp::from_millis(u64::MAX),
-        }));
-        let encoded = hbor_to_vec(&record).expect("a record encodes");
-        assert!(
-            encoded.len() <= record.wire_weight(),
-            "a record naming {crossings} crossings encodes to {} bytes, over the {} its weight \
-             claims",
-            encoded.len(),
-            record.wire_weight(),
-        );
-    }
 }
 
 /// A state tree of `leaves` cells for `shard`, spread across as many

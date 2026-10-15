@@ -26,12 +26,11 @@
 //! index keyed by the natural identifier (`TickId` here, `TxHash` there),
 //! plus a transaction index — a counterpart fetches an outcome by naming
 //! the transaction, having no way to know which certificate carries it.
-//! That index is one to many, because a shard certifies one transaction
-//! more than once: its verdict, and then the retirement, reclaim or
-//! abandonment that settles what the verdict left. A single slot would
-//! be taken by whichever came last, and every counterpart asking about
-//! the transaction would be served a certificate that answers nothing
-//! its tick waits on.
+//! That index is one to many, because a shard can certify one
+//! transaction more than once: in the tick that ran it, and then in an
+//! abandonment that settles what the run left. A single slot would be
+//! taken by whichever came last, and which certificate answers a
+//! counterpart's question only the counterpart can tell.
 //!
 //! Backed by [`papaya::HashMap`] — a lock-free concurrent map. Reads from the
 //! network worker are wait-free in the common case and never contend with
@@ -233,20 +232,17 @@ mod tests {
     /// A transaction this shard certified twice answers with both, and
     /// evicting one leaves the other answering.
     ///
-    /// The second is what settles what the first left — a retirement, a
-    /// reclaim, an abandonment — and a counterpart asks by naming the
-    /// transaction, so it cannot say which it wants. A single slot would
-    /// hand it whichever came last, and a counterpart waiting on the
-    /// verdict would hold a certificate covering nothing its tick awaits
-    /// for as long as it kept asking.
+    /// The second is an abandonment that settles what the first left, and
+    /// a counterpart asks by naming the transaction, so it cannot say
+    /// which it wants. A single slot would hand it whichever came last.
     #[test]
     fn a_transaction_certified_twice_answers_with_both() {
         let store = ExecCertStore::new();
         let hash = tx(9);
         let verdict = attesting(1, vec![outcome(hash, Role::Core)]);
-        let retirement = attesting(2, vec![outcome(hash, Role::Settling)]);
+        let abandonment = attesting(2, vec![outcome(hash, Role::Settling)]);
         store.insert(Arc::clone(&verdict));
-        store.insert(Arc::clone(&retirement));
+        store.insert(Arc::clone(&abandonment));
 
         assert_eq!(
             store
@@ -254,10 +250,10 @@ mod tests {
                 .iter()
                 .map(|cert| *cert.tick_id())
                 .collect::<Vec<_>>(),
-            vec![*verdict.tick_id(), *retirement.tick_id()],
+            vec![*verdict.tick_id(), *abandonment.tick_id()],
         );
 
-        store.evict(retirement.tick_id());
+        store.evict(abandonment.tick_id());
         assert_eq!(
             store
                 .certificates_for_tx(hash)

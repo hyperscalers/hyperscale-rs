@@ -133,9 +133,6 @@ pub struct ReadyStateRootVerification {
     /// The block's claims: what the fold settles on, and among which
     /// the parent-anchored ones are re-read from the parent view.
     pub state_claims: Vec<StateClaim>,
-    /// The block's abandonment records, whose crossings named off this
-    /// shard's leaves are read from the parent view.
-    pub abandonment_records: Vec<AbandonmentRecord>,
     /// The block's transactions, whose fees the parent state judges.
     pub transactions: SharedTransactions,
 }
@@ -171,7 +168,6 @@ pub struct PendingStateRootVerification {
     pub(crate) frontier: FrontierInputs,
     pub(crate) parent_judgement: Option<ParentJudgement>,
     pub(crate) state_claims: Vec<StateClaim>,
-    pub(crate) abandonment_records: Vec<AbandonmentRecord>,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -820,7 +816,6 @@ impl VerificationPipeline {
             frontier,
             parent_judgement,
             state_claims: block.state_claims().to_vec(),
-            abandonment_records: block.abandonment_records().to_vec(),
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -1815,7 +1810,6 @@ impl VerificationPipeline {
             members: MemberInputs::of(block, pending.frontier.windows),
             parent_judgement: pending.parent_judgement.clone(),
             state_claims: pending.state_claims.clone(),
-            abandonment_records: pending.abandonment_records.clone(),
             transactions: Arc::clone(block.transactions()),
         })
     }

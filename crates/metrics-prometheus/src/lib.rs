@@ -139,15 +139,18 @@ pub struct Metrics {
     /// across a shard's replicas: an outlier is one whose rebuild missed
     /// the transaction's own block.
     pub rebuilt_record_entries: Counter,
-    /// Counterpart cells a committed proof answered for, by whether the
-    /// cell was present. An absent answer is what licenses a reclaim.
-    pub reclaim_probes_answered: CounterVec,
+    /// Core members' siblings whose committed cell a committed proof read
+    /// absent inside its window. Each covers its member's entry and
+    /// licenses the member's abandonment.
+    pub sibling_absences_read: Counter,
     /// Escrowed records committed blocks took back on their consumers'
     /// `Never`.
     pub reclaims_folded: Counter,
     /// Escrowed records committed blocks declined for consumers here.
     pub declines_folded: Counter,
-    pub reclaim_probes_pending: Counter,
+    /// Siblings' committed cells this validator's own fetch read as
+    /// answering nothing; a member still waiting asks at a newer header.
+    pub sibling_questions_pending: Counter,
     /// Dispatched ticks a node could not run for want of a package's
     /// code; any rate is a stalled replica.
     pub batches_unavailable: Counter,
@@ -732,10 +735,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            reclaim_probes_answered: register_counter_vec!(
-                "hyperscale_reclaim_probes_answered_total",
-                "Counterpart cells a committed state proof answered for, by presence",
-                &["presence"]
+            sibling_absences_read: register_counter!(
+                "hyperscale_sibling_absences_read_total",
+                "Siblings' committed cells a committed state proof read absent inside their window"
             )
             .unwrap(),
 
@@ -751,9 +753,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            reclaim_probes_pending: register_counter!(
-                "hyperscale_reclaim_probes_pending_total",
-                "Counterpart cells a fetch read as answering nothing yet, asked again at a newer header"
+            sibling_questions_pending: register_counter!(
+                "hyperscale_sibling_questions_pending_total",
+                "Siblings' committed cells a fetch read as answering nothing yet, asked again at a newer header"
             )
             .unwrap(),
 
@@ -1234,12 +1236,8 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.batches_unavailable.inc();
     }
 
-    fn record_reclaim_probe_answered(&self, present: bool) {
-        let label = if present { "present" } else { "absent" };
-        self.metrics
-            .reclaim_probes_answered
-            .with_label_values(&[label])
-            .inc();
+    fn record_sibling_absence_read(&self) {
+        self.metrics.sibling_absences_read.inc();
     }
 
     fn record_reclaim_folded(&self, records: usize) {
@@ -1250,8 +1248,8 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.declines_folded.inc_by(records as f64);
     }
 
-    fn record_reclaim_probe_pending(&self) {
-        self.metrics.reclaim_probes_pending.inc();
+    fn record_sibling_question_pending(&self) {
+        self.metrics.sibling_questions_pending.inc();
     }
 
     fn record_hold_contentions(&self, pairs: usize) {

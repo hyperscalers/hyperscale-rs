@@ -1566,9 +1566,10 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
         Heard, LocalKey, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
-        MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, ReadMark, Routing, Said, StatedTerms,
-        TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange,
-        TransactionEnvelope, Unpublished, entry_leaf_key,
+        MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, ReadMark, Routing, Said,
+        StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf,
+        TimestampRange, TransactionEnvelope, Unpublished, entry_leaf_key,
+        tick_manifest_admits_members,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
@@ -2117,7 +2118,6 @@ mod tests {
                 deleted: vec![tx(1)],
                 stated: Vec::new(),
                 accepted: Vec::new(),
-                reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
         });
@@ -2335,6 +2335,28 @@ mod tests {
                 "{joins:?}",
             );
         }
+    }
+
+    /// A tick seats as many members as a block carries: every
+    /// transaction one block commits is named to run in one tick, and
+    /// the manifest naming them all is admitted, with no seat held back
+    /// for a member no line names.
+    #[test]
+    fn a_tick_seats_as_many_members_as_a_block_carries() {
+        assert_eq!(MAX_NAMED_MEMBERS_PER_TICK, MAX_TXS_PER_BLOCK);
+        let determined = alone(Vec::new());
+        let carried: Vec<TxHash> = (0..MAX_TXS_PER_BLOCK as u64)
+            .map(|at| TxHash::from(Hash::from_bytes(&at.to_be_bytes())))
+            .collect();
+        let lines = select_members(
+            ms(0),
+            carried.iter().map(|&tx| pending(tx, &determined, far())),
+            &Held::default(),
+            &mut ProvisionalCells::default(),
+            &mut ManifestBudget::default(),
+        );
+        assert_eq!(lines.len(), MAX_TXS_PER_BLOCK);
+        assert!(tick_manifest_admits_members(lines.len()));
     }
 
     /// Past its deadline a candidate is named `Aborted`, whether or not
@@ -3259,7 +3281,6 @@ mod tests {
                 deleted: vec![tx(2)],
                 stated: Vec::new(),
                 accepted: Vec::new(),
-                reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
         });
@@ -3684,7 +3705,6 @@ mod tests {
                             deleted: Vec::new(),
                             stated: vec![(tx(1), GlobalReceiptHash::ZERO)],
                             accepted: Vec::new(),
-                            reclaimed: Vec::new(),
                         }],
                         ..MemberInputs::still(shard)
                     });
@@ -5267,7 +5287,6 @@ mod tests {
                 Vec::new()
             },
             accepted: if stated { Vec::new() } else { vec![tx(1)] },
-            reclaimed: Vec::new(),
         };
         let blocks = [
             MemberInputs {

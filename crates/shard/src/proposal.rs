@@ -415,16 +415,7 @@ pub fn select_abandonment_records(
                 })
                 .cloned()
                 .collect();
-            let unclaimed = record.unclaimed().iter().copied().filter(|crossing| {
-                crossing.party(
-                    ctx.local_shard,
-                    record.shard(),
-                    record.terminal_wt(),
-                    &departures,
-                )
-            });
-            let kept = AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept)
-                .with_unclaimed(unclaimed);
+            let kept = AbandonmentRecord::new(record.shard(), record.terminal_wt(), kept);
             (kept.names() > 0).then_some(kept)
         })
         .collect();
@@ -1260,7 +1251,6 @@ mod tests {
                 [0x00; 31],
                 AddressClass::Principal,
             ))]),
-            escrowed: Capped::empty(),
         }
     }
 
@@ -1325,6 +1315,13 @@ mod tests {
             Against::schedule(TopologySnapshot::clone(stamped.head()), stamped.clone());
         against.anchor = inside;
         against.local_shard = SURVIVOR;
+        let resolving = Arc::new(Verifiable::from(make_finalization_on(
+            SURVIVOR,
+            BlockHeight::new(1),
+            stranded().tx_hash,
+            TransactionDecision::Accept,
+        )));
+        against.holding_settled(from_ref(&resolving));
         let ctx = against.ctx();
         let none = FinalizationsFold::from(&ctx);
         assert_eq!(
@@ -1338,12 +1335,6 @@ mod tests {
             "inside the window the record is offered whole",
         );
 
-        let resolving = Arc::new(Verifiable::from(make_finalization_on(
-            SURVIVOR,
-            BlockHeight::new(1),
-            stranded().tx_hash,
-            TransactionDecision::Accept,
-        )));
         let mut resolved = FinalizationsFold::from(&ctx);
         assert_eq!(
             select_finalizations(&ctx, &mut resolved, vec![resolving]).len(),
@@ -1372,7 +1363,8 @@ mod tests {
         );
         assert_ne!(settled.tick_id(), abandoned.tick_id());
 
-        let against = finalizations_against(CommitDedupIndex::new());
+        let mut against = finalizations_against(CommitDedupIndex::new());
+        against.holding_settled(&[Arc::clone(&settled), Arc::clone(&abandoned)]);
         let ctx = against.ctx();
         let mut fold = FinalizationsFold::from(&ctx);
         let selected = select_finalizations(&ctx, &mut fold, vec![Arc::clone(&settled), abandoned]);
@@ -2655,7 +2647,7 @@ mod tests {
                             receipt_hash: GlobalReceiptHash::ZERO,
                         },
                     )
-                    .reserving(0),
+                    .charging(0),
                 ],
             )
             .into(),

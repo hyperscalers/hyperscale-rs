@@ -170,7 +170,8 @@ pub enum TxResolution {
     LegFinalized,
     /// This shard's chain decided it: a whole or core member's verdict,
     /// a failed leg's, a leg closed on every record it issued being
-    /// taken, or the abort a reclaim or an abandonment settles.
+    /// taken, the abort a leg closes on when a record it issued is
+    /// returned, or the abort an abandonment settles.
     Decided(TransactionDecision),
 }
 

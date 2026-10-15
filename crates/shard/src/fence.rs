@@ -178,7 +178,6 @@ impl VoteFence<'_> {
             sets.get(&shard).map(|settled| {
                 record
                     .tx_hashes()
-                    .chain(record.unclaimed().iter().map(|crossing| crossing.tx))
                     .find(|tx_hash| settled.txs.contains(tx_hash))
             })
         });
@@ -384,7 +383,6 @@ impl VoteFence<'_> {
 #[cfg(test)]
 mod tests {
 
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_hbor::Capped;
@@ -392,9 +390,9 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeader,
         BlockHeaderParts, BlockHeight, Epoch, Hash, Inclusion, LeafRoot, MerkleInclusionProof,
-        NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots,
-        SettledTxSet, ShardAnchor, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
-        SubstateKey, TopologySnapshot, TxHash, UnclaimedCrossing, ValidatorSet, WitnessSources,
+        NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Round, SectionRoots, ShardAnchor,
+        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TopologySnapshot,
+        ValidatorSet, WitnessSources,
     };
 
     use super::*;
@@ -802,54 +800,6 @@ mod tests {
             held.judge(&block).expect_err("the contradiction decides"),
             Withheld::Refused(_)
         ));
-    }
-
-    /// A crossing a record names off its leaf is held to the departed
-    /// shard's settled set by its transaction: named there, the shard
-    /// may have taken it, and the record is refused; with no set held,
-    /// the vote waits.
-    #[test]
-    fn a_crossing_whose_transaction_the_departed_shard_settled_is_refused() {
-        let departed = ShardId::leaf(1, 0);
-        let tx = TxHash::from(Hash::from_bytes(&[7; 32]));
-        let crossing = UnclaimedCrossing {
-            record: test_key(1),
-            tx,
-            consumer: RoutePrefix::of(test_key(2).owner),
-            validity_end: WeightedTimestamp::from_millis(1_000),
-        };
-        let record = AbandonmentRecord::new(departed, WeightedTimestamp::from_millis(90_000), [])
-            .with_unclaimed([crossing]);
-        let held = Held::nothing();
-        let stands = |held: &Held| {
-            VoteFence {
-                mirror: &held.mirror,
-                proven_anchors: &held.proven_anchors,
-                precut: &held.precut,
-                cut: WeightedTimestamp::ZERO,
-                local_shard: LOCAL,
-            }
-            .record_stands(&record)
-        };
-        assert!(matches!(stands(&held), Err(Withheld::Deferred { .. })));
-
-        held.mirror.record_settled(
-            departed,
-            SettledTxSet {
-                txs: BTreeSet::new(),
-                terminal_wt: WeightedTimestamp::from_millis(90_000),
-            },
-        );
-        assert!(stands(&held).is_ok());
-
-        held.mirror.record_settled(
-            departed,
-            SettledTxSet {
-                txs: BTreeSet::from([tx]),
-                terminal_wt: WeightedTimestamp::from_millis(90_000),
-            },
-        );
-        assert!(matches!(stands(&held), Err(Withheld::Refused(_))));
     }
 
     /// A right child's vote on a pre-cut transaction reads its parent's

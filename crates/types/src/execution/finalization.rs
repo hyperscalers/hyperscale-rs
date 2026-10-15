@@ -642,9 +642,9 @@ impl Finalization {
     /// some, is an abandonment claim on each one it awaited: the abort is
     /// dominant and needs no verdict of theirs, but a certificate of this
     /// shard's for the member is out, so it needs them not to have
-    /// settled against it. A member that awaited nobody — a leg, a core
-    /// answering alone, a reclaim — claims nothing: its verdict is its
-    /// own, and no counterpart's set can contradict it.
+    /// settled against it. A member that awaited nobody — a leg or a core
+    /// answering alone — claims nothing: its verdict is its own, and no
+    /// counterpart's set can contradict it.
     ///
     /// Nor does a member its tick settles and never ran, a
     /// [`Role::Settling`] outcome. The one such member that names
@@ -786,10 +786,8 @@ impl Finalization {
     /// Used on the storage/sync serving side to rebuild the in-memory shape
     /// from committed state. Walks the local EC's `tx_outcomes` in canonical
     /// block order and fetches a receipt for each outcome that settles one,
-    /// by its transaction and the hash of the receipt the outcome names: one
-    /// transaction can settle several receipts on one shard — its effects,
-    /// then a reclaim or a refund at a later height — and each block
-    /// rebuilds with its own.
+    /// by its transaction and the hash of the receipt the outcome names, so
+    /// each block rebuilds with the receipt it settled.
     ///
     /// Returns `None` if:
     /// - The tick lacks a local EC (malformed — should not happen for a
@@ -1163,11 +1161,8 @@ impl Finalization {
     ///
     /// A leg's success decides nothing: the leg finalized. A member
     /// settling what an execution left is the transaction aborted,
-    /// whatever its own run came to: an abandonment is the abort, and a
-    /// reclaim is composed only on evidence that nothing will take what
-    /// the leg issued — a departed counterpart, a core member that never
-    /// included the transaction, or a consumer's `Never`. Any other name
-    /// decides as [`Self::tx_decisions`] aggregates it.
+    /// whatever its outcome reads: an abandonment is the abort. Any other
+    /// name decides as [`Self::tx_decisions`] aggregates it.
     ///
     /// Read off the outcomes alone, so a replica holding no account of
     /// the transaction reads a name exactly as one that holds it.
@@ -1454,10 +1449,8 @@ mod tests {
     /// A name resolves off its own outcome and nothing else: a leg's
     /// success is the leg finalizing, a leg's failure and a whole
     /// member's verdict decide as they read, and a member settling what
-    /// an execution left aborts the transaction whether its own run
-    /// succeeded or found nothing to take back. A reclaim's success is
-    /// no accept, on a replica that holds the leg's account and on one
-    /// that never did.
+    /// an execution left aborts the transaction whatever its outcome
+    /// reads: a settling success is no accept.
     #[test]
     fn a_name_resolves_off_its_own_outcome() {
         use crate::Role;
@@ -1492,11 +1485,8 @@ mod tests {
             "and so is a whole member's",
         );
         for (outcome, settling) in [
-            (succeeded, "a reclaim that took its records back"),
-            (
-                ExecutionOutcome::Failed,
-                "a reclaim that found nothing to take",
-            ),
+            (succeeded, "a settling success"),
+            (ExecutionOutcome::Failed, "a settling failure"),
             (ExecutionOutcome::Aborted, "an abandonment"),
         ] {
             assert_eq!(
@@ -1524,7 +1514,7 @@ mod tests {
                 BlockHeight::new(1),
                 vec![
                     TxOutcome::new(tx, ExecutionOutcome::Aborted)
-                        .reserving(7)
+                        .charging(7)
                         .awaiting([near, far])
                         .as_role(role),
                 ],
@@ -1561,7 +1551,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(receipt)),
             },
         )
-        .reserving(charged)
+        .charging(charged)
         .awaiting([ShardId::leaf(3, SIBLING)])
         .as_role(Role::Core)
     }
@@ -1699,7 +1689,7 @@ mod tests {
             },
             refusal,
         )
-        .reserving(10)
+        .charging(10)
         .awaiting([ShardId::leaf(3, SIBLING)])
         .as_role(Role::Core);
         let waiting = core(2, b"waiting", 20);
@@ -1891,7 +1881,7 @@ mod tests {
             ExecutionOutcome::Failed,
             GlobalReceiptHash::from_raw(Hash::from_bytes(refusal)),
         )
-        .reserving(charged)
+        .charging(charged)
         .awaiting([ShardId::leaf(3, SIBLING)])
         .as_role(Role::Core)
     }
@@ -1954,7 +1944,7 @@ mod tests {
             TxHash::from(Hash::from_bytes(&[3; 4])),
             ExecutionOutcome::Aborted,
         )
-        .reserving(5)
+        .charging(5)
         .awaiting([ShardId::leaf(3, SIBLING)])
         .as_role(Role::Settling);
         let charge = receipt_under(&no, b"refusal");

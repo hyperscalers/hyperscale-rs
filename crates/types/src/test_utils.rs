@@ -1112,7 +1112,7 @@ pub fn make_finalization_awaiting(
 }
 
 /// A finalization at `block_height` deciding `tx_hash` a success that is
-/// no execution of it — a reclaim's, an abandonment's — which settles
+/// no execution of it — an abandonment's — which settles
 /// past the deadline by construction and is not held to it.
 #[must_use]
 pub fn make_settling_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
@@ -1162,7 +1162,7 @@ pub fn make_finalization_leaving(
 
 /// A finalization at `block_height` whose one outcome is `outcome`,
 /// with the receipt stating what its transaction left: for a fixture
-/// that states whether the outcome's member holds a reserved place.
+/// that states the outcome itself, its charge, role and awaited shards.
 ///
 /// # Panics
 ///

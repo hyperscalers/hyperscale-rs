@@ -348,13 +348,12 @@ impl World {
 /// transaction nobody included: a payer's deadline speaks an abort on
 /// its own, which commits nothing, and a counterpart that abandons the
 /// transaction on a record of its own settles no fee, since only the
-/// shard holding the vault does. Nor does a decision on the payer's own
-/// chain say the price burned: a reclaim's finalization decides a leg
-/// that never ran and burns nothing, and the leg's row, with its fee
-/// hold, stands until the fate that burns it at the close of its leg
-/// entry window. So an abort counts only once the chain owning the
-/// payer's prefix carries the burn: the finalization of the member that
-/// held the transaction's row, or its fate.
+/// shard holding the vault does. So an abort counts only once the chain
+/// owning the payer's prefix carries the burn: the finalization of the
+/// member that held the transaction's row, or its fate. A leg whose
+/// record went back without its ever running holds its row, with its
+/// fee hold, until the fate that burns it at the close of its leg entry
+/// window.
 ///
 /// A host's status for a transaction is what its process heard, not what
 /// its chain holds: a restart forgets every status the process kept, and a
@@ -690,22 +689,21 @@ mod tests {
         assert!(charges.is_charged(&Nowhere::default(), hash));
     }
 
-    /// A leg its reclaim took back without its ever running is decided
-    /// on its payer's chain and not charged there: the reclaim's
-    /// finalization burns nothing, and the fate that follows is what
-    /// charges it.
+    /// A decision on the payer's chain is not what charges an abort: the
+    /// burn is, and a decision carrying none charges nothing until the
+    /// fate that burns the price.
     #[test]
-    fn a_reclaimed_leg_is_charged_by_its_fate_and_not_by_its_reclaim() {
+    fn an_abort_is_charged_by_its_burn_and_not_by_its_decision() {
         let (charges, hash) = recorded();
-        let reclaimed = Nowhere {
+        let decided = Nowhere {
             finalized: Some((BlockHeight::new(7), TransactionDecision::Aborted)),
             burned: None,
         };
-        assert!(!charges.is_charged(&reclaimed, hash));
-        assert_eq!(charges.charged(&reclaimed), 0);
+        assert!(!charges.is_charged(&decided, hash));
+        assert_eq!(charges.charged(&decided), 0);
         let fated = Nowhere {
             burned: Some(BlockHeight::new(90)),
-            ..reclaimed
+            ..decided
         };
         assert!(charges.is_charged(&fated, hash));
         assert_eq!(charges.charged(&fated), 1);

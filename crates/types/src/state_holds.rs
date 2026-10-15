@@ -33,12 +33,3 @@ use crate::{SubstateKey, TxHash};
 /// a leg judging its own reservation finds the one it took rather than
 /// counting it twice.
 pub type ProvisionalHolds = BTreeMap<SubstateKey, BTreeMap<TxHash, u128>>;
-
-/// What each amount cell carries of credits no committed order settles
-/// ahead of a later tick, summed.
-///
-/// A reclaim is seated by no line of its block, so its tick's half is
-/// owed only where it was composed and a later tick's half can settle
-/// first. Every later tick is judged as if the credit were not there
-/// until the base carries it.
-pub type UnsettledCredits = BTreeMap<SubstateKey, u128>;

@@ -18,11 +18,11 @@ use std::sync::Arc;
 use hyperscale_storage::FeeHoldReading;
 use hyperscale_types::{
     Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
-    TopologySnapshot, Transaction, TxHash, UnsettledCredits, Verified, WeightedTimestamp,
+    TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{PriceTable, SeedWindow};
 
-use crate::legs::Runs;
+use crate::legs::Member;
 
 /// What a block fixes about the environment its tick executes under.
 ///
@@ -116,12 +116,6 @@ pub struct TickBatchContext<'a> {
     /// burned was promised, and a member's own burn comes out of its
     /// own hold.
     pub fee_holds: &'a dyn FeeHoldReading,
-    /// What the baseline's cells carry of credits no committed order
-    /// settles ahead of this tick: the output of earlier ticks' reclaims
-    /// the base does not carry yet. The kernel judges every debit and
-    /// reservation as if they were not there, since this tick's members
-    /// can settle before the member that credited them.
-    pub unsettled_credits: &'a UnsettledCredits,
 }
 
 /// One member of a tick's batch.
@@ -131,14 +125,10 @@ pub struct TickBatchContext<'a> {
 /// one batch, so the executor's canonical order and conflict groups
 /// sequence members across ticks.
 pub struct TickTxInput<'a> {
-    /// What names the member, and what its receipt is keyed by. Carried
-    /// rather than hashed off the body, because a housekeeping member
-    /// has no body: the record cell names the transaction that issued
-    /// the crossing, and that is the name its own receipt takes.
+    /// What names the member, and what its receipt is keyed by.
     pub tx_hash: TxHash,
-    /// The transaction to execute, for a member that runs its shape.
-    /// `None` for a housekeeping member, whose cells `runs` names.
-    pub transaction: Option<&'a Arc<Verified<Transaction>>>,
+    /// The transaction to execute.
+    pub transaction: &'a Arc<Verified<Transaction>>,
     /// Verified provision entry lists, one per source shard contribution.
     /// Empty for a single-shard member.
     pub provisions: &'a [Arc<Vec<SubstateEntry>>],
@@ -155,16 +145,15 @@ pub struct TickTxInput<'a> {
     /// table. A table read at the executing head instead would price one
     /// transaction two ways across an epoch fold.
     pub prices: PriceTable,
-    /// What this member runs: the transaction as its block froze it —
-    /// carried, never re-derived, since a reshape landing between
-    /// composition and execution would otherwise leave one shard running
-    /// a whole manifest while its counterpart waits to be sent half of
-    /// it — or a settlement of what a leg here issued. What it says of
-    /// the member decides the batch's write locality — a member
-    /// declaring remote cells has its writes filtered to the subtree
-    /// this shard owns — and the reserve refusal receipt, which only a
-    /// member a counterpart's verdict can still discard holds.
-    pub runs: Runs,
+    /// The transaction as its block froze it — carried, never
+    /// re-derived, since a reshape landing between composition and
+    /// execution would otherwise leave one shard running a whole
+    /// manifest while its counterpart waits to be sent half of it. What
+    /// it says of the member decides the batch's write locality — a
+    /// member declaring remote cells has its writes filtered to the
+    /// subtree this shard owns — and the reserve refusal receipt, which
+    /// only a member a counterpart's verdict can still discard holds.
+    pub member: Member,
     /// What committed bundles attested for the edges this shard's legs
     /// consume. Empty for a member that runs whole.
     pub arrivals: &'a [EscrowedValue],

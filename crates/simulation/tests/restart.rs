@@ -895,24 +895,19 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
     );
 }
 
-/// A leg's reclaim survives its committee restarting between the leg's
-/// own finalization and the core's refusal.
+/// A leg's crossing still comes back when its committee restarts between
+/// the leg's own finalization and the core's refusal.
 ///
-/// The window this opens is the one the replay fold has to reach. The
-/// caller's shard runs the swap's withdraw as a leg: it pays, issues the
-/// crossing and certifies, and its own finalization decides nothing —
+/// The caller's shard runs the swap's withdraw as a leg: it pays, issues
+/// the crossing and certifies, and its own finalization decides nothing —
 /// the venue's does, later. A restart in between loses everything
-/// execution held in memory, so the entry that names what the reclaim
-/// would take back has to come back off the chain: a leg's own
-/// finalization retires nothing from the replay floor, and the fold
-/// reads to a leg entry's horizon rather than to a whole entry's
-/// deadline. A replay that stopped at either would come back to a
-/// refusal holding nothing for the transaction, no reclaim would be
-/// composed, and the caller's input would sit in a record cell until
-/// its grace sweeps it.
+/// execution held in memory. What asks for the venue's `Never` is the
+/// record row the chain's crossing index still holds, and the return is
+/// the commit fold's on the block carrying that `Never`, so the restarted
+/// shard takes the crossing back off its chain alone.
 ///
 /// The whole committee restarts, not one member: a single replica would
-/// be carried by its peers, and what is under test is the entry rather
+/// be carried by its peers, and what is under test is the chain rather
 /// than the vote.
 #[test]
 fn a_restarted_payer_still_reclaims_its_refused_leg() {
@@ -986,8 +981,8 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
         cluster.restart_host(host);
     }
 
-    // The refusal arrives to a restarted shard, and the reclaim it
-    // licenses is composed from the entry the replay rebuilt.
+    // The refusal arrives to a restarted shard, and the return it
+    // licenses is asked for by the record row the chain still holds.
     assert!(
         cluster.run_until(epochs(24), |c| vault_balance(c, SWAPPER_SHARD, caller)
             == funded - price),

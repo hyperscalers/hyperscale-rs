@@ -195,15 +195,15 @@ impl CommitDedupIndex {
     /// `vote_anchor_ts + RETENTION_HORIZON`.
     ///
     /// The deciding outcomes only: a leg's finalization names its hash
-    /// without resolving it, and the reclaim's finalization naming the
-    /// hash later is the one this index must not refuse.
+    /// without resolving it, and a deciding finalization naming the hash
+    /// later is the one this index must not refuse.
     ///
     /// The certificate's own identity is recorded beside them, because
     /// the deciding set is empty for a tick whose every member reaches no
-    /// verdict — a retirement's, which settles records under a
-    /// transaction whose verdict belongs to another chain. Keyed on the
-    /// deciding names alone, such a certificate is never seen as already
-    /// carried, and the proposer offers it again on every block.
+    /// verdict — legs that succeeded, whose transactions their cores
+    /// decide. Keyed on the deciding names alone, such a certificate is
+    /// never seen as already carried, and the proposer offers it again on
+    /// every block.
     pub(crate) fn register_committed_certs(
         &mut self,
         finalizations: &[Arc<Verifiable<Finalization>>],
@@ -790,8 +790,8 @@ mod tests {
         assert!(!live.contains_provision(&p.hash(), deadline));
     }
 
-    /// A leg's finalization names its hash without resolving it, so the
-    /// reclaim's finalization naming the hash later is not a duplicate.
+    /// A leg's finalization names its hash without resolving it, so a
+    /// deciding finalization naming the hash later is not a duplicate.
     #[test]
     fn a_leg_finalization_does_not_resolve_its_transaction() {
         use hyperscale_types::test_utils::{make_finalization, make_leg_finalization};
@@ -815,7 +815,7 @@ mod tests {
         )))]);
         assert!(
             index.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO),
-            "the reclaim's finalization does"
+            "a deciding finalization does"
         );
     }
 }

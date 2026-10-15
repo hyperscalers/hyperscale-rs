@@ -565,12 +565,6 @@ pub struct ShardCoordinator {
     /// only.
     other_shaped: BTreeSet<TxHash>,
 
-    /// Ticks whose determined half the chain still owes, mirrored from
-    /// the execution fold so the proposer and the vote path judge
-    /// settlement order by one rule. Empty until the node reports one,
-    /// which enforces nothing — the safe direction.
-    owed_determined: BTreeSet<BlockHeight>,
-
     /// Validator "ready on shard" signals waiting for inclusion in the
     /// next proposed block. Drained at proposal time.
     ready_signal_pool: ReadySignalPool,
@@ -858,7 +852,6 @@ impl ShardCoordinator {
                 .unwrap_or_else(|| MemberIndex::empty(local_shard)),
             verdict_asks: VerdictAsks::default(),
             other_shaped: BTreeSet::new(),
-            owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
@@ -2084,7 +2077,7 @@ impl ShardCoordinator {
         snapshot: &'a TopologySnapshot,
         topology_schedule: &'a TopologySchedule,
         chain: &'a QcChainSets,
-        (members, owed_determined): (&'a MemberIndex, &'a BTreeSet<BlockHeight>),
+        members: &'a MemberIndex,
         parent_qc: &QuorumCertificate,
     ) -> Option<Committed<'a>> {
         let parent_block_hash = parent_qc.block_hash();
@@ -2127,25 +2120,14 @@ impl ShardCoordinator {
             dedup: &self.dedup_index,
             parent_settled_frontier,
             members,
-            owed_determined,
         })
     }
 
     /// Tick membership at `parent`, each block up to it folded on the
-    /// `windows` grid, and the ticks whose determined half the chain up
-    /// to it still owes: the rows' flags, beside execution's
-    /// report for the ticks that run nothing but reclaims, which no row
-    /// names. `None` while a block between the committed tip and the
-    /// parent is not held.
-    fn rows_at(
-        &self,
-        windows: EpochWindows,
-        parent: BlockHash,
-    ) -> Option<(MemberIndex, BTreeSet<BlockHeight>)> {
-        let rows = self.ancestry(windows, parent)?.rows;
-        let mut owed = rows.owed_determined();
-        owed.extend(self.owed_determined.iter().copied());
-        Some((rows, owed))
+    /// `windows` grid. `None` while a block between the committed tip
+    /// and the parent is not held.
+    fn rows_at(&self, windows: EpochWindows, parent: BlockHash) -> Option<MemberIndex> {
+        Some(self.ancestry(windows, parent)?.rows)
     }
 
     /// What the seat building a block on `parent` asks its node with,
@@ -2617,19 +2599,6 @@ impl ShardCoordinator {
         questions
     }
 
-    /// The heights whose determined half the execution fold says the
-    /// chain still owes, as last mirrored here.
-    #[must_use]
-    pub const fn owed_determined(&self) -> &BTreeSet<BlockHeight> {
-        &self.owed_determined
-    }
-
-    /// Mirror the execution fold's owed determined halves, which
-    /// settlement order at admission is judged against.
-    pub fn set_owed_determined(&mut self, owed: BTreeSet<BlockHeight>) {
-        self.owed_determined = owed;
-    }
-
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
@@ -2800,13 +2769,12 @@ impl ShardCoordinator {
         // instead disagrees for the block after every fold, and while the
         // parent QC lags the beacon.
         let committee = frame.committee;
-        let (members, owed_determined) =
-            self.rows_at(topology_schedule.windows(), parent_block_hash)?;
+        let members = self.rows_at(topology_schedule.windows(), parent_block_hash)?;
         let ctx = self.admission(
             committee,
             topology_schedule,
             &chain,
-            (&members, &owed_determined),
+            &members,
             &frame.parent_qc,
         )?;
         let Some(gather) = gather else {
@@ -4432,9 +4400,7 @@ impl ShardCoordinator {
                 validate_coast_block_for_vote(block, parent_load)
             } else {
                 let chain = QcChainSets::behind(&self.chain_view(), parent);
-                let Some((members, owed_determined)) =
-                    self.rows_at(topology_schedule.windows(), parent)
-                else {
+                let Some(members) = self.rows_at(topology_schedule.windows(), parent) else {
                     trace!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
@@ -4446,7 +4412,7 @@ impl ShardCoordinator {
                     committee,
                     topology_schedule,
                     &chain,
-                    (&members, &owed_determined),
+                    &members,
                     block.header().parent_qc(),
                 ) else {
                     trace!(
@@ -8798,7 +8764,7 @@ mod tests {
         TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction,
         TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
         VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount,
-        VrfProof, WeightedTimestamp, Window, WindowLookup, WitnessSources, decide, encode_amount,
+        VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, decide, encode_amount,
         partner_evidence, read_amount, said_at, settled_set_verdict, test_utils,
         tick_terms_admit_block, verdict_leaf,
     };
@@ -8807,6 +8773,7 @@ mod tests {
 
     use super::*;
     use crate::action_handlers::{Named, Naming, build_proposal};
+    use crate::admission::fixtures::hold_settled;
     use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all, unwrapped};
     use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent};
     use crate::tick_members::Agreement;
@@ -10005,7 +9972,7 @@ mod tests {
         let (state, schedule) = committed_through(from, chain.clone());
         let yes = |tx: &Transaction| {
             outcome_of(tx)
-                .reserving(1)
+                .charging(1)
                 .awaiting([HEARD_SIBLING])
                 .as_role(Role::Core)
         };
@@ -10234,7 +10201,7 @@ mod tests {
                     txs.iter()
                         .map(|tx| {
                             outcome_of(tx)
-                                .reserving(1)
+                                .charging(1)
                                 .awaiting([HEARD_SIBLING])
                                 .as_role(Role::Core)
                         })
@@ -11633,8 +11600,8 @@ mod tests {
             2,
             TickHalf::Determined,
             vec![
-                outcome_of(&early).reserving(1),
-                outcome_of(&late).reserving(1),
+                outcome_of(&early).charging(1),
+                outcome_of(&late).charging(1),
             ],
         );
         let block = proposed_on_tip(
@@ -11661,252 +11628,6 @@ mod tests {
             .expect("the chain's own manifest is admitted");
         assert_eq!(counted, Some(block.header().txs_in_flight()));
         assert_eq!(state.expected_in_flight(&block, counted), counted);
-    }
-
-    /// `block`, committing `leg` alone, stating it a leg of a transaction
-    /// whose core sits on `core`: settled on this shard's word alone,
-    /// run once `core`'s bundle names it, and reserving
-    /// [`HELD_RESERVES`] of its payer's vault.
-    fn stating_a_leg(block: Block, leg: &Transaction, core: ShardId) -> Block {
-        let Block::Live {
-            header,
-            transactions,
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            witness_sources,
-            ..
-        } = block
-        else {
-            unreachable!("a chained block is live")
-        };
-        let terms = MemberTerms {
-            leg: true,
-            reach: Capped::from_array([core]),
-            engages: Capped::from_array([core]),
-            reserves: Capped::from_array([(FeeTerms::of(leg).vault, HELD_RESERVES)]),
-            ..terms_of(leg, &fixture_committee(ShardId::ROOT), ShardId::ROOT)
-        };
-        Block::Live {
-            header,
-            transactions,
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            terms: Arc::new(Capped::from_array([StatedTerms {
-                tx: leg.hash(),
-                terms,
-            }])),
-            witness_sources,
-        }
-    }
-
-    /// What `storage` holds of `fee`'s vault: its balance, whether the
-    /// fee hold stands, the vault's held total and what the rows standing
-    /// reserve of it.
-    fn fee_reads(storage: &SimShardStorage, fee: &FeeTerms) -> (u128, bool, u128, u128) {
-        let state = storage.snapshot();
-        (
-            state
-                .cell(fee.vault)
-                .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell")),
-            state.cell(fee.hold_key()).is_some(),
-            held_total(&state, fee.vault),
-            reserved_total(&state, ShardId::ROOT, fee.vault),
-        )
-    }
-
-    /// Commit `block` on `state` through the path a certified block
-    /// takes.
-    fn commit_next(state: &mut ShardCoordinator, schedule: &TopologySchedule, block: &Block) {
-        let qc = make_test_qc(block.hash(), block.height());
-        let _ = state.on_block_ready_to_commit(
-            schedule,
-            Arc::new(Verified::new_unchecked_for_test(
-                CertifiedBlock::new_unchecked(block.clone(), qc),
-            )),
-            CommitSource::Aggregator,
-        );
-    }
-
-    /// A chain that commits `leg` as a leg whose core sits on `core`,
-    /// its payer's vault holding `funded`, and then carries the
-    /// finalization of the leg's reclaim, whose outcome is not
-    /// `reserved`. The reclaim's block names no line, gives no place
-    /// back, burns nothing and ends no hold, and leaves the row released
-    /// on the settlement its terms stated.
-    fn a_leg_its_reclaim_took_back(
-        from: BlockHash,
-        leg: &Transaction,
-        core: ShardId,
-        funded: u128,
-    ) -> (ShardCoordinator, TopologySchedule, SimShardStorage) {
-        let fee = FeeTerms::of(leg);
-        let committing = stating_a_leg(
-            carrying(
-                block_chained_on(BlockHeight::new(1), from, 1_000),
-                std::slice::from_ref(leg),
-                Vec::new(),
-            ),
-            leg,
-            core,
-        );
-        let chain = [committing];
-        let storage = store_folding_over(
-            &chain,
-            BTreeMap::from([(fee.vault, Some(encode_amount(funded).to_vec()))]),
-        );
-        let (mut state, schedule) = committed_through(from, chain);
-        let committee = Arc::clone(schedule.head());
-        assert_eq!(
-            state.member_rows().members[&leg.hash()].state,
-            RowState::Pending
-        );
-        let standing = (funded, true, fee.max_fee, HELD_RESERVES);
-        assert_eq!(fee_reads(&storage, &fee), standing);
-
-        let reclaim = outcome_of(leg);
-        assert!(!reclaim.reserved());
-        let reclaiming = proposed_on_tip(
-            &state,
-            &schedule,
-            &storage,
-            2_000,
-            &payload_of(&[], vec![half_settling(1, TickHalf::Legs, vec![reclaim])]),
-            None,
-        );
-        assert!(reclaiming.tick_manifest().is_empty());
-        assert_eq!(
-            reclaiming.header().txs_in_flight(),
-            TxsInFlight::new(1),
-            "the reclaim gives no place back",
-        );
-        assert_eq!(
-            state
-                .check_tick_manifest(&schedule, &committee, &reclaiming)
-                .expect("the chain's own manifest is admitted"),
-            Some(TxsInFlight::new(1)),
-        );
-        assert_eq!(
-            fee_reads(&storage, &fee),
-            standing,
-            "the reclaim burns nothing and ends no hold",
-        );
-        commit_next(&mut state, &schedule, &reclaiming);
-        let row = &state.member_rows().members[&leg.hash()];
-        assert_eq!(
-            (row.state, row.waiting.is_none(), row.reach.to_vec()),
-            (
-                RowState::Released {
-                    settlement: Settlement::Alone
-                },
-                true,
-                vec![core],
-            ),
-        );
-        (state, schedule, storage)
-    }
-
-    /// A leg its reclaim took back holds its row and its place in the
-    /// drain until its fate. The reclaim's finalization, whose outcome
-    /// is not `reserved`, releases the waiting row and deletes nothing:
-    /// the vault, the fee hold and what the row reserves stand as its
-    /// committing block left them. No line names the released row to
-    /// run, and none names it at all while its leg entry window stands.
-    /// At the anchor the window closes at the block fates it: one burn
-    /// of its charge, and the row, the hold and the reservation gone
-    /// together.
-    #[test]
-    fn a_reclaimed_leg_holds_its_row_and_its_place_until_its_fate() {
-        let from = BlockHash::from_raw(Hash::from_bytes(b"reclaimed tip"));
-        let leg = test_transaction(1);
-        let charge = test_utils::genesis_charge(&leg);
-        let fee = FeeTerms::of(&leg);
-        assert_eq!(
-            charge.vault, fee.vault,
-            "a charge ends the hold on its vault"
-        );
-        assert!(charge.amount != 0 && charge.amount <= fee.max_fee);
-        let funded = charge.amount * 3;
-        let (mut state, schedule, storage) =
-            a_leg_its_reclaim_took_back(from, &leg, ShardId::leaf(1, 1), funded);
-        let committee = Arc::clone(schedule.head());
-        let standing = (funded, true, fee.max_fee, HELD_RESERVES);
-
-        let deadline = state.member_rows().members[&leg.hash()].deadline;
-        let lapse = Window::LegEntry.of(deadline).end.as_millis();
-        let standing_block = proposed_on_tip(
-            &state,
-            &schedule,
-            &storage,
-            lapse - 1,
-            &payload_of(&[], Vec::new()),
-            None,
-        );
-        assert!(
-            standing_block.tick_manifest().is_empty(),
-            "no line names it while its leg entry window stands",
-        );
-        assert_eq!(standing_block.header().txs_in_flight(), TxsInFlight::new(1));
-        assert_eq!(fee_reads(&storage, &fee), standing);
-        let fate = TickLine::Fate {
-            tx: leg.hash(),
-            charge,
-        };
-        let tip = standing_block.hash();
-        let at = |anchor_ms: u64, lines: Vec<TickLine>| {
-            carrying(
-                block_chained_on(BlockHeight::new(4), tip, anchor_ms),
-                &[],
-                lines,
-            )
-        };
-        commit_next(&mut state, &schedule, &standing_block);
-        for (lines, why) in [
-            (vec![member(&leg)], "a released leg named to run"),
-            (vec![fate.clone()], "a fate short of the window's close"),
-        ] {
-            assert!(
-                matches!(
-                    state.check_tick_manifest(&schedule, &committee, &at(lapse - 1, lines)),
-                    Err(Withheld::Refused(_))
-                ),
-                "{why}",
-            );
-        }
-        assert!(
-            matches!(
-                state.check_tick_manifest(&schedule, &committee, &at(lapse, Vec::new())),
-                Err(Withheld::Refused(_))
-            ),
-            "a block at the window's close that leaves the row standing",
-        );
-
-        let fating = proposed_on_tip(
-            &state,
-            &schedule,
-            &storage,
-            lapse,
-            &payload_of(&[], Vec::new()),
-            None,
-        );
-        assert_eq!(fating.tick_manifest()[..], [fate]);
-        assert_eq!(fating.header().txs_in_flight(), TxsInFlight::ZERO);
-        assert_eq!(
-            fee_reads(&storage, &fee),
-            (funded - charge.amount, false, 0, 0),
-            "one burn, and the hold and the reservation gone with the row",
-        );
-        assert_eq!(
-            state
-                .check_tick_manifest(&schedule, &committee, &fating)
-                .expect("the chain's own manifest is admitted"),
-            Some(TxsInFlight::ZERO),
-        );
     }
 
     /// What [`held_beside`]'s member reserves of its payer's vault.
@@ -12303,11 +12024,11 @@ mod tests {
     }
 
     /// A voter reads the ticks the chain owes a determined half off the
-    /// rows at the parent, so one whose execution never held the tick
-    /// still owes it; execution's report stands beside them for the ticks
-    /// that run nothing but reclaims.
+    /// rows at the parent and off nothing else, so one whose execution
+    /// never held the tick still owes it, and nothing execution reports
+    /// adds one.
     #[test]
-    fn owed_determined_halves_are_read_off_the_rows() {
+    fn admission_reads_owed_halves_off_committed_rows_alone() {
         let from = BlockHash::from_raw(Hash::from_bytes(b"owed tip"));
         let (mut state, schedule) = committed_through(from, []);
         state.member_rows.ticks.insert(
@@ -12326,20 +12047,14 @@ mod tests {
                 awaiting: 1,
             },
         );
-        assert!(state.owed_determined.is_empty());
         let owed = |state: &ShardCoordinator| {
             state
                 .rows_at(schedule.windows(), from)
-                .map(|(_, owed)| owed)
+                .map(|rows| rows.owed_determined())
         };
         assert_eq!(
             owed(&mut state),
             Some(BTreeSet::from([BlockHeight::new(5)]))
-        );
-        state.owed_determined = BTreeSet::from([BlockHeight::new(7)]);
-        assert_eq!(
-            owed(&mut state),
-            Some(BTreeSet::from([BlockHeight::new(5), BlockHeight::new(7)])),
         );
     }
 
@@ -14131,11 +13846,11 @@ mod tests {
             .committee_for_child_of(schedule, parent)
             .expect("the parent's child has a committee");
         let chain = QcChainSets::behind(&state.chain_view(), parent);
-        let (rows, owed) = state
+        let rows = state
             .rows_at(schedule.windows(), parent)
             .expect("the parent's rows are held");
         let ctx = state
-            .admission(committee, schedule, &chain, (&rows, &owed), &parent_qc)
+            .admission(committee, schedule, &chain, &rows, &parent_qc)
             .expect("the block's window is held");
         let provisions = ProvisionsFold::default();
         txs.iter()
@@ -14329,7 +14044,7 @@ mod tests {
         let mut rows_at_parent = Vec::new();
         for state in [&proposer, &voter] {
             let chain = QcChainSets::behind(&state.chain_view(), parent);
-            let (rows, owed) = state
+            let rows = state
                 .rows_at(schedule.windows(), parent)
                 .expect("every block up to the parent is held");
             assert_eq!(
@@ -14337,7 +14052,7 @@ mod tests {
                 MAX_STANDING_TOWARD_SHARD
             );
             let ctx = state
-                .admission(&committee, &schedule, &chain, (&rows, &owed), parent_qc)
+                .admission(&committee, &schedule, &chain, &rows, parent_qc)
                 .expect("the block's window is held");
             let provisions = ProvisionsFold::default();
             let selected = select_transactions(
@@ -21858,7 +21573,6 @@ mod tests {
                         members: &verification.members,
                         fence: &judgement.fence,
                         state_claims: &verification.state_claims,
-                        abandonment_records: &verification.abandonment_records,
                         transactions: &verification.transactions,
                         finalizations: &verification.finalizations,
                     },
@@ -22787,7 +22501,7 @@ mod tests {
                     topology_schedule.head(),
                     topology_schedule,
                     &chain,
-                    (&self.member_rows, &self.owed_determined),
+                    &self.member_rows,
                     block.header().parent_qc(),
                 )
                 .ok_or("the block's anchor window is not held")?;
@@ -22813,7 +22527,7 @@ mod tests {
                     topology_schedule.head(),
                     topology_schedule,
                     &chain,
-                    (&self.member_rows, &self.owed_determined),
+                    &self.member_rows,
                     block.header().parent_qc(),
                 )
                 .ok_or("the block's anchor window is not held")?;
@@ -23045,7 +22759,6 @@ mod tests {
                 committee_anchor: WeightedTimestamp::ZERO,
             },
             reach: Capped::from_array([route(0xAA)]),
-            escrowed: Capped::empty(),
         }
     }
 
@@ -23541,7 +23254,7 @@ mod tests {
             BlockHeight::new(height),
             vec![
                 TxOutcome::new(TxHash::from(Hash::from_bytes(b"tx")), outcome)
-                    .reserving(1)
+                    .charging(1)
                     .awaiting([ShardId::ROOT])
                     .as_role(Role::Core),
             ],
@@ -24009,11 +23722,13 @@ mod tests {
             proposer: ValidatorId::new(1),
             timestamp: ProposerTimestamp::from_millis(1500),
             round: Round::new(1),
-            // The first block of a chain that has committed nothing.
+            // The first block of its chain.
             load: ShardLoad {
                 blocks: 1,
                 ..ShardLoad::ZERO
             },
+            // The row its legs half settles, which stands accepted.
+            txs_in_flight: TxsInFlight::new(1),
             ..Default::default()
         });
         Block::Live {
@@ -24063,6 +23778,7 @@ mod tests {
         // `install_complete_block` helper drops them).
         let ticks: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
+        hold_settled(&mut coord.member_rows, ShardId::leaf(1, 0), &ticks);
         let mut pending =
             PendingBlock::from_complete_block(&block, ticks, vec![], LocalTimestamp::ZERO);
         pending

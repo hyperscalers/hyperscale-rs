@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
-use hyperscale_engine::legs::{Member, Runs};
+use hyperscale_engine::legs::Member;
 use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_storage::{BlockSweep, CommittedHere, FeeTerms, MemberInputs, TickResolution};
 use hyperscale_types::{
@@ -73,17 +73,8 @@ pub struct ParentJudgement {
 pub struct CrossShardExecutionRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
-    /// The transaction to execute, or `None` where this shard holds no
-    /// body for it.
-    ///
-    /// A member running a shape always holds one. The two housekeeping
-    /// members read none — every cell they touch is named by the record
-    /// leaves `runs` carries — but they keep it where it is there,
-    /// because the price still follows the payer's vault and the vault
-    /// is the body's to name. `None` is a reshape successor's
-    /// housekeeping: its store arrives as a prefix of leaves, no body
-    /// arrives with it, and its predecessor's chain settled the price.
-    pub transaction: Option<Arc<Verified<Transaction>>>,
+    /// The transaction to execute.
+    pub transaction: Arc<Verified<Transaction>>,
     /// State entries provisioned by other shards (one `Arc` per source shard
     /// contribution). Engine layers them on top of the local snapshot.
     pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
@@ -103,9 +94,8 @@ pub struct CrossShardExecutionRequest {
     /// committing block's window is the one anchor every participant
     /// shares.
     pub prices: PriceTable,
-    /// What this member runs: the transaction as classified when its
-    /// block committed — carried, never re-derived — or a settlement of
-    /// what a leg here issued. What it says of the member is what the
+    /// The transaction as classified when its block committed —
+    /// carried, never re-derived. What it says of the member is what the
     /// batch reads: whether the transaction reaches beyond this shard,
     /// which makes a member's provisions and arrivals necessary and its
     /// writes filtered to the subtree this shard owns; and whether a
@@ -113,26 +103,11 @@ pub struct CrossShardExecutionRequest {
     /// its contributions provisional, readable by no later tick until
     /// the verdict resolves them, and its declared cells a claim a later
     /// member must compose with.
-    pub runs: Runs,
+    pub member: Member,
     /// What committed bundles attested for the edges this shard's legs
     /// consume, read off the record cells they proved. Empty for a
     /// member that runs the whole shape.
     pub arrivals: Vec<EscrowedValue>,
-}
-
-impl CrossShardExecutionRequest {
-    /// The shape this member runs and the body it runs over, or `None`
-    /// for a housekeeping member.
-    ///
-    /// The pair travels together or not at all: `Runs::Shape` is the one
-    /// arm a body belongs to, and a reclaim or a retirement has neither.
-    #[must_use]
-    pub const fn shape(&self) -> Option<(&Member, &Arc<Verified<Transaction>>)> {
-        match (&self.runs, self.transaction.as_ref()) {
-            (Runs::Shape(member), Some(body)) => Some((member, body)),
-            _ => None,
-        }
-    }
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on
@@ -830,10 +805,6 @@ pub enum Action {
         /// parent-anchored ones are re-read from the verifier's own
         /// parent view.
         state_claims: Vec<StateClaim>,
-        /// The block's abandonment records, whose crossings named off
-        /// this shard's leaves are read from the verifier's own parent
-        /// view.
-        abandonment_records: Vec<AbandonmentRecord>,
     },
 
     /// Verify a block's beacon-witness root + leaf count.

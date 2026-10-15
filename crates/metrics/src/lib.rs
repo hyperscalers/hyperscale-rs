@@ -199,14 +199,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// behind; every replica counting them is code nobody can serve.
     fn record_batch_unavailable(&self) {}
 
-    /// Record a counterpart cell a committed proof answered for, as
-    /// `present` or absent — the fold every replica of a shard reaches
-    /// at the same height.
-    ///
-    /// Absences are what license a reclaim, so an absent rate rising
-    /// against a flat present one is counterparts going silent, not
-    /// proofs going missing.
-    fn record_reclaim_probe_answered(&self, present: bool) {}
+    /// Record a core member's sibling whose committed cell a committed
+    /// proof read absent inside its window, the fold every replica of a
+    /// shard reaches at the same height. Each one covers the member's
+    /// entry and licenses its abandonment.
+    fn record_sibling_absence_read(&self) {}
 
     /// Record the escrowed records a committed block took back on their
     /// consumers' `Never`, crediting each to the cell it left.
@@ -220,11 +217,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
         let _ = records;
     }
 
-    /// Record a counterpart cell this validator's own fetch read as
-    /// answering nothing — a committed cell present while its member is
-    /// still pending, or an absence outside its window — so the question
-    /// is put again at a newer header.
-    fn record_reclaim_probe_pending(&self) {}
+    /// Record a sibling's committed cell this validator's own fetch read
+    /// as answering nothing: the cell present, so the sibling included
+    /// the transaction, or a reading for a member already answered for.
+    /// A member still waiting puts its question again at a newer header.
+    fn record_sibling_question_pending(&self) {}
 
     /// Pending core members a proposed block leaves out behind the holds
     /// of a core member awaiting a shard they await too, one per pair:
@@ -784,10 +781,10 @@ pub fn record_batch_unavailable() {
     recorder().record_batch_unavailable();
 }
 
-/// Record a counterpart cell a committed proof answered for.
+/// Record a sibling's committed cell a committed proof read absent.
 #[inline]
-pub fn record_reclaim_probe_answered(present: bool) {
-    recorder().record_reclaim_probe_answered(present);
+pub fn record_sibling_absence_read() {
+    recorder().record_sibling_absence_read();
 }
 
 /// Record the escrowed records a committed block took back.
@@ -802,10 +799,10 @@ pub fn record_decline_folded(records: usize) {
     recorder().record_decline_folded(records);
 }
 
-/// Record a counterpart cell a fetch read as answering nothing yet.
+/// Record a sibling's committed cell a fetch read as answering nothing yet.
 #[inline]
-pub fn record_reclaim_probe_pending() {
-    recorder().record_reclaim_probe_pending();
+pub fn record_sibling_question_pending() {
+    recorder().record_sibling_question_pending();
 }
 
 /// Record the hold contentions a proposed block leaves standing.

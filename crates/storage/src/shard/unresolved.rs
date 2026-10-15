@@ -150,9 +150,11 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
                 }
             }
             // Only a deciding outcome retires an entry: a leg's own
-            // finalization names the leg and resolves nothing, since its
-            // entry lives on for the reclaim its core's refusal or its
-            // deliveries' lapse may license.
+            // finalization names the leg and resolves nothing. A leg
+            // entry is closed by the commit fold, on the records it
+            // issued being taken or returned, which no finalization
+            // names, so the walk holds a leg until it ages past the
+            // transaction's evidence horizon.
             for finalization in block.certificates().iter() {
                 for tx_hash in finalization.deciding_tx_hashes() {
                     unresolved.remove(&tx_hash);

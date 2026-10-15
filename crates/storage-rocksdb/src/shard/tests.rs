@@ -1147,9 +1147,9 @@ fn receipts_read_back(
     [hashes(stored.block()), hashes(&served.block)]
 }
 
-/// A transaction that settles its effects at one height and a second
-/// receipt for itself at a later one — a reclaim, a refund — leaves
-/// both blocks reading back with their own receipt.
+/// A transaction that settles one receipt at one height and a second
+/// receipt for itself at a later one leaves both blocks reading back
+/// with their own receipt.
 ///
 /// Receipts keyed by transaction alone would let the later one replace
 /// the row the earlier block rebuilds from, so the earlier block would
@@ -1159,14 +1159,14 @@ fn a_transaction_settling_twice_rebuilds_each_block_with_its_own_receipt() {
     let (_dir, storage) = open_fresh();
     let tx = TxHash::from(Hash::from_bytes(b"settled twice"));
     let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
-    let reclaim = GlobalReceiptHash::from_raw(Hash::from_bytes(b"reclaim"));
+    let later = GlobalReceiptHash::from_raw(Hash::from_bytes(b"later"));
     commit_empty(
         &storage,
         &block_settling_receipt(BlockHeight::new(1), tx, effects, Role::Core, 1),
     );
     commit_empty(
         &storage,
-        &block_settling_receipt(BlockHeight::new(2), tx, reclaim, Role::Settling, 2),
+        &block_settling_receipt(BlockHeight::new(2), tx, later, Role::Settling, 2),
     );
 
     assert_eq!(
@@ -1176,7 +1176,7 @@ fn a_transaction_settling_twice_rebuilds_each_block_with_its_own_receipt() {
     );
     assert_eq!(
         receipts_read_back(&storage, BlockHeight::new(2)),
-        [vec![reclaim], vec![reclaim]],
+        [vec![later], vec![later]],
         "and the later block with the receipt it settled",
     );
 }

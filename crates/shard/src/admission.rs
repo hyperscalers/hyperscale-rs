@@ -151,25 +151,15 @@ pub(crate) struct Committed<'a> {
     pub(crate) chain: &'a QcChainSets,
     /// What committed blocks within the retention window carry.
     pub(crate) dedup: &'a CommitDedupIndex,
-    /// Tick membership at the parent: which tick holds each member, and
-    /// in which half.
+    /// Tick membership at the parent: which tick holds each member, in
+    /// which half, and which ticks still owe their determined half, past
+    /// which no half may settle.
     pub(crate) members: &'a MemberIndex,
     /// The settlement frontier the parent left, which a determined half
     /// must settle above. `None` where the parent is pruned, which
     /// leaves the order unjudged here: such a block is verified but not
     /// voted on.
     pub(crate) parent_settled_frontier: Option<BlockHeight>,
-    /// Ticks whose determined half this chain still owes, by height: the
-    /// member rows' flags at the parent, which a proposer and every voter
-    /// read alike, beside execution's report for the ticks that run
-    /// nothing but reclaims, which no row names. A half may not settle
-    /// past one of these.
-    ///
-    /// The report is the one node-local input, and so it may only
-    /// refuse: a validator that never composed a reclaim tick holds it in
-    /// no set and enforces nothing, so it refuses only what a composing
-    /// quorum would refuse anyway.
-    pub(crate) owed_determined: &'a BTreeSet<BlockHeight>,
 }
 
 /// One section of a block, and the rule that admits an item to it.
@@ -519,18 +509,18 @@ impl Section for FinalizationsSection {
     /// rides a later block than the stating half of its members, and one
     /// offered first is refused.
     ///
-    /// **A determined half is whole over its tick's rows.** Its reserved
-    /// outcomes are over distinct rows and number the rows its tick
-    /// holds in flight for the determined half alone, so a proposer
-    /// cannot settle part of them under the tick's certificate projected
-    /// to that part, carry the frontier to the tick, and leave the rest
-    /// where no determined half reaches them again. A reclaim holds no
-    /// row and is counted by none.
+    /// **A determined half is whole over its tick's rows.** Its outcomes
+    /// are over distinct rows and number the rows its tick holds in
+    /// flight for the determined half alone, so a proposer cannot settle
+    /// part of them under the tick's certificate projected to that part,
+    /// carry the frontier to the tick, and leave the rest where no
+    /// determined half reaches them again. Every outcome stands over a
+    /// row, so a half over none is refused.
     ///
     /// **A stating half is whole and single.** Every outcome of its
     /// certificate, one it settles or one it states, is over a distinct
-    /// row its tick holds in flight outside the determined half, a
-    /// reserved one, and a stated yes over a row a counterpart shares
+    /// row its tick holds in flight outside the determined half, and a
+    /// stated yes over a row a counterpart shares
     /// the verdict on, which is the only row a stating half moves and
     /// does not delete. They number the rows the tick holds so, so a
     /// proposer cannot state part of a tick and leave the rest with no
@@ -549,12 +539,11 @@ impl Section for FinalizationsSection {
     /// transaction rather than about which kind of verdict each
     /// certificate carried: every name is held to once per block, and
     /// only a deciding one against what the chain already resolved,
-    /// since a leg's finalization resolves nothing and the reclaim's
-    /// may follow it. The identity rule beside it is the same rule at a
-    /// coarser key, for the case the fine key cannot reach: a
-    /// certificate whose members reach no verdict names nothing the
-    /// per-transaction rule can hold it to, so without it the same
-    /// certificate rides every block.
+    /// since a leg's finalization resolves nothing. The identity rule
+    /// beside it is the same rule at a coarser key, for the case the
+    /// fine key cannot reach: a certificate whose members reach no
+    /// verdict names nothing the per-transaction rule can hold it to, so
+    /// without it the same certificate rides every block.
     ///
     /// A certificate anchored before the chain's origin names a tick on
     /// a predecessor, resolves transactions this chain never committed,
@@ -571,12 +560,10 @@ impl Section for FinalizationsSection {
     /// A certificate anchored below a bridge of this shard's recovery
     /// settles nothing in a block anchored at or past it. The recovery's
     /// crossing block discards every tick below the bridge, so no row
-    /// stands for it, but a determined half projected to its reclaims
-    /// holds no row and the row rules would admit it; and the committee
-    /// that certified it is one the recovery replaced, or a fresh one
-    /// whose members sign no tick below the bridge. Read off the
-    /// bindings the block's own snapshot records, so every voter reads
-    /// one history.
+    /// stands for it; and the committee that certified it is one the
+    /// recovery replaced, or a fresh one whose members sign no tick
+    /// below the bridge. Read off the bindings the block's own snapshot
+    /// records, so every voter reads one history.
     ///
     /// The order its tick settles in is [`settles_in_order`]'s.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
@@ -618,20 +605,6 @@ impl Section for FinalizationsSection {
         let stating = fw.half() == TickHalf::Stated;
         for outcome in fw.settled_outcomes() {
             let tx_hash = outcome.tx_hash();
-            // A half settles only members its tick holds for that half: a
-            // discarded one is released or gone, one an earlier legs half
-            // of the tick named is deleted, and a later finalization of
-            // either is refused. A member no committing block reserved a
-            // place for, a reclaim, has no row to hold it, and is no
-            // member a stating half speaks for.
-            if (outcome.reserved() || stating) && !held_for(ctx.members, fw, tx_hash) {
-                return Err(format!(
-                    "finalization {receipt_hash:?} settles transaction {tx_hash}, which tick {} \
-                     does not hold for its {:?} half",
-                    fw.tick_id(),
-                    fw.half(),
-                ));
-            }
             if fold.resolved_here.contains(&tx_hash) {
                 return Err(format!(
                     "transaction {tx_hash} resolved twice within the same block"
@@ -639,6 +612,18 @@ impl Section for FinalizationsSection {
             }
             if outcome.decides() {
                 already_resolved(ctx, tx_hash)?;
+            }
+            // A half settles only members its tick holds for that half: a
+            // discarded one is released or gone, one an earlier legs half
+            // of the tick named is deleted, and a later finalization of
+            // either is refused.
+            if !held_for(ctx.members, fw, tx_hash) {
+                return Err(format!(
+                    "finalization {receipt_hash:?} settles transaction {tx_hash}, which tick {} \
+                     does not hold for its {:?} half",
+                    fw.tick_id(),
+                    fw.half(),
+                ));
             }
         }
         let stated = match fw.half() {
@@ -677,9 +662,8 @@ impl Section for FinalizationsSection {
 ///
 /// Its settled outcomes are held to their rows by the caller. Here each
 /// yes is held to a row its tick holds in flight on terms a counterpart
-/// shares, every outcome to a reserved place and to a row of its own,
-/// and the outcomes together to the count of rows the tick holds outside
-/// its determined half.
+/// shares, every outcome to a row of its own, and the outcomes together
+/// to the count of rows the tick holds outside its determined half.
 fn states_its_tick_whole(
     members: &MemberIndex,
     fold: &FinalizationsFold,
@@ -716,13 +700,6 @@ fn states_its_tick_whole(
         stated += 1;
     }
     let outcomes: Vec<&TxOutcome> = fw.settled_outcomes().chain(fw.stated_outcomes()).collect();
-    if let Some(unreserved) = outcomes.iter().find(|outcome| !outcome.reserved()) {
-        return Err(format!(
-            "finalization {receipt_hash:?} states transaction {}, which no committing block \
-             reserved a place for",
-            unreserved.tx_hash()
-        ));
-    }
     if outcomes.is_empty() {
         return Err(format!(
             "finalization {receipt_hash:?} states no member of tick {}",
@@ -735,26 +712,27 @@ fn states_its_tick_whole(
 }
 
 /// A refusal unless `fw`, a determined half, settles every row its tick
-/// holds for one.
+/// holds for one, and some row.
 ///
-/// Its reserved outcomes are held to their rows by the caller, each to
-/// one in flight in the tick that the determined half alone settles.
-/// Here they are held to rows of their own and to the count of such
-/// rows the tick's own row lists. A tick's certificate projects to any
-/// of its outcomes under one root and one signature, so a half over
-/// some of those rows is as well formed as the half over all of them;
-/// and a tick takes one determined half, since the frontier it carries
-/// refuses a second. One settling part of the rows would leave the rest
-/// in flight behind a frontier no half of theirs settles above.
-///
-/// A member no committing block reserved a place for holds no row, and
-/// the count says nothing of it: a tick of nothing but such members
-/// holds no row for the half, and its half is admitted over none.
+/// Its outcomes are held to their rows by the caller, each to one in
+/// flight in the tick that the determined half alone settles. Here they
+/// are held to rows of their own and to the count of such rows the
+/// tick's own row lists. A tick's certificate projects to any of its
+/// outcomes under one root and one signature, so a half over some of
+/// those rows is as well formed as the half over all of them; and a tick
+/// takes one determined half, since the frontier it carries refuses a
+/// second. One settling part of the rows would leave the rest in flight
+/// behind a frontier no half of theirs settles above. A half over none
+/// settles nothing a row owes, and is refused.
 fn settles_its_rows_whole(members: &MemberIndex, fw: &Finalization) -> Result<(), String> {
-    let reserved: Vec<&TxOutcome> = fw
-        .settled_outcomes()
-        .filter(|outcome| outcome.reserved())
-        .collect();
+    let outcomes: Vec<&TxOutcome> = fw.settled_outcomes().collect();
+    if outcomes.is_empty() {
+        return Err(format!(
+            "finalization {:?} settles no member of tick {}",
+            fw.receipt_hash(),
+            fw.tick_id().block_height().inner(),
+        ));
+    }
     let listed: BTreeSet<TxHash> = members
         .ticks
         .get(&fw.tick_id().block_height())
@@ -763,7 +741,7 @@ fn settles_its_rows_whole(members: &MemberIndex, fw: &Finalization) -> Result<()
         .into_iter()
         .filter(|&tx_hash| held_for(members, fw, tx_hash))
         .count();
-    covers_its_rows(fw, &reserved, held)
+    covers_its_rows(fw, &outcomes, held)
 }
 
 /// A refusal unless `outcomes`, the ones of `fw` that each stand over a
@@ -817,9 +795,8 @@ fn settles_in_order(
         // A tick at or below the frontier leaves no range to read.
         if tick > settled
             && let Some(owed) = ctx
-                .owed_determined
-                .range((Bound::Excluded(settled), Bound::Included(tick)))
-                .next()
+                .members
+                .first_owed_determined((Bound::Excluded(settled), Bound::Included(tick)))
         {
             return Err(format!(
                 "{:?} half of tick {} settles ahead of tick {}, whose determined half the chain \
@@ -843,9 +820,8 @@ fn settles_in_order(
     // whose half is refused for good the moment its certificate lands,
     // leaving its members committed and never finalized.
     if let Some(skipped) = ctx
-        .owed_determined
-        .range((Bound::Excluded(settled), Bound::Excluded(tick)))
-        .next()
+        .members
+        .first_owed_determined((Bound::Excluded(settled), Bound::Excluded(tick)))
     {
         return Err(format!(
             "determined half of tick {} settles past tick {}, whose own determined half the \
@@ -938,7 +914,6 @@ pub fn admit_finalization_over(
         panic!("the one window spans every anchor");
     };
     let (chain, dedup) = (QcChainSets::default(), CommitDedupIndex::new());
-    let owed_determined = rows.owed_determined();
     let ctx = Committed {
         snapshot,
         window,
@@ -957,7 +932,6 @@ pub fn admit_finalization_over(
         dedup: &dedup,
         parent_settled_frontier: Some(frontier),
         members: rows,
-        owed_determined: &owed_determined,
     };
     FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
 }
@@ -1024,9 +998,6 @@ impl RecordsSection<'_> {
     /// Whether every name a record carries is one the departed shard was
     /// party to, by [`UnsettledTx::party`]: it held one of the name's
     /// remote routes when the transaction committed, and left afterwards.
-    /// A crossing named off its leaf is held to
-    /// [`UnclaimedCrossing::party`](hyperscale_types::UnclaimedCrossing::party):
-    /// the departed shard was the only one that could have taken it.
     ///
     /// A stranger to the departed shard is absent from its settled set
     /// trivially, and abandoning it would charge a payer for a
@@ -1049,21 +1020,6 @@ impl RecordsSection<'_> {
                 return Err(format!(
                     "abandonment record names {}, which the departed shard {:?} was not party to",
                     entry.tx_hash,
-                    record.shard()
-                ));
-            }
-        }
-        for crossing in record.unclaimed() {
-            if !crossing.party(
-                ctx.local_shard,
-                record.shard(),
-                record.terminal_wt(),
-                &departures,
-            ) {
-                return Err(format!(
-                    "abandonment record names the crossing at {:?}, which the departed shard {:?} \
-                     was not the one to take",
-                    crossing.record,
                     record.shard()
                 ));
             }
@@ -1513,15 +1469,81 @@ pub(crate) mod fixtures {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
-    use hyperscale_storage::MemberIndex;
+    use hyperscale_hbor::Capped;
+    use hyperscale_storage::{MemberIndex, MemberRow, RowState, TickRow};
+    use hyperscale_types::test_utils::stub_abort_charge;
     use hyperscale_types::{
-        Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
-        ShardAnchor, ShardId, StateRoot, TopologySchedule, TopologySnapshot, ValidatorSet,
+        Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch, Finalization,
+        GlobalReceiptHash, Hash, Joins, NetworkDefinition, Settlement, ShardAnchor, ShardId,
+        StateRoot, TickHalf, TopologySchedule, TopologySnapshot, ValidatorSet, Verifiable,
         WeightedTimestamp, WindowLookup,
     };
 
     use super::{Committed, QcChainSets};
     use crate::commit_dedup::CommitDedupIndex;
+
+    /// `members` holding, for each determined or legs half among
+    /// `certificates` of `local`'s own ticks, the row of each member no
+    /// row stands for yet: in flight in that tick and settled by the
+    /// determined half alone, or stated in it for the legs half.
+    pub fn hold_settled(
+        members: &mut MemberIndex,
+        local: ShardId,
+        certificates: &[Arc<Verifiable<Finalization>>],
+    ) {
+        for fw in certificates {
+            let fw = fw.as_unverified();
+            let legs = fw.half() == TickHalf::Legs;
+            if !(fw.is_determined() || legs) || fw.tick_id().shard_id() != local {
+                continue;
+            }
+            let tick = fw.tick_id().block_height();
+            for tx in fw.tx_hashes() {
+                if members.members.contains_key(&tx) {
+                    continue;
+                }
+                let row = MemberRow {
+                    tx,
+                    deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
+                    committed: WeightedTimestamp::ZERO,
+                    height: BlockHeight::new(1),
+                    state: if legs {
+                        RowState::Stated {
+                            tick,
+                            receipt: GlobalReceiptHash::ZERO,
+                        }
+                    } else {
+                        RowState::InFlight {
+                            tick,
+                            joins: Joins::Executes,
+                            settlement: Settlement::Alone,
+                        }
+                    },
+                    holds: Capped::empty(),
+                    reach: Capped::empty(),
+                    awaits: Capped::empty(),
+                    charge: stub_abort_charge(0),
+                    share: 0,
+                    reserves: Capped::empty(),
+                    crossings: Capped::empty(),
+                    waiting: None,
+                    covered: false,
+                    executed: true,
+                    hearing: Capped::empty(),
+                };
+                members.members.insert(tx, row);
+                let held = members.ticks.entry(tick).or_insert(TickRow {
+                    members: Capped::empty(),
+                    determined_unsettled: !legs,
+                    awaiting: 0,
+                });
+                held.awaiting += u32::from(legs);
+                let mut members = held.members.to_vec();
+                members.push(tx);
+                held.members = Capped::new(members).expect("a list written out in a test");
+            }
+        }
+    }
 
     /// What a test block is admitted against: one window, with nothing
     /// behind the parent and nothing committed unless a test puts it
@@ -1537,10 +1559,15 @@ pub(crate) mod fixtures {
         pub(crate) dedup: CommitDedupIndex,
         pub(crate) parent_settled_frontier: Option<BlockHeight>,
         pub(crate) members: MemberIndex,
-        pub(crate) owed_determined: BTreeSet<BlockHeight>,
     }
 
     impl Against {
+        /// This admission holding the rows [`hold_settled`] writes for
+        /// `certificates`.
+        pub fn holding_settled(&mut self, certificates: &[Arc<Verifiable<Finalization>>]) {
+            hold_settled(&mut self.members, self.local_shard, certificates);
+        }
+
         /// Admission under `snapshot`, whose one window spans every
         /// anchor a test sets.
         pub fn window(snapshot: TopologySnapshot) -> Self {
@@ -1567,7 +1594,6 @@ pub(crate) mod fixtures {
                 dedup: CommitDedupIndex::new(),
                 parent_settled_frontier: Some(BlockHeight::GENESIS),
                 members: MemberIndex::empty(ShardId::ROOT),
-                owed_determined: BTreeSet::new(),
             }
         }
 
@@ -1592,7 +1618,6 @@ pub(crate) mod fixtures {
                 dedup: &self.dedup,
                 parent_settled_frontier: self.parent_settled_frontier,
                 members: &self.members,
-                owed_determined: &self.owed_determined,
             }
         }
     }
@@ -1610,17 +1635,7 @@ pub(crate) mod fixtures {
         survivors: &[ShardId],
         handoff_complete: Option<Epoch>,
     ) -> TopologySchedule {
-        departures_cut_at(DEPARTURE_CUT_MS, departed, survivors, handoff_complete)
-    }
-
-    /// [`departures`], with every window `cut_ms` long, so the cut falls
-    /// at `cut_ms`.
-    pub fn departures_cut_at(
-        cut_ms: u64,
-        departed: &[ShardId],
-        survivors: &[ShardId],
-        handoff_complete: Option<Epoch>,
-    ) -> TopologySchedule {
+        let cut_ms = DEPARTURE_CUT_MS;
         let window = |shards: &[ShardId], boundaries: BTreeMap<ShardId, ShardAnchor>| {
             Arc::new(TopologySnapshot::from_explicit_committees(
                 NetworkDefinition::simulator(),

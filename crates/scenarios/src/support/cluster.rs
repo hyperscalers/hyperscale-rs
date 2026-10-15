@@ -278,17 +278,16 @@ pub trait Cluster {
     /// shape replicated on every participant and a shape divided into a
     /// core and its legs settle to the same balances, and a scenario
     /// asserting the divided path has to read which one ran. A shard
-    /// that ran a member and later composed a reclaim for the same
-    /// transaction reports both.
+    /// that ran a member and later abandoned it reports both.
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs>;
 
     /// Every abandonment record on `shard`'s chain naming `tx`: the
     /// height each committed at and the departed shard it speaks for.
     ///
-    /// An observation seam like [`Self::ran`]: a record licenses a
-    /// reclaim, and whether a chain wrote one for a transaction is a
-    /// fact about its blocks that no balance reads back once the
-    /// reclaim and the settlement it races have both landed.
+    /// An observation seam like [`Self::ran`]: a record licenses an
+    /// abandonment, and whether a chain wrote one for a transaction is
+    /// a fact about its blocks that no balance reads back once the
+    /// abandonment and the settlement it races have both landed.
     fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)>;
 
     /// Whether `shard`'s chain has carried a held reading of `key`, on
@@ -334,8 +333,8 @@ pub trait Cluster {
     /// The height at which `shard`'s chain burned `tx`'s price, if it
     /// has: the block carrying the finalization of the member that held
     /// its row, or its fate. Apart from [`chain_fate`](Self::chain_fate)'s
-    /// decision, which a reclaim's finalization gives without burning
-    /// anything.
+    /// decision, which says what the chain decided and not whether it
+    /// burned anything.
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight>;
 
     /// Everything `shard`'s chain carries of `txs` from `from` up, read

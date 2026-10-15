@@ -1,7 +1,7 @@
 //! What history a shard keeps, and until when.
 //!
 //! Retention is a span of weighted time. Every window that licenses a
-//! read of history — a reclaim probe's, a provision's, a state proof's —
+//! read of history — a sibling question's, a provision's, a state proof's —
 //! is stated in milliseconds against the consensus-authenticated
 //! weighted timestamp, so a count of versions answers those windows only
 //! through whatever block rate the chain happens to be running at.

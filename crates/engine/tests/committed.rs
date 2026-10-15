@@ -14,7 +14,7 @@ use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
     GenesisPackages, genesis_world_with_pools, pool_address, stake_unit,
 };
-use hyperscale_engine::legs::{Classified, Member, Runs};
+use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_engine::tick_select::{CommittedSets, member_lines, terms_of_member};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
@@ -33,7 +33,7 @@ use hyperscale_types::{
     MAX_INTENT_VALIDITY_RANGE, Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
     Settlement, ShardId, ShardTrie, StakePoolId, StakePoolSeat, StateRoot, StateWrites,
     StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction,
-    TxHash, UnsettledCredits, Verified, WeightedTimestamp, absorb_committed_cells,
+    TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{Composed, Hash32, InstanceMeta, IntentHeader, Value, package_hash};
 use hyperscale_vm_fixtures::{peg, peg_package_hash};
@@ -819,7 +819,6 @@ fn a_till_a_pending_member_took_is_not_taken_again_below_its_verdict() {
         TickOutput {
             determined: Vec::new(),
             provisional: vec![provisional(&first, &ran)],
-            rowless: BTreeSet::new(),
         },
         &[],
     );
@@ -1111,7 +1110,6 @@ impl Window {
                     env: TickEnvironment::unfolded(),
                     holds: &ProvisionalHolds::new(),
                     fee_holds: &NoFeeHolds,
-                    unsettled_credits: &UnsettledCredits::new(),
                 },
                 PriceTable::GENESIS,
                 &store,
@@ -1220,15 +1218,14 @@ impl Window {
             env: TickEnvironment::unfolded(),
             holds: &holds,
             fee_holds: &NoFeeHolds,
-            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
-            transaction: Some(tx),
+            transaction: tx,
             provisions,
             clock: ANCHOR,
-            runs: Runs::Shape(self.member(tx)),
+            member: self.member(tx),
             arrivals: &[],
         };
         let executed = self

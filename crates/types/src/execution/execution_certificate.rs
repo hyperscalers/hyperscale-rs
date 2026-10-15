@@ -970,7 +970,7 @@ mod tests {
                 TxHash::from(Hash::from_bytes(b"worked-tx")),
                 ExecutionOutcome::Aborted,
             )
-            .reserving(amount)
+            .charging(amount)
         };
         let outcomes = vec![charged(100)];
         let root = compute_global_receipt_root(&outcomes);

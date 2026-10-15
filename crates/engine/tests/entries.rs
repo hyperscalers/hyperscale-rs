@@ -22,7 +22,7 @@ use hyperscale_types::{
     BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EntryKey, FrontierInputs,
     MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProtocolHasher,
     ProvisionalHolds, ResourceAddr, SettledWrites, ShardId, ShardTrie, StoredReceipt,
-    TimestampRange, Transaction, UnsettledCredits, Verified, WeightedTimestamp,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
@@ -155,7 +155,6 @@ fn run_tick(
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");

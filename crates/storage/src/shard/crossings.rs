@@ -686,14 +686,14 @@ mod tests {
         Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, EpochWindows,
         FrontierInputs, Hash, LocalKey, MemberTerms, MerkleInclusionProof, RETENTION_HORIZON,
         ReadFence, ReadFrontier, ReadMark, Reading, ResourceAddr, Settlement, ShardId, StateRoot,
-        Stated, StatedTerms, TickHalf, TickId, TickLine, TxHash, WeightedTimestamp, encode_amount,
+        Stated, StatedTerms, TickLine, TxHash, WeightedTimestamp, encode_amount,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use proptest::collection::vec;
     use proptest::prelude::*;
 
     use super::*;
-    use crate::shard::members::{MemberIndex, MemberInputs, RowState, SettledHalf};
+    use crate::shard::members::{MemberIndex, MemberInputs, RowState};
 
     /// A store of cells alone.
     struct Cells(BTreeMap<SubstateKey, Vec<u8>>);
@@ -1214,12 +1214,10 @@ mod tests {
         )
     }
 
-    /// A `Never` goes once its producer's leg is fated, and not at the
-    /// leg's reclaim. The producer's chain commits the issuing
-    /// transaction as a leg that waits; a reclaim's finalization names it
-    /// and releases the row, which stands, so a reading of the row beside
-    /// the record's absence proves no exit; the fate deletes the row, and
-    /// the reading taken past it does.
+    /// A `Never` goes once its producer's leg is fated. The producer's
+    /// chain commits the issuing transaction as a leg that waits, whose
+    /// standing row beside the record's absence proves no exit; the fate
+    /// deletes the row, and the reading taken past it does.
     #[test]
     fn an_unseen_never_goes_once_its_producers_leg_is_fated() {
         let id = crossing(0x2B);
@@ -1262,29 +1260,6 @@ mod tests {
         });
         assert_eq!(state_of(&producer), Some(RowState::Pending));
         assert!(removed(&producer, 91).is_empty());
-
-        producer.advance(&MemberInputs {
-            height: BlockHeight::new(2),
-            settled: vec![SettledHalf {
-                tick: TickId::new(PRODUCER, BlockHeight::new(2)),
-                half: TickHalf::Determined,
-                stated: Vec::new(),
-                deleted: Vec::new(),
-                accepted: Vec::new(),
-                reclaimed: vec![issuer()],
-            }],
-            ..MemberInputs::still(PRODUCER)
-        });
-        assert_eq!(
-            state_of(&producer),
-            Some(RowState::Released {
-                settlement: Settlement::Alone
-            }),
-        );
-        assert!(
-            removed(&producer, 92).is_empty(),
-            "the reclaim deletes no row, so the leg has not exited",
-        );
 
         producer.advance(&MemberInputs {
             height: BlockHeight::new(3),

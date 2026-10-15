@@ -410,9 +410,7 @@ impl ShardParticipation {
     }
 
     /// What reads the tip after its folds, run once per event however
-    /// many blocks the event folded: the vote scan, the fold's owed
-    /// determined ticks mirrored into consensus (where the proposer's
-    /// selection and the vote path both refuse by them), the seat
+    /// many blocks the event folded: the vote scan, the seat
     /// questions the tip's member rows put to counterparts, the verdict
     /// questions its hearing rows put to their siblings, and the proposal
     /// latch.
@@ -423,8 +421,6 @@ impl ShardParticipation {
         // The single path to execution voting from a commit: every
         // replica at this tip produces the same votes.
         let mut actions = self.execution_coordinator.emit_vote_actions(sched);
-        self.shard_coordinator
-            .set_owed_determined(self.execution_coordinator.owed_determined_ticks());
         actions.extend(
             self.execution_coordinator
                 .ask_seats(&self.shard_coordinator.seat_questions()),
@@ -438,7 +434,6 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine, TimerId};
@@ -1139,10 +1134,6 @@ mod tests {
         assert!(
             reported < dispatched,
             "the mempool hears the block before the fold's actions"
-        );
-        assert_eq!(
-            node.shard_coordinator().owed_determined(),
-            &BTreeSet::from([BlockHeight::new(1)]),
         );
         assert_eq!(
             node.mempool_coordinator().status(&tx_hash),

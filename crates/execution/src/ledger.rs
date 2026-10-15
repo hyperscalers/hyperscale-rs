@@ -26,26 +26,12 @@ use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, CommittedAt, Deadline, Finalization, Inclusion, Issuer,
-    MAX_VALIDITY_RANGE, PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Window, answer_hashes,
+    MAX_VALIDITY_RANGE, PriceTable, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, Kind};
+use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::ProtocolHasher;
-
-/// What the chain read of one cell a counterpart was asked about:
-/// which question the cell answers, and what it said.
-///
-/// A reading is the chain's, folded off the block that carries the
-/// claim by every replica alike, and it is never asked again: it is
-/// what licenses the settlement of the crossing the cell was asked
-/// about. What this validator has fetched and holds to offer is not
-/// here — it is the validator's own, and lives beside the ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Reading {
-    probed: Probed,
-    inclusion: Inclusion,
-}
 
 /// How far a tick of this shard's has spoken for a transaction, in the
 /// order the ranks outrank each other: a tick discarded, wedged or
@@ -105,22 +91,27 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     departed_by: Option<ShardId>,
-    /// What the chain has read of the cells counterparts were asked
-    /// about, by the shard each was read on and the cell.
+    /// The siblings' committed cells the chain has read absent inside
+    /// [`Window::Core`], by the shard each was read on and the cell.
+    ///
+    /// The chain's, folded off the block that carries the claim by
+    /// every replica alike, and never asked again. What this validator
+    /// has fetched and holds to offer is not here: it is the
+    /// validator's own, and lives beside the ledger.
     ///
     /// Held on the entry rather than beside the ledger because that is
-    /// the lifetime: a reading speaks only for a transaction still owed
+    /// the lifetime: an absence speaks only for a transaction still owed
     /// an outcome here, and the entry going is what makes it moot. A
-    /// second home would have to be reclaimed on its own rule, and two
+    /// second home would have to be pruned on its own rule, and two
     /// rules for one fact are two answers to when it stops being true.
-    readings: BTreeMap<(ShardId, SubstateKey), Reading>,
+    absences: BTreeSet<(ShardId, SubstateKey)>,
     /// The cells the entry's questions and its settlement are named by,
     /// derived from its part once, where the entry is held.
     cells: Cells,
 }
 
 /// The cells one entry is named by on its own shard: the records it
-/// issued, and the cells its counterparts answer at.
+/// issued, and its core siblings' committed cells.
 ///
 /// Each is a function of the transaction, the classification its
 /// committing block froze and this shard's identity, none of which
@@ -133,21 +124,8 @@ struct Cells {
     issued: Vec<SubstateKey>,
     /// Each other core shard's committed cell for the transaction.
     core: Vec<(ShardId, SubstateKey)>,
-    /// [`Kept::claims`].
-    claims: Vec<AnswerCell>,
-    /// [`Kept::deliveries`].
-    deliveries: Vec<AnswerCell>,
-}
-
-/// One answer cell the consumer of a crossing this shard issued writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AnswerCell {
-    /// The shard that held the consumer when the transaction committed.
-    home: ShardId,
-    /// The cell.
-    key: SubstateKey,
-    /// The crossing it answers, which the answer's bytes derive from.
-    id: CrossingId,
+    /// [`Kept::delivers`].
+    delivers: bool,
 }
 
 impl Cells {
@@ -168,8 +146,7 @@ impl Cells {
                     (shard, cell)
                 })
                 .collect(),
-            claims: kept.claims(local),
-            deliveries: kept.deliveries(local),
+            delivers: kept.delivers(local),
         }
     }
 }
@@ -190,7 +167,7 @@ impl Owed {
             certified,
             part,
             departed_by,
-            readings: BTreeMap::new(),
+            absences: BTreeSet::new(),
             cells,
         }
     }
@@ -199,15 +176,7 @@ impl Owed {
     /// claim for, so its verdict resolves the transaction and leaves the
     /// entry standing until the commit fold retires them.
     const fn owes_deliveries(&self) -> bool {
-        matches!(self.part, Part::Core(_)) && !self.cells.deliveries.is_empty()
-    }
-
-    /// The questions the chain read absent, each an answer that the
-    /// counterpart asked can never settle the transaction.
-    fn absences(&self) -> impl Iterator<Item = Probed> + '_ {
-        self.readings.values().filter_map(|reading| {
-            matches!(reading.inclusion, Inclusion::Absent).then_some(reading.probed)
-        })
+        matches!(self.part, Part::Core(_)) && self.cells.delivers
     }
 
     /// The issuer an answer to a record of this entry's derives from:
@@ -225,43 +194,13 @@ impl Owed {
         })
     }
 
-    /// Whether `inclusion`, read at `key` for the question `probed`, is
-    /// a reading of this entry's own transaction.
-    ///
-    /// A committed cell is keyed by the transaction, so any reading of
-    /// it is. A claim is keyed by the edge alone, and an edge is issued
-    /// again by any later transaction carrying its
-    /// intent: a presence there is this entry's answer only where it
-    /// states the hash of an answer derived from this entry's
-    /// transaction. One stating anything else is what a consumer
-    /// answered another transaction's record at the same key.
-    fn answered_by(&self, key: SubstateKey, probed: Probed, inclusion: Inclusion) -> bool {
-        let answered = match probed {
-            Probed::Core => return true,
-            Probed::Claim => Answered::Taken,
-        };
-        let Inclusion::Present(stated) = inclusion else {
-            return true;
-        };
-        let Some(issuer) = self.issuer() else {
-            return false;
-        };
-        let cells = &self.cells;
-        cells
-            .claims
-            .iter()
-            .chain(&cells.deliveries)
-            .filter(|cell| cell.key == key)
-            .any(|cell| answer_hashes(&cell.id, issuer, answered).contains(&stated))
-    }
-
     /// Whether the chain has established that no counterpart can settle
     /// the transaction: a departed shard's record names it, a cell a
     /// counterpart would have written was read absent inside its
     /// window. Either licenses the abandonment, and puts every question
     /// the entry asks to rest.
     fn covered(&self) -> bool {
-        self.departed_by.is_some() || self.absences().next().is_some()
+        self.departed_by.is_some() || !self.absences.is_empty()
     }
 
     /// The moment the entry stops being settleable and becomes the
@@ -341,8 +280,8 @@ pub enum Part {
     /// verdict.
     Whole,
     /// A leg outside the core, held for the settlement of what it
-    /// issued: never abandoned, probed past the deadline, closed by the
-    /// commit fold taking its records back or retiring them.
+    /// issued: never abandoned, asking nothing, closed by the commit
+    /// fold taking its records back or retiring them.
     Leg(LegEntry),
     /// A member of the core, whose verdict is its own and which issues
     /// crossings deliveries elsewhere consume.
@@ -543,41 +482,12 @@ impl Kept {
             .collect()
     }
 
-    /// The claim cells the consumers' folds write for the owed crossings
-    /// `local` issued, each under the shard that held the consumer when
-    /// the transaction committed. The cell follows its prefix to a
-    /// departed consumer's successor, which [`Ledger::questions`]
-    /// resolves off the trie it is given.
-    fn deliveries(&self, local: ShardId) -> Vec<AnswerCell> {
-        self.answers(local, Kind::Owed, Answered::Taken)
-    }
-
-    /// The answer cells in `answered`'s role that consumers of the
-    /// `kind` crossings `local` issued write, each under the consumer's
-    /// frozen home.
-    fn answers(&self, local: ShardId, kind: Kind, answered: Answered) -> Vec<AnswerCell> {
+    /// Whether `local` issued an owed crossing, which a delivery
+    /// elsewhere claims and nothing takes back.
+    fn delivers(&self, local: ShardId) -> bool {
         self.classified
             .crossings()
-            .filter(|(edge, _)| edge.from == local && edge.crossing.kind == kind)
-            .map(|(edge, home)| {
-                let id = edge.crossing.id;
-                AnswerCell {
-                    home,
-                    key: id.answer_key(&ProtocolHasher, answered),
-                    id,
-                }
-            })
-            .collect()
-    }
-
-    /// The claim cells core consumers write for the crossings a leg on
-    /// `local` issued, each under the shard holding the consumer's
-    /// target — what a probe asks the core about, and whose presence
-    /// licenses the retirement. Empty for a core shard: a leg beside the
-    /// core is the core's, so nothing a core shard produces is claimed
-    /// by a core it is not in.
-    fn claims(&self, local: ShardId) -> Vec<AnswerCell> {
-        self.answers(local, Kind::Escrowed, Answered::Taken)
+            .any(|(edge, _)| edge.from == local && edge.crossing.kind == Kind::Owed)
     }
 }
 
@@ -597,8 +507,6 @@ pub struct Question {
     pub shard: ShardId,
     /// The cell it asks about.
     pub(crate) key: SubstateKey,
-    /// Which question it is.
-    pub(crate) probed: Probed,
     /// The entry's deadline, which every window an answer is held to
     /// is read off.
     pub(crate) deadline: Deadline,
@@ -612,6 +520,25 @@ impl Question {
     #[must_use]
     pub(crate) fn open_at(self, now: WeightedTimestamp) -> bool {
         self.deadline.passed(now)
+    }
+
+    /// Whether a header at `anchor_wt` is one to ask at: inside
+    /// [`Window::Core`], where an absence of the sibling's committed
+    /// cell answers.
+    #[must_use]
+    pub(crate) fn asks_at(self, anchor_wt: WeightedTimestamp) -> bool {
+        Window::Core.of(self.deadline).contains(&anchor_wt)
+    }
+
+    /// Whether `inclusion`, read at `read_at`, answers the question: an
+    /// absence inside [`Window::Core`]. A committed cell present is a
+    /// sibling that included the transaction and answers for it itself,
+    /// with a claim or a `Never` beside the cell, so it answers nothing
+    /// here; an absence outside the window is a cell not yet written or
+    /// already swept, and says nothing either way.
+    #[must_use]
+    pub(crate) fn answered_by(self, read_at: WeightedTimestamp, inclusion: Inclusion) -> bool {
+        matches!(inclusion, Inclusion::Absent) && self.asks_at(read_at)
     }
 }
 
@@ -747,7 +674,6 @@ impl Ledger {
                     tx,
                     committed,
                     classified.local_price(tx, self.local, prices),
-                    classified.escrowed_records(self.local),
                     prices,
                 ),
                 Certified::No,
@@ -758,17 +684,12 @@ impl Ledger {
         }
     }
 
-    /// What the chain read of `key` on `shard` for `tx_hash`, once it
-    /// has read it.
+    /// Whether the chain read `key` on `shard` absent for `tx_hash`.
     #[cfg(test)]
-    pub(crate) fn reading(
-        &self,
-        tx_hash: TxHash,
-        shard: ShardId,
-        key: SubstateKey,
-    ) -> Option<Inclusion> {
-        let reading = self.owed.get(&tx_hash)?.readings.get(&(shard, key))?;
-        Some(reading.inclusion)
+    pub(crate) fn read_absent(&self, tx_hash: TxHash, shard: ShardId, key: SubstateKey) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.absences.contains(&(shard, key)))
     }
 
     /// Give a registered entry the part a fixture wants it to play,
@@ -783,53 +704,30 @@ impl Ledger {
         }
     }
 
-    /// Record what the chain read of `key` on `shard` for `tx_hash`,
-    /// the question `probed` asks. First reading wins: `false` says the
-    /// cell was already read, the transaction is not held here, or the
-    /// reading answers nothing — and a later claim adds nothing.
+    /// Record that the chain read the sibling's committed cell at `key`
+    /// on `shard` absent for `tx_hash`, an absence
+    /// [`Question::answered_by`] admits. First reading wins: `false`
+    /// says the cell was already read or the transaction is not held
+    /// here, and a later claim adds nothing.
     ///
-    /// A reading [`Probed::read`] does not admit is refused here rather
-    /// than only at the fold that fetches one, because what it would
-    /// leave behind is not a spare row: [`Self::covered`] counts any
-    /// absence, so an absence that answers nothing would cover the
-    /// entry. Capped at the store, the set of absences an entry can
-    /// hold is exactly the one `Probed::read` admits — the committed
-    /// cell's.
-    ///
-    /// So is a claim read present that is no answer of this
-    /// transaction's ([`Owed::answered_by`]): it is what a consumer
-    /// answered another transaction's record at the same key, and the
-    /// question stays open for the entry's own answer.
-    pub(crate) fn record_reading(
+    /// Only an answering absence is recorded, because [`Self::covered`]
+    /// counts any absence: one that answered nothing would cover the
+    /// entry.
+    pub(crate) fn record_absence(
         &mut self,
         tx_hash: TxHash,
         shard: ShardId,
         key: SubstateKey,
-        probed: Probed,
-        inclusion: Inclusion,
     ) -> bool {
-        if probed.read(inclusion).is_none() {
-            return false;
-        }
-        let Some(owed) = self.owed.get_mut(&tx_hash) else {
-            return false;
-        };
-        if !owed.answered_by(key, probed, inclusion) {
-            return false;
-        }
-        match owed.readings.entry((shard, key)) {
-            std::collections::btree_map::Entry::Occupied(_) => false,
-            std::collections::btree_map::Entry::Vacant(vacant) => {
-                vacant.insert(Reading { probed, inclusion });
-                true
-            }
-        }
+        self.owed
+            .get_mut(&tx_hash)
+            .is_some_and(|owed| owed.absences.insert((shard, key)))
     }
 
     /// Whether `inclusion`, read at `read_at`, answers `question` for
-    /// the entry that asked it: inside the window the question's cell
-    /// answers in, and a reading of the entry's own transaction. What
-    /// [`Self::record_reading`] would keep, asked without keeping it.
+    /// the entry that asked it ([`Question::answered_by`]), for an entry
+    /// still held. What [`Self::record_absence`] would keep, asked
+    /// without keeping it.
     #[must_use]
     pub(crate) fn answers(
         &self,
@@ -837,99 +735,47 @@ impl Ledger {
         read_at: WeightedTimestamp,
         inclusion: Inclusion,
     ) -> bool {
-        question
-            .probed
-            .answer(read_at, question.deadline, inclusion)
-            .is_some()
-            && self
-                .owed
-                .get(&question.tx_hash)
-                .is_some_and(|owed| owed.answered_by(question.key, question.probed, inclusion))
+        question.answered_by(read_at, inclusion) && self.owed.contains_key(&question.tx_hash)
     }
 
-    /// Every question this ledger has open, under `trie`, whatever the
-    /// clock: for each entry nothing has answered for, each other core
-    /// shard's committed cell, each core consumer's claim on the shard
-    /// holding the consumer's target and on whatever holds the prefix
-    /// now, and each delivery's claim on the shard that was to
-    /// deliver it and on whatever shard holds the cell's prefix now —
-    /// each less the cells the chain has already read.
+    /// Every question this ledger has open, whatever the clock: for
+    /// each core member nothing has answered for, each other core
+    /// shard's committed cell, less the cells the chain has already
+    /// read.
     ///
     /// Whatever the clock, because a claim the chain committed is read
     /// against these too, and the claim's own anchor says whether the
-    /// window was open. `trie` is the block's committee's, which says
-    /// who holds a cell's prefix now: a claim cell follows its prefix
-    /// across a cut to a departed shard's successor, and both are asked
-    /// because the vote fence checks a record against the voter's own
-    /// proof of the shard it names, so two validators straddling the
-    /// cut would otherwise prove different shards and never both vote
-    /// one record. This shard is never asked about: a core member holds
-    /// the core it is part of, itself included, but what it has
+    /// window was open. This shard is never asked about: a core member
+    /// holds the core it is part of, itself included, but what it has
     /// committed is not something it fetches a proof of.
+    ///
+    /// A core member waits only for its siblings, whose certificates its
+    /// own settlement needs. A sibling that refused keeps its committed
+    /// cell, so the cell reads present and answers nothing here: what
+    /// covers the waiting core is the sibling's certificate, pushed by
+    /// its outbound tracker and servable by transaction inside its
+    /// retention. Losing that road costs liveness only. A leg entry asks
+    /// nothing: the commit fold closes it on what its block carries.
     #[must_use]
-    pub(crate) fn questions(&self, trie: &ShardTrie) -> Vec<Question> {
+    pub(crate) fn questions(&self) -> Vec<Question> {
         let mut questions = Vec::new();
         for (&tx_hash, owed) in &self.owed {
-            if owed.covered() || owed.part.settling().is_none() {
+            if owed.covered() || !matches!(owed.part, Part::Core(_)) {
                 continue;
             }
-            let cells = &owed.cells;
             let deadline = owed.figures.deadline;
-            let question = |shard, key, probed| {
-                (!owed.readings.contains_key(&(shard, key))).then_some(Question {
-                    tx_hash,
-                    shard,
-                    key,
-                    probed,
-                    deadline,
-                })
-            };
-            // What an entry asks about is what it waits on. A leg waits
-            // for the core's verdict and for the crossings it issued to
-            // be claimed; a core member waits only for its siblings,
-            // whose certificates its own settlement needs. Its
-            // deliveries are what it waits on once it has a verdict, as
-            // the remainder its acceptance leaves.
-            //
-            // A sibling that refused keeps its committed cell, so the
-            // cell reads present and answers nothing here: what covers
-            // the waiting core is the sibling's certificate, pushed by
-            // its outbound tracker and servable by transaction inside
-            // its retention. Losing that road costs liveness only — a
-            // presence licenses no credit, so nothing is taken back on
-            // it.
             questions.extend(
-                cells
+                owed.cells
                     .core
                     .iter()
-                    .filter_map(|&(shard, cell)| question(shard, cell, Probed::Core)),
+                    .filter(|&&(shard, key)| !owed.absences.contains(&(shard, key)))
+                    .map(|&(shard, key)| Question {
+                        tx_hash,
+                        shard,
+                        key,
+                        deadline,
+                    }),
             );
-            if !owed.part.is_leg() {
-                continue;
-            }
-            // One question per claim cell, whichever kind of consumer
-            // writes it: a claim answers by being present and by nothing
-            // else, so the side it was issued to changes nothing about
-            // what is asked. A decline is asked of no fresh header: a
-            // record goes back on its consumer's `Never` read at a
-            // boundary of the consumer's shard, which the record's row
-            // asks for. Asked of the shard the classification homed the
-            // consumer on and of whoever holds its prefix now, which are
-            // the same shard until a cut moves it.
-            let asked = |consumer: ShardId, key: SubstateKey, probed: Probed| {
-                let holder = trie.shard_for_prefix(key.owner);
-                let second = (holder != consumer).then_some(consumer.max(holder));
-                [Some(consumer.min(holder)), second]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(move |shard| question(shard, key, probed))
-            };
-            for claim in &cells.claims {
-                questions.extend(asked(claim.home, claim.key, Probed::Claim));
-            }
-            for claim in &cells.deliveries {
-                questions.extend(asked(claim.home, claim.key, Probed::Claim));
-            }
         }
         questions
     }
@@ -941,9 +787,10 @@ impl Ledger {
     }
 
     /// Whether the entry of `tx_hash` issued the record at `record`: the
-    /// entry that composes the disposal of that transaction's record
-    /// there, as against one of another transaction carrying the same
-    /// intent, which names the key and settles nothing of this record.
+    /// entry the fold's retirement or return of that transaction's
+    /// record there closes, as against one of another transaction
+    /// carrying the same intent, which names the key and is closed by
+    /// nothing done to this record.
     #[must_use]
     pub(crate) fn issued_by(&self, record: SubstateKey, tx_hash: TxHash) -> bool {
         self.issuers
@@ -1564,7 +1411,7 @@ impl Ledger {
         // *here*, whatever evidence lands, because this is the road
         // that reads an entry. The leaf's road stays open. Short of
         // it only the finalization that decides it ends it.
-        if owed.part.is_leg() || owed.absences().next().is_some() {
+        if owed.part.is_leg() || !owed.absences.is_empty() {
             return Window::LegEntry.of(owed.figures.deadline).end > now;
         }
         if let Some(shard) = owed.departed_by {
@@ -1618,9 +1465,7 @@ impl Ledger {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_hbor::Capped;
     use hyperscale_storage::committed_tx_cell_key;
-    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
     };
@@ -1628,6 +1473,7 @@ mod tests {
         AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY,
         MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
+    use hyperscale_vm_effects::Answered;
     use proptest::collection::vec as prop_vec;
     use proptest::prelude::*;
 
@@ -1692,25 +1538,6 @@ mod tests {
             .collect();
         assert_eq!(crossings.len(), 1, "the fixture issues one crossing");
         crossings[0]
-    }
-
-    /// `id`'s `answered` cell read present, stating the answer `tx`'s
-    /// consumer writes.
-    fn stating(
-        id: &CrossingId,
-        tx: &Arc<Verifiable<Transaction>>,
-        answered: Answered,
-    ) -> Inclusion {
-        let end = tx.validity_range().end_timestamp_exclusive.as_millis();
-        Inclusion::Present(jmt_value_hash(
-            &id.answer(tx.hash(), answered, end).to_bytes(),
-        ))
-    }
-
-    /// The claim cell the core writes for what `classified` says `LOCAL`
-    /// issued, under the shard holding the consumer's target.
-    fn core_claim(classified: &Classified) -> (ShardId, SubstateKey) {
-        one_claim(classified, Kind::Escrowed, "to the core")
     }
 
     /// The committed cell `shard` writes for `tx`.
@@ -1867,7 +1694,6 @@ mod tests {
             charge: charge(tx),
             committed: committed_at(tx),
             reach: tx.routing().all_routes(),
-            escrowed: Capped::empty(),
         }
     }
 
@@ -1882,7 +1708,6 @@ mod tests {
             tx,
             committed_at(tx),
             tx.price(&PriceTable::GENESIS),
-            Capped::empty(),
             &PriceTable::GENESIS,
         )
         .charge
@@ -2621,150 +2446,77 @@ mod tests {
         );
     }
 
-    /// A leg entry is probeable from its deadline and not a moment
-    /// before, and only while no record covers it; an entry this shard
-    /// ran whole is never probed, since nothing it awaits is a core. A
-    /// leg asks its consumer for the `Taken` alone: a `Never` returns its
-    /// record only at a boundary of the consumer's shard, which the
-    /// record's row asks for.
+    /// A sibling's committed cell read present is a sibling that included
+    /// the transaction, and answers nothing; read absent it answers only
+    /// inside its window.
     #[test]
-    fn a_leg_entry_is_probeable_past_its_deadline_until_a_record_covers_it() {
+    fn a_present_sibling_cell_answers_nothing() {
         let mut ledger = Ledger::new(LOCAL);
-        let leg = tx(4, 60_000);
-        let whole = tx(5, 60_000);
-        commit_as(&mut ledger, &leg, &classified());
-        commit(&mut ledger, &whole);
-        ledger.certify(leg.hash(), Certified::ByExecution);
-        ledger.certify(whole.hash(), Certified::ByExecution);
-
+        let member = tx(5, 60_000);
+        commit_as(&mut ledger, &member, &two_shard_core());
+        ledger.certify(member.hash(), Certified::ByExecution);
+        let question = ledger.questions()[0];
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        let questions = ledger.questions(&ShardTrie::uniform(1));
-        let (consumer, claim) = core_claim(&classified());
-        let question = |key, probed| Question {
-            tx_hash: leg.hash(),
-            shard: PARTNER,
-            key,
-            probed,
-            deadline: Deadline::of(ms(60_000)),
-        };
-        assert_eq!(
-            questions,
-            vec![
-                question(core_cell(PARTNER, &leg), Probed::Core),
-                question(claim, Probed::Claim),
-            ],
-            "the leg asks the core for its committed cell and its claim, and the whole entry \
-             asks nothing"
-        );
-        assert_eq!(consumer, PARTNER);
-        assert!(
-            questions
-                .iter()
-                .all(|question| !question.open_at(deadline.minus(Duration::from_millis(1)))),
-            "before the deadline the core may still commit"
-        );
-        assert!(
-            questions.iter().all(|question| question.open_at(deadline)),
-            "at the deadline the leg is asked about"
-        );
-
-        ledger.record_reading(
-            leg.hash(),
-            PARTNER,
-            core_cell(PARTNER, &leg),
-            Probed::Core,
-            Inclusion::Absent,
-        );
-        assert!(
-            ledger.questions(&ShardTrie::uniform(1)).is_empty(),
-            "a covered entry is asked about once"
-        );
-        assert!(ledger.is_covered(leg.hash()));
+        assert!(!ledger.answers(&question, deadline, Inclusion::Present([7; 32])));
+        assert!(ledger.answers(&question, deadline, Inclusion::Absent));
+        assert!(!ledger.answers(
+            &question,
+            deadline.minus(Duration::from_millis(1)),
+            Inclusion::Absent
+        ));
     }
 
-    /// A leg whose counterpart is a delivery is probeable past the
-    /// deadline like any other and carries the claim cells the probe
-    /// asks about; what covers it is the core's committed cell read
-    /// absent, and a claim read absent covers nothing.
-    ///
-    /// The two readings are not interchangeable and only one of them is
-    /// evidence: a committed cell is written at inclusion and by nothing
-    /// else, so its absence says the core never took the transaction; a
-    /// claim is written by the execution that takes the
-    /// crossing, so its absence says only that nobody has taken it yet.
-    /// [`Probed::read`] admits the first and refuses the second, and
-    /// [`Ledger::record_reading`] is held to the same rule so an entry
-    /// cannot hold an absence that answers nothing.
+    /// A leg entry asks nothing: the commit fold closes it on what its
+    /// block carries. A core member asks its sibling's committed cell
+    /// from its deadline and not a moment before, and only while nothing
+    /// covers it; an entry this shard ran whole is never asked about.
     #[test]
-    fn a_leg_delivered_elsewhere_is_probeable_with_its_claims() {
+    fn a_leg_entry_asks_nothing_and_a_core_member_asks_its_sibling() {
         let mut ledger = Ledger::new(LOCAL);
-        let leg = tx(6, 60_000);
-        commit_as(&mut ledger, &leg, &delivering());
-        ledger.certify(leg.hash(), Certified::ByExecution);
+        let (leg, member, whole) = (tx(4, 60_000), tx(5, 60_000), tx(6, 60_000));
+        commit_as(&mut ledger, &leg, &classified());
+        commit_as(&mut ledger, &member, &two_shard_core());
+        commit(&mut ledger, &whole);
+        for tx in [&leg, &member, &whole] {
+            ledger.certify(tx.hash(), Certified::ByExecution);
+        }
 
-        let (delivered_by, claim) = delivered_claim(&delivering());
-        let question = |shard, key, probed| Question {
-            tx_hash: leg.hash(),
-            shard,
-            key,
-            probed,
-            deadline: Deadline::of(ms(60_000)),
-        };
-        assert_eq!(delivered_by, DELIVERER);
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        let sibling = core_cell(SIBLING, &member);
+        let questions = ledger.questions();
         assert_eq!(
-            ledger.questions(&delivery_trie()),
-            vec![
-                question(BEARER, core_cell(BEARER, &leg), Probed::Core),
-                question(DELIVERER, claim, Probed::Claim),
-            ],
+            questions,
+            vec![Question {
+                tx_hash: member.hash(),
+                shard: SIBLING,
+                key: sibling,
+                deadline: Deadline::of(ms(60_000)),
+            }],
+            "the core member asks its sibling's committed cell, and nothing else asks",
         );
         assert!(
-            !ledger.record_reading(
-                leg.hash(),
-                DELIVERER,
-                claim,
-                Probed::Claim,
-                Inclusion::Absent,
-            ),
-            "a claim read absent answers nothing, so the entry does not hold it",
+            !questions[0].open_at(deadline.minus(Duration::from_millis(1))),
+            "before the deadline the sibling may still commit"
         );
-        assert_eq!(
-            ledger.questions(&delivery_trie()).len(),
-            2,
-            "and the questions both stand, because neither was answered",
-        );
-        assert!(
-            !ledger.is_covered(leg.hash()),
-            "nothing covers the entry on a silence",
-        );
+        assert!(questions[0].open_at(deadline));
 
+        ledger.record_absence(member.hash(), SIBLING, sibling);
         assert!(
-            ledger.record_reading(
-                leg.hash(),
-                BEARER,
-                core_cell(BEARER, &leg),
-                Probed::Core,
-                Inclusion::Absent,
-            ),
-            "the core's committed cell absent is the reading that answers",
+            ledger.questions().is_empty(),
+            "a covered entry is asked about once"
         );
-        assert!(
-            ledger.questions(&delivery_trie()).is_empty(),
-            "covered once"
-        );
-        assert!(ledger.is_covered(leg.hash()));
+        assert!(ledger.is_covered(member.hash()));
     }
 
     /// An issuer in the core is released by its own verdict like any
     /// entry — unless it accepted with deliveries owed, when it stays on
-    /// as a remainder: never abandoned, named by no departure, probed
-    /// past the deadline for its claims, and closed by the commit fold
-    /// once its delivery's `Taken` retires the record.
+    /// as a remainder: never abandoned, named by no departure, asking
+    /// nothing, and closed by the commit fold once its delivery's
+    /// `Taken` retires the record.
     ///
-    /// **A remainder asks one question and a silence never answers it.**
-    /// Its only question is its delivery's claim, whose absence says
-    /// nothing at any anchor — so nothing a clock reaches covers it, and
-    /// the one thing that does is a departure naming the transaction:
+    /// **A silence never covers a remainder.** Nothing a clock reaches
+    /// covers it, and the one thing that does is a departure naming the
+    /// transaction:
     /// the chain that was to deliver is gone, so no claim is coming from
     /// that chain. The crossing behind it is owed and never credited
     /// back, and the successor holding the consumer's prefix credits it.
@@ -2782,37 +2534,17 @@ mod tests {
         };
 
         let (ledger, _) = resolved(TransactionDecision::Reject);
-        assert_eq!(ledger.len(), 0, "a refusal issued nothing to reclaim");
+        assert_eq!(ledger.len(), 0, "a refusal issued nothing to settle");
 
         let (mut ledger, tx) = resolved(TransactionDecision::Accept);
-        assert_eq!(ledger.len(), 1, "an acceptance stays for the reclaim");
+        assert_eq!(ledger.len(), 1, "an acceptance stays for its deliveries");
         assert!(ledger.past_deadline(deadline).is_empty(), "never abandoned");
         assert!(
             ledger.outstanding_with(PARTNER, ms(70_000)).is_empty(),
             "named by no departure: the successor still delivers"
         );
-        let (delivered_by, claim) = delivered_claim(&issuing());
-        assert_eq!(
-            ledger.questions(&ShardTrie::uniform(1)),
-            vec![Question {
-                tx_hash: tx.hash(),
-                shard: delivered_by,
-                key: claim,
-                probed: Probed::Claim,
-                deadline: Deadline::of(ms(60_000)),
-            }],
-            "a remainder asks about its deliveries, and never about itself"
-        );
-        assert!(
-            !ledger.record_reading(
-                tx.hash(),
-                delivered_by,
-                claim,
-                Probed::Claim,
-                Inclusion::Absent
-            ),
-            "the delivery's silence answers nothing, so the entry does not hold it",
-        );
+        let (delivered_by, _) = delivered_claim(&issuing());
+        assert!(ledger.questions().is_empty(), "a remainder asks nothing");
         assert!(
             !ledger.is_covered(tx.hash()),
             "and a remainder is never covered by a delivery that has not spoken",
@@ -2871,7 +2603,7 @@ mod tests {
         )]);
         assert!(
             ledger.past_deadline(past).is_empty(),
-            "a record licenses a reclaim of it, never an abort"
+            "a record naming a leg licenses no abort of it"
         );
         assert_eq!(ledger.len(), 1);
     }
@@ -2926,80 +2658,6 @@ mod tests {
             "a rotated-in replica must name the same parties the seated one does, \
              or the abandonment it composes carries a different receipt root",
         );
-    }
-
-    /// A claim follows its prefix, so the shard that answers for it
-    /// after a cut is the frozen consumer's successor — and its word
-    /// licenses the retirement exactly as the consumer's would have.
-    ///
-    /// [`Ledger::questions`] already asks whoever holds the
-    /// prefix now, so a ledger matching the frozen shard by identity
-    /// drops the answer to a question it asked itself, and the record
-    /// cell outlives the entry.
-    #[test]
-    fn a_successors_claim_retires_the_record_the_consumer_was_holding() {
-        // `PARTNER` splits, and the half that takes the `AWAY` prefixes
-        // is the depth-2 leaf on the same path.
-        const SUCCESSOR: ShardId = ShardId::leaf(2, 2);
-
-        let mut ledger = Ledger::new(LOCAL);
-        let tx = tx(8, 60_000);
-        commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash(), Certified::ByExecution);
-
-        let (_, claim) = core_claim(&classified());
-        assert!(
-            ledger.record_reading(
-                tx.hash(),
-                SUCCESSOR,
-                claim,
-                Probed::Claim,
-                stating(&core_crossing(&classified()), &tx, Answered::Taken),
-            ),
-            "the successor's claim answers the question the entry asked",
-        );
-    }
-
-    /// A claim key names its edge and no transaction. A `Taken` an
-    /// earlier transaction's consumer left there is no reading of a
-    /// later transaction's entry: it is not held, covers nothing and
-    /// leaves the question open for the entry's own answer, which is then
-    /// read. Nor is the entry's own transaction's answer under another
-    /// validity end.
-    #[test]
-    fn an_entry_reads_no_answer_of_another_transaction() {
-        let mut ledger = Ledger::new(LOCAL);
-        let (earlier, later) = (tx(7, 60_000), tx(8, 60_000));
-        commit_as(&mut ledger, &later, &classified());
-        ledger.certify(later.hash(), Certified::ByExecution);
-        let id = core_crossing(&classified());
-        let (consumer, claim) = core_claim(&classified());
-        let open = ledger.questions(&ShardTrie::uniform(1));
-        let question = *open
-            .iter()
-            .find(|question| question.key == claim)
-            .expect("the entry asks its consumer's claim");
-
-        let restated = Inclusion::Present(jmt_value_hash(
-            &id.answer(later.hash(), Answered::Taken, 60_001).to_bytes(),
-        ));
-        for old in [stating(&id, &earlier, Answered::Taken), restated] {
-            assert!(!ledger.answers(&question, ms(200_000), old));
-            assert!(
-                !ledger.record_reading(later.hash(), consumer, claim, Probed::Claim, old),
-                "another transaction's answer is not the entry's to hold",
-            );
-        }
-        assert!(!ledger.is_covered(later.hash()));
-        assert_eq!(
-            ledger.questions(&ShardTrie::uniform(1)),
-            open,
-            "and every question stands for the entry's own answer",
-        );
-
-        let own = stating(&id, &later, Answered::Taken);
-        assert!(ledger.answers(&question, ms(200_000), own));
-        assert!(ledger.record_reading(later.hash(), consumer, claim, Probed::Claim, own));
     }
 
     /// Two transactions carrying one intent name one record key. A
@@ -3219,7 +2877,7 @@ mod tests {
         );
 
         let sibling = core_cell(SIBLING, &tx);
-        ledger.record_reading(tx.hash(), SIBLING, sibling, Probed::Core, Inclusion::Absent);
+        ledger.record_absence(tx.hash(), SIBLING, sibling);
         assert!(ledger.is_covered(tx.hash()));
         assert_eq!(
             ledger.past_deadline(past),
@@ -3344,49 +3002,35 @@ mod tests {
 
     /// [`Ledger::questions`], deriving every cell from the entry's
     /// classification as it is asked about.
-    fn questions_by_walk(ledger: &Ledger, trie: &ShardTrie) -> Vec<Question> {
+    fn questions_by_walk(ledger: &Ledger) -> Vec<Question> {
         let local = ledger.local;
         let mut questions = Vec::new();
         for (&tx_hash, owed) in &ledger.owed {
+            let Part::Core(kept) = &owed.part else {
+                continue;
+            };
             if owed.covered() {
                 continue;
             }
-            let Some(kept) = owed.part.settling() else {
-                continue;
-            };
             let deadline = owed.figures.deadline;
-            let question = |shard, key, probed| {
-                (!owed.readings.contains_key(&(shard, key))).then_some(Question {
-                    tx_hash,
-                    shard,
-                    key,
-                    probed,
-                    deadline,
-                })
-            };
             questions.extend(
                 kept.core()
                     .iter()
                     .filter(|&&shard| shard != local)
-                    .filter_map(|&shard| {
-                        let cell = committed_tx_cell_key(shard, tx_hash, deadline.validity_end());
-                        question(shard, cell, Probed::Core)
+                    .map(|&shard| {
+                        (
+                            shard,
+                            committed_tx_cell_key(shard, tx_hash, deadline.validity_end()),
+                        )
+                    })
+                    .filter(|key| !owed.absences.contains(key))
+                    .map(|(shard, key)| Question {
+                        tx_hash,
+                        shard,
+                        key,
+                        deadline,
                     }),
             );
-            if !owed.part.is_leg() {
-                continue;
-            }
-            let asked = |consumer: ShardId, key: SubstateKey, probed: Probed| {
-                BTreeSet::from([consumer, trie.shard_for_prefix(key.owner)])
-                    .into_iter()
-                    .filter_map(move |shard| question(shard, key, probed))
-            };
-            for claim in kept.claims(local) {
-                questions.extend(asked(claim.home, claim.key, Probed::Claim));
-            }
-            for claim in kept.deliveries(local) {
-                questions.extend(asked(claim.home, claim.key, Probed::Claim));
-            }
         }
         questions
     }
@@ -3490,15 +3134,9 @@ mod tests {
                     }
                     9 => ledger.seed(tx.hash(), Part::of(LOCAL, tx, shape)),
                     _ => {
-                        let open = ledger.questions(&delivery_trie());
+                        let open = ledger.questions();
                         if let Some(asked) = open.iter().find(|asked| asked.tx_hash == tx.hash()) {
-                            let _ = ledger.record_reading(
-                                asked.tx_hash,
-                                asked.shard,
-                                asked.key,
-                                asked.probed,
-                                Inclusion::Absent,
-                            );
+                            let _ = ledger.record_absence(asked.tx_hash, asked.shard, asked.key);
                         }
                     }
                 }
@@ -3508,9 +3146,7 @@ mod tests {
                         &Cells::of(LOCAL, *tx_hash, owed.figures.deadline, &owed.part)
                     );
                 }
-                for trie in [ShardTrie::uniform(1), delivery_trie()] {
-                    prop_assert_eq!(ledger.questions(&trie), questions_by_walk(&ledger, &trie));
-                }
+                prop_assert_eq!(ledger.questions(), questions_by_walk(&ledger));
                 prop_assert_eq!(&ledger.issuers, &issuers_by_walk(&ledger));
             }
         }

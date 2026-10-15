@@ -2366,13 +2366,11 @@ pub fn test_tx_index_answers_with_the_local_shards_certificate(
 /// Shared test: the transaction index answers with every certificate of
 /// this shard's naming the transaction, not the newest.
 ///
-/// A shard certifies one transaction its verdict and then again whatever
-/// settles what the verdict left — a retirement, a reclaim, an
-/// abandonment. A counterpart asks by naming the transaction and cannot
-/// say which it wants, so a single slot hands it whichever committed
-/// last: a counterpart waiting on the verdict then holds a certificate
-/// covering nothing its tick awaits, and asking again gets the same
-/// answer for as long as it asks.
+/// A shard can certify one transaction in the tick that ran it and again
+/// in an abandonment that settles what the run left. A counterpart asks
+/// by naming the transaction and cannot say which it wants, so a single
+/// slot would hand it whichever committed last, and asking again would
+/// get the same answer for as long as it asks.
 ///
 /// Both certificates land in one block here, which is the case a
 /// per-certificate write would also lose: it would read the stored set
@@ -4177,7 +4175,6 @@ where
         TickOutput {
             determined: vec![(refused, charge.clone())],
             provisional: Vec::new(),
-            rowless: BTreeSet::new(),
         },
         &[],
     );
@@ -4194,7 +4191,6 @@ where
         TickOutput {
             determined: vec![(crediting, credit)],
             provisional: Vec::new(),
-            rowless: BTreeSet::new(),
         },
         &[],
     );
@@ -5088,7 +5084,6 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
                 committee_anchor: WeightedTimestamp::from_millis(100),
             },
             reach: stranded.routing().all_routes(),
-            escrowed: Capped::empty(),
         }],
     );
 
@@ -5158,8 +5153,8 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
 /// A whole entry's fate is decided inside [`RETENTION_HORIZON`] of its
 /// commit, and that is as far as a rebuild reads for one. A leg entry
 /// stands one [`CLAIM_WINDOW`] past its deadline, so its commit sits
-/// below that reach while the entry is still live — and the fold has to
-/// reach it, or a restart drops a reclaim the ledger was still owed.
+/// below that reach while the entry is still live, and the fold has to
+/// reach it, or a restart drops an entry the ledger still holds.
 ///
 /// # Panics
 ///
@@ -5297,9 +5292,9 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
 /// Shared rebuild test: a leg's own finalization does not retire it from
 /// the replay floor.
 ///
-/// Its entry lives on for the reclaim its core's refusal or its
-/// deliveries' lapse may license; the reclaim's deciding finalization is
-/// what retires it.
+/// Its entry is closed by the commit fold on the records it issued,
+/// which no finalization names, so only a deciding outcome naming the
+/// transaction releases the floor.
 ///
 /// # Panics
 ///
@@ -5342,10 +5337,10 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
             ChainOrigin::ROOT
         ),
         Some(BlockHeight::new(1)),
-        "a leg that succeeded is still owed a reclaim, so its commit holds the floor",
+        "a leg that succeeded is still unresolved, so its commit holds the floor",
     );
 
-    let reclaiming = push_certificate(
+    let deciding = push_certificate(
         make_test_block(BlockHeight::new(3)),
         Arc::new(Verifiable::from(make_finalization(
             BlockHeight::new(3),
@@ -5355,7 +5350,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
     );
     commit_settled_at(
         storage,
-        &make_test_certified(reclaiming),
+        &make_test_certified(deciding),
         &[],
         &[],
         &empty_witness(),
@@ -5368,7 +5363,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
             ChainOrigin::ROOT
         ),
         None,
-        "the reclaim's finalization decides it and releases the floor",
+        "a deciding finalization releases the floor",
     );
 }
 
@@ -6148,7 +6143,7 @@ fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )
-            .reserving(0)
+            .charging(0)
         })
         .collect();
     push_certificate(
@@ -6200,7 +6195,7 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )
-                .reserving(0),
+                .charging(0),
                 StateWrites::default(),
             )
             .into(),
@@ -6459,7 +6454,6 @@ fn core_settled_of_one(shard: ShardId, height: u64, half: TickHalf, tx: TxHash) 
                 Vec::new()
             },
             accepted: Vec::new(),
-            reclaimed: Vec::new(),
         }],
         ..MemberInputs::still(shard)
     }
@@ -6476,7 +6470,6 @@ fn core_accepted_of_one(shard: ShardId, height: u64, tx: TxHash) -> MemberInputs
             deleted: Vec::new(),
             stated: Vec::new(),
             accepted: vec![tx],
-            reclaimed: Vec::new(),
         }],
         ..MemberInputs::still(shard)
     }
@@ -6709,7 +6702,6 @@ fn abort_settled_of_one(shard: ShardId, tick: u64, height: u64, tx: TxHash) -> M
             deleted: vec![tx],
             stated: Vec::new(),
             accepted: Vec::new(),
-            reclaimed: Vec::new(),
         }],
         ..MemberInputs::still(shard)
     }

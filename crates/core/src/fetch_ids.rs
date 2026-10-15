@@ -42,7 +42,7 @@ pub enum FetchIds {
     /// Verdict questions as `(anchor, cells)`: the three cells one
     /// question reads on a sibling, asked together so an answer holds
     /// each question whole. Fetched apart from [`Self::StateProofs`], so
-    /// one that never returns holds no place a record, seat or reclaim
+    /// one that never returns holds no place a record, seat or sibling
     /// probe needs.
     VerdictProofs(Vec<(Anchor, VerdictCells)>),
     /// Departed shards' settled sets, by the terminal each is checked

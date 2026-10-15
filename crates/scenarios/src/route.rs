@@ -736,20 +736,20 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
 ///
 /// Neither venue can hear the other, pushes and pulls alike, so the
 /// two-shard core commits the route and cannot settle it while the cut
-/// stands. The trader's leg meanwhile pays its input, reaches its
-/// deadline with the core silent, and asks the core's chain whether it
-/// committed the transaction — a leg's crossing is reclaimed only on
-/// proof the core never did, and a core that committed and cannot yet
-/// answer is exactly what that probe must not mistake for absence. So
-/// the leg stays paid. The cut lifts inside the delivery window, the
-/// core settles, and the route accepts: paid once, delivered once.
+/// stands. The trader's leg meanwhile pays its input and reaches its
+/// deadline with the core silent. Its crossing goes back only on the
+/// core's `Never`, and a core that committed writes none: past the
+/// deadline each venue asks its sibling's committed cell, reads it
+/// present, and so is neither covered nor abandoned. The leg stays
+/// paid. The cut lifts inside the delivery window, the core settles,
+/// and the route accepts: paid once, delivered once.
 ///
 /// One route rather than the usual four: the core's tick for the first
 /// holds the venues' reserves as provisional claims until its
 /// counterpart's certificate arrives, so a second route could not
 /// compose while the cut stood and would be abandoned at the deadline
-/// instead — a refusal the leg's reclaim rightly follows, and not the
-/// boundary this pins.
+/// instead, a refusal whose `Never` rightly returns the leg's crossing,
+/// and not the boundary this pins.
 ///
 /// Requires disjoint committees — a host serving both venues, or a venue
 /// and the trader, would carry certificates in-process past the cut or
@@ -760,7 +760,7 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
 /// Panics if either venue misses its budget standing up, if the trader's
 /// leg never pays, if the cut never fires or lifts outside the delivery
 /// window, if the trader is refunded while the cut stands past the
-/// probe's anchor, if the route does not accept once the cut lifts, or
+/// deadline, if the route does not accept once the cut lifts, or
 /// if either side of the pair is not conserved.
 pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
@@ -797,26 +797,27 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
-    // Past the anchor a probe of the core is licensed at, and held there
-    // until the probe has read the core's cell: the reading is `Present`
-    // — the core's block is on its chain, its member still pending — and
-    // that answers nothing, so the reclaim is not licensed. Read off the
-    // probe rather than off a settling delay, so the scenario fails where
-    // the evidence is instead of wherever a timer happened to land.
+    // Past the deadline, and held there until a venue has asked its
+    // sibling's committed cell: the reading is `Present`, the sibling's
+    // block on its chain and its member still pending, and that answers
+    // nothing, so the core is not abandoned and writes no `Never`. Read
+    // off the question rather than off a settling delay, so the scenario
+    // fails where the evidence is instead of wherever a timer happened
+    // to land.
     let validity_end = validity.end_timestamp_exclusive;
-    let anchor = Deadline::of(validity_end).at();
+    let deadline = Deadline::of(validity_end).at();
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     assert!(
-        c.run_until(epochs(8), |c| clock(c) >= anchor),
-        "the cut must stand past the reclaim probe's anchor",
+        c.run_until(epochs(8), |c| clock(c) >= deadline),
+        "the cut must stand past the transaction's deadline",
     );
-    let probed = c.metric("reclaim_probes_pending", None);
+    let asked = c.metric("sibling_questions_pending", None);
     let reclaimed = c.metric("reclaims_folded", None);
     assert!(
-        c.run_until(epochs(8), |c| c.metric("reclaim_probes_pending", None)
-            > probed),
-        "the trader's leg must probe the core past its deadline and read \
-         that the core's block is there",
+        c.run_until(epochs(8), |c| c.metric("sibling_questions_pending", None)
+            > asked),
+        "a venue must ask its sibling past the deadline and read that the \
+         sibling's block is there",
     );
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
@@ -826,19 +827,19 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         assert!(
             c.chain_fate(shard, hash).1.is_none(),
             "the core must still be waiting on its certificates when the cut lifts, \
-             or the reclaim below is answered by its verdict rather than by the probe",
+             or the leg below stays paid on the core's verdict rather than on its silence",
         );
     }
     assert_eq!(
         held(c, trader.address(), *PROTOCOL_RESOURCE),
         paid,
         "a leg whose core committed the transaction must stay paid at its deadline: \
-         the probe finds the core's block, and the reclaim is refused",
+         the core writes no `Never`, so nothing returns the crossing",
     );
     assert_eq!(
         c.metric("reclaims_folded", None),
         reclaimed,
-        "a present answer licenses no reclaim anywhere in the cluster",
+        "no return folds anywhere in the cluster while the core is pending",
     );
 
     // Whole network from here: the certificates flow, the core settles,

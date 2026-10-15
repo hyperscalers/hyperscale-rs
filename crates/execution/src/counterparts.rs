@@ -19,8 +19,8 @@ use hyperscale_engine::tick_select::SeatQuestion;
 use hyperscale_metrics::{
     record_boundary_cells_asked, record_boundary_claims_carried, record_boundary_drained,
     record_crossing_fallback_ask, record_decline_folded, record_fenced_claim,
-    record_rebuilt_record_entry, record_reclaim_folded, record_reclaim_probe_answered,
-    record_reclaim_probe_pending, set_standing_answers,
+    record_rebuilt_record_entry, record_reclaim_folded, record_sibling_absence_read,
+    record_sibling_question_pending, set_standing_answers,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
@@ -37,7 +37,7 @@ use hyperscale_types::{
     ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey, MAX_CLAIMS_PER_BLOCK,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
-    MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
+    MerkleInclusionProof, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
     STATE_CLAIM_CELL_BYTES, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey,
     TerminalEvidence, TickLine, TopologySchedule, TxHash, TxOutcome, TxResolution, UnsettledTx,
     VerdictCells, VerdictQuestion, Verifiable, Verified, WeightedTimestamp, answer_hashes, said_at,
@@ -1654,14 +1654,12 @@ fn fetches(wanted: BTreeMap<Anchor, Vec<SubstateKey>>) -> Vec<Action> {
 }
 
 /// A question this validator put to a counterpart: the question, the
-/// header it was asked at, whether the fetch has returned, and how many
-/// times it has been asked.
+/// header it was asked at, and whether the fetch has returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     question: Question,
     anchor: Anchor,
     returned: bool,
-    asked: u32,
 }
 
 /// A seat question this validator put to a counterpart: the header it
@@ -1979,7 +1977,7 @@ impl Counterparts {
         // proposer cut differently leaves only what the block carried,
         // and the remainder of a cut claim is offered whole.
         self.cut_carried(block.state_claims());
-        self.fold_state_claims(trie, block);
+        self.fold_state_claims(block);
         let mut actions = Vec::new();
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
@@ -2017,7 +2015,7 @@ impl Counterparts {
         self.drop_below_floor(windows);
         self.derive_asks(trie);
         actions.extend(self.settle_boundaries(topology_schedule, now));
-        actions.extend(self.release_answered_fetches(trie));
+        actions.extend(self.release_answered_fetches());
         self.cap_held_unsolicited();
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
@@ -2154,25 +2152,20 @@ impl Counterparts {
         }
     }
 
-    /// Ask each silent counterpart whether it took the transaction a
-    /// leg here issued for, once the transaction's deadline has passed.
+    /// Ask each counterpart what this shard waits on it for.
     ///
-    /// The deadline gates the probe: absence at a block past the floor
-    /// is the evidence, and before it the
-    /// counterpart may still legitimately act. Every core shard is asked
-    /// about the transaction's committed cell past the deadline: any one
-    /// of them absent is the whole answer, while a shard that still
-    /// holds its cell included the transaction and answers with a claim
-    /// or a `Never` beside it, and is asked again at each newer header. The
-    /// shard holding the core consumer's target is asked about the
-    /// consumer's claim, whose presence is what licenses the retirement.
-    /// The shard holding an owed crossing's consumer is asked about the
-    /// crossing's claim cell past the deadline, where no push answered
-    /// it. Each is asked against that shard's newest
-    /// commit-proven header the question stands at — inside the window
-    /// an absence answers in, at or past its floor and short of the
-    /// probed cell's own sweep, or past the point a presence is asked
-    /// from — of those standing at `now`, the chain's committed clock.
+    /// Three questions, each from the instant it opens. A core member
+    /// asks each sibling's committed cell past the transaction's
+    /// deadline: any one read absent inside its window is the whole
+    /// answer, while a sibling that still holds its cell included the
+    /// transaction and answers with its certificate, so it is asked
+    /// again at each newer header ([`Self::ask_entries`]). A record this
+    /// shard holds asks whoever holds its consumer's prefix for the
+    /// consumer's answer ([`Self::ask_consumer_answers`]). A record a
+    /// member here waits on is read off its producer
+    /// ([`Self::ask_wanted_records`]). Each is asked against that shard's
+    /// newest commit-proven header the question stands at, of those
+    /// standing at `now`, the chain's committed clock.
     ///
     /// That ceiling is what makes a committee ask one question rather
     /// than four. The answer is held to each voter's own reading, so a
@@ -2183,15 +2176,6 @@ impl Counterparts {
     /// not reached here yet is asked when it does, and one whose every
     /// standing header is past the window is not asked at all: the entry
     /// then waits out its horizon.
-    ///
-    /// A delivering shard that departs at a reshape may leave no header
-    /// past the lapse at all, so the claim cell is asked about wherever
-    /// its prefix sits: on the shard that was to deliver it and on the
-    /// shard the trie names for its owner now, which is the successor
-    /// holding the departed chain's cells. Both are asked rather than
-    /// the trie's answer alone, because a departed shard may leave no
-    /// header past the lapse, and the successor's is the one a proof can
-    /// still be taken at.
     ///
     /// The cell is named from signed content and the counterpart shard
     /// alone, so nothing but the header and the proof is fetched.
@@ -2204,7 +2188,7 @@ impl Counterparts {
     ) -> Vec<Action> {
         self.want(records);
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
-        self.ask_entries(trie, now, &mut wanted);
+        self.ask_entries(now, &mut wanted);
         self.ask_consumer_answers(trie, now, &mut wanted);
         self.ask_wanted_records(trie, now, records, windows, &mut wanted);
         fetches(wanted)
@@ -2303,28 +2287,21 @@ impl Counterparts {
     /// header it stands at.
     fn ask_entries(
         &mut self,
-        trie: &ShardTrie,
         now: WeightedTimestamp,
         wanted: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
     ) {
-        for question in self.ledger.questions(trie) {
+        for question in self.ledger.questions() {
             if !question.open_at(now) {
                 continue;
             }
-            let Question {
-                shard,
-                key,
-                probed,
-                deadline,
-                ..
-            } = question;
+            let Question { shard, key, .. } = question;
             // The newest header the question stands at, of those
             // standing at the chain's clock: the one the shard is
             // likeliest to still serve, and the one every member of
             // this committee is asking of.
             let Some(anchor) = self
                 .proven_anchors
-                .newest_licensed(shard, now, |ts| probed.asks_at(ts, deadline))
+                .newest_licensed(shard, now, |ts| question.asks_at(ts))
             else {
                 continue;
             };
@@ -2334,19 +2311,13 @@ impl Counterparts {
             // each new one abandons the fetch before its answer
             // returns. A probe whose fetch returned a reading that
             // answered nothing is moved on, which is how a cell read
-            // outside its window is asked again — at a newer header,
-            // not of the same one every block.
-            //
-            // An answer is the fallback for a push that did not land, so
-            // it backs off as the leaf's questions do; a core's cell has
-            // no push to stand in for and is asked at every newer header.
-            let answer = matches!(probed, Probed::Claim);
+            // present is asked again — at a newer header, not of the
+            // same one every block. A core's cell has no push
+            // to stand in for, so it is asked at every newer header.
             let prior = self.probes.get(&(shard, key)).copied();
-            let gap = |asked| if answer { answer_ask_gap(asked) } else { 1 };
             if self.fetched.reads(shard, key)
                 || prior.is_some_and(|probe| {
-                    !probe.returned
-                        || anchor.height.inner() < probe.anchor.height.inner() + gap(probe.asked)
+                    !probe.returned || anchor.height.inner() <= probe.anchor.height.inner()
                 })
             {
                 continue;
@@ -2357,12 +2328,8 @@ impl Counterparts {
                     question,
                     anchor,
                     returned: false,
-                    asked: prior.map_or(1, |probe| probe.asked.saturating_add(1)),
                 },
             );
-            if answer {
-                record_crossing_fallback_ask("producer");
-            }
             wanted.entry(anchor).or_default().push(key);
         }
     }
@@ -3376,11 +3343,11 @@ impl Counterparts {
         // carries the claim nothing here has composed anything from it.
         //
         // One rule for both, because a reading that answers nothing is
-        // worth neither. A probe fires from the deadline, and a lapse
-        // opens a validity range past it, so the readings taken in
-        // between are absences outside their window — true of the tree
-        // and mute about the question. Offering one spends the section
-        // on a cell no record can be composed from.
+        // worth neither. A question is asked only at a header inside its
+        // window, so a reading that answers nothing is a sibling's cell
+        // read present, or a cell read for a member already answered
+        // for. Offering one spends the section on a cell that covers
+        // nothing.
         let mut answering: BTreeSet<SubstateKey> = BTreeSet::new();
         let mut speaks_for: BTreeSet<TxHash> = BTreeSet::new();
         for question in &answered {
@@ -3392,7 +3359,7 @@ impl Counterparts {
                 answering.insert(question.key);
                 speaks_for.insert(question.tx_hash);
             } else {
-                record_reclaim_probe_pending();
+                record_sibling_question_pending();
             }
         }
         answering.extend(
@@ -3550,17 +3517,15 @@ impl Counterparts {
     /// whose window the anchor's clock sits inside — whether or not this
     /// replica had a probe out, and wherever its own probe sat — so a
     /// replica that never fetched reads the same answer as the one that
-    /// did. A claim cell present is the consumer holding the crossing,
-    /// which is written straight to the ledger and licenses the
-    /// retirement. A core consumer's claim absent says only that a
-    /// sibling is pending, and a committed cell present that a member
-    /// is; either is asked again at the next header. The first proof to
-    /// answer a cell is the answer; a later one adds nothing.
-    fn fold_state_claims(&mut self, trie: &ShardTrie, block: &Block) {
+    /// did. Only a sibling's committed cell read absent answers; one read
+    /// present is a sibling that included the transaction, and is asked
+    /// again at the next header. The first proof to answer a cell is the
+    /// answer; a later one adds nothing.
+    fn fold_state_claims(&mut self, block: &Block) {
         if block.state_claims().is_empty() {
             return;
         }
-        let questions = self.ledger.questions(trie);
+        let questions = self.ledger.questions();
         for claim in block.state_claims() {
             self.fold_cells(claim, &questions);
         }
@@ -3667,40 +3632,24 @@ impl Counterparts {
     /// Fold one claim's answers into the questions the ledger is
     /// waiting on.
     fn fold_cells(&mut self, claim: &StateClaim, questions: &[Question]) {
-        for &Question {
-            tx_hash,
-            shard,
-            key,
-            probed,
-            deadline,
-            ..
-        } in questions
-        {
-            if shard != claim.anchor.shard {
+        for question in questions {
+            if question.shard != claim.anchor.shard {
                 continue;
             }
-            let Some(inclusion) = claim.reading(key) else {
-                continue;
-            };
             // Judged per cell by the one rule, whoever fetched the
-            // proof: an absence is read only inside its window and only
-            // for the cell a refusal leaves absent, a presence wherever
-            // it was taken and only for the cell a claim writes — and a
-            // probe never sent may still be answered by a claim a block
-            // carries.
-            let Some(inclusion) = probed.answer(claim.anchor.ts, deadline, inclusion) else {
-                continue;
-            };
-            // The question is answered with what the chain read. A
-            // claim cell present is the consumer holding the crossing,
-            // which is what licenses the retirement.
-            if !self
-                .ledger
-                .record_reading(tx_hash, shard, key, probed, inclusion)
+            // proof: an absence of the sibling's committed cell, read
+            // inside its window. A question never sent may still be
+            // answered by a claim a block carries.
+            let answered = claim
+                .reading(question.key)
+                .is_some_and(|inclusion| question.answered_by(claim.anchor.ts, inclusion));
+            if answered
+                && self
+                    .ledger
+                    .record_absence(question.tx_hash, question.shard, question.key)
             {
-                continue;
+                record_sibling_absence_read();
             }
-            record_reclaim_probe_answered(inclusion.is_present());
         }
     }
 
@@ -4007,7 +3956,7 @@ impl Counterparts {
     /// answered first, or one whose entry is gone — releasing every
     /// fetch still out for one, so a counterpart that never serves the
     /// height does not pin the slot.
-    fn release_answered_fetches(&mut self, trie: &ShardTrie) -> Vec<Action> {
+    fn release_answered_fetches(&mut self) -> Vec<Action> {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or a
@@ -4046,7 +3995,7 @@ impl Counterparts {
         // A probe lives while its question is open, and the ledger says
         // which those are.
         let open: BTreeSet<(ShardId, SubstateKey)> = unresolved
-            .questions(trie)
+            .questions()
             .into_iter()
             .map(|question| (question.shard, question.key))
             .collect();
@@ -4275,7 +4224,6 @@ mod tests {
                     .collect(),
             )
             .expect("a reach written out in a test"),
-            escrowed: Capped::empty(),
         }
     }
 
@@ -5025,11 +4973,11 @@ mod tests {
 
         let at_the_horizon = now.plus(RETENTION_HORIZON);
         anchors.retire_below(at_the_horizon);
-        producer.release_answered_fetches(&trie);
+        producer.release_answered_fetches();
         assert_eq!(producer.state_claims().len(), 1);
 
         anchors.retire_below(at_the_horizon.plus(Duration::from_millis(1)));
-        producer.release_answered_fetches(&trie);
+        producer.release_answered_fetches();
         assert!(producer.state_claims().is_empty());
     }
 
@@ -6512,7 +6460,6 @@ mod tests {
     /// stands or a member row of its transaction does.
     #[test]
     fn a_kept_record_is_held_until_it_is_answered_or_a_member_stands() {
-        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
         let now = WeightedTimestamp::from_millis(100_000);
         let (key, id, cell) = escrowed_record(0xF1, 2_000);
         let kept = |rows: &Arc<TestRows>| {
@@ -6526,7 +6473,7 @@ mod tests {
         let rows = Arc::new(TestRows::default());
         let mut consumer = kept(&rows);
         for _ in 0..3 {
-            consumer.release_answered_fetches(&trie);
+            consumer.release_answered_fetches();
             assert_eq!(
                 named(&consumer),
                 vec![(key, id)],
@@ -6538,7 +6485,7 @@ mod tests {
             id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
                 .to_bytes(),
         );
-        consumer.release_answered_fetches(&trie);
+        consumer.release_answered_fetches();
         assert!(
             consumer.state_claims().is_empty(),
             "the decline is written, and the reading answers nothing more",
@@ -6547,7 +6494,7 @@ mod tests {
         let rows = Arc::new(TestRows::default());
         let mut consumer = kept(&rows);
         rows.put(member_row_leaf(CONSUMER, cell.tx), vec![1]);
-        consumer.release_answered_fetches(&trie);
+        consumer.release_answered_fetches();
         assert!(
             consumer.state_claims().is_empty(),
             "a member of the transaction stands, and may yet take the record",
@@ -6985,7 +6932,7 @@ mod tests {
         );
 
         producer.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
-        producer.release_answered_fetches(&trie);
+        producer.release_answered_fetches();
         assert!(
             producer
                 .state_claims()

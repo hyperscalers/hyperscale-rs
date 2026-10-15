@@ -92,10 +92,9 @@ pub struct Divergence {
 /// transaction: it does unless the member is a leg, whose transaction
 /// its core decides. Not a third awaited case — a leg and a single-shard
 /// core await the same set — but the one fact the wire cannot derive
-/// from that set. And whether the member **executes** the transaction or settles what an execution left:
-/// a reclaim, an abandonment, a held record's disposal or a retirement
-/// runs no execution of the transaction's own, and the deadline holds
-/// only what does.
+/// from that set. And whether the member **executes** the transaction or
+/// settles what an execution left: an abandonment runs no execution of
+/// the transaction's own, and the deadline holds only what does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     awaited: BTreeSet<ShardId>,
@@ -132,9 +131,8 @@ impl Membership {
     }
 
     /// This membership for a member that settles what an execution left
-    /// rather than executing the transaction: a reclaim, an abandonment,
-    /// a held record's disposal. The awaited set stays as stated; the
-    /// member decides and executes nothing.
+    /// rather than executing the transaction: an abandonment. The awaited
+    /// set stays as stated; the member decides and executes nothing.
     #[must_use]
     pub const fn settling(mut self) -> Self {
         self.role = Role::Settling;
@@ -226,12 +224,10 @@ struct Seat {
     /// Whose certificate its settlement waits on, and who its own is
     /// owed to.
     membership: Membership,
-    /// What the member was charged, where its tick holds the row its
-    /// committing block wrote for it — `None` for a member settling what
-    /// an execution left, which its tick holds no row for. Carried apart
-    /// from the transaction because an abandoned member has no body here
-    /// and still has to attest exactly what was priced.
-    charged: Option<u128>,
+    /// What the member was charged. Carried apart from the transaction
+    /// because an abandoned member has no body here and still has to
+    /// attest exactly what was priced.
+    charged: u128,
     /// Dispatched to the engine and still owing a result. A tick is
     /// votable once no seat is.
     awaiting_result: bool,
@@ -277,7 +273,7 @@ struct Seat {
 
 impl Seat {
     /// A seat on the terms `joins` names.
-    const fn new(membership: Membership, charged: Option<u128>, joins: Joins) -> Self {
+    const fn new(membership: Membership, charged: u128, joins: Joins) -> Self {
         Self {
             membership,
             charged,
@@ -423,13 +419,7 @@ impl TickState {
     /// share its committing block priced, which is everything an abort
     /// has to state. A member the tick already holds keeps the terms it
     /// joined under.
-    pub fn admit(
-        &mut self,
-        tx_hash: TxHash,
-        membership: Membership,
-        charged: Option<u128>,
-        joins: Joins,
-    ) {
+    pub fn admit(&mut self, tx_hash: TxHash, membership: Membership, charged: u128, joins: Joins) {
         if self.seats.contains_key(&tx_hash) {
             return;
         }
@@ -856,14 +846,11 @@ impl TickState {
                     None => TxOutcome::new(*tx_hash, outcome),
                 };
                 // What the transaction was charged when its block
-                // committed it, and that its row is the one this
-                // certificate's finalization deletes.
-                match seat.charged {
-                    Some(charged) => attested.reserving(charged),
-                    None => attested,
-                }
-                .awaiting(counterparts)
-                .as_role(seat.membership.role())
+                // committed it.
+                attested
+                    .charging(seat.charged)
+                    .awaiting(counterparts)
+                    .as_role(seat.membership.role())
             })
             .collect()
     }
@@ -1659,13 +1646,13 @@ mod tests {
             tick.admit(
                 shared,
                 Membership::whole(BTreeSet::from([local, peer])),
-                None,
+                0,
                 Joins::Executes,
             );
             tick.admit(
                 alone,
                 Membership::whole(BTreeSet::from([local])),
-                None,
+                0,
                 Joins::Executes,
             );
             tick
@@ -1736,13 +1723,13 @@ mod tests {
         tick.admit(
             determined,
             Membership::whole(BTreeSet::from([local])),
-            Some(10),
+            10,
             Joins::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
-            Some(20),
+            20,
             Joins::Executes,
         );
         for tx_hash in [determined, leg] {
@@ -1784,7 +1771,7 @@ mod tests {
         tick.admit(
             member,
             Membership::whole(BTreeSet::from([local, peer])),
-            Some(10),
+            10,
             Joins::Executes,
         );
         let from_peer = |counterparts: Vec<ShardId>| {
@@ -1836,13 +1823,13 @@ mod tests {
         tick.admit(
             determined,
             Membership::whole(BTreeSet::from([local])),
-            Some(10),
+            10,
             Joins::Executes,
         );
         tick.admit(
             leg,
             Membership::whole(BTreeSet::from([local, shard(1)])),
-            Some(20),
+            20,
             Joins::Executes,
         );
         for tx_hash in [determined, leg] {
@@ -1932,14 +1919,9 @@ mod tests {
         Some(half)
     }
 
-    /// How many of the half's outcomes name a row their finalization
-    /// deletes.
-    fn reserved_in(half: &Finalization) -> usize {
-        half.local_ec()
-            .tx_outcomes()
-            .iter()
-            .filter(|outcome| outcome.reserved())
-            .count()
+    /// How many outcomes the half's certificate carries.
+    fn outcomes_in(half: &Finalization) -> usize {
+        half.local_ec().tx_outcomes().len()
     }
 
     /// The milestone's whole point: a leg whose counterpart never
@@ -1962,7 +1944,7 @@ mod tests {
             "the half names its own members and no others",
         );
         assert_eq!(
-            (reserved_in(&half), half.charged()),
+            (outcomes_in(&half), half.charged()),
             (1, 10),
             "and settles only what those members reserved",
         );
@@ -2014,7 +1996,7 @@ mod tests {
         let half = take_legs(&mut tick).expect("covered");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
         assert_eq!(
-            (reserved_in(&half), half.charged()),
+            (outcomes_in(&half), half.charged()),
             (1, 0),
             "the legs half charges nothing: the stating half counted the member",
         );
@@ -2040,7 +2022,7 @@ mod tests {
                 tick.admit(
                     tx_hash,
                     Membership::whole(BTreeSet::from([local, shard(1)])),
-                    Some(charged),
+                    charged,
                     Joins::Executes,
                 );
             }
@@ -2128,14 +2110,14 @@ mod tests {
         tick.admit(
             aborted,
             Membership::whole(BTreeSet::from([local, shard(1)])).settling(),
-            Some(7),
+            7,
             Joins::Aborted,
         );
         let charge = receipt(aborted);
         tick.record_refusal_receipt(charge.clone());
         assert!(tick.determined_members().is_empty());
         let (_, root, outcomes) = tick.build_vote_data().expect("an abort waits on no engine");
-        assert!(outcomes[0].is_aborted() && outcomes[0].reserved());
+        assert!(outcomes[0].is_aborted());
         tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
@@ -2231,7 +2213,7 @@ mod tests {
                 tick.admit(
                     tx_hash,
                     Membership::whole(BTreeSet::from([local, shard(1)])),
-                    Some(10),
+                    10,
                     Joins::Executes,
                 );
             }
@@ -2291,7 +2273,7 @@ mod tests {
                     tick.admit(
                         tx_hash,
                         Membership::whole(BTreeSet::from([local])).settling(),
-                        Some(5),
+                        5,
                         Joins::Aborted,
                     );
                 } else {
@@ -2300,12 +2282,7 @@ mod tests {
                     } else {
                         BTreeSet::from([local])
                     };
-                    tick.admit(
-                        tx_hash,
-                        Membership::whole(awaited),
-                        Some(10),
-                        Joins::Executes,
-                    );
+                    tick.admit(tx_hash, Membership::whole(awaited), 10, Joins::Executes);
                 }
             }
             tick
@@ -2386,14 +2363,14 @@ mod tests {
             tick.admit(
                 aborted,
                 Membership::whole(BTreeSet::from([local])).settling(),
-                Some(5),
+                5,
                 Joins::Aborted,
             );
             tick.record_refusal_receipt(receipt(aborted));
             tick.admit(
                 shared,
                 Membership::whole(BTreeSet::from([local, shard(1)])),
-                Some(10),
+                10,
                 Joins::Executes,
             );
             tick
@@ -2451,7 +2428,7 @@ mod tests {
             tick.admit(
                 tx_hash,
                 Membership::whole(BTreeSet::from([local])).settling(),
-                Some(5),
+                5,
                 Joins::Aborted,
             );
         }
@@ -2488,7 +2465,7 @@ mod tests {
             tick.admit(
                 tx_hash,
                 Membership::whole(BTreeSet::from([local, shard(1)])),
-                Some(charged),
+                charged,
                 Joins::Executes,
             );
             tick.record_execution_result(
@@ -2589,7 +2566,7 @@ mod tests {
         tick.admit(
             tx(1),
             Membership::whole(BTreeSet::from([local])),
-            Some(10),
+            10,
             Joins::Executes,
         );
         tick.record_execution_result(
@@ -2702,13 +2679,13 @@ mod tests {
         tick.admit(
             leg,
             membership([local], [local, venue], Role::Leg),
-            Some(10),
+            10,
             Joins::Executes,
         );
         tick.admit(
             core,
             membership([local, venue], [local, venue], Role::Core),
-            Some(10),
+            10,
             Joins::Executes,
         );
 
@@ -2758,7 +2735,7 @@ mod tests {
                 local,
                 BTreeSet::from([local, venue]),
             )),
-            Some(10),
+            10,
             Joins::Executes,
         );
 
@@ -2863,7 +2840,7 @@ mod tests {
         tick.admit(
             member,
             Membership::whole(participating),
-            Some(10),
+            10,
             Joins::Executes,
         );
         tick.record_execution_result(
@@ -2934,7 +2911,7 @@ mod tests {
                 WeightedTimestamp::from_millis(9_000),
                 GlobalReceiptRoot::ZERO,
                 Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)
-                    .reserving(10)
+                    .charging(10)
                     .awaiting([shard(0)])
                     .as_role(Role::Settling)]),
                 AggregateSignature::ZERO,

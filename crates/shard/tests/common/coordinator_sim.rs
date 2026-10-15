@@ -1260,7 +1260,6 @@ impl ShardCoordinatorSim {
                 members: ready.members,
                 parent_judgement: ready.parent_judgement,
                 state_claims: ready.state_claims,
-                abandonment_records: ready.abandonment_records,
                 transactions: ready.transactions,
             });
         }
@@ -2058,7 +2057,6 @@ impl ShardCoordinatorSim {
                 members,
                 parent_judgement,
                 state_claims,
-                abandonment_records,
             } => {
                 let computed_terminal_settled_txs = terminal_settled_txs_required.then(|| {
                     self.pending_chains[emitter_idx]
@@ -2096,7 +2094,6 @@ impl ShardCoordinatorSim {
                                 members: &members,
                                 fence,
                                 state_claims: &state_claims,
-                                abandonment_records: &abandonment_records,
                                 transactions: &transactions,
                                 finalizations: &finalizations,
                             },

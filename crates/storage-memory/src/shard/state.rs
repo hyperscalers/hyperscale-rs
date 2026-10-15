@@ -347,11 +347,10 @@ pub struct ConsensusState {
     /// `tx_finalizations` CF so simulation integration tests serve the
     /// by-transaction certificate fetch the same way a real node does.
     ///
-    /// A set rather than a slot: a shard certifies one transaction its
-    /// verdict and then again whatever settles what the verdict left —
-    /// a retirement, a reclaim, an abandonment — and a counterpart that
-    /// asks by naming the transaction cannot say which of them it
-    /// wants.
+    /// A set rather than a slot: a shard can certify one transaction in
+    /// the tick that ran it and again in an abandonment that settles
+    /// what the run left, and a counterpart that asks by naming the
+    /// transaction cannot say which of them it wants.
     pub(crate) tx_finalizations: OrdSet<(TxHash, FinalizationHash)>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests

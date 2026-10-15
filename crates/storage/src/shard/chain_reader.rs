@@ -154,9 +154,8 @@ pub trait ShardChainReader: Send + Sync + 'static {
 
     /// The consensus receipt `tx_hash` settled under `receipt_hash`.
     ///
-    /// Keyed by both because one transaction settles more than one
-    /// receipt on a shard — its effects, then a reclaim or a refund at a
-    /// later height — and each finalization names the one it settled.
+    /// Keyed by both because each finalization names the receipt it
+    /// settled by its hash, beside the transaction.
     fn get_consensus_receipt(
         &self,
         tx_hash: &TxHash,

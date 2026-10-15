@@ -22,7 +22,7 @@ pub enum Role {
     /// on its shard.
     Leg,
     /// A member settling what an execution left, with a verdict of its
-    /// own: a reclaim, an abandonment, an inherited record's member.
+    /// own: an abandonment.
     Settling,
 }
 
@@ -42,8 +42,8 @@ impl Role {
     /// Whether a *success* in this role bears the verdict.
     ///
     /// The population a deadline refuses: such a success committed past
-    /// the transaction's deadline is one a leg may already have
-    /// reclaimed against, so no block carries it and the tick holding
+    /// the transaction's deadline is one a producer may already have
+    /// taken a crossing back against, so no block carries it and the tick holding
     /// one has nothing left to say.
     #[must_use]
     pub const fn success_decides(self) -> bool {
@@ -111,18 +111,6 @@ pub struct TxOutcome {
     /// beacon weighs a shard's emission by what its certificates settled.
     /// Zero for a member whose shard charged the transaction already.
     charged: u128,
-    /// Whether this member's row is the one its finalization deletes: the
-    /// row its committing block wrote, which its tick holds in flight in
-    /// the half that settles it.
-    ///
-    /// False for a member its tick holds no row for: a reclaim, or any
-    /// other member settling what an execution left. Such a member's
-    /// finalization deletes no row, and where its transaction's row still
-    /// waits on a tick it releases it, to stand until its fate. No
-    /// outcome releases a counted place: the drain is the rows standing,
-    /// and falls as a row is deleted. Attested for the reason `charged`
-    /// is: the settling block is judged with no history behind it.
-    reserved: bool,
     /// The other shards party to the transaction — the ones whose
     /// certificates its settlement waits on. Ascending and distinct;
     /// empty for a transaction reaching no further than this shard.
@@ -146,8 +134,7 @@ pub struct TxOutcome {
     /// ask about it.
     ///
     /// Attested rather than derived because it cannot be: a leg and a
-    /// single-shard core both await nobody and both may escrow, a
-    /// reclaim and a single-shard core both decide and both succeed, and
+    /// single-shard core both await nobody and both may escrow, and
     /// only the classification the certifying shard froze and the tick
     /// that admitted the member tell them apart.
     role: Role,
@@ -159,7 +146,6 @@ impl TxOutcome {
     pub const fn new(tx_hash: TxHash, outcome: ExecutionOutcome) -> Self {
         Self {
             charged: 0,
-            reserved: false,
             tx_hash,
             outcome,
             refusal_receipt: None,
@@ -168,12 +154,10 @@ impl TxOutcome {
         }
     }
 
-    /// Bind what this transaction was charged, and that its row is the
-    /// one its finalization deletes.
+    /// Bind what this transaction was charged.
     #[must_use]
-    pub const fn reserving(mut self, charged: u128) -> Self {
+    pub const fn charging(mut self, charged: u128) -> Self {
         self.charged = charged;
-        self.reserved = true;
         self
     }
 
@@ -252,7 +236,6 @@ impl TxOutcome {
     ) -> Self {
         Self {
             charged: 0,
-            reserved: false,
             tx_hash,
             outcome,
             refusal_receipt: Some(refusal_receipt),
@@ -265,13 +248,6 @@ impl TxOutcome {
     #[must_use]
     pub const fn charged(&self) -> u128 {
         self.charged
-    }
-
-    /// Whether this member's row is the one its finalization deletes:
-    /// the row its tick holds in flight in the half that settles it.
-    #[must_use]
-    pub const fn reserved(&self) -> bool {
-        self.reserved
     }
 
     /// The refusal receipt this outcome settles, if any.

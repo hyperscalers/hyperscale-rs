@@ -57,7 +57,6 @@ use hyperscale_types::{
     signed_bytes, tick_terms_admit_block, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
-use crate::local_crossings::keep_standing_unclaimed;
 use crate::parent_checks::{
     AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
     without_refused_reclaims,
@@ -1149,7 +1148,6 @@ where
                         tx,
                         entry.committed,
                         classified.local_price(tx, ctx.shard, &at.prices),
-                        classified.escrowed_records(ctx.shard),
                         &at.prices,
                     ) == *entry;
                 Some(restated)
@@ -1264,7 +1262,6 @@ where
             members,
             parent_judgement,
             state_claims,
-            abandonment_records,
         } => {
             let start = Stopwatch::start();
             let view = ctx
@@ -1333,7 +1330,6 @@ where
                         members: &members,
                         fence: &judgement.fence,
                         state_claims: &state_claims,
-                        abandonment_records: &abandonment_records,
                         transactions: &transactions,
                         finalizations: &finalizations,
                     },
@@ -1537,10 +1533,6 @@ where
                     "Dropped what the read frontier refuses from the proposal"
                 );
             }
-            // A crossing named off a leaf the parent no longer holds as
-            // named would refuse the block at every voter.
-            let abandonment_records =
-                keep_standing_unclaimed(abandonment_records, &view.snapshot());
             // Drop what a payer would refuse, charged against the parent
             // view every voter judges the block by, so a proposal never
             // refuses itself.
@@ -2012,7 +2004,6 @@ mod tests {
                 committee_anchor: WeightedTimestamp::from_millis(committee_anchor),
             },
             reach: Capped::empty(),
-            escrowed: Capped::empty(),
         }
     }
 

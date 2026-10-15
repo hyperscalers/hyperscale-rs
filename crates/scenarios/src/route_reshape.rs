@@ -2039,8 +2039,8 @@ fn assert_fated_unreclaimed<C: Cluster>(c: &C, stranded: &[StrandedLeg], mention
                 naming(&mentions.named_unsettled, leg.tx),
             ),
             (0, 0),
-            "no member of a stranded leg ran and no reclaim took one back, so no finalization \
-             names {:?}, and no departure's record does",
+            "no member of a stranded leg ran, so no finalization names {:?}, and no departure's \
+             record does",
             leg.tx,
         );
         assert_eq!(
@@ -2336,16 +2336,13 @@ fn strand_the_load<C: Cluster>(c: &mut C, samples: &mut Vec<LoadSample>) -> Stra
 /// carries, up to twice the drain between them. The survivor
 /// commits what its drain admits; a swap's leg there waits for the
 /// venue's shard to commit the swap too, and the venue's shard leaves
-/// before it has committed them all. Those legs never run, and nothing
-/// licenses a reclaim of one. No tick took it, so no certificate of the
-/// survivor's covers it, and the departure's records name only what one
-/// covers. The absence that licenses the reclaim of a leg whose core
-/// never included it is read of the core's shard at an anchor past the
-/// leg's deadline, and the venue's shard ended at its cut, short of every
-/// one. So each stranded leg stands pending with its fee hold, holding
-/// its place in the drain, until the close of its own leg entry window,
-/// where a fate deletes its row, burns the price its block took and ends
-/// the hold.
+/// before it has committed them all. Those legs never run, issue no
+/// record, and so have nothing to return. No tick took one, so no
+/// certificate of the survivor's covers it, and the departure's records
+/// name only what one covers. So each stranded leg stands pending with
+/// its fee hold, holding its place in the drain, until the close of its
+/// own leg entry window, where a fate deletes its row, burns the price
+/// its block took and ends the hold.
 ///
 /// The measure is whether the survivor admits throughout: from the cut
 /// being served until every stranded row has gone, and once more after,

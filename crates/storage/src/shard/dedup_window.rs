@@ -164,8 +164,8 @@ impl DedupWindow {
                 .push((finalization.receipt_hash(), deadline));
             // The names it *decided*, which is what the live index
             // records. A leg's finalization names its transaction
-            // without resolving it, and the reclaim's finalization
-            // naming the hash later is the one neither may refuse.
+            // without resolving it, so a deciding outcome naming the
+            // hash later is one neither may refuse.
             for tx_hash in finalization.deciding_tx_hashes() {
                 self.resolved.push((tx_hash, deadline));
             }

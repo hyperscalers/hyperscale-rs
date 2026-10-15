@@ -1,13 +1,14 @@
 //! What a block says about a counterpart's cells, and the proof of it.
 //!
-//! A leg's ledger asks a silent counterpart whether it took what the leg
-//! issued: a core's committed cell, a delivery's claim, a core
-//! consumer's claim. What is done with the answer — a record offered, a
-//! reclaim or a retirement composed — is composed from the ledger, so
-//! the answer has to be the chain's rather than a replica's, or the
-//! composition splits. That is what a block carries: the claim, one
-//! reading per cell against a commit-proven header, and the multiproof
-//! the readings were taken from.
+//! A shard asks a counterpart about the cells a crossing or a member
+//! leaves there: a core member asks its siblings' committed cells, a
+//! producer asks its consumer's answer to a record it issued, and a
+//! consumer reads the record it takes. What is done with the answer, an
+//! abandonment licensed or a record retired, returned or taken, is
+//! decided by every replica alike, so the answer has to be the chain's
+//! rather than a replica's, or the decision splits. That is what a block
+//! carries: the claim, one reading per cell against a commit-proven
+//! header, and the multiproof the readings were taken from.
 //!
 //! The proof travels with the claim so that the claim is checkable from
 //! the block alone. Every replica walks it at admission under the

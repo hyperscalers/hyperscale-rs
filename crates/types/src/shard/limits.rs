@@ -85,10 +85,10 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// leaves what a block may create and remove exactly where it was.
 ///
 /// Three families are sweepable and share that capacity — the nullifier,
-/// the escrow claim (a reclaim's included) and the committed-transaction
-/// cell a shard writes for every transaction it commits — because the
-/// removal capacity they draw on is one capacity. A budget per family would cost throughput as well as
-/// counters: a block could be invalid on one family's peak while the
+/// the escrow claim and the committed-transaction cell a shard writes for
+/// every transaction it commits — because the removal capacity they draw
+/// on is one capacity. A budget per family would cost throughput as well
+/// as counters: a block could be invalid on one family's peak while the
 /// shared walk had room.
 ///
 /// The count has a fourth term that is not one of them. An escrow record
@@ -220,15 +220,15 @@ pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 /// Bounds the response, whose per-entry cost is a merkle path rather
 /// than a hash. Two questions share it, because a proof costs the same
 /// whichever of them asked: the transactions a successor asks a
-/// predecessor about, and the substate keys a leg's probe asks a
-/// counterpart to prove present or absent — one probe asks about one
+/// predecessor about, and the substate keys a shard asks a counterpart
+/// to prove present or absent — one question asks about one
 /// transaction's cell, so the two are the same size of question.
 ///
 /// Each population is small by construction. A successor asks only about
 /// transactions whose validity window opened before its origin, and only
-/// until the chain outlives that origin by `MAX_VALIDITY_RANGE`; a leg
-/// asks only about the crossings it issued. Anything with more than this
-/// outstanding asks across several requests.
+/// until the chain outlives that origin by `MAX_VALIDITY_RANGE`; a
+/// producer asks only about the crossings it issued. Anything with more
+/// than this outstanding asks across several requests.
 pub const MAX_PROOFS_PER_QUERY: usize = 256;
 
 /// Hard cap on the number of provision batches any single block can carry.
@@ -488,13 +488,6 @@ pub const ABANDONMENT_RECORD_BYTES: usize = 32;
 
 /// Bytes one [`UnsettledTx`](crate::UnsettledTx) costs before its reach.
 pub const UNSETTLED_TX_BYTES: usize = 160;
-
-/// Bytes one escrowed record of an [`UnsettledTx`](crate::UnsettledTx)
-/// costs: its key.
-pub const ESCROWED_RECORD_BYTES: usize = 48;
-
-/// Bytes one [`UnclaimedCrossing`](crate::UnclaimedCrossing) costs.
-pub const UNCLAIMED_CROSSING_BYTES: usize = 112;
 
 /// Bytes one [`RoutePrefix`](crate::RoutePrefix) of a name's reach
 /// costs.

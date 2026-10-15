@@ -1189,7 +1189,6 @@ mod tests {
                 members,
                 parent_judgement: None,
                 state_claims: Vec::new(),
-                abandonment_records: Vec::new(),
             }],
         );
         events

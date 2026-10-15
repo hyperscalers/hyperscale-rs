@@ -22,13 +22,13 @@ use hyperscale_storage::{
     reclaim_credits, reclaimed, reserved_total, settling_writes,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Finalization, FrontierInputs, FrontierRefusal, ReadFence, ShardId,
-    SharedTransactions, StateClaim, StateWrites, Stated, StoredReceipt, SubstateKey, Transaction,
-    TxHash, Verifiable, shard_prefix_path,
+    Anchor, Finalization, FrontierInputs, FrontierRefusal, ReadFence, ShardId, SharedTransactions,
+    StateClaim, StateWrites, Stated, StoredReceipt, SubstateKey, Transaction, TxHash, Verifiable,
+    shard_prefix_path,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
 
-use crate::local_crossings::{disagreeing_parent_reading, misstated_unclaimed, parent_claims};
+use crate::local_crossings::{disagreeing_parent_reading, parent_claims};
 use crate::read_fence::{Dropped, drop_refused};
 
 /// The parts of a block its parent state judges.
@@ -43,8 +43,6 @@ pub struct AtParent<'a> {
     pub fence: &'a ReadFence,
     /// The block's claims.
     pub state_claims: &'a [StateClaim],
-    /// The block's abandonment records.
-    pub abandonment_records: &'a [AbandonmentRecord],
     /// The block's transactions, whose fees its payers must cover.
     pub transactions: &'a SharedTransactions,
     /// The block's finalizations, whose settling receipts a record it
@@ -68,9 +66,6 @@ pub enum ParentRefusal {
     /// A record the block takes back that its commit fold would leave
     /// standing.
     Reclaim(SubstateKey),
-    /// A crossing a departure names off this shard's leaf whose record
-    /// the parent does not hold as named.
-    MisstatedUnclaimed(SubstateKey),
     /// A fee the payer's stored rule does not let this transaction's
     /// attesting set engage.
     UnadmittedPayer(SubstateKey),
@@ -96,9 +91,6 @@ impl fmt::Display for ParentRefusal {
             }
             Self::Reclaim(key) => {
                 write!(f, "record {key:?} taken back where it cannot be returned")
-            }
-            Self::MisstatedUnclaimed(key) => {
-                write!(f, "named crossing {key:?} not held by the parent as named")
             }
             Self::UnadmittedPayer(vault) => {
                 write!(f, "payer of {vault:?} does not admit the attesting set")
@@ -157,9 +149,6 @@ pub fn refused_at_parent(
         .next()
     {
         return Err(ParentRefusal::Reclaim(key));
-    }
-    if let Some(key) = misstated_unclaimed(block.abandonment_records, parent) {
-        return Err(ParentRefusal::MisstatedUnclaimed(key));
     }
     let mut charges = PayerCharges::new(block.local, parent);
     for tx in block.transactions.iter() {
@@ -444,8 +433,8 @@ mod tests {
         Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
         Hash, Inclusion, LocalKey, MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON,
         ReadFrontier, ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, StateWrites,
-        Stated, TickHalf, TickId, TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp,
-        encode_amount, entry_leaf_key,
+        Stated, TickHalf, TickId, TimestampRange, Verifiable, WeightedTimestamp, encode_amount,
+        entry_leaf_key,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
@@ -601,7 +590,6 @@ mod tests {
         members: MemberInputs,
         fence: ReadFence,
         state_claims: Vec<StateClaim>,
-        abandonment_records: Vec<AbandonmentRecord>,
         transactions: SharedTransactions,
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
     }
@@ -614,7 +602,6 @@ mod tests {
                 members: MemberInputs::still(local),
                 fence: ReadFence::default(),
                 state_claims: Vec::new(),
-                abandonment_records: Vec::new(),
                 transactions: Arc::new(Capped::empty()),
                 finalizations: Vec::new(),
             }
@@ -628,7 +615,6 @@ mod tests {
                     members: &self.members,
                     fence: &self.fence,
                     state_claims: &self.state_claims,
-                    abandonment_records: &self.abandonment_records,
                     transactions: &self.transactions,
                     finalizations: &self.finalizations,
                 },
@@ -706,24 +692,6 @@ mod tests {
             block.judged(&parent),
             Err(ParentRefusal::ParentReading(id.record_key(&ProtocolHasher))),
             "read at a parent holding the record, judged at one without it",
-        );
-
-        let escrowed = crossing(0x51);
-        let record = escrowed.record_key(&ProtocolHasher);
-        let named = UnclaimedCrossing::of(
-            record,
-            &record_cell(escrowed, Terms::Escrowed { credit: record }),
-        );
-        let block = Block {
-            abandonment_records: vec![
-                AbandonmentRecord::new(producer, WeightedTimestamp::from_millis(9_000), [])
-                    .with_unclaimed([named]),
-            ],
-            ..Block::empty(local)
-        };
-        assert_eq!(
-            block.judged(&parent),
-            Err(ParentRefusal::MisstatedUnclaimed(record)),
         );
     }
 
@@ -1466,7 +1434,6 @@ mod tests {
                     deleted: vec![member],
                     stated: Vec::new(),
                     accepted: Vec::new(),
-                    reclaimed: Vec::new(),
                 }],
                 ..MemberInputs::still(chain)
             },

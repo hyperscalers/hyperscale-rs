@@ -25,18 +25,13 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_hbor::Capped;
 use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
-    WeightedTimestamp, answer_hashes,
+    WeightedTimestamp,
 };
-use hyperscale_vm_effects::{
-    Answered, CrossingCell, CrossingEdge as StarEdge, CrossingId, Kind, Star, star_at,
-};
+use hyperscale_vm_effects::{Answered, CrossingEdge as StarEdge, CrossingId, Kind, Star, star_at};
 use hyperscale_vm_kernel::{Arrival, Crossed, Departure, LegPlan, OwnerSet, PlanFault};
-use hyperscale_vm_types::{
-    DeclaredWork, LegShape, MAX_CROSSINGS_PER_TX, PriceTable, ProtocolHasher, Quanta,
-};
+use hyperscale_vm_types::{DeclaredWork, LegShape, PriceTable, ProtocolHasher, Quanta};
 
 use crate::sharding::TrieShardResolver;
 
@@ -323,26 +318,6 @@ impl Classified {
             .map(|edge| (edge, self.home(edge.consumer)))
     }
 
-    /// The escrowed records `local` issues, ascending: what a departure
-    /// of the transaction's consumers takes back there.
-    ///
-    /// # Panics
-    ///
-    /// Never: a star carries at most [`MAX_CROSSINGS_PER_TX`] edges.
-    #[must_use]
-    pub fn escrowed_records(
-        &self,
-        local: ShardId,
-    ) -> Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX> {
-        let records: BTreeSet<SubstateKey> = self
-            .edges()
-            .iter()
-            .filter(|edge| edge.from == local && edge.crossing.kind == Kind::Escrowed)
-            .map(|edge| edge.crossing.id.record_key(&ProtocolHasher))
-            .collect();
-        Capped::new(records.into_iter().collect()).expect("a star's edges are capped")
-    }
-
     /// The edges `local` consumes and may refuse: the escrowed ones,
     /// which a core member consumes.
     ///
@@ -616,119 +591,6 @@ impl Member {
     #[must_use]
     pub fn in_core(&self) -> bool {
         self.classified.core().contains(&self.local)
-    }
-}
-
-/// What a member runs of its transaction: the shape its committing
-/// block froze, or a reclaim of records this shard holds.
-///
-/// No tick of a chain seats a reclaim: a record goes back in its
-/// producer's commit fold. The engine runs one only where it is asked
-/// to, writing what the fold writes for the same record, and charging
-/// nothing: it deletes no row, so it carries nothing of the fee and
-/// ends no fee hold.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Runs {
-    /// The transaction as classified at commit — whole, or the legs
-    /// this shard's placement gives it.
-    Shape(Member),
-    /// No node at all: records of crossings a producer here issued,
-    /// credited back and removed.
-    Reclaim {
-        /// The member the reclaim runs as: whole, on its own shard,
-        /// reaching nobody else.
-        member: Member,
-        /// The record cells to take back, each with the evidence that
-        /// licenses it. One the commit fold has already removed, or one
-        /// its evidence does not bind, is skipped, not refused: the rest
-        /// are still this member's.
-        records: Vec<(SubstateKey, Unclaimable)>,
-    },
-}
-
-/// What a reclaim the engine runs binds to the record it reads before
-/// it credits anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unclaimable {
-    /// The consumer's `Never`, read present at `read` stating `stated`.
-    Never {
-        /// The decline cell the reading was of.
-        read: SubstateKey,
-        /// The value hash the presence stated: what says which
-        /// transaction's record the decline answers.
-        stated: [u8; 32],
-    },
-    /// The transaction whose record it is.
-    IssuedBy {
-        /// The transaction that issued the record.
-        tx: TxHash,
-    },
-}
-
-impl Unclaimable {
-    /// Whether this evidence speaks for the record at `key`: a `Never`
-    /// read at the decline cell its own crossing derives, stating an
-    /// answer of the transaction that issued it, or that transaction
-    /// named outright.
-    ///
-    /// A decline cell names its edge and no transaction, so the cell a
-    /// record's crossing derives can hold what an earlier transaction's
-    /// consumer answered a record that stood at this key before. The
-    /// hash is what tells that from this record's own decline.
-    #[must_use]
-    pub fn binds(self, key: SubstateKey, cell: &CrossingCell) -> bool {
-        match self {
-            Self::Never { read, stated } => {
-                let id = CrossingId::of_record(key.owner, cell);
-                id.answer_key(&ProtocolHasher, Answered::Never) == read
-                    && answer_hashes(&id, cell.into(), Answered::Never).contains(&stated)
-            }
-            Self::IssuedBy { tx } => cell.tx == tx,
-        }
-    }
-}
-
-impl Runs {
-    /// The member this runs as.
-    #[must_use]
-    pub const fn member(&self) -> &Member {
-        match self {
-            Self::Shape(member) | Self::Reclaim { member, .. } => member,
-        }
-    }
-
-    /// Whether the transaction reaches beyond the running shard. A
-    /// reclaim reaches nobody: every cell it touches is this shard's.
-    #[must_use]
-    pub fn reaches_beyond(&self) -> bool {
-        match self {
-            Self::Shape(member) => member.reaches_beyond(),
-            Self::Reclaim { .. } => false,
-        }
-    }
-
-    /// Whether a counterpart's verdict can still discard this member's
-    /// effects after it executes. Nothing retracts a reclaim.
-    #[must_use]
-    pub fn abortable(&self) -> bool {
-        match self {
-            Self::Shape(member) => member.abortable(),
-            Self::Reclaim { .. } => false,
-        }
-    }
-
-    /// Whether another member of this one's batch can settle without
-    /// what this one credits, so that the credit is withheld from them.
-    ///
-    /// True of a member a verdict can still discard, whose batch-mates
-    /// settle ahead of that verdict, and of a reclaim, which no line
-    /// names.
-    #[must_use]
-    pub(crate) fn credits_withheld(&self) -> bool {
-        match self {
-            Self::Shape(member) => member.abortable(),
-            Self::Reclaim { .. } => true,
-        }
     }
 }
 
@@ -1174,27 +1036,6 @@ mod tests {
             divided.runs_at(high(), legs.len()),
             vec![false; legs.len()],
             "and reserves nothing",
-        );
-    }
-
-    /// A shard's escrowed records are the escrowed edges it issues, and
-    /// never an owed one: a transfer's crossing is owed and names none,
-    /// a swap's withdraw into the venue is escrowed and names its record.
-    #[test]
-    fn escrowed_records_are_the_escrowed_edges_a_shard_issues() {
-        assert!(frozen(&transfer()).escrowed_records(low()).is_empty());
-        let swap = frozen(&swap());
-        let escrowed: Vec<SubstateKey> = swap
-            .edges()
-            .iter()
-            .filter(|edge| edge.from == low() && edge.crossing.kind == Kind::Escrowed)
-            .map(|edge| edge.crossing.id.record_key(&ProtocolHasher))
-            .collect();
-        assert!(!escrowed.is_empty(), "the swap escrows into its venue");
-        assert_eq!(swap.escrowed_records(low()).to_vec(), escrowed);
-        assert!(
-            swap.escrowed_records(high()).is_empty(),
-            "the venue issues nothing escrowed"
         );
     }
 

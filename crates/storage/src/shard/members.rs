@@ -37,7 +37,7 @@
 //! claim's anchor, keeping the newest reading per sibling on the row.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::RangeInclusive;
+use std::ops::{RangeBounds, RangeInclusive};
 use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
@@ -727,8 +727,8 @@ pub struct SettledHalf {
     pub tick: TickId,
     /// Which half.
     pub half: TickHalf,
-    /// The members it names whose rows it deletes: the ones a committing
-    /// block reserved a place for, less those it accepts.
+    /// The members it names whose rows it deletes: every one, less those
+    /// it accepts.
     pub deleted: Vec<TxHash>,
     /// The members a legs half settles by their effects: stated rows it
     /// moves to accepted and does not delete. Empty for any other half.
@@ -737,11 +737,6 @@ pub struct SettledHalf {
     /// receipt hash its certificate attests: rows it moves and does not
     /// delete. Empty for any other half.
     pub stated: Vec<(TxHash, GlobalReceiptHash)>,
-    /// The members it names that hold no place of their own: outcomes
-    /// no committed row reserved for, which no line of this chain seats.
-    /// Where one names a transaction whose row still waits, the
-    /// finalization releases the row and does not delete it.
-    pub reclaimed: Vec<TxHash>,
 }
 
 impl SettledHalf {
@@ -751,12 +746,9 @@ impl SettledHalf {
     /// sections are.
     #[must_use]
     pub fn of(fw: &Finalization) -> Self {
-        let (reserved, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
-            .settled_outcomes()
-            .partition(|outcome| outcome.reserved());
         let accepts = fw.accepted_names();
-        let (accepted, deleted): (Vec<&TxOutcome>, Vec<&TxOutcome>) = reserved
-            .into_iter()
+        let (accepted, deleted): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
+            .settled_outcomes()
             .partition(|outcome| accepts.contains(&outcome.tx_hash()));
         let names =
             |outcomes: Vec<&TxOutcome>| outcomes.into_iter().map(TxOutcome::tx_hash).collect();
@@ -775,7 +767,6 @@ impl SettledHalf {
             deleted: names(deleted),
             accepted: names(accepted),
             stated,
-            reclaimed: names(reclaimed),
         }
     }
 }
@@ -814,7 +805,7 @@ pub struct MemberInputs {
 /// terms and its lines.
 #[derive(Debug, Clone, Copy)]
 pub struct MemberSections<'a> {
-    /// Its finalizations, each settling, stating or reclaiming members.
+    /// Its finalizations, each settling or stating members.
     pub certificates: &'a [Arc<Verifiable<Finalization>>],
     /// Its abandonment records, whose names cover the rows standing for
     /// them.
@@ -1248,21 +1239,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 receipt,
             };
             row.share = 0;
-            self.set_member(tx, Some(row));
-        }
-        for &tx in &settled.reclaimed {
-            let Some(mut row) = self.member(tx) else {
-                continue;
-            };
-            if row.state != RowState::Pending {
-                continue;
-            }
-            let Some(waiting) = row.waiting.take() else {
-                continue;
-            };
-            row.state = RowState::Released {
-                settlement: waiting.settlement,
-            };
             self.set_member(tx, Some(row));
         }
         if settled.half == TickHalf::Determined
@@ -2056,6 +2032,19 @@ impl MemberIndex {
             .count()
     }
 
+    /// The lowest height in `heights` whose determined half the chain
+    /// still owes.
+    #[must_use]
+    pub fn first_owed_determined(
+        &self,
+        heights: impl RangeBounds<BlockHeight>,
+    ) -> Option<BlockHeight> {
+        self.ticks
+            .range(heights)
+            .find(|(_, tick)| tick.determined_unsettled)
+            .map(|(height, _)| *height)
+    }
+
     /// The heights whose determined half the chain still owes.
     #[must_use]
     pub fn owed_determined(&self) -> BTreeSet<BlockHeight> {
@@ -2305,7 +2294,6 @@ mod tests {
                 deleted: txs.iter().map(|&seed| tx(seed)).collect(),
                 stated: Vec::new(),
                 accepted: Vec::new(),
-                reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
         }
@@ -2328,7 +2316,6 @@ mod tests {
                 deleted: refused.iter().map(|&seed| tx(seed)).collect(),
                 stated: yes.iter().map(|&seed| (tx(seed), effects(seed))).collect(),
                 accepted: Vec::new(),
-                reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
         }
@@ -2546,7 +2533,6 @@ mod tests {
                 deleted: Vec::new(),
                 stated: Vec::new(),
                 accepted: txs.iter().map(|&seed| tx(seed)).collect(),
-                reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
         }
@@ -2876,7 +2862,7 @@ mod tests {
                     receipt_hash: effects(1),
                 },
             )
-            .reserving(0)
+            .charging(0)
             .awaiting([PEER])
             .as_role(Role::Core)
         };
@@ -3283,110 +3269,6 @@ mod tests {
         );
         let tick = &MemberIndex::load(&store, LOCAL).ticks[&BlockHeight::new(2)];
         assert_eq!(tick.members[..], [tx(2)]);
-    }
-
-    /// A block at `height` whose finalization of the tick at `tick` names
-    /// the reclaims of `txs`: outcomes holding no reserved place.
-    fn reclaiming(height: u64, tick: u64, txs: &[u8]) -> MemberInputs {
-        MemberInputs {
-            height: BlockHeight::new(height),
-            settled: vec![SettledHalf {
-                tick: TickId::new(LOCAL, BlockHeight::new(tick)),
-                half: TickHalf::Determined,
-                deleted: Vec::new(),
-                stated: Vec::new(),
-                accepted: Vec::new(),
-                reclaimed: txs.iter().map(|&seed| tx(seed)).collect(),
-            }],
-            ..MemberInputs::still(LOCAL)
-        }
-    }
-
-    /// A reclaim's finalization deletes no row. The waiting row of the
-    /// transaction it names is released on the settlement its terms
-    /// state, keeping its reach, its charge and what it reserves, and
-    /// dropping what it waited on; a later line cannot put it in flight
-    /// from `Pending`, since it stands there no more. Its fate is what
-    /// deletes it.
-    #[test]
-    fn a_reclaim_releases_the_waiting_row_it_names_and_deletes_nothing() {
-        let mut store = Entries::default();
-        store.fold(&reserving(1, &[(1, 9, 40)]));
-        let waiting = row_of(&store, 1).expect("a committed row");
-        let stated = waiting.waiting.clone().expect("a pending row waits");
-        assert_eq!(waiting.state, RowState::Pending);
-        assert_eq!(reserved(&store, 9), 40);
-
-        store.fold(&reclaiming(2, 2, &[1]));
-        let released = row_of(&store, 1).expect("the reclaim deletes no row");
-        assert_eq!(
-            released,
-            MemberRow {
-                state: RowState::Released {
-                    settlement: stated.settlement,
-                },
-                waiting: None,
-                ..waiting
-            },
-        );
-        assert_eq!(
-            reserved(&store, 9),
-            40,
-            "a released row reserves what it did"
-        );
-        assert!(!seated_in(&store, 1));
-
-        store.fold(&reclaiming(3, 3, &[1]));
-        assert_eq!(
-            row_of(&store, 1),
-            Some(released),
-            "a second reclaim naming it changes nothing",
-        );
-
-        store.fold(&naming(
-            4,
-            vec![TickLine::Fate {
-                tx: tx(1),
-                charge: stub_abort_charge(1),
-            }],
-        ));
-        assert_eq!(row_of(&store, 1), None);
-        assert_eq!(reserved(&store, 9), 0);
-    }
-
-    /// A leg a line named to run after its reclaim was admitted is left
-    /// running: the reclaim's finalization over a row in flight changes
-    /// nothing, and neither does one over a row a discard released, an
-    /// aborted one, or a transaction no row stands for.
-    #[test]
-    fn a_leg_named_after_its_reclaim_is_left_running() {
-        let mut store = Entries::default();
-        store.fold(&committing(1, &[1, 2, 3]));
-        store.fold(&naming(
-            2,
-            vec![member(1, Settlement::Alone), joining(3, Joins::Aborted)],
-        ));
-        store.fold(&naming(3, vec![member(2, Settlement::Shared)]));
-        store.fold(&discarding(4, 3, DiscardCause::Recovery));
-        let before: Vec<Option<MemberRow>> = (1..=3).map(|seed| row_of(&store, seed)).collect();
-        assert!(matches!(
-            before[0].as_ref().map(|row| row.state),
-            Some(RowState::InFlight {
-                joins: Joins::Executes,
-                ..
-            })
-        ));
-        assert!(matches!(
-            before[1].as_ref().map(|row| row.state),
-            Some(RowState::Released { .. })
-        ));
-        let ticks = MemberIndex::load(&store, LOCAL).ticks;
-
-        store.fold(&reclaiming(5, 5, &[1, 2, 3, 4]));
-        let after: Vec<Option<MemberRow>> = (1..=3).map(|seed| row_of(&store, seed)).collect();
-        assert_eq!(after, before);
-        assert_eq!(row_of(&store, 4), None);
-        assert_eq!(MemberIndex::load(&store, LOCAL).ticks, ticks);
     }
 
     /// A record covers the row it names, and nothing else.
@@ -5987,7 +5869,6 @@ mod tests {
                     deleted: Vec::new(),
                     stated,
                     accepted: Vec::new(),
-                    reclaimed: Vec::new(),
                 }));
         }
         block

@@ -15,9 +15,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, stake_unit,
     staking_artifact,
 };
-use hyperscale_engine::legs::{
-    Classified, Member, Runs, Unclaimable, abandoned_never, never_answer,
-};
+use hyperscale_engine::legs::{Classified, Member, abandoned_never, never_answer};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, RecordStore, TickBatchContext,
@@ -37,8 +35,8 @@ use hyperscale_types::{
     GlobalReceipt, Hash, Inclusion, Issuer, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof,
     NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId,
     ShardTrie, Stake, StakePoolId, StakePoolSeat, StateClaim, StateRoot, Stated, SubstateEntry,
-    SubstateKey, TimestampRange, Transaction, TxHash, UnsettledCredits, Verified,
-    WeightedTimestamp, absorb_committed_cells, answer_hashes, compute_merkle_root,
+    SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
+    absorb_committed_cells, answer_hashes, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, CrossingId, IntentHeader, Kind,
@@ -250,7 +248,6 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
@@ -311,7 +308,6 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
     // The second pool becomes actual the way the chain makes one actual:
     // a transaction seals it, and the commit path offers its cells to
@@ -389,7 +385,6 @@ fn a_member_holding_no_record_executes_the_call_alike() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
 
     let raw = signed_instantiate(OPERATOR, &unseated);
@@ -487,7 +482,6 @@ fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
@@ -606,7 +600,6 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(executor.derivation().as_ref())
@@ -978,19 +971,18 @@ impl DividedStake {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
-            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
             tx_hash: self.tx.hash(),
-            transaction: Some(&self.tx),
+            transaction: &self.tx,
             provisions,
             clock: WeightedTimestamp::from_millis(1_000),
-            runs: Runs::Shape(Member::of(
+            member: Member::of(
                 self.classified.clone(),
                 local,
                 BTreeSet::from([self.payer_shard, self.core, self.sibling]),
-            )),
+            ),
             arrivals,
         };
         self.executor
@@ -1610,7 +1602,6 @@ fn a_decline_another_transaction_wrote_over_binds_nothing_of_the_first_record() 
     let divided = divided_stake();
     let id = divided.own_edge().crossing.id;
     let first = divided.record(&divided.store(&divided.seats));
-    let record_key = id.record_key(&ProtocolHasher);
     let end = divided.validity_end_ms();
     let second = Issuer {
         tx: TxHash::from(Hash::from_bytes(b"a second transaction")),
@@ -1626,15 +1617,12 @@ fn a_decline_another_transaction_wrote_over_binds_nothing_of_the_first_record() 
     let mut consumer: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::new();
     let bound_to = |standing: &[u8]| {
         let proven = read_off_a_tree(divided.core, decline, standing, id);
-        let Some(Inclusion::Present(stated)) = proven.reading(decline) else {
-            panic!("the tree holds the decline");
-        };
-        let licence = Unclaimable::Never {
-            read: decline,
-            stated,
-        };
+        assert!(
+            matches!(proven.reading(decline), Some(Inclusion::Present(_))),
+            "the tree holds the decline",
+        );
         (
-            proven.answers(&id, &first, Answered::Never) && licence.binds(record_key, &first),
+            proven.answers(&id, &first, Answered::Never),
             proven.answers(&id, second, Answered::Never),
         )
     };
@@ -1680,22 +1668,16 @@ fn a_replayed_decline_cannot_take_back_a_reissued_record() {
         tx: TxHash::from(Hash::from_bytes(b"a second transaction")),
         ..first
     };
-    let record_key = id.record_key(&ProtocolHasher);
     let decline = id.answer_key(&ProtocolHasher, Answered::Never);
     let (producer, consumer) = (divided.payer_shard, divided.core);
-    let licence_of = |standing: &[u8]| {
+    let proven_of = |standing: &[u8]| {
         let proven = read_off_a_tree(consumer, decline, standing, id);
         assert_eq!(proven.verify(), Ok(()));
-        let Some(Inclusion::Present(stated)) = proven.reading(decline) else {
-            panic!("the tree holds the decline");
-        };
-        (
-            proven,
-            Unclaimable::Never {
-                read: decline,
-                stated,
-            },
-        )
+        assert!(
+            matches!(proven.reading(decline), Some(Inclusion::Present(_))),
+            "the tree holds the decline",
+        );
+        proven
     };
 
     let mut state = MapDb {
@@ -1705,16 +1687,13 @@ fn a_replayed_decline_cannot_take_back_a_reissued_record() {
     let first_never = declined_never(id, &first, producer, consumer, &state)
         .expect("the fold declines the first record");
     state.cells.insert(decline, first_never.clone());
-    let (proven, licence) = licence_of(&first_never);
-    assert!(proven.answers(&id, &first, Answered::Never));
+    let proven = proven_of(&first_never);
     assert!(
-        licence.binds(record_key, &first),
+        proven.answers(&id, &first, Answered::Never),
         "the decline licenses taking the first record back",
     );
-
-    assert!(!proven.answers(&id, &reissued, Answered::Never));
     assert!(
-        !licence.binds(record_key, &reissued),
+        !proven.answers(&id, &reissued, Answered::Never),
         "replayed, it licenses nothing against the record issued again",
     );
 
@@ -1722,11 +1701,9 @@ fn a_replayed_decline_cannot_take_back_a_reissued_record() {
         .expect("the first transaction's Never refuses no decline of the second record");
     assert_ne!(second_never, first_never);
     state.cells.insert(decline, second_never.clone());
-    let (proven, licence) = licence_of(&second_never);
-    assert!(
-        proven.answers(&id, &reissued, Answered::Never) && licence.binds(record_key, &reissued)
-    );
-    assert!(!licence.binds(record_key, &first));
+    let proven = proven_of(&second_never);
+    assert!(proven.answers(&id, &reissued, Answered::Never));
+    assert!(!proven.answers(&id, &first, Answered::Never));
     assert_eq!(
         declined_never(id, &reissued, producer, consumer, &state),
         None,
@@ -1751,7 +1728,6 @@ fn a_decline_written_over_another_transactions_never_binds_its_own_record() {
     let divided = divided_stake();
     let id = divided.own_edge().crossing.id;
     let first = divided.record(&divided.store(&divided.seats));
-    let record_key = id.record_key(&ProtocolHasher);
     let end = divided.validity_end_ms();
     let second = TxHash::from(Hash::from_bytes(b"a second transaction"));
     let (producer, consumer) = (divided.payer_shard, divided.core);
@@ -1782,14 +1758,11 @@ fn a_decline_written_over_another_transactions_never_binds_its_own_record() {
     let binds_the_record = |standing: &[u8]| {
         let proven = read_off_a_tree(consumer, decline, standing, id);
         assert_eq!(proven.verify(), Ok(()));
-        let Some(Inclusion::Present(stated)) = proven.reading(decline) else {
-            panic!("the tree holds the decline");
-        };
-        let licence = Unclaimable::Never {
-            read: decline,
-            stated,
-        };
-        proven.answers(&id, &first, Answered::Never) && licence.binds(record_key, &first)
+        assert!(
+            matches!(proven.reading(decline), Some(Inclusion::Present(_))),
+            "the tree holds the decline",
+        );
+        proven.answers(&id, &first, Answered::Never)
     };
     assert!(
         !binds_the_record(&second_never),
@@ -1946,7 +1919,6 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        unsettled_credits: &UnsettledCredits::new(),
     };
     let run = |executor: &Executor, store: &MapDb, raw: Transaction| {
         raw.try_derived(executor.derivation().as_ref())

@@ -861,8 +861,8 @@ impl Cluster for SimCluster {
     fn events(&self, shard: ShardId, tx: TxHash) -> Option<Vec<Event>> {
         let store =
             (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))?;
-        // Every receipt the transaction settled here, effects and any
-        // reclaim or refund alike: each carries the events it emitted.
+        // Every receipt the transaction settled here: each carries the
+        // events it emitted.
         let receipts = store.get_consensus_receipts(&tx);
         (!receipts.is_empty()).then(|| {
             receipts
