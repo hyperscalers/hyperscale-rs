@@ -16,7 +16,7 @@ use hyperscale_types::{
     SubstateLeaf,
 };
 
-use crate::{MemberIndex, Substates};
+use crate::{CrossingCursor, MemberIndex, Substates};
 
 /// Which pinned boundaries a store keeps when the node trims its pins.
 ///
@@ -464,6 +464,19 @@ pub trait BoundaryStore {
     /// Persisted rows only; an unpersisted ancestor's writes are the
     /// overlay's to add.
     fn crossing_rows(&self, under: &NibblePath) -> Vec<SubstateKey>;
+
+    /// The keys under `under` whose crossing row a persisted write above
+    /// `since` and at or below `through` has put or removed, or `None`
+    /// where the store cannot say and a reader reads the rows whole,
+    /// with where the reader stands once it has read them at `through`:
+    /// [`CrossingJournal::since`](crate::CrossingJournal::since) over the
+    /// store's journal.
+    fn crossing_changes(
+        &self,
+        under: &NibblePath,
+        since: Option<CrossingCursor>,
+        through: BlockHeight,
+    ) -> (Option<Vec<SubstateKey>>, CrossingCursor);
 
     /// The read frontier `shard`'s slice of the committed state holds:
     /// [`load_read_frontier`](crate::load_read_frontier) over the store,

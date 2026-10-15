@@ -1977,6 +1977,102 @@ where
     );
 }
 
+/// The crossing journal names every row a commit moves.
+///
+/// A reader with no cursor, or one from another store, reads the rows
+/// whole. A cursor reads the rows put or removed above it, up to the
+/// height it reads at and under the prefix it reads, each once, and no
+/// ordinary cell. An import starts the importing store's line over.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_crossing_changes_name_every_moved_row<S>(storage: &S, fresh: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    install_stub_protocol_statics();
+    let all = NibblePath::empty();
+    let (whole, start) = storage.crossing_changes(&all, None, storage.jmt_height());
+    assert_eq!(whole, None, "no cursor reads the rows whole");
+
+    let ordinary = state_key(1, 1);
+    let (left, right) = (crossing_record_leaf(2), crossing_record_leaf(0x82));
+    let answered = fixture_crossing(0x84, 3);
+    let answer = answered.answer_key(&ProtocolHasher, Answered::Taken);
+    let answer_value = answered
+        .answer(VmTxHash(Hash32([0xC1; 32])), Answered::Taken, 1_000)
+        .to_bytes();
+    commit_writes(
+        storage,
+        &SettledWrites::from_absolutes(
+            [
+                (ordinary, Some(vec![9, 9, 9])),
+                (left.key, Some(left.value.to_vec())),
+                (right.key, Some(right.value.to_vec())),
+                (answer, Some(answer_value)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    let written = storage.jmt_height();
+    let (before, held) = storage.crossing_changes(
+        &all,
+        Some(start),
+        written.prev().expect("a commit stands above genesis"),
+    );
+    assert_eq!(
+        before,
+        Some(Vec::new()),
+        "a write above the height read at is not named"
+    );
+    let mut moved = vec![left.key, right.key, answer];
+    moved.sort_unstable();
+    let (changed, cursor) = storage.crossing_changes(&all, Some(held), written);
+    assert_eq!(
+        changed,
+        Some(moved),
+        "every row the commit put, and no ordinary cell"
+    );
+    assert_eq!(
+        storage.crossing_changes(&all, Some(cursor), written).0,
+        Some(Vec::new()),
+        "and nothing twice",
+    );
+
+    commit_writes(
+        storage,
+        &SettledWrites::from_absolutes([(left.key, None), (answer, None)].into_iter().collect()),
+    );
+    let removed = storage.jmt_height();
+    let half = shard_prefix_path(ShardId::leaf(1, 0));
+    let mut under: Vec<SubstateKey> = [left.key, answer]
+        .into_iter()
+        .filter(|key| key_under_prefix(&key.to_bytes(), &half))
+        .collect();
+    under.sort_unstable();
+    assert_eq!(
+        storage.crossing_changes(&half, Some(cursor), removed).0,
+        Some(under),
+        "the rows removed under the prefix read",
+    );
+
+    let (_, imported) = fresh.crossing_changes(&all, None, fresh.jmt_height());
+    let leaves = boundary_leaves(storage, removed);
+    import_boundary_state(fresh, removed, &leaves, WitnessSeed::default()).unwrap();
+    assert_eq!(
+        fresh.crossing_changes(&all, Some(imported), removed).0,
+        None,
+        "an import starts the line over",
+    );
+    assert_eq!(
+        fresh.crossing_changes(&all, Some(cursor), removed).0,
+        None,
+        "and another store's cursor reads whole",
+    );
+}
+
 /// Every leaf `serving` holds at `height`, pinned there, as a snap-sync
 /// import receives them.
 fn boundary_leaves<S: BoundaryStore>(serving: &S, height: BlockHeight) -> Vec<SubstateLeaf> {

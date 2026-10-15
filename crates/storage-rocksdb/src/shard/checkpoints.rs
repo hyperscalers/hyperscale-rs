@@ -19,8 +19,8 @@ use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryRetention, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows,
-    MemberIndex, SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes,
+    AdoptSource, BoundaryRetention, BoundaryStore, CrossingCursor, ImportProgress, JmtSnapshot,
+    LeafRows, MemberIndex, SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes,
     holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
@@ -310,6 +310,10 @@ impl RocksDbShardStorage {
             self.db
                 .write(batch)
                 .map_err(|e| format!("snap-sync import write: {e}"))?;
+            self.crossing_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .restart();
 
             parent = Some(batch_version);
             batch_version += 1;
@@ -535,6 +539,18 @@ impl BoundaryStore for RocksDbShardStorage {
         .collect()
     }
 
+    fn crossing_changes(
+        &self,
+        under: &NibblePath,
+        since: Option<CrossingCursor>,
+        through: BlockHeight,
+    ) -> (Option<Vec<SubstateKey>>, CrossingCursor) {
+        self.crossing_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .since(under, since, through.inner())
+    }
+
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
         load_read_frontier(self, shard)
     }
@@ -691,7 +707,7 @@ impl BoundaryStore for RocksDbShardStorage {
             return Ok(base_root);
         }
 
-        let (mut batch, sweep_rows) = self.build_substate_write_batch(
+        let (mut batch, rows) = self.build_substate_write_batch(
             &filtered,
             height.inner(),
             /* write_history */ true,
@@ -700,7 +716,7 @@ impl BoundaryStore for RocksDbShardStorage {
         );
         // `commit_lock` is held across this whole follow and the batch is
         // written below, so the fold's read is of the state it extends.
-        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &sweep_rows);
+        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &rows.sweep);
         let parent_version =
             jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
         let (new_root, collected) =
@@ -717,6 +733,7 @@ impl BoundaryStore for RocksDbShardStorage {
         self.db
             .write(batch)
             .map_err(|e| format!("follow write failed: {e}"))?;
+        self.record_crossings(height.inner(), rows.crossings);
         Ok(new_root)
     }
 
@@ -771,8 +788,8 @@ mod tests {
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
-        test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
-        test_followed_halves_drop_a_late_sweepable_write,
+        test_boundary_unpinned_height_not_served, test_crossing_changes_name_every_moved_row,
+        test_crossing_index_equals_the_leaves, test_followed_halves_drop_a_late_sweepable_write,
         test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
         test_import_gate_reads_the_trie,
         test_pending_views_read_a_verdict_change_alike_at_every_depth,
@@ -931,6 +948,98 @@ mod tests {
         let fresh_dir = TempDir::new().unwrap();
         let fresh = open_storage(fresh_dir.path());
         test_boundary_import_roundtrip(&storage, &fresh);
+    }
+
+    /// A reader following the journal the way `ChainCrossings` does, a
+    /// snapshot at the committed height first and then the changes
+    /// through that height read at the snapshot, while another thread
+    /// commits, holds the rows a whole read finds once the commits stop.
+    #[test]
+    fn a_reader_following_beside_concurrent_commits_holds_the_rows_a_whole_read_finds() {
+        use hyperscale_storage::VersionedStore;
+        use hyperscale_storage::test_helpers::{commit_writes, crossing_record_leaf};
+        use hyperscale_types::SettledWrites;
+        let dir = TempDir::new().unwrap();
+        let storage = open_storage(dir.path());
+        let all = NibblePath::empty();
+        let read = |storage: &RocksDbShardStorage,
+                    cursor: Option<CrossingCursor>,
+                    rows: &mut BTreeMap<SubstateKey, Vec<u8>>|
+         -> CrossingCursor {
+            let height = storage.jmt_height();
+            let tip = storage.snapshot_at(height);
+            let (changed, cursor) = storage.crossing_changes(&all, cursor, height);
+            match changed {
+                None => {
+                    *rows = storage
+                        .crossing_rows(&all)
+                        .into_iter()
+                        .filter_map(|key| tip.cell(key).map(|value| (key, value)))
+                        .collect();
+                }
+                Some(keys) => {
+                    for key in keys {
+                        match tip.cell(key) {
+                            Some(value) => rows.insert(key, value),
+                            None => rows.remove(&key),
+                        };
+                    }
+                }
+            }
+            cursor
+        };
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let mut followed = BTreeMap::new();
+        let mut reads = 0u32;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut draw = 0x2545_F491_4F6C_DD1Du64;
+                for _ in 0..400 {
+                    let writes = (0..4)
+                        .map(|_| {
+                            draw ^= draw << 13;
+                            draw ^= draw >> 7;
+                            draw ^= draw << 17;
+                            let leaf =
+                                crossing_record_leaf(u8::try_from(draw % 40).unwrap() * 2 + 1);
+                            let value = (!draw.is_multiple_of(3)).then(|| leaf.value.to_vec());
+                            (leaf.key, value)
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    commit_writes(&storage, &SettledWrites::from_absolutes(writes));
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let mut cursor = None;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                cursor = Some(read(&storage, cursor, &mut followed));
+                reads += 1;
+            }
+            let cursor = read(&storage, cursor, &mut followed);
+            let mut whole = BTreeMap::new();
+            read(&storage, None, &mut whole);
+            assert!(reads > 10, "the reader ran beside the commits: {reads}");
+            assert_eq!(followed, whole, "after {reads} reads, at {cursor:?}");
+        });
+    }
+
+    /// The crossing journal names every row a commit moves, and a
+    /// reopened store reads a running one's cursor whole.
+    #[test]
+    fn the_crossing_changes_name_every_moved_row() {
+        let (dir, fresh_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let storage = open_storage(dir.path());
+        test_crossing_changes_name_every_moved_row(&storage, &open_storage(fresh_dir.path()));
+        let all = NibblePath::empty();
+        let (_, cursor) = storage.crossing_changes(&all, None, storage.jmt_height());
+        let height = storage.jmt_height();
+        drop(storage);
+        assert_eq!(
+            open_storage(dir.path())
+                .crossing_changes(&all, Some(cursor), height)
+                .0,
+            None,
+        );
     }
 
     /// The crossing index equals the leaves across commits, deletes and

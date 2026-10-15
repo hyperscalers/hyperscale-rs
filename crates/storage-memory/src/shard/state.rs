@@ -11,8 +11,8 @@ use hyperscale_hbor::{
 use hyperscale_jmt::NodeKey;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BlockRowKeys, BlockRows, ChainHold, Indexed, JmtSnapshot, RowChange, SweepRows,
-    entry_leaf_rows, index_leaf, retire_dated,
+    BlockRowKeys, BlockRows, ChainHold, CrossingJournal, Indexed, JmtSnapshot, RowChange,
+    SweepRows, entry_leaf_rows, index_leaf, retire_dated,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
@@ -105,6 +105,8 @@ pub struct SharedState {
     /// The crossing index — the mirror of the `RocksDB` backend's: one
     /// key per committed crossing record or answer.
     pub(crate) crossing_index: OrdSet<SubstateKey>,
+    /// The crossing index rows written or removed, in commit order.
+    pub(crate) crossing_journal: CrossingJournal,
 }
 
 impl SharedState {
@@ -222,6 +224,7 @@ impl SharedState {
             package_artifacts: OrdMap::new(),
             sweep_index: SweepRows::default(),
             crossing_index: OrdSet::new(),
+            crossing_journal: CrossingJournal::new(),
         }
     }
 
@@ -624,6 +627,7 @@ pub fn apply_writes(
     // cell does; the index rows beside them keep range scans native.
     let leaf_rows = entry_leaf_rows(writes.entries());
     let mut sweep_rows = SweepRows::default();
+    let mut crossings = Vec::new();
     for (key, change) in writes.cells().iter().chain(&leaf_rows) {
         let prior = state.current_state.get(key).cloned();
         let Indexed { package, crossing } =
@@ -634,9 +638,11 @@ pub fn apply_writes(
         match crossing {
             RowChange::Put => {
                 state.crossing_index.insert(*key);
+                crossings.push(*key);
             }
             RowChange::Delete => {
                 state.crossing_index.remove(key);
+                crossings.push(*key);
             }
             RowChange::Keep => {}
         }
@@ -655,6 +661,7 @@ pub fn apply_writes(
         }
     }
     state.sweep_index.fold(&sweep_rows);
+    state.crossing_journal.record(version, crossings);
     for (key, change) in writes.entries() {
         let prior = state.current_entries.get(key).cloned();
         if write_history {

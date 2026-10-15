@@ -13,6 +13,7 @@ pub mod chain_floor;
 pub mod chain_reader;
 pub mod chain_writer;
 pub mod committed_provisions;
+pub mod crossing_journal;
 pub mod crossings;
 pub mod dedup_window;
 pub mod derived;

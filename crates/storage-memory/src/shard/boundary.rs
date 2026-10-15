@@ -13,9 +13,9 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BoundaryRetention, BoundaryStore, ImportProgress, LeafRows, MemberIndex,
-    SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
-    key_under_prefix, load_read_frontier, prefix_low_key,
+    AdoptSource, BoundaryRetention, BoundaryStore, CrossingCursor, ImportProgress, LeafRows,
+    MemberIndex, SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes,
+    holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, FrontierInputs, ReadFrontier,
@@ -105,6 +105,17 @@ impl BoundaryStore for SimShardStorage {
             .take_while(|key| key_under_prefix(&key.to_bytes(), under))
             .copied()
             .collect()
+    }
+
+    fn crossing_changes(
+        &self,
+        under: &NibblePath,
+        since: Option<CrossingCursor>,
+        through: BlockHeight,
+    ) -> (Option<Vec<SubstateKey>>, CrossingCursor) {
+        read_or_recover(&self.state)
+            .crossing_journal
+            .since(under, since, through.inner())
     }
 
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier {
@@ -252,6 +263,7 @@ impl BoundaryStore for SimShardStorage {
                 .insert(leaf.key, Arc::from(leaf.value.into_inner()));
         }
         state.sweep_index.fold(&sweep_rows);
+        state.crossing_journal.restart();
 
         // Seed the substate byte total: a fresh-tree import's byte delta IS
         // the imported leaves' value bytes.
@@ -356,8 +368,8 @@ mod tests {
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
-        test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
-        test_followed_halves_drop_a_late_sweepable_write,
+        test_boundary_unpinned_height_not_served, test_crossing_changes_name_every_moved_row,
+        test_crossing_index_equals_the_leaves, test_followed_halves_drop_a_late_sweepable_write,
         test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
         test_import_gate_reads_the_trie,
         test_pending_views_read_a_verdict_change_alike_at_every_depth,
@@ -485,6 +497,20 @@ mod tests {
         let storage = SimShardStorage::default();
         let fresh = SimShardStorage::default();
         test_boundary_import_roundtrip(&storage, &fresh);
+    }
+
+    /// The crossing journal names every row a commit moves, and a store
+    /// restored from an image reads a cursor taken before it whole.
+    #[test]
+    fn the_crossing_changes_name_every_moved_row() {
+        let storage = SimShardStorage::default();
+        let image = storage.image();
+        test_crossing_changes_name_every_moved_row(&storage, &SimShardStorage::default());
+        let all = NibblePath::empty();
+        let height = storage.jmt_height();
+        let (_, cursor) = storage.crossing_changes(&all, None, height);
+        storage.restore(&image);
+        assert_eq!(storage.crossing_changes(&all, Some(cursor), height).0, None);
     }
 
     /// The crossing index equals the leaves across commits, deletes and

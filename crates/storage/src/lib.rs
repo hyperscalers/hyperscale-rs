@@ -50,6 +50,7 @@ pub use shard::chain_floor::{ChainHold, FloorInputs, chain_floor, history_floor}
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
 pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
+pub use shard::crossing_journal::{CrossingCursor, CrossingJournal};
 pub use shard::crossings::{
     CrossingSettlements, credit_lands, crossing_settlements, decline_rows, live_record,
     owed_credits, reclaim_credits, reclaimed, record_arrivals, unclaimed_declines,

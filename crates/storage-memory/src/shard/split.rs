@@ -94,6 +94,7 @@ impl SimShardStorage {
                 for key in foreign {
                     shared.crossing_index.remove(&key);
                 }
+                shared.crossing_journal.restart();
                 root
             }
         };

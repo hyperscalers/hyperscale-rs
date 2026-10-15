@@ -920,6 +920,12 @@ impl<S> SubstateView<S> {
     pub const fn base(&self) -> &Arc<S> {
         &self.base
     }
+
+    /// The height this view's state stands at.
+    #[must_use]
+    pub const fn anchor_height(&self) -> BlockHeight {
+        self.anchor_height
+    }
 }
 
 impl<S> SubstateView<S> {

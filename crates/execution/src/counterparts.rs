@@ -22,14 +22,19 @@ use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_folded, record_reclaim_probe_answered,
     record_reclaim_probe_pending, set_standing_answers,
 };
+#[cfg(test)]
+use hyperscale_storage::CrossingJournal;
 use hyperscale_storage::{
-    committed_tx_cell_key, credit_lands, member_row_leaf, reclaimed, unclaimed_records,
+    CrossingCursor, committed_tx_cell_key, credit_lands, member_row_leaf, reclaimed,
+    unclaimed_records,
 };
 use hyperscale_types::network::response::ServedValue;
+#[cfg(test)]
+use hyperscale_types::shard_prefix_path;
 use hyperscale_types::{
-    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHash, BlockHeight,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Address, Anchor, Block, BlockHash, BlockHeight,
     BoundaryAttestation, BoundaryOffer, CounterpartMirror, Deadline, EpochWindows,
-    ExecutionCertificate, FrontierInputs, Inclusion, Issuer, MAX_CLAIMS_PER_BLOCK,
+    ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey, MAX_CLAIMS_PER_BLOCK,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
     MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
@@ -107,9 +112,16 @@ impl Budget {
 /// reads it: a question it raises is answered by a reading every voter
 /// re-proves, and a question it misses or asks late costs latency.
 pub trait CrossingIndex: Send + Sync {
-    /// The crossing records and answers under `shard`'s prefix, each
-    /// with its bytes as the persisted tip holds them, ascending by key.
-    fn crossing_rows(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
+    /// The crossing records and answers under `shard`'s prefix that
+    /// moved since `since`, or every one of them where the index cannot
+    /// say what moved, each with its bytes as the persisted tip holds
+    /// them, ascending by key; and where the reader stands once it has
+    /// read them.
+    fn crossing_changes(
+        &self,
+        shard: ShardId,
+        since: Option<CrossingCursor>,
+    ) -> (CrossingRead, Option<CrossingCursor>);
 
     /// The bytes `key` holds at the persisted tip, if it holds any.
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>>;
@@ -118,6 +130,16 @@ pub trait CrossingIndex: Send + Sync {
     fn present(&self, key: SubstateKey) -> bool {
         self.cell(key).is_some()
     }
+}
+
+/// What one read of a [`CrossingIndex`] brings.
+#[derive(Debug)]
+pub enum CrossingRead {
+    /// Every row, with its bytes.
+    Whole(Vec<(SubstateKey, Vec<u8>)>),
+    /// The rows that moved, each with its bytes, or `None` where it is
+    /// gone.
+    Changed(Vec<(SubstateKey, Option<Vec<u8>>)>),
 }
 
 /// The index a shard's store answers with, bound once the store's
@@ -143,9 +165,15 @@ impl CrossingIndexSlot {
 }
 
 impl CrossingIndex for CrossingIndexSlot {
-    fn crossing_rows(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
-        self.bound()
-            .map_or_else(Vec::new, |index| index.crossing_rows(shard))
+    fn crossing_changes(
+        &self,
+        shard: ShardId,
+        since: Option<CrossingCursor>,
+    ) -> (CrossingRead, Option<CrossingCursor>) {
+        self.bound().map_or_else(
+            || (CrossingRead::Whole(Vec::new()), None),
+            |index| index.crossing_changes(shard, since),
+        )
     }
 
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
@@ -154,51 +182,103 @@ impl CrossingIndex for CrossingIndexSlot {
 }
 
 /// Crossing rows written out by hand: what a test holds where a store
-/// would.
+/// would, with a journal of the keys each write touched.
 #[cfg(test)]
 #[derive(Default)]
-pub struct TestRows(std::sync::Mutex<BTreeMap<SubstateKey, Vec<u8>>>);
+pub struct TestRows(std::sync::Mutex<TestCells>);
+
+/// The cells a [`TestRows`] holds, and the journal of its writes, one
+/// version a write.
+#[cfg(test)]
+#[derive(Default)]
+pub struct TestCells {
+    cells: BTreeMap<SubstateKey, Vec<u8>>,
+    journal: CrossingJournal,
+    version: u64,
+}
+
+#[cfg(test)]
+impl TestCells {
+    fn write(&mut self, key: SubstateKey, value: Option<Vec<u8>>) {
+        match value {
+            Some(value) => self.cells.insert(key, value),
+            None => self.cells.remove(&key),
+        };
+        self.version += 1;
+        self.journal.record(self.version, [key]);
+    }
+
+    fn read(
+        &self,
+        shard: ShardId,
+        since: Option<CrossingCursor>,
+    ) -> (CrossingRead, Option<CrossingCursor>) {
+        let (changed, cursor) = self
+            .journal
+            .since(&shard_prefix_path(shard), since, self.version);
+        let read = changed.map_or_else(
+            || {
+                CrossingRead::Whole(
+                    self.cells
+                        .keys()
+                        .filter_map(|key| self.row(shard, *key).map(|value| (*key, value.clone())))
+                        .collect(),
+                )
+            },
+            |keys| {
+                CrossingRead::Changed(
+                    keys.into_iter()
+                        .map(|key| (key, self.row(shard, key).cloned()))
+                        .collect(),
+                )
+            },
+        );
+        (read, Some(cursor))
+    }
+
+    fn row(&self, shard: ShardId, key: SubstateKey) -> Option<&Vec<u8>> {
+        self.cells.get(&key).filter(|value| {
+            ShardTrie::shard_owns_prefix(shard, key.owner)
+                && CrossingLeaf::read(&ProtocolHasher, key, value).is_some()
+        })
+    }
+}
 
 #[cfg(test)]
 impl TestRows {
     /// A cell at `key`, crossing leaf or not.
     pub fn put(&self, key: SubstateKey, value: Vec<u8>) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, value);
+        self.cells().write(key, Some(value));
     }
 
     /// The cell at `key` gone.
     pub fn remove(&self, key: SubstateKey) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
+        self.cells().write(key, None);
+    }
+
+    /// Start the journal over, as a store its readers no longer follow:
+    /// the next read is whole.
+    pub fn restart(&self) {
+        self.cells().journal.restart();
+    }
+
+    fn cells(&self) -> std::sync::MutexGuard<'_, TestCells> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 #[cfg(test)]
 impl CrossingIndex for TestRows {
-    fn crossing_rows(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(key, value)| {
-                ShardTrie::shard_owns_prefix(shard, key.owner)
-                    && CrossingLeaf::read(&ProtocolHasher, **key, value).is_some()
-            })
-            .map(|(key, value)| (*key, value.clone()))
-            .collect()
+    fn crossing_changes(
+        &self,
+        shard: ShardId,
+        since: Option<CrossingCursor>,
+    ) -> (CrossingRead, Option<CrossingCursor>) {
+        self.cells().read(shard, since)
     }
 
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .cloned()
+        self.cells().cells.get(&key).cloned()
     }
 }
 
@@ -716,6 +796,408 @@ fn return_lands(cell: &CrossingCell, local: ShardId, index: &dyn CrossingIndex) 
     credit_lands(cell, local, index.cell(credit).as_deref(), [])
 }
 
+/// What one crossing row of this shard's puts, derived where the row is
+/// read.
+#[derive(Debug, Clone)]
+enum RowRead {
+    /// A record whose consumer another shard holds: what it asks of the
+    /// consumer, and what this shard pushes it again and returns on.
+    Carried {
+        id: CrossingId,
+        cells: CrossingCells,
+        carried: Carried,
+        never: Option<Box<NeverRow>>,
+    },
+    /// A record whose consumer this shard holds, which this shard's own
+    /// fold settles off a reading at the parent.
+    Settling {
+        id: CrossingId,
+        cells: CrossingCells,
+        cell: CrossingCell,
+    },
+    /// An answer whose record another shard holds.
+    Answer {
+        id: CrossingId,
+        row: AnswerRow,
+        bytes: usize,
+    },
+    /// An answer whose record this shard holds.
+    Closing {
+        id: CrossingId,
+        record: SubstateKey,
+        bytes: usize,
+    },
+}
+
+impl RowRead {
+    /// What `value` at `key`, a crossing row under `local`'s prefix,
+    /// puts under `trie`, if it is a crossing leaf.
+    fn of(trie: &ShardTrie, local: ShardId, key: SubstateKey, value: &[u8]) -> Option<Self> {
+        match CrossingLeaf::read(&ProtocolHasher, key, value)? {
+            CrossingLeaf::Record { cell, .. } => {
+                let id = CrossingId::of_record(key.owner, &cell);
+                let cells = CrossingCells::of(&id);
+                if trie.shard_for_prefix(cells.taken.owner) == local {
+                    return Some(Self::Settling { id, cells, cell });
+                }
+                let end = WeightedTimestamp::from_millis(cell.validity_end_ms);
+                let owed = cell.terms == Terms::Owed;
+                let carried = Carried {
+                    id,
+                    due_from: if owed { Deadline::of(end).at() } else { end },
+                    escrowed: !owed,
+                };
+                // A credit cell under another shard's prefix, which a
+                // split leaves on the other child, takes no return here
+                // whatever it holds: no question is put.
+                let never = (!owed && credit_lands(&cell, local, None, []))
+                    .then(|| Box::new(NeverRow::of(trie, id, &cell)));
+                Some(Self::Carried {
+                    id,
+                    cells,
+                    carried,
+                    never,
+                })
+            }
+            CrossingLeaf::Answer { id, answer } => {
+                let bytes = key.to_bytes().len() + value.len();
+                let record = id.record_key(&ProtocolHasher);
+                let holder = trie.shard_for_prefix(record.owner);
+                if holder == local {
+                    return Some(Self::Closing { id, record, bytes });
+                }
+                let validity_end = WeightedTimestamp::from_millis(answer.validity_end_ms);
+                Some(Self::Answer {
+                    id,
+                    row: AnswerRow {
+                        holder,
+                        record,
+                        row: member_row_leaf(holder, answer.tx),
+                        marker: committed_tx_cell_key(holder, answer.tx, validity_end),
+                        validity_end,
+                    },
+                    bytes,
+                })
+            }
+        }
+    }
+}
+
+/// The lowest key in key order.
+const LOWEST_KEY: SubstateKey = SubstateKey {
+    owner: Address::MIN,
+    local: LocalKey([0; 16]),
+};
+
+/// What a standing row is, kept to take it down: the rest of what it
+/// puts is in the maps it put it in.
+#[derive(Debug, Clone, Copy)]
+enum RowKind {
+    /// A record, with the claim and decline keys of its crossing.
+    Record {
+        taken: SubstateKey,
+        never: SubstateKey,
+    },
+    /// An answer, with its bytes.
+    Answer { bytes: usize },
+}
+
+/// The crossing rows of this shard's as the index last read them, and
+/// what each puts, kept from one commit to the next and moved by the
+/// rows that moved: a commit reads the rows written or removed since the
+/// last, and the whole index only where the index cannot say what moved
+/// or the trie the rows were read under has changed.
+#[derive(Debug, Default)]
+struct CrossingRows {
+    /// Where the index was last read to.
+    cursor: Option<CrossingCursor>,
+    /// The trie the rows were read under, which says which shard holds
+    /// each record and each consumer.
+    trie: Option<ShardTrie>,
+    /// Every row, with what takes it down.
+    rows: BTreeMap<SubstateKey, RowKind>,
+
+    /// The questions the record rows put, by the key asked: a record's
+    /// consumer answers. Keeps a question's pacing for as long as its
+    /// row stands; no field records an answer.
+    asks: BTreeMap<SubstateKey, Asked>,
+
+    /// The answers whose record another shard holds, by answer key, each
+    /// with the cells its deletion reads.
+    answers: BTreeMap<SubstateKey, AnswerRow>,
+
+    /// Each cell an answer's deletion reads, with the answer: a record
+    /// key is read by the answers to its record, and a row leaf and a
+    /// committed marker by every answer of the transaction.
+    readers: BTreeSet<(SubstateKey, SubstateKey)>,
+
+    /// How many of `answers` each shard holds the record of.
+    holders: BTreeMap<ShardId, usize>,
+
+    /// The escrowed records whose consumer another shard holds, by
+    /// decline key, each with what its return reads.
+    nevers: BTreeMap<SubstateKey, NeverRow>,
+
+    /// The crossing a reading of each key speaks for, over every row,
+    /// with how many rows name it there: a record's answers and an
+    /// answer's record, whoever asks about them. A record an entry here
+    /// settles is asked about by the entry under its transaction's name,
+    /// and its readings still have to name the crossing for the fold to
+    /// settle on them.
+    names: BTreeMap<SubstateKey, (CrossingId, usize)>,
+
+    /// The claim keys of every record row, whoever asks about them: a
+    /// pushed answer to one is kept to offer, including one for a record
+    /// an entry here owns, which the leaf does not ask about.
+    awaited: BTreeSet<SubstateKey>,
+
+    /// Every record this shard holds for a consumer elsewhere: what the
+    /// consumer's fold credits or declines only once a reading reaches
+    /// it, and so what this shard sends it again until the record goes.
+    carried: BTreeMap<SubstateKey, Carried>,
+
+    /// The records whose consumer this shard holds, by record key, and
+    /// the answers whose record it holds, by answer key: the crossings
+    /// whose two ends are here, read again at every commit, since what
+    /// settles them turns on the clock and on cells no row holds.
+    settling: BTreeMap<SubstateKey, (CrossingId, CrossingCell)>,
+    closing: BTreeMap<SubstateKey, (CrossingId, SubstateKey)>,
+
+    /// How many answers stand, and their bytes.
+    standing: usize,
+    standing_bytes: usize,
+
+    /// The cells whose boundary readings may no longer be needed since
+    /// the readings were last judged: every cell of an answer gone or
+    /// refuted at a boundary, and every decline key gone.
+    unread: BTreeSet<SubstateKey>,
+
+    /// Whether every held boundary reading is to be judged again: the
+    /// rows were read whole.
+    rejudge: bool,
+}
+
+impl CrossingRows {
+    /// Take what a read of the index under `trie` brought, `read` to
+    /// `cursor`, for `local`.
+    fn take(
+        &mut self,
+        trie: &ShardTrie,
+        local: ShardId,
+        read: CrossingRead,
+        cursor: Option<CrossingCursor>,
+    ) {
+        match read {
+            CrossingRead::Whole(rows) => {
+                let pacing = std::mem::take(&mut self.asks);
+                *self = Self {
+                    rejudge: true,
+                    ..Self::default()
+                };
+                for (key, value) in rows {
+                    if let Some(read) = RowRead::of(trie, local, key, &value) {
+                        self.put(key, read, &pacing);
+                    }
+                }
+            }
+            CrossingRead::Changed(rows) => {
+                for (key, value) in rows {
+                    let pacing = self.retract(key);
+                    if let Some(read) =
+                        value.and_then(|value| RowRead::of(trie, local, key, &value))
+                    {
+                        self.put(key, read, &pacing);
+                    }
+                }
+            }
+        }
+        self.cursor = cursor;
+        self.trie = Some(trie.clone());
+    }
+
+    /// Where the index is to be read from under `trie`: from the last
+    /// read, or whole where the rows were read under another trie.
+    fn since(&self, trie: &ShardTrie) -> Option<CrossingCursor> {
+        self.cursor.filter(|_| self.trie.as_ref() == Some(trie))
+    }
+
+    fn name(&mut self, key: SubstateKey, id: CrossingId) {
+        self.names.entry(key).or_insert((id, 0)).1 += 1;
+    }
+
+    fn unname(&mut self, key: SubstateKey) {
+        if let Some((_, count)) = self.names.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.names.remove(&key);
+            }
+        }
+    }
+
+    /// Stand `read` at `key`, a question it asks keeping its pacing in
+    /// `pacing`.
+    fn put(&mut self, key: SubstateKey, read: RowRead, pacing: &BTreeMap<SubstateKey, Asked>) {
+        let kind = match &read {
+            RowRead::Carried { cells, .. } | RowRead::Settling { cells, .. } => RowKind::Record {
+                taken: cells.taken,
+                never: cells.never,
+            },
+            RowRead::Answer { bytes, .. } | RowRead::Closing { bytes, .. } => {
+                RowKind::Answer { bytes: *bytes }
+            }
+        };
+        match read {
+            RowRead::Carried {
+                id,
+                cells,
+                carried,
+                never,
+            } => {
+                self.name(cells.taken, id);
+                self.name(cells.never, id);
+                self.awaited.insert(cells.taken);
+                let (last, step) = pacing
+                    .get(&cells.taken)
+                    .map_or((None, 0), |asked| (asked.last, asked.step));
+                self.asks.insert(
+                    cells.taken,
+                    Asked {
+                        id,
+                        due_from: carried.due_from,
+                        last,
+                        step,
+                    },
+                );
+                self.carried.insert(key, carried);
+                if let Some(never) = never {
+                    self.nevers.insert(cells.never, *never);
+                }
+            }
+            RowRead::Settling { id, cells, cell } => {
+                self.name(cells.taken, id);
+                self.name(cells.never, id);
+                self.awaited.insert(cells.taken);
+                self.settling.insert(key, (id, cell));
+            }
+            RowRead::Answer { id, row, bytes } => {
+                self.name(row.record, id);
+                for cell in [row.record, row.row, row.marker] {
+                    self.readers.insert((cell, key));
+                }
+                *self.holders.entry(row.holder).or_default() += 1;
+                self.answers.insert(key, row);
+                self.standing += 1;
+                self.standing_bytes += bytes;
+            }
+            RowRead::Closing { id, record, bytes } => {
+                self.name(record, id);
+                self.closing.insert(key, (id, record));
+                self.standing += 1;
+                self.standing_bytes += bytes;
+            }
+        }
+        self.rows.insert(key, kind);
+    }
+
+    /// Take down whatever stands at `key`, handing back the pacing of
+    /// the question it asked.
+    fn retract(&mut self, key: SubstateKey) -> BTreeMap<SubstateKey, Asked> {
+        let mut pacing = BTreeMap::new();
+        match self.rows.remove(&key) {
+            Some(RowKind::Record { taken, never }) => {
+                self.unname(taken);
+                self.unname(never);
+                self.awaited.remove(&taken);
+                if let Some(asked) = self.asks.remove(&taken) {
+                    pacing.insert(taken, asked);
+                }
+                self.carried.remove(&key);
+                self.settling.remove(&key);
+                if self.nevers.remove(&never).is_some() {
+                    self.unread.insert(never);
+                }
+            }
+            Some(RowKind::Answer { bytes }) => {
+                if let Some(row) = self.answers.remove(&key) {
+                    self.unname(row.record);
+                    for cell in [row.record, row.row, row.marker] {
+                        self.readers.remove(&(cell, key));
+                        self.unread.insert(cell);
+                    }
+                    if let Some(count) = self.holders.get_mut(&row.holder) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.holders.remove(&row.holder);
+                        }
+                    }
+                }
+                if let Some((_, record)) = self.closing.remove(&key) {
+                    self.unname(record);
+                }
+                self.standing -= 1;
+                self.standing_bytes -= bytes;
+            }
+            None => {}
+        }
+        pacing
+    }
+
+    /// The answers whose deletion reads `cell`.
+    fn readers_of(&self, cell: SubstateKey) -> impl Iterator<Item = &AnswerRow> + '_ {
+        self.readers
+            .range((cell, LOWEST_KEY)..)
+            .take_while(move |(read, _)| *read == cell)
+            .filter_map(|(_, answer)| self.answers.get(answer))
+    }
+
+    /// What `cell` has to read at a boundary for a deletion to be made
+    /// of it, if an answer's deletion reads it: a committed marker
+    /// present, as `true`, and a record or a row leaf absent.
+    fn deleting(&self, cell: SubstateKey) -> Option<bool> {
+        self.readers_of(cell).next().map(|row| row.marker == cell)
+    }
+
+    /// Note every cell of the answers reading `cell` as one whose
+    /// readings are to be judged again.
+    fn unread_with(&mut self, cell: SubstateKey) {
+        let cells: Vec<SubstateKey> = self
+            .readers_of(cell)
+            .flat_map(|row| [row.record, row.row, row.marker])
+            .collect();
+        self.unread.extend(cells);
+        self.unread.insert(cell);
+    }
+
+    /// Whether an answer or a return reads `cell` at `anchor`.
+    fn reads_at(&self, anchor: &Anchor, cell: SubstateKey) -> bool {
+        self.readers_of(cell)
+            .any(|row| row.holder == anchor.shard && row.cells(anchor).contains(&cell))
+            || self
+                .nevers
+                .get(&cell)
+                .is_some_and(|row| row.holder == anchor.shard)
+    }
+
+    /// Whether a deletion or a return can still be made at `anchor` of
+    /// a reading of `cell`, with `refuted` read there the way none needs.
+    fn needed_at(
+        &self,
+        anchor: &Anchor,
+        cell: SubstateKey,
+        refuted: &BTreeSet<SubstateKey>,
+    ) -> bool {
+        self.readers_of(cell).any(|row| {
+            row.holder == anchor.shard && {
+                let cells = row.cells(anchor);
+                cells.contains(&cell) && !cells.iter().any(|read| refuted.contains(read))
+            }
+        }) || self
+            .nevers
+            .get(&cell)
+            .is_some_and(|row| row.holder == anchor.shard && !refuted.contains(&cell))
+    }
+}
+
 /// The readings held at one boundary anchor.
 #[derive(Debug)]
 struct BoundaryReadings {
@@ -739,23 +1221,34 @@ struct BoundaryReadings {
 }
 
 impl BoundaryReadings {
-    /// Keep the held cells `keep` answers for, each claim cut to them
-    /// with its proof.
-    fn keep(&mut self, keep: impl Fn(SubstateKey) -> bool) {
-        if self.cells.iter().all(|key| keep(*key)) {
+    /// Drop the held cells `gone` names, each claim reading one cut to
+    /// the rest with its proof.
+    ///
+    /// A claim is cut only where a dropped cell falls inside its span,
+    /// read off the span's two ends rather than its cells.
+    fn drop_cells(&mut self, gone: &BTreeSet<SubstateKey>) {
+        if gone.is_empty() {
             return;
         }
+        let span = |claim: &StateClaim| {
+            claim
+                .cells
+                .first()
+                .zip(claim.cells.last())
+                .map(|((lo, _), (hi, _))| (*lo, *hi))
+        };
         self.claims = std::mem::take(&mut self.claims)
             .into_iter()
-            .filter_map(|claim| {
-                if claim.cells.iter().all(|(key, _)| keep(*key)) {
-                    Some(claim)
-                } else {
-                    claim.restrict(&keep)
+            .filter_map(|claim| match span(&claim) {
+                Some((lo, hi)) if gone.range(lo..=hi).next().is_some() => {
+                    claim.restrict(|key| !gone.contains(&key))
                 }
+                _ => Some(claim),
             })
             .collect();
-        self.cells.retain(|key| keep(*key));
+        for key in gone {
+            self.cells.remove(key);
+        }
     }
 }
 
@@ -862,28 +1355,70 @@ impl BoundaryClaims {
 
     /// Keep the anchors `stands` answers for, and at each the cells an
     /// answer still `reads` there, held only where one is still `needed`
-    /// for a deletion. Hands back the cells still asked for that nothing
-    /// needs any more, for their fetches to be let go, and the clock
-    /// each anchor was asked at whose held readings have now all gone.
+    /// for a deletion against what is refuted there; of the cells
+    /// `judged` names where it names any, and of every cell otherwise.
+    /// Hands back the cells still asked for that nothing needs any more,
+    /// for their fetches to be let go, and the clock each anchor was
+    /// asked at whose held readings have now all gone.
     fn settle(
         &mut self,
         stands: impl Fn(&Anchor) -> bool,
+        judged: Option<&BTreeSet<SubstateKey>>,
         reads: impl Fn(&Anchor, SubstateKey) -> bool,
-        needed: impl Fn(&Anchor, SubstateKey) -> bool,
+        needed: impl Fn(&Anchor, SubstateKey, &BTreeSet<SubstateKey>) -> bool,
     ) -> (Vec<(Anchor, SubstateKey)>, Vec<WeightedTimestamp>) {
         let mut released = Vec::new();
         let mut drained = Vec::new();
         self.at.retain(|anchor, at| {
             let standing = stands(anchor);
-            at.pending.retain(|key| {
-                let keep = standing && needed(anchor, *key);
-                if !keep {
-                    released.push((*anchor, *key));
+            let BoundaryReadings {
+                pending, refuted, ..
+            } = at;
+            let gone: Vec<SubstateKey> = match judged {
+                _ if !standing => pending.iter().copied().collect(),
+                Some(judged) => judged
+                    .iter()
+                    .filter(|key| pending.contains(key) && !needed(anchor, **key, refuted))
+                    .copied()
+                    .collect(),
+                None => pending
+                    .iter()
+                    .filter(|key| !needed(anchor, **key, refuted))
+                    .copied()
+                    .collect(),
+            };
+            for key in gone {
+                pending.remove(&key);
+                released.push((*anchor, key));
+            }
+            let unneeded: BTreeSet<SubstateKey> = match judged {
+                _ if !standing => at.cells.clone(),
+                Some(judged) => judged
+                    .iter()
+                    .filter(|key| at.cells.contains(key) && !needed(anchor, **key, &at.refuted))
+                    .copied()
+                    .collect(),
+                None => at
+                    .cells
+                    .iter()
+                    .filter(|key| !needed(anchor, **key, &at.refuted))
+                    .copied()
+                    .collect(),
+            };
+            match judged {
+                Some(judged) => {
+                    let unread: Vec<SubstateKey> = judged
+                        .iter()
+                        .filter(|key| at.refuted.contains(key) && !reads(anchor, **key))
+                        .copied()
+                        .collect();
+                    for key in unread {
+                        at.refuted.remove(&key);
+                    }
                 }
-                keep
-            });
-            at.refuted.retain(|key| reads(anchor, *key));
-            at.keep(|key| standing && needed(anchor, key));
+                None => at.refuted.retain(|key| reads(anchor, *key)),
+            }
+            at.drop_cells(&unneeded);
             if at.draining && at.claims.is_empty() && at.pending.is_empty() {
                 at.draining = false;
                 drained.push(at.asked_at);
@@ -898,7 +1433,7 @@ impl BoundaryClaims {
     fn cut(&mut self, carried: &BTreeMap<Anchor, BTreeSet<SubstateKey>>) {
         for (anchor, keys) in carried {
             if let Some(at) = self.at.get_mut(anchor) {
-                at.keep(|key| !keys.contains(&key));
+                at.drop_cells(keys);
             }
         }
     }
@@ -1252,27 +1787,11 @@ pub struct Counterparts {
     /// offers. Composition never reads it.
     index: Arc<dyn CrossingIndex>,
 
-    /// The questions this shard's record rows put, by the key asked: a
-    /// record's consumer answers. Rebuilt from the rows at every commit,
-    /// keeping only the pacing of a question that still stands; no field
-    /// records an answer.
-    asks: BTreeMap<SubstateKey, Asked>,
-
-    /// The answers this shard holds whose record another shard holds, by
-    /// answer key, each with the cells its deletion reads. Rebuilt from
-    /// the rows at every commit.
-    answers: BTreeMap<SubstateKey, AnswerRow>,
-
-    /// What each cell an answer's deletion reads has to read at a
-    /// boundary for the deletion to be made of it: a committed marker
-    /// present, as `true`, and a record or a row leaf absent. Rebuilt
-    /// with the answers.
-    deleting: BTreeMap<SubstateKey, bool>,
-
-    /// The escrowed records this shard holds whose consumer another
-    /// shard holds, by decline key, each with what its return reads.
-    /// Rebuilt from the rows at every commit.
-    nevers: BTreeMap<SubstateKey, NeverRow>,
+    /// The crossing rows of this shard's and what each puts: the
+    /// questions the records put of their consumers, the answers whose
+    /// deletion is read at a boundary, the returns read there, and the
+    /// crossings whose two ends are here.
+    rows: CrossingRows,
 
     /// The boundary each holder was last asked at, for the answers this
     /// shard holds whose record it holds and the declines it holds of
@@ -1285,34 +1804,10 @@ pub struct Counterparts {
     /// held claim.
     boundaries: BoundaryClaims,
 
-    /// The crossing a reading of each key speaks for, over every row:
-    /// a record's answers and an answer's record, whoever asks about
-    /// them. A record an entry here settles is asked about by the entry
-    /// under its transaction's name, and its readings still have to name
-    /// the crossing for the fold to settle on them.
-    names: BTreeMap<SubstateKey, CrossingId>,
-
-    /// The cells of every crossing a row of this shard's names, derived
-    /// where its row is first read and carried from one derivation of
-    /// the questions to the next for as long as the row stands.
-    cells: BTreeMap<CrossingId, CrossingCells>,
-
-    /// The claim and decline keys of every record row, whoever asks
-    /// about them: a pushed answer to one is kept to offer, including
-    /// one for a record an entry here owns, which the leaf does not ask
-    /// about.
-    awaited: BTreeSet<SubstateKey>,
-
-    /// Every record this shard holds for a consumer elsewhere: what the
-    /// consumer's fold credits or declines only once a reading reaches
-    /// it, and so what this shard sends it again until the record goes.
-    /// Rebuilt from the rows at every commit, one entry a record row.
-    carried: BTreeMap<SubstateKey, Carried>,
-
     /// When each carried record was last re-pushed, at this shard's
     /// height, and how many times: node-local pacing, so a restarted
-    /// replica re-pushes at once. One entry at most per entry of
-    /// `carried`.
+    /// replica re-pushes at once. One entry at most per carried
+    /// record.
     repushed: BTreeMap<SubstateKey, (BlockHeight, u32)>,
 
     /// The committed clock as of the last commit or push: what an
@@ -1407,16 +1902,9 @@ impl Counterparts {
             proven_anchors,
             fetched: HeldClaims::default(),
             index,
-            asks: BTreeMap::new(),
-            answers: BTreeMap::new(),
-            deleting: BTreeMap::new(),
-            nevers: BTreeMap::new(),
+            rows: CrossingRows::default(),
             boundary_asked: BTreeMap::new(),
             boundaries: BoundaryClaims::default(),
-            names: BTreeMap::new(),
-            cells: BTreeMap::new(),
-            awaited: BTreeSet::new(),
-            carried: BTreeMap::new(),
             repushed: BTreeMap::new(),
             clock: WeightedTimestamp::ZERO,
             frontier,
@@ -1879,24 +2367,10 @@ impl Counterparts {
         }
     }
 
-    /// The pacing a record's question about its answer carries from the
-    /// last derivation, or a fresh one.
-    ///
-    /// The question stands as long as the record does. An answer is
-    /// written only while its record stands and goes only once the
-    /// record reads absent, so no window bounds it: a consumer that halts
-    /// can write its answer after recovering, and a return a recovery
-    /// discards is made again on the next reading.
-    fn answer_pacing(&self, claim: SubstateKey) -> (Option<BlockHeight>, u32) {
-        self.asks
-            .get(&claim)
-            .map_or((None, 0), |asked| (asked.last, asked.step))
-    }
-
-    /// The questions this shard's crossing rows put, rebuilt from the
-    /// rows the index holds under this shard's prefix, keeping the pacing
-    /// of every question that still stands; and the local crossings a
-    /// settlement is due for.
+    /// The questions this shard's crossing rows put, moved by the rows
+    /// the index has written or removed since the last commit, keeping
+    /// the pacing of every question that still stands; and the local
+    /// crossings a settlement is due for.
     ///
     /// A record row asks for its consumer's claim key, of whichever shard
     /// holds the key's prefix, and an escrowed one whose credit cell is
@@ -1913,105 +2387,34 @@ impl Counterparts {
     ///
     /// Every record is asked about, whether or not an entry of the
     /// ledger's issued it: the row is what stands for as long as the
-    /// record does.
+    /// record does. An answer is written only while its record stands
+    /// and goes only once the record reads absent, so no window bounds
+    /// the question: a consumer that halts can write its answer after
+    /// recovering, and a return a recovery discards is made again on the
+    /// next reading.
     pub(crate) fn derive_asks(&mut self, trie: &ShardTrie) {
         let local = self.ledger.local();
-        let mut asks = BTreeMap::new();
-        let mut answers = BTreeMap::new();
-        let mut names = BTreeMap::new();
-        let mut cells = BTreeMap::new();
-        let mut awaited = BTreeSet::new();
-        let mut carried = BTreeMap::new();
-        let mut nevers = BTreeMap::new();
-        let (mut standing, mut standing_bytes) = (0usize, 0usize);
-        self.local_crossings.clear();
-        for (key, value) in self.index.crossing_rows(local) {
-            match CrossingLeaf::read(&ProtocolHasher, key, &value) {
-                Some(CrossingLeaf::Record { cell, .. }) => {
-                    let id = CrossingId::of_record(key.owner, &cell);
-                    let derived = self.cells_of(&id);
-                    cells.insert(id, derived);
-                    let (claim, decline) = (derived.taken, derived.never);
-                    names.insert(claim, id);
-                    names.insert(decline, id);
-                    awaited.insert(claim);
-                    let end = WeightedTimestamp::from_millis(cell.validity_end_ms);
-                    let owed = cell.terms == Terms::Owed;
-                    let due_from = if owed { Deadline::of(end).at() } else { end };
-                    if trie.shard_for_prefix(claim.owner) == local {
-                        if self.settles_at_the_parent(&id, &cell) {
-                            self.local_crossings.insert(id);
-                        }
-                        continue;
-                    }
-                    carried.insert(
-                        key,
-                        Carried {
-                            id,
-                            due_from,
-                            escrowed: !owed,
-                        },
-                    );
-                    let (asked_at, step) = self.answer_pacing(claim);
-                    asks.insert(
-                        claim,
-                        Asked {
-                            id,
-                            due_from,
-                            last: asked_at,
-                            step,
-                        },
-                    );
-                    // A credit cell under another shard's prefix, which
-                    // a split leaves on the other child, takes no return
-                    // here whatever it holds: no question is put.
-                    if !owed && credit_lands(&cell, local, None, []) {
-                        nevers.insert(decline, NeverRow::of(trie, id, &cell));
-                    }
-                }
-                Some(CrossingLeaf::Answer { id, answer }) => {
-                    standing += 1;
-                    standing_bytes += key.to_bytes().len() + value.len();
-                    let derived = self.cells_of(&id);
-                    cells.insert(id, derived);
-                    let record = derived.record;
-                    names.insert(record, id);
-                    let holder = trie.shard_for_prefix(record.owner);
-                    if holder == local {
-                        if !self.index.present(record) {
-                            self.local_crossings.insert(id);
-                        }
-                        continue;
-                    }
-                    let validity_end = WeightedTimestamp::from_millis(answer.validity_end_ms);
-                    answers.insert(
-                        key,
-                        AnswerRow {
-                            holder,
-                            record,
-                            row: member_row_leaf(holder, answer.tx),
-                            marker: committed_tx_cell_key(holder, answer.tx, validity_end),
-                            validity_end,
-                        },
-                    );
-                }
-                None => {}
-            }
-        }
-        set_standing_answers(local.inner(), standing, standing_bytes);
-        self.asks = asks;
-        self.deleting = answers
-            .values()
-            .flat_map(|row| [(row.record, false), (row.row, false), (row.marker, true)])
-            .collect();
-        self.answers = answers;
-        self.nevers = nevers;
-        self.names = names;
-        self.cells = cells;
+        let (read, cursor) = self.index.crossing_changes(local, self.rows.since(trie));
+        self.rows.take(trie, local, read, cursor);
+        set_standing_answers(local.inner(), self.rows.standing, self.rows.standing_bytes);
+        let carried = &self.rows.carried;
         self.repushed
             .retain(|record, _| carried.contains_key(record));
-        self.carried = carried;
-        self.awaited = awaited;
+        let settling: BTreeSet<CrossingId> = self
+            .rows
+            .settling
+            .values()
+            .filter(|(id, cell)| self.settles_at_the_parent(id, cell))
+            .map(|(id, _)| *id)
+            .chain(
+                self.rows
+                    .closing
+                    .values()
+                    .filter(|(_, record)| !self.index.present(*record))
+                    .map(|(id, _)| *id),
+            )
+            .collect();
+        self.local_crossings = settling;
     }
 
     /// Take `records` as what consumers here wait on from now.
@@ -2052,15 +2455,6 @@ impl Counterparts {
             )
     }
 
-    /// The cells `id` derives, read from the last derivation of the
-    /// questions where a row named the crossing then.
-    fn cells_of(&self, id: &CrossingId) -> CrossingCells {
-        self.cells
-            .get(id)
-            .copied()
-            .unwrap_or_else(|| CrossingCells::of(id))
-    }
-
     /// The records to push to their consumers again at `height`, by the
     /// shard holding each consumer's prefix under `trie`, ascending.
     ///
@@ -2091,6 +2485,7 @@ impl Counterparts {
         height: BlockHeight,
     ) -> BTreeMap<ShardId, Vec<SubstateKey>> {
         let mut due: Vec<(Option<BlockHeight>, WeightedTimestamp, SubstateKey, u32)> = self
+            .rows
             .carried
             .iter()
             .filter(|(_, carried)| now >= carried.due_from)
@@ -2107,7 +2502,7 @@ impl Counterparts {
         let mut targets: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
         let mut unsolicited: BTreeMap<ShardId, usize> = BTreeMap::new();
         for (_, _, record, times) in due {
-            let carried = self.carried[&record];
+            let carried = self.rows.carried[&record];
             let target = trie.shard_for_prefix(carried.id.consumer);
             if carried.escrowed {
                 let sent = unsolicited.entry(target).or_default();
@@ -2143,6 +2538,7 @@ impl Counterparts {
         wanted: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
     ) {
         let claims: Vec<(SubstateKey, Asked)> = self
+            .rows
             .asks
             .iter()
             .map(|(key, asked)| (*key, *asked))
@@ -2169,7 +2565,7 @@ impl Counterparts {
             {
                 continue;
             }
-            self.asks.insert(
+            self.rows.asks.insert(
                 claim,
                 Asked {
                     id,
@@ -2266,10 +2662,11 @@ impl Counterparts {
         let head = topology_schedule.head();
         let due = |row: &&NeverRow| now >= row.due_from();
         let holders: BTreeSet<ShardId> = self
-            .answers
-            .values()
-            .map(|row| row.holder)
-            .chain(self.nevers.values().filter(due).map(|row| row.holder))
+            .rows
+            .holders
+            .keys()
+            .copied()
+            .chain(self.rows.nevers.values().filter(due).map(|row| row.holder))
             .collect();
         self.boundary_asked
             .retain(|holder, _| holders.contains(holder));
@@ -2288,12 +2685,14 @@ impl Counterparts {
                 continue;
             }
             let cells: BTreeSet<SubstateKey> = self
+                .rows
                 .answers
                 .values()
                 .filter(|row| row.holder == holder)
                 .flat_map(|row| row.cells(&boundary))
                 .chain(
-                    self.nevers
+                    self.rows
+                        .nevers
                         .iter()
                         .filter(|(_, row)| row.holder == holder && due(row))
                         .map(|(never, _)| *never),
@@ -2323,48 +2722,16 @@ impl Counterparts {
         topology_schedule: &TopologySchedule,
         now: WeightedTimestamp,
     ) -> Vec<Action> {
-        // For each anchor still a boundary: the cells an answer reads
-        // there, and the ones among them a deletion can still be made of.
-        let mut read: BTreeMap<Anchor, (BTreeSet<SubstateKey>, BTreeSet<SubstateKey>)> =
-            BTreeMap::new();
-        for (anchor, at) in &self.boundaries.at {
-            if topology_schedule.attests_boundary(anchor) != BoundaryAttestation::Stands {
-                continue;
-            }
-            let (mut reads, mut needed) = (BTreeSet::new(), BTreeSet::new());
-            for row in self
-                .answers
-                .values()
-                .filter(|row| row.holder == anchor.shard)
-            {
-                let cells = row.cells(anchor);
-                if !cells.iter().any(|cell| at.refuted.contains(cell)) {
-                    needed.extend(cells.iter().copied());
-                }
-                reads.extend(cells);
-            }
-            for (never, _) in self
-                .nevers
-                .iter()
-                .filter(|(_, row)| row.holder == anchor.shard)
-            {
-                if !at.refuted.contains(never) {
-                    needed.insert(*never);
-                }
-                reads.insert(*never);
-            }
-            read.insert(*anchor, (reads, needed));
-        }
+        // Only the cells whose readers moved since the last commit are
+        // judged, unless the rows were read whole.
+        let rejudge = std::mem::take(&mut self.rows.rejudge);
+        let unread = std::mem::take(&mut self.rows.unread);
+        let rows = &self.rows;
         let (released, drained) = self.boundaries.settle(
-            |anchor| read.contains_key(anchor),
-            |anchor, key| {
-                read.get(anchor)
-                    .is_some_and(|(reads, _)| reads.contains(&key))
-            },
-            |anchor, key| {
-                read.get(anchor)
-                    .is_some_and(|(_, needed)| needed.contains(&key))
-            },
+            |anchor| topology_schedule.attests_boundary(anchor) == BoundaryAttestation::Stands,
+            (!rejudge).then_some(&unread),
+            |anchor, key| rows.reads_at(anchor, key),
+            |anchor, key, refuted| rows.needed_at(anchor, key, refuted),
         );
         for asked_at in drained {
             record_boundary_drained(
@@ -2410,7 +2777,7 @@ impl Counterparts {
         let mut proving: Vec<(SubstateKey, Inclusion)> = Vec::new();
         let mut refuted: BTreeSet<SubstateKey> = BTreeSet::new();
         for &(key, inclusion) in inclusions.iter().filter(|(key, _)| asked.contains(key)) {
-            let proves = match (self.deleting.get(&key), self.nevers.get(&key)) {
+            let proves = match (self.rows.deleting(key).as_ref(), self.rows.nevers.get(&key)) {
                 (Some(present), _) => Some(inclusion.is_present() == *present),
                 (None, Some(row)) => Some(matches!(
                     inclusion,
@@ -2438,6 +2805,11 @@ impl Counterparts {
                     .collect();
                 StateClaim::new(anchor, proving, proof).naming(named)
             });
+        // A refuted cell leaves its answers to the next boundary, and
+        // what else they read here may be needed by none.
+        for key in &refuted {
+            self.rows.unread_with(*key);
+        }
         self.boundaries.hold(anchor, &asked, claim, refuted);
         asked
     }
@@ -2470,7 +2842,7 @@ impl Counterparts {
         let mut offers = Vec::new();
         for (anchor, at) in anchors {
             let mut returns: Vec<Vec<SubstateKey>> = Vec::new();
-            for (never, row) in &self.nevers {
+            for (never, row) in &self.rows.nevers {
                 if row.holder != anchor.shard
                     || offered.contains(never)
                     || !at.cells.contains(never)
@@ -2489,7 +2861,7 @@ impl Counterparts {
             }
             let mut deletions: BTreeMap<(SubstateKey, SubstateKey), Vec<SubstateKey>> =
                 BTreeMap::new();
-            for (answer, row) in &self.answers {
+            for (answer, row) in &self.rows.answers {
                 if row.holder != anchor.shard || offered.contains(answer) {
                     continue;
                 }
@@ -3028,7 +3400,9 @@ impl Counterparts {
                 .iter()
                 .map(|(key, _)| *key)
                 .filter(|key| !at_boundary.contains(key))
-                .filter(|key| wants_reading(&self.asks, &self.awaited, &self.wanted, *key)),
+                .filter(|key| {
+                    wants_reading(&self.rows.asks, &self.rows.awaited, &self.wanted, *key)
+                }),
         );
         for (reading, victim) in self.answer_seats(anchor, keys, proof, &inclusions) {
             self.hold_seat_reading(&reading, victim);
@@ -3166,7 +3540,7 @@ impl Counterparts {
     /// asked about it: a held record's `Taken` or `Never`, or the record
     /// behind an answer this shard holds.
     fn crossing_of(&self, key: SubstateKey) -> Option<CrossingId> {
-        self.names.get(&key).copied()
+        self.rows.names.get(&key).map(|(id, _)| *id)
     }
 
     /// Fold the claims a committed block carries into the answers every
@@ -3576,7 +3950,7 @@ impl Counterparts {
             .keys()
             .into_iter()
             .filter(|key| {
-                wants_reading(&self.asks, &self.awaited, &self.wanted, *key)
+                wants_reading(&self.rows.asks, &self.rows.awaited, &self.wanted, *key)
                     || owed_here(claim, *key, local, self.index.as_ref()).is_some()
             })
             .chain(unasked.iter().map(|(_, key)| *key))
@@ -3645,8 +4019,8 @@ impl Counterparts {
         // commit-proven, since a retired or fenced anchor is one no
         // voter could stand it at, so one whose anchor is gone is let go
         // of here.
-        let asks = &self.asks;
-        let awaited = &self.awaited;
+        let asks = &self.rows.asks;
+        let awaited = &self.rows.awaited;
         let wanted = &self.wanted;
         let proven = &self.proven_anchors;
         let local = unresolved.local();
@@ -4371,7 +4745,7 @@ mod tests {
             .iter()
             .flat_map(|offer| offer.deletions.iter())
             .filter_map(|cells| match cells.as_slice() {
-                [never] if producer.nevers.contains_key(never) => Some(*never),
+                [never] if producer.rows.nevers.contains_key(never) => Some(*never),
                 _ => None,
             })
             .collect()
@@ -4460,7 +4834,7 @@ mod tests {
             escrowed(1, producer_record(0xD5), 1_000),
         );
         let (producer, _, asked) = declined_at_one_boundary(left, &trie, &[stranded, home], &[]);
-        assert!(!producer.nevers.contains_key(&decline_of(&stranded)));
+        assert!(!producer.rows.nevers.contains_key(&decline_of(&stranded)));
         assert_eq!(asked, vec![decline_of(&home)]);
         assert_eq!(offered_returns(&producer), vec![decline_of(&home)]);
     }
@@ -5415,13 +5789,13 @@ mod tests {
         );
         producer.derive_asks(&trie);
         assert!(
-            producer.asks.contains_key(&claim) && !producer.nevers.contains_key(&decline),
+            producer.rows.asks.contains_key(&claim) && !producer.rows.nevers.contains_key(&decline),
             "the refusal is block content, not a flag here",
         );
         rows.remove(record_of(0, deadline));
         producer.derive_asks(&trie);
         assert!(
-            producer.asks.is_empty() && producer.nevers.is_empty(),
+            producer.rows.asks.is_empty() && producer.rows.nevers.is_empty(),
             "and the questions go with the row"
         );
     }
@@ -5443,48 +5817,10 @@ mod tests {
         );
         seated.derive_asks(&trie);
         assert_eq!(
-            seated.asks.keys().collect::<Vec<_>>(),
-            through.asks.keys().collect::<Vec<_>>(),
+            seated.rows.asks.keys().collect::<Vec<_>>(),
+            through.rows.asks.keys().collect::<Vec<_>>(),
         );
-        assert_eq!(seated.names, through.names);
-        assert_eq!(seated.cells, through.cells);
-    }
-
-    /// The cells kept for a crossing are the ones its identity derives,
-    /// kept for exactly the crossings a row names: a derivation after a
-    /// row has gone keeps nothing of it.
-    #[test]
-    fn the_cells_kept_for_a_crossing_are_its_own_while_its_row_stands() {
-        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
-        let (mut producer, trie, _, rows) = producing(3, deadline);
-        let derived = |producer: &Counterparts| {
-            producer
-                .cells
-                .iter()
-                .map(|(id, cells)| (*id, *cells))
-                .collect::<Vec<_>>()
-        };
-        let by_identity = |seeds: &[u8]| {
-            let mut cells: Vec<(CrossingId, CrossingCells)> = seeds
-                .iter()
-                .map(|seed| producer_crossing(*seed, deadline))
-                .map(|id| (id, CrossingCells::of(&id)))
-                .collect();
-            cells.sort_unstable_by_key(|(id, _)| *id);
-            cells
-        };
-        assert_eq!(derived(&producer), by_identity(&[0, 1, 2]));
-        producer.derive_asks(&trie);
-        assert_eq!(derived(&producer), by_identity(&[0, 1, 2]));
-
-        rows.remove(record_of(1, deadline));
-        producer.derive_asks(&trie);
-        assert_eq!(derived(&producer), by_identity(&[0, 2]));
-        assert_eq!(
-            producer.cells_of(&producer_crossing(1, deadline)),
-            CrossingCells::of(&producer_crossing(1, deadline)),
-            "a crossing no row names is derived where it is asked about"
-        );
+        assert_eq!(seated.rows.names, through.rows.names);
     }
 
     /// The heights a producer asks its consumer's answer at, over a run
@@ -8203,5 +8539,548 @@ mod tests {
             Ok(None)
         );
         assert_eq!(counterparts.verdict_claims(), vec![push]);
+    }
+
+    /// An index read only whole: what a replica holds that follows no
+    /// change, at every commit.
+    struct ReadWhole(Arc<TestRows>);
+
+    impl CrossingIndex for ReadWhole {
+        fn crossing_changes(
+            &self,
+            shard: ShardId,
+            _since: Option<CrossingCursor>,
+        ) -> (CrossingRead, Option<CrossingCursor>) {
+            (self.0.crossing_changes(shard, None).0, None)
+        }
+
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.cell(key)
+        }
+    }
+
+    /// A small deterministic generator, so a failing sequence replays.
+    struct Draws(u64);
+
+    impl Draws {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % n as u64).expect("small")
+        }
+
+        fn one_in(&mut self, n: usize) -> bool {
+            self.below(n) == 0
+        }
+    }
+
+    /// What a replica derives from its rows and holds at its boundaries,
+    /// less how it came to read them.
+    fn derived(counterparts: &Counterparts) -> String {
+        let rows = &counterparts.rows;
+        format!(
+            "{:?}",
+            (
+                (
+                    &rows.rows.keys().collect::<Vec<_>>(),
+                    &rows.asks,
+                    &rows.answers,
+                    &rows.readers,
+                    &rows.holders,
+                    &rows.nevers,
+                    &rows.names,
+                ),
+                (
+                    &rows.awaited,
+                    &rows.carried,
+                    &rows.settling,
+                    &rows.closing,
+                    rows.standing,
+                    rows.standing_bytes,
+                ),
+                &counterparts.local_crossings,
+                &counterparts.repushed,
+                &counterparts.boundaries,
+                &counterparts.boundary_asked,
+            )
+        )
+    }
+
+    /// The address with every body byte `byte`.
+    fn differential_address(byte: u8) -> Address {
+        Address::new([byte; 31], AddressClass::Component)
+    }
+
+    /// Crossing `c` of the differential, its transaction `tx`: answered
+    /// here with its record on the producer, recorded here for a
+    /// consumer on the producer, or both ends here.
+    fn differential_crossing(
+        c: usize,
+        tx: usize,
+        late: bool,
+        terms: Terms,
+    ) -> (CrossingId, CrossingCell) {
+        let base = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(36_000)));
+        let (producer, consumer) = match c % 3 {
+            0 => (differential_address(0xAA), differential_address(0x11)),
+            1 => (differential_address(0x2A), differential_address(0xBB)),
+            _ => (differential_address(0x2A), differential_address(0x11)),
+        };
+        let cell = CrossingCell {
+            intent: IntentHash(Hash32([u8::try_from(c).expect("small"); 32])),
+            tx: TxHash::from(Hash::from_bytes(
+                &[u8::try_from(c * 4 + tx).expect("small"); 32],
+            )),
+            validity_end_ms: base.validity_end_ms + if late { 600_000 } else { 0 },
+            consumer,
+            terms,
+            ..base
+        };
+        (CrossingId::of_record(producer, &cell), cell)
+    }
+
+    /// The credit cells the differential's escrowed records return to:
+    /// one under the consumer's prefix, one under the producer's.
+    fn differential_credits() -> [SubstateKey; 2] {
+        [
+            SubstateKey {
+                owner: differential_address(0x23),
+                local: LocalKey([0x23; 16]),
+            },
+            SubstateKey {
+                owner: differential_address(0xB3),
+                local: LocalKey([0xB3; 16]),
+            },
+        ]
+    }
+
+    /// Every cell under the producer's prefix a boundary of the
+    /// differential can be asked about, with the values a tree may hold
+    /// there.
+    fn differential_universe() -> BTreeMap<SubstateKey, Vec<Vec<u8>>> {
+        let mut universe: BTreeMap<SubstateKey, Vec<Vec<u8>>> = BTreeMap::new();
+        for c in 0..18 {
+            for tx in 0..2 {
+                for late in [false, true] {
+                    let (id, cell) = differential_crossing(c, tx, late, Terms::Owed);
+                    let end = WeightedTimestamp::from_millis(cell.validity_end_ms);
+                    let mut cells = vec![
+                        member_row_leaf(PRODUCER, cell.tx),
+                        committed_tx_cell_key(PRODUCER, cell.tx, end),
+                    ];
+                    if c % 3 == 0 {
+                        cells.push(id.record_key(&ProtocolHasher));
+                    }
+                    for key in cells {
+                        universe.entry(key).or_insert_with(|| vec![vec![7, 7, 7]]);
+                    }
+                    if c % 3 == 1 {
+                        universe
+                            .entry(id.answer_key(&ProtocolHasher, Answered::Never))
+                            .or_insert_with(|| vec![vec![7, 7, 7]])
+                            .push(
+                                id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
+                                    .to_bytes(),
+                            );
+                    }
+                }
+            }
+        }
+        universe
+    }
+
+    /// Write, rewrite or remove a few of the differential's rows, or its
+    /// credit cell, at random.
+    fn write_at_random(draws: &mut Draws, rows: &TestRows, written: &mut Vec<SubstateKey>) {
+        let credits = differential_credits();
+        for _ in 0..draws.below(4) {
+            match draws.below(10) {
+                0..=3 => {
+                    let c = draws.below(18);
+                    let c = if c % 3 == 1 { c + 1 } else { c };
+                    let (id, cell) =
+                        differential_crossing(c, draws.below(2), draws.one_in(2), Terms::Owed);
+                    let answer = match draws.below(3) {
+                        0 => id.answer(cell.tx, Answered::Taken, cell.validity_end_ms),
+                        1 => id.answer(cell.tx, Answered::Never, cell.validity_end_ms),
+                        _ => id.unseen_never(cell.tx, cell.validity_end_ms),
+                    };
+                    let key = id.answer_key(&ProtocolHasher, answer.answered);
+                    rows.put(key, answer.to_bytes());
+                    written.push(key);
+                }
+                4..=6 => {
+                    let c = 1 + 3 * draws.below(6) + usize::from(draws.one_in(3));
+                    let terms = if draws.one_in(3) {
+                        Terms::Owed
+                    } else {
+                        Terms::Escrowed {
+                            credit: credits[usize::from(draws.one_in(4))],
+                        }
+                    };
+                    let (id, cell) =
+                        differential_crossing(c, draws.below(2), draws.one_in(2), terms);
+                    let key = id.record_key(&ProtocolHasher);
+                    rows.put(key, cell.to_bytes());
+                    written.push(key);
+                }
+                7 | 8 if !written.is_empty() => {
+                    let key = written.swap_remove(draws.below(written.len()));
+                    rows.remove(key);
+                }
+                _ => {
+                    let credit = credits[0];
+                    if draws.one_in(2) {
+                        rows.put(credit, encode_amount(40).to_vec());
+                    } else {
+                        rows.put(credit, vec![1, 2, 3]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `at`th boundary of the differential's producer, over a tree
+    /// holding some of `universe`, and what the tree holds.
+    fn differential_boundary(
+        draws: &mut Draws,
+        universe: &BTreeMap<SubstateKey, Vec<Vec<u8>>>,
+        at: u64,
+    ) -> (Anchor, Vec<(SubstateKey, Vec<u8>)>) {
+        let mut held = Vec::new();
+        for (key, values) in universe {
+            if draws.one_in(3) {
+                held.push((*key, values[draws.below(values.len())].clone()));
+            }
+        }
+        let (state_root, _) = state_and_proof_holding(PRODUCER, &held, &[]);
+        let end = differential_crossing(0, 0, false, Terms::Owed)
+            .1
+            .validity_end_ms;
+        let boundary = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(40 * at),
+            state_root,
+            ts: WeightedTimestamp::from_millis(end - 50_000 + 60_000 * at),
+        };
+        (boundary, held)
+    }
+
+    /// Serve some of what `replicas` still ask at each boundary, both
+    /// alike, out of that boundary's tree in `trees`: a cell not served
+    /// stays asked for, until it is served or let go.
+    fn serve_at_random(
+        draws: &mut Draws,
+        trees: &BTreeMap<Anchor, Vec<(SubstateKey, Vec<u8>)>>,
+        replicas: [&mut Counterparts; 2],
+    ) {
+        let [following, whole] = replicas;
+        let waiting: Vec<(Anchor, Vec<SubstateKey>)> = following
+            .boundaries
+            .at
+            .iter()
+            .map(|(anchor, at)| (*anchor, at.pending.iter().copied().collect()))
+            .collect();
+        for (anchor, keys) in waiting {
+            let keys: Vec<SubstateKey> = keys.into_iter().filter(|_| draws.one_in(2)).collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let (_, proof) = state_and_proof_holding(PRODUCER, &trees[&anchor], &keys);
+            following.on_proof_fetched(anchor, &keys, &proof, &[]);
+            whole.on_proof_fetched(anchor, &keys, &proof, &[]);
+        }
+    }
+
+    /// Claims held at one boundary, each cut to the cells a dropped set
+    /// leaves, hold what restricting every claim to the cells not
+    /// dropped holds: whichever cells of a claim's span go, its first
+    /// and last among them.
+    #[test]
+    fn dropping_cells_leaves_each_claim_restricted_to_the_rest() {
+        let mut draws = Draws(0x5DEE_CE66_D1A4_F00D);
+        for round in 0..200 {
+            let keys: BTreeSet<SubstateKey> = (0..=draws.below(40))
+                .map(|_| {
+                    let mut local = [0u8; 16];
+                    local[..8].copy_from_slice(&draws.next().to_le_bytes());
+                    SubstateKey {
+                        owner: producer_record(0).owner,
+                        local: LocalKey(local),
+                    }
+                })
+                .collect();
+            let keys: Vec<SubstateKey> = keys.into_iter().collect();
+            let present: Vec<SubstateKey> =
+                keys.iter().filter(|_| draws.one_in(2)).copied().collect();
+            let mut claims = Vec::new();
+            let mut rest = keys.as_slice();
+            while !rest.is_empty() {
+                let (span, after) = rest.split_at(1 + draws.below(rest.len()));
+                claims.push(proven_claim(PRODUCER, 9, &present, span));
+                rest = after;
+            }
+            let gone: BTreeSet<SubstateKey> = keys
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| *at + 1 == keys.len() || draws.one_in(3))
+                .map(|(_, key)| *key)
+                .collect();
+            let mut held = BoundaryReadings {
+                cells: keys.iter().copied().collect(),
+                claims: claims.clone(),
+                refuted: BTreeSet::new(),
+                pending: BTreeSet::new(),
+                asked_at: WeightedTimestamp::ZERO,
+                draining: true,
+            };
+            held.drop_cells(&gone);
+            let reference: Vec<StateClaim> = claims
+                .iter()
+                .filter_map(|claim| claim.restrict(|key| !gone.contains(&key)))
+                .collect();
+            assert_eq!(held.claims, reference, "round {round}");
+            assert!(held.claims.iter().all(|claim| claim.verify().is_ok()));
+            assert_eq!(
+                held.cells,
+                keys.iter()
+                    .filter(|key| !gone.contains(key))
+                    .copied()
+                    .collect(),
+                "round {round}"
+            );
+        }
+    }
+
+    /// The crossing each key of `all`, a shard's rows under `trie`,
+    /// names, and the answers whose record another shard holds: one
+    /// pass over the rows, as a derivation from scratch.
+    fn one_pass(
+        trie: &ShardTrie,
+        all: &[(SubstateKey, Vec<u8>)],
+    ) -> (BTreeMap<SubstateKey, CrossingId>, Vec<AnswerRow>) {
+        let mut names: BTreeMap<SubstateKey, CrossingId> = BTreeMap::new();
+        let mut answers: Vec<AnswerRow> = Vec::new();
+        for (key, value) in all {
+            match CrossingLeaf::read(&ProtocolHasher, *key, value) {
+                Some(CrossingLeaf::Record { cell, .. }) => {
+                    let id = CrossingId::of_record(key.owner, &cell);
+                    names.insert(id.answer_key(&ProtocolHasher, Answered::Taken), id);
+                    names.insert(id.answer_key(&ProtocolHasher, Answered::Never), id);
+                }
+                Some(CrossingLeaf::Answer { id, answer }) => {
+                    let record = id.record_key(&ProtocolHasher);
+                    names.insert(record, id);
+                    let holder = trie.shard_for_prefix(record.owner);
+                    if holder != CONSUMER {
+                        let end = WeightedTimestamp::from_millis(answer.validity_end_ms);
+                        answers.push(AnswerRow {
+                            holder,
+                            record,
+                            row: member_row_leaf(holder, answer.tx),
+                            marker: committed_tx_cell_key(holder, answer.tx, end),
+                            validity_end: end,
+                        });
+                    }
+                }
+                None => {}
+            }
+        }
+        (names, answers)
+    }
+
+    /// The rows a replica holds, put and taken down in any order, answer
+    /// what one pass over the rows derives: each key's crossing, each
+    /// cell's deleting reading, the holders, and at a boundary which
+    /// cells an answer or a return reads and which a deletion or a
+    /// return still needs against what is refuted there.
+    #[test]
+    fn the_rows_answer_what_one_pass_over_them_derives() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let universe = differential_universe();
+        for seed in 1..=16u64 {
+            let mut draws = Draws(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+            let index = TestRows::default();
+            let mut rows = CrossingRows::default();
+            let mut written = Vec::new();
+            for step in 0..120 {
+                write_at_random(&mut draws, &index, &mut written);
+                let (read, cursor) = index.crossing_changes(CONSUMER, rows.since(&trie));
+                rows.take(&trie, CONSUMER, read, cursor);
+                let CrossingRead::Whole(all) = index.crossing_changes(CONSUMER, None).0 else {
+                    panic!("no cursor reads whole");
+                };
+                let (names, answers) = one_pass(&trie, &all);
+                assert_eq!(
+                    rows.names
+                        .iter()
+                        .map(|(key, (id, _))| (*key, *id))
+                        .collect::<BTreeMap<_, _>>(),
+                    names,
+                    "seed {seed} step {step}"
+                );
+                let deleting: BTreeMap<SubstateKey, bool> = answers
+                    .iter()
+                    .flat_map(|row| [(row.record, false), (row.row, false), (row.marker, true)])
+                    .collect();
+                let mut holders: BTreeMap<ShardId, usize> = BTreeMap::new();
+                for row in &answers {
+                    *holders.entry(row.holder).or_default() += 1;
+                }
+                assert_eq!(rows.holders, holders, "seed {seed} step {step}");
+                let at = 1 + draws.below(4) as u64;
+                let (anchor, _) = differential_boundary(&mut draws, &universe, at);
+                let refuted: BTreeSet<SubstateKey> = universe
+                    .keys()
+                    .chain(deleting.keys())
+                    .filter(|_| draws.one_in(3))
+                    .copied()
+                    .collect();
+                let (mut reads, mut needed) = (BTreeSet::new(), BTreeSet::new());
+                for row in answers.iter().filter(|row| row.holder == anchor.shard) {
+                    let cells = row.cells(&anchor);
+                    if !cells.iter().any(|cell| refuted.contains(cell)) {
+                        needed.extend(cells.iter().copied());
+                    }
+                    reads.extend(cells);
+                }
+                for (never, _) in rows
+                    .nevers
+                    .iter()
+                    .filter(|(_, row)| row.holder == anchor.shard)
+                {
+                    if !refuted.contains(never) {
+                        needed.insert(*never);
+                    }
+                    reads.insert(*never);
+                }
+                for key in universe.keys().chain(deleting.keys()) {
+                    assert_eq!(
+                        rows.deleting(*key),
+                        deleting.get(key).copied(),
+                        "seed {seed} step {step}"
+                    );
+                    assert_eq!(
+                        rows.reads_at(&anchor, *key),
+                        reads.contains(key),
+                        "seed {seed} step {step}"
+                    );
+                    assert_eq!(
+                        rows.needed_at(&anchor, *key, &refuted),
+                        needed.contains(key),
+                        "seed {seed} step {step}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rows written, rewritten and removed at random, a journal that
+    /// restarts, a trie that splits the records' holder, boundaries asked
+    /// and read with some cells refuted, and deletions carried: a replica
+    /// following the index's changes holds after every commit exactly
+    /// what one reading the rows whole at every commit holds, and both
+    /// ask, release and offer alike.
+    #[test]
+    fn a_replica_following_the_changes_holds_what_one_reading_them_whole_holds() {
+        let whole_trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let split_trie =
+            ShardTrie::from_leaves([CONSUMER, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let universe = differential_universe();
+        for seed in 1..=24u64 {
+            let mut draws = Draws(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let rows = Arc::new(TestRows::default());
+            let new = |index: Arc<dyn CrossingIndex>| {
+                Counterparts::new(
+                    CONSUMER,
+                    Arc::new(ProvenAnchors::default()),
+                    Arc::new(CounterpartMirror::default()),
+                    index,
+                    ReadFrontier::default(),
+                )
+            };
+            let mut following = new(Arc::clone(&rows) as _);
+            let mut whole = new(Arc::new(ReadWhole(Arc::clone(&rows))));
+            let mut trie = whole_trie.clone();
+            let mut boundaries: Vec<Anchor> = Vec::new();
+            let mut written: Vec<SubstateKey> = Vec::new();
+            let mut trees: BTreeMap<Anchor, Vec<(SubstateKey, Vec<u8>)>> = BTreeMap::new();
+            for step in 0..240 {
+                let now = WeightedTimestamp::from_millis(500_000 + 1_000 * step);
+                write_at_random(&mut draws, &rows, &mut written);
+                if draws.one_in(25) {
+                    rows.restart();
+                }
+                if draws.one_in(30) {
+                    trie = if trie == whole_trie {
+                        split_trie.clone()
+                    } else {
+                        whole_trie.clone()
+                    };
+                }
+                if draws.one_in(12) {
+                    let (boundary, held) =
+                        differential_boundary(&mut draws, &universe, boundaries.len() as u64 + 1);
+                    trees.insert(boundary, held);
+                    boundaries.push(boundary);
+                }
+                let schedule = recording(&boundaries[boundaries.len().saturating_sub(3)..]);
+                // The commit: what each derives, keeps and asks.
+                following.clock = now;
+                whole.clock = now;
+                following.derive_asks(&trie);
+                whole.derive_asks(&trie);
+                let released = following.settle_boundaries(&schedule, now);
+                assert_eq!(
+                    format!("{released:?}"),
+                    format!("{:?}", whole.settle_boundaries(&schedule, now)),
+                    "seed {seed} step {step}"
+                );
+                let asked = following.ask_boundaries(&schedule, now);
+                assert_eq!(
+                    format!("{asked:?}"),
+                    format!("{:?}", whole.ask_boundaries(&schedule, now)),
+                    "seed {seed} step {step}"
+                );
+                assert_eq!(
+                    derived(&following),
+                    derived(&whole),
+                    "seed {seed} step {step}"
+                );
+                serve_at_random(&mut draws, &trees, [&mut following, &mut whole]);
+                // A block carrying part of the first offer.
+                let offered = following.offers().boundary_claims;
+                assert_eq!(
+                    format!("{offered:?}"),
+                    format!("{:?}", whole.offers().boundary_claims),
+                    "seed {seed} step {step}"
+                );
+                if let Some(offer) = offered.first().filter(|_| draws.one_in(2)) {
+                    let carried = offer.carrying(1 + draws.below(offer.deletions.len()));
+                    following.cut_carried(&carried);
+                    whole.cut_carried(&carried);
+                    // The fold deletes the answers whose records the
+                    // block read absent.
+                    for claim in &carried {
+                        for record in claim.deleting() {
+                            if let Some(id) = following.crossing_of(record) {
+                                for answered in [Answered::Taken, Answered::Never] {
+                                    let key = id.answer_key(&ProtocolHasher, answered);
+                                    if draws.one_in(2) {
+                                        rows.remove(key);
+                                        written.retain(|written| *written != key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

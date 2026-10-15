@@ -19,7 +19,7 @@ use hyperscale_types::{
 use rocksdb::{WriteBatch, WriteOptions};
 
 use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
-use super::core::{RocksDbShardStorage, fold_sweep_rows};
+use super::core::{BatchRows, RocksDbShardStorage, fold_sweep_rows};
 use super::metadata::read_jmt_metadata;
 use super::retention::retention_floor;
 use super::snapshot::RocksDbSnapshot;
@@ -143,7 +143,7 @@ impl RocksDbShardStorage {
     pub(crate) fn try_apply_prepared_commit(
         &self,
         mut write_batch: WriteBatch,
-        sweep_rows: &SweepRows,
+        rows: BatchRows,
         jmt_snapshot: &JmtSnapshot,
         block: &Block,
         qc: &Verified<QuorumCertificate>,
@@ -198,7 +198,7 @@ impl RocksDbShardStorage {
         // fold reads the persisted rows and belongs here, under
         // `commit_lock` with the write it decides: a batch prepared over
         // unpersisted ancestors has not seen what they moved.
-        fold_sweep_rows(&self.db, &mut write_batch, &self.cf(), sweep_rows);
+        fold_sweep_rows(&self.db, &mut write_batch, &self.cf(), &rows.sweep);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);
@@ -212,6 +212,7 @@ impl RocksDbShardStorage {
         self.db.write_opt(write_batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
+        self.record_crossings(new_version, rows.crossings);
         record_storage_batch_size(batch_size);
         record_block_persisted();
         record_certificates_persisted(block.certificates().len());

@@ -140,6 +140,10 @@ impl RocksDbShardStorage {
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(format!("reshape adoption write: {e}")))?;
+        self.crossing_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restart();
         Ok(adopted)
     }
 

@@ -23,8 +23,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore, Substates,
-    SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
+    BaseReadCache, CrossingJournal, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore,
+    Substates, SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -105,6 +105,21 @@ pub struct RocksDbShardStorage {
     /// until one holds. Process-local rather than a column: a restarted
     /// node's readers start where its store does.
     pub(crate) retention_hold: Arc<AtomicU64>,
+
+    /// The crossing index rows each persisted write put or removed.
+    /// Process-local: a reopened store starts a new line, and its
+    /// readers read the rows whole once.
+    pub(crate) crossing_journal: Arc<Mutex<CrossingJournal>>,
+}
+
+/// What a substate write batch moves in the derived indexes the batch
+/// itself does not place: the sweep-index delta, folded where the batch
+/// is written, and the crossing rows it puts or removes, recorded once
+/// the batch is written.
+#[derive(Default)]
+pub struct BatchRows {
+    pub sweep: SweepRows,
+    pub crossings: Vec<SubstateKey>,
 }
 
 /// Fold what a batch `moved` in the sweep index into the rows it holds.
@@ -311,6 +326,7 @@ impl RocksDbShardStorage {
             checkpoints,
             vote_registers: Arc::new(Mutex::new(HashMap::new())),
             retention_hold: Arc::new(AtomicU64::new(u64::MAX)),
+            crossing_journal: Arc::new(Mutex::new(CrossingJournal::new())),
         })
     }
 
@@ -486,9 +502,9 @@ impl RocksDbShardStorage {
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
         pending: &[Arc<JmtSnapshot>],
-    ) -> (WriteBatch, SweepRows) {
+    ) -> (WriteBatch, BatchRows) {
         let mut batch = WriteBatch::default();
-        let sweep_rows = self.append_substate_writes_to_batch(
+        let rows = self.append_substate_writes_to_batch(
             &mut batch,
             writes,
             version,
@@ -496,7 +512,7 @@ impl RocksDbShardStorage {
             base_reads,
             pending,
         );
-        (batch, sweep_rows)
+        (batch, rows)
     }
 
     /// Same as `build_substate_write_batch` but appends to an existing
@@ -515,7 +531,7 @@ impl RocksDbShardStorage {
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
         pending: &[Arc<JmtSnapshot>],
-    ) -> SweepRows {
+    ) -> BatchRows {
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
         let history_cf = StateHistoryCf::handle(&cf);
@@ -565,6 +581,7 @@ impl RocksDbShardStorage {
         let history_key_codec = VersionedSubstateKeyCodec;
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
         let mut sweep_rows = SweepRows::default();
+        let mut crossings = Vec::new();
         let artifacts_cf = PackageArtifactsCf::handle(&cf);
         let crossing_cf = CrossingIndexCf::handle(&cf);
         for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
@@ -579,8 +596,14 @@ impl RocksDbShardStorage {
                 batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
             }
             match crossing {
-                RowChange::Put => batch_put::<CrossingIndexCf>(batch, crossing_cf, key, &()),
-                RowChange::Delete => batch_delete::<CrossingIndexCf>(batch, crossing_cf, key),
+                RowChange::Put => {
+                    batch_put::<CrossingIndexCf>(batch, crossing_cf, key, &());
+                    crossings.push(*key);
+                }
+                RowChange::Delete => {
+                    batch_delete::<CrossingIndexCf>(batch, crossing_cf, key);
+                    crossings.push(*key);
+                }
                 RowChange::Keep => {}
             }
             if let Some(new_value) = change {
@@ -635,7 +658,20 @@ impl RocksDbShardStorage {
             );
         }
 
-        sweep_rows
+        BatchRows {
+            sweep: sweep_rows,
+            crossings,
+        }
+    }
+
+    /// Record the crossing rows a written batch at `version` moved.
+    pub(crate) fn record_crossings(&self, version: u64, crossings: Vec<SubstateKey>) {
+        if !crossings.is_empty() {
+            self.crossing_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(version, crossings);
+        }
     }
 
     /// The entries half of a substate write batch: each entry's leaf row
@@ -756,7 +792,7 @@ impl RocksDbShardStorage {
         // Genesis writes at version 0. Repeat Sets to the same key
         // overwrite — idempotent by RocksDB write semantics. No history
         // entries: genesis has no pre-state to preserve.
-        let (mut batch, sweep_rows) = self.build_substate_write_batch(
+        let (mut batch, rows) = self.build_substate_write_batch(
             writes,
             0,
             /* write_history */ false,
@@ -765,12 +801,13 @@ impl RocksDbShardStorage {
         );
         // Genesis builds and writes in one step over an empty store, so
         // the fold's read is of what this batch is about to extend.
-        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &sweep_rows);
+        fold_sweep_rows(&self.db, &mut batch, &self.cf(), &rows.sweep);
 
         // Substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db
             .write(batch)
             .expect("genesis substate-only commit failed");
+        self.record_crossings(0, rows.crossings);
     }
 
     /// Compute the JMT once at version 0 from the merged genesis updates.

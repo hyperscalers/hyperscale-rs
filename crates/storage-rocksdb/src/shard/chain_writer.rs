@@ -6,8 +6,8 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, member_writes,
-    read_frontier_writes, settled_writes_at,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, member_writes, read_frontier_writes,
+    settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, ShardId,
@@ -16,7 +16,7 @@ use hyperscale_types::{
 use rocksdb::WriteBatch;
 
 use super::column_families::ConsensusReceiptsCf;
-use super::core::RocksDbShardStorage;
+use super::core::{BatchRows, RocksDbShardStorage};
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::{read_chain_floor, write_chain_floor};
 use super::receipts::add_receipts_to_batch;
@@ -72,7 +72,7 @@ impl ShardChainWriter for RocksDbShardStorage {
             let prepared = build_prepared_commit(
                 Arc::clone(self),
                 WriteBatch::default(),
-                SweepRows::default(),
+                BatchRows::default(),
                 Arc::clone(&jmt_snapshot),
             );
             return (parent.state_root, jmt_snapshot, prepared);
@@ -105,7 +105,7 @@ impl ShardChainWriter for RocksDbShardStorage {
 
         // Merge writes for the substate WriteBatch (off the state_root critical path).
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
-        let (mut write_batch, sweep_rows) = self.build_substate_write_batch(
+        let (mut write_batch, rows) = self.build_substate_write_batch(
             &settled,
             block_height.inner(),
             /* write_history */ true,
@@ -119,7 +119,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         let prepared = build_prepared_commit(
             Arc::clone(self),
             write_batch,
-            sweep_rows,
+            rows,
             Arc::clone(&jmt_snapshot),
         );
 
@@ -149,7 +149,7 @@ impl ShardChainWriter for RocksDbShardStorage {
 fn build_prepared_commit(
     storage: Arc<RocksDbShardStorage>,
     write_batch: WriteBatch,
-    sweep_rows: SweepRows,
+    rows: BatchRows,
     jmt_snapshot: Arc<JmtSnapshot>,
 ) -> PreparedCommit {
     Box::new(
@@ -182,7 +182,7 @@ fn build_prepared_commit(
             // across the reads its write depends on.
             let applied = storage.try_apply_prepared_commit(
                 write_batch,
-                &sweep_rows,
+                rows,
                 &jmt_snapshot,
                 block,
                 qc,

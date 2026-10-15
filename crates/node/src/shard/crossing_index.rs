@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
-use hyperscale_execution::CrossingIndex;
-use hyperscale_storage::{PendingChain, ShardStorage, SubstateStore, Substates};
+use hyperscale_execution::{CrossingIndex, CrossingRead};
+use hyperscale_storage::{CrossingCursor, PendingChain, ShardStorage, SubstateStore, Substates};
 use hyperscale_types::{ShardId, SubstateKey, shard_prefix_path};
 
-/// The persisted index's rows, each point-read at the persisted tip and
-/// dropped where it reads absent there.
+/// The persisted index's rows, or those its store's journal names as
+/// put or removed since the reader's cursor, each point-read at the
+/// persisted tip and dropped where it reads absent there.
 ///
 /// A block committed but not yet persisted is not seen: a cell it writes
 /// is missed and a cell it removes still reads present until it
@@ -17,14 +18,32 @@ use hyperscale_types::{ShardId, SubstateKey, shard_prefix_path};
 pub struct ChainCrossings<S: ShardStorage>(pub Arc<PendingChain<S>>);
 
 impl<S: ShardStorage> CrossingIndex for ChainCrossings<S> {
-    fn crossing_rows(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)> {
+    fn crossing_changes(
+        &self,
+        shard: ShardId,
+        since: Option<CrossingCursor>,
+    ) -> (CrossingRead, Option<CrossingCursor>) {
         let view = self.0.view_at_persisted_tip();
         let tip = view.snapshot();
-        view.base()
-            .crossing_rows(&shard_prefix_path(shard))
-            .into_iter()
-            .filter_map(|key| tip.cell(key).map(|value| (key, value)))
-            .collect()
+        let under = shard_prefix_path(shard);
+        let (changed, cursor) = view
+            .base()
+            .crossing_changes(&under, since, view.anchor_height());
+        let read = changed.map_or_else(
+            || {
+                CrossingRead::Whole(
+                    view.base()
+                        .crossing_rows(&under)
+                        .into_iter()
+                        .filter_map(|key| tip.cell(key).map(|value| (key, value)))
+                        .collect(),
+                )
+            },
+            |keys| {
+                CrossingRead::Changed(keys.into_iter().map(|key| (key, tip.cell(key))).collect())
+            },
+        );
+        (read, Some(cursor))
     }
 
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
@@ -34,6 +53,8 @@ impl<S: ShardStorage> CrossingIndex for ChainCrossings<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyperscale_storage::test_helpers::{
         StatedRowChain, commit_settled_at, make_test_block, make_test_certified,
     };
@@ -90,12 +111,12 @@ mod tests {
             ChainOrigin::ROOT,
         ));
         let index = ChainCrossings(Arc::clone(&chain));
-        let rows = |index: &ChainCrossings<SimShardStorage>| {
-            index
-                .crossing_rows(ShardId::ROOT)
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect::<Vec<_>>()
+        let rows = |index: &ChainCrossings<SimShardStorage>| match index
+            .crossing_changes(ShardId::ROOT, None)
+            .0
+        {
+            CrossingRead::Whole(rows) => rows.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            CrossingRead::Changed(_) => panic!("no cursor reads the rows whole"),
         };
         assert!(index.present(a));
         assert_eq!(rows(&index), vec![a]);
@@ -161,5 +182,150 @@ mod tests {
                 "with {persisted} blocks persisted",
             );
         }
+    }
+
+    /// A reader following the index's changes across commits, and across
+    /// a store restored from an older image, holds after every commit the
+    /// rows a whole read finds.
+    #[test]
+    fn a_reader_following_the_changes_holds_the_rows_a_whole_read_finds() {
+        let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
+        let store = SimShardStorage::default();
+        let chain = Arc::new(PendingChain::new(
+            Arc::new(store.clone()),
+            ChainOrigin::ROOT,
+        ));
+        let index = ChainCrossings(Arc::clone(&chain));
+        let whole = || match index.crossing_changes(ShardId::ROOT, None).0 {
+            CrossingRead::Whole(rows) => rows.into_iter().collect::<BTreeMap<_, _>>(),
+            CrossingRead::Changed(_) => panic!("no cursor reads the rows whole"),
+        };
+        let mut followed: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::new();
+        let mut cursor = None;
+        let mut images = Vec::new();
+        let mut draw = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |below: u64| {
+            draw ^= draw << 13;
+            draw ^= draw >> 7;
+            draw ^= draw << 17;
+            draw % below
+        };
+        for height in 1..=120u64 {
+            if next(15) == 0 && !images.is_empty() {
+                let at = usize::try_from(next(images.len() as u64)).expect("small");
+                store.restore(&images[at]);
+            } else {
+                let rows = whole();
+                let creations: Vec<(SubstateKey, Vec<u8>)> = (0..next(4))
+                    .map(|_| record(u8::try_from(next(40)).expect("small") * 2 + 1))
+                    .filter(|(key, _)| !rows.contains_key(key))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                let removals: Vec<SubstateKey> = rows
+                    .keys()
+                    .filter(|_| next(4) == 0)
+                    .copied()
+                    .filter(|key| creations.iter().all(|(created, _)| created != key))
+                    .collect();
+                commit_settled_at(
+                    &store,
+                    &make_test_certified(make_test_block(store.jmt_height().next())),
+                    &creations,
+                    &removals,
+                    &witness,
+                );
+                images.push(store.image());
+            }
+            let (read, moved) = index.crossing_changes(ShardId::ROOT, cursor);
+            cursor = moved;
+            match read {
+                CrossingRead::Whole(rows) => followed = rows.into_iter().collect(),
+                CrossingRead::Changed(rows) => {
+                    for (key, value) in rows {
+                        match value {
+                            Some(value) => followed.insert(key, value),
+                            None => followed.remove(&key),
+                        };
+                    }
+                }
+            }
+            assert_eq!(followed, whole(), "at height {height}");
+        }
+    }
+
+    /// A reader following the changes through `ChainCrossings` while
+    /// another thread commits to the store holds the rows a whole read
+    /// finds once the commits stop: it never stands past the height it
+    /// read the rows at.
+    #[test]
+    fn a_reader_following_beside_concurrent_commits_holds_the_rows_a_whole_read_finds() {
+        let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
+        let store = SimShardStorage::default();
+        let chain = Arc::new(PendingChain::new(
+            Arc::new(store.clone()),
+            ChainOrigin::ROOT,
+        ));
+        let index = ChainCrossings(Arc::clone(&chain));
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let follow = |cursor: Option<CrossingCursor>, rows: &mut BTreeMap<SubstateKey, Vec<u8>>| {
+            let (read, moved) = index.crossing_changes(ShardId::ROOT, cursor);
+            match read {
+                CrossingRead::Whole(whole) => *rows = whole.into_iter().collect(),
+                CrossingRead::Changed(changed) => {
+                    for (key, value) in changed {
+                        match value {
+                            Some(value) => rows.insert(key, value),
+                            None => rows.remove(&key),
+                        };
+                    }
+                }
+            }
+            moved
+        };
+        let mut followed = BTreeMap::new();
+        let mut reads = 0u32;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut draw = 0x2545_F491_4F6C_DD1Du64;
+                let mut next = |below: u64| {
+                    draw ^= draw << 13;
+                    draw ^= draw >> 7;
+                    draw ^= draw << 17;
+                    draw % below
+                };
+                let mut standing: Vec<SubstateKey> = Vec::new();
+                for _ in 0..400 {
+                    let creations: Vec<(SubstateKey, Vec<u8>)> = (0..next(4))
+                        .map(|_| record(u8::try_from(next(40)).expect("small") * 2 + 1))
+                        .filter(|(key, _)| !standing.contains(key))
+                        .collect::<BTreeMap<_, _>>()
+                        .into_iter()
+                        .collect();
+                    let removals: Vec<SubstateKey> =
+                        standing.iter().filter(|_| next(4) == 0).copied().collect();
+                    standing.retain(|key| !removals.contains(key));
+                    standing.extend(creations.iter().map(|(key, _)| *key));
+                    commit_settled_at(
+                        &store,
+                        &make_test_certified(make_test_block(store.jmt_height().next())),
+                        &creations,
+                        &removals,
+                        &witness,
+                    );
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let mut cursor = None;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                cursor = follow(cursor, &mut followed);
+                reads += 1;
+            }
+            follow(cursor, &mut followed);
+        });
+        let mut whole = BTreeMap::new();
+        follow(None, &mut whole);
+        assert!(reads > 10, "the reader ran beside the commits: {reads}");
+        assert_eq!(followed, whole, "after {reads} reads");
     }
 }
