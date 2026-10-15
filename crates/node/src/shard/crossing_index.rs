@@ -60,7 +60,7 @@ mod tests {
     };
     use hyperscale_storage::{
         ChainEntry, ChainWrites, MemberInputs, ParentAnchor, ShardChainWriter, SubstateStore,
-        member_row_leaf,
+        VersionedStore, member_row_leaf,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
@@ -262,6 +262,12 @@ mod tests {
     fn a_reader_following_beside_concurrent_commits_holds_the_rows_a_whole_read_finds() {
         let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
         let store = SimShardStorage::default();
+        // The writer stamps its blocks a second apart and runs far ahead
+        // of a reader the machine stalls, so the retention floor would
+        // pass a tip the reader captured within a horizon's worth of
+        // commits. A node's tick chain holds retention at or below any
+        // tip its readers take; here the hold is genesis, for the run.
+        store.hold_retention_at(BlockHeight::new(0));
         let chain = Arc::new(PendingChain::new(
             Arc::new(store.clone()),
             ChainOrigin::ROOT,

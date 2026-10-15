@@ -8745,8 +8745,10 @@ mod tests {
         }
     }
 
-    /// The `at`th boundary of the differential's producer, over a tree
-    /// holding some of `universe`, and what the tree holds.
+    /// The `at`th boundary of the differential's producer, counting from
+    /// one, over a tree holding some of `universe`, and what the tree
+    /// holds. The first stands ten seconds past the validity end of the
+    /// crossings that end early and the rest follow a minute apart.
     fn differential_boundary(
         draws: &mut Draws,
         universe: &BTreeMap<SubstateKey, Vec<Vec<u8>>>,
@@ -8758,6 +8760,7 @@ mod tests {
                 held.push((*key, values[draws.below(values.len())].clone()));
             }
         }
+        assert!(at >= 1, "boundaries count from one");
         let (state_root, _) = state_and_proof_holding(PRODUCER, &held, &[]);
         let end = differential_crossing(0, 0, false, Terms::Owed)
             .1
@@ -8766,7 +8769,7 @@ mod tests {
             shard: PRODUCER,
             height: BlockHeight::new(40 * at),
             state_root,
-            ts: WeightedTimestamp::from_millis(end - 50_000 + 60_000 * at),
+            ts: WeightedTimestamp::from_millis(end + 60_000 * at - 50_000),
         };
         (boundary, held)
     }
