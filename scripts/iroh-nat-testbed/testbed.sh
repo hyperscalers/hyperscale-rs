@@ -124,6 +124,12 @@ join_private() {
 # set: empty keeps the source port where it can (endpoint independent
 # mapping), `random` draws one per flow (endpoint dependent). $3 adds a rule
 # to the forward chain ahead of the defaults.
+#
+# Like a home router, the router drops what arrives on `wan` for itself
+# unasked. Accepting it would let a hole punch probe that arrives before
+# the inner host's own probe leaves claim the outside address and port in
+# conntrack, and the inner host's probe would then be translated to another
+# port.
 nat_router() {
     local router=$1 flags=$2 extra_forward=${3:-}
     ns "$router" nft -f - <<RULES
@@ -137,6 +143,10 @@ table ip nat {
     }
 }
 table inet filter {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname "wan" ct state new drop
+    }
     chain forward {
         type filter hook forward priority filter; policy drop;
         $extra_forward
