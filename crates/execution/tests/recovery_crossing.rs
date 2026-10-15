@@ -3,8 +3,8 @@
 //!
 //! A shard halted past f is recovered by a fresh committee that holds the
 //! settled state at the beacon-attested frontier and folds the harvested
-//! blocks above it. No replica that has folded the recovery runs or signs
-//! a tick anchored below its bridge. The crossing block, the first
+//! blocks above it. No replica that has folded the recovery dispatches a
+//! run of a tick anchored below its bridge, or signs one. The crossing block, the first
 //! anchored at or past the bridge, discards every tick its parent's rows
 //! hold, and the tick chain floor rises to its parent, so the first tick
 //! past it reads the base alone on a replica that ran the discarded ticks

@@ -530,11 +530,6 @@ pub struct ExecutionCoordinator {
     /// outstanding.
     tick_in_flight: bool,
 
-    /// The tick chain floor this coordinator has raised: the parent
-    /// height of a halt recovery's crossing block, at or below which no
-    /// tick runs or is read.
-    recovery_floor: BlockHeight,
-
     /// Whether the committed tip is past this chain's terminal window.
     ///
     /// Derived in every fold from the tip header's parent QC, before
@@ -798,7 +793,6 @@ impl ExecutionCoordinator {
             code,
             persisted: BlockHeight::GENESIS,
             tick_in_flight: false,
-            recovery_floor: BlockHeight::GENESIS,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -863,9 +857,13 @@ impl ExecutionCoordinator {
 
     /// Record that the settled base now carries `height`, and dispatch
     /// the head tick if that is the baseline it was waiting for.
-    pub fn on_block_persisted(&mut self, height: BlockHeight) -> Vec<Action> {
+    pub fn on_block_persisted(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        height: BlockHeight,
+    ) -> Vec<Action> {
         self.persisted = self.persisted.max(height);
-        self.dispatch_next_tick()
+        self.dispatch_next_tick(topology_schedule)
     }
 
     /// The lowest height a tick this coordinator has still to run reads
@@ -1640,7 +1638,8 @@ impl ExecutionCoordinator {
     /// this node has not fetched waits. What releases it is the same
     /// thing — the engine answering for the package — and what retries
     /// it is the next commit, which seats and dispatches as every
-    /// commit does.
+    /// commit does. A tick anchored below a halt recovery's bridge goes
+    /// back too, and the next dispatch drops it.
     pub fn on_execution_batch_unavailable(
         &mut self,
         tick: BlockHeight,
@@ -1658,11 +1657,6 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
-        if tick <= self.recovery_floor {
-            // A recovery's crossing let go of the tick while its batch
-            // was out: it runs nowhere again.
-            return self.dispatch_next_tick();
-        }
         self.pending_ticks.push_front(Queued::Run(PendingTick {
             tick,
             tick_ts,
@@ -1738,7 +1732,7 @@ impl ExecutionCoordinator {
         // appends before notifying), so fates waiting on it can resolve
         // and the next queued tick can go.
         actions.extend(self.drain_ready_tick_resolutions());
-        actions.extend(self.dispatch_next_tick());
+        actions.extend(self.dispatch_next_tick(topology_schedule));
         actions
     }
 
@@ -3238,7 +3232,6 @@ impl ExecutionCoordinator {
         let block = certified.block();
         let height = block.height();
         let (floor, crossed) = self.cross_a_bridge(topology_schedule, committee_anchor, block);
-        self.withhold_replaced(topology_schedule);
 
         // What the block's finalizations settle about the transactions
         // they name, read off their outcomes alone.
@@ -3581,12 +3574,7 @@ impl ExecutionCoordinator {
         if !members.is_empty() {
             actions.extend(self.replay_early_attestations(topology_schedule, &members));
         }
-        // A tick anchored below a halt recovery's bridge is seated, so its
-        // members are held where every replica holds them, and never run
-        // here: the crossing block discards it.
-        let replaced =
-            topology_schedule.committee_replaced_for_anchored(self.local_shard, block.ts);
-        if let Some(pending) = pending.filter(|_| !replaced) {
+        if let Some(pending) = pending {
             if runnable && pending.in_hand {
                 tracing::debug!(
                     height = height.inner(),
@@ -3611,7 +3599,7 @@ impl ExecutionCoordinator {
         // chain: a discarded tick's legs hold cells this one may
         // need, and nothing else is coming to release them.
         actions.extend(self.drain_ready_tick_resolutions());
-        actions.extend(self.dispatch_next_tick());
+        actions.extend(self.dispatch_next_tick(topology_schedule));
 
         actions
     }
@@ -3728,10 +3716,6 @@ impl ExecutionCoordinator {
                 tally.map_or(0, VoteTracker::distinct_global_receipt_root_count),
             verified_power = tally.map_or(0, |tracker| tracker.total_verified_power().inner()),
             "Discarding a tick a halt recovery left no quorum to certify"
-        );
-        debug_assert!(
-            tick_id.block_height() <= self.recovery_floor,
-            "a recovery discards a tick the crossing's raised floor has not withdrawn",
         );
         self.ticks.discard_tick(&tick_id);
         // The floor raise of the crossing it is let go of at drops its
@@ -4004,7 +3988,7 @@ impl ExecutionCoordinator {
     }
 
     /// At this shard's crossing block past a halt recovery's bridge
-    /// ([`TopologySchedule::recovery_crossing`]), let go of every tick
+    /// ([`TopologySchedule::crossing_block`]), let go of every tick
     /// below it and raise the tick chain floor to the crossing block's
     /// parent height.
     ///
@@ -4038,7 +4022,6 @@ impl ExecutionCoordinator {
         }) else {
             return (Vec::new(), Vec::new());
         };
-        self.recovery_floor = self.recovery_floor.max(floor);
         let below: Vec<TickId> = self
             .ticks
             .ticks_iter()
@@ -4060,22 +4043,6 @@ impl ExecutionCoordinator {
             .retain(|(_, tick, _)| *tick > floor);
         self.last_completed_tick = self.last_completed_tick.max(floor);
         (vec![Action::RaiseTickFloor { floor }], below)
-    }
-
-    /// Take out of the dispatch queue every tick anchored below a halt
-    /// recovery's bridge: a replica that has folded the recovery runs
-    /// none, since the crossing block discards each.
-    fn withhold_replaced(&mut self, topology_schedule: &TopologySchedule) {
-        let local_shard = self.local_shard;
-        let ticks = &self.ticks;
-        self.pending_ticks.retain(|queued| match queued {
-            Queued::Run(pending) => {
-                !topology_schedule.committee_replaced_for_anchored(local_shard, pending.tick_ts)
-            }
-            Queued::Held(tick_id) => ticks.get_tick(tick_id).is_none_or(|tick| {
-                !topology_schedule.committee_replaced_for_anchored(local_shard, tick.anchor())
-            }),
-        });
     }
 
     /// Emit every buffered resolution whose tick is now on the chain.
@@ -4154,7 +4121,23 @@ impl ExecutionCoordinator {
     /// They stay buffered too, and are emitted again once the tick
     /// completes with whatever was recorded while it ran: the chain
     /// resolves a member once however often it is told.
-    fn dispatch_next_tick(&mut self) -> Vec<Action> {
+    ///
+    /// No tick anchored below a halt recovery's bridge leaves here once
+    /// `topology_schedule` holds the recovery: each is dropped from the
+    /// queue, since the crossing block discards it. Every dispatch reads
+    /// the schedule, so a tick queued before the fold is dropped by the
+    /// first dispatch after it, a write's or a commit's alike.
+    fn dispatch_next_tick(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let local_shard = self.local_shard;
+        let ticks = &self.ticks;
+        self.pending_ticks.retain(|queued| match queued {
+            Queued::Run(pending) => {
+                !topology_schedule.committee_replaced_for_anchored(local_shard, pending.tick_ts)
+            }
+            Queued::Held(tick_id) => ticks.get_tick(tick_id).is_none_or(|tick| {
+                !topology_schedule.committee_replaced_for_anchored(local_shard, tick.anchor())
+            }),
+        });
         if self.tick_in_flight || self.committed_height < self.replay_through {
             return Vec::new();
         }
@@ -4163,19 +4146,16 @@ impl ExecutionCoordinator {
         // It blocks too while a leg of it that may reserve is unresolved:
         // whether the leg completed, and so holds what it declared, is
         // committed only by the finalization that settles it, and every
-        // later tick below that commit reads the hold. One at or below the
-        // tick chain floor is read by no tick above it, so nothing waits
-        // on it.
+        // later tick below that commit reads the hold.
         while let Some(Queued::Held(tick_id)) = self.pending_ticks.front() {
-            if tick_id.block_height() > self.recovery_floor
-                && (self
-                    .ticks
-                    .get_tick(tick_id)
-                    .is_some_and(TickState::determined_unsettled)
-                    || self
-                        .ticked
-                        .get(tick_id)
-                        .is_some_and(TickedBatch::may_reserve))
+            if self
+                .ticks
+                .get_tick(tick_id)
+                .is_some_and(TickState::determined_unsettled)
+                || self
+                    .ticked
+                    .get(tick_id)
+                    .is_some_and(TickedBatch::may_reserve)
             {
                 return Vec::new();
             }
@@ -5276,9 +5256,8 @@ mod tests {
 
     /// A schedule whose root shard is under a halt recovery seated at
     /// epoch 20 and frozen at `frontier`, with one-second windows: the
-    /// bridge is epoch 21, so an anchor under 21s is the replaced
-    /// committee's at or below the frontier and the fresh committee's
-    /// above it, and a QC stamped from 20s on is the fresh committee's.
+    /// bridge is epoch 21, so an anchor under 21s lies below the bridge,
+    /// at or below the frontier and above it alike.
     fn make_test_topology_bridged_at_20(frontier: BlockHeight) -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
@@ -8743,7 +8722,6 @@ mod tests {
         ));
         assert!(state.ticks.get_tick(&frontier).is_none());
         assert!(state.ticks.get_tick(&tail).is_none());
-        assert_eq!(state.recovery_floor, BlockHeight::new(4));
 
         let fresh = hold(&mut state, 5, 21_100);
         let (raised, dropped) = at(&mut state, 6, 21_100, 21_200);
@@ -8851,12 +8829,11 @@ mod tests {
         }
     }
 
-    /// A batch the environment hands back for a tick a recovery's
-    /// crossing let go of while it was out runs nowhere again: the tick
-    /// is at or below the floor the crossing raised, and no later commit
-    /// dispatches it.
+    /// A batch the environment hands back for a tick anchored below a
+    /// recovery's bridge, folded while the batch was out, runs nowhere
+    /// again: neither the next write nor the next commit dispatches it.
     #[test]
-    fn a_batch_handed_back_below_the_crossing_floor_runs_nowhere_again() {
+    fn a_batch_handed_back_below_a_bridge_runs_nowhere_again() {
         let mut state = make_test_state();
         let topology_schedule = make_test_topology();
         let package = Hash::from_bytes(b"code this node holds");
@@ -8886,12 +8863,19 @@ mod tests {
         else {
             panic!("a tick running code this node holds must dispatch");
         };
-        state.recovery_floor = tick;
+        let bridged = make_test_topology_bridged_at_20(BlockHeight::GENESIS);
         let _ =
             state.on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package);
+        let written = state.on_block_persisted(&bridged, BlockHeight::new(1));
+        assert!(
+            !written
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "a write dispatches a tick below the bridge again: {written:?}",
+        );
         let again = state
             .commit_block_carrying(
-                &topology_schedule,
+                &bridged,
                 &certify(make_live_block(
                     BlockHeight::new(2),
                     2000,
@@ -8906,7 +8890,55 @@ mod tests {
                 action,
                 Action::ExecuteTransactions { tick: dispatched, .. } if *dispatched == tick
             )),
-            "a tick below the floor is dispatched again: {again:?}",
+            "a tick below the bridge is dispatched again: {again:?}",
+        );
+    }
+
+    /// A tick queued before this replica folded a recovery, waiting on the
+    /// write of the block below it, is not dispatched by that write once
+    /// the replica has folded it: the tick is anchored below the bridge,
+    /// and no commit comes between to withhold it.
+    #[test]
+    fn a_tick_queued_before_the_fold_does_not_run_on_the_write_after_it() {
+        let mut state = make_test_state();
+        let topology_schedule = make_test_topology();
+        let package = Hash::from_bytes(b"code this node holds");
+        let _ = state.commit_block_carrying(
+            &topology_schedule,
+            &certify(make_live_block(
+                BlockHeight::new(1),
+                1000,
+                ValidatorId::new(0),
+                vec![],
+            )),
+            Naming::Composed,
+        );
+        let queued = state
+            .commit_block_carrying(
+                &topology_schedule,
+                &certify(make_live_block(
+                    BlockHeight::new(2),
+                    2000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(test_transaction_running(1, &[package]))],
+                )),
+                Naming::Composed,
+            )
+            .actions;
+        assert!(
+            !queued
+                .iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "tick 2 waits for height 1 to be written: {queued:?}",
+        );
+        let ran = state.on_block_persisted(
+            &make_test_topology_bridged_at_20(BlockHeight::GENESIS),
+            BlockHeight::new(1),
+        );
+        assert!(
+            !ran.iter()
+                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "a write after the fold dispatches a tick below the bridge: {ran:?}",
         );
     }
 
@@ -10190,6 +10222,73 @@ mod tests {
         );
     }
 
+    /// A tick anchored below a recovery's bridge that this node cannot
+    /// run is seated into `held` as on a replica that has not folded the
+    /// recovery, dropped from the queue by the next dispatch, and let go
+    /// of from `held` at the crossing block.
+    #[test]
+    fn a_replaced_tick_not_in_hand_is_held_then_dropped_at_dispatch() {
+        let mut schedule = make_test_topology_bridged_at_20(BlockHeight::GENESIS);
+        let head = Arc::clone(schedule.head());
+        for epoch in 1..=30 {
+            schedule.insert(Epoch::new(epoch), Arc::clone(&head));
+        }
+        let tx = test_transaction(1);
+        let mut state = make_test_state();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
+        let sealed = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx.clone())],
+        )
+        .into_sealed();
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &naming(
+                &test_certify(sealed, 2_000),
+                vec![TickLine::Member {
+                    tx: tx.hash(),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Alone,
+                    holds: Capped::empty(),
+                    reach: Capped::empty(),
+                    awaits: Capped::empty(),
+                    charge: genesis_charge(&tx),
+                    share: 0,
+                    reserves: Capped::empty(),
+                    deadline: Deadline::of_transaction(&tx),
+                    nevers: Capped::empty(),
+                }],
+            ),
+            Naming::Manifest,
+        );
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        assert!(
+            state.held.contains_key(&tick_id),
+            "the tick is seated into held"
+        );
+        assert!(
+            state.pending_ticks.is_empty()
+                && !effects
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            "the dispatch drops the replaced tick from the queue",
+        );
+        let crossing = test_certify(
+            make_live_block(BlockHeight::new(3), 0, ValidatorId::new(0), vec![]),
+            21_100,
+        );
+        let _ = state.cross_a_bridge(
+            &schedule,
+            WeightedTimestamp::from_millis(2_000),
+            crossing.block(),
+        );
+        assert!(state.held.is_empty(), "the crossing lets go of it");
+    }
+
     /// A tick this node cannot run holds every later tick until its
     /// determined half settles; the settling commit seats what its
     /// receipts say it left on the chain, then the later tick runs.
@@ -10246,7 +10345,9 @@ mod tests {
             "the held tick holds tick 3 back"
         );
         assert!(
-            state.on_block_persisted(BlockHeight::new(3)).is_empty(),
+            state
+                .on_block_persisted(&schedule, BlockHeight::new(3))
+                .is_empty(),
             "and still does once the block below it is written",
         );
 
@@ -10575,7 +10676,7 @@ mod tests {
             })
         };
         assert_eq!(
-            runs_tick_3(&state.on_block_persisted(BlockHeight::new(3))),
+            runs_tick_3(&state.on_block_persisted(&schedule, BlockHeight::new(3))),
             None,
             "the block below tick 3 being written does not release it",
         );
@@ -10656,7 +10757,7 @@ mod tests {
             &naming(&test_certify(later, 3_000), vec![alone(&later_tx)]),
             Naming::Manifest,
         );
-        let _ = state.on_block_persisted(BlockHeight::new(3));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(3));
         let determined: Arc<Verifiable<Finalization>> = Arc::new(
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
                 .into(),
@@ -10735,7 +10836,7 @@ mod tests {
             &naming(&test_certify(later, 3_000), vec![alone(later_tx)]),
             Naming::Manifest,
         );
-        let _ = state.on_block_persisted(BlockHeight::new(3));
+        let _ = state.on_block_persisted(schedule, BlockHeight::new(3));
         let determined: Arc<Verifiable<Finalization>> = Arc::new(
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
                 .into(),
@@ -11038,13 +11139,13 @@ mod tests {
             "tick 1 is done and block 1 is unwritten, so tick 2 waits",
         );
         assert_eq!(
-            dispatched(&state.on_block_persisted(BlockHeight::new(1))),
+            dispatched(&state.on_block_persisted(&schedule, BlockHeight::new(1))),
             [2],
             "block 1's write releases it",
         );
 
         assert!(
-            dispatched(&state.on_block_persisted(BlockHeight::new(2))).is_empty(),
+            dispatched(&state.on_block_persisted(&schedule, BlockHeight::new(2))).is_empty(),
             "block 2 is written and tick 2 is still running, so tick 3 waits",
         );
         assert_eq!(
@@ -11054,7 +11155,7 @@ mod tests {
         );
 
         assert!(dispatched(&complete(&mut state, 3)).is_empty());
-        assert!(dispatched(&state.on_block_persisted(BlockHeight::new(3))).is_empty());
+        assert!(dispatched(&state.on_block_persisted(&schedule, BlockHeight::new(3))).is_empty());
         assert_eq!(
             dispatched(&commit(&mut state, 4)),
             [4],
@@ -11075,7 +11176,7 @@ mod tests {
                 .into(),
         );
         state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
-        state.on_block_persisted(BlockHeight::new(3));
+        state.on_block_persisted(&schedule, BlockHeight::new(3));
         let later = make_live_block(
             BlockHeight::new(4),
             4_000,
@@ -14201,7 +14302,7 @@ mod tests {
             .end
             .plus(Duration::from_secs(1));
         commit_carrying(&mut state, &schedule, 1, horizon.as_millis(), vec![]);
-        state.on_block_persisted(BlockHeight::new(1));
+        state.on_block_persisted(&schedule, BlockHeight::new(1));
         assert!(
             !state
                 .counterparts
@@ -14613,7 +14714,11 @@ mod tests {
             let actions = state
                 .commit_block_carrying(&schedule, &reclaiming, Naming::Composed)
                 .actions;
-            let mut actions = [actions, state.on_block_persisted(BlockHeight::new(1))].concat();
+            let mut actions = [
+                actions,
+                state.on_block_persisted(&schedule, BlockHeight::new(1)),
+            ]
+            .concat();
             actions.retain(|action| matches!(action, Action::ExecuteTransactions { .. }));
             (state, actions)
         };
@@ -14635,7 +14740,7 @@ mod tests {
             let mut actions = state
                 .commit_block_carrying(&schedule, &next, Naming::Composed)
                 .actions;
-            actions.extend(state.on_block_persisted(BlockHeight::new(2)));
+            actions.extend(state.on_block_persisted(&schedule, BlockHeight::new(2)));
             let dispatched = actions.iter().find_map(|action| match action {
                 Action::ExecuteTransactions { tick, requests, .. }
                     if *tick == BlockHeight::new(2) =>
@@ -14694,7 +14799,7 @@ mod tests {
         let mut actions = state
             .commit_block_carrying(&schedule, &naming, Naming::Composed)
             .actions;
-        actions.extend(state.on_block_persisted(BlockHeight::new(2)));
+        actions.extend(state.on_block_persisted(&schedule, BlockHeight::new(2)));
         assert!(
             actions.iter().any(|action| matches!(
                 action,
@@ -18253,7 +18358,7 @@ mod tests {
         seat_lines(&mut held, &pair(tick_id, t));
         assert_let_go(&held, t, "held the tick");
         assert!(!held.ticks.contains_tick(&tick_id));
-        let _ = held.dispatch_next_tick();
+        let _ = held.dispatch_next_tick(&make_test_topology());
         assert!(
             held.pending_ticks.is_empty(),
             "the released tick holds no later one back",

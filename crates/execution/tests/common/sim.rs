@@ -364,7 +364,7 @@ impl ExecutionSim {
     fn acknowledge_writes(&mut self) {
         self.chain
             .prune_persisted(self.height, self.coord.baseline_floor());
-        let actions = self.coord.on_block_persisted(self.height);
+        let actions = self.coord.on_block_persisted(&self.topology, self.height);
         self.absorb(actions);
     }
 

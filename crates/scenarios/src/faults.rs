@@ -805,13 +805,14 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 /// one that did not, wherever the draw left neither. The member on a kept
 /// host seats into the shard loop that host never stopped, whose tick
 /// chain still carries what it ran up to the freeze. Transfers go in
-/// flight at the freeze edge, so that chain holds ticks at or below the
-/// recovery frontier which the fresh committee never runs. The recovery
-/// raises the chain's floor to the frontier; above it the retained replica
-/// has to produce the receipts a freshly seated one does, or its vote
-/// diverges from the committee's certificate and its host panics. The
-/// in-flight and post-recovery transfers then settle, and the committee's
-/// replicas converge on one state root.
+/// flight at the freeze edge, so that chain holds runs of ticks below the
+/// recovery's bridge, which the fresh committee never runs. The crossing
+/// block discards every such tick and raises the chain's floor to its
+/// parent, so past it the retained replica has to produce the receipts a
+/// freshly seated one does, or its vote diverges from the committee's
+/// certificate and its host panics. The in-flight and post-recovery
+/// transfers then settle, and the committee's replicas converge on one
+/// state root.
 ///
 /// `rehome(c, validator, host)` runs `validator` on `host` from then on if
 /// it holds no seat, and says whether it did. Requires [`halt_straddler_setup`] at genesis, two

@@ -168,7 +168,10 @@ impl ShardParticipation {
                         duration: self.shard_coordinator.config().cleanup_interval,
                     });
                 }
-                actions.extend(self.execution_coordinator.on_block_persisted(height));
+                actions.extend(
+                    self.execution_coordinator
+                        .on_block_persisted(topology_schedule, height),
+                );
                 actions
             }
             ProtocolEvent::FinalizationsAdmitted { finalizations } => self

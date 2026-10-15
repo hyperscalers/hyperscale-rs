@@ -277,10 +277,6 @@ struct TickEntry {
     /// merging every tick's contributions into one map, which is what
     /// keeps a read's cost off the whole content of the retained chain.
     folded: Option<CachedFold>,
-    /// Whether a run appended this entry, rather than restored receipts
-    /// alone: a run read a baseline, and receipts restate committed
-    /// writes that depend on none.
-    ran: bool,
 }
 
 impl TickEntry {
@@ -292,7 +288,6 @@ impl TickEntry {
             pending: BTreeMap::new(),
             retiring: BTreeMap::new(),
             folded: None,
-            ran: false,
         }
     }
 
@@ -347,7 +342,6 @@ impl TickEntry {
                 .collect(),
             retiring: BTreeMap::new(),
             folded: None,
-            ran: true,
         }
     }
 
@@ -673,12 +667,11 @@ where
     /// every tick above it: the parent height of a halt recovery's
     /// crossing block.
     ///
-    /// Every entry at or below the floor goes whole, readable or pending.
-    /// Every entry above it a run appended goes too, since it read a
-    /// baseline that held them; an entry above it only receipts seated
-    /// stays, since receipts depend on no baseline. The base is held at
-    /// the floor, so the first tick past the crossing reads a baseline
-    /// still there.
+    /// Every entry at or below the floor goes whole, readable or pending,
+    /// and nothing else: every contribution at or below it is in the base
+    /// or discarded, and no run above it is under way yet. The base is
+    /// held at the floor, so the first tick past the crossing reads a
+    /// baseline still there.
     ///
     /// A floor at or below the current one does nothing, so every vnode
     /// sharing the chain may raise it and it applies once.
@@ -691,7 +684,11 @@ where
             }
             *current = floor;
         }
-        entries.retain(|height, entry| *height > floor && !entry.ran);
+        debug_assert!(
+            entries.range(floor.next()..).next().is_none(),
+            "a run above the floor is under way at its first raise",
+        );
+        entries.retain(|height, _| *height > floor);
         drop(entries);
         let persisted = *read_or_recover(&self.persisted);
         self.base.hold_retention_at(persisted.min(floor));
@@ -1775,12 +1772,14 @@ mod tests {
         assert_eq!(read_at(&chain, 7, key(1)), Some(b"base".to_vec()));
     }
 
-    /// A run above the floor read a baseline the raise withdrew, so it
-    /// goes; an entry above it only receipts seated depends on no
-    /// baseline and stays.
+    /// Nothing above the floor is under way at its first raise, and a
+    /// later raise drops nothing above it: an entry a run appended and
+    /// one receipts seated both stay.
     #[test]
-    fn a_raised_floor_drops_run_entries_above_it_and_keeps_restored_ones() {
+    fn a_later_raise_keeps_every_entry_above_the_floor() {
+        let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        chain.raise_floor(floor);
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
@@ -1794,15 +1793,16 @@ mod tests {
                 rowless: BTreeSet::new(),
             },
         );
-        chain.raise_floor(BlockHeight::new(3));
-        assert_eq!(chain.len(), 1, "the restored entry alone stays");
-        assert_eq!(read_at(&chain, 7, key(1)), Some(b"base".to_vec()));
+        chain.raise_floor(floor);
+        chain.raise_floor(BlockHeight::new(2));
+        assert_eq!(chain.len(), 2, "both entries stay");
+        assert_eq!(read_at(&chain, 7, key(1)), Some(b"five".to_vec()));
         assert_eq!(read_at(&chain, 7, key(2)), Some(b"six".to_vec()));
     }
 
     /// A run at or below the floor lands nothing: its tick is one a
     /// recovery's crossing let go of while the run was in flight. One
-    /// above the floor lands, whoever dispatched it.
+    /// above the floor lands.
     #[test]
     fn an_append_at_or_below_the_floor_lands_nothing() {
         let floor = BlockHeight::new(3);
@@ -1823,7 +1823,8 @@ mod tests {
     }
 
     /// Every vnode sharing the chain raises it, and it applies once: a
-    /// second raise at the same floor, or a lower one, drops no re-run.
+    /// second raise at the same floor, or a lower one, drops nothing
+    /// appended above it.
     #[test]
     fn raising_the_floor_twice_is_one_raise() {
         let floor = BlockHeight::new(3);
@@ -1839,8 +1840,8 @@ mod tests {
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
     }
 
-    /// The base is held at the floor, so the runs that replace what the
-    /// raise dropped read a baseline still there.
+    /// The base is held at the floor, so the first tick past the
+    /// crossing reads a baseline still there.
     #[test]
     fn a_raised_floor_holds_retention_at_it() {
         let store = Arc::new(StubStore::with_cell(key(1), b"base"));
