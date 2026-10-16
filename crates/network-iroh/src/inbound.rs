@@ -8,9 +8,10 @@
 //! one request, answered and finished.
 //!
 //! Requests are admitted against a global concurrency limit and a per-peer
-//! one, and a peer whose streams keep failing is cooled down, so no single
-//! peer (or flood of peers) can exhaust handler capacity. A request refused
-//! for capacity is answered as such rather than left to time out.
+//! one, and a peer whose failed streams cost more than its share is cooled
+//! down, so no single peer (or flood of peers) can exhaust handler
+//! capacity. A request refused for capacity is answered as such rather than
+//! left to time out.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +33,7 @@ use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::cooldown::FailureCooldown;
+use crate::cooldown::Cooldown;
 use crate::fanout::Fanout;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::path::PathPolicy;
@@ -50,6 +51,10 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// when it has given up.
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Work charged against a peer for a stream of its that broke the protocol
+/// or stalled: the task, the reads, and the slot it held.
+const FAILED_STREAM_WORK: Duration = Duration::from_millis(1);
+
 /// Maximum number of inbound requests handled concurrently across all peers.
 const MAX_INBOUND_CONCURRENT: usize = 128;
 
@@ -65,8 +70,8 @@ pub struct InboundRouter {
     global_semaphore: Arc<Semaphore>,
     /// Per-peer count of requests in flight.
     per_peer: DashMap<EndpointId, AtomicUsize>,
-    /// Peers whose streams keep failing.
-    failures: FailureCooldown,
+    /// What each peer's failed streams have cost this host.
+    failures: Cooldown,
     /// Decides whether a response goes back over the requester's path.
     paths: Arc<PathPolicy>,
     /// Where gossip and subscription streams go. Unset until the host's
@@ -86,7 +91,7 @@ impl InboundRouter {
             paths,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: DashMap::new(),
-            failures: FailureCooldown::default(),
+            failures: Cooldown::default(),
             fanout: OnceLock::new(),
         }
     }
@@ -132,20 +137,19 @@ impl InboundRouter {
         });
     }
 
+    /// Charge `peer` for a stream that failed by its fault. A stream that
+    /// succeeded earns nothing back: a peer can always open one that does.
     fn record_outcome(&self, peer: EndpointId, result: &Result<(), StreamError>) {
-        match result {
-            Ok(()) => self.failures.record_success(peer),
-            Err(error) => {
-                debug!(peer = %peer.fmt_short(), %error, "Inbound stream failed");
-                if !error.is_peer_abandonment()
-                    && let Some(cooldown) = self.failures.record_failure(peer)
-                {
-                    warn!(
-                        peer = %peer.fmt_short(),
-                        cooldown_secs = cooldown.as_secs_f32(),
-                        "Peer entering failure cooldown; its streams will be dropped"
-                    );
-                }
+        if let Err(error) = result {
+            debug!(peer = %peer.fmt_short(), %error, "Inbound stream failed");
+            if error.is_peers_fault()
+                && let Some(cooldown) = self.failures.charge(peer, FAILED_STREAM_WORK)
+            {
+                warn!(
+                    peer = %peer.fmt_short(),
+                    cooldown_secs = cooldown.as_secs_f32(),
+                    "Peer entering failure cooldown; its streams will be dropped"
+                );
             }
         }
     }
@@ -394,10 +398,17 @@ impl StreamError {
         Self::Io(error.into())
     }
 
+    /// Whether the peer is to blame: it broke the protocol or stalled. A
+    /// peer that closed or reset its stream abandoned it, as requesters do
+    /// as a normal part of their retry strategy, and one that asked for a
+    /// type this host does not know runs another version; neither is
+    /// charged.
+    fn is_peers_fault(&self) -> bool {
+        !matches!(self, Self::UnknownMessageType) && !self.is_peer_abandonment()
+    }
+
     /// Whether the error was caused by the peer closing or resetting the
-    /// stream rather than a protocol violation or a local fault. Requesters
-    /// abandon streams as a normal part of their retry strategy, so these
-    /// must not count toward the per-peer failure threshold.
+    /// stream rather than a protocol violation or a local fault.
     fn is_peer_abandonment(&self) -> bool {
         let io_kind = match self {
             Self::Io(e) | Self::Frame(FrameError::Io(e)) => Some(e.kind()),
@@ -503,6 +514,31 @@ mod tests {
 
         assert!(router.try_admit(b).is_none(), "global cap refuses");
         assert_eq!(peer_count(&router, b), 0);
+    }
+
+    #[test]
+    fn a_request_of_an_unknown_type_is_not_the_peers_fault() {
+        assert!(!StreamError::UnknownMessageType.is_peers_fault());
+        assert!(StreamError::MalformedHeader.is_peers_fault());
+        assert!(StreamError::Timeout.is_peers_fault());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_streams_do_not_buy_back_failed_ones() {
+        let router = make_router(MAX_INBOUND_CONCURRENT);
+        let peer = random_peer();
+        let mut failed = 0;
+        while !router.failures.cooling_down(peer) {
+            router.record_outcome(peer, &Err(StreamError::MalformedHeader));
+            failed += 1;
+            for _ in 0..7 {
+                router.record_outcome(peer, &Ok(()));
+            }
+            assert!(
+                failed <= 64,
+                "a peer failing one stream in eight is cooled down"
+            );
+        }
     }
 
     #[test]

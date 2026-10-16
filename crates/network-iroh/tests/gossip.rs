@@ -4,12 +4,12 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
-use hyperscale_network::fault::{DropSpec, HostId};
+use hyperscale_network::fault::HostId;
 use hyperscale_network::{GossipVerdict, HandlerRegistry, Network};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::CountingVerifier;
@@ -25,7 +25,7 @@ use hyperscale_types::{
 use iroh::EndpointAddr;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout};
 
 /// Budget for hosts to find and bind each other and for an item to arrive.
 const BUDGET: Duration = Duration::from_secs(20);
@@ -54,6 +54,45 @@ impl NetworkMessage for BeaconBlock {
 impl GossipMessage for BeaconBlock {
     const SCOPE: TopicScope = TopicScope::Global;
 }
+
+/// A committed block header, as far as the transport is concerned: a
+/// global item of a few KiB.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct CommittedHeader {
+    seq: u64,
+    body: Vec<u8>,
+}
+
+impl NetworkMessage for CommittedHeader {
+    fn message_type_id() -> &'static str {
+        "block.committed"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
+    }
+}
+
+impl GossipMessage for CommittedHeader {
+    const SCOPE: TopicScope = TopicScope::Global;
+}
+
+/// Forged address records whose checks fit in a peer's allowance of
+/// refused work, and the one that takes it past.
+const FORGERIES_IN_ALLOWANCE: u64 = 26;
+
+/// Items of one peer a host judges at once.
+const JUDGED_AT_ONCE: u64 = 4;
+
+/// Size of a committed header stand-in.
+const HEADER_BYTES: usize = 2048;
+
+/// Headers a second an honest, busy peer sends a host that refuses them
+/// all: more than one peer hands any host in a cluster of this size.
+const HONEST_RATE: u32 = 300;
+
+/// How long the honest peer keeps sending.
+const HONEST_WATCH_SECS: u32 = 15;
 
 /// A batch of transactions, as far as the transport is concerned: an item
 /// for one shard.
@@ -415,67 +454,81 @@ async fn a_global_item_is_handled_once_however_many_copies_arrive() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_peer_whose_items_keep_being_rejected_is_refused_for_a_while() {
+async fn a_peer_slipping_signed_records_between_forged_ones_is_cooled_down() {
     let fixtures = TestFixtures::new(21, 2);
-    let receiver = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
-    // The sender's own address records are accepted, and an accepted item
-    // restores a sender's standing. The gate keeps them out from before the
-    // sender exists, so only the rejected items count.
-    receiver
-        .adapter
-        .fault_configure(HostId(0), [(fixtures.network_key(1).public(), HostId(1))]);
-    let _records_dropped = receiver.adapter.fault_gate().install_drop(DropSpec {
-        type_id: Some(ValidatorAddressGossip::message_type_id()),
-        from: Some(HostId(1)),
-        ..DropSpec::default()
-    });
-    let sender = host(
-        &fixtures,
-        1,
-        &[ShardId::ROOT],
-        vec![receiver.adapter.endpoint_addr()],
-    )
-    .await;
-    wait_for("the pair binds", || {
-        receiver.adapter.peer_for_validator(vid(1)).is_some()
-            && sender.adapter.peer_for_validator(vid(0)).is_some()
+    let (_receiver, counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+    checks_settle(&counted).await;
+    let refused = counted.refused();
+
+    // Seven forged records, then one the sender signed, which the receiver
+    // accepts: accepting it buys none of the forged ones back.
+    let start = Instant::now();
+    let mut forged = 0;
+    for sequence in 1..=800 {
+        let is_forged = sequence % 8 != 0;
+        forged += u64::from(is_forged);
+        sender.network.broadcast_global(&address_record(
+            &fixtures,
+            1,
+            &sender,
+            1_000 + sequence,
+            is_forged,
+        ));
+        sleep(Duration::from_millis(2)).await;
+    }
+    checks_settle(&counted).await;
+    let checked = counted.refused() - refused;
+    // What the receiver's budget admits over the time the flood ran: its
+    // first allowance, the items judged when the cooldown began, then five
+    // checks a second paid down by time and the items judged at each lapse.
+    let secs = start.elapsed().as_secs() + 1;
+    let admitted = FORGERIES_IN_ALLOWANCE + JUDGED_AT_ONCE + secs * (5 + JUDGED_AT_ONCE);
+    assert!(
+        checked <= admitted,
+        "the sender is cooled down: {checked} of {forged} forged records checked in {secs} s"
+    );
+
+    // The cooldown lapses and the sender is heard again.
+    let mut sequence = 10_000;
+    let heard = counted.checked();
+    wait_for("the sender is heard again after its cooldown", || {
+        sequence += 1;
+        sender
+            .network
+            .broadcast_global(&address_record(&fixtures, 1, &sender, sequence, false));
+        counted.checked() > heard
     })
     .await;
+}
 
-    let seen = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&seen);
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+
+    // The receiver cannot place any header yet and refuses each one, as a
+    // host behind the chain refuses headers signed under a committee it
+    // has not learned. The sender is honest and busy.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
     receiver
         .network
-        .register_gossip_handler(move |_: BeaconBlock, _: ShardId| {
+        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
             counted.fetch_add(1, Ordering::SeqCst);
             GossipVerdict::Reject
         });
 
-    // Eight rejections in a row cool the sender down.
-    for item in 0..8 {
-        sender.network.broadcast_global(&BeaconBlock(item));
+    let sent = HONEST_RATE * HONEST_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.broadcast_global(&CommittedHeader {
+            seq: u64::from(seq),
+            body: vec![7; HEADER_BYTES],
+        });
     }
-    wait_for("the rejected items are all handled", || {
-        seen.load(Ordering::SeqCst) == 8
-    })
-    .await;
-
-    for item in 8..12 {
-        sender.network.broadcast_global(&BeaconBlock(item));
-    }
-    sleep(SILENCE_WATCH).await;
-    assert_eq!(
-        seen.load(Ordering::SeqCst),
-        8,
-        "a cooled down sender's items are not read"
-    );
-
-    // The cooldown lapses and the sender is heard again.
-    wait_for("the sender is heard again after its cooldown", || {
-        sender
-            .network
-            .broadcast_global(&BeaconBlock(100 + seen.load(Ordering::SeqCst) as u64));
-        seen.load(Ordering::SeqCst) > 8
+    wait_for("every refused header is still read", || {
+        handled.load(Ordering::SeqCst) == sent as usize
     })
     .await;
 }
