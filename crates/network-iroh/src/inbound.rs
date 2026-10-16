@@ -10,8 +10,8 @@
 //! Requests are admitted against a global concurrency limit and a per-peer
 //! one, and a peer whose failed streams cost more than its share is cooled
 //! down, so no single peer (or flood of peers) can exhaust handler
-//! capacity. A request refused for capacity is answered as such rather than
-//! left to time out.
+//! capacity. Both are kept per principal (see [`Peer`]). A request refused
+//! for capacity is answered as such rather than left to time out.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +23,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::{MessageClass, ShardId};
+use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
@@ -37,6 +37,7 @@ use crate::cooldown::Cooldown;
 use crate::fanout::Fanout;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::path::PathPolicy;
+use crate::peer::Peer;
 use crate::protocol::{
     RESPONSE_BUSY, RESPONSE_OK, RESPONSE_RELAYED, RESPONSE_SHARD_UNSUPPORTED,
     RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STREAM_GOSSIP, STREAM_NOTIFY, STREAM_REQUEST,
@@ -68,8 +69,8 @@ pub struct InboundRouter {
     local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
     /// Global concurrency limiter. Each request in flight holds one permit.
     global_semaphore: Arc<Semaphore>,
-    /// Per-peer count of requests in flight.
-    per_peer: DashMap<EndpointId, AtomicUsize>,
+    /// Per-principal count of requests in flight.
+    per_peer: DashMap<ValidatorId, AtomicUsize>,
     /// What each peer's failed streams have cost this host.
     failures: Cooldown,
     /// Decides whether a response goes back over the requester's path.
@@ -105,9 +106,13 @@ impl InboundRouter {
         self.fanout.get().and_then(Weak::upgrade)
     }
 
-    /// Serve every stream the peer opens on `connection` until it closes.
-    pub fn serve(self: &Arc<Self>, connection: &Connection) {
-        let peer = connection.remote_id();
+    /// Serve every stream the peer opens on `connection`, which bound as
+    /// `principal` among others, until it closes.
+    pub fn serve(self: &Arc<Self>, connection: &Connection, principal: ValidatorId) {
+        let peer = Peer {
+            endpoint: connection.remote_id(),
+            principal,
+        };
         if let Some(fanout) = self.fanout() {
             fanout.on_link(peer);
         }
@@ -139,14 +144,15 @@ impl InboundRouter {
 
     /// Charge `peer` for a stream that failed by its fault. A stream that
     /// succeeded earns nothing back: a peer can always open one that does.
-    fn record_outcome(&self, peer: EndpointId, result: &Result<(), StreamError>) {
+    fn record_outcome(&self, peer: Peer, result: &Result<(), StreamError>) {
         if let Err(error) = result {
-            debug!(peer = %peer.fmt_short(), %error, "Inbound stream failed");
+            debug!(peer = %peer.endpoint.fmt_short(), %error, "Inbound stream failed");
             if error.is_peers_fault()
-                && let Some(cooldown) = self.failures.charge(peer, FAILED_STREAM_WORK)
+                && let Some(cooldown) = self.failures.charge(peer.principal, FAILED_STREAM_WORK)
             {
                 warn!(
-                    peer = %peer.fmt_short(),
+                    peer = %peer.endpoint.fmt_short(),
+                    validator = peer.principal.inner(),
                     cooldown_secs = cooldown.as_secs_f32(),
                     "Peer entering failure cooldown; its streams will be dropped"
                 );
@@ -156,7 +162,7 @@ impl InboundRouter {
 
     /// Try to admit an inbound request, checking per-peer and then global
     /// concurrency. Returns `Some(permit)` if admitted.
-    fn try_admit(&self, peer: EndpointId) -> Option<OwnedSemaphorePermit> {
+    fn try_admit(&self, peer: ValidatorId) -> Option<OwnedSemaphorePermit> {
         let counter = self
             .per_peer
             .entry(peer)
@@ -166,7 +172,7 @@ impl InboundRouter {
         if active >= MAX_INBOUND_PER_PEER {
             self.release(peer);
             warn!(
-                peer = %peer.fmt_short(),
+                validator = peer.inner(),
                 active,
                 limit = MAX_INBOUND_PER_PEER,
                 "Refusing inbound request: per-peer limit exceeded"
@@ -177,7 +183,7 @@ impl InboundRouter {
         let Ok(permit) = Arc::clone(&self.global_semaphore).try_acquire_owned() else {
             self.release(peer);
             warn!(
-                peer = %peer.fmt_short(),
+                validator = peer.inner(),
                 limit = MAX_INBOUND_CONCURRENT,
                 "Refusing inbound request: global concurrency limit reached"
             );
@@ -189,7 +195,7 @@ impl InboundRouter {
 
     /// Give back the per-peer slot an admitted (or just-refused) request
     /// took.
-    fn release(&self, peer: EndpointId) {
+    fn release(&self, peer: ValidatorId) {
         if let Some(counter) = self.per_peer.get(&peer) {
             counter.fetch_sub(1, Ordering::Relaxed);
         }
@@ -202,8 +208,8 @@ impl InboundRouter {
         set_inbound_streams_in_use("all", in_use);
     }
 
-    async fn handle_uni(&self, peer: EndpointId, mut recv: RecvStream) -> Result<(), StreamError> {
-        if self.failures.cooling_down(peer) {
+    async fn handle_uni(&self, peer: Peer, mut recv: RecvStream) -> Result<(), StreamError> {
+        if self.failures.cooling_down(peer.principal) {
             return Ok(());
         }
         // Every unidirectional stream opens with its kind and its class.
@@ -214,7 +220,7 @@ impl InboundRouter {
         match header[0] {
             STREAM_NOTIFY => {
                 let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
-                self.read_notifications(peer, class, recv).await
+                self.read_notifications(peer.endpoint, class, recv).await
             }
             STREAM_GOSSIP => {
                 let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
@@ -273,11 +279,11 @@ impl InboundRouter {
 
     async fn handle_bi(
         &self,
-        peer: EndpointId,
+        peer: Peer,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), StreamError> {
-        if self.failures.cooling_down(peer) {
+        if self.failures.cooling_down(peer.principal) {
             return Ok(());
         }
         let mut kind = [0u8; 1];
@@ -292,12 +298,12 @@ impl InboundRouter {
             return Err(StreamError::UnknownStreamKind);
         }
 
-        let Some(permit) = self.try_admit(peer) else {
+        let Some(permit) = self.try_admit(peer.principal) else {
             return respond_status(&mut send, RESPONSE_BUSY).await;
         };
-        let result = self.serve_request(peer, send, recv).await;
+        let result = self.serve_request(peer.endpoint, send, recv).await;
         drop(permit);
-        self.release(peer);
+        self.release(peer.principal);
         result
     }
 
@@ -442,12 +448,15 @@ impl fmt::Display for StreamError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use iroh::SecretKey;
 
     use super::*;
 
-    fn random_peer() -> EndpointId {
-        SecretKey::generate().public()
+    fn random_peer() -> ValidatorId {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        ValidatorId::new(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     fn make_router(global_cap: usize) -> InboundRouter {
@@ -461,7 +470,7 @@ mod tests {
         }
     }
 
-    fn peer_count(router: &InboundRouter, peer: EndpointId) -> usize {
+    fn peer_count(router: &InboundRouter, peer: ValidatorId) -> usize {
         router
             .per_peer
             .get(&peer)
@@ -526,9 +535,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn successful_streams_do_not_buy_back_failed_ones() {
         let router = make_router(MAX_INBOUND_CONCURRENT);
-        let peer = random_peer();
+        let peer = Peer {
+            endpoint: SecretKey::generate().public(),
+            principal: random_peer(),
+        };
         let mut failed = 0;
-        while !router.failures.cooling_down(peer) {
+        while !router.failures.cooling_down(peer.principal) {
             router.record_outcome(peer, &Err(StreamError::MalformedHeader));
             failed += 1;
             for _ in 0..7 {

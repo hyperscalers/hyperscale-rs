@@ -26,6 +26,7 @@ mod inbound;
 mod network;
 mod notify;
 pub mod path;
+mod peer;
 mod peer_backoff;
 mod protocol;
 mod record_pace;

@@ -39,7 +39,8 @@
 //! [`crate::record_pace`]), so no validator can make the network check its
 //! records faster, however fast it signs them.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use std::{io, mem};
@@ -79,6 +80,7 @@ use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
 use crate::path::{PathKind, Readiness};
+use crate::peer::Peer;
 use crate::protocol::{
     SCOPE_GLOBAL, SCOPE_SHARD, SHARD_WIRE_LEN, STOP_GOSSIP_REFUSED, STOP_SUBSCRIBERS_FULL,
     STREAM_GOSSIP, STREAM_SUBSCRIBE, decode_shard, encode_shard,
@@ -99,8 +101,14 @@ pub const FORWARD_SAMPLE: usize = 8;
 /// Hosts a host that serves no shard subscribes to.
 pub const FOLLOWER_SUBSCRIPTIONS: usize = 4;
 
-/// Subscribers a host serves at once.
+/// Subscribers a host serves at once, at most one for each principal.
 const MAX_SUBSCRIBERS: usize = 64;
+
+/// Least time between two handings of the whole address book to one
+/// principal. A peer that binds again within it has the book already, and
+/// a validator binding over and over under fresh endpoints would otherwise
+/// have the book sent each time.
+const BOOK_REPEAT: Duration = Duration::from_mins(1);
 
 /// Items remembered per generation of the seen set. Two generations are
 /// held, so an item is recognised for at least this many items after it
@@ -320,7 +328,7 @@ struct Turns {
 /// class it travels on with when accepted.
 #[derive(Clone)]
 struct Arrival {
-    sender: EndpointId,
+    sender: Peer,
     class: MessageClass,
     /// `None` for an item that is not forwarded.
     frame: Option<Bytes>,
@@ -374,16 +382,20 @@ pub struct Fanout {
     records: RecordPace<HeldRecord>,
     /// What each peer's refused items have cost this host.
     rejects: Cooldown,
-    /// Turns at judging each peer's items.
-    judging: DashMap<EndpointId, Arc<Semaphore>>,
-    /// Turns at being waited on for a deferred verdict, per peer.
-    deferring: DashMap<EndpointId, Arc<Semaphore>>,
+    /// Turns at judging each principal's items.
+    judging: DashMap<ValidatorId, Arc<Semaphore>>,
+    /// Turns at being waited on for a deferred verdict, per principal.
+    deferring: DashMap<ValidatorId, Arc<Semaphore>>,
     /// Items waiting on a deferred verdict.
     waiting: Mutex<Waiting<DeferredItem>>,
     topology: Arc<ArcSwap<TopologySnapshot>>,
     routing_committees: Arc<ArcSwap<RoutingCommittees>>,
     /// Hosts that asked for every global item this host accepts.
     subscribers: DashSet<EndpointId>,
+    /// The principals holding those subscriptions.
+    subscribed: DashSet<ValidatorId>,
+    /// When each principal was last handed the whole address book.
+    handed_book: Mutex<HashMap<ValidatorId, Instant>>,
     /// Hosts this one holds a subscription stream to.
     subscriptions: Arc<DashSet<EndpointId>>,
     tokio_handle: Handle,
@@ -419,6 +431,8 @@ impl Fanout {
             topology,
             routing_committees,
             subscribers: DashSet::new(),
+            subscribed: DashSet::new(),
+            handed_book: Mutex::new(HashMap::new()),
             subscriptions: Arc::new(DashSet::new()),
             tokio_handle,
             tasks: Mutex::new(Vec::new()),
@@ -564,12 +578,12 @@ impl Fanout {
     /// cooled down.
     pub async fn read_gossip(
         self: &Arc<Self>,
-        peer: EndpointId,
+        peer: Peer,
         class: MessageClass,
         mut recv: RecvStream,
     ) -> Result<(), FrameError> {
         loop {
-            if self.rejects.cooling_down(peer) {
+            if self.rejects.cooling_down(peer.principal) {
                 let _ = recv.stop(STOP_GOSSIP_REFUSED);
                 return Ok(());
             }
@@ -603,7 +617,7 @@ impl Fanout {
             let waits = Arc::clone(
                 &self
                     .deferring
-                    .entry(peer)
+                    .entry(peer.principal)
                     .or_insert_with(|| Arc::new(Semaphore::new(DEFERRED_PER_PEER))),
             );
             let waiting = waits
@@ -615,7 +629,7 @@ impl Fanout {
             let turns = Arc::clone(
                 &self
                     .judging
-                    .entry(peer)
+                    .entry(peer.principal)
                     .or_insert_with(|| Arc::new(Semaphore::new(JUDGED_AT_ONCE_PER_PEER))),
             );
             let turn = turns
@@ -624,7 +638,7 @@ impl Fanout {
                 .expect("the judging semaphore is never closed");
             // Checked again once the frame and a turn are in hand: the wait
             // for them may have begun before the cooldown did.
-            if self.rejects.cooling_down(peer) {
+            if self.rejects.cooling_down(peer.principal) {
                 let _ = recv.stop(STOP_GOSSIP_REFUSED);
                 return Ok(());
             }
@@ -646,7 +660,7 @@ impl Fanout {
     /// handlers and, when a global item is accepted, forward it once.
     fn receive(
         self: &Arc<Self>,
-        sender: EndpointId,
+        sender: Peer,
         class: MessageClass,
         scope: Scope,
         type_id: &str,
@@ -658,7 +672,7 @@ impl Fanout {
         if self
             .adapter
             .fault_gate()
-            .drop_inbound_gossip(sender, type_id)
+            .drop_inbound_gossip(sender.endpoint, type_id)
         {
             return;
         }
@@ -667,7 +681,7 @@ impl Fanout {
             && !self.adapter.local_shards().contains(&shard)
         {
             debug!(
-                peer = %sender.fmt_short(),
+                peer = %sender.endpoint.fmt_short(),
                 shard = shard.inner(),
                 type_id,
                 "Dropping gossip for a shard this host does not serve"
@@ -696,7 +710,11 @@ impl Fanout {
         let payload = match decompress(compressed) {
             Ok(payload) => payload,
             Err(error) => {
-                warn!(peer = %sender.fmt_short(), %error, "Failed to decompress gossip item");
+                warn!(
+                    peer = %sender.endpoint.fmt_short(),
+                    %error,
+                    "Failed to decompress gossip item"
+                );
                 record_invalid_message();
                 self.note_reject(sender, refused_work(compressed.len(), Refusal::Fault));
                 return;
@@ -803,7 +821,7 @@ impl Fanout {
             GossipVerdict::Accept => {
                 record_network_message_received();
                 if let Some(frame) = &arrival.frame {
-                    self.forward(arrival.sender, arrival.class, frame);
+                    self.forward(arrival.sender.endpoint, arrival.class, frame);
                 }
             }
             GossipVerdict::Reject => {
@@ -919,10 +937,11 @@ impl Fanout {
         self.seen.lock().expect("seen set lock").forget(item);
     }
 
-    fn note_reject(&self, sender: EndpointId, work: Duration) {
-        if let Some(cooldown) = self.rejects.charge(sender, work) {
+    fn note_reject(&self, sender: Peer, work: Duration) {
+        if let Some(cooldown) = self.rejects.charge(sender.principal, work) {
             warn!(
-                peer = %sender.fmt_short(),
+                peer = %sender.endpoint.fmt_short(),
+                validator = sender.principal.inner(),
                 cooldown_secs = cooldown.as_secs_f32(),
                 "Peer's gossip keeps being rejected; refusing it for a while"
             );
@@ -930,25 +949,43 @@ impl Fanout {
     }
 
     /// Serve `peer`'s subscription for as long as it holds this stream
-    /// open.
-    pub async fn hold_subscription(&self, peer: EndpointId, mut recv: RecvStream) {
-        if self.subscribers.len() >= MAX_SUBSCRIBERS && !self.subscribers.contains(&peer) {
+    /// open. A principal holds one subscription at a time, so a validator
+    /// cannot take every slot by binding under many endpoints.
+    pub async fn hold_subscription(&self, peer: Peer, mut recv: RecvStream) {
+        if self.subscribers.len() >= MAX_SUBSCRIBERS || !self.subscribed.insert(peer.principal) {
             let _ = recv.stop(STOP_SUBSCRIBERS_FULL);
             return;
         }
-        self.subscribers.insert(peer);
+        self.subscribers.insert(peer.endpoint);
         // The stream carries nothing; it ends when the subscriber finishes
         // it or the connection closes.
         let mut sink = [0u8; 64];
         while matches!(recv.read(&mut sink).await, Ok(Some(_))) {}
-        self.subscribers.remove(&peer);
+        self.subscribers.remove(&peer.endpoint);
+        self.subscribed.remove(&peer.principal);
     }
 
-    /// Give a newly bound `peer` this host's own address records and every
-    /// record in its book.
-    pub fn on_link(&self, peer: EndpointId) {
+    /// Give a newly bound `peer` this host's own address records, and every
+    /// record in its book unless its principal was handed the book within
+    /// [`BOOK_REPEAT`].
+    pub fn on_link(&self, peer: Peer) {
         let mut records = self.adapter.address_records();
-        records.extend(self.adapter.book_records());
+        let now = Instant::now();
+        let hand_book = {
+            let mut handed = self.handed_book.lock().expect("handed book lock");
+            handed.retain(|_, at| now.saturating_duration_since(*at) < BOOK_REPEAT);
+            match handed.entry(peer.principal) {
+                Entry::Occupied(_) => false,
+                Entry::Vacant(vacant) => {
+                    vacant.insert(now);
+                    true
+                }
+            }
+        };
+        if hand_book {
+            records.extend(self.adapter.book_records());
+        }
+        let peer = peer.endpoint;
         let type_id = ValidatorAddressGossip::message_type_id();
         for record in records {
             let Ok(payload) = hbor_to_vec(&record) else {
