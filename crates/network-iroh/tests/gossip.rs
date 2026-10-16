@@ -795,7 +795,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
         .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
             let key = VerdictKey::of(&block);
             let _ = keys_tx.send(key);
-            Verdict::Defer(key)
+            Verdict::defer(key)
         });
     let (tx, mut rx) = mpsc::unbounded_channel();
     follower
@@ -851,7 +851,7 @@ async fn a_peer_whose_items_fail_their_deferred_check_is_cooled_down() {
                 counted.fetch_add(1, Ordering::SeqCst);
                 network.settle(key, Verdict::Reject);
             });
-            Verdict::Defer(key)
+            Verdict::defer(key)
         });
 
     let start = Instant::now();
@@ -1078,4 +1078,160 @@ async fn a_forged_copy_does_not_keep_an_honest_one_from_its_handler() {
     });
     sleep(SILENCE_WATCH).await;
     assert_eq!(handled_count(), 2, "content already taken is handled once");
+}
+
+/// The key of the second check an item rests on, as a committed header
+/// rests on its quorum certificate after its sender signature.
+fn certificate_of(block: &BeaconBlock) -> VerdictKey {
+    VerdictKey::of(&(block.0, 1u8))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_travels_on_only_once_every_check_it_rests_on_holds() {
+    let fixtures = TestFixtures::with_surplus(21, 1, 2);
+    let (relay, sender, follower) = relay_line(&fixtures).await;
+
+    let (keys_tx, mut keys) = mpsc::unbounded_channel();
+    relay
+        .network
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+            let checks = [VerdictKey::of(&block), certificate_of(&block)];
+            let _ = keys_tx.send(checks);
+            Verdict::defer_all(checks)
+        });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    follower
+        .network
+        .register_host_gossip_handler(move |block: BeaconBlock| {
+            let _ = tx.send(block);
+        });
+    follower
+        .network
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+
+    sender.network.broadcast_global(&BeaconBlock(7));
+    let [signature, certificate] = timeout(BUDGET, keys.recv())
+        .await
+        .expect("the relay judges the item")
+        .expect("its checks");
+    relay.network.settle(signature, Verdict::Accept);
+    assert!(
+        timeout(SILENCE_WATCH, rx.recv()).await.is_err(),
+        "nothing travels on while one of its checks runs"
+    );
+    relay.network.settle(certificate, Verdict::Accept);
+    let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
+    assert_eq!(delivered, Some(BeaconBlock(7)));
+
+    // One whose second check fails stops at the relay, though its first
+    // held.
+    sender.network.broadcast_global(&BeaconBlock(8));
+    let [signature, certificate] = timeout(BUDGET, keys.recv())
+        .await
+        .expect("the relay judges the item")
+        .expect("its checks");
+    relay.network.settle(signature, Verdict::Accept);
+    relay.network.settle(certificate, Verdict::Reject);
+    assert!(timeout(SILENCE_WATCH, rx.recv()).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_checked_before_its_item_arrives_is_settled_for_it() {
+    let fixtures = TestFixtures::with_surplus(21, 1, 2);
+    let (relay, sender, follower) = relay_line(&fixtures).await;
+
+    let (keys_tx, mut keys) = mpsc::unbounded_channel();
+    relay
+        .network
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+            let own = VerdictKey::of(&block);
+            let _ = keys_tx.send(own);
+            Verdict::defer_all([own, certificate_of(&block)])
+        });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    follower
+        .network
+        .register_host_gossip_handler(move |block: BeaconBlock| {
+            let _ = tx.send(block);
+        });
+    follower
+        .network
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+
+    // As a ratify vote a proof carries was checked when it arrived alone:
+    // the item that carries it waits only on its own check.
+    relay
+        .network
+        .settle(certificate_of(&BeaconBlock(7)), Verdict::Accept);
+    sender.network.broadcast_global(&BeaconBlock(7));
+    let own = timeout(BUDGET, keys.recv())
+        .await
+        .expect("the relay judges the item")
+        .expect("its own check");
+    relay.network.settle(own, Verdict::Accept);
+    let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
+    assert_eq!(delivered, Some(BeaconBlock(7)));
+
+    // A part found false before stops every item that carries it.
+    relay
+        .network
+        .settle(certificate_of(&BeaconBlock(8)), Verdict::Reject);
+    sender.network.broadcast_global(&BeaconBlock(8));
+    let own = timeout(BUDGET, keys.recv())
+        .await
+        .expect("the relay judges the item")
+        .expect("its own check");
+    relay.network.settle(own, Verdict::Accept);
+    assert!(timeout(SILENCE_WATCH, rx.recv()).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_items_fail_a_later_check_is_cooled_down() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+
+    // Every header's sender signature holds and its certificate does not,
+    // checked one after the other as the shard loop and the remote header
+    // coordinator check them.
+    let checked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&checked);
+    let network = Arc::clone(&receiver.network);
+    let handle = Handle::current();
+    receiver
+        .network
+        .register_gossip_handler(move |header: CommittedHeader, _: ShardId| {
+            let signature = VerdictKey::of(&header);
+            let certificate = VerdictKey::of(&(header.seq, 1u8));
+            let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
+            handle.spawn(async move {
+                sleep(CHECK_DELAY).await;
+                network.settle(signature, Verdict::Accept);
+                sleep(CHECK_DELAY).await;
+                counted.fetch_add(1, Ordering::SeqCst);
+                network.settle(certificate, Verdict::Reject);
+            });
+            Verdict::defer_all([signature, certificate])
+        });
+
+    let start = Instant::now();
+    let sent = HONEST_RATE * REJECTED_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.broadcast_global(&CommittedHeader {
+            seq: u64::from(seq),
+            body: vec![7; HEADER_BYTES],
+        });
+    }
+    sleep(SILENCE_WATCH).await;
+    let judged = checked.load(Ordering::SeqCst) as u64;
+    let secs = start.elapsed().as_secs() + 1;
+    // As for a single deferred check: what was already waiting on its
+    // checks when the cooldown began, on top of the allowance.
+    let admitted = FORGERIES_IN_ALLOWANCE + DEFERRED_AT_ONCE + secs * (5 + DEFERRED_AT_ONCE);
+    assert!(judged > 0, "the headers reach the receiver");
+    assert!(
+        judged <= admitted,
+        "the sender is cooled down: {judged} of {sent} certificates checked in {secs} s"
+    );
 }

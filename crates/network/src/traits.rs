@@ -75,14 +75,14 @@ pub enum RequestError {
 /// charges [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no
 /// one's.
 ///
-/// A handler whose check of the message finishes only after it returns
-/// says [`Self::Defer`], and the check settles the verdict through
-/// [`Network::settle`]. A transport that forwards only what it has judged
-/// holds the message until then, so a host never forwards a message whose
-/// check could still fail, and the sender answers for it when it does. A
-/// notification is never forwarded, so it is not held; its sender answers
-/// for it when the verdict comes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A handler whose checks of the message finish only after it returns says
+/// [`Self::Defer`], naming every check the message's validity rests on, and
+/// each check settles its part through [`Network::settle`]. A transport that
+/// forwards only what it has judged holds the message until then, so a host
+/// never forwards a message whose check could still fail, and the sender
+/// answers for it when it does. A notification is never forwarded, so it is
+/// not held; its sender answers for it when the verdict comes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Nothing here holds the message against its sender. A gossip
     /// message is valid and travels on; a notification was taken in, its
@@ -99,9 +99,55 @@ pub enum Verdict {
     /// sender's fault; a host that is behind refuses honest messages this
     /// way.
     Ignore,
-    /// The message is being checked, and the check settles the verdict
-    /// on the item `key` names through [`Network::settle`].
-    Defer(VerdictKey),
+    /// The message is being checked, and the checks it names settle the
+    /// verdict through [`Network::settle`].
+    Defer(Deferral),
+}
+
+impl Verdict {
+    /// Defer to the check that settles the item `key` names.
+    #[must_use]
+    pub fn defer(key: VerdictKey) -> Self {
+        Self::Defer(Deferral(vec![key]))
+    }
+
+    /// Defer to every check that settles one of the items `keys` names.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `keys` is empty: a message that waits on no check has
+    /// a verdict already.
+    #[must_use]
+    pub fn defer_all(keys: impl IntoIterator<Item = VerdictKey>) -> Self {
+        let mut keys: Vec<VerdictKey> = keys.into_iter().collect();
+        keys.sort_unstable_by_key(|key| key.0);
+        keys.dedup();
+        assert!(!keys.is_empty(), "a deferred verdict waits on some check");
+        Self::Defer(Deferral(keys))
+    }
+}
+
+/// The checks a deferred verdict waits on. The message holds up when every
+/// one of them settles [`Verdict::Accept`], and is refused as soon as one
+/// settles anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferral(Vec<VerdictKey>);
+
+impl Deferral {
+    /// The items whose checks the verdict waits on, at least one.
+    #[must_use]
+    pub fn keys(&self) -> &[VerdictKey] {
+        &self.0
+    }
+
+    /// The checks both deferrals wait on.
+    #[must_use]
+    pub fn join(self, other: Self) -> Self {
+        let Verdict::Defer(joined) = Verdict::defer_all(self.0.into_iter().chain(other.0)) else {
+            unreachable!("deferring on two deferrals' checks defers");
+        };
+        joined
+    }
 }
 
 /// Names an item whose verdict waits on a check, so that the check,
@@ -334,11 +380,12 @@ pub trait Network: Send + Sync + 'static {
 
     // ── Deferred verdicts ──
 
-    /// Settle the verdict a handler deferred on the item `key`
-    /// names, once the check it waited on has finished: [`Verdict::Accept`]
-    /// when the item holds up, [`Verdict::Reject`] when it is false,
-    /// [`Verdict::Ignore`] when this host could not finish judging it.
-    /// A check runs on every copy, wherever it came from; settling an item
+    /// Settle the part of a deferred verdict the item `key` names, once the
+    /// check of that item has finished: [`Verdict::Accept`] when the item
+    /// holds up, [`Verdict::Reject`] when it is false, [`Verdict::Ignore`]
+    /// when this host could not finish judging it; a deferral here is taken
+    /// as [`Verdict::Ignore`]. A check runs on every copy, wherever it came
+    /// from, and may run before any handler defers on it; settling an item
     /// no handler deferred is harmless.
     ///
     /// Default is a no-op, for a backend that does not wait for deferred
@@ -386,6 +433,26 @@ pub trait Network: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deferral_names_each_check_once() {
+        let (a, b) = (VerdictKey::of(&1u8), VerdictKey::of(&2u8));
+        assert_eq!(Verdict::defer_all([a, b, a]), Verdict::defer_all([b, a]));
+        let Verdict::Defer(deferral) = Verdict::defer_all([a, b, a]) else {
+            panic!("a deferral");
+        };
+        assert_eq!(deferral.keys().len(), 2);
+        assert_eq!(
+            Verdict::Defer(deferral.join(Deferral(vec![a]))),
+            Verdict::defer_all([a, b])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "waits on some check")]
+    fn a_deferral_waits_on_some_check() {
+        let _ = Verdict::defer_all([]);
+    }
 
     // Verify that closures satisfy GossipHandler<M> via blanket impl.
     #[test]

@@ -56,7 +56,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_network::compression::{compress, decompress};
 use hyperscale_network::{
-    HandlerRegistry, RawGossipHandler, RawHostGossipHandler, Verdict, VerdictKey,
+    Deferral, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, Verdict, VerdictKey,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -75,7 +75,7 @@ use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
 use crate::cooldown::{Cooldown, Refusal, refused_work};
-use crate::deferred::Waiting;
+use crate::deferred::{Deferred, Waiting};
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
@@ -724,13 +724,13 @@ impl Fanout {
                     handler(payload, scope.shard()).unwrap_or(Verdict::Ignore)
                 }
             };
-            if let Verdict::Defer(key) = verdict {
+            if let Verdict::Defer(deferral) = verdict {
                 // The turn is held until the verdict comes.
                 let waits = Arc::clone(waiting.semaphore());
                 waiting.forget();
-                fanout.defer(key, DeferredItem { arrival, waits });
+                fanout.defer(&deferral, DeferredItem { arrival, waits });
             } else {
-                fanout.conclude(&arrival, verdict);
+                fanout.conclude(&arrival, &verdict);
             }
         });
     }
@@ -745,17 +745,16 @@ impl Fanout {
         )
     }
 
-    /// Charge `sender` for a notification of `bytes` once the check its
-    /// handler deferred to settles the verdict on the item `key` names.
-    /// Nothing is held, for a notification is never forwarded. The wait
-    /// takes one of the sender's turns at being waited on; a sender with
-    /// none free is charged at once, as for a notification this host could
-    /// not judge.
+    /// Charge `sender` for a notification of `bytes` once the checks its
+    /// handler deferred to settle. Nothing is held, for a notification is
+    /// never forwarded. The wait takes one of the sender's turns at being
+    /// waited on; a sender with none free is charged at once, as for a
+    /// notification this host could not judge.
     pub fn await_notification_verdict(
         self: &Arc<Self>,
         sender: Peer,
         class: MessageClass,
-        key: VerdictKey,
+        deferral: &Deferral,
         bytes: usize,
     ) {
         let arrival = Arrival {
@@ -766,48 +765,54 @@ impl Fanout {
         };
         let waits = self.deferring_turns(sender.principal);
         let Ok(turn) = Arc::clone(&waits).try_acquire_owned() else {
-            self.conclude(&arrival, Verdict::Ignore);
+            self.conclude(&arrival, &Verdict::Ignore);
             return;
         };
         turn.forget();
-        self.defer(key, DeferredItem { arrival, waits });
+        self.defer(deferral, DeferredItem { arrival, waits });
     }
 
-    /// Wait on the verdict deferred on the item `key` names, for at most
-    /// [`DEFER_TIMEOUT`].
-    fn defer(self: &Arc<Self>, key: VerdictKey, item: DeferredItem) {
-        let settled = self.waiting.lock().expect("waiting lock").defer(key, item);
-        if let Some((item, verdict)) = settled {
-            self.finish(&item, verdict);
-            return;
-        }
+    /// Wait on the checks `deferral` names, for at most [`DEFER_TIMEOUT`].
+    fn defer(self: &Arc<Self>, deferral: &Deferral, item: DeferredItem) {
+        let deferred = self
+            .waiting
+            .lock()
+            .expect("waiting lock")
+            .defer(deferral.keys(), item);
+        let id = match deferred {
+            Deferred::Waits(id) => id,
+            Deferred::Settled(item, verdict) => {
+                self.finish(&item, &verdict);
+                return;
+            }
+        };
         let fanout = Arc::downgrade(self);
         self.tokio_handle.spawn(async move {
             sleep(DEFER_TIMEOUT).await;
             if let Some(fanout) = fanout.upgrade() {
-                let expired = fanout.waiting.lock().expect("waiting lock").expire(key);
+                let expired = fanout.waiting.lock().expect("waiting lock").expire(id);
                 if let Some(item) = expired {
-                    fanout.finish(&item, Verdict::Ignore);
+                    fanout.finish(&item, &Verdict::Ignore);
                 }
             }
         });
     }
 
-    /// Settle the verdict deferred on the item `key` names.
+    /// Settle the part of a deferred verdict the item `key` names.
     pub fn settle(&self, key: VerdictKey, verdict: Verdict) {
-        let waited = self
+        let done = self
             .waiting
             .lock()
             .expect("waiting lock")
             .settle(key, verdict);
-        if let Some(item) = waited {
-            self.finish(&item, verdict);
+        for (item, verdict) in done {
+            self.finish(&item, &verdict);
         }
     }
 
     /// Act on the verdict an item waited for, as if it had come at once,
     /// and give its sender's turn back.
-    fn finish(&self, item: &DeferredItem, verdict: Verdict) {
+    fn finish(&self, item: &DeferredItem, verdict: &Verdict) {
         item.waits.add_permits(1);
         self.conclude(&item.arrival, verdict);
     }
@@ -817,7 +822,7 @@ impl Fanout {
     /// answer to the hosts it reaches for whatever the item turns out to
     /// be. Anything else is charged against its sender, a rejection as its
     /// fault.
-    fn conclude(&self, arrival: &Arrival, verdict: Verdict) {
+    fn conclude(&self, arrival: &Arrival, verdict: &Verdict) {
         match verdict {
             Verdict::Accept => {
                 record_network_message_received();
@@ -920,7 +925,7 @@ impl Fanout {
         let Some(held) = self.records.release(validator, Instant::now()) else {
             return;
         };
-        self.conclude(&held.arrival, self.check_address_record(&held.record));
+        self.conclude(&held.arrival, &self.check_address_record(&held.record));
     }
 
     /// Verify an address record and store it if it is the newest for its

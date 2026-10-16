@@ -33,11 +33,11 @@ use crate::shard::push_protocol_event;
 /// - `beacon.candidate` and `beacon.ratify_vote` route to the named
 ///   shard's consensus.
 ///
-/// Each defers its gossip verdict to the coordinator's signature check,
-/// whose action handler settles it, so the transport forwards a beacon
-/// item only once it holds up. An item the coordinator drops unchecked,
-/// one it holds already or cannot place, is never settled and so never
-/// forwarded from here.
+/// Each defers its gossip verdict to the coordinator's signature checks,
+/// whose action handlers settle them, so the transport forwards a beacon
+/// item only once it holds up. An item the coordinator drops unchecked
+/// because it cannot place it is never settled and so never forwarded from
+/// here; one it holds already was settled when it was first checked.
 pub fn register_beacon_gossip_handlers<N: Network>(
     network: &N,
     senders: &SharedShardSenders,
@@ -68,7 +68,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     block: gossip.block,
                 },
             );
-            Verdict::Defer(key)
+            Verdict::defer(key)
         },
     );
 
@@ -104,7 +104,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     candidate: gossip.candidate,
                 },
             );
-            Verdict::Defer(key)
+            Verdict::defer(key)
         },
     );
 
@@ -139,9 +139,14 @@ pub fn register_beacon_gossip_handlers<N: Network>(
             let Some(tx) = senders.get(&target_shard) else {
                 return Verdict::Ignore;
             };
-            // The message stands on its sender's own vote; the proof votes
-            // it carries are each judged as they would be alone.
-            let key = VerdictKey::of(gossip.vote());
+            // Every vote the message carries is judged as it would be
+            // alone, and the message travels on only once all of them hold.
+            // A proof vote this host pooled already is not checked again;
+            // the check that pooled it settled it.
+            let checks: Vec<VerdictKey> = std::iter::once(gossip.vote())
+                .chain(gossip.proof.iter().map(|vote| vote.as_unverified()))
+                .map(VerdictKey::of)
+                .collect();
             for vote in gossip.into_votes() {
                 push_protocol_event(
                     tx,
@@ -149,7 +154,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     ProtocolEvent::UnverifiedRatifyVoteReceived { vote },
                 );
             }
-            Verdict::Defer(key)
+            Verdict::defer_all(checks)
         },
     );
 

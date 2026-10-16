@@ -232,7 +232,7 @@ impl Network for Libp2pNetwork {
     /// Gossip is relayed as soon as its handler returns, so a settled
     /// verdict reaches only the registry's dedup.
     fn settle(&self, key: VerdictKey, verdict: Verdict) {
-        self.registry.settle(key, verdict);
+        self.registry.settle(key, &verdict);
     }
 
     fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {

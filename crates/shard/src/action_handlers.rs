@@ -18,7 +18,7 @@ use hyperscale_metrics::{
     record_hold_contentions, record_hold_inversions_proven, record_intake_capped,
     record_signature_verification_failure, record_signature_verification_latency,
 };
-use hyperscale_network::Network;
+use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
     MemberSections, ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage,
@@ -1048,6 +1048,16 @@ where
             if matches!(*result, Err(CertifiedHeaderVerifyError::Qc(_))) {
                 record_signature_verification_failure("remote_header_qc");
             }
+            // A gossiped copy of the header travels on only once its
+            // certificate holds; a false one is its sender's to answer for.
+            ctx.network.settle(
+                VerdictKey::of(&*certified_header),
+                if result.is_ok() {
+                    Verdict::Accept
+                } else {
+                    Verdict::Reject
+                },
+            );
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
