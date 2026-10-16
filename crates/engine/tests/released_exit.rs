@@ -3,10 +3,10 @@
 //!
 //! The lines are the ones [`member_lines`] names and the readings are
 //! proven against a store's committed roots, so the abort a released
-//! row's deadline licenses is held to the exit its sibling reads: the
+//! row that ran takes at once is held to the exit its sibling reads: the
 //! row and its verdict cell absent beside the committed marker.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_engine::tick_select::{CommittedSets, member_lines};
 use hyperscale_jmt::NibblePath;
@@ -26,6 +26,7 @@ fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
         &|_, _| Evidence::Live { terminating: false },
         false,
         &BTreeSet::new(),
+        &BTreeMap::new(),
     );
     assert!(missing.is_empty());
     lines

@@ -11,79 +11,14 @@
 //!   events, and the beacon facts are shard-specific — a no-op on
 //!   writes the executor already projected.
 
-use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
+use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    Address, BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
-    ExecutionMetadata, GlobalReceipt, GlobalReceiptHash, Hash, ShardId, ShardTrie, StateWrites,
-    TxHash, compute_merkle_root,
+    Address, BeaconWitnessEvent, ConsensusReceipt, Event, ExecutionMetadata, GlobalReceiptHash,
+    ShardId, ShardTrie, StateWrites, TxHash,
 };
 
 use crate::output::ExecutedTx;
-use crate::sharding::{filter_writes_for_shard, owned_by, writes_root};
-
-/// Domain tag separating a receipt's beacon-fact leaf from every other
-/// leaf preimage the codebase hashes.
-const RECEIPT_WITNESS_LEAF_TAG: &[u8] = b"hyperscale.receipt_witness_leaf.v1";
-
-/// The witness root for a [`GlobalReceipt`] over the beacon facts a
-/// receipt carries, in the order it carries them: one leaf per fact, the
-/// tag and the fact's canonical encoding. No facts commit to
-/// [`BeaconWitnessRoot::ZERO`].
-///
-/// A receipt's own commitment, and nothing a header states: a block's
-/// witness root is taken over the shard's whole window, under another
-/// leaf.
-///
-/// # Panics
-///
-/// If a fact does not encode, which a closed wire type always does.
-pub fn witness_root<'a>(
-    facts: impl IntoIterator<Item = &'a BeaconWitnessEvent>,
-) -> BeaconWitnessRoot {
-    let leaves: Vec<Hash> = facts
-        .into_iter()
-        .map(|fact| {
-            let bytes = hbor_to_vec(fact).expect("a beacon fact encodes");
-            Hash::from_parts(&[RECEIPT_WITNESS_LEAF_TAG, &bytes])
-        })
-        .collect();
-    BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves))
-}
-
-/// A receipt's hash, recomputed from what the receipt carries.
-///
-/// `projected` is whether the batch that produced the receipt hashed
-/// under this shard's own locality, which a batch with a member reaching
-/// beyond the shard does and which the receipt does not record. Its
-/// writes, events and beacon facts are then exactly what the three roots
-/// were taken over, so the answer is the hash a quorum signed for an
-/// honest receipt and some other hash for one altered since.
-///
-/// `None` for a success hashed under whole locality: its writes root can
-/// cover more than the slice the receipt holds. Every failure is the one
-/// canonical hash, whatever it ran under.
-#[must_use]
-pub fn receipt_hash_of(receipt: &ConsensusReceipt, projected: bool) -> Option<GlobalReceiptHash> {
-    let ConsensusReceipt::Succeeded {
-        writes,
-        beacon_witness_events,
-        events,
-        ..
-    } = receipt
-    else {
-        return Some(receipt.receipt_hash());
-    };
-    projected.then(|| {
-        let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();
-        GlobalReceipt::new(
-            true,
-            EventRoot::from_raw(compute_merkle_root(&event_hashes)),
-            witness_root(beacon_witness_events.iter()),
-            writes_root(writes),
-        )
-        .receipt_hash()
-    })
-}
+use crate::sharding::{filter_writes_for_shard, owned_by};
 
 /// Cached projection of an execution receipt.
 ///

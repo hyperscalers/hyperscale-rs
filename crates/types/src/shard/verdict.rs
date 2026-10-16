@@ -223,8 +223,9 @@ pub enum Decision {
     Refuse,
     /// Nothing yet.
     Wait,
-    /// Nothing this replica can say: no sibling keeps the row waiting,
-    /// and one is judged on something only this replica lacks.
+    /// Nothing this replica can say: a sibling is judged on something
+    /// only this replica lacks, and what it lacks could change the
+    /// decision.
     Lacking,
     /// A stated row is let go: no sibling refused, none can still be
     /// waited on, and one can never be read.
@@ -237,10 +238,11 @@ pub enum Decision {
 /// `values`, one per shard it awaits.
 ///
 /// A stated row accepts on any sibling's accept, which decides alone;
-/// failing that it is refused on any sibling's leaving, accepts on a yes
-/// from every sibling, waits while any sibling counts as nothing yet,
-/// is lacking while any is this replica's lack, and is let go otherwise,
-/// which leaves an unreadable sibling. A stated row given no value at
+/// failing that it is lacking while any sibling is this replica's lack,
+/// since what it lacks may be an accept, then it is refused on any
+/// sibling's leaving, accepts on a yes from every sibling, waits while
+/// any sibling counts as nothing yet, and is let go otherwise, which
+/// leaves an unreadable sibling. A stated row given no value at
 /// all waits: nobody has said yes. An accepted row ends once every
 /// sibling has accepted, left or become unreadable, waits while any says
 /// yes or counts as nothing yet, and is lacking otherwise.
@@ -250,10 +252,10 @@ pub fn decide(state: Hears, values: &[Value]) -> Decision {
     match state {
         Hears::Stated if values.is_empty() => Decision::Wait,
         Hears::Stated if any(Value::A) => Decision::Accept,
+        Hears::Stated if any(Value::N) => Decision::Lacking,
         Hears::Stated if any(Value::L) => Decision::Refuse,
         Hears::Stated if values.iter().all(|value| *value == Value::Y) => Decision::Accept,
         Hears::Stated if any(Value::W) => Decision::Wait,
-        Hears::Stated if any(Value::N) => Decision::Lacking,
         Hears::Stated => Decision::LetGo,
         Hears::Accepted if any(Value::Y) || any(Value::W) => Decision::Wait,
         Hears::Accepted if any(Value::N) => Decision::Lacking,
@@ -921,18 +923,13 @@ mod tests {
     }
 
     #[test]
-    fn a_stated_row_is_lacking_where_nothing_waits_and_a_sibling_is_unjudged() {
-        for rest in [Value::Y, Value::U] {
+    fn a_stated_row_is_lacking_where_no_sibling_accepted_and_one_is_unjudged() {
+        for rest in [Value::L, Value::Y, Value::W, Value::U] {
             assert_eq!(decide(Hears::Stated, &[rest, Value::N]), Decision::Lacking);
         }
-        assert_eq!(decide(Hears::Stated, &[Value::N, Value::W]), Decision::Wait);
         assert_eq!(
             decide(Hears::Stated, &[Value::N, Value::A]),
             Decision::Accept
-        );
-        assert_eq!(
-            decide(Hears::Stated, &[Value::N, Value::L]),
-            Decision::Refuse
         );
     }
 

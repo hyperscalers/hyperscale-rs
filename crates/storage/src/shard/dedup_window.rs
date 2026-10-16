@@ -159,7 +159,7 @@ impl DedupWindow {
     fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
         for finalization in block.certificates().iter() {
-            let deadline = finalization.local_ec().deadline();
+            let deadline = finalization.retained_until(anchor);
             self.finalizations
                 .push((finalization.receipt_hash(), deadline));
             // The names it *decided*, which is what the live index

@@ -134,7 +134,7 @@ impl ShardChainReader for RocksDbShardStorage {
         let ids: Vec<FinalizationHash> = finalizations.into_iter().collect();
         self.get_certificates_batch(&ids)
             .iter()
-            .map(|fw| fw.local_ec().clone())
+            .filter_map(|fw| fw.local_ec().cloned())
             .filter(|cert| asked.iter().any(|tx| cert.covers(tx)))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()

@@ -21,16 +21,17 @@ use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_CLAIMS_BYTES,
     MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_TOWARD_SHARD,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr,
-    ResourceAddr, Said, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
+    REATTESTATION_STEP, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
+    verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::faults::{await_halt_recovery, freeze_shard};
 use crate::straddler::{
-    isolate_crossing_intake, isolate_ec_intake, isolate_provision_intake, isolate_pushed_readings,
-    isolate_state_reads,
+    isolate_crossing_intake, isolate_crossing_intake_among, isolate_ec_intake,
+    isolate_provision_intake, isolate_pushed_readings, isolate_state_reads,
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::{
@@ -299,30 +300,28 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
 }
 
 /// Two venues that have each said yes to a route hear the other's yes by
-/// asking for it.
+/// asking for it, and accept on it.
 ///
-/// Each venue is cut off from the other's certificate, so each states
-/// its own yes and neither can settle; and from the other's pushed
-/// readings, so nothing tells it what the other's chain wrote. Each
-/// venue's row then stands stated, asks the other venue for the route's
-/// verdict cell, carries the reading it fetches in a block, and its fold
-/// records the yes on the row. The cuts lift and the route settles as it
-/// does on certificates, which is all a hearing may change: nothing.
+/// Each venue is cut off from the other's certificate, which decides
+/// nothing, and from the other's pushed readings, so nothing tells it
+/// what the other's chain wrote. Each venue's row stands stated, asks
+/// the other venue for the route's verdict cell, carries the reading it
+/// fetches in a block, and accepts on it: the route settles on both
+/// venues with every cut still standing.
 ///
 /// Requires disjoint committees, as the cuts are keyed on the hosts.
 ///
 /// # Panics
 ///
 /// Panics if either venue misses its budget standing up, if either cut
-/// of the certificates never fires, if either venue's row does not hear
-/// the other's yes while it stands stated, if the route does not accept
-/// once the cuts lift, or if either side of the pair is not conserved.
+/// never fires, if either venue does not accept the route while the cuts
+/// stand, or if either side of the pair is not conserved.
 pub fn stated_venues_hear_each_others_yes_by_asking<C: FaultableCluster>(c: &mut C) {
     stated_venues_hear_each_other(c, Road::Asked);
 }
 
 /// Two venues that have each said yes to a route hear the other's yes
-/// from the push of the block that wrote it.
+/// from the push of the block that wrote it, and accept on it.
 ///
 /// As [`stated_venues_hear_each_others_yes_by_asking`], with the other
 /// road cut: neither venue can read the other's state, so no ask of
@@ -380,26 +379,22 @@ fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
         ),
     );
 
-    let hears_yes = |c: &C, venue: ShardId, sibling: ShardId| {
-        c.heard(venue, route)
-            .iter()
-            .any(|heard| heard.shard == sibling && heard.said == Some(Said::Yes))
-            && c.member_rows(venue)
-                .is_some_and(|rows| matches!(rows.get(&route), Some(RowState::Stated { .. })))
+    let accepted = |c: &C, venue: ShardId| {
+        matches!(
+            c.chain_fate(venue, route).1,
+            Some((_, TransactionDecision::Accept))
+        )
     };
     assert!(
         c.run_until(epochs(8), |c| {
-            hears_yes(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD)
-                && hears_yes(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD)
+            accepted(c, FIRST_VENUE_SHARD) && accepted(c, SECOND_VENUE_SHARD)
         }),
-        "each venue's stated row must hear the other's yes: first heard {:?} at {:?}, \
-         second heard {:?} at {:?}",
+        "each venue must accept the route on the other's yes while the cuts stand: first \
+         {:?} heard {:?}, second {:?} heard {:?}",
+        c.chain_fate(FIRST_VENUE_SHARD, route),
         c.heard(FIRST_VENUE_SHARD, route),
-        c.member_rows(FIRST_VENUE_SHARD)
-            .and_then(|rows| rows.get(&route).copied()),
+        c.chain_fate(SECOND_VENUE_SHARD, route),
         c.heard(SECOND_VENUE_SHARD, route),
-        c.member_rows(SECOND_VENUE_SHARD)
-            .and_then(|rows| rows.get(&route).copied()),
     );
     assert!(
         certificates.iter().all(|handle| handle.fired() > 0),
@@ -410,18 +405,13 @@ fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
         "each venue must actually have been cut off from the other road",
     );
     c.clear_drops();
-
-    assert!(
-        c.run_until(epochs(8), |c| c
-            .tx_status(route)
-            .is_some_and(|status| status.is_final())),
-        "the route must settle once the cuts lift: {:?}",
-        c.tx_status(route),
-    );
+    c.run_until(epochs(8), |c| {
+        c.tx_status(route).is_some_and(|status| status.is_final())
+    });
     assert_eq!(
         c.tx_status(route),
         Some(TransactionStatus::Completed(TransactionDecision::Accept)),
-        "what the rows heard changes nothing: the certificates accept the route",
+        "the route accepts on what the rows heard",
     );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "heard routes");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "heard routes");
@@ -734,29 +724,29 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
     units.assert_settles_within(c, &Charges::default(), epochs(8), "a ring of holds");
 }
 
-/// One route with the certificate channel cut across the trader's
-/// deadline, and the trader's paid leg not reclaimed at it.
+/// One route with the venues cut off from each other across the
+/// trader's deadline, and the trader's paid leg not reclaimed at it.
 ///
-/// Neither venue can hear the other, pushes and pulls alike, so the
-/// two-shard core commits the route and cannot settle it while the cut
+/// Neither venue can read the other's state or hold its certificate,
+/// pushes and pulls alike, so the two-shard core commits the route,
+/// each venue states its yes, and neither can accept while the cut
 /// stands. The trader's leg meanwhile pays its input and reaches its
 /// deadline with the core silent. Its crossing goes back only on the
-/// core's `Never`, and a core that committed writes none: past the
-/// deadline each venue asks its sibling's committed cell, reads it
-/// present, and so is neither covered nor abandoned. The leg stays
-/// paid. The cut lifts inside the delivery window, the core settles,
-/// and the route accepts: paid once, delivered once.
+/// core's `Never`, and a core that stated writes none: a stated row
+/// leaves only on what it hears, so the deadline ends neither venue's
+/// row. The leg stays paid. The cut lifts inside the delivery window,
+/// each venue reads the other's yes, and the route accepts: paid once,
+/// delivered once.
 ///
-/// One route rather than the usual four: the core's tick for the first
-/// holds the venues' reserves as provisional claims until its
-/// counterpart's certificate arrives, so a second route could not
-/// compose while the cut stood and would be abandoned at the deadline
+/// One route rather than the usual four: the core's row for the first
+/// holds the venues' reserves until it accepts, so a second route could
+/// not compose while the cut stood and would be aborted at the deadline
 /// instead, a refusal whose `Never` rightly returns the leg's crossing,
 /// and not the boundary this pins.
 ///
 /// Requires disjoint committees — a host serving both venues, or a venue
-/// and the trader, would carry certificates in-process past the cut or
-/// be cut off from its own shard by it.
+/// and the trader, would carry readings in-process past the cut or be
+/// cut off from its own shard by it.
 ///
 /// # Panics
 ///
@@ -770,11 +760,14 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
     let (key, trader) = &traders[0];
-    // Neither venue can obtain the other's certificate by any path, push
-    // or pull; the trader's shard is untouched, and its leg awaits nobody.
+    // Neither venue can read the other's verdict or obtain its
+    // certificate by any path, push or pull; the trader's shard is
+    // untouched, and its leg awaits nobody.
     let cut = [
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+        isolate_crossing_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_crossing_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
     let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
 
@@ -800,13 +793,12 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
-    // Past the deadline, and held there until a venue has asked its
-    // sibling's committed cell: the reading is `Present`, the sibling's
-    // block on its chain and its member still pending, and that answers
-    // nothing, so the core is not abandoned and writes no `Never`. Read
-    // off the question rather than off a settling delay, so the scenario
-    // fails where the evidence is instead of wherever a timer happened
-    // to land.
+    // Past the deadline, and held there until each venue's chain has
+    // committed blocks anchored past it with the route's row still
+    // stated: the deadline is no exit of a row that said yes, so the
+    // core is not aborted and writes no `Never`. Read off the rows
+    // rather than off a settling delay, so the scenario fails where the
+    // evidence is instead of wherever a timer happened to land.
     let validity_end = validity.end_timestamp_exclusive;
     let deadline = Deadline::of(validity_end).at();
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
@@ -814,22 +806,16 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         c.run_until(epochs(8), |c| clock(c) >= deadline),
         "the cut must stand past the transaction's deadline",
     );
-    let asked = c.metric("sibling_questions_pending", None);
     let reclaimed = c.metric("reclaims_folded", None);
-    assert!(
-        c.run_until(epochs(8), |c| c.metric("sibling_questions_pending", None)
-            > asked),
-        "a venue must ask its sibling past the deadline and read that the \
-         sibling's block is there",
-    );
+    assert_stated_past_the_deadline(c, hash);
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut",
+        "the channels between the venues must actually have been exercised and cut",
     );
     for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
         assert!(
             c.chain_fate(shard, hash).1.is_none(),
-            "the core must still be waiting on its certificates when the cut lifts, \
+            "the core must still be waiting on its sibling's verdict when the cut lifts, \
              or the leg below stays paid on the core's verdict rather than on its silence",
         );
     }
@@ -845,13 +831,13 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         "no return folds anywhere in the cluster while the core is pending",
     );
 
-    // Whole network from here: the certificates flow, the core settles,
+    // Whole network from here: the readings flow, the core settles,
     // and the trader banks the route's output.
     c.clear_drops();
     assert!(
         c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
             > paid),
-        "the core must settle once its certificates flow, and the route bank its output",
+        "the core must settle once its readings flow, and the route bank its output",
     );
     let status = c.tx_status(hash);
     assert!(
@@ -872,6 +858,41 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         &Charges::default(),
         epochs(8),
         "a route cut off across the deadline",
+    );
+}
+
+/// Run each venue's chain on past the transaction's deadline, which the
+/// cluster clock has passed, and assert `hash`'s row still stands stated
+/// on both.
+///
+/// # Panics
+///
+/// Panics if either venue commits no block anchored past the deadline
+/// within budget, or either row has left `Stated`.
+fn assert_stated_past_the_deadline<C: Cluster>(c: &mut C, hash: TxHash) {
+    let venues = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD];
+    let at_the_deadline = venues.map(|venue| c.committed_height(venue));
+    let stated = |c: &C, venue: ShardId| {
+        c.member_rows(venue)
+            .is_some_and(|rows| matches!(rows.get(&hash), Some(RowState::Stated { .. })))
+    };
+    // A block's anchor is its parent's certificate, so the second block
+    // committed past the deadline's instant is anchored past it.
+    assert!(
+        c.run_until(epochs(8), |c| venues
+            .iter()
+            .zip(at_the_deadline)
+            .all(|(venue, then)| c.committed_height(*venue)
+                > then.map(|then| BlockHeight::new(then.inner() + 2)))),
+        "each venue must commit blocks anchored past the deadline",
+    );
+    assert!(
+        venues.iter().all(|venue| stated(c, *venue)),
+        "each venue's row must stand stated past the deadline: first {:?}, second {:?}",
+        c.member_rows(FIRST_VENUE_SHARD)
+            .and_then(|rows| rows.get(&hash).copied()),
+        c.member_rows(SECOND_VENUE_SHARD)
+            .and_then(|rows| rows.get(&hash).copied()),
     );
 }
 
@@ -1149,8 +1170,8 @@ enum FeePayer {
 ///
 /// **The verdict is a presence, and only the consumer speaks it.** A
 /// claim's absence answers nothing at any anchor, and a core member held
-/// by a silent sibling has no answer to give: its certificate may be
-/// out, and the sibling may yet combine an accept with it. What the
+/// by a silent sibling has no answer to give: its yes stands in its
+/// state, and the sibling may yet accept on it. What the
 /// producer waits on is the member's own verdict, whenever it comes.
 ///
 /// Requires disjoint committees, as its neighbour does.
@@ -1187,9 +1208,11 @@ pub fn a_route_whose_held_core_keeps_its_sponsors_hold<C: FaultableCluster>(c: &
     route_held_by_a_silent_sibling(c, FeePayer::Sponsor);
 }
 
-/// Hold one route's core by cutting its siblings' certificates past the
-/// close of [`Window::Core`], then lift the cut and settle it, its fee
-/// paid by `payer`.
+/// Hold one route's core by cutting its siblings' certificates and
+/// readings of each other past the close of [`Window::Core`], then lift
+/// the cut and settle it, its fee paid by `payer`. The readings are cut
+/// among every host outside the trader shard's committee, since the
+/// venues' committees may gain members over a span this long.
 fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePayer) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
@@ -1199,6 +1222,7 @@ fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePaye
     let cut = [
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+        isolate_crossing_intake_among(c, &[TRADER_SHARD]),
     ];
     let (protocol_resource, units) =
         route_worlds(c, &first, &second, accounts(&traders).chain([sponsor.1]));
@@ -1235,7 +1259,7 @@ fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePaye
     hold_past_the_core_window(c, deadline);
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut",
+        "the channels between the venues must actually have been exercised and cut",
     );
     assert_nothing_spoke(c, hash, *trader, paid);
     fee.assert_while_held(c, payer);
@@ -1296,16 +1320,16 @@ fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePaye
 /// aborted on both venues past the recovery, and the trader's escrowed
 /// input is released.
 ///
-/// The core is held on both venues, their certificates cut, and stands
-/// on the first venue's shard through a halt and its committee redraw.
-/// The recovery's crossing block releases the row, and the recovered
-/// shard aborts it from its deadline: the row goes and the chain reads
-/// the route `Aborted`.
+/// The core is held on both venues, each cut off from the other's state
+/// and certificates, and stands stated on the first venue's shard
+/// through a halt and its committee redraw. The recovery's crossing
+/// block releases the row, and the recovered shard aborts it at once:
+/// the row goes and the chain reads the route `Aborted`.
 ///
-/// The abort is certified by the fresh committee, at an anchor past the
-/// recovery's bridge, so once the cut lifts the surviving venue's shard
-/// verifies it: its stated core ends `Aborted` as well. The trader's
-/// escrowed input is then answered, and both resources settle.
+/// Once the cut lifts the surviving venue's shard reads the recovered
+/// shard's exit, the row gone beside its committed marker, and refuses:
+/// its stated core ends `Aborted` as well. The trader's escrowed input
+/// is then answered, and both resources settle.
 ///
 /// # Panics
 ///
@@ -1330,6 +1354,8 @@ pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
     let cut = [
         isolate_ec_intake(c, halted, survivor),
         isolate_ec_intake(c, survivor, halted),
+        isolate_crossing_intake(c, halted, survivor),
+        isolate_crossing_intake(c, survivor, halted),
     ];
     let (protocol_resource, units) =
         route_worlds(c, &first, &second, accounts(&traders).chain([sponsor.1]));
@@ -1363,7 +1389,7 @@ pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
     let halt = freeze_shard(c, halted, survivor, |_| {});
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut",
+        "the channels between the venues must actually have been exercised and cut",
     );
     await_halt_recovery(c, &halt);
 
@@ -1383,7 +1409,7 @@ pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
     c.clear_drops();
     assert!(
         c.run_until(epochs(6), |c| aborted_on(c, survivor)),
-        "the survivor verifies the recovered shard's abort and ends its core by it: {:?} {:?}",
+        "the survivor reads the recovered shard's exit and ends its core by an abort: {:?} {:?}",
         row(c, survivor, hash),
         c.chain_fate(survivor, hash),
     );
@@ -2147,6 +2173,541 @@ pub enum Certificates {
     /// of its sibling it learns from a verdict reading. Requires the
     /// venue shards' committees on hosts of their own.
     CutWhileOffered,
+}
+
+/// Transfer pairs per loaded shard, each paying within its own shard and
+/// cycled one per shard per [`LOAD_PERIOD`].
+const LOAD_PAIRS: usize = 4;
+
+/// How often the steady load submits a transfer on each shard it covers.
+const LOAD_PERIOD: Duration = Duration::from_secs(2);
+
+/// Epochs a route held past a certificate's life gets to settle in once
+/// the venue waiting on it can read its sibling again: a verdict question
+/// asked again at the widest gap of its backoff, and the blocks that
+/// carry its reading, accept and end the row.
+const LATE_CERTIFICATE_SETTLE_EPOCHS: u32 = 8;
+
+/// Epochs the terminal records a grow leaves get to leave beacon state.
+const RESHAPE_EVIDENCE_EPOCHS: u32 = 16;
+
+/// The route cast, and transfer pairs local to each venue's shard for a
+/// steady load on both, ground last so every other account lands where
+/// [`route_genesis_accounts`] puts it.
+#[must_use]
+pub fn late_certificate_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut taken = Vec::new();
+    let mut accounts = route_accounts(&mut taken);
+    accounts.extend(VenueLoad::new(&mut taken).accounts());
+    accounts
+}
+
+type Pair = (Ed25519PrivateKey, PrincipalAddr, PrincipalAddr);
+
+/// Steady transfers local to each venue's shard, so both chains carry
+/// work of their own whatever a route between them is waiting on.
+struct VenueLoad {
+    pairs: Vec<Vec<Pair>>,
+    round: usize,
+    /// The last transfer submitted on each shard, in the order of `pairs`.
+    last: Vec<Option<TxHash>>,
+}
+
+impl VenueLoad {
+    const SHARDS: [ShardId; 2] = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD];
+
+    fn new(taken: &mut Vec<u8>) -> Self {
+        let pairs = Self::SHARDS
+            .iter()
+            .map(|&shard| {
+                (0..LOAD_PAIRS)
+                    .map(|_| {
+                        let (key, from) = grind_onto(shard, taken);
+                        let (_, to) = grind_onto(shard, taken);
+                        (key, from, to)
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            pairs,
+            round: 0,
+            last: vec![None; Self::SHARDS.len()],
+        }
+    }
+
+    fn accounts(&self) -> Vec<(PrincipalAddr, u128)> {
+        self.pairs
+            .iter()
+            .flatten()
+            .flat_map(|(_, from, to)| [(*from, SWAPPER_FUNDING), (*to, 10)])
+            .collect()
+    }
+
+    /// Submit one transfer on each shard.
+    fn submit<C: Cluster>(&mut self, c: &mut C) {
+        for (pairs, last) in self.pairs.iter().zip(&mut self.last) {
+            let (key, from, to) = &pairs[self.round % LOAD_PAIRS];
+            let tx = build_transfer_tx(key, *from, *to, 1, validity_around(c.now()));
+            *last = Some(tx.hash());
+            c.submit(Arc::new(tx));
+        }
+        self.round += 1;
+    }
+
+    /// Run under load until `cond` holds, for at most `span`. Whether it
+    /// came to hold.
+    fn run<C: Cluster>(&mut self, c: &mut C, span: Duration, cond: impl Fn(&C) -> bool) -> bool {
+        let deadline = c.now() + span;
+        loop {
+            if cond(c) {
+                return true;
+            }
+            if c.now() >= deadline {
+                return false;
+            }
+            self.submit(c);
+            let next = (c.now() + LOAD_PERIOD).min(deadline);
+            c.run_until(epochs(1), |c| c.now() >= next);
+        }
+    }
+
+    /// A transfer on `shard` submitted now, run under load to an outcome.
+    fn settles_on<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        shard: ShardId,
+        span: Duration,
+    ) -> Option<TransactionStatus> {
+        let index = Self::SHARDS
+            .iter()
+            .position(|&loaded| loaded == shard)
+            .expect("the load covers the shard");
+        self.submit(c);
+        let hash = self.last[index].expect("just submitted");
+        self.run(c, span, |c| {
+            c.tx_status(hash).is_some_and(|status| status.is_final())
+        });
+        c.tx_status(hash)
+    }
+}
+
+/// A route's core settles on both venues when each reads the other's
+/// verdict only after the anchor its certificate was signed at has
+/// lapsed.
+///
+/// Both venues state the member, and every road each venue's certificate
+/// and state have to the other is cut for three epochs and three
+/// [`REATTESTATION_STEP`]s, so the anchor each certificate was signed at
+/// is below every schedule floor when the cut lifts: the route is
+/// submitted only once the terminal records the grow left are gone, so
+/// nothing but the clock holds the floor. Both chains carry transfers of
+/// their own throughout. Each row stands stated through the cut, and
+/// once it lifts each must accept on the other's state, which no
+/// certificate's life bounds, end its row, and let its reserves price a
+/// swap again.
+///
+/// Requires disjoint committees, as its neighbours do.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if either
+/// venue's member is never stated, if the cut never fires, if either
+/// venue settles before the cut lifts, if a transfer local to either
+/// venue's shard reaches no outcome after it, if the venues reach no
+/// verdict or different ones, if a row of the route stands, or if a swap
+/// on the first venue's shard does not accept after it.
+pub fn a_route_settles_on_a_certificate_delivered_past_its_life<C: FaultableCluster>(c: &mut C) {
+    route_held_past_a_certificates_life(c);
+}
+
+/// The route's two venues: the swap that follows it runs on the first.
+const LATE_CERTIFICATE_VENUES: (ShardId, ShardId) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+
+/// Where `tx`'s row stands on `shard`, if it holds one.
+fn row_on<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> Option<RowState> {
+    c.member_rows(shard).and_then(|rows| rows.get(&tx).copied())
+}
+
+/// The verdict `shard`'s chain reached on `tx`, and where.
+fn verdict_on<C: Cluster>(
+    c: &C,
+    shard: ShardId,
+    tx: TxHash,
+) -> Option<(BlockHeight, TransactionDecision)> {
+    c.chain_fate(shard, tx).1
+}
+
+/// Whether beacon state holds no departed shard's boundary record.
+///
+/// A departed shard's record pins the schedule floor at its settled
+/// window for as long as it lingers, so no certificate signed since
+/// lapses however late it lands.
+fn no_reshape_evidence<C: Cluster>(c: &C) -> bool {
+    c.beacon_state().is_some_and(|state| {
+        state
+            .boundaries
+            .values()
+            .all(|boundary| boundary.terminal_epoch.is_none())
+            && state.live_settled_window_floors().is_empty()
+    })
+}
+
+fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C) {
+    let (waiting, sibling) = LATE_CERTIFICATE_VENUES;
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (caller_key, caller) = sponsor(&mut taken);
+    let mut load = VenueLoad::new(&mut taken);
+    let (key, trader) = &traders[0];
+    let epoch = c
+        .beacon_state()
+        .expect("beacon committed")
+        .chain_config
+        .epoch_duration();
+
+    for shard in VenueLoad::SHARDS {
+        let status = load.settles_on(c, shard, epoch * 8);
+        assert_eq!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+            "a transfer local to {shard:?} must accept while nothing is cut",
+        );
+    }
+    // The grow that seated these shards left two terminal records.
+    assert!(
+        load.run(c, epoch * RESHAPE_EVIDENCE_EPOCHS, no_reshape_evidence),
+        "the grow's terminal records must go before a certificate can lapse",
+    );
+
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = route.hash();
+    let hold = hold_past_a_certificates_life(c, &mut load, route, epoch);
+
+    c.clear_drops();
+    let budget = epoch * LATE_CERTIFICATE_SETTLE_EPOCHS;
+    let settled = load.run(c, budget, |c| {
+        verdict_on(c, waiting, hash).is_some() && verdict_on(c, sibling, hash).is_some()
+    });
+    for shard in VenueLoad::SHARDS {
+        let status = load.settles_on(c, shard, epoch * 4);
+        assert!(
+            matches!(status, Some(TransactionStatus::Completed(_))),
+            "a transfer local to {shard:?} must reach an outcome once the fault lifts; \
+             status = {status:?}",
+        );
+    }
+    assert!(
+        settled,
+        "the route must reach a verdict on both venues within {budget:?} of the fault \
+         lifting (held {hold:?}): {waiting:?} verdict {:?} and row {:?}, \
+         {sibling:?} verdict {:?} and row {:?}, status {:?}",
+        verdict_on(c, waiting, hash),
+        row_on(c, waiting, hash),
+        verdict_on(c, sibling, hash),
+        row_on(c, sibling, hash),
+        c.tx_status(hash),
+    );
+    for venue in [waiting, sibling] {
+        assert_eq!(
+            verdict_on(c, venue, hash).map(|(_, decision)| decision),
+            Some(TransactionDecision::Accept),
+            "{venue:?} must accept the route both venues stated a yes for",
+        );
+    }
+    let ended = |c: &C| row_on(c, waiting, hash).is_none() && row_on(c, sibling, hash).is_none();
+    assert!(
+        load.run(c, epoch * 4, ended),
+        "an accepted member ends its row on both venues: {:?} {:?}",
+        row_on(c, waiting, hash),
+        row_on(c, sibling, hash),
+    );
+
+    // The reserves the held member claimed price a swap again.
+    let swap = build_swap_tx(
+        &caller_key,
+        caller,
+        &first.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let swap_hash = swap.hash();
+    c.submit(Arc::new(swap));
+    load.run(c, epoch * 8, |c| {
+        c.tx_status(swap_hash)
+            .is_some_and(|status| status.is_final())
+    });
+    assert_eq!(
+        c.tx_status(swap_hash),
+        Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+        "a swap on {waiting:?} must accept once the route let its reserves go; its row \
+         stands {:?}",
+        row_on(c, waiting, swap_hash),
+    );
+}
+
+/// Cut the venues off from each other's certificates and state, submit
+/// `route`, and hold both venues' members stated for three epochs and
+/// three [`REATTESTATION_STEP`]s under load. The span held, with the
+/// fault still standing.
+///
+/// The readings are cut among every host outside the trader shard's
+/// committee, both ways: each venue's committee gains members over a
+/// span this long, and a cut keyed on one committee's hosts would let a
+/// joiner through.
+///
+/// # Panics
+///
+/// Panics if either venue's member is never stated, if the fault never
+/// fires, if a reshape lands inside the span, or if either venue reaches
+/// a verdict while the fault stands.
+fn hold_past_a_certificates_life<C: FaultableCluster>(
+    c: &mut C,
+    load: &mut VenueLoad,
+    route: Transaction,
+    epoch: Duration,
+) -> Duration {
+    let (waiting, sibling) = LATE_CERTIFICATE_VENUES;
+    let fault = [
+        isolate_ec_intake(c, waiting, sibling),
+        isolate_ec_intake(c, sibling, waiting),
+        isolate_crossing_intake_among(c, &[TRADER_SHARD]),
+    ];
+    let held_from = c.now();
+    let hash = route.hash();
+    c.submit(Arc::new(route));
+
+    let stated =
+        |c: &C, venue: ShardId| matches!(row_on(c, venue, hash), Some(RowState::Stated { .. }));
+    assert!(
+        load.run(c, epoch * 8, |c| stated(c, waiting) && stated(c, sibling)),
+        "the route's core must stand stated on both venues; its rows stand {:?} and {:?}",
+        row_on(c, waiting, hash),
+        row_on(c, sibling, hash),
+    );
+
+    let hold = epoch * 3 + REATTESTATION_STEP * 3;
+    let remaining = (held_from + hold).saturating_sub(c.now());
+    let decided =
+        |c: &C| verdict_on(c, waiting, hash).is_some() || verdict_on(c, sibling, hash).is_some();
+    load.run(c, remaining, decided);
+    assert!(
+        fault.iter().all(|handle| handle.fired() > 0),
+        "the fault must actually have dropped certificates and readings",
+    );
+    assert!(
+        no_reshape_evidence(c),
+        "a reshape during the hold pins the schedule floor under the certificate",
+    );
+    assert!(
+        !decided(c),
+        "neither venue may settle while it cannot read the other: {:?} {:?}",
+        verdict_on(c, waiting, hash),
+        verdict_on(c, sibling, hash),
+    );
+    hold
+}
+
+/// Epochs a recovered venue gets to end the row its recovery released,
+/// and its sibling the accepted row it holds beside it, once every
+/// channel is open again.
+const RECOVERED_ROW_EPOCHS: u32 = 6;
+
+/// Whether `shard`'s chain accepted `tx`.
+fn accepted_on<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
+    matches!(
+        c.chain_fate(shard, tx).1,
+        Some((_, TransactionDecision::Accept))
+    )
+}
+
+/// Whether a verdict leaf of `tx` stands on `shard`.
+fn leaf_stands<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
+    let leaf = verdict_leaf(shard, tx);
+    c.substate(shard, leaf.owner, leaf.local.0).is_some()
+}
+
+/// The height of the last boundary the beacon attests for `shard`.
+fn attested_boundary<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
+    c.beacon_state()
+        .and_then(|state| state.boundaries.get(&shard).map(|boundary| boundary.height))
+}
+
+/// A route both venues accepted and ended before one of them halts stays
+/// settled on both past the recovery.
+///
+/// Nothing is cut. Each venue reads the other's yes, accepts and ends
+/// its row, and the beacon attests a boundary of the first venue's shard
+/// past the block that ended it, so the recovery's frontier keeps it.
+/// The shard then halts and a fresh committee resumes it: a recovery
+/// discards tick rows, and the route stands in none, so neither venue's
+/// verdict moves and no row or leaf of the route comes back.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the route
+/// does not accept and end on both venues before the halt, if the halt
+/// or its recovery misses a budget, if either venue's verdict is
+/// anything but an accept after it, if a row or leaf of the route
+/// stands, or if either resource does not settle.
+pub fn a_route_a_halting_venue_could_read_is_settled_before_the_halt<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (halted, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let venues = [halted, survivor];
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
+    let mut charges = Charges::default();
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = charges.submit(c, route);
+    let settled_on =
+        |c: &C, venue: ShardId| accepted_on(c, venue, hash) && row_on(c, venue, hash).is_none();
+    assert!(
+        c.run_until(epochs(8), |c| venues
+            .iter()
+            .all(|venue| settled_on(c, *venue))),
+        "both venues must accept the route and end its rows before the halt: {:?}",
+        venues.map(|venue| (c.chain_fate(venue, hash).1, row_on(c, venue, hash))),
+    );
+    let ended = c.committed_height(halted);
+    assert!(
+        c.run_until(epochs(4), |c| attested_boundary(c, halted) >= ended),
+        "the beacon must attest a boundary of {halted:?} past the route's end at {ended:?}; it \
+         attests {:?}",
+        attested_boundary(c, halted),
+    );
+
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    await_halt_recovery(c, &halt);
+    for venue in venues {
+        assert!(
+            settled_on(c, venue) && !leaf_stands(c, venue, hash),
+            "{venue:?} keeps the route accepted past the recovery, with no row or leaf of it: \
+             {:?} {:?}",
+            c.chain_fate(venue, hash).1,
+            row_on(c, venue, hash),
+        );
+    }
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a route settled before its venue's halt",
+    );
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a route settled before its venue's halt",
+    );
+}
+
+/// A route one venue accepted while its sibling could not read it is
+/// aborted by the sibling's recovery, and the accepted row ends on that
+/// abort.
+///
+/// The tear a recovery leaves is an outcome both chains record.
+///
+/// The first venue is cut off from the second's certificate and state,
+/// so it states its yes and stands, while the second reads that yes and
+/// accepts. The first venue's shard then halts and a fresh committee
+/// resumes it: the recovery releases the stated row, and the recovered
+/// shard aborts it at once. The cuts lift, the second venue reads the
+/// first's exit, the row gone beside its committed marker, and ends its
+/// accepted row. The route is torn, the residual a recovery carries: the
+/// second venue applied and the first did not. Nothing of it stands on
+/// either venue.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the second
+/// venue does not accept while the first stands stated, if the cut
+/// never fires, if the halt or its recovery misses a budget, if the
+/// recovered venue does not end its row by an abort, if the second
+/// venue's accepted row does not end, or if a leaf of the route stands.
+pub fn a_recovered_venue_aborts_what_its_sibling_accepted<C: FaultableCluster>(c: &mut C) {
+    let (halted, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, trader) = &traders[0];
+    let cut = [
+        isolate_ec_intake(c, halted, survivor),
+        isolate_crossing_intake(c, halted, survivor),
+    ];
+    let mut charges = Charges::default();
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let hash = charges.submit(c, route);
+    assert!(
+        c.run_until(epochs(8), |c| accepted_on(c, survivor, hash)
+            && matches!(row_on(c, halted, hash), Some(RowState::Stated { .. }))),
+        "{survivor:?} must accept the route while {halted:?} stands stated: {:?} {:?}",
+        c.chain_fate(survivor, hash).1,
+        row_on(c, halted, hash),
+    );
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "the halting venue must actually have been cut off from its sibling",
+    );
+
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    await_halt_recovery(c, &halt);
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(RECOVERED_ROW_EPOCHS), |c| row_on(c, halted, hash)
+            .is_none()
+            && matches!(
+                c.chain_fate(halted, hash).1,
+                Some((_, TransactionDecision::Aborted))
+            )),
+        "the recovered venue ends the route's row by an abort: {:?} {:?}",
+        row_on(c, halted, hash),
+        c.chain_fate(halted, hash).1,
+    );
+    assert!(
+        c.run_until(epochs(RECOVERED_ROW_EPOCHS), |c| row_on(c, survivor, hash)
+            .is_none()),
+        "{survivor:?}'s accepted row ends on reading the abort: {:?}, heard {:?}",
+        row_on(c, survivor, hash),
+        c.heard(survivor, hash),
+    );
+    assert!(
+        accepted_on(c, survivor, hash)
+            && [halted, survivor]
+                .iter()
+                .all(|venue| !leaf_stands(c, *venue, hash)),
+        "the survivor's accept stands, and no leaf of the route does",
+    );
 }
 
 /// What each trader of a load is funded with: every route it has in

@@ -145,8 +145,8 @@ impl BlockRowKeys {
             if attestation.tick_id().shard_id() == local_shard {
                 keys.tx_finalizations.extend(
                     attestation
-                        .settled_outcomes()
-                        .map(|outcome| (outcome.tx_hash(), *id)),
+                        .indexed_tx_hashes()
+                        .map(|tx_hash| (tx_hash, *id)),
                 );
             }
         }

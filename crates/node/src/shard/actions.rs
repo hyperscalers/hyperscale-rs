@@ -972,11 +972,10 @@ mod tests {
     use hyperscale_types::network::request::GetFinalizationsRequest;
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        Address, AddressClass, AggregateSignature, BlockHash, BlockHeight, CheckOutcome,
-        ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, Role, SWEEP_BUCKET_MS, SettledWrites, SignerBitfield, SubstateKey,
-        SweepBucket, SweepFrontier, TickHalf, TickId, TxHash, TxOutcome, Verifiable,
-        VerificationKind, WeightedTimestamp, shard_prefix_path,
+        Address, AddressClass, BlockHash, BlockHeight, CheckOutcome, ConsensusReceipt,
+        Finalization, FrontierInputs, GlobalReceiptHash, Hash, SWEEP_BUCKET_MS, SettledWrites,
+        StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, TickId, TxHash,
+        Verifiable, VerificationKind, WeightedTimestamp, shard_prefix_path,
     };
 
     use crate::event::{HostEvent, ShardScopedInput};
@@ -995,31 +994,24 @@ mod tests {
         host.seat_vnode(SHARD, fix.seat(1));
 
         let tick_id = TickId::new(SHARD, BlockHeight::new(1));
-        let legs: Vec<TxOutcome> = [b"first leg", b"other leg"]
+        let legs: Vec<StoredReceipt> = [b"first leg", b"other leg"]
             .into_iter()
             .map(|seed| {
-                TxOutcome::new(
+                StoredReceipt::new(
                     TxHash::from(Hash::from_bytes(seed)),
-                    ExecutionOutcome::Succeeded {
+                    Arc::new(ConsensusReceipt::Succeeded {
                         receipt_hash: GlobalReceiptHash::ZERO,
-                    },
+                        writes: StateWrites::default(),
+                        beacon_witness_events: Capped::empty(),
+                        events: Capped::empty(),
+                    }),
                 )
-                .as_role(Role::Core)
             })
             .collect();
-        let first_leg = legs[0].tx_hash();
-        let every_leg = Finalization::new(
+        let first_leg = legs[0].tx_hash;
+        let every_leg = Finalization::accepting(
             tick_id,
-            TickHalf::Legs,
-            &Capped::from_array([Arc::new(ExecutionCertificate::new(
-                tick_id,
-                WeightedTimestamp::from_millis(1),
-                GlobalReceiptRoot::ZERO,
-                Capped::new(legs).expect("a list written out in a test"),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ))]),
-            Capped::empty(),
+            Capped::new(legs).expect("a list written out in a test"),
         );
         let replaced = every_leg.clone().naming(&HashSet::from([first_leg]));
         assert_ne!(replaced.receipt_hash(), every_leg.receipt_hash());

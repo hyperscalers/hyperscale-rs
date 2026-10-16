@@ -12,8 +12,8 @@ use hyperscale_core::ProvisionsRequest;
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     ConsensusPublicKey, ConsensusReceipt, DeclaredKey, DeclaredRange, ExecutionCertificate,
-    Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, TxOutcome, ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
+    Finalization, ShardId, ShardTrie, SubstateKey, TickHalf, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{CrossingCell, CrossingLeaf};
 use hyperscale_vm_types::ProtocolHasher;
@@ -219,8 +219,9 @@ pub fn provision_request(
 /// [`Finalization::settling_receipts`], never the raw receipt list or
 /// the node's execution cache, and keeps a cell write only when the
 /// value is present, `CrossingLeaf::read` reads it as a record naming
-/// the receipt's own transaction, and the local certificate's outcome
-/// for that transaction is the transaction's own execution. A retired
+/// the receipt's own transaction, and the transaction's own execution
+/// settles it: the local certificate's outcome for it executes, or a
+/// legs half, which carries no certificate, accepts it. A retired
 /// rewrite reads as a tombstone, and a deletion, a settling member's
 /// write and a write under another transaction's name are not record
 /// writes of an executing member, so none of them is named. Read off
@@ -228,19 +229,23 @@ pub fn provision_request(
 /// no transaction bodies derives the same list.
 #[must_use]
 pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey, CrossingCell)> {
-    let Some(local) = finalization
-        .execution_certificates()
-        .iter()
-        .find(|ec| ec.tick_id() == finalization.tick_id())
-    else {
-        return Vec::new();
+    let executing: BTreeSet<TxHash> = if finalization.half() == TickHalf::Legs {
+        finalization.accepted_names()
+    } else {
+        let Some(local) = finalization
+            .execution_certificates()
+            .iter()
+            .find(|ec| ec.tick_id() == finalization.tick_id())
+        else {
+            return Vec::new();
+        };
+        local
+            .tx_outcomes()
+            .iter()
+            .filter(|outcome| outcome.executes())
+            .map(TxOutcome::tx_hash)
+            .collect()
     };
-    let executing: BTreeSet<TxHash> = local
-        .tx_outcomes()
-        .iter()
-        .filter(|outcome| outcome.executes())
-        .map(TxOutcome::tx_hash)
-        .collect();
     let mut written = Vec::new();
     for receipt in finalization.settling_receipts() {
         if !executing.contains(&receipt.tx_hash) {
@@ -452,7 +457,7 @@ mod tests {
     ) -> Finalization {
         Finalization::new(
             TickId::new(local, BlockHeight::new(3)),
-            TickHalf::Legs,
+            TickHalf::Determined,
             &Capped::new(certificates).expect("a list written out in a test"),
             Capped::from_array([]),
         )
@@ -510,49 +515,24 @@ mod tests {
         let _ = deleted;
     }
 
-    /// A member refused by a counterpart certificate and one left
-    /// uncovered both carry succeeded writes with a record, and neither
-    /// is named.
+    /// A legs half carries no certificate, and the records its accepted
+    /// members write are issued all the same: each name is a core
+    /// member's own run, accepted.
     #[test]
-    fn records_written_skips_what_the_certificates_do_not_settle() {
+    fn records_written_names_what_a_legs_half_accepts() {
         let local = ShardId::leaf(1, 0);
-        let remote = ShardId::leaf(1, 1);
-        let tick = TickId::new(local, BlockHeight::new(3));
-        let (refused, refused_key) = crossing(6, 0x16, 0x26);
-        let (uncovered, uncovered_key) = crossing(7, 0x17, 0x27);
+        let (issued, issued_key) = crossing(1, 0x11, 0x21);
         let resource = ResourceAddr::new([0xE1; 31]);
-        let live = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
-
-        let finalization = finalization(
-            local,
-            vec![
-                certificate(
-                    tick,
-                    vec![
-                        TxOutcome::new(tx(0xC1), SUCCEEDED.clone()).awaiting([remote]),
-                        TxOutcome::new(tx(0xC2), SUCCEEDED.clone()).awaiting([remote]),
-                    ],
-                ),
-                certificate(
-                    TickId::new(remote, BlockHeight::new(5)),
-                    vec![TxOutcome::new(tx(0xC1), ExecutionOutcome::Failed)],
-                ),
-            ],
-            vec![
-                receipt(
-                    tx(0xC1),
-                    vec![(refused_key, Some(live(refused, tx(0xC1)).to_bytes()))],
-                ),
-                receipt(
-                    tx(0xC2),
-                    vec![(uncovered_key, Some(live(uncovered, tx(0xC2)).to_bytes()))],
-                ),
-            ],
+        let cell = issued.cell(tx(0xA1), resource, 7, 9_000, Terms::Owed);
+        let legs = Finalization::accepting(
+            TickId::new(local, BlockHeight::new(3)),
+            Capped::new(vec![receipt(
+                tx(0xA1),
+                vec![(issued_key, Some(cell.to_bytes()))],
+            )])
+            .expect("a list written out in a test"),
         );
-        assert!(
-            records_written(&finalization).is_empty(),
-            "the refused member and the uncovered one issue nothing"
-        );
+        assert_eq!(records_written(&legs), vec![(tx(0xA1), issued_key, cell)]);
     }
 
     /// Each record goes to the shard owning its consumer in the given

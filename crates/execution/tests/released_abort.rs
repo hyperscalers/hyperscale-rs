@@ -1,19 +1,17 @@
 //! A member a halt recovery released is ended by an abort of its own.
 //!
 //! A recovery discards a tick whole, and with it a member a counterpart
-//! shares the verdict on: no fresh quorum holds the certificate its legs
-//! half would carry, so no half settles it. Past its deadline a block
-//! names it `Aborted` off its row, and the tick that seats the
-//! line settles it on this shard's certificate alone: its stating half
-//! carries no counterpart's certificate, puts no claim to a
-//! counterpart's settled set, burns the charge the line states and lands
-//! none of the effects the member's run produced. The abort ends the row
-//! on this shard, and a counterpart that has not settled reads it off the
-//! fresh committee's certificate.
+//! shares the verdict on: its stated yes goes with its row, so no half
+//! settles it. The next block names it `Aborted` off its row, and the
+//! tick that seats the line settles it on this shard's certificate
+//! alone: its stating half carries no counterpart's certificate, burns
+//! the charge the line states and lands none of the effects the member's
+//! run produced. The abort ends the row on this shard, and a counterpart
+//! reads its exit off this shard's state.
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use common::sim::{ExecutionSim, LEFT, Schedule, amount, cell_of, counter};
@@ -92,15 +90,16 @@ fn lines_at(sim: &ExecutionSim, anchor: WeightedTimestamp) -> Vec<TickLine> {
         &|_, _| Evidence::Live { terminating: false },
         false,
         &BTreeSet::new(),
+        &BTreeMap::new(),
     );
     assert!(missing.is_empty());
     lines
 }
 
-/// The abort line the rows of a replica that ran `tx` name for it at its
-/// deadline, and at no anchor short of it: the row stands released, a
-/// counterpart sharing its verdict, having run and under no record.
-fn abort_named_at_the_deadline(sim: &ExecutionSim, tx: &Transaction) -> Vec<TickLine> {
+/// The abort line the rows of a replica that ran `tx` name for it at
+/// once, short of its deadline: the row stands released, a counterpart
+/// sharing its verdict, having run and under no record.
+fn abort_named_at_once(sim: &ExecutionSim, tx: &Transaction) -> Vec<TickLine> {
     let row = &sim.member_rows().members[&tx.hash()];
     assert_eq!(
         (row.state, row.executed, row.covered),
@@ -113,20 +112,15 @@ fn abort_named_at_the_deadline(sim: &ExecutionSim, tx: &Transaction) -> Vec<Tick
         ),
     );
     let deadline = Deadline::of_transaction(tx);
-    assert_eq!(
-        lines_at(sim, deadline.at().minus(Duration::from_millis(1))),
-        vec![],
-        "the row stands short of its deadline",
-    );
-    let lines = lines_at(sim, deadline.at());
+    let lines = lines_at(sim, deadline.at().minus(Duration::from_millis(1)));
     assert_eq!(lines, vec![aborting(tx)]);
     lines
 }
 
 /// A member that ran, whose certificate formed, and whose tick a
-/// recovery then discarded is named for an abort by the block anchored
-/// at its deadline, and the tick seating that line settles it with no
-/// certificate of its sibling's.
+/// recovery then discarded is named for an abort by the next block, and
+/// the tick seating that line settles it with no certificate of its
+/// sibling's.
 #[test]
 fn a_released_shared_member_settles_the_abort_its_row_names_with_no_counterpart_certificate() {
     let tx = crossing();
@@ -138,7 +132,7 @@ fn a_released_shared_member_settles_the_abort_its_row_names_with_no_counterpart_
     let mut sim = released_after_running(&tx);
     assert_eq!(amount(sim.settled(vault)), FUNDED);
 
-    sim.commit_naming(abort_named_at_the_deadline(&sim, &tx));
+    sim.commit_naming(abort_named_at_once(&sim, &tx));
     let seated_in = sim.tick_of(hash).expect("the line seats the abort");
     let offered = sim.certify_votable();
     let [half] = &offered[..] else {
@@ -159,11 +153,6 @@ fn a_released_shared_member_settles_the_abort_its_row_names_with_no_counterpart_
         outcome.counterparts(),
         &[SIBLING],
         "the outcome names the sibling the member reaches",
-    );
-    assert_eq!(
-        half.claims(LEFT, |_| false),
-        vec![],
-        "it asks nothing of the sibling's settled set",
     );
 
     sim.commit(Vec::new(), offered);
@@ -210,7 +199,7 @@ fn a_replica_holding_only_the_line_settles_the_abort_its_peers_settle() {
     };
 
     let retained = released_after_running(&tx);
-    let lines = abort_named_at_the_deadline(&retained, &tx);
+    let lines = abort_named_at_once(&retained, &tx);
     let mut fresh = ExecutionSim::with_shards(Schedule::Eager, 2, LEFT);
     fresh.fund(vault, FUNDED);
     fresh.commit(Vec::new(), Vec::new());

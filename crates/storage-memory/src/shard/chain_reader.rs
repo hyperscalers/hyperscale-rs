@@ -131,7 +131,7 @@ impl ShardChainReader for SimShardStorage {
         finalizations
             .iter()
             .filter_map(|id| c.attestation(id))
-            .map(|fw| fw.local_ec().clone())
+            .filter_map(|fw| fw.local_ec().cloned())
             .filter(|cert| asked.iter().any(|tx| cert.covers(tx)))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()

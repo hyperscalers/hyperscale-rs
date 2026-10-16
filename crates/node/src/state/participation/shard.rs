@@ -416,7 +416,8 @@ impl ShardParticipation {
     /// What reads the tip after its folds, run once per event however
     /// many blocks the event folded: the vote scan, the seat
     /// questions the tip's member rows put to counterparts, the verdict
-    /// questions its hearing rows put to their siblings, and the proposal
+    /// questions its hearing rows put to their siblings, the stated rows
+    /// that accept, which the legs halves offered name, and the proposal
     /// latch.
     ///
     /// Each reads current state, so after a replay that a live commit
@@ -431,6 +432,8 @@ impl ShardParticipation {
         );
         let verdicts = self.shard_coordinator.verdict_questions(sched);
         actions.extend(self.execution_coordinator.ask_verdicts(&verdicts, sched));
+        let accepting = self.shard_coordinator.accepting(sched);
+        actions.extend(self.execution_coordinator.offer_accepting(accepting));
         self.shard_coordinator.queue_ready_proposal();
         actions
     }

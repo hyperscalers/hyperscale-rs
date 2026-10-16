@@ -86,8 +86,7 @@ pub use execution::execution_certificate::{
 };
 pub use execution::finalization::{
     Finalization, FinalizationContext, FinalizationVerifyError,
-    MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, TickHalf,
-    refused_transactions, settles,
+    MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, TickHalf, settles,
 };
 pub use execution::outcome::{ExecutionOutcome, Role, TxOutcome};
 pub use execution::receipt_tree::{
@@ -148,6 +147,7 @@ pub use receipt::event::{
 };
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
+pub use receipt::recompute::{receipt_hash_of, witness_root, writes_root};
 pub use receipt::stored::StoredReceipt;
 pub use shard::abandonment::{
     AbandonmentRecord, AbortCharge, CommitWindow, CommittedAt, Resolutions, UnsettledTx,
@@ -268,8 +268,7 @@ pub use topology::schedule::{
     TopologySchedule, Unpublished, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
-    Evidence, SettledSetVerdict, SettledTxSet, TerminalEvidence, TerminalLines, TxClaim,
-    UnboundLines, partner_evidence, settled_set_verdict,
+    Evidence, SettledTxSet, TerminalEvidence, TerminalLines, UnboundLines, partner_evidence,
 };
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};

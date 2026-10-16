@@ -89,6 +89,60 @@ pub fn isolate_crossing_intake(
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
 
+/// Cut every crossing reading between `shard`'s committee and every host
+/// outside it and outside the committees of `open`, both ways: what
+/// [`isolate_crossing_intake`] cuts between two committees, held as well
+/// against a host that joins another committee after the cut, which a
+/// cut keyed on that committee's hosts would let through.
+///
+/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+#[must_use]
+pub fn isolate_crossing_intake_but_from(
+    c: &mut impl FaultableCluster,
+    shard: ShardId,
+    open: &[ShardId],
+) -> FaultHandle {
+    let shard_hosts = member_hosts(c, shard);
+    let kept: BTreeSet<usize> = open
+        .iter()
+        .flat_map(|open| member_hosts(c, *open))
+        .chain(shard_hosts.iter().copied())
+        .collect();
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !kept.contains(host))
+        .collect();
+    let handles = [
+        c.drop_type_between(&others, &shard_hosts, "crossing.readings"),
+        c.drop_type_between(&shard_hosts, &others, "state_proof.request"),
+        c.drop_type_between(&shard_hosts, &others, "crossing.readings"),
+        c.drop_type_between(&others, &shard_hosts, "state_proof.request"),
+    ];
+    FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
+}
+
+/// Cut every crossing reading among the hosts outside the committees of
+/// `open`, both ways: each of them reads nothing of another's state,
+/// whichever committee either joins after the cut, while every reading
+/// to or from a host of `open` flows.
+#[must_use]
+pub fn isolate_crossing_intake_among(
+    c: &mut impl FaultableCluster,
+    open: &[ShardId],
+) -> FaultHandle {
+    let kept: BTreeSet<usize> = open
+        .iter()
+        .flat_map(|open| member_hosts(c, *open))
+        .collect();
+    let cut: Vec<usize> = (0..c.host_count())
+        .filter(|host| !kept.contains(host))
+        .collect();
+    let handles = [
+        c.drop_type_between(&cut, &cut, "crossing.readings"),
+        c.drop_type_between(&cut, &cut, "state_proof.request"),
+    ];
+    FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
+}
+
 /// Cut every provision bundle `producer`'s chain sends off from
 /// `consumer`'s committee: the producer's broadcasts
 /// (`provisions.broadcast`) and the consumer's own fetches of them

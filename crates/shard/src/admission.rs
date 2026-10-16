@@ -572,6 +572,13 @@ impl Section for FinalizationsSection {
     /// against the cap, since each moves a row. A stated name joins no
     /// resolved set: the legs half that settles it comes later.
     ///
+    /// **A legs half names what its rows state.** It carries no
+    /// certificate: each name is a row stated in its tick, under the
+    /// receipt hash the row records, and the receipt beside it recomputes
+    /// to that hash. Whether the siblings' state accepts each name is the
+    /// vote's to judge, over the rows the block's claims leave, beside its
+    /// tick lines.
+    ///
     /// **The name rule is what makes settlement and abandonment
     /// exclusive.** A shard abandons a transaction its counterpart left
     /// in flight, and settles one whose coverage completed; both are
@@ -609,18 +616,23 @@ impl Section for FinalizationsSection {
     ///
     /// The order its tick settles in is [`settles_in_order`]'s.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
-        let vote_anchor = fw.local_ec().vote_anchor_ts();
-        if vote_anchor < ctx.chain_origin {
-            return Err(format!(
-                "certificate for tick {:?} predates this chain's origin",
-                fw.tick_id()
-            ));
-        }
-        if certified_below_a_crossed_bridge(ctx, vote_anchor) {
-            return Err(format!(
-                "certificate for tick {:?} is anchored below a recovery bridge the block is past",
-                fw.tick_id()
-            ));
+        // A legs half carries no certificate: its names are held to rows
+        // stated on this chain, which a recovery's discard releases.
+        if let Some(local) = fw.local_ec() {
+            let vote_anchor = local.vote_anchor_ts();
+            if vote_anchor < ctx.chain_origin {
+                return Err(format!(
+                    "certificate for tick {:?} predates this chain's origin",
+                    fw.tick_id()
+                ));
+            }
+            if certified_below_a_crossed_bridge(ctx, vote_anchor) {
+                return Err(format!(
+                    "certificate for tick {:?} is anchored below a recovery bridge the block is \
+                     past",
+                    fw.tick_id()
+                ));
+            }
         }
         if fw.tick_id().shard_id() != ctx.local_shard {
             return Err(format!(
@@ -645,14 +657,15 @@ impl Section for FinalizationsSection {
             ));
         }
         let stating = fw.half() == TickHalf::Stated;
-        for outcome in fw.settled_outcomes() {
-            let tx_hash = outcome.tx_hash();
-            if fold.resolved_here.contains(&tx_hash) {
+        let deciding: HashSet<TxHash> = fw.deciding_tx_hashes().collect();
+        let mut named_here = HashSet::new();
+        for tx_hash in fw.tx_hashes() {
+            if fold.resolved_here.contains(&tx_hash) || !named_here.insert(tx_hash) {
                 return Err(format!(
                     "transaction {tx_hash} resolved twice within the same block"
                 ));
             }
-            if outcome.decides() {
+            if deciding.contains(&tx_hash) {
                 already_resolved(ctx, tx_hash)?;
             }
             // A half settles only members its tick holds for that half: a
@@ -674,7 +687,10 @@ impl Section for FinalizationsSection {
                 0
             }
             TickHalf::Stated => states_its_tick_whole(ctx.members, fold, fw)?,
-            TickHalf::Legs => 0,
+            TickHalf::Legs => {
+                names_its_rows(ctx.members, fw)?;
+                0
+            }
         };
         let frontier = settles_in_order(ctx, fold.frontier, fw)?;
         let tx_count = fold
@@ -696,6 +712,38 @@ impl Section for FinalizationsSection {
         }
         Ok(())
     }
+}
+
+/// A refusal unless every name of `fw`, a legs half, is the transaction
+/// and the receipt hash its stated row records: the receipt the tick's
+/// certificate attested for the member when its stating half committed.
+/// The receipt `fw` carries for each name recomputes to that hash, which
+/// decoding holds it to, so the bytes a block settles are the ones the
+/// tick's quorum signed for.
+fn names_its_rows(members: &MemberIndex, fw: &Finalization) -> Result<(), String> {
+    let receipts = fw
+        .settled_receipts()
+        .expect("a legs half names what it settles");
+    for (tx_hash, named) in receipts {
+        let stated = members
+            .members
+            .get(&tx_hash)
+            .and_then(|row| match row.state {
+                RowState::Stated { receipt, .. } => Some(receipt),
+                RowState::Pending
+                | RowState::InFlight { .. }
+                | RowState::Released { .. }
+                | RowState::Accepted => None,
+            });
+        if stated != Some(named) {
+            return Err(format!(
+                "finalization {:?} names transaction {tx_hash} under a receipt its stated row \
+                 does not record",
+                fw.receipt_hash(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// How many members `fw`, a stating half, states a yes for, where it

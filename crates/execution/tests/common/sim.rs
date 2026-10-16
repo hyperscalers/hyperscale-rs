@@ -28,7 +28,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
-use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::tick_select::terms_of;
 use hyperscale_engine::{AllCodeRuns, ExecutedTx, PROTOCOL_RESOURCE};
 use hyperscale_execution::action_handlers::{
@@ -56,7 +55,7 @@ use hyperscale_types::{
     StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
     Verified, WeightedTimestamp, compute_global_receipt_root, encode_amount, read_amount,
-    shard_prefix_path,
+    shard_prefix_path, writes_root,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -1326,65 +1325,5 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
         TickHalf::Determined,
         &Capped::from_array([Arc::new(ec)]),
         Capped::new(receipts.to_vec()).expect("a list written out in a test"),
-    )
-}
-
-/// A committed `Finalization` whose counterpart refused every member.
-///
-/// The local shard completed its half and carries the receipts to prove
-/// it; the counterpart's certificate reports failure for the same
-/// transactions, so the tick as a whole decided against them. Two
-/// certificates for one tick is the ordinary cross-shard shape — what the
-/// combine exists to reconcile.
-#[must_use]
-pub fn settle_refused_by_counterpart(
-    tick_id: &TickId,
-    counterpart: ShardId,
-    receipts: &[StoredReceipt],
-    charges: &[StoredReceipt],
-) -> Finalization {
-    // The local certificate reports what this shard did and names the
-    // charge it holds against a refusal, which is what its own outcomes
-    // carry. The stored receipts are the charges, because that is the
-    // side of each outcome the tick's verdict selects.
-    let outcomes: Vec<TxOutcome> = receipts
-        .iter()
-        .zip(charges)
-        .map(|(receipt, charge)| {
-            TxOutcome::with_refusal(
-                receipt.tx_hash,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: receipt.consensus.receipt_hash(),
-                },
-                charge.consensus.receipt_hash(),
-            )
-        })
-        .collect();
-    let local = ExecutionCertificate::new(
-        *tick_id,
-        WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
-        compute_global_receipt_root(&outcomes),
-        Capped::new(outcomes).expect("a list written out in a test"),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    );
-    let refused: Vec<TxOutcome> = receipts
-        .iter()
-        .map(|receipt| TxOutcome::new(receipt.tx_hash, ExecutionOutcome::Failed))
-        .collect();
-    let remote_id = TickId::new(counterpart, tick_id.block_height());
-    let remote = ExecutionCertificate::new(
-        remote_id,
-        WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
-        compute_global_receipt_root(&refused),
-        Capped::new(refused).expect("a list written out in a test"),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    );
-    Finalization::new(
-        *tick_id,
-        TickHalf::Legs,
-        &Capped::from_array([Arc::new(local), Arc::new(remote)]),
-        Capped::new(charges.to_vec()).expect("a list written out in a test"),
     )
 }

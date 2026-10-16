@@ -190,9 +190,10 @@ impl CommitDedupIndex {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
     }
 
-    /// Record every transaction a block's finalizations resolved. Each
-    /// entry's deadline is the resolving tick's local EC
-    /// `vote_anchor_ts + RETENTION_HORIZON`.
+    /// Record every transaction a block anchored at `anchor` resolved by
+    /// its finalizations. Each entry's deadline is what the resolving
+    /// finalization is retained until
+    /// ([`Finalization::retained_until`]).
     ///
     /// The deciding outcomes only: a leg's finalization names its hash
     /// without resolving it, and a deciding finalization naming the hash
@@ -207,9 +208,10 @@ impl CommitDedupIndex {
     pub(crate) fn register_committed_certs(
         &mut self,
         finalizations: &[Arc<Verifiable<Finalization>>],
+        anchor: WeightedTimestamp,
     ) {
         for fw in finalizations {
-            let deadline = fw.local_ec().deadline();
+            let deadline = fw.retained_until(anchor);
             self.finalization_retention
                 .entry(fw.receipt_hash())
                 .or_insert(deadline);
@@ -504,7 +506,7 @@ mod tests {
         let mut idx = CommitDedupIndex::new();
         let fw = make_fw(1);
         let tx_hash = fw.tx_hashes().next().expect("a tick names its members");
-        idx.register_committed_certs(std::slice::from_ref(&fw));
+        idx.register_committed_certs(std::slice::from_ref(&fw), WeightedTimestamp::ZERO);
         assert!(idx.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO));
 
         idx.prune(WeightedTimestamp::ZERO);
@@ -514,8 +516,7 @@ mod tests {
         );
 
         idx.prune(
-            fw.local_ec()
-                .deadline()
+            fw.retained_until(WeightedTimestamp::ZERO)
                 .plus(std::time::Duration::from_millis(1)),
         );
         assert!(!idx.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO));
@@ -732,12 +733,12 @@ mod tests {
     fn a_dedup_lookup_is_judged_at_the_admitting_anchor() {
         let fw = make_fw(1);
         let tx_hash = fw.tx_hashes().next().expect("a tick names its members");
-        let deadline = fw.local_ec().deadline();
+        let deadline = fw.retained_until(WeightedTimestamp::ZERO);
         let p = make_provisions(1);
         let batch_anchor = deadline.minus(RETENTION_HORIZON);
         let build = || {
             let mut idx = CommitDedupIndex::new();
-            idx.register_committed_certs(std::slice::from_ref(&fw));
+            idx.register_committed_certs(std::slice::from_ref(&fw), WeightedTimestamp::ZERO);
             idx.register_committed_provisions(&[p.hash()], batch_anchor);
             idx
         };
@@ -799,20 +800,26 @@ mod tests {
 
         let tx_hash = TxHash::from(Hash::from_bytes(b"leg"));
         let mut index = CommitDedupIndex::new();
-        index.register_committed_certs(&[Arc::new(Verifiable::from(make_leg_finalization(
-            BlockHeight::new(1),
-            tx_hash,
-        )))]);
+        index.register_committed_certs(
+            &[Arc::new(Verifiable::from(make_leg_finalization(
+                BlockHeight::new(1),
+                tx_hash,
+            )))],
+            WeightedTimestamp::ZERO,
+        );
         assert!(
             !index.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO),
             "the leg decided nothing"
         );
 
-        index.register_committed_certs(&[Arc::new(Verifiable::from(make_finalization(
-            BlockHeight::new(5),
-            tx_hash,
-            TransactionDecision::Accept,
-        )))]);
+        index.register_committed_certs(
+            &[Arc::new(Verifiable::from(make_finalization(
+                BlockHeight::new(5),
+                tx_hash,
+                TransactionDecision::Accept,
+            )))],
+            WeightedTimestamp::ZERO,
+        );
         assert!(
             index.contains_resolved_tx(&tx_hash, WeightedTimestamp::ZERO),
             "a deciding finalization does"

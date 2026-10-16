@@ -897,6 +897,7 @@ pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
             for fw in certified.block().certificates().iter() {
                 ran.extend(
                     fw.settled_outcomes()
+                        .chain(fw.stated_outcomes())
                         .filter(|outcome| outcome.tx_hash() == tx)
                         .map(|outcome| RanAs {
                             awaited: outcome.counterparts().to_vec(),

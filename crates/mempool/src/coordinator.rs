@@ -60,9 +60,9 @@ use hyperscale_metrics::{
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CommittedClock, Deadline, DeclaredWork, ForkFence, IntakeView,
     LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, Reach,
-    ShardId, ShardTrie, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxResolution, Verified, WeightedTimestamp, Window, budget_admits_block,
-    caps_admit_transaction,
+    ShardId, ShardTrie, TickLine, TopologySnapshot, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, TxResolution, Verified, WeightedTimestamp, Window,
+    budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -793,8 +793,10 @@ impl MempoolCoordinator {
     /// committed, and sweep the cross-shard expectations it satisfies or
     /// outlives.
     ///
-    /// What the block's finalizations settle about the transactions
-    /// they name arrives separately, through [`Self::on_resolutions`]:
+    /// A fate the block's manifest names aborts its member, which no
+    /// finalization will name. What the block's finalizations settle
+    /// about the transactions they name arrives separately, through
+    /// [`Self::on_resolutions`]:
     /// a finalization's name means different things on different
     /// entries, and the execution ledger is what knows which.
     #[instrument(skip(self, certified), fields(
@@ -899,6 +901,14 @@ impl MempoolCoordinator {
                         submitted_locally,
                     });
                 }
+            }
+        }
+
+        // A fate ends a member that no finalization will ever name, so
+        // nothing else reaches the pool about it: it is aborted here.
+        for line in block.tick_manifest().iter() {
+            if let TickLine::Fate { tx, .. } = line {
+                actions.extend(self.abort_one(*tx));
             }
         }
 
@@ -1479,13 +1489,14 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, install_stub_protocol_statics, make_finalization, make_live_block,
-        stub_transaction, stub_transaction_declaring, test_prefix, test_principal,
-        test_transaction, test_transaction_at_priority, test_transaction_with_prefixes,
-        test_validity_range,
+        naming, stub_abort_charge, stub_transaction, stub_transaction_declaring, test_prefix,
+        test_principal, test_transaction, test_transaction_at_priority,
+        test_transaction_with_prefixes, test_validity_range,
     };
     use hyperscale_types::{
-        Address, Epoch, MAX_BLOCK_COMPUTE, MAX_STANDING_TOWARD_SHARD, PrincipalAddr,
-        StandingToward, TopologySchedule, TxsInFlight, Verified, WeightedTimestamp, WitnessSources,
+        Address, Epoch, Hash, MAX_BLOCK_COMPUTE, MAX_STANDING_TOWARD_SHARD, PrincipalAddr,
+        StandingToward, TickLine, TopologySchedule, TxsInFlight, Verified, WeightedTimestamp,
+        WitnessSources,
     };
 
     /// Intake under `trie` on a parent whose header records `in_flight`.
@@ -2242,6 +2253,57 @@ mod tests {
                 } if *h == tx_hash
             )),
             "sweep must emit the terminal abort status"
+        );
+        assert!(mempool.status(&tx_hash).is_none());
+        assert!(mempool.is_tombstoned(&tx_hash));
+    }
+
+    /// A fate ends a member that no finalization will ever name: the
+    /// block carrying it drives the entry to `Completed(Aborted)`, and a
+    /// fate naming a transaction the pool does not hold says nothing.
+    #[test]
+    fn a_fate_aborts_its_pool_entry() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        let tx = test_transaction_with_prefixes(b"fated", &[test_prefix(7)], &[test_prefix(8)]);
+        let tx_hash = tx.hash();
+        let committing = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_234_567_890,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+            vec![],
+        );
+        mempool.on_block_committed(
+            &topology_snapshot,
+            &certify(committing, TEST_BLOCK_INTERVAL_MS),
+        );
+        let fating = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(2),
+            1_234_567_990,
+            ValidatorId::new(0),
+            vec![],
+            vec![],
+        );
+        let fated = |tx| TickLine::Fate {
+            tx,
+            charge: stub_abort_charge(0),
+        };
+        let actions = mempool.on_block_committed(
+            &topology_snapshot,
+            &naming(
+                &certify(fating, TEST_BLOCK_INTERVAL_MS),
+                vec![
+                    fated(tx_hash),
+                    fated(TxHash::from(Hash::from_bytes(b"not pooled"))),
+                ],
+            ),
+        );
+        assert_eq!(
+            emitted(&actions, tx_hash),
+            vec![TransactionStatus::Completed(TransactionDecision::Aborted)],
         );
         assert!(mempool.status(&tx_hash).is_none());
         assert!(mempool.is_tombstoned(&tx_hash));

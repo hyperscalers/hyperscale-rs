@@ -58,13 +58,18 @@ use hyperscale_scenarios::{
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
+    a_recovered_venue_aborts_what_its_sibling_accepted,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
+    a_route_only_the_departing_venue_heard_settles_on_both_venues_or_neither,
+    a_route_only_the_survivor_heard_settles_on_both_venues_or_neither,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
-    a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
+    a_route_settles_across_two_venues, a_route_settles_on_a_certificate_delivered_past_its_life,
+    a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_shard_halted_across_an_abandon_window_settles_again,
     a_spent_nullifier_is_swept_once_unreachable,
@@ -104,9 +109,9 @@ use hyperscale_scenarios::{
     halted_shard_recovery_replays_a_sweep_its_suffix_walked, halted_shard_straddler_atomic,
     hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
-    isolated_validator_still_settles, late_departing_route_genesis_accounts,
-    livelock_resolves_promptly, liveness_baseline, mass_decline_genesis_accounts,
-    merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
+    isolated_validator_still_settles, late_certificate_genesis_accounts,
+    late_departing_route_genesis_accounts, livelock_resolves_promptly, liveness_baseline,
+    mass_decline_genesis_accounts, merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
     merge_seats_full_keeper_committee, merge_straddler_atomic, merge_train_genesis_accounts,
     merged_pair_genesis_accounts, merging_caller_genesis_accounts,
     minority_fragment_rejoins_after_partition, more_records_than_the_cap_are_declined_in_turn,
@@ -1358,10 +1363,10 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
     dedicated_route_cluster(&route_genesis_accounts())
 }
 
-/// On a route cluster with a second cohort of pool surplus, the committee
-/// the halted venue's shard is redrawn from.
-fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released_at_seed(seed: u64) {
-    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+/// A route cluster at `seed` with a second cohort of pool surplus, the
+/// committee a halted venue's shard is redrawn from.
+fn route_cluster_with_recovery_spares(seed: u64) -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &ScenarioConfig {
             num_shards: 4,
             pool_surplus: 24,
@@ -1370,13 +1375,18 @@ fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released_at_see
         seed,
         &route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
-    );
+    )
+}
+
+fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released_at_seed(seed: u64) {
+    let mut cluster = route_cluster_with_recovery_spares(seed);
     cluster.run_faultable(a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released);
 }
 
 seeded!(
     a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released_at_seed:
     seed_7 = 7,
+    seed_29 = 29,
     seed_42 = 42,
 );
 
@@ -1488,6 +1498,38 @@ fn a_shard_halted_across_an_abandon_window_settles_again_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
     cluster.run_faultable(a_shard_halted_across_an_abandon_window_settles_again);
 }
+
+/// Each venue reads its core sibling's verdict only after the anchor the
+/// sibling's certificate was signed at has lapsed: the cut is keyed on
+/// hosts. Sim-only — the cut stands several re-attestation steps of
+/// weighted time.
+#[test]
+fn a_route_settles_on_a_certificate_delivered_past_its_life_sim() {
+    let mut cluster = dedicated_route_cluster(&late_certificate_genesis_accounts());
+    cluster.run_faultable(a_route_settles_on_a_certificate_delivered_past_its_life);
+}
+
+fn a_route_a_halting_venue_could_read_is_settled_before_the_halt_at_seed(seed: u64) {
+    let mut cluster = route_cluster_with_recovery_spares(seed);
+    cluster.run_faultable(a_route_a_halting_venue_could_read_is_settled_before_the_halt);
+}
+
+seeded!(
+    a_route_a_halting_venue_could_read_is_settled_before_the_halt_at_seed:
+    seed_19 = 19,
+    seed_42 = 42,
+);
+
+fn a_recovered_venue_aborts_what_its_sibling_accepted_at_seed(seed: u64) {
+    let mut cluster = route_cluster_with_recovery_spares(seed);
+    cluster.run_faultable(a_recovered_venue_aborts_what_its_sibling_accepted);
+}
+
+seeded!(
+    a_recovered_venue_aborts_what_its_sibling_accepted_at_seed:
+    seed_19 = 19,
+    seed_42 = 42,
+);
 
 #[test]
 fn a_route_cut_off_across_its_deadline_is_not_reclaimed_sim() {
@@ -2636,10 +2678,21 @@ fn a_merged_chain_declines_at_its_own_parent_sim() {
 /// the survivor's and reaches its terminal with the route unsettled, and
 /// its side applies nowhere.
 #[test]
-#[ignore = "a route accepted before its sibling's split is projected tears"]
 fn a_route_accepted_before_its_venues_split_is_projected_is_not_torn_sim() {
     let mut cluster = late_departing_route_cluster();
     cluster.run_faultable(a_route_accepted_before_its_venues_split_is_projected_is_not_torn);
+}
+
+#[test]
+fn a_route_only_the_survivor_heard_settles_on_both_venues_or_neither_sim() {
+    let mut cluster = late_departing_route_cluster();
+    cluster.run_faultable(a_route_only_the_survivor_heard_settles_on_both_venues_or_neither);
+}
+
+#[test]
+fn a_route_only_the_departing_venue_heard_settles_on_both_venues_or_neither_sim() {
+    let mut cluster = late_departing_route_cluster();
+    cluster.run_faultable(a_route_only_the_departing_venue_heard_settles_on_both_venues_or_neither);
 }
 
 /// The route topology grown to four shards on dedicated pool hosts, with

@@ -23,7 +23,7 @@ use crate::route::{
     FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, route_worlds, sponsor, stand_up_venues,
     traders,
 };
-use crate::straddler::isolate_ec_intake;
+use crate::straddler::{isolate_crossing_intake, isolate_ec_intake};
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{declared_price, owning_shard, vault_balance};
 use crate::support::tx::{
@@ -608,13 +608,14 @@ const CONTESTED_LIFE: Duration = Duration::from_secs(30);
 /// Two payers on one shard publish the same artifact, whose package cell
 /// the other shard keeps, so each publish runs whole on both shards and
 /// either shard can refuse it. The package's shard is cut off from the
-/// payers' shard's certificates, so the rival's publish stays in flight
-/// there holding the package cell, and the payer's publish, committed
-/// behind it, waits on that hold until its deadline and is aborted
-/// unrun. The payers' shard hears every certificate: it settles the
-/// rival's publish, runs the payer's to completion and attests it, and
-/// then reads the abort that discards what it wrote, the burn and the
-/// end of the fee hold among it.
+/// payers' shard's state and certificates, so it never reads the
+/// rival's publish accepted there and its own row stays stated holding
+/// the package cell, and the payer's publish, committed behind it,
+/// waits on that hold until its deadline and is aborted unrun. The
+/// payers' shard reads everything: it accepts the rival's publish, runs
+/// the payer's to completion and states it, and then reads the package
+/// shard's abort, on which it aborts its own row, discarding what it
+/// wrote, the burn and the end of the fee hold among it.
 ///
 /// What a chain owes the payer then is what it owes any refused attempt:
 /// the price once, no fee hold left standing for it, and a vault whose
@@ -654,7 +655,10 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
     let artifact = artifact_kept_on(c, REMOTE_SHARD);
     let cell = package_key(package_hash(&ProtocolHasher, &artifact));
 
-    let cut = isolate_ec_intake(c, REMOTE_SHARD, PAYER_SHARD);
+    let cut = [
+        isolate_ec_intake(c, REMOTE_SHARD, PAYER_SHARD),
+        isolate_crossing_intake(c, REMOTE_SHARD, PAYER_SHARD),
+    ];
     let first = build_publish_tx(&rival_key, artifact.clone(), validity_around(c.now()));
     let first_hash = charges.submit(c, first);
     assert!(
@@ -686,7 +690,10 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
         c.chain_fate(PAYER_SHARD, publish_hash),
         c.chain_fate(REMOTE_SHARD, publish_hash),
     );
-    assert!(cut.fired() > 0, "the certificates must have been cut");
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "the certificates and readings must have been cut",
+    );
     assert!(
         c.chain_fate(REMOTE_SHARD, first_hash).1.is_none(),
         "the rival's publish must still be in flight on the package's shard: {:?}",
@@ -701,7 +708,7 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
             .chain_fate(REMOTE_SHARD, first_hash)
             .1
             .is_some()),
-        "{context}: the rival's publish must end on the package's shard once certificates flow",
+        "{context}: the rival's publish must end on the package's shard once readings flow",
     );
     world.assert_settles_within(c, &charges, budget, context);
     assert_package_stands_where_accepted(c, first_hash, cell, context);

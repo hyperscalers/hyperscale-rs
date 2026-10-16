@@ -666,55 +666,6 @@ mod tests {
         );
     }
 
-    /// A leg that succeeded here and was refused by its counterpart
-    /// settles nothing when it owes no charge — so no receipt was ever
-    /// stored for it, and a rebuild must not demand one. This is the
-    /// ordinary shape on a non-payer shard: the payer settles the charge,
-    /// this side settles nothing at all.
-    #[test]
-    fn reconstruct_skips_a_leg_its_counterpart_refused() {
-        let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let remote_tick_id = make_tick_id(1, BlockHeight::new(42));
-        let settling = TxHash::from(Hash::from_bytes(b"settling"));
-        let refused = TxHash::from(Hash::from_bytes(b"refused_by_counterpart"));
-
-        // Locally both succeeded; the counterpart aborted the second.
-        let local_ec = make_local_ec(
-            &tick_id,
-            vec![
-                TxOutcome::new(
-                    settling,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                ),
-                TxOutcome::new(
-                    refused,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                ),
-            ],
-        );
-        let remote_ec = make_local_ec(
-            &remote_tick_id,
-            vec![TxOutcome::new(refused, ExecutionOutcome::Aborted)],
-        );
-        let attestation = Finalization::new(
-            tick_id,
-            TickHalf::Determined,
-            &Capped::from_array([local_ec, remote_ec]),
-            Capped::from_array([]),
-        );
-
-        let fw = Finalization::reconstruct(attestation, |tx_hash, _| {
-            (*tx_hash == settling).then(make_success_receipt)
-        })
-        .expect("a refused leg owing no charge stored no receipt to find");
-        assert_eq!(fw.receipts().len(), 1);
-        assert_eq!(fw.receipts()[0].tx_hash, settling);
-    }
-
     #[test]
     fn reconstruct_fails_when_local_ec_missing() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
@@ -735,75 +686,6 @@ mod tests {
 
         let fw = Finalization::reconstruct(attestation, |_, _| Some(make_success_receipt()));
         assert!(fw.is_none(), "reconstruction requires the local EC");
-    }
-
-    /// Dropping the certificate carrying a counterpart's refusal is
-    /// caught, because the tick's own certificate names the counterpart.
-    ///
-    /// The set left behind is internally consistent — [`settles`] reads
-    /// the outcomes in front of it, finds no refusal, and the receipts
-    /// built around that reading agree with it — so nothing about the
-    /// receipts can tell the two sets apart. What can is that the local
-    /// outcome says shard 1 is party to the transaction and no
-    /// certificate here speaks for shard 1.
-    ///
-    /// [`settles`]: crate::settles
-    #[test]
-    fn dropping_a_refusal_leaves_the_transaction_uncovered() {
-        let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let counterpart = make_tick_id(1, BlockHeight::new(42));
-        let leg = TxHash::from(Hash::from_bytes(b"cross_shard_leg"));
-
-        let local_ec = make_local_ec(
-            &tick_id,
-            vec![
-                TxOutcome::new(
-                    leg,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .awaiting([counterpart.shard_id()]),
-            ],
-        );
-        let refusal = make_local_ec(
-            &counterpart,
-            vec![TxOutcome::new(leg, ExecutionOutcome::Aborted).awaiting([tick_id.shard_id()])],
-        );
-        let effects = StoredReceipt {
-            tx_hash: leg,
-            consensus: make_success_receipt(),
-        };
-
-        let thinned = Finalization::new(
-            tick_id,
-            TickHalf::Legs,
-            &Capped::from_array([Arc::clone(&local_ec)]),
-            Capped::from_array([effects]),
-        );
-        assert_eq!(
-            thinned.validate_against_certificates(),
-            Err(ReceiptValidationError::IncompleteCoverage {
-                tx_hash: leg,
-                missing: counterpart.shard_id(),
-            }),
-            "a set that leaves out a participant decides nothing about its transaction",
-        );
-        assert!(
-            thinned.settling_receipts().is_empty(),
-            "and nothing it carries reaches state by another road",
-        );
-
-        // The same tick with the refusal present settles the charge its
-        // outcome named — here, none — and never the effects.
-        let whole = Finalization::new(
-            tick_id,
-            TickHalf::Legs,
-            &Capped::from_array([local_ec, refusal]),
-            Capped::from_array([]),
-        );
-        assert_eq!(whole.validate_against_certificates(), Ok(()));
-        assert!(whole.settling_receipts().is_empty());
     }
 
     /// A transaction reaching no further than its own shard names no
@@ -831,25 +713,6 @@ mod tests {
         );
         assert_eq!(fw.validate_against_certificates(), Ok(()));
         assert_eq!(fw.settling_receipts().len(), 1);
-    }
-
-    /// A refused transaction needs no completeness: one refusal discards
-    /// its effects everywhere, so the shards yet to report can only agree.
-    #[test]
-    fn a_refused_transaction_settles_without_every_participant() {
-        let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let absent = make_tick_id(2, BlockHeight::new(42));
-        let leg = TxHash::from(Hash::from_bytes(b"refused_leg"));
-        let fw = Finalization::new(
-            tick_id,
-            TickHalf::Legs,
-            &Capped::from_array([make_local_ec(
-                &tick_id,
-                vec![TxOutcome::new(leg, ExecutionOutcome::Aborted).awaiting([absent.shard_id()])],
-            )]),
-            Capped::from_array([]),
-        );
-        assert_eq!(fw.validate_against_certificates(), Ok(()));
     }
 
     /// The awaited shards sit under the signed receipt root, so a set

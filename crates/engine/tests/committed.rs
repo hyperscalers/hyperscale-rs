@@ -929,6 +929,7 @@ impl<'w> Naming<'w> {
             &|_, _| Evidence::Readable,
             false,
             &BTreeSet::new(),
+            &BTreeMap::new(),
         );
         assert!(missing.is_empty(), "no member is held past its evidence");
         let run = lines.iter().any(|line| {

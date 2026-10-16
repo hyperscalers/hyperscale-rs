@@ -935,297 +935,385 @@ module recovery_bridge_honest_old {
 
 // The cross-shard freeze — INV-SEC-8's other half, and the fix for the
 // cascade escalation of finding G-1. A halted shard's committed suffix
-// made cross-shard commitments (execution certificates other shards
-// finalized on); the retained beyond-f committee can forge NEW ECs
-// extending the halted tip, and a consuming shard resolves the source
-// committee for an EC by its anchor window (`gate_certificate`,
-// crates/execution/src/gate.rs) — the PLAIN lookup, no recovery bridge —
-// so a stale-anchored orphan EC resolves the old committee and its
-// beyond-f signatures verify. Without the fence, the orphan exports a
-// forged finalization cross-shard: an f+1 liveness halt becomes an
+// carries state its core siblings read: a stated yes, which a sibling
+// accepts on. The retained beyond-f committee can certify NEW headers
+// extending the halted tip, and a sibling proves a claim on a header by
+// the committee its anchor resolves — the PLAIN lookup, no recovery
+// bridge — so a stale-anchored orphan header resolves the old committee
+// and its beyond-f signatures verify. Without the fence, the orphan
+// exports forged state cross-shard: an f+1 liveness halt becomes an
 // INV-EXEC-1 cascade.
 //
 // The fix is a beacon mandate. At the fold that flags the halt, the
 // beacon stamps a recovery: from that fold, folded network-wide, no shard
-// verifies an old-committee certificate of the halted shard anchored below
-// the recovery's bridge above the beacon-attested frontier. The beacon is
-// the only actor that is honest-majority (pool ratification), globally
-// observed (every shard folds it), and unforgeable by the halted
+// admits a claim on an old-committee header of the halted shard anchored
+// below the recovery's bridge above the beacon-attested frontier. The
+// beacon is the only actor that is honest-majority (pool ratification),
+// globally observed (every shard folds it), and unforgeable by the halted
 // committee — so the cutoff is authenticated and synchronized, not a
-// per-consumer guess. Structurally this is shard termination: the frozen
+// per-sibling guess. Structurally this is shard termination: the frozen
 // committee is a shard cut at the freeze, and the fresh committee is the
 // successor.
 //
 // The recovered shard's crossing block, its first anchored at or past the
-// bridge, discards every tick its parent's rows hold. A tick the old
-// committee certified stands only where a kept block settled it whole;
-// every other is let go of, at or below the frontier and above it alike,
-// and every tick above the halted tip with them. A member the discard
-// releases is aborted from its deadline under the fresh committee's
-// certificate.
+// bridge, discards every tick its parent's rows hold, and with them every
+// tick above the halted tip. A core member the discard releases that ran
+// is aborted at once, stated or not: the recovered shard ends its row
+// with a recorded outcome. A sibling that reads that exit and has not
+// accepted refuses; one that accepted on the yes the discard dropped
+// keeps its accept, the tear of a recovery (residual 1), and ends its
+// accepted row on the exit.
 //
-// This module models the consuming side only: an honest consumer shard
-// folds the beacon record, verifies certificates purportedly from the
-// halted source, settles on the ones it verified, and meets the fresh
-// committee's abort of a discarded tick. Verifying and settling are two
-// steps: the fence refuses a certificate when it is verified, and the
-// consumer's own block admits a half built from a certificate it already
-// holds whenever it verified it, since admission bands only the
-// consumer's own ticks. The first certificate covering a member decides
-// it: an abort arriving over a verified certificate covers nothing new.
-// It does NOT re-model consensus (Module 2) or the cross-shard
-// transaction lifecycle (Models C/D) — only the trust surface the freeze
-// governs.
+// What bounds the tear is the reading rule, not the fence. A sibling's
+// row counts no reading marked below the bridge of the newest recovery
+// its view records, at or below the frontier and above it alike, so once
+// it has folded the recovery no yes the replaced committee's chain
+// stated decides anything there; it accepts only on what the fresh chain
+// says past the bridge. The fence keeps a folded sibling from proving new
+// orphan state at all, which the crossings it admits on the same claims
+// rely on.
+//
+// This module models the sibling's side only: an honest core sibling
+// folds the beacon record, admits claims on headers purportedly from the
+// halted shard, accepts on the yeses they read, and meets the recovered
+// shard's exit. Admitting and deciding are two steps: the fence refuses
+// a claim when it is admitted, and the reading rule refuses a reading
+// when the row decides. One core member per source height: the header at
+// height `h` states a yes on member `h`. It does NOT re-model consensus
+// (Module 2) or the reading lifecycle (Models C/D) — only the trust
+// surface the freeze and the bridge govern.
 //
 // Code anchors:
-//   - Cross-shard EC committee resolution: `gate_certificate`
-//     (crates/execution/src/gate.rs) resolves the committee at the
-//     certificate's `vote_anchor_ts`; `ec_has_shard_quorum_power`
-//     (crates/execution/src/lookups.rs) checks the signer power against it.
+//   - Claim proof: a claim is proven on the source header its anchor
+//     names, resolved by the anchor's clock; `refused_away_from_the_parent`
+//     (crates/shard/src/admission.rs) and `place_pushed_claim`
+//     (crates/execution/src/coordinator.rs) refuse a claim anchored in a
+//     recovery's band, and `ProvenAnchors::forget_orphaned`
+//     (crates/types/src/shard/proven_anchors.rs) drops a proven anchor
+//     there.
 //   - The freeze is the `attested_frontier` on the beacon's `ShardRecovery`
 //     record (crates/types/src/beacon/state.rs) — the shard's boundary
 //     height as folded at detection, recorded by `recover_committee`
 //     (crates/beacon/src/state/committee.rs).
 //     `TopologySchedule::recovery_orphaned`
-//     (crates/types/src/topology/schedule.rs) refuses a certificate
-//     anchored below a bridge above its frontier in `gate_certificate` and
-//     again in `on_certificate_verified`, and
-//     `lookup_for_shard_certified_fenced` applies the height cutoff to
-//     remote-header sync (crates/remote-headers/src/coordinator.rs) and
-//     the beacon boundary fold (crates/beacon/src/boundary.rs).
-//   - The discard: `TopologySchedule::crossing_block` picks the crossing
-//     block, `member_lines` (crates/engine/src/tick_select.rs) names a
-//     `Recovery` discard for every tick row its parent holds, and
-//     `FinalizationsSection::admit` (crates/shard/src/admission.rs)
-//     refuses, on the recovered shard, a finalization of its own tick
-//     certified below a bridge the block is past.
-//   - Settling on a held certificate: the consumer builds its half from
-//     the first certificate covering the member, and its own admission
-//     checks no band of the source.
+//     (crates/types/src/topology/schedule.rs) is the band: anchored below
+//     a bridge, above its frontier.
+//   - The reading rule: `counts` (crates/types/src/shard/verdict.rs) — an
+//     entry marked below the bridge of the sibling's newest recovery the
+//     published window records is no entry; `decide` accepts a stated
+//     row on a counted yes, refuses it on a counted exit, and ends an
+//     accepted row once the sibling has accepted or left.
+//   - The discard and the abort: `member_lines` (crates/engine/src/
+//     tick_select.rs) names a `Recovery` discard for every tick row the
+//     parent holds on the crossing block (`TopologySchedule::crossing_block`),
+//     the fold releases each member of it (`release`, crates/storage/src/
+//     shard/members.rs), and `Exit::of` aborts a released shared member
+//     that ran at once.
 //
-// Properties (INV-SEC-8, cross-shard half):
-//   invFenceHolds — once an honest consumer has folded the recovery, it
-//                      never verifies an old-committee EC above the
-//                      frontier attested at fold time: the fence stops the
-//                      leak at the cutoff. The `no_freeze` twin (the
-//                      unfenced counterfactual) violates it.
-//   invResidualBounded — every old-committee certificate the consumer
-//                      settled on for a tick the recovered shard discards
-//                      above the fold-time frontier was verified before it
-//                      folded the recovery: the tear the discard leaves
-//                      above the frontier is decided by arrival order
-//                      relative to the fold, and nothing verified after it
-//                      tears. At or below the frontier no fence applies,
-//                      so a consumer holding the old certificate of a
-//                      discarded tick there is torn whenever it verified
-//                      it; both are bounded by the standing-row cap toward
-//                      one shard, which this model does not count.
-//   invOneOutcome — the consumer ends a member one way: never on both the
-//                      old certificate and the fresh abort.
+// Properties (INV-SEC-8, cross-shard half; INV-EXEC-1 residual 1):
+//   invFenceHolds — once an honest sibling has folded the recovery, it
+//                      never admits a claim on an old-committee header
+//                      above the frontier attested at fold time: the fence
+//                      stops the leak at the cutoff. The `no_freeze` twin
+//                      (the unfenced counterfactual) violates it.
+//   invResidualBounded — every member the two shards end apart is one the
+//                      sibling accepted before it folded the recovery: the
+//                      tear is decided by arrival order relative to the
+//                      fold, at or below the frontier and above it alike,
+//                      and nothing read before the bridge decides anything
+//                      after. Bounded by the standing-row cap toward one
+//                      shard, which this model does not count. The
+//                      `pre_bridge_reading` twin counts a reading below the
+//                      bridge and violates it.
+//   invOneOutcome — the sibling ends a member one way: never both accepted
+//                      and refused.
+//   invEndsOnExit — an accepted row the sibling ended is one the
+//                      recovered shard ended too, by its abort or its
+//                      accept.
 //   invObservable — the fence decides only on beacon-observable data (the
 //                      folded record + the beacon-attested frontier),
-//                      never the true halted tip, which no consumer knows.
+//                      never the true halted tip, which no sibling knows.
 //
 // Modeling assumptions:
-//   - The attested frontier can be POISONED: a consumer that settles on a
+//   - The attested frontier can be POISONED: a sibling that accepts on a
 //     forged orphan before folding the recovery attests it, advancing the
 //     frontier past the true tip. That poisoning is the irreducible
 //     residual (pre-freeze forgeries are irreversible); the fence blocks
 //     only NEW forgeries beyond what is already attested — the most any
 //     after-the-fact mechanism can do, since a beyond-f committee's
-//     exports cannot be un-finalized once honest consumers acted on them.
+//     exports cannot be un-accepted once honest siblings acted on them.
 //     (In the implementation the frontier is a pure fold of committed
 //     boundary crossings: a crossing the beyond-f committee lands before
 //     detection advances it, playing this poisoning role; the model folds
-//     that channel into pre-fold consumer attestation, and the stamped
-//     frontier does not move once the consumer has folded it.)
-//   - Consumer fold lag is free (the recovery propagates per replica, like
-//     the recovery in the bridge module): an unfolded consumer still
-//     verifies old ECs, so the residual includes "at a consumer that has
-//     not yet folded the recovery" — bounded by its propagation.
+//     that channel into pre-fold sibling attestation, and the stamped
+//     frontier does not move once the sibling has folded it.)
+//   - Sibling fold lag is free (the recovery propagates per replica, like
+//     the recovery in the bridge module): an unfolded sibling still admits
+//     and counts old-committee readings, so the residual is "accepted at a
+//     sibling that had not yet folded the recovery" — bounded by its
+//     propagation. Folding stands for the window that records the
+//     recovery being published at the sibling's anchor.
+//   - A reading's age rule (a yes no older than the epoch before the
+//     anchor's) only narrows what counts; it is left out.
 //   - Which ticks the crossing block discards is the environment's: any
-//     set holding every height above the halted tip, since a kept block
-//     settled only ticks the halted chain certified.
-//   - One honest consumer; the source's beyond-f committee is an oracle
-//     that emits any EC (its signatures always verify against the old
-//     committee at a stale anchor — the export path has no timestamp
-//     defence, unlike the bridge). The fresh committee's ECs resolve the
-//     fresh committee and are always safe to accept.
+//     set holding every height above the halted tip. A member the
+//     crossing keeps is still stated and accepts on the sibling's accept
+//     as in Model C.
+//   - One honest sibling; the source's beyond-f committee is an oracle
+//     that certifies any header (its signatures always verify against the
+//     old committee at a stale anchor — the claim path has no timestamp
+//     defence, unlike the bridge). The fresh committee's headers resolve
+//     the fresh committee and are always safe to read.
 //
 // Run:
 //   quint test --main=cross_shard_freeze_ok specs/shard_recovery.qnt
+//   quint run --main=cross_shard_freeze_ok --invariant=invAll specs/shard_recovery.qnt
 //   quint verify --main=cross_shard_freeze_ok --invariant=invAll --max-steps=8 specs/shard_recovery.qnt
-//     (the fence holds: no new forgery crosses the cut, every tear above
-//      the frontier is on a certificate verified before the fold, and the
-//      fresh committee stays live)
+//     (the fence holds: no new forgery crosses the cut, every tear is an
+//      accept made before the fold, and the fresh committee stays live)
 //   quint verify --main=cross_shard_no_freeze --invariant=invFenceHolds --max-steps=8 specs/shard_recovery.qnt
-//     (the unfenced counterfactual; expect a counterexample — an orphan is
-//      verified after the halt is detected and the consumer folded)
-//   quint verify --main=cross_shard_no_freeze --invariant=invResidualBounded --max-steps=8 specs/shard_recovery.qnt
-//     (same twin; without the fence a certificate verified after the fold
-//      tears)
+//     (the unfenced counterfactual; expect a counterexample — an orphan
+//      claim is admitted after the halt is detected and the sibling folded)
+//   quint test --main=cross_shard_pre_bridge_reading --match=postFoldTear specs/shard_recovery.qnt
+//     (scripted witness: a yes read before the fold is accepted on after
+//      it, and the crossing aborts the member)
+//   quint verify --main=cross_shard_pre_bridge_reading --invariant=invResidualBounded --max-steps=8 specs/shard_recovery.qnt
+//     (same tear, found by search)
 
 module cross_shard_freeze {
-  // The true halted tip H_t (unknown to any consumer). An old-committee EC
-  // above it is an orphan forgery.
+  // The true halted tip H_t (unknown to any sibling). An old-committee
+  // header above it is an orphan forgery.
   const HALT_TIP: int
   // The beacon-attested frontier at the start — the highest legit
-  // S-height an honest consumer had finalized and attested before the
-  // window (<= HALT_TIP).
+  // height an honest sibling had acted on and attested before the window
+  // (<= HALT_TIP).
   const ATTESTED_0: int
   // The epoch the beacon folds the recovery (halt detection).
   const FREEZE_EPOCH: int
   const MAX_HEIGHT: int
   const MAX_TIME: int
   // Broken twin: no beacon freeze (the unfenced counterfactual). The
-  // consumer has no authenticated cutoff and keeps resolving the old
-  // committee for any stale-anchored EC. True is the shipped fence.
+  // sibling has no authenticated cutoff and keeps resolving the old
+  // committee for any stale-anchored header. True is the shipped fence.
   const FREEZE_FENCE: bool
+  // Broken twin: a reading marked below the bridge still counts once the
+  // recovery is folded. True is the shipped reading rule.
+  const BRIDGE_RULE: bool
 
   var now: int
   // The beacon has folded the recovery (a committed fact).
   var beaconFrozen: bool
-  // The honest consumer has folded the recovery.
-  var consumerFolded: bool
-  // The beacon-attested S frontier from old-committee ECs: the max height
-  // an honest consumer has settled on and attested before it folded
-  // (forgeries included — the poisoning).
+  // The honest sibling has folded the recovery.
+  var siblingFolded: bool
+  // The beacon-attested frontier from old-committee headers: the max
+  // height an honest sibling has accepted on and attested before it
+  // folded (forgeries included — the poisoning).
   var attestedFrontier: int
-  // Snapshot of `attestedFrontier` when the consumer folded the recovery —
-  // the fence caps further old-committee verification at this height.
+  // Snapshot of `attestedFrontier` when the sibling folded the recovery —
+  // the fence caps further old-committee claims at this height.
   var frontierAtFold: int
-  // The fence was breached: a folded consumer verified an old-committee
-  // EC above the fold-time frontier — a NEW cross-shard forgery past the
-  // cut.
+  // The fence was breached: a folded sibling admitted a claim on an
+  // old-committee header above the fold-time frontier — a NEW cross-shard
+  // forgery past the cut.
   var breached: bool
-  // The heights whose old-committee certificate the consumer verified,
-  // and the subset it verified before folding the recovery.
-  var verified: Set[int]
-  var verifiedPreFold: Set[int]
-  // The heights the consumer settled on the old certificate, and those it
-  // ended aborted on the fresh committee's certificate.
-  var settled: Set[int]
-  var aborted: Set[int]
+  // The heights whose old-committee header the sibling read a yes off.
+  var read: Set[int]
+  // The members the sibling accepted, and the subset it accepted before
+  // folding the recovery.
+  var accepted: Set[int]
+  var acceptedPreFold: Set[int]
+  // The members the sibling refused on the recovered shard's exit.
+  var refused: Set[int]
+  // The accepted rows the sibling ended on the recovered shard's exit or
+  // accept.
+  var ended: Set[int]
   // The recovered shard has committed its crossing block, and the ticks
-  // that block discarded.
+  // that block discarded, each member of which it aborted there.
   var crossed: bool
   var discarded: Set[int]
+  // The members the recovered shard accepted past the bridge, on the
+  // sibling's accept.
+  var sourceAccepted: Set[int]
   // The fresh committee has advanced the shard post-freeze (liveness).
   var freshAdvanced: bool
 
-  // Whether the honest consumer verifies an old-committee EC at
-  // `srcHeight`. It resolves the old committee at the EC's stale anchor,
-  // whose signatures verify. The fence — folded record + the
-  // beacon-attested frontier — is the only gate; without it, any old EC
-  // verifies.
-  def acceptsOldEC(srcHeight: int): bool =
-    not(FREEZE_FENCE and consumerFolded and srcHeight > attestedFrontier)
+  // Whether the sibling admits a claim on an old-committee header at
+  // `srcHeight`. It resolves the old committee at the header's stale
+  // anchor, whose signatures verify. The fence — folded record + the
+  // beacon-attested frontier — is the only gate; without it, any old
+  // header proves.
+  def admitsOldHeader(srcHeight: int): bool =
+    not(FREEZE_FENCE and siblingFolded and srcHeight > attestedFrontier)
 
-  // The settlements a discard tears: the consumer settled on the old
-  // certificate of a tick the recovered shard let go of.
-  val torn: Set[int] = settled.intersect(discarded)
+  // Whether a reading off an old-committee header counts: every one is
+  // marked below the bridge, which the sibling's view records once it has
+  // folded the recovery.
+  val oldReadingCounts: bool = not(BRIDGE_RULE and siblingFolded)
 
-  // An honest consumer verifies an old-committee EC at `srcHeight`.
-  action verifyOldEC(srcHeight: int): bool = all {
-    srcHeight >= 0,
+  // The members the two shards end apart: the sibling accepted, and the
+  // recovered shard aborted at its crossing.
+  val torn: Set[int] = accepted.intersect(discarded)
+
+  // The sibling admits a claim on an old-committee header at `srcHeight`
+  // and records the yes it reads there.
+  action readOld(srcHeight: int): bool = all {
+    srcHeight >= 1,
     srcHeight <= MAX_HEIGHT,
-    acceptsOldEC(srcHeight),
-    not(srcHeight.in(verified)),
-    breached' = (breached or (consumerFolded and srcHeight > frontierAtFold)),
-    verified' = verified.union(Set(srcHeight)),
-    verifiedPreFold' =
-      if (consumerFolded) verifiedPreFold else verifiedPreFold.union(Set(srcHeight)),
+    admitsOldHeader(srcHeight),
+    not(srcHeight.in(read)),
+    breached' = (breached or (siblingFolded and srcHeight > frontierAtFold)),
+    read' = read.union(Set(srcHeight)),
     now' = now,
     beaconFrozen' = beaconFrozen,
-    consumerFolded' = consumerFolded,
+    siblingFolded' = siblingFolded,
     attestedFrontier' = attestedFrontier,
     frontierAtFold' = frontierAtFold,
-    settled' = settled,
-    aborted' = aborted,
+    accepted' = accepted,
+    acceptedPreFold' = acceptedPreFold,
+    refused' = refused,
+    ended' = ended,
     crossed' = crossed,
     discarded' = discarded,
+    sourceAccepted' = sourceAccepted,
     freshAdvanced' = freshAdvanced,
   }
 
-  // The consumer settles on a certificate it verified, folded or not: its
-  // own block admits the half, judging no band of the source. A
-  // settlement before the fold attests the height — at or below the true
-  // tip legit history, above it the poisoning.
-  action settleOldEC(srcHeight: int): bool = all {
-    srcHeight.in(verified),
-    not(srcHeight.in(settled.union(aborted))),
-    settled' = settled.union(Set(srcHeight)),
+  // The sibling's row accepts on a yes it read off an old-committee
+  // header, where that reading counts. An accept before the fold attests
+  // the height — at or below the true tip legit history, above it the
+  // poisoning.
+  action acceptOld(srcHeight: int): bool = all {
+    srcHeight.in(read),
+    oldReadingCounts,
+    not(srcHeight.in(accepted.union(refused))),
+    accepted' = accepted.union(Set(srcHeight)),
+    acceptedPreFold' =
+      if (siblingFolded) acceptedPreFold else acceptedPreFold.union(Set(srcHeight)),
     attestedFrontier' =
-      if (not(consumerFolded) and srcHeight > attestedFrontier) srcHeight
+      if (not(siblingFolded) and srcHeight > attestedFrontier) srcHeight
       else attestedFrontier,
     now' = now,
     beaconFrozen' = beaconFrozen,
-    consumerFolded' = consumerFolded,
+    siblingFolded' = siblingFolded,
     frontierAtFold' = frontierAtFold,
     breached' = breached,
-    verified' = verified,
-    verifiedPreFold' = verifiedPreFold,
-    aborted' = aborted,
+    read' = read,
+    refused' = refused,
+    ended' = ended,
     crossed' = crossed,
     discarded' = discarded,
+    sourceAccepted' = sourceAccepted,
     freshAdvanced' = freshAdvanced,
   }
 
   // The recovered shard commits its crossing block, discarding `lost`:
   // every tick above the halted tip, and whichever of the rest no kept
-  // block settled whole.
+  // block settled. Every member it releases is aborted there.
   action crossBridge(lost: Set[int]): bool = all {
     beaconFrozen,
     not(crossed),
     1.to(MAX_HEIGHT).filter(h => h > HALT_TIP).subseteq(lost),
     crossed' = true,
     discarded' = lost,
+    freshAdvanced' = true,
     now' = now,
     beaconFrozen' = beaconFrozen,
-    consumerFolded' = consumerFolded,
+    siblingFolded' = siblingFolded,
     attestedFrontier' = attestedFrontier,
     frontierAtFold' = frontierAtFold,
     breached' = breached,
-    verified' = verified,
-    verifiedPreFold' = verifiedPreFold,
-    settled' = settled,
-    aborted' = aborted,
+    read' = read,
+    accepted' = accepted,
+    acceptedPreFold' = acceptedPreFold,
+    refused' = refused,
+    ended' = ended,
+    sourceAccepted' = sourceAccepted,
+  }
+
+  // A folded sibling reads the fresh chain past the bridge on a member it
+  // shares. An aborted member reads `Left`: a stated row refuses and an
+  // accepted one ends. A kept member still reads its yes, which counts
+  // there.
+  action readFresh(srcHeight: int): bool = all {
+    crossed,
+    siblingFolded,
+    srcHeight >= 1,
+    srcHeight <= MAX_HEIGHT,
+    if (srcHeight.in(discarded)) all {
+      not(srcHeight.in(refused.union(ended))),
+      if (srcHeight.in(accepted)) all {
+        ended' = ended.union(Set(srcHeight)),
+        refused' = refused,
+      } else all {
+        refused' = refused.union(Set(srcHeight)),
+        ended' = ended,
+      },
+      accepted' = accepted,
+      acceptedPreFold' = acceptedPreFold,
+    } else all {
+      not(srcHeight.in(accepted.union(refused))),
+      accepted' = accepted.union(Set(srcHeight)),
+      acceptedPreFold' = acceptedPreFold,
+      refused' = refused,
+      ended' = ended,
+    },
+    now' = now,
+    beaconFrozen' = beaconFrozen,
+    siblingFolded' = siblingFolded,
+    attestedFrontier' = attestedFrontier,
+    frontierAtFold' = frontierAtFold,
+    breached' = breached,
+    read' = read,
+    crossed' = crossed,
+    discarded' = discarded,
+    sourceAccepted' = sourceAccepted,
     freshAdvanced' = freshAdvanced,
   }
 
-  // The fresh committee's abort of a discarded member reaches a folded
-  // consumer. It decides the member only where no certificate covered it
-  // first.
-  action abortFresh(srcHeight: int): bool = all {
+  // The recovered shard reads the sibling's accept of a member its
+  // crossing kept and accepts; the sibling then reads that accept and
+  // ends its row.
+  action sourceAccept(srcHeight: int): bool = all {
     crossed,
-    consumerFolded,
-    srcHeight.in(discarded),
-    not(srcHeight.in(verified)),
-    not(srcHeight.in(aborted)),
-    aborted' = aborted.union(Set(srcHeight)),
-    freshAdvanced' = true,
+    srcHeight.in(accepted),
+    not(srcHeight.in(discarded)),
+    not(srcHeight.in(sourceAccepted)),
+    sourceAccepted' = sourceAccepted.union(Set(srcHeight)),
     now' = now,
     beaconFrozen' = beaconFrozen,
-    consumerFolded' = consumerFolded,
+    siblingFolded' = siblingFolded,
     attestedFrontier' = attestedFrontier,
     frontierAtFold' = frontierAtFold,
     breached' = breached,
-    verified' = verified,
-    verifiedPreFold' = verifiedPreFold,
-    settled' = settled,
+    read' = read,
+    accepted' = accepted,
+    acceptedPreFold' = acceptedPreFold,
+    refused' = refused,
+    ended' = ended,
     crossed' = crossed,
     discarded' = discarded,
+    freshAdvanced' = freshAdvanced,
   }
 
-  // The fresh committee's EC — resolves the fresh committee, always safe;
-  // this is the recovery's liveness continuing past the freeze.
-  action consumeFreshEC: bool = all {
-    beaconFrozen,
-    freshAdvanced' = true,
-    now' = now, beaconFrozen' = beaconFrozen, consumerFolded' = consumerFolded,
-    attestedFrontier' = attestedFrontier, frontierAtFold' = frontierAtFold,
-    breached' = breached, verified' = verified, verifiedPreFold' = verifiedPreFold,
-    settled' = settled, aborted' = aborted, crossed' = crossed, discarded' = discarded,
+  action endOnAccept(srcHeight: int): bool = all {
+    siblingFolded,
+    srcHeight.in(sourceAccepted),
+    not(srcHeight.in(ended)),
+    ended' = ended.union(Set(srcHeight)),
+    now' = now,
+    beaconFrozen' = beaconFrozen,
+    siblingFolded' = siblingFolded,
+    attestedFrontier' = attestedFrontier,
+    frontierAtFold' = frontierAtFold,
+    breached' = breached,
+    read' = read,
+    accepted' = accepted,
+    acceptedPreFold' = acceptedPreFold,
+    refused' = refused,
+    crossed' = crossed,
+    discarded' = discarded,
+    sourceAccepted' = sourceAccepted,
+    freshAdvanced' = freshAdvanced,
   }
 
   action tick: bool = all {
@@ -1233,181 +1321,220 @@ module cross_shard_freeze {
     now' = now + 1,
     // The beacon folds the recovery at its detection epoch.
     beaconFrozen' = (beaconFrozen or (now + 1 >= FREEZE_EPOCH)),
-    consumerFolded' = consumerFolded,
+    siblingFolded' = siblingFolded,
     attestedFrontier' = attestedFrontier,
     frontierAtFold' = frontierAtFold,
     breached' = breached,
-    verified' = verified,
-    verifiedPreFold' = verifiedPreFold,
-    settled' = settled,
-    aborted' = aborted,
+    read' = read,
+    accepted' = accepted,
+    acceptedPreFold' = acceptedPreFold,
+    refused' = refused,
+    ended' = ended,
     crossed' = crossed,
     discarded' = discarded,
+    sourceAccepted' = sourceAccepted,
     freshAdvanced' = freshAdvanced,
   }
 
-  // The consumer folds the committed recovery — any time after the beacon
+  // The sibling folds the committed recovery — any time after the beacon
   // committed it, no fairness (it may lag).
-  action consumerFold: bool = all {
+  action siblingFold: bool = all {
     beaconFrozen,
-    not(consumerFolded),
-    consumerFolded' = true,
+    not(siblingFolded),
+    siblingFolded' = true,
     frontierAtFold' = attestedFrontier,
     now' = now, beaconFrozen' = beaconFrozen, attestedFrontier' = attestedFrontier,
-    breached' = breached, verified' = verified, verifiedPreFold' = verifiedPreFold,
-    settled' = settled, aborted' = aborted, crossed' = crossed, discarded' = discarded,
+    breached' = breached, read' = read, accepted' = accepted,
+    acceptedPreFold' = acceptedPreFold, refused' = refused, ended' = ended,
+    crossed' = crossed, discarded' = discarded, sourceAccepted' = sourceAccepted,
     freshAdvanced' = freshAdvanced,
   }
 
   action init = all {
     now' = 0,
     beaconFrozen' = false,
-    consumerFolded' = false,
+    siblingFolded' = false,
     attestedFrontier' = ATTESTED_0,
     frontierAtFold' = 0,
     breached' = false,
-    verified' = Set(),
-    verifiedPreFold' = Set(),
-    settled' = Set(),
-    aborted' = Set(),
+    read' = Set(),
+    accepted' = Set(),
+    acceptedPreFold' = Set(),
+    refused' = Set(),
+    ended' = Set(),
     crossed' = false,
     discarded' = Set(),
+    sourceAccepted' = Set(),
     freshAdvanced' = false,
   }
 
   action step = any {
     tick,
-    consumerFold,
-    consumeFreshEC,
-    nondet h = 0.to(MAX_HEIGHT).oneOf()
+    siblingFold,
+    nondet h = 1.to(MAX_HEIGHT).oneOf()
     any {
-      verifyOldEC(h),
-      settleOldEC(h),
-      abortFresh(h),
+      readOld(h),
+      acceptOld(h),
+      readFresh(h),
+      sourceAccept(h),
+      endOnAccept(h),
     },
-    nondet lost = 0.to(MAX_HEIGHT).powerset().oneOf()
+    nondet lost = 1.to(MAX_HEIGHT).powerset().oneOf()
     crossBridge(lost),
   }
 
   // ── Invariants ──
 
-  // The fence holds: no folded consumer verifies an old-committee EC
-  // above the frontier attested when it folded.
+  // The fence holds: no folded sibling admits a claim on an old-committee
+  // header above the frontier attested when it folded.
   val invFenceHolds = not(breached)
 
-  // The residual the discard leaves above the frontier is bounded to the
-  // pre-fold window: every certificate a folded consumer settled on for a
-  // discarded tick above the fold-time frontier is one it verified before
-  // it folded. At or below the frontier the tear is unbounded in time.
+  // Every member the two shards end apart is one the sibling accepted
+  // before it folded the recovery. The recovered shard refuses nothing
+  // the sibling refused on, so a tear is an accept beside an abort.
   val invResidualBounded =
-    consumerFolded implies
-      torn.filter(h => h > frontierAtFold).subseteq(verifiedPreFold)
+    torn.subseteq(acceptedPreFold) and refused.intersect(sourceAccepted) == Set()
 
-  // The first certificate covering a member decides it: never both the old
-  // certificate and the fresh abort.
-  val invOneOutcome = settled.intersect(aborted) == Set()
+  // The sibling ends a member one way: never both accepted and refused.
+  val invOneOutcome = accepted.intersect(refused) == Set()
+
+  // An accepted row the sibling ended is one the recovered shard ended:
+  // aborted at its crossing, or accepted past it.
+  val invEndsOnExit =
+    ended.subseteq(accepted.intersect(discarded.union(sourceAccepted)))
 
   // The fence reads only observable state — the folded record and the
   // attested frontier — never the true halted tip. With the fence on, a
-  // folded consumer's frontier is the one it folded.
+  // folded sibling's frontier is the one it folded.
   val invObservable =
-    (FREEZE_FENCE and consumerFolded) implies (attestedFrontier == frontierAtFold)
+    (FREEZE_FENCE and siblingFolded) implies (attestedFrontier == frontierAtFold)
 
   val invAll = and {
     invFenceHolds,
     invResidualBounded,
     invOneOutcome,
+    invEndsOnExit,
     invObservable,
   }
 
-  // ── Scripted witnesses (honest paths — valid under both instances) ──
+  // ── Scripted witnesses (honest paths — valid under every instance) ──
 
-  // Legit cross-shard history is attested up to the tip, the halt is
-  // detected and the beacon stamps the recovery, the consumer folds it,
-  // the crossing discards the tip's tick, and the fresh committee's abort
-  // ends a discarded member the consumer verified nothing for, while the
-  // fence stays intact. (A folded consumer verifying an above-frontier old
-  // EC is disabled under the fence, which is exactly the fence working;
-  // the twin's counterexample exhibits that firing.)
+  // Legit history is read and accepted up to the tip, the halt is
+  // detected and the beacon stamps the recovery, the sibling folds it,
+  // the crossing keeps that member and aborts the tick above it, and the
+  // sibling refuses the aborted member on the exit and ends its accept on
+  // the recovered shard's, while the fence stays intact. (A folded
+  // sibling admitting an above-frontier old claim is disabled under the
+  // fence, which is exactly the fence working; the twin's counterexample
+  // exhibits that firing.)
   run freezeClosesLeakTest =
     init
-      .then(verifyOldEC(2))
-      .then(settleOldEC(2))
+      .then(readOld(2))
+      .then(acceptOld(2))
       .expect(attestedFrontier == 2 and not(breached))
       .then(tick)
       .then(tick)
       .then(tick)
       .expect(beaconFrozen)
-      .then(consumerFold)
+      .then(siblingFold)
       .expect(frontierAtFold == 2)
       .then(crossBridge(Set(3, 4)))
-      .then(abortFresh(3))
-      .expect(freshAdvanced and not(breached) and torn == Set() and aborted == Set(3))
+      .then(readFresh(3))
+      .then(sourceAccept(2))
+      .then(endOnAccept(2))
+      .expect(freshAdvanced and not(breached) and torn == Set()
+        and refused == Set(3) and ended == Set(2))
 
-  // The residual above the frontier: the consumer verifies the old
-  // certificate of a tick above the frontier before it folds, settles on
-  // it after, and the crossing discards that tick. The fresh abort covers
-  // nothing new, so the consumer keeps what the recovered shard aborts —
-  // a tear decided by arrival order relative to the fold.
-  run tearVerifiedBeforeFoldTest =
+  // The tear: the sibling accepts on a yes read before it folds, and the
+  // crossing aborts that member. Its accepted row ends on the exit, and
+  // nothing stands.
+  run tearAcceptedBeforeFoldTest =
     init
-      .then(verifyOldEC(2))
+      .then(readOld(2))
+      .then(acceptOld(2))
       .then(tick)
       .then(tick)
       .then(tick)
-      .then(consumerFold)
-      .expect(frontierAtFold == 1)
-      .then(settleOldEC(2))
+      .then(siblingFold)
       .then(crossBridge(Set(2, 3, 4)))
-      .expect(torn == Set(2) and 2.in(verifiedPreFold) and not(breached))
+      .expect(torn == Set(2) and 2.in(acceptedPreFold) and not(breached))
+      .then(readFresh(2))
+      .expect(ended == Set(2) and invAll)
 
-  // The residual at or below the frontier: the consumer verifies and
-  // settles a discarded tick's old certificate after it folds, which no
-  // fence refuses.
-  run tearAtTheFrontierTest =
+  // A yes read before the fold and not yet accepted on decides nothing
+  // after it, at or below the frontier: the row waits for the fresh
+  // chain, which says the abort.
+  run readBeforeFoldDecidesNothingTest =
     init
+      .then(readOld(1))
       .then(tick)
       .then(tick)
       .then(tick)
-      .then(consumerFold)
-      .then(verifyOldEC(1))
-      .then(settleOldEC(1))
+      .then(siblingFold)
       .then(crossBridge(Set(1, 3, 4)))
-      .expect(torn == Set(1) and not(breached))
+      .then(readFresh(1))
+      .expect(refused == Set(1) and torn == Set() and invAll)
 
   // A pre-fold orphan (above the true tip) poisons the attested frontier —
   // irreversible, the detection-latency window — but once the recovery is
-  // folded no new orphan verifies and the fence is never breached.
+  // folded no new orphan is admitted and the fence is never breached.
   run residualPoisonTest =
     init
-      .then(verifyOldEC(3))
-      .then(settleOldEC(3))
+      .then(readOld(3))
+      .then(acceptOld(3))
       .expect(attestedFrontier == 3 and not(breached))
       .then(tick)
       .then(tick)
       .then(tick)
-      .then(consumerFold)
+      .then(siblingFold)
       .expect(frontierAtFold == 3 and not(breached))
+      .then(crossBridge(Set(3, 4)))
+      .expect(torn == Set(3) and 3.in(acceptedPreFold))
 }
 
-// The shipped configuration: the freeze fence is on.
+// The shipped configuration: the freeze fence and the reading rule are on.
 module cross_shard_freeze_ok {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
-    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = true
   ).*
 }
 
 // Broken twin: the unfenced counterfactual — no beacon freeze. The
-// consumer resolves the old committee for any stale-anchored EC forever,
-// so orphans keep verifying after the halt is detected and the consumer
-// folded — invFenceHolds fails, and a certificate verified after the fold
-// tears — invResidualBounded fails.
+// sibling resolves the old committee for any stale-anchored header
+// forever, so orphan claims keep proving after the halt is detected and
+// the sibling folded — invFenceHolds fails. The reading rule still keeps
+// such a reading from deciding anything.
 module cross_shard_no_freeze {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
-    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = false
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = false, BRIDGE_RULE = true
   ).*
+}
+
+// Broken twin: a reading marked below the bridge counts after the fold.
+// A yes the sibling read off the replaced committee's chain before it
+// folded decides an accept after it, which the crossing aborts —
+// invResidualBounded fails on a tear no arrival order before the fold
+// explains.
+module cross_shard_pre_bridge_reading {
+  import cross_shard_freeze(
+    HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = false
+  ).*
+
+  // The scripted twin witness: a yes read before the fold is accepted on
+  // after it, and the crossing aborts the member.
+  run postFoldTear =
+    init
+      .then(readOld(1))
+      .then(tick)
+      .then(tick)
+      .then(tick)
+      .then(siblingFold)
+      .then(acceptOld(1))
+      .then(crossBridge(Set(1, 3, 4)))
+      .expect(not(invResidualBounded))
 }
 
 // Active-fork detection and the commit-proof consumption gate — the
@@ -1481,7 +1608,7 @@ module cross_shard_no_freeze {
 //                      neither branch's provisions above the attested
 //                      frontier: the fork fence is commit-level and never
 //                      retreats (INV-SEC-13, extending `cross_shard_freeze`
-//                      from finalization to commit). The
+//                      from a reading to a commit). The
 //                      `fork_detection_no_fence` twin violates it.
 //   invArmingIdempotent — the fork recovery is stamped once at the attested
 //                      frontier and never moves, however many proofs arrive

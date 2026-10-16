@@ -170,7 +170,7 @@ mod tests {
             Arc::new(
                 Finalization::new(
                     *verdict.tick_id(),
-                    TickHalf::Legs,
+                    TickHalf::Determined,
                     &Capped::from_array([Arc::new(verdict.clone())]),
                     Capped::from_array([]),
                 )
@@ -297,7 +297,7 @@ mod tests {
         let storage = Arc::new(SimShardStorage::default());
         for (height, half_of, tx_hash) in [
             (1, TickHalf::Determined, determined),
-            (2, TickHalf::Legs, leg),
+            (2, TickHalf::Determined, leg),
         ] {
             let block = push_certificate(
                 make_test_block(BlockHeight::new(height)),

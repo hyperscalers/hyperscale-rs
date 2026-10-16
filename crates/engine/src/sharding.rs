@@ -7,11 +7,9 @@
 //! JMT must contain only its own subtree, so what a shard commits is
 //! filtered here first.
 
-use hyperscale_types::{Hash, SettledWrites, ShardId, ShardTrie, StateWrites, WritesRoot};
+use hyperscale_types::{SettledWrites, ShardId, ShardTrie, StateWrites};
 use hyperscale_vm_effects::{ShardId as VmShardId, ShardResolver};
 use hyperscale_vm_types::Address;
-
-use crate::executor::protocol_hash;
 
 /// The routing layer's view of the trie, for the classifier.
 ///
@@ -113,22 +111,6 @@ pub(crate) fn filter_writes_for_shard(
     filtered
 }
 
-/// The `writes_root` for a [`GlobalReceipt`](hyperscale_types::GlobalReceipt)
-/// over the writes the executing shard attests — the shard-projected
-/// delta for a batch with cross-shard members, the full fold for a
-/// whole-locality batch.
-///
-/// [`StateWrites`] encodes in canonical key order by construction, so the
-/// root is the hash of the encoding — a pure function of content with no
-/// sort step. Empty writes commit to [`WritesRoot::ZERO`].
-#[must_use]
-pub fn writes_root(writes: &StateWrites) -> WritesRoot {
-    if writes.is_empty() {
-        return WritesRoot::ZERO;
-    }
-    WritesRoot::from_raw(Hash::from(writes.root(protocol_hash)))
-}
-
 #[cfg(test)]
 mod resolver_tests {
     use hyperscale_types::AddressClass;
@@ -175,6 +157,8 @@ mod tests {
         }
         writes
     }
+
+    use hyperscale_types::writes_root;
 
     // ── writes_root ──────────────────────────────────────────────────────────
 

@@ -305,10 +305,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// cap on rows toward one shard.
     fn record_accepted_rows_toward_a_sibling(&self, rows: usize) {}
 
-    /// One comparison of what a member row's readings would have decided
-    /// with what its block did on certificates, by how the two compare.
-    fn record_decide_against_certificate(&self, agreement: &str) {}
-
     /// A consumer asking a producer's chain for a crossing record it
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
@@ -897,12 +893,6 @@ pub fn record_blocks_from_stated_to_heard(blocks: u64) {
 #[inline]
 pub fn record_accepted_rows_toward_a_sibling(rows: usize) {
     recorder().record_accepted_rows_toward_a_sibling(rows);
-}
-
-/// Record how a row's readings compare with what its block did.
-#[inline]
-pub fn record_decide_against_certificate(agreement: &str) {
-    recorder().record_decide_against_certificate(agreement);
 }
 
 /// Record a consumer's ask for a crossing record.

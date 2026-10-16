@@ -14,7 +14,6 @@ use hyperscale_engine::genesis::{
     GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
 };
 use hyperscale_engine::legs::{Classified, Member, PlanDefect};
-use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
     PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
@@ -35,7 +34,7 @@ use hyperscale_types::{
     MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
     RETENTION_HORIZON, SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites,
     Stated, SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
-    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path,
+    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, CrossingLeaf, Hash32, InstanceMeta,

@@ -1156,7 +1156,7 @@ pub fn test_a_foreign_ticks_finalization_is_stored_and_not_indexed(
     );
     let finalization: Verifiable<Finalization> = Finalization::new(
         *foreign.tick_id(),
-        TickHalf::Legs,
+        TickHalf::Determined,
         &Capped::from_array([Arc::new(foreign)]),
         Capped::from_array([]),
     )
@@ -2338,7 +2338,7 @@ pub fn test_tx_index_answers_with_the_local_shards_certificate(
     commit_empty_blocks_below(storage, BlockHeight::new(1));
     let certificate = Finalization::new(
         *local.tick_id(),
-        TickHalf::Legs,
+        TickHalf::Determined,
         &Capped::from_array([Arc::new(local.clone()), Arc::new(remote)]),
         Capped::from_array([]),
     );
@@ -2393,7 +2393,7 @@ pub fn test_the_tx_index_answers_with_every_certificate_of_this_shards(
             Arc::new(
                 Finalization::new(
                     *verdict.tick_id(),
-                    TickHalf::Legs,
+                    TickHalf::Determined,
                     &Capped::from_array([Arc::new(verdict.clone())]),
                     Capped::from_array([]),
                 )
@@ -7054,8 +7054,8 @@ fn abort_settled_of_one(shard: ShardId, tick: u64, height: u64, tx: TxHash) -> M
 /// and a claim at that root reads the verdict cell absent beside the
 /// row: nothing is stated, so the counterpart's accepted row waits.
 /// `named` is the lines a block names over the rows the store holds at
-/// an anchor: short of the row's deadline it names none, and at the
-/// deadline the row's abort. The reading is the same while the abort's
+/// an anchor: the row ran, so the first block after its release names
+/// its abort, short of its deadline. The reading is the same while the abort's
 /// tick holds the row. Once that tick's stating half deletes it, a claim
 /// reads the cell and the row absent beside the committed marker, the
 /// counterpart hears that the shard has left, and its accepted row ends.
@@ -7146,12 +7146,7 @@ pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + Tree
             settlement: Settlement::Shared,
         },
     );
-    assert_eq!(
-        named(&standing, deadline.at().minus(Duration::from_millis(1))),
-        vec![],
-        "the released row stands short of its deadline",
-    );
-    let abort = named(&standing, deadline.at());
+    let abort = named(&standing, deadline.at().minus(Duration::from_millis(1)));
     assert_eq!(abort, vec![abort_of_a_released_row(tx, reader, deadline)]);
     let aborting = claim_at(4, commit(4, &[], &naming(4, abort)));
     assert_eq!(

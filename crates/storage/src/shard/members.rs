@@ -315,10 +315,6 @@ pub struct HeardCells {
     /// The rows a reading of the block changed that then hold a reading
     /// of every sibling they await.
     pub complete: BTreeSet<TxHash>,
-    /// The rows a reading of the block found a sibling's verdict cell
-    /// holding a leaf of another shape for: a verdict shared among other
-    /// shards than the row's own.
-    pub other_shaped: BTreeSet<TxHash>,
 }
 
 impl HeardCells {
@@ -748,18 +744,17 @@ pub struct SettledHalf {
 }
 
 impl SettledHalf {
-    /// What `fw` settles, off the outcomes of its local certificate,
-    /// which admission requires of every committed finalization. Read
-    /// without relying on it, since a root is checked before a block's
-    /// sections are.
+    /// What `fw` settles: a legs half accepts every member it names, and
+    /// any other half deletes every member it settles, off the outcomes
+    /// of its local certificate. Read without relying on the half being
+    /// well formed, since a root is checked before a block's sections
+    /// are.
     #[must_use]
     pub fn of(fw: &Finalization) -> Self {
         let accepts = fw.accepted_names();
-        let (accepted, deleted): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
-            .settled_outcomes()
-            .partition(|outcome| accepts.contains(&outcome.tx_hash()));
-        let names =
-            |outcomes: Vec<&TxOutcome>| outcomes.into_iter().map(TxOutcome::tx_hash).collect();
+        let (accepted, deleted): (Vec<TxHash>, Vec<TxHash>) = fw
+            .tx_hashes()
+            .partition(|tx_hash| accepts.contains(tx_hash));
         let stated = fw
             .stated_outcomes()
             .filter_map(|outcome| match outcome.outcome() {
@@ -772,8 +767,8 @@ impl SettledHalf {
         Self {
             tick: *fw.tick_id(),
             half: fw.half(),
-            deleted: names(deleted),
-            accepted: names(accepted),
+            deleted,
+            accepted,
             stated,
         }
     }
@@ -863,6 +858,18 @@ impl MemberInputs {
             manifest: Arc::new(Capped::empty()),
             terms: Vec::new(),
             heard: Vec::new(),
+        }
+    }
+
+    /// What the claims of a block on `shard` say to the rows that hear,
+    /// and nothing else of the block: the inputs a block's legs halves
+    /// are judged over, before any finalization of it settles. Their
+    /// anchors are marked on the `windows` grid.
+    #[must_use]
+    pub fn hearing(shard: ShardId, claims: &[StateClaim], windows: EpochWindows) -> Self {
+        Self {
+            heard: AnchorReadings::among(claims, windows),
+            ..Self::still(shard)
         }
     }
 
@@ -1169,9 +1176,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     .entry(at.anchor)
                     .or_default()
                     .extend(read.clone());
-                if said == Some(Said::Left) && at.cells.get(&leaf) != Some(&Inclusion::Absent) {
-                    cells.other_shaped.insert(tx);
-                }
                 if row.hear(Heard {
                     shard: sibling,
                     mark,
@@ -1779,7 +1783,8 @@ pub fn verdict_changes(
             finalization
                 .stated_outcomes()
                 .chain(finalization.settled_outcomes())
-                .map(TxOutcome::tx_hash),
+                .map(TxOutcome::tx_hash)
+                .chain(finalization.accepted_names()),
         );
     }
     for line in block.tick_manifest().iter() {
@@ -2160,7 +2165,6 @@ impl Substates for MemberIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::slice::from_ref;
 
     use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree};
@@ -2168,11 +2172,10 @@ mod tests {
         StubTree, make_live_block, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
     };
     use hyperscale_types::{
-        AddressClass, AggregateSignature, Declared, Derivation, DerivationError, Derived, Epoch,
-        ExecutionCertificate, GlobalReceiptRoot, LocalKey, MAX_CLAIMS_PER_BLOCK,
-        MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_PER_BLOCK,
-        MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, Role, RoutePrefix, SignerBitfield,
-        StateRoot, TransactionEnvelope, ValidatorId, shard_prefix_path,
+        AddressClass, ConsensusReceipt, Declared, Derivation, DerivationError, Derived, Epoch,
+        LocalKey, MAX_CLAIMS_PER_BLOCK, MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY,
+        MAX_STATE_CLAIMS_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, RoutePrefix,
+        StateRoot, StoredReceipt, TransactionEnvelope, ValidatorId, shard_prefix_path,
     };
     use hyperscale_vm_effects::CrossingId;
     use proptest::collection::vec;
@@ -2745,6 +2748,47 @@ mod tests {
         );
     }
 
+    /// A recovery deletes the yes leaf of every row stated in the ticks
+    /// its crossing block discards, whichever tick stated it: no leaf
+    /// outlives the row that said so, and each row stands released.
+    #[test]
+    fn a_recovery_deletes_a_stated_rows_leaf() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2]));
+        store.fold(&naming(2, vec![sharing(1, 7)]));
+        store.fold(&naming(3, vec![sharing(2, 9)]));
+        store.fold(&stating(4, 2, &[], &[1]));
+        store.fold(&stating(5, 3, &[], &[2]));
+        assert!(leaf_of(&store, 1).is_some() && leaf_of(&store, 2).is_some());
+
+        store.fold(&naming(
+            6,
+            vec![
+                TickLine::Discard {
+                    tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                    cause: DiscardCause::Recovery,
+                },
+                TickLine::Discard {
+                    tick: TickId::new(LOCAL, BlockHeight::new(3)),
+                    cause: DiscardCause::Recovery,
+                },
+            ],
+        ));
+        for seed in [1, 2] {
+            assert!(
+                leaf_of(&store, seed).is_none(),
+                "{seed}'s yes leaf is deleted"
+            );
+            assert_eq!(
+                state_of(&store, seed),
+                Some(RowState::Released {
+                    settlement: Settlement::Shared,
+                }),
+            );
+        }
+        assert!(MemberIndex::load(&store, LOCAL).ticks.is_empty());
+    }
+
     /// A legs half accepts only a row stated in its own tick: one in
     /// flight, one stated in another tick, one pending and one released
     /// are left as they stand, and a second fold of an accepting block
@@ -2893,62 +2937,28 @@ mod tests {
         assert!(rows.members.is_empty() && rows.ticks.is_empty());
     }
 
-    /// A legs half moves a member to accepted only where its
-    /// certificates settle it by effects: with a counterpart it names
-    /// yet to report, the half accepts nothing, as it settles nothing.
+    /// A legs half carries no certificate and accepts every member it
+    /// names, carrying each one's effects receipt: it deletes no row.
     #[test]
-    fn a_legs_half_missing_a_counterparts_certificate_accepts_nothing() {
-        let member = tx(1);
-        let outcome = || {
-            TxOutcome::new(
-                member,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: effects(1),
-                },
-            )
-            .charging(0)
-            .awaiting([PEER])
-            .as_role(Role::Core)
+    fn a_legs_half_accepts_every_member_it_names() {
+        let receipt = |seed: u8| StoredReceipt {
+            tx_hash: tx(seed),
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
         };
-        let certificate = |shard: ShardId, outcome: TxOutcome| {
-            Arc::new(ExecutionCertificate::new(
-                TickId::new(shard, BlockHeight::new(2)),
-                WeightedTimestamp::from_millis(2),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([outcome]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ))
-        };
-        let legs = |certificates: Vec<Arc<ExecutionCertificate>>| {
-            Finalization::new(
-                TickId::new(LOCAL, BlockHeight::new(2)),
-                TickHalf::Legs,
-                &Capped::new(certificates).expect("two certificates"),
-                Capped::empty(),
-            )
-            .naming(&HashSet::from([member]))
-        };
-
-        let uncovered = legs(vec![certificate(LOCAL, outcome())]);
-        assert!(uncovered.accepted_names().is_empty());
-        let half = SettledHalf::of(&uncovered);
-        assert_eq!((half.accepted, half.deleted), (vec![], vec![member]));
-        assert!(uncovered.settling_receipts().is_empty());
-
-        let covered = legs(vec![
-            certificate(LOCAL, outcome()),
-            certificate(PEER, TxOutcome::new(member, outcome().outcome().clone())),
-        ]);
-        let half = SettledHalf::of(&covered);
-        assert_eq!((half.accepted, half.deleted), (vec![member], vec![]));
-
-        let refused = legs(vec![
-            certificate(LOCAL, outcome()),
-            certificate(PEER, TxOutcome::new(member, ExecutionOutcome::Failed)),
-        ]);
-        let half = SettledHalf::of(&refused);
-        assert_eq!((half.accepted, half.deleted), (vec![], vec![member]));
+        let half = SettledHalf::of(&Finalization::accepting(
+            TickId::new(LOCAL, BlockHeight::new(2)),
+            Capped::new(vec![receipt(1), receipt(2)]).expect("two receipts"),
+        ));
+        assert_eq!(
+            (half.half, half.accepted, half.deleted),
+            (TickHalf::Legs, vec![tx(1), tx(2)], vec![]),
+        );
+        assert!(half.stated.is_empty());
     }
 
     fn state_of(store: &Entries, seed: u8) -> Option<RowState> {
@@ -3896,7 +3906,8 @@ mod tests {
     /// A row owes the counts of the crossings its committing block's
     /// terms carry from its commit until its writes land: pending, in
     /// flight, released and stated alike, and nothing once it stands
-    /// accepted. A finalization deleting it takes what it owes with it.
+    /// accepted. A finalization deleting it, a stated row's abort among
+    /// them, takes what it owes with it.
     #[test]
     fn a_row_owes_its_crossings_until_its_writes_land() {
         let owed = Owes::of(&stub_stated_terms(tx(1), 1).terms.crossings);
@@ -3925,6 +3936,27 @@ mod tests {
         let accepted = row_of(&store, 1).expect("accepted");
         assert_eq!(accepted.state, RowState::Accepted);
         assert!(accepted.owes.is_empty(), "its writes landed");
+
+        let mut store = stated_beside_peer();
+        store.fold(&naming(4, vec![joining(1, Joins::Aborted)]));
+        let aborting = row_of(&store, 1).expect("aborting");
+        assert!(matches!(
+            aborting.state,
+            RowState::InFlight {
+                joins: Joins::Aborted,
+                ..
+            }
+        ));
+        assert_eq!(
+            aborting.owes, owed,
+            "an abort of a stated yes lands nothing"
+        );
+        store.fold(&settling(5, 4, TickHalf::Determined, &[1]));
+        assert_eq!(
+            row_of(&store, 1),
+            None,
+            "the settled abort takes what it owes"
+        );
     }
 
     /// A transaction its own block commits and runs owes, from that

@@ -2,17 +2,12 @@
 //! one release that re-drives it.
 //!
 //! Every artifact here was refused nothing: it arrived before what it
-//! needs — a beacon epoch, a source block's commit proof, a departed
-//! partner's settled set — and goes back through the handler it came
-//! in by once that lands. Holding is bounded per reason and shard,
-//! oldest dropped: a node this far behind re-fetches through ordinary
-//! sync regardless, and the expected-certificate tracker re-fetches a
-//! certificate on timeout.
-//!
-//! A finalization built here and held on its settlement is the
-//! locally-produced class of [`hyperscale_types::verifiable`]: content-
-//! addressed, held once, and never dropped on a clock — a deadline
-//! verdict could contradict a settlement the partner already committed.
+//! needs — a beacon epoch, or a source block's commit proof, which a
+//! departed partner's settled set stands in for — and goes back through
+//! the handler it came in by once that lands. Holding is bounded per
+//! reason and shard, oldest dropped: a node this far behind re-fetches
+//! through ordinary sync regardless, and the expected-certificate tracker
+//! re-fetches a certificate on timeout.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -36,11 +31,6 @@ pub enum Waiting {
     /// corrupt committee can certify a sibling that never commits and
     /// export certificates computed from it.
     Proof(ShardId),
-    /// The finalize gate deferred: a contained certificate names a
-    /// shard scheduled to terminate, or past-terminal with its settled
-    /// set not yet known. Re-asked on every commit and when a set is
-    /// recorded; leaves only on evidence.
-    Settlement,
 }
 
 /// What arrived.
@@ -49,15 +39,13 @@ pub enum Parked {
     Certificate(Box<Verifiable<ExecutionCertificate>>),
     /// A finalization fetched from a peer.
     Fetched(Arc<Verifiable<Finalization>>),
-    /// A finalization this validator built.
-    Built(Arc<Verifiable<Finalization>>),
 }
 
 impl Parked {
     fn shard(&self) -> ShardId {
         match self {
             Self::Certificate(cert) => cert.shard_id(),
-            Self::Fetched(tick) | Self::Built(tick) => tick.tick_id().shard_id(),
+            Self::Fetched(tick) => tick.tick_id().shard_id(),
         }
     }
 }
@@ -69,19 +57,15 @@ pub enum Wake {
     Beacon,
     /// A block of this shard was commit-proven.
     Proof(ShardId),
-    /// A block committed here.
-    Commit,
     /// This departed shard's settled set was recorded: it stands in for
-    /// the commit proof of everything it names, and answers the
-    /// settlement question.
+    /// the commit proof of everything it names.
     SettledSet(ShardId),
 }
 
 impl Wake {
     fn releases(self, waiting: Waiting) -> bool {
         match (self, waiting) {
-            (Self::Beacon, Waiting::Beacon)
-            | (Self::Commit | Self::SettledSet(_), Waiting::Settlement) => true,
+            (Self::Beacon, Waiting::Beacon) => true,
             (Self::Proof(shard) | Self::SettledSet(shard), Waiting::Proof(held)) => shard == held,
             _ => false,
         }
@@ -98,12 +82,6 @@ impl ParkedArtifacts {
     /// Hold `item` until `waiting` is answered.
     pub(crate) fn park(&mut self, waiting: Waiting, item: Parked) {
         let queue = self.held.entry((waiting, item.shard())).or_default();
-        if let Parked::Built(tick) = &item {
-            let id = tick.receipt_hash();
-            queue.retain(|held| !matches!(held, Parked::Built(held) if held.receipt_hash() == id));
-            queue.push_back(item);
-            return;
-        }
         queue.push_back(item);
         while queue.len() > MAX_PARKED_PER_SHARD {
             queue.pop_front();
@@ -169,7 +147,6 @@ mod tests {
         parked.park(Waiting::Beacon, cert(a, 3));
 
         assert_eq!(parked.release(Wake::Proof(a)).len(), 1);
-        assert_eq!(parked.release(Wake::Commit).len(), 0);
         assert_eq!(parked.waiting_on(|w| matches!(w, Waiting::Proof(_))), 1);
         assert_eq!(parked.release(Wake::SettledSet(b)).len(), 1);
         assert_eq!(parked.release(Wake::Beacon).len(), 1);

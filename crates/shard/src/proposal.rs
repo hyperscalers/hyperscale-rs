@@ -20,7 +20,7 @@ use std::sync::Arc;
 use hyperscale_core::Action;
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
 use hyperscale_storage::{
-    SettledHalf, Substates, committed_tx_cell_key, member_row_leaf, unclaimed_records,
+    RowState, SettledHalf, Substates, committed_tx_cell_key, member_row_leaf, unclaimed_records,
 };
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, BoundaryAttestation,
@@ -177,6 +177,10 @@ pub struct ProposalPayload {
     /// What the read frontier judges of the claims selected, for the
     /// builder to drop against the parent state.
     pub(crate) fence: ReadFence,
+    /// The legs halves among `finalizations` this proposer cut to the
+    /// names that stand at the block's anchor: no other replica holds
+    /// them, so they are handed to the node that serves them.
+    pub(crate) cut_legs: Vec<Arc<Verifiable<Finalization>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -556,7 +560,9 @@ pub struct ParentReads {
 /// more wherever the first two take less. Each claim is charged as
 /// admission charges it.
 ///
-/// The verdict claims are taken in the order offered, each cut first to
+/// The verdict claims are taken in the order offered, those naming a row
+/// stated at the parent first where this shard is terminating at the
+/// block's anchor, each cut first to
 /// what a row at the parent would hear once the block's `finalizations`
 /// have settled, by [`heard_at_the_parent`], and carried only where it
 /// fits the section's order beside what is already selected: a claim
@@ -613,6 +619,7 @@ pub fn select_claims(
             spans.entry(claim.anchor).or_default().push((*lo, *hi));
         }
     }
+    let verdict_claims = stated_readings_first(ctx, verdict_claims);
     let settled: BTreeSet<TxHash> = if verdict_claims.is_empty() {
         BTreeSet::new()
     } else {
@@ -696,6 +703,27 @@ pub fn select_claims(
     selected.sort_unstable();
     at_parent.crossings.extend(returned);
     (selected, at_parent)
+}
+
+/// `verdict_claims` in the order a block spends on them: on a
+/// terminating shard, the readings a stated row awaits ride ahead of the
+/// rest, since its stated rows must read their siblings' accepts before
+/// the cut. Stable, so each part keeps the order it was offered in.
+fn stated_readings_first(
+    ctx: &Committed<'_>,
+    mut verdict_claims: Vec<StateClaim>,
+) -> Vec<StateClaim> {
+    if ctx.terminating.contains(ctx.local_shard) {
+        verdict_claims.sort_by_key(|claim| {
+            !claim.verdicts.iter().any(|tx| {
+                ctx.members
+                    .members
+                    .get(tx)
+                    .is_some_and(|row| matches!(row.state, RowState::Stated { .. }))
+            })
+        });
+    }
+    verdict_claims
 }
 
 /// The transactions whose member rows a block carrying `selected` may
@@ -1086,6 +1114,7 @@ pub fn assemble_build_action(
         local_crossings,
         rowless,
         fence,
+        cut_legs: _,
     } = payload;
     let parent_anchor = Anchor {
         shard: local_shard,
@@ -1194,7 +1223,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::{MemberRow, RowState, committed_tx_cell_key, member_row_leaf};
+    use hyperscale_storage::{MemberRow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::test_utils::{
         finalization_of, install_stub_protocol_statics, make_finalization, make_finalization_on,
         make_leg_finalization, proven_claim, stub_abort_charge, stub_transaction,
@@ -1415,7 +1444,7 @@ mod tests {
             "the fixture has to decide nothing, or it tests the ordinary path",
         );
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::clone(&committed)]);
+        dedup_index.register_committed_certs(&[Arc::clone(&committed)], WeightedTimestamp::ZERO);
 
         let against = finalizations_against(dedup_index);
         let ctx = against.ctx();
@@ -1437,7 +1466,7 @@ mod tests {
             make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
         );
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(from_ref(&committed));
+        dedup_index.register_committed_certs(from_ref(&committed), WeightedTimestamp::ZERO);
 
         let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
             make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
@@ -2876,6 +2905,77 @@ mod tests {
         assert_eq!(
             select(vec![inner.clone(), outer, apart.clone()]),
             vec![inner, apart]
+        );
+    }
+
+    /// A shard terminating at the end of the block's window offers the
+    /// readings its stated rows await ahead of every other verdict
+    /// reading, with no row changed: a stated row must read its siblings'
+    /// accepts before the cut, where an accepted row waiting to end can
+    /// be ended by the terminal. Two readings that cannot ride one block
+    /// then ride in the other order.
+    #[test]
+    fn an_offering_follows_a_termination_scheduled_with_no_row_change() {
+        let local = ShardId::leaf(1, 1);
+        let members: Vec<TxHash> = (1..=3).map(heard_member).collect();
+        let mut keyed: Vec<(SubstateKey, TxHash)> = members
+            .iter()
+            .map(|tx| (verdict_leaf(SIBLING, *tx), *tx))
+            .collect();
+        keyed.sort_unstable();
+        let leaves: Vec<SubstateKey> = keyed.iter().map(|(leaf, _)| *leaf).collect();
+        let [(low, low_tx), (mid, mid_tx), (high, high_tx)] = [keyed[0], keyed[1], keyed[2]];
+        let accepted = proven_claim(SIBLING, 3, &leaves, &[low, high]).hearing([low_tx, high_tx]);
+        let stated = proven_claim(SIBLING, 3, &leaves, &[mid]).hearing([mid_tx]);
+        let rows = [
+            MemberRow {
+                state: RowState::Accepted,
+                ..stated_row(low_tx, None)
+            },
+            stated_row(mid_tx, None),
+            MemberRow {
+                state: RowState::Accepted,
+                ..stated_row(high_tx, None)
+            },
+        ];
+        let snapshot = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        );
+        let at = |terminal: BTreeMap<ShardId, Epoch>| {
+            let window = Arc::new(snapshot.clone().with_scheduled_terminals(terminal));
+            let mut against = Against::schedule(
+                snapshot.clone(),
+                TopologySchedule::new(1_000, Epoch::new(3), window),
+            );
+            against.local_shard = local;
+            against.anchor = WeightedTimestamp::from_millis(3_500);
+            against.members.members = rows.iter().map(|row| (row.tx, row.clone())).collect();
+            against
+        };
+        let select = |against: &Against| {
+            select_claims(
+                &against.ctx(),
+                &mut StateClaimsFold::default(),
+                Vec::new(),
+                vec![accepted.clone(), stated.clone()],
+                &[],
+                Vec::new(),
+                &[],
+            )
+            .0
+        };
+        assert_eq!(select(&at(BTreeMap::new())), vec![accepted.clone()]);
+        assert_eq!(
+            select(&at(BTreeMap::from([(local, Epoch::new(3))]))),
+            vec![stated.clone()],
+            "terminating, the stated row's reading rides first",
+        );
+        assert_eq!(
+            select(&at(BTreeMap::from([(SIBLING, Epoch::new(3))]))),
+            vec![accepted],
+            "a terminating sibling reorders nothing here",
         );
     }
 

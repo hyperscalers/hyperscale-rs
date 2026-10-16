@@ -623,9 +623,9 @@ pub mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
-        BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
-        EngagementRoot, Epoch, Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-        Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES,
+        BodyRootContext, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline, DiscardCause,
+        Engagement, EngagementRoot, Epoch, Evidence, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES,
         MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS, MAX_NAMED_MEMBERS_PER_TICK,
         MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
         MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
@@ -634,11 +634,11 @@ pub mod tests {
         ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
         RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId,
         ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
-        StatedTerms, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        StatedTerms, StoredReceipt, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
         TimeoutCertificate, TimestampRange, TopologySchedule, Transaction, TransactionDecision,
         TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
         Verified, Verify, VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
-        state_claims_admit_block, test_utils, verdict_leaf,
+        receipt_hash_of, state_claims_admit_block, test_utils, verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
@@ -753,39 +753,42 @@ pub mod tests {
         }
     }
 
-    /// The legs half of tick 2 over a certificate attesting each of
-    /// `members` succeeded, naming those of `named`.
-    fn legs_naming(members: &[TxHash], named: &[TxHash]) -> Finalization {
-        use hyperscale_types::{ExecutionCertificate, GlobalReceiptRoot, Role, TickHalf};
-        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
-        let outcomes: Vec<TxOutcome> = members
-            .iter()
-            .map(|&tx| {
-                TxOutcome::new(
-                    tx,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .charging(0)
-                .as_role(Role::Core)
-            })
-            .collect();
-        let certificate = ExecutionCertificate::new(
-            tick_id,
-            WeightedTimestamp::from_millis(2),
-            GlobalReceiptRoot::ZERO,
-            Capped::new(outcomes).expect("a list written out in a test"),
-            AggregateSignature::ZERO,
-            SignerBitfield::new(4),
-        );
-        Finalization::new(
-            tick_id,
-            TickHalf::Legs,
-            &Capped::from_array([Arc::new(certificate)]),
-            Capped::empty(),
+    /// The effects receipt of `tx`'s run: no writes and no events, under
+    /// the hash that content recomputes to, which [`succeeded`] states
+    /// and [`stated_in`] records.
+    fn effects_of(tx: TxHash) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash: tx,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: effects_hash(),
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        }
+    }
+
+    /// The hash of every [`effects_of`] receipt.
+    fn effects_hash() -> GlobalReceiptHash {
+        receipt_hash_of(
+            &ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            },
+            true,
         )
-        .naming(&named.iter().copied().collect())
+        .expect("a projected success")
+    }
+
+    /// The legs half of tick 2 accepting each of `named`.
+    fn legs_naming(named: &[TxHash]) -> Finalization {
+        Finalization::accepting(
+            TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+            Capped::new(named.iter().map(|&tx| effects_of(tx)).collect())
+                .expect("a list written out in a test"),
+        )
     }
 
     /// Where a row stands once the stating half of the tick at `tick`
@@ -793,7 +796,7 @@ pub mod tests {
     fn stated_in(tick: u64) -> RowState {
         RowState::Stated {
             tick: BlockHeight::new(tick),
-            receipt: GlobalReceiptHash::ZERO,
+            receipt: effects_hash(),
         }
     }
 
@@ -842,7 +845,7 @@ pub mod tests {
 
     fn succeeded() -> ExecutionOutcome {
         ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
+            receipt_hash: effects_hash(),
         }
     }
 
@@ -1085,7 +1088,7 @@ pub mod tests {
     #[test]
     fn a_legs_half_before_its_stating_half_is_refused() {
         let member = TxHash::from(Hash::from_bytes(b"a core member"));
-        let (stating, legs) = (stating_yes(2, &[member]), legs_naming(&[member], &[member]));
+        let (stating, legs) = (stating_yes(2, &[member]), legs_naming(&[member]));
 
         let against = holding_in_flight(&[member]);
         let err = settles(&against, &legs).unwrap_err();
@@ -1109,6 +1112,39 @@ pub mod tests {
         assert!(err.contains("does not hold for its Legs half"), "{err}");
     }
 
+    /// A legs half whose receipt recomputes to the hash it names, and so
+    /// decodes, is refused where that hash is not the one the member's
+    /// stated row records: the receipt it carries is the row's or none.
+    #[test]
+    fn a_receipt_whose_content_misses_the_rows_hash_is_refused() {
+        let member = TxHash::from(Hash::from_bytes(b"a core member"));
+        let unhashed = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: make_state_writes(1, 1, vec![1]),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        };
+        let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
+        assert_ne!(receipt_hash, effects_hash());
+        let other = Finalization::accepting(
+            TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+            Capped::new(vec![StoredReceipt {
+                tx_hash: member,
+                consensus: Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash,
+                    writes: make_state_writes(1, 1, vec![1]),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
+                }),
+            }])
+            .expect("a list written out in a test"),
+        );
+        let stated = holding_legs(&[member]);
+        let err = settles(&stated, &other).unwrap_err();
+        assert!(err.contains("does not record"), "{err}");
+        assert_eq!(settles(&stated, &legs_naming(&[member])), Ok(()));
+    }
+
     /// A core member's share enters the cumulative fees once, in the
     /// block carrying its tick's stating half: the legs half that later
     /// settles it adds nothing, whichever way its counterparts decided,
@@ -1116,7 +1152,6 @@ pub mod tests {
     /// the share its row carries once stated, which is nothing.
     #[test]
     fn cumulative_fees_count_a_core_member_once() {
-        use hyperscale_types::{ExecutionCertificate, GlobalReceiptRoot, TickHalf};
         let (accepted, refused) = (
             TxHash::from(Hash::from_bytes(b"an accepted core")),
             TxHash::from(Hash::from_bytes(b"a refused core")),
@@ -1128,19 +1163,7 @@ pub mod tests {
                 core_outcome(refused, ExecutionOutcome::Failed, 12),
             ],
         ));
-        let legs = Arc::new(Finalization::new(
-            *stating.tick_id(),
-            TickHalf::Legs,
-            &Capped::from_array([Arc::new(ExecutionCertificate::new(
-                *stating.tick_id(),
-                WeightedTimestamp::from_millis(2),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([core_outcome(accepted, succeeded(), 30)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ))]),
-            Capped::empty(),
-        ));
+        let legs = Arc::new(legs_naming(&[accepted]));
         assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), [accepted]);
         let fees_after = |blocks: &[&Block]| {
             blocks
@@ -1249,11 +1272,7 @@ pub mod tests {
         let mut fold = FinalizationsFold::from(&ctx);
         for named in [first, second] {
             assert_eq!(
-                FinalizationsSection::admit(
-                    &ctx,
-                    &mut fold,
-                    &legs_naming(&[first, second], &[named]),
-                ),
+                FinalizationsSection::admit(&ctx, &mut fold, &legs_naming(&[named]),),
                 Ok(()),
             );
         }
@@ -1265,17 +1284,14 @@ pub mod tests {
     /// naming a member that still stands there is admitted.
     #[test]
     fn a_second_legs_finalization_of_one_tick_is_admitted() {
-        let (settled, standing) = (
-            TxHash::from(Hash::from_bytes(b"settled leg")),
-            TxHash::from(Hash::from_bytes(b"standing leg")),
-        );
+        let standing = TxHash::from(Hash::from_bytes(b"standing leg"));
         let against = holding_legs(&[standing]);
         let ctx = against.ctx();
         assert_eq!(
             FinalizationsSection::admit(
                 &ctx,
                 &mut FinalizationsFold::from(&ctx),
-                &legs_naming(&[settled, standing], &[standing]),
+                &legs_naming(&[standing]),
             ),
             Ok(()),
         );
@@ -1290,7 +1306,7 @@ pub mod tests {
             TxHash::from(Hash::from_bytes(b"settled leg")),
             TxHash::from(Hash::from_bytes(b"standing leg")),
         );
-        let both = legs_naming(&[settled, standing], &[settled, standing]);
+        let both = legs_naming(&[settled, standing]);
 
         let against = holding_legs(&[standing]);
         let ctx = against.ctx();
@@ -1302,11 +1318,7 @@ pub mod tests {
         let ctx = against.ctx();
         let mut fold = FinalizationsFold::from(&ctx);
         assert_eq!(
-            FinalizationsSection::admit(
-                &ctx,
-                &mut fold,
-                &legs_naming(&[settled, standing], &[settled]),
-            ),
+            FinalizationsSection::admit(&ctx, &mut fold, &legs_naming(&[settled]),),
             Ok(()),
         );
         let err = FinalizationsSection::admit(&ctx, &mut fold, &both).unwrap_err();
@@ -2503,10 +2515,11 @@ pub mod tests {
 
     /// Rows a recovery released, each awaiting one sibling that still
     /// answers and covered by no record, hold that sibling at its cap
-    /// only to their deadline: the block anchored there aborts every one
-    /// of them, which takes each out of the count toward the sibling, and
-    /// the stating half of that block's tick deletes the rows and takes
-    /// them out of the drain.
+    /// only to their deadline where they never ran: the block anchored
+    /// there aborts every one of them, which takes each out of the count
+    /// toward the sibling, and the stating half of that block's tick
+    /// deletes the rows and takes them out of the drain. Rows that ran
+    /// hold it to no clock: the first block names their aborts.
     #[test]
     fn released_rows_leave_the_count_and_the_drain_from_their_deadline() {
         use hyperscale_engine::tick_select::{CommittedSets, member_lines};
@@ -2524,6 +2537,10 @@ pub mod tests {
             row.reach = Capped::from_array([near]);
             row.deadline = deadline;
         }
+        let mut ran = against.members.clone();
+        for row in against.members.members.values_mut() {
+            row.executed = false;
+        }
         let named = |rows: &MemberIndex, anchor: WeightedTimestamp| {
             let (lines, missing, _) = member_lines(
                 rows,
@@ -2532,11 +2549,14 @@ pub mod tests {
                 &|_, _| Evidence::Live { terminating: false },
                 false,
                 &BTreeSet::new(),
+                &BTreeMap::new(),
             );
             assert!(missing.is_empty());
             lines
         };
         let short = deadline.at().minus(std::time::Duration::from_millis(1));
+        assert_eq!(named(&ran, short).len(), MAX_STANDING_TOWARD_SHARD);
+        ran.members.clear();
         assert!(named(&against.members, short).is_empty());
         assert!(admit_in_order(&against, &[&first])[0].is_err());
 
@@ -3558,7 +3578,8 @@ pub mod tests {
         let fw = survivor_finalization_at(1);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
+        dedup_index
+            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3579,7 +3600,8 @@ pub mod tests {
         assert_eq!(fw.deciding_tx_hashes().count(), 0);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
+        dedup_index
+            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3599,7 +3621,10 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
+        dedup_index.register_committed_certs(
+            &[Arc::new((*settled).clone().into())],
+            WeightedTimestamp::ZERO,
+        );
 
         let abandoned = survivor_finalization_over(9, tx_hash);
         assert_ne!(abandoned.tick_id(), settled.tick_id());
@@ -3625,7 +3650,10 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
+        dedup_index.register_committed_certs(
+            &[Arc::new((*settled).clone().into())],
+            WeightedTimestamp::ZERO,
+        );
 
         let block = block_with_verdicts(
             vec![AbandonmentRecord::new(
@@ -3903,46 +3931,30 @@ pub mod tests {
         assert!(err.contains("still owes"), "{err}");
     }
 
-    /// The legs half of the tick at `height` over a certificate attesting
-    /// `tx` succeeded as a leg, with the receipt stating what it left.
+    /// The legs half of the tick at `height` accepting `tx`, its effects
+    /// receipt leaving `writes`.
     fn legs_leaving(height: u64, tx: TxHash, writes: StateWrites) -> Finalization {
-        use hyperscale_types::{
-            ConsensusReceipt, ExecutionCertificate, Role, StoredReceipt, TickHalf,
-            compute_global_receipt_root,
+        let unhashed = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
         };
-        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
-        let outcomes = vec![
-            TxOutcome::new(
+        let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
+        let ConsensusReceipt::Succeeded { writes, .. } = unhashed else {
+            unreachable!("built a success")
+        };
+        Finalization::accepting(
+            TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+            Capped::from_array([StoredReceipt::new(
                 tx,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )
-            .charging(0)
-            .as_role(Role::Leg),
-        ];
-        let receipt = StoredReceipt::new(
-            tx,
-            Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-                writes,
-                beacon_witness_events: Capped::empty(),
-                events: Capped::empty(),
-            }),
-        );
-        let certificate = ExecutionCertificate::new(
-            tick_id,
-            WeightedTimestamp::from_millis(height),
-            compute_global_receipt_root(&outcomes),
-            Capped::new(outcomes).expect("a list written out in a test"),
-            AggregateSignature::ZERO,
-            SignerBitfield::new(4),
-        );
-        Finalization::new(
-            tick_id,
-            TickHalf::Legs,
-            &Capped::from_array([Arc::new(certificate)]),
-            Capped::from_array([receipt]),
+                Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash,
+                    writes,
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
+                }),
+            )]),
         )
     }
 
@@ -3989,10 +4001,17 @@ pub mod tests {
         // Tick 4 owes its determined half, and tick 5 holds the later
         // writer stated, for a legs half to settle.
         let mut against = owing(3, &[4]);
-        against
-            .members
-            .members
-            .insert(member, member_row(member, stated_in(5)));
+        let receipt = later.settled_receipts().expect("a legs half names")[0].1;
+        against.members.members.insert(
+            member,
+            member_row(
+                member,
+                RowState::Stated {
+                    tick: BlockHeight::new(5),
+                    receipt,
+                },
+            ),
+        );
 
         // The legs half is refused alone, which would leave tick 4's
         // half to land on it in a later block.
@@ -4127,7 +4146,7 @@ pub mod tests {
                 StoredReceipt::new(
                     outcome.tx_hash(),
                     Arc::new(ConsensusReceipt::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
+                        receipt_hash: effects_hash(),
                         writes: StateWrites::default(),
                         beacon_witness_events: Capped::empty(),
                         events: Capped::empty(),
@@ -4186,7 +4205,12 @@ pub mod tests {
         let subset = determined_projected(outcomes(), &[first]);
 
         assert_eq!(subset.tx_hashes().collect::<Vec<_>>(), vec![first]);
-        assert!(!subset.local_ec().is_complete());
+        assert!(
+            !subset
+                .local_ec()
+                .expect("its own certificate")
+                .is_complete()
+        );
         assert_eq!(subset.validate_against_certificates(), Ok(()));
         let wire = to_vec(&subset).expect("a half encodes");
         assert!(
@@ -4267,7 +4291,9 @@ pub mod tests {
 
         let later = determined_projected_at(9, vec![alone(first), alone(second)], &[first, second]);
         let reanchored = held
-            .reanchored(&Verified::new_unchecked_for_test(later.local_ec().clone()))
+            .reanchored(&Verified::new_unchecked_for_test(
+                later.local_ec().expect("its own certificate").clone(),
+            ))
             .expect("the same outcomes under the same root at a later anchor");
         assert_ne!(reanchored.receipt_hash(), held.receipt_hash());
         assert_eq!(settles(&rows, &reanchored), Ok(()));
@@ -4469,6 +4495,7 @@ pub mod tests {
             &|_, _| Evidence::Live { terminating: false },
             false,
             &BTreeSet::new(),
+            &BTreeMap::new(),
         );
         assert!(missing.is_empty());
         assert!(
@@ -4507,6 +4534,7 @@ pub mod tests {
             &|_, _| Evidence::Live { terminating: false },
             true,
             &BTreeSet::new(),
+            &BTreeMap::new(),
         );
         assert!(missing.is_empty());
         assert_eq!(
@@ -4524,14 +4552,15 @@ pub mod tests {
         rows
     }
 
-    /// No line answers `Never` for a member a tick ran and no recovery
-    /// released, at any clock, under any evidence, covered by a record
-    /// or not: a member its own tick decides is named by no line while
-    /// that tick owes its determined half, and one a sibling shares the
-    /// verdict on is named only by an abort a record covers, which
-    /// answers nothing, or by a fate. So until a recovery releases the
-    /// member, a crossing it consumed is answered by its tick's own
-    /// certificate and by nothing else.
+    /// No line answers `Never` for a member a tick ran that no recovery
+    /// released and no sibling's state refuses, at any clock, under any
+    /// evidence, covered by a record or not: a member its own tick
+    /// decides is named by no line while that tick owes its determined
+    /// half, and one a sibling shares the verdict on is named only by an
+    /// abort a record covers, which answers nothing, or by a fate. So
+    /// until a recovery releases the member or a sibling refuses it, a
+    /// crossing it consumed is answered by its own tick and by nothing
+    /// else.
     #[test]
     fn no_line_answers_never_for_a_member_a_tick_ran() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
@@ -4580,6 +4609,7 @@ pub mod tests {
                             &|_, _| said,
                             false,
                             &BTreeSet::new(),
+                            &BTreeMap::new(),
                         );
                         for line in &lines {
                             let TickLine::Member {
@@ -4614,9 +4644,9 @@ pub mod tests {
     /// line names the member to run again though its arrival still
     /// stands in the committed inputs. Where its own tick decided it, a
     /// fate ends the row from the close of its leg entry window. Where a
-    /// sibling shares its verdict, an abort from its deadline ends it
-    /// while a shard it reaches can answer, answering its crossing
-    /// `Never` unless a record covers it, and a fate once none can.
+    /// sibling shares its verdict, an abort at once ends it while a
+    /// shard it reaches can answer, answering its crossing `Never` unless
+    /// a record covers it, and a fate once none can.
     #[test]
     fn a_member_a_recovery_released_takes_nothing_off_a_reading_below_the_bridge() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
@@ -4653,7 +4683,7 @@ pub mod tests {
         assert_eq!(settles(&over(&shared_in_flight), &yes), Ok(()));
         let stated = after_committing(over(&shared_in_flight), &[&yes]).members;
         assert_eq!(stated.members[&sharer].state, stated_in(2));
-        let accept = legs_naming(&[sharer], &[sharer]);
+        let accept = legs_naming(&[sharer]);
         assert_eq!(
             settles(&over(&stated), &accept),
             Ok(()),
@@ -4702,10 +4732,10 @@ pub mod tests {
     /// landing nothing for it: admission refuses each of `halves`, and
     /// at each of `anchors`, under every reading of its counterparts'
     /// evidence and with `arrived` in hand, the chain names the fate
-    /// that ends its row, an abort from its deadline where a sibling
-    /// shares its verdict and can answer, which answers the crossings its
-    /// row still lists unless a record covers it, or no line at all.
-    /// Folding the fate leaves no row, and each half is refused still.
+    /// that ends its row, an abort at once where a sibling shares its
+    /// verdict and can answer, which answers the crossings its row still
+    /// lists unless a record covers it, or no line at all. Folding the
+    /// fate leaves no row, and each half is refused still.
     fn released_lands_nothing(
         rows: &MemberIndex,
         arrived: &CommittedSets,
@@ -4763,13 +4793,16 @@ pub mod tests {
                         &|_, _| said,
                         recovery,
                         &BTreeSet::new(),
+                        &BTreeMap::new(),
                     );
                     let fated = match settlement {
                         Settlement::Alone => anchor >= lapse,
                         Settlement::Shared | Settlement::Awaited => said == Evidence::Unreadable,
                     };
+                    // A shared member that ran is aborted at once, any
+                    // other from its deadline.
                     let aborted = settlement != Settlement::Alone
-                        && row.deadline.passed(anchor)
+                        && (row.deadline.passed(anchor) || settlement == Settlement::Shared)
                         && matches!(said, Evidence::Live { .. } | Evidence::Readable);
                     if aborted {
                         assert!(

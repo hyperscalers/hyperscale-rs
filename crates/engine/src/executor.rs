@@ -33,7 +33,7 @@ use hyperscale_types::{
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
     Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
-    install_protocol_statics, whole_work,
+    install_protocol_statics, whole_work, witness_root, writes_root,
 };
 use hyperscale_vm_effects::{
     Admitted, Answered, ChainRecords, CrossingId, Declaration, DeclaredAccess, IntentRecord,
@@ -52,9 +52,8 @@ use hyperscale_vm_types::{
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
 use crate::legs::{Member, never_answer};
-use crate::receipt::witness_root;
 use crate::records::BatchRecords;
-use crate::sharding::{owned_by, writes_root};
+use crate::sharding::owned_by;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
 
 /// One derived transaction, as the batch consumes it.

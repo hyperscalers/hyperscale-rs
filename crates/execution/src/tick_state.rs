@@ -37,7 +37,7 @@
 //!    has aborted it, which is terminal-covered), whatever its
 //!    tick-mates still wait for.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,12 +46,9 @@ use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, Joins, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY, Role,
-    Settles, ShardId, StoredReceipt, TickHalf, TickId, TxClaim, TxHash, TxOutcome, Verified,
-    WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
+    Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, Verified,
+    WeightedTimestamp, compute_global_receipt_root, settles,
 };
-
-/// What a finalization claims of its counterparts' settled sets.
-pub(crate) type Claims = Vec<(ShardId, TxHash, TxClaim)>;
 
 /// A tick whose local execution disagreed with the quorum's.
 ///
@@ -265,10 +262,6 @@ struct Seat {
     /// later than the halves being emitted, since a handed-off
     /// finalization still has to reach a block.
     settled: bool,
-    /// The tick has stopped speaking for the member: a partner past its
-    /// terminal never settled it, so no finalization may name it, and
-    /// its deadline is what ends it.
-    withdrawn: bool,
 }
 
 impl Seat {
@@ -286,15 +279,7 @@ impl Seat {
             covered_by: BTreeSet::new(),
             aborted_anywhere: false,
             settled: false,
-            withdrawn: false,
         }
-    }
-
-    /// Whether the member has the verdict its settlement needs: an
-    /// abort anywhere is terminal, and anything else waits for every
-    /// awaited shard to have certified it.
-    fn is_covered(&self) -> bool {
-        self.aborted_anywhere || self.membership.awaited().is_subset(&self.covered_by)
     }
 
     /// Whether a counterpart shares the verdict on this member: a whole
@@ -364,11 +349,6 @@ pub struct TickState {
     /// A legs half is handed off again only where the members it would
     /// name differ from these.
     legs_offered: Vec<TxHash>,
-    /// The legs that could settle when the half was last handed off and
-    /// were left out of it, each with the claims on its counterparts'
-    /// settled sets that were held back. They are not built into a half
-    /// again until one of those claims is answered.
-    legs_deferred: BTreeMap<TxHash, Claims>,
     /// Whether the local certificate has been added to
     /// `execution_certificates`. Gates completion. Independent of the
     /// canonical-root reconciliation — `locally_divergent` carries the
@@ -403,7 +383,6 @@ impl TickState {
             determined_emitted: false,
             stating: Stating::Owed,
             legs_offered: Vec::new(),
-            legs_deferred: BTreeMap::new(),
             local_ec_emitted: false,
             overdue_warned: false,
             execution_certificates: Vec::new(),
@@ -1069,24 +1048,18 @@ impl TickState {
     /// receipt its outcome names, or its failure record. A member the
     /// certificate succeeded for carries nothing there.
     fn holds_stating_receipts(&self, local: &ExecutionCertificate, members: &[TxHash]) -> bool {
-        let stated: Vec<&TxOutcome> = local
+        local
             .tx_outcomes()
             .iter()
             .filter(|outcome| members.contains(&outcome.tx_hash()))
-            .collect();
-        let refused: BTreeSet<TxHash> = stated
-            .iter()
-            .filter(|outcome| !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }))
-            .map(|outcome| outcome.tx_hash())
-            .collect();
-        stated.into_iter().all(|outcome| {
-            let seat = self.seats.get(&outcome.tx_hash());
-            match settles(outcome, &refused) {
-                Settles::Refusal(_) => seat.is_some_and(|seat| seat.refusal_receipt.is_some()),
-                Settles::Failure => seat.is_some_and(|seat| seat.receipt.is_some()),
-                Settles::Effects(_) | Settles::Nothing => true,
-            }
-        })
+            .all(|outcome| {
+                let seat = self.seats.get(&outcome.tx_hash());
+                match settles(outcome) {
+                    Settles::Refusal(_) => seat.is_some_and(|seat| seat.refusal_receipt.is_some()),
+                    Settles::Failure => seat.is_some_and(|seat| seat.receipt.is_some()),
+                    Settles::Effects(_) | Settles::Nothing => true,
+                }
+            })
     }
 
     /// Whether the stating half can be handed off now: it is owed, this
@@ -1129,25 +1102,25 @@ impl TickState {
         self.stating = Stating::Committed;
     }
 
-    /// The legs a half can settle now, in the order the tick's own
-    /// certificate attests them: the tick's stating half has committed,
-    /// each has its verdict, this validator holds the receipt it
-    /// settles, no committed block has settled it, and the tick has not
-    /// stopped speaking for it. A leg still waiting on a counterpart is
+    /// The stated members a legs half can accept now, in the order the
+    /// tick's own certificate attests them: the tick's stating half has
+    /// committed, the member's row at the committed tip accepts on what
+    /// its siblings' state says, which `accepting` holds, this validator
+    /// holds the effects receipt the half carries for it, and no committed
+    /// block has settled it. A member still waiting on its siblings is
     /// not among them, and holds none of its tick-mates. A member the
-    /// certificate refused is none: the stating half's commit settled
-    /// it.
+    /// certificate refused is none: the stating half's commit settled it.
     ///
-    /// Their certificate does not wait on the determined half's. The two
+    /// They do not wait on the determined half's settlement. The two
     /// cannot produce conflicting absolutes, because composition claims a
-    /// leg's declared access before testing any determined member: the
+    /// member's declared access before testing any determined member: the
     /// pair is admitted together only where both reach the cell
-    /// commutatively. A leg's debit may still rest on a determined
+    /// commutatively. A member's debit may still rest on a determined
     /// member's credit, so a block carries a legs half only behind the
     /// determined halves the chain owes up to this tick; that order is
     /// admission's, and the half is ready to be offered without it.
     #[must_use]
-    fn covered_legs(&self) -> Vec<TxHash> {
+    fn accepting_members(&self, accepting: &BTreeSet<TxHash>) -> Vec<TxHash> {
         let Some(local_ec) = self
             .local_certificate()
             .filter(|_| self.attestable() && self.stating == Stating::Committed)
@@ -1158,75 +1131,35 @@ impl TickState {
             .tx_outcomes()
             .iter()
             .filter(|outcome| {
-                self.awaits_beyond(outcome.tx_hash())
-                    && self.seats.get(&outcome.tx_hash()).is_some_and(|seat| {
-                        !seat.settled
-                            && !seat.withdrawn
-                            && seat.is_covered()
-                            && (outcome.is_aborted() || seat.receipt.is_some())
-                    })
-            })
-            .inspect(|outcome| {
-                debug_assert!(
-                    matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }),
-                    "a legs half names only members the committed stating half stated"
-                );
+                matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
+                    && accepting.contains(&outcome.tx_hash())
+                    && self.awaits_beyond(outcome.tx_hash())
+                    && self
+                        .seats
+                        .get(&outcome.tx_hash())
+                        .is_some_and(|seat| !seat.settled && seat.receipt.is_some())
             })
             .map(TxOutcome::tx_hash)
             .collect()
     }
 
-    /// Whether the legs half is due: the legs that can settle now are
-    /// not exactly the ones the half last handed off names and the ones
-    /// it left out.
+    /// Whether the legs half is due: the members that can accept now
+    /// under `accepting` are not exactly the ones the half last handed
+    /// off names.
     #[must_use]
-    pub fn legs_ready(&self) -> bool {
-        let covered = self.covered_legs();
-        let asked: HashSet<&TxHash> = self
-            .legs_offered
-            .iter()
-            .chain(self.legs_deferred.keys())
-            .collect();
-        covered.len() != asked.len() || covered.iter().any(|tx_hash| !asked.contains(tx_hash))
+    pub fn legs_ready(&self, accepting: &BTreeSet<TxHash>) -> bool {
+        self.accepting_members(accepting) != self.legs_offered
     }
 
-    /// Record that the legs half handed off names `names`, leaving out
-    /// `deferred`, legs that could settle but for the claims given.
-    /// Returns whether `names` differ from those of the half handed off
-    /// before it, which it then replaces.
-    pub(crate) fn offer_legs(
-        &mut self,
-        names: Vec<TxHash>,
-        deferred: BTreeMap<TxHash, Claims>,
-    ) -> bool {
-        self.legs_deferred = deferred;
+    /// Record that the legs half handed off names `names`. Returns
+    /// whether they differ from those of the half handed off before it,
+    /// which it then replaces.
+    pub(crate) fn offer_legs(&mut self, names: Vec<TxHash>) -> bool {
         if names == self.legs_offered {
             return false;
         }
         self.legs_offered = names;
         true
-    }
-
-    /// The legs left out of the half last handed off, each with the
-    /// claims held back.
-    pub(crate) const fn deferred_legs(&self) -> &BTreeMap<TxHash, Claims> {
-        &self.legs_deferred
-    }
-
-    /// Ask about `tx_hash` again: a claim that held it back has an
-    /// answer, so the next legs half is built with it.
-    pub(crate) fn reask_leg(&mut self, tx_hash: TxHash) {
-        self.legs_deferred.remove(&tx_hash);
-    }
-
-    /// Stop speaking for `names`: no legs half names them again.
-    pub(crate) fn withdraw_legs(&mut self, names: &[TxHash]) {
-        for tx_hash in names {
-            if let Some(seat) = self.seats.get_mut(tx_hash) {
-                seat.withdrawn = true;
-            }
-            self.legs_deferred.remove(tx_hash);
-        }
     }
 
     /// Whether the determined half is still owed here: the tick holds
@@ -1278,8 +1211,8 @@ impl TickState {
     /// Whether this tick has said everything it will say: its
     /// determined half is out of the way, its stating half is handed
     /// off or has no member left to state, and every member awaiting
-    /// another shard is one its certificate refused, or is settled,
-    /// withdrawn, or named by the legs half handed off.
+    /// another shard is one its certificate refused, or is settled or
+    /// named by the legs half handed off.
     #[must_use]
     pub fn has_spoken(&self) -> bool {
         self.determined_emitted_or_absent()
@@ -1287,10 +1220,7 @@ impl TickState {
             && self.awaiting_tx_hashes().all(|tx_hash| {
                 self.legs_offered.contains(&tx_hash)
                     || self.refused_here(tx_hash)
-                    || self
-                        .seats
-                        .get(&tx_hash)
-                        .is_some_and(|seat| seat.settled || seat.withdrawn)
+                    || self.seats.get(&tx_hash).is_some_and(|seat| seat.settled)
             })
     }
 
@@ -1308,7 +1238,6 @@ impl TickState {
                 seat.settled = true;
                 seat.receipt = None;
                 seat.refusal_receipt = None;
-                self.legs_deferred.remove(&tx_hash);
                 if self.legs_offered.contains(&tx_hash) {
                     self.legs_offered.clear();
                 }
@@ -1377,7 +1306,6 @@ impl TickState {
             ecs_collected = self.execution_certificates.len(),
             determined_ready = self.determined_ready(),
             stating_ready = self.stating_ready(),
-            legs_ready = self.legs_ready(),
             determined_emitted = self.determined_emitted,
             stating = ?self.stating,
             legs_offered = self.legs_offered.len(),
@@ -1485,21 +1413,18 @@ impl TickState {
     /// `attestation` carrying one stored receipt per outcome it settles
     /// anything of, in the certificate's canonical order.
     ///
-    /// Which side of an outcome settles is [`settles`]'s question, read
-    /// against the whole certificate rather than against this shard's own
-    /// verdict: a leg that completed here and was refused by a counterpart
-    /// settles its charge, not its effects. Peers re-derive the same rule
-    /// through `validate_against_certificates` at ingress.
+    /// Which side of an outcome settles is [`settles`]'s question. Peers
+    /// re-derive the same rule through `validate_against_certificates` at
+    /// ingress.
     ///
     /// The seats keep their receipts until a committed block settles
-    /// them: a legs half is built again as the legs it can name change,
-    /// and each one carries the receipts of every member it names.
+    /// them: a legs half is built again as the members it can name
+    /// change, and each one carries the receipts of every member it names.
     fn with_receipts(&self, attestation: Finalization) -> Finalization {
-        let refused = refused_transactions(attestation.execution_certificates());
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(attestation.tx_count());
         for outcome in attestation.settled_outcomes() {
             let seat = self.seats.get(&outcome.tx_hash());
-            let held = match settles(outcome, &refused) {
+            let held = match settles(outcome) {
                 // The charge stands in for whatever the transaction did:
                 // a `Failed` receipt carries nothing, and a completed
                 // leg's effects are discarded by the refusal. Either way
@@ -1565,23 +1490,33 @@ impl TickState {
         Some(self.with_receipts(attestation))
     }
 
-    /// A legs half naming every leg that can settle now, where there is
-    /// one.
+    /// The legs half accepting every stated member that can accept now
+    /// under `accepting`, carrying each one's effects receipt and no
+    /// certificate, where there is one.
     ///
-    /// Building it hands nothing off: the caller narrows it to the
-    /// members it may offer and records them through
-    /// [`Self::offer_legs`], and the half then replaces the one handed
-    /// off before, which named other legs or one a committed block has
-    /// since settled.
+    /// Building it hands nothing off: the caller records its names
+    /// through [`Self::offer_legs`], and the half then replaces the one
+    /// handed off before, which named other members or one a committed
+    /// block has since settled.
+    ///
+    /// # Panics
+    ///
+    /// Never: the members are the tick's own, under the cap its
+    /// certificate's outcomes share.
     #[must_use]
-    pub(crate) fn legs_half(&self) -> Option<Finalization> {
-        let names = self.covered_legs();
-        if names.is_empty() {
+    pub(crate) fn legs_half(&self, accepting: &BTreeSet<TxHash>) -> Option<Finalization> {
+        let receipts: Vec<StoredReceipt> = self
+            .accepting_members(accepting)
+            .into_iter()
+            .filter_map(|tx_hash| self.seats.get(&tx_hash)?.receipt.clone())
+            .collect();
+        if receipts.is_empty() {
             return None;
         }
-        let members: HashSet<TxHash> = names.into_iter().collect();
-        let attestation = self.attestation_for(TickHalf::Legs, &members)?;
-        Some(self.with_receipts(attestation))
+        Some(Finalization::accepting(
+            self.tick_id,
+            Capped::new(receipts).expect("a tick's members are within the receipts' cap"),
+        ))
     }
 
     /// Release every member sharing no verdict with a counterpart, and
@@ -1617,7 +1552,6 @@ impl TickState {
         }
         self.order.clone_from(&kept);
         self.legs_offered.clear();
-        self.legs_deferred.clear();
         (released, kept)
     }
 }
@@ -1626,7 +1560,8 @@ impl TickState {
 mod tests {
     use hyperscale_engine::legs::Classified;
     use hyperscale_types::{
-        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
+        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield, StateWrites,
+        receipt_hash_of,
     };
 
     use super::*;
@@ -1693,11 +1628,26 @@ mod tests {
         TxHash::from(Hash::from_bytes(&[seed; 32]))
     }
 
+    /// The hash of a success that wrote and emitted nothing, as its
+    /// content recomputes to: what every member here succeeds under.
+    fn effects_hash() -> GlobalReceiptHash {
+        receipt_hash_of(
+            &ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            },
+            true,
+        )
+        .expect("a projected success")
+    }
+
     fn receipt(tx_hash: TxHash) -> StoredReceipt {
         StoredReceipt {
             tx_hash,
             consensus: Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
+                receipt_hash: effects_hash(),
                 #[allow(clippy::default_trait_access)]
                 writes: Default::default(),
                 beacon_witness_events: Capped::empty(),
@@ -1736,7 +1686,7 @@ mod tests {
             tick.record_execution_result(
                 tx_hash,
                 ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
+                    receipt_hash: effects_hash(),
                 },
             );
             tick.record_receipt(receipt(tx_hash));
@@ -1782,7 +1732,7 @@ mod tests {
                 Capped::from_array([TxOutcome::new(
                     member,
                     ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
+                        receipt_hash: effects_hash(),
                     },
                 )
                 .awaiting(counterparts)]),
@@ -1836,7 +1786,7 @@ mod tests {
             tick.record_execution_result(
                 tx_hash,
                 ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
+                    receipt_hash: effects_hash(),
                 },
             );
         }
@@ -1861,7 +1811,7 @@ mod tests {
                 Capped::from_array([TxOutcome::new(
                     leg,
                     ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
+                        receipt_hash: effects_hash(),
                     },
                 )
                 .awaiting([local])]),
@@ -1874,8 +1824,9 @@ mod tests {
             !tick.determined_ready(),
             "the determined half is missing the receipt it would settle",
         );
+        let accepting = BTreeSet::from([leg]);
         assert!(
-            !tick.legs_ready(),
+            !tick.legs_ready(&accepting),
             "no leg settles before the tick's stating half commits",
         );
         let stated = state(&mut tick);
@@ -1887,8 +1838,11 @@ mod tests {
             vec![leg],
             "the stating half waits on the determined receipt no more than the legs do",
         );
-        assert!(tick.legs_ready(), "and the legs are ready regardless");
-        let half = take_legs(&mut tick).expect("covered and receipted");
+        assert!(
+            tick.legs_ready(&accepting),
+            "and the legs are ready regardless"
+        );
+        let half = take_legs(&mut tick, &accepting).expect("accepting and receipted");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
         assert_eq!(half.half(), TickHalf::Legs);
     }
@@ -1912,16 +1866,15 @@ mod tests {
         half
     }
 
-    /// Hand off the legs half as a caller that narrows nothing does.
-    fn take_legs(tick: &mut TickState) -> Option<Finalization> {
-        let half = tick.legs_ready().then(|| tick.legs_half()).flatten()?;
-        tick.offer_legs(half.tx_hashes().collect(), BTreeMap::new());
+    /// Hand off the legs half naming the members of `accepting` that can
+    /// accept now, as the coordinator does.
+    fn take_legs(tick: &mut TickState, accepting: &BTreeSet<TxHash>) -> Option<Finalization> {
+        let half = tick
+            .legs_ready(accepting)
+            .then(|| tick.legs_half(accepting))
+            .flatten()?;
+        tick.offer_legs(half.tx_hashes().collect());
         Some(half)
-    }
-
-    /// How many outcomes the half's certificate carries.
-    fn outcomes_in(half: &Finalization) -> usize {
-        half.local_ec().tx_outcomes().len()
     }
 
     /// The milestone's whole point: a leg whose counterpart never
@@ -1933,7 +1886,11 @@ mod tests {
         let (mut tick, determined, leg) = mixed_tick();
 
         assert!(tick.determined_ready());
-        assert!(!tick.legs_ready(), "the counterpart has not certified");
+        let nobody = BTreeSet::new();
+        assert!(
+            !tick.legs_ready(&nobody),
+            "its siblings' state has not accepted it"
+        );
 
         let half = tick
             .take_determined_finalization()
@@ -1944,46 +1901,31 @@ mod tests {
             "the half names its own members and no others",
         );
         assert_eq!(
-            (outcomes_in(&half), half.charged()),
+            (half.tx_count(), half.charged()),
             (1, 10),
             "and settles only what those members reserved",
         );
         assert!(!tick.has_spoken(), "the leg is still owed a verdict");
 
-        // The counterpart still never certifies.
-        assert!(!tick.legs_ready());
-        assert!(take_legs(&mut tick).is_none());
+        // Its siblings' state still never accepts it.
+        assert!(!tick.legs_ready(&nobody));
+        assert!(take_legs(&mut tick, &nobody).is_none());
         assert!(!tick.determined_ready(), "the determined half is one-shot");
         let _ = leg;
     }
 
-    /// Once the counterpart certifies, the legs half follows and the tick
-    /// has said everything it will say.
+    /// Once its row accepts, the legs half follows the stating half and
+    /// the tick has said everything it will say. The half carries the
+    /// member's effects receipt and no certificate.
     #[test]
-    fn the_legs_half_follows_its_counterpart() {
+    fn the_legs_half_follows_its_rows_accept() {
         let (mut tick, _determined, leg) = mixed_tick();
         tick.take_determined_finalization().expect("ready");
-
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
-            ExecutionCertificate::new(
-                TickId::new(shard(1), BlockHeight::new(4)),
-                WeightedTimestamp::from_millis(1_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(
-                    leg,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .awaiting([shard(0)])]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ),
-        )));
+        let accepting = BTreeSet::from([leg]);
 
         assert!(
-            !tick.legs_ready() && !tick.has_spoken(),
-            "covered, and still behind the stating half",
+            !tick.legs_ready(&accepting) && !tick.has_spoken(),
+            "accepting, and still behind the stating half",
         );
         let stated = state(&mut tick);
         assert_eq!(
@@ -1992,15 +1934,22 @@ mod tests {
             "the stating half settles nothing of a yes and is where it is charged",
         );
 
-        assert!(tick.legs_ready());
-        let half = take_legs(&mut tick).expect("covered");
+        assert!(tick.legs_ready(&accepting));
+        let half = take_legs(&mut tick, &accepting).expect("accepting");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
+        assert!(half.execution_certificates().is_empty());
+        assert_eq!(half.validate_against_certificates(), Ok(()));
         assert_eq!(
-            (outcomes_in(&half), half.charged()),
+            (half.tx_count(), half.charged()),
             (1, 0),
             "the legs half charges nothing: the stating half counted the member",
         );
         assert!(tick.has_spoken());
+        assert!(!tick.legs_ready(&accepting), "handed off once");
+        assert!(
+            tick.legs_ready(&BTreeSet::new()),
+            "and withdrawn where its row no longer accepts",
+        );
     }
 
     /// A core member this shard's own run refused settles in the stating
@@ -2029,7 +1978,7 @@ mod tests {
             tick.record_execution_result(
                 accepted,
                 ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
+                    receipt_hash: effects_hash(),
                 },
             );
             tick.record_receipt(receipt(accepted));
@@ -2066,7 +2015,7 @@ mod tests {
         for (height, tx_hash) in [(4, accepted), (5, refused)] {
             tick.add_execution_certificate(counterpart(height, tx_hash));
         }
-        assert!(tick.stating_ready() && !tick.legs_ready());
+        assert!(tick.stating_ready() && !tick.legs_ready(&BTreeSet::from([accepted, refused])));
         let half = state(&mut tick);
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![refused]);
         assert_eq!(half.receipts(), &vec![refusal]);
@@ -2087,7 +2036,8 @@ mod tests {
             "a tick states once",
         );
 
-        let legs = take_legs(&mut tick).expect("the yes is covered");
+        let legs =
+            take_legs(&mut tick, &BTreeSet::from([accepted, refused])).expect("the yes accepts");
         assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), vec![accepted]);
         assert!(tick.has_spoken());
         assert!(tick.record_settled([accepted]), "and the tick is done");
@@ -2130,7 +2080,7 @@ mod tests {
         )));
 
         assert!(
-            !tick.legs_ready() && !tick.has_spoken(),
+            !tick.legs_ready(&BTreeSet::from([aborted])) && !tick.has_spoken(),
             "no legs half names an abort, and the tick has yet to state it",
         );
         let half = tick
@@ -2151,7 +2101,7 @@ mod tests {
             tick.record_settled(half.tx_hashes()),
             "the stating half's commit resolves the whole tick",
         );
-        assert!(!tick.legs_ready());
+        assert!(!tick.legs_ready(&BTreeSet::from([aborted])));
     }
 
     /// A release owes a handed-off stating half again, over the members
@@ -2183,8 +2133,8 @@ mod tests {
             !committed.stating_owed() && committed.take_stating_finalization().is_none(),
             "a tick states once, whatever a later discard takes",
         );
-        committed.add_execution_certificate(counterpart(4, near));
-        let legs = take_legs(&mut committed).expect("the kept member's legs half follows");
+        let legs = take_legs(&mut committed, &BTreeSet::from([near, far]))
+            .expect("the kept member's legs half follows");
         assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), vec![near]);
     }
 
@@ -2201,7 +2151,7 @@ mod tests {
         let (voter, near, far) = two_leg_tick();
         let certificate = Arc::clone(voter.local_certificate().expect("certified"));
         let succeeded = ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
+            receipt_hash: effects_hash(),
         };
         let seating = |members: &[TxHash]| {
             let mut tick = TickState::new(
@@ -2260,7 +2210,7 @@ mod tests {
         let local = shard(0);
         let (unrouted, aborted, shared) = (tx(1), tx(2), tx(3));
         let succeeded = || ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
+            receipt_hash: effects_hash(),
         };
         let seating = |members: &[TxHash]| {
             let mut tick = TickState::new(
@@ -2380,7 +2330,7 @@ mod tests {
         voter.record_execution_result(
             shared,
             ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
+                receipt_hash: effects_hash(),
             },
         );
         voter.record_receipt(receipt(shared));
@@ -2471,7 +2421,7 @@ mod tests {
             tick.record_execution_result(
                 tx_hash,
                 ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
+                    receipt_hash: effects_hash(),
                 },
             );
             tick.record_receipt(receipt(tx_hash));
@@ -2500,7 +2450,7 @@ mod tests {
             Capped::from_array([TxOutcome::new(
                 tx_hash,
                 ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
+                    receipt_hash: effects_hash(),
                 },
             )
             .awaiting([shard(0)])]),
@@ -2509,23 +2459,26 @@ mod tests {
         )))
     }
 
-    /// A leg whose counterpart has certified is offered while its
-    /// tick-mate still waits. The half offered names every covered leg
-    /// no committed block has settled, so it is taken again exactly when
-    /// those names change: as coverage grows, and as a block settles one.
+    /// A member whose row accepts is offered while its tick-mate still
+    /// waits. The half offered names every accepting member no committed
+    /// block has settled, so it is taken again exactly when those names
+    /// change: as more rows accept, and as a block settles one.
     #[test]
-    fn a_covered_leg_is_offered_beside_an_uncovered_tick_mate() {
+    fn an_accepting_member_is_offered_beside_a_waiting_tick_mate() {
         let (mut tick, near, far) = two_leg_tick();
-        assert!(take_legs(&mut tick).is_none(), "neither is covered");
+        let (one, both_accept) = (BTreeSet::from([near]), BTreeSet::from([near, far]));
+        assert!(
+            take_legs(&mut tick, &both_accept).is_none(),
+            "neither is stated"
+        );
         let stated = state(&mut tick);
         assert_eq!((stated.tx_count(), stated.charged()), (0, 30));
         assert!(
-            take_legs(&mut tick).is_none(),
-            "stated, and neither covered"
+            take_legs(&mut tick, &BTreeSet::new()).is_none(),
+            "stated, and neither accepting"
         );
 
-        tick.add_execution_certificate(counterpart(4, near));
-        let half = take_legs(&mut tick).expect("the covered leg does not wait for its tick-mate");
+        let half = take_legs(&mut tick, &one).expect("the accepting member does not wait");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![near]);
         assert_eq!(half.validate_against_certificates(), Ok(()));
         assert_eq!(
@@ -2533,21 +2486,24 @@ mod tests {
             (1, 0),
             "a legs half charges nothing",
         );
-        assert!(!tick.has_spoken(), "the other leg is still owed a verdict");
+        assert!(!tick.has_spoken(), "the other member is still waiting");
         assert!(
-            take_legs(&mut tick).is_none(),
+            take_legs(&mut tick, &one).is_none(),
             "the same names are offered once",
         );
 
-        tick.add_execution_certificate(counterpart(5, far));
-        let both = take_legs(&mut tick).expect("the names grew with the coverage");
+        let both = take_legs(&mut tick, &both_accept).expect("the names grew");
         assert_eq!(both.tx_hashes().collect::<Vec<_>>(), vec![near, far]);
         assert_eq!(both.validate_against_certificates(), Ok(()));
         assert_ne!(both.receipt_hash(), half.receipt_hash());
         assert!(tick.has_spoken());
 
-        assert!(!tick.record_settled([near]), "the other leg still stands");
-        let rest = take_legs(&mut tick).expect("the half out names a member a block has settled");
+        assert!(
+            !tick.record_settled([near]),
+            "the other member still stands"
+        );
+        let rest = take_legs(&mut tick, &both_accept)
+            .expect("the half out names a member a block has settled");
         assert_eq!(rest.tx_hashes().collect::<Vec<_>>(), vec![far]);
         assert_eq!(rest.validate_against_certificates(), Ok(()));
         assert!(tick.record_settled([far]));
@@ -2572,7 +2528,7 @@ mod tests {
         tick.record_execution_result(
             tx(1),
             ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
+                receipt_hash: effects_hash(),
             },
         );
         tick.record_receipt(receipt(tx(1)));
@@ -2756,7 +2712,7 @@ mod tests {
         tick.record_execution_result(
             leg,
             ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
+                receipt_hash: effects_hash(),
             },
         );
         tick.record_receipt(receipt(leg));
@@ -2846,7 +2802,7 @@ mod tests {
         tick.record_execution_result(
             member,
             ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
+                receipt_hash: effects_hash(),
             },
         );
         tick.record_receipt(receipt(member));
@@ -2873,7 +2829,7 @@ mod tests {
                     Capped::from_array([TxOutcome::new(
                         member,
                         ExecutionOutcome::Succeeded {
-                            receipt_hash: GlobalReceiptHash::ZERO,
+                            receipt_hash: effects_hash(),
                         },
                     )
                     .awaiting(vec![local])]),
@@ -2889,63 +2845,5 @@ mod tests {
                 .is_none(),
             "a half that does not fit one finalization is one this node declines"
         );
-    }
-
-    /// A counterpart whose tick stated a shared member holds the replaced
-    /// committee's yes for it, verified before it folded the recovered
-    /// shard's binding, when the fresh committee's abort of the released
-    /// member verifies at it. The legs half it builds is the one its
-    /// first certificate covered: the abort covers nothing new and is not
-    /// kept, so the counterpart accepts what the recovered shard aborts.
-    /// The same two in the other order settle the abort. Which one a
-    /// counterpart settles turns on the order they reached it, and the
-    /// band refuses the replaced yes only where it arrives after the
-    /// fold.
-    #[test]
-    fn a_stated_counterpart_holding_a_replaced_yes_meets_a_fresh_abort() {
-        use hyperscale_types::{Role, TransactionDecision};
-
-        let abort = |height: u64, tx_hash: TxHash| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-                TickId::new(shard(1), BlockHeight::new(height)),
-                WeightedTimestamp::from_millis(9_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)
-                    .charging(10)
-                    .awaiting([shard(0)])
-                    .as_role(Role::Settling)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            )))
-        };
-        let decided = |half: &Finalization, tx_hash: TxHash| {
-            half.tx_decisions()
-                .into_iter()
-                .find(|(named, _)| *named == tx_hash)
-                .map(|(_, decision)| decision)
-        };
-        let from_counterpart = |half: &Finalization| {
-            half.execution_certificates()
-                .iter()
-                .filter(|ec| ec.shard_id() == shard(1))
-                .map(|ec| ec.tick_id().block_height().inner())
-                .collect::<Vec<_>>()
-        };
-
-        let (mut tick, near, _) = two_leg_tick();
-        state(&mut tick);
-        tick.add_execution_certificate(counterpart(4, near));
-        tick.add_execution_certificate(abort(9, near));
-        let half = tick.legs_half().expect("covered");
-        assert_eq!(decided(&half, near), Some(TransactionDecision::Accept));
-        assert_eq!(from_counterpart(&half), vec![4], "the abort is not kept");
-
-        let (mut tick, near, _) = two_leg_tick();
-        state(&mut tick);
-        tick.add_execution_certificate(abort(9, near));
-        tick.add_execution_certificate(counterpart(4, near));
-        let half = tick.legs_half().expect("covered");
-        assert_eq!(decided(&half, near), Some(TransactionDecision::Aborted));
-        assert_eq!(from_counterpart(&half), vec![9]);
     }
 }

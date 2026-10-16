@@ -26,9 +26,10 @@ use crate::{
 /// `block.header().shard_id()` — that a counterpart could ask about: one
 /// some other shard's certificate attests beside this shard's, whatever
 /// the verdict, or one this shard completed alone whose reach goes
-/// beyond it — a core's claim, a delivery, a leg that ran. The outcome
-/// states its reach, since a member that answers to nobody leaves no
-/// other trace of the shards that will ask.
+/// beyond it — a core's claim, a delivery, a leg that ran — and every
+/// core member a legs half accepts. The outcome states its reach, since
+/// a member that answers to nobody leaves no other trace of the shards
+/// that will ask.
 ///
 /// A verdict this shard reached alone and did not complete is excluded:
 /// a refusal or an abort names nothing a counterpart may treat as
@@ -64,6 +65,7 @@ pub fn local_settled_tx_hashes<'a>(
                             && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }))
                 })
                 .map(TxOutcome::tx_hash)
+                .chain(fw.accepted_names())
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -232,6 +234,49 @@ mod tests {
             Vec::new(),
         )));
         assert_eq!(local_settled_tx_hashes([&half], local), vec![]);
+    }
+
+    /// A legs half carries no certificate, and every member it names is
+    /// a core accept a sibling may ask about: the settled set names each
+    /// one, so an abandonment record against the set never aborts what
+    /// this shard accepted. A legs half of another shard's tick names
+    /// nothing here.
+    #[test]
+    fn a_legs_half_puts_its_accepts_in_the_settled_set() {
+        use crate::{ConsensusReceipt, StateWrites, StoredReceipt};
+
+        let local = ShardId::leaf(1, 0);
+        let accepting = |shard: ShardId, members: &[TxHash]| {
+            Arc::new(Verifiable::from(Finalization::accepting(
+                TickId::new(shard, BlockHeight::new(2)),
+                Capped::new(
+                    members
+                        .iter()
+                        .map(|&tx_hash| StoredReceipt {
+                            tx_hash,
+                            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                                receipt_hash: GlobalReceiptHash::ZERO,
+                                writes: StateWrites::default(),
+                                beacon_witness_events: Capped::empty(),
+                                events: Capped::empty(),
+                            }),
+                        })
+                        .collect(),
+                )
+                .expect("a list written out in a test"),
+            )))
+        };
+        let mut named = local_settled_tx_hashes(
+            [
+                &accepting(local, &[tx(1), tx(2)]),
+                &accepting(ShardId::leaf(1, 1), &[tx(3)]),
+            ],
+            local,
+        );
+        named.sort_unstable();
+        let mut expected = vec![tx(1), tx(2)];
+        expected.sort_unstable();
+        assert_eq!(named, expected);
     }
 
     #[test]

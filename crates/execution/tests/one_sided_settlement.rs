@@ -1,17 +1,9 @@
-//! A transaction refused by one participant settles nowhere.
-//!
-//! A cross-shard transaction runs at every shard its effects reach, and
-//! each shard reports what its own half did. The verdict is the combine of
-//! those reports, not any one of them: a leg that completed here while its
-//! payer shard found the reservation infeasible describes a transaction
-//! that did not happen. Applying this shard's half regardless would move
-//! value one-sidedly — the recipient credited, the payer never debited.
+//! A crossing settles its local half once its tick's halves land.
 
 mod common;
 
 use common::sim::{
-    ExecutionSim, FLOOR, LEFT, Schedule, amount, cell_of, charge_of, counter, settle,
-    settle_refused_by_counterpart, vault_of,
+    ExecutionSim, LEFT, Schedule, amount, cell_of, charge_of, counter, settle, vault_of,
 };
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
 use hyperscale_types::{ShardId, Transaction};
@@ -30,10 +22,9 @@ fn crossing(seed: u8) -> Transaction {
     )
 }
 
-/// Settle a crossing with `refused`, and report what reached state: the
-/// cell its effects would have written, the vault they would have
-/// credited, and the charge it owes for having been refused.
-fn settled_local_effect(refused: bool) -> (u64, u128, u128) {
+/// Settle a crossing, and report what reached state: the cell its
+/// effects write, the vault they credit, and any charge.
+fn settled_local_effect() -> (u64, u128, u128) {
     let mut sim = ExecutionSim::with_shards(Schedule::Eager, 2, LEFT);
 
     let leg = crossing(0);
@@ -48,17 +39,7 @@ fn settled_local_effect(refused: bool) -> (u64, u128, u128) {
     let receipts = sim.receipts_for(&tick);
     assert!(!receipts.is_empty(), "the local half executed");
 
-    let finalized = if refused {
-        settle_refused_by_counterpart(
-            &tick,
-            ShardId::leaf(1, 1),
-            &receipts,
-            &sim.charges_for(&tick),
-        )
-    } else {
-        settle(&tick, &receipts)
-    };
-    sim.commit(Vec::new(), vec![finalized]);
+    sim.commit(Vec::new(), vec![settle(&tick, &receipts)]);
     sim.drain();
     (
         counter(sim.settled(cell_of(test_prefix(LOCAL)))),
@@ -67,25 +48,9 @@ fn settled_local_effect(refused: bool) -> (u64, u128, u128) {
     )
 }
 
-/// The control: with every participant accepting, the local half settles
-/// and there is nothing to charge.
+/// With every participant accepting, the local half settles and there is
+/// nothing to charge.
 #[test]
 fn an_accepted_crossing_settles_its_local_half() {
-    assert_eq!(settled_local_effect(false), (1, 1, 0));
-}
-
-/// The refusal: none of the effects settle, because nothing happened —
-/// and the charge does, because the attempt did.
-///
-/// The two halves fail in opposite directions and both matter. Settling
-/// the effects moves value one-sidedly; dropping the charge with them
-/// makes a transaction whose counterpart refuses it free, and leaves the
-/// tick chain holding a debit state never takes.
-#[test]
-fn a_crossing_refused_by_its_counterpart_settles_only_its_charge() {
-    assert_eq!(
-        settled_local_effect(true),
-        (0, 0, FLOOR),
-        "a refused crossing must settle its charge and none of its effects"
-    );
+    assert_eq!(settled_local_effect(), (1, 1, 0));
 }

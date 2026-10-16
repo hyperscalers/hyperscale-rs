@@ -483,10 +483,6 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("accepted_rows_toward_a_sibling", None, rows as f64);
     }
 
-    fn record_decide_against_certificate(&self, agreement: &str) {
-        self.inc("decide_against_certificate", Some(agreement), 1);
-    }
-
     fn record_record_ask(&self) {
         self.inc("record_asks", None, 1);
     }

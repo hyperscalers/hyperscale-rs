@@ -6,18 +6,23 @@
 //! the chain up to the parent as the committed tier plus each pending
 //! ancestor's content, and so read one input.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
-use hyperscale_engine::tick_select::{CommittedSets, Judged, SiblingViews, terms_of};
+use hyperscale_engine::tick_select::{
+    CommittedSets, Judged, ManifestBudget, SiblingViews, Unlicensed, accepting, ends_stand,
+    legs_stand, terms_of,
+};
 use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, record_arrivals};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CounterpartMirror, Decision, Engagement, EpochWindows, Hears,
-    Joins, MemberTerms, Settlement, ShardId, SiblingView, Source, StatedTerms, SubstateKey,
-    TickHalf, TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
-    decide, partner_evidence, source_of,
+    Block, BlockHash, BlockHeight, CounterpartMirror, Engagement, EpochWindows, Finalization,
+    MemberTerms, Settlement, ShardId, SiblingView, Source, StatedTerms, SubstateKey, TickHalf,
+    TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
+    WeightedTimestamp, partner_evidence, source_of,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
+use crate::fence::Withheld;
 
 /// The terms each of `transactions` stands on, in their order, derived
 /// under `committee`, the committee their block is classified under.
@@ -159,12 +164,137 @@ pub fn sibling_view(
     )
 }
 
-/// The rows of `rows` standing accepted: the ones an `End` line may
-/// name in a block built on them.
-pub fn accepted_rows(rows: &MemberIndex) -> impl Iterator<Item = &MemberRow> {
-    rows.members
-        .values()
-        .filter(|row| row.state == RowState::Accepted)
+/// The rows of `rows` that hear their siblings, stated or accepted: the
+/// ones a block's legs halves, exits of stated rows and `End` lines turn
+/// on.
+pub fn hearing_rows(rows: &MemberIndex) -> impl Iterator<Item = &MemberRow> {
+    rows.members.values().filter(|row| row.state.hears())
+}
+
+/// Whether `ended`, the end lines closing the manifest of a block, are
+/// lines the chain licenses: each for a row accepted at `parent` that no
+/// sibling can still ask about, judged under `views` over `rows`, the
+/// parent's advanced by the block, within `budget`, what the block's
+/// other lines left.
+///
+/// # Errors
+///
+/// Refused for a line no replica licenses; deferred where this one
+/// lacks the block's window as it was published or a departed
+/// sibling's ended names, which a line turns on.
+pub fn ends_licensed(
+    ended: &[TickLine],
+    rows: &MemberIndex,
+    parent: &MemberIndex,
+    views: &SiblingViews,
+    budget: ManifestBudget,
+) -> Result<(), Withheld> {
+    let ended: Vec<TxHash> = ended
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::End { tx } => Some(*tx),
+            TickLine::Member { .. } | TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+        })
+        .collect();
+    ends_stand(&ended, rows, parent, views, budget).map_err(|unlicensed| match unlicensed {
+        Unlicensed::Refused(why) => Withheld::Refused(why),
+        Unlicensed::Lacking(tx) => Withheld::deferred(format!(
+            "what the end line of {tx:?} is judged on is not held here"
+        )),
+    })
+}
+
+/// Whether the names of every legs half among `certificates` accept on
+/// what their siblings' state says, under `views`, over `parent`'s rows
+/// as the block's claims in `pending` leave them and before any
+/// finalization of the block settles.
+///
+/// # Errors
+///
+/// Refused for a name over a row that does not accept; deferred where
+/// this replica cannot judge one.
+pub fn legs_licensed(
+    parent: &MemberIndex,
+    pending: &MemberInputs,
+    certificates: &[Arc<Verifiable<Finalization>>],
+    views: &SiblingViews,
+) -> Result<(), Withheld> {
+    let legs: Vec<TxHash> = certificates
+        .iter()
+        .filter(|fw| fw.half() == TickHalf::Legs)
+        .flat_map(|fw| fw.tx_hashes())
+        .collect();
+    if legs.is_empty() {
+        return Ok(());
+    }
+    let rows = heard_named(parent, pending, &legs);
+    legs_stand(legs, &rows, views).map_err(|unlicensed| match unlicensed {
+        Unlicensed::Refused(why) => Withheld::Refused(why),
+        Unlicensed::Lacking(tx) => Withheld::deferred(format!(
+            "what the legs half naming {tx:?} is judged on is not held here"
+        )),
+    })
+}
+
+/// The finalizations a proposer offers in a block, and the legs halves
+/// among them it cut, which no other replica holds and which voters
+/// fetch.
+pub struct OfferedLegs {
+    pub offered: Vec<Arc<Verifiable<Finalization>>>,
+    pub cut: Vec<Arc<Verifiable<Finalization>>>,
+}
+
+/// `finalizations` as a proposer offers them in a block over `parent`'s
+/// rows: each legs half cut to the names whose siblings' state accepts
+/// them under `views`, judged over the rows as the block's claims in
+/// `pending` leave them, and dropped where it is left naming nobody. A
+/// name this replica cannot judge is cut too: a voter lacking what it
+/// turns on would defer the block.
+pub fn legs_that_stand(
+    finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    parent: &MemberIndex,
+    pending: &MemberInputs,
+    views: &SiblingViews,
+) -> OfferedLegs {
+    let mut cut = Vec::new();
+    let offered = finalizations
+        .into_iter()
+        .filter_map(|fw| {
+            if fw.half() != TickHalf::Legs {
+                return Some(fw);
+            }
+            let names: Vec<TxHash> = fw.tx_hashes().collect();
+            let standing = accepting(&heard_named(parent, pending, &names), views);
+            if names.iter().all(|tx| standing.contains(tx)) {
+                return Some(fw);
+            }
+            let kept: HashSet<TxHash> = names
+                .into_iter()
+                .filter(|tx| standing.contains(tx))
+                .collect();
+            if kept.is_empty() {
+                return None;
+            }
+            let narrowed = Arc::new(Verifiable::from(fw.as_unverified().clone().naming(&kept)));
+            cut.push(Arc::clone(&narrowed));
+            Some(narrowed)
+        })
+        .collect();
+    OfferedLegs { offered, cut }
+}
+
+/// The rows of `parent` named by `names`, each as it stands once the
+/// claims of `pending` are heard and before anything else of the block
+/// is folded.
+pub fn heard_named(parent: &MemberIndex, pending: &MemberInputs, names: &[TxHash]) -> MemberIndex {
+    let heard = parent.heard_rows(pending);
+    let mut rows = MemberIndex::empty(parent.shard());
+    for tx in names {
+        if let Some(row) = heard.get(tx).or_else(|| parent.members.get(tx)) {
+            rows.members.insert(*tx, row.clone());
+        }
+    }
+    rows
 }
 
 /// What the schedule and `mirror` say at `anchor` of each shard one of
@@ -202,152 +332,6 @@ pub fn sibling_views<'r>(
         }
     }
     views
-}
-
-/// How [`decide`], had it judged a row while it stood stated, compares
-/// with what a committed block did with the row on its certificates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Agreement {
-    /// The two match.
-    Agree,
-    /// `decide` waits, and a legs half settled the member.
-    AfterLocalSettle,
-    /// `decide` refuses a member the legs half accepted, on a sibling's
-    /// leaf shared among other shards than the row's own.
-    AwaitedSetStricter,
-    /// `decide` waits or accepts, and a line aborted the member under a
-    /// record or its deadline.
-    RecordAbort,
-    /// `decide` accepts, and the certificates refused: on a shard whose
-    /// verdict no core leaf states.
-    LegSibling,
-    /// `decide` lacks the published window or a departed sibling's
-    /// names.
-    NoView,
-    /// Anything else.
-    Other,
-}
-
-impl Agreement {
-    /// The label the sample is counted under: where the block settled
-    /// the row, or under `ended`, where it ended a row that had
-    /// accepted.
-    #[must_use]
-    pub const fn label(self, ended: bool) -> &'static str {
-        match (self, ended) {
-            (Self::Agree, false) => "agree",
-            (Self::AfterLocalSettle, false) => "after_local_settle",
-            (Self::AwaitedSetStricter, false) => "awaited_set_stricter",
-            (Self::RecordAbort, false) => "record_abort",
-            (Self::LegSibling, false) => "leg_sibling",
-            (Self::NoView, false) => "no_view",
-            (Self::Other, false) => "other",
-            (Self::Agree, true) => "end_agree",
-            (Self::AfterLocalSettle, true) => "end_after_local_settle",
-            (Self::AwaitedSetStricter, true) => "end_awaited_set_stricter",
-            (Self::RecordAbort, true) => "end_record_abort",
-            (Self::LegSibling, true) => "end_leg_sibling",
-            (Self::NoView, true) => "end_no_view",
-            (Self::Other, true) => "end_other",
-        }
-    }
-}
-
-/// What a block did with a row that stood stated at its parent, or with
-/// one that stood accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Did {
-    /// A legs half accepted it.
-    Accepted,
-    /// A legs half settled its refusal.
-    Refused,
-    /// A line aborted it.
-    Aborted,
-    /// A fate ended it.
-    Fated,
-    /// An end line ended it, accepted earlier.
-    Ended,
-}
-
-/// For each row a block of `inputs` takes out of `Stated`, and each
-/// accepted row it ends, how [`decide`] over the row as a stated one
-/// compares with what the block did, beside whether the sample is of an
-/// ended row. `parent` holds the rows at the block's parent, judged
-/// once the block's claims are heard, at `anchor`; `other_shaped` names
-/// the rows a sibling's leaf of another shape was read for.
-pub fn agreements(
-    parent: &MemberIndex,
-    inputs: &MemberInputs,
-    other_shaped: &BTreeSet<TxHash>,
-    schedule: &TopologySchedule,
-    mirror: &CounterpartMirror,
-    anchor: WeightedTimestamp,
-) -> Vec<(bool, Agreement)> {
-    let mut did: BTreeMap<TxHash, Did> = BTreeMap::new();
-    for half in inputs
-        .settled
-        .iter()
-        .filter(|half| half.half == TickHalf::Legs)
-    {
-        did.extend(half.deleted.iter().map(|tx| (*tx, Did::Refused)));
-        did.extend(half.accepted.iter().map(|tx| (*tx, Did::Accepted)));
-    }
-    for line in inputs.manifest.iter() {
-        match line {
-            TickLine::Member { tx, joins, .. } if *joins == Joins::Aborted => {
-                did.insert(*tx, Did::Aborted);
-            }
-            TickLine::Fate { tx, .. } => {
-                did.insert(*tx, Did::Fated);
-            }
-            TickLine::End { tx } => {
-                did.insert(*tx, Did::Ended);
-            }
-            TickLine::Member { .. } | TickLine::Discard { .. } => {}
-        }
-    }
-    did.retain(|tx, did| {
-        parent.members.get(tx).is_some_and(|row| match did {
-            Did::Ended => row.state == RowState::Accepted,
-            Did::Accepted | Did::Refused | Did::Aborted | Did::Fated => {
-                matches!(row.state, RowState::Stated { .. })
-            }
-        })
-    });
-    if did.is_empty() {
-        return Vec::new();
-    }
-    let heard = parent.heard_rows(inputs);
-    let rows: Vec<&MemberRow> = did
-        .keys()
-        .filter_map(|tx| heard.get(tx).or_else(|| parent.members.get(tx)))
-        .collect();
-    let views = sibling_views(rows.iter().copied(), schedule, mirror, anchor);
-    rows.into_iter()
-        .map(|row| {
-            let did = did[&row.tx];
-            let decision = decide(Hears::Stated, &views.values(row));
-            let settled = if did == Did::Ended {
-                Did::Accepted
-            } else {
-                did
-            };
-            let agreement = match (decision, settled) {
-                (Decision::Lacking, _) => Agreement::NoView,
-                (Decision::Accept, Did::Accepted)
-                | (Decision::Refuse, Did::Refused | Did::Aborted)
-                | (Decision::LetGo, Did::Fated) => Agreement::Agree,
-                (Decision::Wait, Did::Accepted | Did::Refused) => Agreement::AfterLocalSettle,
-                (Decision::Refuse, Did::Accepted) if other_shaped.contains(&row.tx) => {
-                    Agreement::AwaitedSetStricter
-                }
-                (Decision::Wait | Decision::Accept, Did::Aborted) => Agreement::RecordAbort,
-                (Decision::Accept, Did::Refused) => Agreement::LegSibling,
-                _ => Agreement::Other,
-            };
-            (did == Did::Ended, agreement)
-        })
-        .collect()
 }
 
 /// What committed content up to the parent, and the block's own, says

@@ -25,8 +25,7 @@
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Block, BoundaryAttestation, CounterpartMirror, ProvenAnchors,
-    SettledSetVerdict, ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
-    settled_set_verdict,
+    ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -76,69 +75,20 @@ pub struct VoteFence<'a> {
 
 impl VoteFence<'_> {
     /// Judge every claim `block` makes, in the order the cheapest
-    /// evidence answers: its finalizations and its records against the
-    /// settled sets, its state claims' anchors against the headers this
-    /// validator has commit-proven, and its pre-cut content against the
-    /// predecessors' answers.
+    /// evidence answers: its records against the settled sets, its state
+    /// claims' anchors against the headers this validator has
+    /// commit-proven, and its pre-cut content against the predecessors'
+    /// answers. What its finalizations settle is held to the member rows
+    /// they name, which the block's own claims are folded into, alongside
+    /// its tick lines.
     ///
     /// # Errors
     ///
     /// The first claim this validator refuses or cannot yet check.
     pub(crate) fn judge(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
-        let anchored_wt = block.header().parent_qc().weighted_timestamp();
-        self.finalizations(schedule, block, anchored_wt)?;
         self.records(block)?;
         self.state_claims(schedule, block)?;
         self.precut(block)
-    }
-
-    /// The split-boundary fence over a block's finalizations.
-    ///
-    /// Each finalization's claims on its counterparts' settled sets —
-    /// a settlement on every shard whose certificate it carries, an
-    /// abort on every shard a member that ran here awaited and never
-    /// heard from, and nothing for an abandonment a line names — are
-    /// the ones [`hyperscale_types::Finalization::claims`]
-    /// derives, so a voter judges a tick by the rule its proposer's gate
-    /// composed it under. Record coverage of a member that ran and
-    /// aborted in its own tick is read off the mirror the execution
-    /// coordinator writes at the record's commit.
-    ///
-    /// Past-terminal-ness is read off the **anchored** snapshot at
-    /// `anchored_wt` (the block's `parent_qc` weighted timestamp), never
-    /// the head, so every replica voting this block reaches the same
-    /// verdict. A shard the anchor's window neither carries nor holds a
-    /// boundary record for is so far past its terminal that any claim
-    /// naming it is unreachable everywhere — refused. A past-terminal
-    /// shard whose settled set isn't known yet defers the vote, as does an
-    /// anchor in a window not yet committed; past the set's evidence
-    /// window the claim is categorically unprovable and refuses.
-    ///
-    /// # Errors
-    ///
-    /// A claim the sets contradict, or one no held set can answer.
-    pub(crate) fn finalizations(
-        &self,
-        schedule: &TopologySchedule,
-        block: &Block,
-        anchored_wt: WeightedTimestamp,
-    ) -> Result<(), Withheld> {
-        let claims = block
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.claims(self.local_shard, |tx_hash| self.mirror.covers(tx_hash)));
-        let verdict = self.mirror.with_settled(|settled| {
-            settled_set_verdict(settled, schedule, self.local_shard, anchored_wt, claims)
-        });
-        match verdict {
-            SettledSetVerdict::Pass => Ok(()),
-            SettledSetVerdict::Reject => Err(Withheld::Refused(
-                "finalization names a past-terminal shard that didn't settle it".into(),
-            )),
-            SettledSetVerdict::Defer => Err(Withheld::deferred(
-                "settled set for a past-terminal shard unknown".into(),
-            )),
-        }
     }
 
     /// Whether the block's abandonment records are ones this voter can

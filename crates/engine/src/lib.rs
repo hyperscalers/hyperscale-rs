@@ -54,4 +54,4 @@ pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,
     PreviewOutcome, PreviewReport, ResourceChange,
 };
-pub use receipt::{CachedOutput, project_to_shard, receipt_hash_of};
+pub use receipt::{CachedOutput, project_to_shard};

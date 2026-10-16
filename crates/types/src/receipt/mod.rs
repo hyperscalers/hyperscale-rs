@@ -24,6 +24,7 @@ pub mod consensus;
 pub mod event;
 pub mod global;
 pub mod metadata;
+pub mod recompute;
 pub mod stored;
 
 #[cfg(test)]
