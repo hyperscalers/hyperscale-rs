@@ -292,6 +292,20 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         secs: u64,
     },
+    /// A peer floods global items whose first check holds and whose second
+    /// fails, as committed headers whose sender signature holds and whose
+    /// certificate does not, while a follower hears only what the receiver
+    /// forwards.
+    CertificateFlood {
+        /// Items the peer sends a second.
+        #[arg(long, default_value_t = 1000)]
+        rate: u32,
+        /// Which checks the receiver's handler defers on.
+        #[arg(long, value_enum)]
+        checks: Checks,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// A peer floods notifications whose signature its receiver checks
     /// and finds false.
     NotifyFlood {
@@ -335,6 +349,16 @@ enum Checked {
     Accept,
     /// Defer to the check, which settles it.
     Defer,
+}
+
+/// The checks a certificate flood's receiver defers on.
+#[derive(Clone, Copy, ValueEnum)]
+enum Checks {
+    /// The sender signature alone; the certificate is checked after the
+    /// item has travelled on, and its failure is no one's to answer for.
+    Signature,
+    /// The sender signature and the certificate.
+    Both,
 }
 
 /// What a notify flood's receiver answers after its check fails.
@@ -1787,7 +1811,7 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
         });
         match checked {
             Checked::Accept => Verdict::Accept,
-            Checked::Defer => Verdict::Defer(key),
+            Checked::Defer => Verdict::defer(key),
         }
     });
     let reached = Arc::new(AtomicU64::new(0));
@@ -1825,6 +1849,80 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
             "secs": wall,
             "sent_per_sec": per_sec(sent),
             "receiver_checks_per_sec": per_sec(checks.load(Ordering::Relaxed)),
+            "follower_reached_per_sec": per_sec(reached.load(Ordering::Relaxed)),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
+/// A peer sends a receiver 2 KiB global items at `rate` for `watch`; the
+/// receiver checks each item's sender signature for 15 ms and finds it
+/// sound, then its certificate for 2 ms more and finds it false, deferring
+/// on `checks`. A follower bound only to the receiver hears what it
+/// forwards.
+async fn certificate_flood(rate: u32, checks: Checks, watch: Duration) {
+    /// How long the sender signature check takes: the header batch window.
+    const SIGNATURE_CHECK: Duration = Duration::from_millis(15);
+    /// How long the certificate check takes after it.
+    const CERTIFICATE_CHECK: Duration = Duration::from_millis(2);
+    let fixtures = IrohFixtures::with_surplus(SEED, 1, 2);
+    let (receiver_network, sender_network, follower_network) = relay_line(&fixtures).await;
+
+    let certificates = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&certificates);
+    let network = Arc::clone(&receiver_network);
+    let handle = Handle::current();
+    receiver_network.register_gossip_handler(move |item: Committed, _: ShardId| {
+        let signature = VerdictKey::of(&item);
+        let certificate = VerdictKey::of(&(item.seq, 1u8));
+        let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
+        handle.spawn(async move {
+            sleep(SIGNATURE_CHECK).await;
+            network.settle(signature, Verdict::Accept);
+            sleep(CERTIFICATE_CHECK).await;
+            counted.fetch_add(1, Ordering::Relaxed);
+            network.settle(certificate, Verdict::Reject);
+        });
+        match checks {
+            Checks::Signature => Verdict::defer(signature),
+            Checks::Both => Verdict::defer_all([signature, certificate]),
+        }
+    });
+    let reached = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&reached);
+    follower_network.register_host_gossip_handler(move |_: Committed| {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+    follower_network.register_gossip_handler(|_: Committed, _: ShardId| Verdict::Accept);
+
+    let mut tick = interval(Duration::from_secs(1) / rate);
+    let start = (Instant::now(), cpu_time());
+    let mut sent = 0u64;
+    while start.0.elapsed() < watch {
+        tick.tick().await;
+        sent += 1;
+        sender_network.broadcast_global(&Committed {
+            seq: sent,
+            body: vec![7; HEADER_BYTES],
+        });
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "certificate flood",
+            "backend": "iroh",
+            "checks": match checks {
+                Checks::Signature => "signature",
+                Checks::Both => "both",
+            },
+            "secs": wall,
+            "sent_per_sec": per_sec(sent),
+            "receiver_certificate_checks_per_sec": per_sec(certificates.load(Ordering::Relaxed)),
             "follower_reached_per_sec": per_sec(reached.load(Ordering::Relaxed)),
             "process_cpu_cores": cpu.as_secs_f64() / wall,
         })
@@ -1955,6 +2053,9 @@ async fn main() {
             secs,
         } => {
             notify_flood(rate, verdict, Duration::from_secs(secs)).await;
+        }
+        Command::CertificateFlood { rate, checks, secs } => {
+            certificate_flood(rate, checks, Duration::from_secs(secs)).await;
         }
         Command::ShadowFlood { rate, secs } => {
             shadow_flood(rate, Duration::from_secs(secs)).await;

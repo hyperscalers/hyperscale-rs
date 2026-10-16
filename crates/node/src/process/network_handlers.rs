@@ -165,10 +165,14 @@ where
                         return Verdict::Ignore;
                     };
 
-                    // The shard loop checks the sender signature off this
-                    // thread and settles the verdict, so the header travels
-                    // on only once it holds up.
-                    let key = VerdictKey::of(&gossip);
+                    // The header travels on only once both its checks hold:
+                    // the shard loop's of the sender signature, and the
+                    // remote header coordinator's of the quorum certificate,
+                    // which runs once the signature holds.
+                    let checks = [
+                        VerdictKey::of(&gossip),
+                        VerdictKey::of(gossip.certified_header.as_unverified()),
+                    ];
                     push_shard_input(
                         tx,
                         target_shard,
@@ -179,7 +183,7 @@ where
                             sender_signature: gossip.sender_signature,
                         },
                     );
-                    Verdict::Defer(key)
+                    Verdict::defer_all(checks)
                 },
             );
 

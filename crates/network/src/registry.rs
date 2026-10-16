@@ -194,11 +194,15 @@ where
             .map(|target| self.handler.on_message(typed.clone(), target))
             .reduce(combine_verdicts);
         if let Some(key) = content {
-            match verdict {
+            match &verdict {
                 Some(Verdict::Reject | Verdict::Ignore) => {
                     self.dedup.remove(&key);
                 }
-                Some(Verdict::Defer(item)) => self.deferred.insert(item, (TypeId::of::<M>(), key)),
+                Some(Verdict::Defer(deferral)) => {
+                    for item in deferral.keys() {
+                        self.deferred.insert(*item, (TypeId::of::<M>(), key));
+                    }
+                }
                 Some(Verdict::Accept) | None => {}
             }
         }
@@ -208,13 +212,16 @@ where
 
 /// The verdict of several hosted shards on one message. A rejection is the
 /// sender's fault whatever the other shards made of it; otherwise a shard
-/// that accepts the message carries it on, one still checking it holds it,
-/// and it is ignored only when every shard ignored it.
-const fn combine_verdicts(a: Verdict, b: Verdict) -> Verdict {
+/// that accepts the message carries it on, shards still checking it hold it
+/// until every one of their checks holds, and it is ignored only when every
+/// shard ignored it.
+fn combine_verdicts(a: Verdict, b: Verdict) -> Verdict {
     match (a, b) {
         (Verdict::Reject, _) | (_, Verdict::Reject) => Verdict::Reject,
         (Verdict::Accept, _) | (_, Verdict::Accept) => Verdict::Accept,
-        (Verdict::Defer(key), _) | (_, Verdict::Defer(key)) => Verdict::Defer(key),
+        (Verdict::Defer(a), Verdict::Defer(b)) => Verdict::Defer(a.join(b)),
+        (Verdict::Defer(deferral), Verdict::Ignore)
+        | (Verdict::Ignore, Verdict::Defer(deferral)) => Verdict::Defer(deferral),
         (Verdict::Ignore, Verdict::Ignore) => Verdict::Ignore,
     }
 }
@@ -716,7 +723,7 @@ impl HandlerRegistry {
     /// [`crate::Network::settle`]): a copy whose check found it false, or
     /// left this host unable to judge it, no longer keeps later copies of
     /// its content from their handlers.
-    pub fn settle(&self, key: VerdictKey, verdict: Verdict) {
+    pub fn settle(&self, key: VerdictKey, verdict: &Verdict) {
         let Some((message_type, content)) = self.deferred_content.get(&key) else {
             return;
         };
@@ -970,8 +977,8 @@ mod tests {
     }
 
     /// A message several hosted shards judge carries the strongest verdict:
-    /// any rejection, else any acceptance; it is ignored only when every
-    /// shard ignored it.
+    /// any rejection, else any acceptance, else every check the shards
+    /// still run; it is ignored only when every shard ignored it.
     #[test]
     fn hosted_shards_verdicts_fold_rejection_first_then_acceptance() {
         use std::sync::Mutex;
@@ -999,7 +1006,9 @@ mod tests {
         let registry = HandlerRegistry::new([a, b].into_iter().collect());
         let verdicts: Arc<Mutex<HashMap<ShardId, Verdict>>> = Arc::default();
         let answers = Arc::clone(&verdicts);
-        registry.register_gossip(move |_: FoldMsg, shard: ShardId| answers.lock().unwrap()[&shard]);
+        registry.register_gossip(move |_: FoldMsg, shard: ShardId| {
+            answers.lock().unwrap()[&shard].clone()
+        });
         let handler = registry.get_gossip("test.fold").unwrap();
 
         let fold = |first: Verdict, second: Verdict| {
@@ -1010,6 +1019,18 @@ mod tests {
         assert_eq!(fold(Ignore, Reject), Some(Reject));
         assert_eq!(fold(Ignore, Accept), Some(Accept));
         assert_eq!(fold(Ignore, Ignore), Some(Ignore));
+
+        let (first, second) = (VerdictKey::of(&1u8), VerdictKey::of(&2u8));
+        assert_eq!(
+            fold(Verdict::defer(first), Verdict::defer(second)),
+            Some(Verdict::defer_all([second, first])),
+            "a message two shards are checking holds up only when both checks do"
+        );
+        assert_eq!(
+            fold(Verdict::defer(first), Ignore),
+            Some(Verdict::defer(first))
+        );
+        assert_eq!(fold(Verdict::defer(first), Accept), Some(Accept));
     }
 
     /// A copy of some content, as several senders publish it: `content`
@@ -1105,26 +1126,26 @@ mod tests {
     #[test]
     fn a_deferred_copy_stands_until_its_check_finds_it_false() {
         let key = |copy: &Copy| VerdictKey::of(&(copy.sender, copy.forged));
-        let (registry, handled) = copies_judged_by(move |copy| Verdict::Defer(key(copy)));
+        let (registry, handled) = copies_judged_by(move |copy| Verdict::defer(key(copy)));
 
         let forged = copy(1, true);
         assert_eq!(
             deliver(&registry, &forged),
-            Some(Verdict::Defer(key(&forged)))
+            Some(Verdict::defer(key(&forged)))
         );
         assert_eq!(
             deliver(&registry, &copy(2, false)),
             None,
             "a copy being checked stands for its content"
         );
-        registry.settle(key(&forged), Verdict::Reject);
+        registry.settle(key(&forged), &Verdict::Reject);
 
         let honest = copy(3, false);
         assert_eq!(
             deliver(&registry, &honest),
-            Some(Verdict::Defer(key(&honest)))
+            Some(Verdict::defer(key(&honest)))
         );
-        registry.settle(key(&honest), Verdict::Accept);
+        registry.settle(key(&honest), &Verdict::Accept);
         assert_eq!(
             deliver(&registry, &copy(4, false)),
             None,

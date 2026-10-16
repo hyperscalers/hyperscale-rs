@@ -344,8 +344,8 @@ impl InboundRouter {
             Verdict::Accept => {}
             Verdict::Reject => self.charge(peer, refused_work(bytes, Refusal::Fault)),
             Verdict::Ignore => self.charge(peer, refused_work(bytes, Refusal::Unjudged)),
-            Verdict::Defer(key) => match self.fanout() {
-                Some(fanout) => fanout.await_notification_verdict(peer, class, key, bytes),
+            Verdict::Defer(deferral) => match self.fanout() {
+                Some(fanout) => fanout.await_notification_verdict(peer, class, &deferral, bytes),
                 None => self.charge(peer, refused_work(bytes, Refusal::Unjudged)),
             },
         }

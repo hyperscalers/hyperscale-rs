@@ -302,6 +302,10 @@ where
                 return;
             };
             let vote = Arc::new(verified);
+            // A message that carries this vote as proof stands on it, and
+            // this host never checks a vote it signed.
+            ctx.network
+                .settle(VerdictKey::of::<RatifyVote>(&vote), Verdict::Accept);
             let proof = RatifyProof::new(
                 proof
                     .into_iter()

@@ -25,6 +25,6 @@ pub use registry::{
 };
 pub use topic::{ParsedTopic, Topic, parse_topic};
 pub use traits::{
-    GossipHandler, Network, NotificationHandler, RequestError, RequestHandler, ResponseVerdict,
-    TopicScope, ValidatorKeyMap, Verdict, VerdictKey,
+    Deferral, GossipHandler, Network, NotificationHandler, RequestError, RequestHandler,
+    ResponseVerdict, TopicScope, ValidatorKeyMap, Verdict, VerdictKey,
 };

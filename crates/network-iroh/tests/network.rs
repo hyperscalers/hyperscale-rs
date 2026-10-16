@@ -703,7 +703,7 @@ async fn a_peer_whose_notifications_fail_their_deferred_check_is_cooled_down() {
                 counted.fetch_add(1, Ordering::SeqCst);
                 network.settle(key, Verdict::Reject);
             });
-            Verdict::Defer(key)
+            Verdict::defer(key)
         });
 
     let start = Instant::now();
