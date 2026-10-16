@@ -148,7 +148,7 @@ struct Inner {
     redials_held: DashMap<EndpointId, Connection>,
     /// Fault gate consulted at the delivery seams. A zero-sized no-op
     /// unless the `test-utils` feature is enabled.
-    fault_gate: FaultState,
+    fault_gate: Arc<FaultState>,
     /// Bound connections, one per peer host.
     links: DashMap<EndpointId, Link>,
     /// Validators proved to be behind each bound connection.
@@ -234,12 +234,14 @@ impl IrohAdapter {
 
         let local_shards = Arc::new(ArcSwap::from_pointee(local_shards));
         let paths = Arc::new(PathPolicy::default());
+        let fault_gate = Arc::new(FaultState::new());
         let inner = Arc::new(Inner {
             runtime: Handle::current(),
             router: Arc::new(InboundRouter::new(
                 registry,
                 Arc::clone(&local_shards),
                 Arc::clone(&paths),
+                Arc::clone(&fault_gate),
             )),
             redialer: Redialer::new(
                 endpoint.clone(),
@@ -250,7 +252,7 @@ impl IrohAdapter {
             ),
             paths,
             redials_held: DashMap::new(),
-            fault_gate: FaultState::new(),
+            fault_gate,
             bind: BindContext {
                 network,
                 local_vnodes: Arc::from(vnodes),

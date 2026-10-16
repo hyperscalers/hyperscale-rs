@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 
 use crate::cooldown::Cooldown;
 use crate::fanout::Fanout;
+use crate::fault_gate::FaultState;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::path::PathPolicy;
 use crate::peer::Peer;
@@ -75,6 +76,8 @@ pub struct InboundRouter {
     failures: Cooldown,
     /// Decides whether a response goes back over the requester's path.
     paths: Arc<PathPolicy>,
+    /// The host's fault gate, which may rewrite what a handler answers.
+    fault_gate: Arc<FaultState>,
     /// Where gossip and subscription streams go. Unset until the host's
     /// gossip is running; such streams are dropped unread before then.
     fanout: OnceLock<Weak<Fanout>>,
@@ -85,11 +88,13 @@ impl InboundRouter {
         registry: Arc<HandlerRegistry>,
         local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
         paths: Arc<PathPolicy>,
+        fault_gate: Arc<FaultState>,
     ) -> Self {
         Self {
             registry,
             local_shards,
             paths,
+            fault_gate,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: DashMap::new(),
             failures: Cooldown::default(),
@@ -352,9 +357,16 @@ impl InboundRouter {
 
         // Handlers do heavy work (merkle proof generation) that would starve
         // the async runtime on a worker thread.
-        let response = spawn_blocking(move || handler(&payload))
-            .await
-            .expect("request handler task panicked");
+        let (asked, answer) = spawn_blocking(move || {
+            let answer = handler(&payload);
+            (payload, answer)
+        })
+        .await
+        .expect("request handler task panicked");
+        let response = self
+            .fault_gate
+            .rewrite_response(peer, &type_id, &asked, answer);
+        drop(asked);
 
         if !self.paths.admit(peer, class, response.len()) {
             return respond_status(&mut send, RESPONSE_RELAYED).await;
@@ -466,6 +478,7 @@ mod tests {
                 Arc::new(HandlerRegistry::default()),
                 Arc::new(ArcSwap::from_pointee(HashSet::new())),
                 Arc::new(PathPolicy::default()),
+                Arc::new(FaultState::new()),
             )
         }
     }
