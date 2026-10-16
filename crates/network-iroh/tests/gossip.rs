@@ -36,6 +36,14 @@ const SILENCE_WATCH: Duration = Duration::from_millis(500);
 /// Validators seated in the root committee, one per host.
 const SEATED: u32 = 3;
 
+/// Validators the topology knows in the address record tests: two hosts,
+/// and the rest named by forged records, each a validator whose turn at
+/// having a record checked has not been taken.
+const KNOWN: u32 = 64;
+
+/// Least time between two checks of one validator's records.
+const RECORD_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A committed beacon block, as far as the transport is concerned: a
 /// global item that names no source shard.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
@@ -94,6 +102,9 @@ const HONEST_RATE: u32 = 300;
 
 /// How long the honest peer keeps sending.
 const HONEST_WATCH_SECS: u32 = 15;
+
+/// How long a validator signs records without pause.
+const FLOOD_WATCH: Duration = Duration::from_secs(6);
 
 /// How long a peer whose headers are its own fault keeps sending.
 const REJECTED_WATCH_SECS: u32 = 5;
@@ -256,8 +267,9 @@ async fn counted_pair(
     (receiver, counted, sender)
 }
 
-/// `host`'s own address record at `sequence`: signed when `forged` is
-/// false, carrying a signature over other bytes when it is true.
+/// `host`'s own address record, `sequence` past the one it signed itself:
+/// signed when `forged` is false, carrying a signature over other bytes
+/// when it is true.
 fn address_record(
     fixtures: &TestFixtures,
     index: u32,
@@ -265,7 +277,20 @@ fn address_record(
     sequence: u64,
     forged: bool,
 ) -> ValidatorAddressGossip {
+    address_record_naming(fixtures, index, host, vid(index), sequence, forged)
+}
+
+/// [`address_record`], naming `validator` as the record's own.
+fn address_record_naming(
+    fixtures: &TestFixtures,
+    index: u32,
+    host: &Host,
+    validator: ValidatorId,
+    sequence: u64,
+    forged: bool,
+) -> ValidatorAddressGossip {
     let own = host.adapter.address_records().remove(0);
+    let sequence = own.sequence + sequence;
     let message = if forged {
         b"not this record".to_vec()
     } else {
@@ -275,10 +300,17 @@ fn address_record(
         )
     };
     ValidatorAddressGossip {
+        validator,
         sequence,
         signature: fixtures.signer(index).sign(&message).expect("signs"),
         ..own
     }
+}
+
+/// The validator a forged record in a flood names: one of those no host
+/// carries, in turn.
+fn forged_validator(sequence: u64) -> ValidatorId {
+    ValidatorId::new(2 + sequence % u64::from(KNOWN - 2))
 }
 
 /// Wait until `counted` has seen no new signature check for a while.
@@ -294,16 +326,17 @@ async fn checks_settle(counted: &CountingVerifier) -> u64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forged_address_record_is_checked_once() {
-    let fixtures = TestFixtures::new(21, 2);
+    let fixtures = TestFixtures::new(21, KNOWN);
     let (_receiver, counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
     let settled = checks_settle(&counted).await;
     let refused = counted.refused();
 
     for sequence in 0..4 {
-        sender.network.broadcast_global(&address_record(
+        sender.network.broadcast_global(&address_record_naming(
             &fixtures,
             1,
             &sender,
+            forged_validator(sequence),
             1_000 + sequence,
             true,
         ));
@@ -321,7 +354,7 @@ async fn a_forged_address_record_is_checked_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_that_serves_no_shard_refuses_forged_address_records() {
-    let fixtures = TestFixtures::new(21, 2);
+    let fixtures = TestFixtures::new(21, KNOWN);
     let (_receiver, counted, sender) = counted_pair(&fixtures, &[]).await;
     checks_settle(&counted).await;
     let refused = counted.refused();
@@ -330,10 +363,11 @@ async fn a_host_that_serves_no_shard_refuses_forged_address_records() {
     // records cools it down before the receiver has checked them all.
     let sent = 400;
     for sequence in 0..sent {
-        sender.network.broadcast_global(&address_record(
+        sender.network.broadcast_global(&address_record_naming(
             &fixtures,
             1,
             &sender,
+            forged_validator(sequence),
             1_000 + sequence,
             true,
         ));
@@ -459,7 +493,7 @@ async fn a_global_item_is_handled_once_however_many_copies_arrive() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_slipping_signed_records_between_forged_ones_is_cooled_down() {
-    let fixtures = TestFixtures::new(21, 2);
+    let fixtures = TestFixtures::new(21, KNOWN);
     let (_receiver, counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
     checks_settle(&counted).await;
     let refused = counted.refused();
@@ -471,22 +505,34 @@ async fn a_peer_slipping_signed_records_between_forged_ones_is_cooled_down() {
     for sequence in 1..=800 {
         let is_forged = sequence % 8 != 0;
         forged += u64::from(is_forged);
-        sender.network.broadcast_global(&address_record(
+        let validator = if is_forged {
+            forged_validator(sequence)
+        } else {
+            vid(1)
+        };
+        sender.network.broadcast_global(&address_record_naming(
             &fixtures,
             1,
             &sender,
+            validator,
             1_000 + sequence,
             is_forged,
         ));
         sleep(Duration::from_millis(2)).await;
     }
+    // Records held for their validators' turns are checked when those come.
+    sleep(RECORD_INTERVAL).await;
     checks_settle(&counted).await;
     let checked = counted.refused() - refused;
     // What the receiver's budget admits over the time the flood ran: its
     // first allowance, the items judged when the cooldown began, then five
-    // checks a second paid down by time and the items judged at each lapse.
+    // checks a second paid down by time and the items judged at each lapse,
+    // and at most one held record of each validator named.
     let secs = start.elapsed().as_secs() + 1;
-    let admitted = FORGERIES_IN_ALLOWANCE + JUDGED_AT_ONCE + secs * (5 + JUDGED_AT_ONCE);
+    let admitted = FORGERIES_IN_ALLOWANCE
+        + JUDGED_AT_ONCE
+        + secs * (5 + JUDGED_AT_ONCE)
+        + u64::from(KNOWN - 2);
     assert!(
         checked <= admitted,
         "the sender is cooled down: {checked} of {forged} forged records checked in {secs} s"
@@ -503,6 +549,61 @@ async fn a_peer_slipping_signed_records_between_forged_ones_is_cooled_down() {
         counted.checked() > heard
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validator_signing_records_without_pause_is_checked_once_an_interval() {
+    let fixtures = TestFixtures::with_surplus(21, 2, 1);
+    let (receiver, counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+    // A third host, bound to the receiver, counts what reaches it.
+    let onward_counted = Arc::new(CountingVerifier::default());
+    let onward = host_checking_with(
+        &fixtures,
+        2,
+        &[ShardId::ROOT],
+        vec![receiver.adapter.endpoint_addr()],
+        Arc::clone(&onward_counted) as Arc<dyn Verifier>,
+    )
+    .await;
+    wait_for("the third host binds", || {
+        onward.adapter.peer_for_validator(vid(0)).is_some()
+    })
+    .await;
+    let settled = checks_settle(&counted).await;
+    let onward_settled = checks_settle(&onward_counted).await;
+
+    // The sender's own validator signs a newer record every 5 ms.
+    let start = Instant::now();
+    let mut sent = 0;
+    let mut latest = 0;
+    while start.elapsed() < FLOOD_WATCH {
+        sent += 1;
+        let record = address_record(&fixtures, 1, &sender, sent, false);
+        latest = record.sequence;
+        sender.network.broadcast_global(&record);
+        sleep(Duration::from_millis(5)).await;
+    }
+    // The last record held is checked when its turn comes.
+    wait_for("the newest record is taken within an interval", || {
+        receiver
+            .adapter
+            .address_book()
+            .sequence(vid(1))
+            .is_some_and(|held| held == latest)
+    })
+    .await;
+    let secs = start.elapsed().as_secs() + 1;
+    let turns = 1 + secs / RECORD_INTERVAL.as_secs() + 1;
+    let checked = checks_settle(&counted).await - settled;
+    let onward_checked = checks_settle(&onward_counted).await - onward_settled;
+    assert!(
+        checked <= turns,
+        "the receiver checked {checked} of {sent} records in {secs} s"
+    );
+    assert!(
+        onward_checked <= turns,
+        "the next host checked {onward_checked} of {sent} records in {secs} s"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -227,6 +227,14 @@ impl AddressBook {
         (IngestOutcome::Recorded, Some(endpoint))
     }
 
+    /// The sequence of the newest verified record for `validator`, if any.
+    #[must_use]
+    pub fn sequence(&self, validator: ValidatorId) -> Option<u64> {
+        self.records
+            .get(&validator)
+            .map(|record| record.announcement.sequence)
+    }
+
     /// The newest verified record for `validator`, if any.
     #[must_use]
     pub(crate) fn get(&self, validator: ValidatorId) -> Option<AddressRecord> {

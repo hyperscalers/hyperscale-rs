@@ -363,6 +363,16 @@ impl IrohAdapter {
         outcome
     }
 
+    /// Whether the topology gives `validator` a key, so that its records
+    /// can be checked.
+    pub(crate) fn knows_validator(&self, validator: ValidatorId) -> bool {
+        self.inner
+            .bind
+            .validator_keys
+            .load()
+            .contains_key(&validator)
+    }
+
     /// One signed address record per hosted vnode, naming where this host
     /// can currently be reached. Empty while the endpoint knows no address
     /// for itself.
