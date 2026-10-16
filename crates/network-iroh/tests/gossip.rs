@@ -852,14 +852,20 @@ async fn a_validator_binding_again_under_a_new_endpoint_is_still_cooled_down() {
         }
     };
 
-    // The sender runs past its allowance and is cooled down.
+    // The sender runs past its allowance and is cooled down: the receiver
+    // stops judging its items long before the last.
     flood(&sender, 0);
-    wait_for("the sender runs past its allowance", || {
-        handled.load(Ordering::SeqCst) as u64 >= FORGERIES_IN_ALLOWANCE
-    })
-    .await;
-    sleep(SILENCE_WATCH).await;
-    let before = handled.load(Ordering::SeqCst) as u64;
+    let before = loop {
+        let judged = handled.load(Ordering::SeqCst);
+        sleep(SILENCE_WATCH).await;
+        if judged > 0 && handled.load(Ordering::SeqCst) == judged {
+            break judged as u64;
+        }
+    };
+    assert!(
+        before < ROTATION_FLOOD,
+        "the sender is cooled down: {before} of {ROTATION_FLOOD} judged"
+    );
 
     // The same validator binds again under an endpoint it just made.
     let again = host_keyed(
