@@ -86,6 +86,34 @@ impl GossipMessage for CommittedHeader {
     const SCOPE: TopicScope = TopicScope::Global;
 }
 
+/// One copy of some content several senders publish, as committee members
+/// each publish a committed header under their own signature: the content
+/// key covers `seq` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Copy {
+    seq: u64,
+    sender: u32,
+    forged: bool,
+}
+
+impl NetworkMessage for Copy {
+    fn message_type_id() -> &'static str {
+        "test.copy"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
+    }
+}
+
+impl GossipMessage for Copy {
+    const SCOPE: TopicScope = TopicScope::Global;
+
+    fn dedup_key(&self) -> Option<u64> {
+        Some(self.seq)
+    }
+}
+
 /// A vote, as far as the transport is concerned: a small notification.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 struct Vote(u64);
@@ -993,4 +1021,61 @@ async fn a_peer_cooled_down_for_its_gossip_is_refused_its_notifications_too() {
         heard < votes as usize / 2,
         "a cooled down peer's notifications are refused: {heard} of {votes} votes heard"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_copy_does_not_keep_an_honest_one_from_its_handler() {
+    let fixtures = TestFixtures::new(21, 3);
+    let receiver = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let bootstrap = vec![receiver.adapter.endpoint_addr()];
+    let forger = host(&fixtures, 1, &[ShardId::ROOT], bootstrap.clone()).await;
+    let honest = host(&fixtures, 2, &[ShardId::ROOT], bootstrap).await;
+    wait_for("both senders bind to the receiver", || {
+        receiver.adapter.peer_for_validator(vid(1)).is_some()
+            && receiver.adapter.peer_for_validator(vid(2)).is_some()
+    })
+    .await;
+
+    // The receiver finds a forged copy false, as a committed header whose
+    // sender signature fails, and takes an honest one.
+    let handled: Arc<std::sync::Mutex<Vec<Copy>>> = Arc::default();
+    let seen = Arc::clone(&handled);
+    receiver
+        .network
+        .register_gossip_handler(move |copy: Copy, _: ShardId| {
+            let false_on_its_face = copy.forged;
+            seen.lock().unwrap().push(copy);
+            if false_on_its_face {
+                Verdict::Reject
+            } else {
+                Verdict::Accept
+            }
+        });
+    let handled_count = || handled.lock().unwrap().len();
+
+    forger.network.broadcast_global(&Copy {
+        seq: 1,
+        sender: 1,
+        forged: true,
+    });
+    wait_for("the forged copy is judged first", || handled_count() == 1).await;
+    honest.network.broadcast_global(&Copy {
+        seq: 1,
+        sender: 2,
+        forged: false,
+    });
+    wait_for("the honest copy reaches its handler", || {
+        handled_count() == 2
+    })
+    .await;
+
+    // An accepted copy stands for its content: a later copy is not handed
+    // to the handler again.
+    forger.network.broadcast_global(&Copy {
+        seq: 1,
+        sender: 1,
+        forged: false,
+    });
+    sleep(SILENCE_WATCH).await;
+    assert_eq!(handled_count(), 2, "content already taken is handled once");
 }

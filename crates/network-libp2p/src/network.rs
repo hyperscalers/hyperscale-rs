@@ -16,7 +16,7 @@ use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    ResponseVerdict, Topic, ValidatorKeyMap, Verdict,
+    ResponseVerdict, Topic, ValidatorKeyMap, Verdict, VerdictKey,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -227,6 +227,12 @@ impl Network for Libp2pNetwork {
         // Cache the snapshot for validator identity. ArcSwap is lock-free;
         // readers in `request` use `.load()`.
         self.topology_snapshot.store(snapshot);
+    }
+
+    /// Gossip is relayed as soon as its handler returns, so a settled
+    /// verdict reaches only the registry's dedup.
+    fn settle(&self, key: VerdictKey, verdict: Verdict) {
+        self.registry.settle(key, verdict);
     }
 
     fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {
