@@ -3053,6 +3053,39 @@ fn hold_late_venues_apart<C: FaultableCluster>(c: &mut C, trader: ShardId) -> [F
     ]
 }
 
+/// Once both late venues stand `Stated` on `hash`, cut the survivor's
+/// readings from every host outside its own committee, the trader
+/// shard's included, and return `cut` with that cut beside it.
+///
+/// A trader host rotated onto the departing venue's committee would
+/// otherwise carry its verdict to the survivor through the trader's
+/// exemption, while nothing carries the survivor's back.
+///
+/// # Panics
+///
+/// Panics if either venue does not state its success within budget.
+fn cut_the_trader_once_stated<C: FaultableCluster>(
+    c: &mut C,
+    hash: TxHash,
+    cut: [FaultHandle; 3],
+) -> Vec<FaultHandle> {
+    let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
+    let stated = |c: &C, shard: ShardId| {
+        matches!(
+            c.member_rows(shard)
+                .and_then(|rows| rows.get(&hash).copied()),
+            Some(RowState::Stated { .. })
+        )
+    };
+    assert!(
+        c.run_until(epochs(12), |c| stated(c, survivor) && stated(c, departing)),
+        "both venues must state their success before the trader's shard is cut off too",
+    );
+    cut.into_iter()
+        .chain([isolate_crossing_intake_but_from(c, survivor, &[])])
+        .collect()
+}
+
 /// Drive the late vote through to the merged parent serving.
 ///
 /// The activation carries the run past the floor the grow's own split
@@ -3140,12 +3173,13 @@ pub fn merging_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 ///
 /// # Panics
 ///
-/// Panics if the grown topology does not settle, if the late split is
-/// not admitted where it was voted, if the record and the venue's
-/// prefix do not come to the merged parent together, if the merged
-/// chain does not decline the record, if the decline is a refusal's or
-/// names another transaction, if the input does not come home, or if
-/// the answer outlives the record.
+/// Panics if the grown topology does not settle, if either venue does
+/// not state its success, if the late split is not admitted where it
+/// was voted, if the record and the venue's prefix do not come to the
+/// merged parent together, if the merged chain does not decline the
+/// record, if the decline is a refusal's or names another transaction,
+/// if the input does not come home, or if the answer outlives the
+/// record.
 pub fn a_merged_chain_declines_at_its_own_parent<C: FaultableCluster>(c: &mut C) {
     let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
     let mut taken = Vec::new();
@@ -3192,6 +3226,7 @@ pub fn a_merged_chain_declines_at_its_own_parent<C: FaultableCluster>(c: &mut C)
         "the trader's leg must pay before the core is asked anything",
     );
     let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    let cut = cut_the_trader_once_stated(c, hash, cut);
     let (record, id) = escrowed_into(c, &charges.records(c), departing);
     let decline = id.answer_key(&ProtocolHasher, Answered::Never);
     assert_eq!(
