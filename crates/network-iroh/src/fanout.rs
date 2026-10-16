@@ -23,10 +23,13 @@
 //!
 //! Samples are drawn only from hosts that proved, in the bind handshake,
 //! that they carry a validator of the beacon derived set; nothing a peer
-//! merely claims widens an audience. Each item a host refuses is charged
-//! against its sender at about the work it took, and a sender whose refused
-//! items cost more than its share is cooled down: its gossip streams are
-//! stopped unread until the cooldown lapses.
+//! merely claims widens an audience. A host forwards only what one of its
+//! own handlers accepted. Each item it does not accept is charged against
+//! its sender at about the work it took, and one that is the sender's fault
+//! (a rejection, not an item this host could not judge) at the cost of a
+//! signature check on top. A sender whose refused items cost more than its
+//! share is cooled down: its gossip streams are stopped unread until the
+//! cooldown lapses.
 //!
 //! Discovery rides the same path. Each host announces its signed address
 //! records at an interval, and hands a newly bound peer its own records and
@@ -120,27 +123,36 @@ const ADDRESS_RECORD_CLASS: MessageClass = MessageClass::CrossShardProgress;
 const JUDGED_AT_ONCE_PER_PEER: usize = 4;
 
 /// Work charged against a peer for each of its gossip items this host
-/// refuses: reading, hashing, and dispatching it.
+/// does not accept: reading, hashing, and dispatching it.
 const REFUSED_ITEM_WORK: Duration = Duration::from_micros(10);
 
-/// Work charged for each KiB of a refused item, for decompressing and
-/// decoding it.
+/// Work charged for each KiB of an item this host does not accept, for
+/// decompressing and decoding it.
 const REFUSED_KIB_WORK: Duration = Duration::from_micros(1);
 
-/// Work charged for a refused address record, whose signature this host
-/// checks before it can refuse it. The other items the transport carries
-/// fail, when they fail here, before any signature is checked.
-const SIGNATURE_CHECK_WORK: Duration = Duration::from_millis(2);
+/// Work charged on top for an item that is its sender's fault: one that
+/// does not decode, or whose claims a check here found false. Set at what
+/// checking one signature costs, the check that finds most such items
+/// out, so a sender pays the same for any item no honest peer sends.
+const SENDER_FAULT_WORK: Duration = Duration::from_millis(2);
 
-/// The work charged for refusing an item of `bytes`.
-fn refused_work(bytes: usize, signature_checked: bool) -> Duration {
+/// Who answers for an item this host did not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The sender: no honest peer sends it.
+    Fault,
+    /// Nobody: this host could not judge it, or it was not for this host.
+    Unjudged,
+}
+
+/// The work charged for an item of `bytes` this host did not accept.
+fn refused_work(bytes: usize, refusal: Refusal) -> Duration {
     let kib = u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX);
-    let checked = if signature_checked {
-        SIGNATURE_CHECK_WORK
-    } else {
-        Duration::ZERO
+    let fault = match refusal {
+        Refusal::Fault => SENDER_FAULT_WORK,
+        Refusal::Unjudged => Duration::ZERO,
     };
-    REFUSED_ITEM_WORK + REFUSED_KIB_WORK * kib + checked
+    REFUSED_ITEM_WORK + REFUSED_KIB_WORK * kib + fault
 }
 
 /// Where a gossip item is addressed.
@@ -598,7 +610,7 @@ impl Fanout {
             Err(error) => {
                 warn!(peer = %sender.fmt_short(), %error, "Failed to decompress gossip item");
                 record_invalid_message();
-                self.note_reject(sender, refused_work(compressed.len(), false));
+                self.note_reject(sender, refused_work(compressed.len(), Refusal::Fault));
                 return;
             }
         };
@@ -615,12 +627,12 @@ impl Fanout {
             Scope::Shard(_) => None,
         };
 
-        let refused = refused_work(payload.len(), matches!(judge, Judge::AddressBook));
+        let bytes = payload.len();
         let fanout = Arc::clone(self);
         self.tokio_handle.spawn(async move {
             let _turn = turn;
             let verdict = match judge {
-                Judge::AddressBook => fanout.ingest_address_record(&payload),
+                Judge::AddressBook => Some(fanout.ingest_address_record(&payload)),
                 Judge::Registry {
                     handler,
                     host_handler,
@@ -631,8 +643,11 @@ impl Fanout {
                     handler(payload, scope.shard())
                 }
             };
+            // Only what a handler here accepted is forwarded: a host that
+            // forwards an item it did not judge would answer to the hosts
+            // it reaches for whatever the item turns out to be.
             match verdict {
-                GossipVerdict::Accept => {
+                Some(GossipVerdict::Accept) => {
                     record_network_message_received();
                     if let Some(frame) = forward {
                         let audience = forward_audience(
@@ -644,9 +659,12 @@ impl Fanout {
                         fanout.send(&audience, class, &frame);
                     }
                 }
-                GossipVerdict::Reject => {
+                Some(GossipVerdict::Reject) => {
                     record_invalid_message();
-                    fanout.note_reject(sender, refused);
+                    fanout.note_reject(sender, refused_work(bytes, Refusal::Fault));
+                }
+                Some(GossipVerdict::Ignore) | None => {
+                    fanout.note_reject(sender, refused_work(bytes, Refusal::Unjudged));
                 }
             }
         });

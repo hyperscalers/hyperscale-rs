@@ -13,6 +13,7 @@
 //! bench idle      --backend iroh|libp2p --connections 150
 //! bench delayed-idle --rtt-ms 40 --connections 500
 //! bench reject-flood --rate 1000 --forged-per-signed 7 [--follower]
+//! bench refused-flood --rate 1000 --verdict reject|ignore
 //! ```
 //!
 //! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
@@ -35,7 +36,7 @@ use arc_swap::ArcSwap;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
-use hyperscale_network::{HandlerRegistry, Network, RequestError, ResponseVerdict};
+use hyperscale_network::{GossipVerdict, HandlerRegistry, Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
 use hyperscale_network_iroh::testing::{CountingVerifier, Star, UdpBridge};
 use hyperscale_network_iroh::{
@@ -51,9 +52,9 @@ use hyperscale_network_libp2p::{
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
-    GenesisValidators, MessageClass, NetworkDefinition, NetworkMessage, Request, RoutingCommittees,
-    ShardId, Signer, TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier,
-    signed_bytes,
+    GenesisValidators, GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, Request,
+    RoutingCommittees, ShardId, Signer, TopicScope, TopologySnapshot, ValidatorAddressMessage,
+    ValidatorId, Verifier, signed_bytes,
 };
 use libc::{RUSAGE_SELF, getrusage, rusage, timeval};
 use serde_json::{Value, json};
@@ -246,6 +247,48 @@ enum Command {
         #[arg(long)]
         follower: bool,
     },
+    /// A peer floods global items its receiver refuses with one verdict.
+    RefusedFlood {
+        /// Items the peer sends a second.
+        #[arg(long, default_value_t = 1000)]
+        rate: u32,
+        /// What the receiver's handler answers every item with.
+        #[arg(long, value_enum)]
+        verdict: Refusal,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
+}
+
+/// The verdict a refused flood's receiver gives every item.
+#[derive(Clone, Copy, ValueEnum)]
+enum Refusal {
+    /// The item is the sender's fault.
+    Reject,
+    /// The receiver cannot judge the item.
+    Ignore,
+}
+
+/// A committed block header, as far as the transport is concerned: a global
+/// item of a few KiB.
+#[derive(Debug, Clone, Hbor)]
+struct Committed {
+    seq: u64,
+    body: Vec<u8>,
+}
+
+impl NetworkMessage for Committed {
+    fn message_type_id() -> &'static str {
+        "block.committed"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
+    }
+}
+
+impl GossipMessage for Committed {
+    const SCOPE: TopicScope = TopicScope::Global;
 }
 
 #[derive(Debug, Clone, Hbor)]
@@ -1084,6 +1127,84 @@ async fn reject_flood(rate: u32, forged_per_signed: u32, watch: Duration, follow
     );
 }
 
+/// A peer sends a receiver 2 KiB global items at `rate` for `watch`, and the
+/// receiver's handler answers each with `refusal`. Counts the items the
+/// receiver judged: what the sender made it spend.
+async fn refused_flood(rate: u32, refusal: Refusal, watch: Duration) {
+    let fixtures = IrohFixtures::new(SEED, 2);
+    let (receiver, receiver_network) = iroh_host(
+        &fixtures,
+        0,
+        &[ShardId::ROOT],
+        None,
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let (sender, sender_network) = iroh_host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        Some(receiver.endpoint_addr()),
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let bound = timeout(MESH_BUDGET, async {
+        while receiver.peer_for_validator(vid(1)).is_none()
+            || sender.peer_for_validator(vid(0)).is_none()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(bound.is_ok(), "the pair binds");
+    sleep(Duration::from_secs(3)).await;
+
+    let judged = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&judged);
+    receiver_network.register_gossip_handler(move |_: Committed, _: ShardId| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        match refusal {
+            Refusal::Reject => GossipVerdict::Reject,
+            Refusal::Ignore => GossipVerdict::Ignore,
+        }
+    });
+
+    let mut tick = interval(Duration::from_secs(1) / rate);
+    let start = (Instant::now(), cpu_time());
+    let mut sent = 0u64;
+    while start.0.elapsed() < watch {
+        tick.tick().await;
+        sent += 1;
+        sender_network.broadcast_global(&Committed {
+            seq: sent,
+            body: vec![7; HEADER_BYTES],
+        });
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "refused flood",
+            "backend": "iroh",
+            "verdict": match refusal {
+                Refusal::Reject => "reject",
+                Refusal::Ignore => "ignore",
+            },
+            "secs": wall,
+            "sent_per_sec": per_sec(sent),
+            "receiver_judged_per_sec": per_sec(judged.load(Ordering::Relaxed)),
+            "receiver_judged": judged.load(Ordering::Relaxed),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
 /// Run `measure` over a cluster on `backend`.
 macro_rules! on_backend {
     ($backend:expr, $spec:expr, |$hosts:ident| $measure:expr) => {
@@ -1178,6 +1299,13 @@ async fn main() {
             follower,
         } => {
             reject_flood(rate, forged_per_signed, Duration::from_secs(secs), follower).await;
+        }
+        Command::RefusedFlood {
+            rate,
+            verdict,
+            secs,
+        } => {
+            refused_flood(rate, verdict, Duration::from_secs(secs)).await;
         }
     }
 }

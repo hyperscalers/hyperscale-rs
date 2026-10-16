@@ -67,15 +67,24 @@ pub enum RequestError {
 
 /// Result of gossip message validation by the application handler.
 ///
-/// Returned by [`GossipHandler::on_message`] to tell the network layer whether
-/// the message should be accepted (forwarded to peers) or rejected (dropped
-/// with a peer-scoring penalty).
+/// Returned by [`GossipHandler::on_message`] to tell the network layer
+/// whether the message may travel on, and whose fault it is when it may
+/// not. A transport that charges senders for refused traffic charges
+/// [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no one's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GossipVerdict {
     /// Message is valid — accept and forward to peers.
     Accept,
-    /// Message is invalid — reject and penalize sender.
+    /// Message is invalid, and no honest sender sends it: it does not
+    /// decode, or what it claims is false by this host's own settled view.
+    /// Dropped, and held against the sender.
     Reject,
+    /// This host cannot judge the message now: it does not serve the
+    /// shard the message is for yet, or its view of the chain does not
+    /// reach what the message names. Dropped and not forwarded, but not the
+    /// sender's fault; a host that is behind refuses honest messages this
+    /// way.
+    Ignore,
 }
 
 /// Result of request-response evaluation by the application callback.

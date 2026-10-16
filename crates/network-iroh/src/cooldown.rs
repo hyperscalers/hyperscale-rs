@@ -13,8 +13,9 @@
 //! always send something acceptable, such as a record of its own signed
 //! afresh, so credit for good traffic would let it buy back refused work
 //! item for item. What keeps an honest peer clear is that the refusals it
-//! causes cost little: a host that is behind refuses items it cannot place
-//! yet, and those fail before any signature is checked.
+//! causes cost little: a host that is behind ignores items it cannot place
+//! yet, and is charged only the work of reading them, while the heavy
+//! charge is kept for items no honest peer sends.
 //!
 //! A cooldown, once begun, runs its course. Work charged while it lasts is
 //! for traffic read before it began, so it adds to the debt without

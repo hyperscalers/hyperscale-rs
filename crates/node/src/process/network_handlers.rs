@@ -83,7 +83,7 @@ where
                             shard = shard.inner(),
                             "Dropping tx gossip: shard not hosted"
                         );
-                        return GossipVerdict::Reject;
+                        return GossipVerdict::Ignore;
                     };
                     for transaction in gossip.transactions {
                         // A cross-shard tx arrives once per hosted shard
@@ -119,7 +119,7 @@ where
                             target_shard = target_shard.inner(),
                             "Dropping certified header gossip: shard not hosted"
                         );
-                        return GossipVerdict::Reject;
+                        return GossipVerdict::Ignore;
                     };
                     let sender = gossip.sender;
                     let header = gossip.certified_header.header();
@@ -142,8 +142,20 @@ where
                             shard = header_shard.inner(),
                             "certified header gossip at a window the schedule does not hold"
                         );
-                        return GossipVerdict::Reject;
+                        return GossipVerdict::Ignore;
                     };
+                    // The schedule holds the window, so it says who signed
+                    // there: a sender outside that committee is false on
+                    // its face. A member whose key the head topology no
+                    // longer carries is this host's own gap.
+                    if !signing.committee_for_shard(header_shard).contains(&sender) {
+                        warn!(
+                            sender = sender.inner(),
+                            shard = header_shard.inner(),
+                            "certified header sender not in the committee that signed it"
+                        );
+                        return GossipVerdict::Reject;
+                    }
                     let topo = topology_snapshot.load();
                     let Some(public_key) = resolve_sender_key(
                         signing,
@@ -152,7 +164,7 @@ where
                         header_shard,
                         "certified header",
                     ) else {
-                        return GossipVerdict::Reject;
+                        return GossipVerdict::Ignore;
                     };
 
                     push_shard_input(
@@ -186,7 +198,7 @@ where
                             target_shard = target_shard.inner(),
                             "Dropping fork proof gossip: shard not hosted"
                         );
-                        return GossipVerdict::Reject;
+                        return GossipVerdict::Ignore;
                     };
                     push_shard_input(
                         tx,
@@ -215,7 +227,7 @@ where
                             target_shard = target_shard.inner(),
                             "Dropping double-vote gossip: shard not hosted"
                         );
-                        return GossipVerdict::Reject;
+                        return GossipVerdict::Ignore;
                     };
                     push_shard_input(
                         tx,

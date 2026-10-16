@@ -52,7 +52,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     target_shard = target_shard.inner(),
                     "Dropping beacon block gossip: shard not hosted"
                 );
-                return GossipVerdict::Reject;
+                return GossipVerdict::Ignore;
             };
             push_protocol_event(
                 tx,
@@ -87,7 +87,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         move |gossip: BeaconCandidateGossip, target_shard: ShardId| -> GossipVerdict {
             let senders = s.load();
             let Some(tx) = senders.get(&target_shard) else {
-                return GossipVerdict::Reject;
+                return GossipVerdict::Ignore;
             };
             push_protocol_event(
                 tx,
@@ -129,7 +129,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         move |gossip: RatifyVoteGossip, target_shard: ShardId| -> GossipVerdict {
             let senders = s.load();
             let Some(tx) = senders.get(&target_shard) else {
-                return GossipVerdict::Reject;
+                return GossipVerdict::Ignore;
             };
             for vote in gossip.into_votes() {
                 push_protocol_event(
