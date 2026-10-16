@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::ValueEnum;
+use iroh::tls::CaTlsConfig;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,11 @@ pub struct IrohConfig {
     /// relaying: the host is then reachable only at its socket addresses.
     pub relays: Vec<RelayUrl>,
 
+    /// Certificate authorities the relays' TLS certificates are checked
+    /// against, in place of the platform's roots. A relay whose certificate
+    /// comes from a private authority needs this.
+    pub relay_roots: Option<CaTlsConfig>,
+
     /// Whether the relays serve QUIC address discovery, through which the
     /// endpoint learns its address as seen from outside. A relay that
     /// serves plain HTTP alone does not.
@@ -115,6 +121,7 @@ impl IrohConfig {
             secret_key,
             bind_addr: None,
             relays: Vec::new(),
+            relay_roots: None,
             relay_address_discovery: true,
             external_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),

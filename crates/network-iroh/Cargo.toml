@@ -63,5 +63,9 @@ required-features = ["test-utils"]
 name = "bench"
 required-features = ["test-utils"]
 
+[[example]]
+name = "seat"
+required-features = ["test-utils"]
+
 [lints]
 workspace = true

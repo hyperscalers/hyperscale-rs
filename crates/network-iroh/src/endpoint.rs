@@ -508,6 +508,12 @@ impl IrohAdapter {
         self.inner.redialer.refused()
     }
 
+    /// Resolves once the endpoint is connected to its home relay, and so
+    /// reachable by peers that know only its id and relay.
+    pub async fn online(&self) {
+        self.inner.endpoint.online().await;
+    }
+
     /// Advertise `addr` as one at which this host is reachable from
     /// outside, beside what the endpoint discovers for itself.
     pub async fn add_external_addr(&self, addr: SocketAddr) {
@@ -604,6 +610,9 @@ async fn build_endpoint(
         .transport_config(transport.build());
     for addr in &config.external_addrs {
         builder = builder.external_addr(*addr);
+    }
+    if let Some(roots) = &config.relay_roots {
+        builder = builder.ca_tls_config(roots.clone());
     }
     if let Some(addr) = config.bind_addr {
         builder = builder
