@@ -2963,13 +2963,8 @@ impl Display for CoreLoadSample {
 }
 
 /// The fetches a load's readings ride: a row's ask of its sibling's
-/// verdict cells, a consumer's read of a crossing's cells, and a core
-/// member's fallback for its sibling's certificate.
-const LOAD_FETCHES: &[Option<&str>] = &[
-    Some("verdict_proof"),
-    Some("state_proof"),
-    Some("exec_cert"),
-];
+/// verdict cells and a consumer's read of a crossing's cells.
+const LOAD_FETCHES: &[Option<&str>] = &[Some("verdict_proof"), Some("state_proof")];
 
 /// Every counter a load's report reads, with the labels it reads each
 /// under.
@@ -3017,10 +3012,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("fetch_completed", LOAD_FETCHES),
     ("fetch_abandoned", LOAD_FETCHES),
     ("fetch_retried", LOAD_FETCHES),
-    (
-        "fetch_items_sent",
-        &[Some("state_proof"), Some("exec_cert")],
-    ),
+    ("fetch_items_sent", &[Some("state_proof")]),
     ("fetch_responses_refused", LOAD_FETCHES),
 ];
 
@@ -4015,20 +4007,11 @@ impl CoreLoadRun<'_> {
                 "fetch_responses_refused",
             ],
         );
-        let routes = wide(self.flight.routes.len());
         println!(
             "core load [7 computed]: a verdict ask is served as a state proof, so its answers \
              are counted in fetch_items_sent{{state_proof}} with the record reads' and under no \
              label of their own; no counter tells a verdict reading that arrived by push from \
-             one that was asked for; exec_cert fetches a route {}, retries a route {}",
-            mean(
-                after.since(before, "fetch_started", Some("exec_cert")),
-                routes
-            ),
-            mean(
-                after.since(before, "fetch_retried", Some("exec_cert")),
-                routes
-            ),
+             one that was asked for"
         );
     }
 

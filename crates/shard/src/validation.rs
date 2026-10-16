@@ -865,7 +865,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Stated,
-            &Capped::from_array([Arc::new(certificate)]),
+            Some(Arc::new(certificate)),
             Capped::empty(),
         )
     }
@@ -3801,7 +3801,7 @@ pub mod tests {
             Arc::new(Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                &Capped::from_array([Arc::new(ec)]),
+                Some(Arc::new(ec)),
                 Capped::new(receipts).expect("a list written out in a test"),
             )))
         };
@@ -4157,7 +4157,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(projected)]),
+            Some(Arc::new(projected)),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -4327,7 +4327,7 @@ pub mod tests {
         let none = Finalization::new(
             tick_id,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(empty)]),
+            Some(Arc::new(empty)),
             Capped::empty(),
         );
         let err = settles(&holding_alone(&[]), &none).unwrap_err();

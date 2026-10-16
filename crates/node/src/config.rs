@@ -16,8 +16,6 @@ pub struct NodeConfig {
     pub transaction_fetch: FetchConfig,
     /// Cross-shard provision fetch configuration.
     pub provision_fetch: FetchConfig,
-    /// Execution-certificate fetch configuration.
-    pub exec_cert_fetch: FetchConfig,
     /// Cross-shard beacon-witness fetch configuration.
     pub shard_witness_fetch: FetchConfig,
     /// Missing-proposal fetch configuration: beacon proposals and ratify

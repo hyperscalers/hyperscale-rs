@@ -2875,7 +2875,7 @@ mod tests {
         let settling = Arc::new(Verifiable::from(Finalization::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(1)),
             TickHalf::Determined,
-            &Capped::from_array([]),
+            None,
             Capped::from_array([StoredReceipt::new(
                 TxHash::from(Hash::from_bytes(b"a late settle")),
                 Arc::new(ConsensusReceipt::Succeeded {

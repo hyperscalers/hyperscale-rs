@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    GlobalReceiptHash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload,
-    Transaction, TxHash, Verifiable, Verified,
+    CertifiedBlockHeader, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash,
+    ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    TxHash, Verifiable, Verified,
 };
 
 use crate::RecoveredState;
@@ -165,25 +165,6 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Every consensus receipt `tx_hash` settled on this shard, in
     /// receipt-hash order.
     fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>>;
-
-    /// Retrieve this shard's execution certificates carrying outcomes for
-    /// `tx_hashes`, deduplicated — one certificate covers every
-    /// transaction of its batch, so several requested transactions
-    /// commonly resolve to the same certificate. Only the copies that
-    /// carry an asked transaction are returned.
-    ///
-    /// This is the key a counterpart shard asks by: it knows the
-    /// transaction from our committed header and cannot know which
-    /// certificate we put it in. Served off the committed finalizations
-    /// themselves, through an index written beside each of this shard's
-    /// own: every finalization naming the transaction answers with its
-    /// local certificate, so the verdict and whatever later settled what
-    /// it left both answer. Transactions with no attested outcome here
-    /// are skipped.
-    fn get_execution_certificates_for_txs(
-        &self,
-        tx_hashes: &[TxHash],
-    ) -> Vec<Verified<ExecutionCertificate>>;
 
     /// Read retained beacon-witness payloads in leaf-index order, up to
     /// (but not including) `end`. Storage is scoped per-shard, so the

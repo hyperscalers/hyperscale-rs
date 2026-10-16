@@ -4159,6 +4159,13 @@ impl Counterparts {
         );
     }
 
+    /// Whether `shard`'s certificate naming `tx` is held as evidence that
+    /// arms a read of the records `tx` writes there.
+    #[cfg(test)]
+    pub(crate) fn heard_certificate(&self, shard: ShardId, tx: TxHash) -> bool {
+        self.records.heard(shard, tx)
+    }
+
     /// Whether `shard`'s settled set stands in for a commit proof of this
     /// certificate's source block.
     ///

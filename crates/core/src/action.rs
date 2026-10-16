@@ -598,21 +598,20 @@ pub enum Action {
         public_keys: Vec<ConsensusPublicKey>,
     },
 
-    /// Verify every EC inside a fetched [`Finalization`] in one async dispatch.
+    /// Verify a fetched [`Finalization`]'s certificate in one async
+    /// dispatch.
     ///
     /// Used by `ExecutionCoordinator::admit_finalization` to keep the
-    /// state-machine call off the signature verification critical path. Carries
-    /// per-EC public-key vectors aligned with
-    /// `finalization.execution_certificates()`.
+    /// state-machine call off the signature verification critical path.
     /// Returns `ProtocolEvent::FinalizationVerified` when complete.
     VerifyFinalization {
-        /// The finalization whose every EC needs signature verification
-        /// before admission. A `Verifiable::Verified` wrapper
-        /// short-circuits verification.
+        /// The finalization whose certificate needs signature
+        /// verification before admission. A `Verifiable::Verified`
+        /// wrapper short-circuits verification.
         finalization: Arc<Verifiable<Finalization>>,
-        /// Public keys for each EC, indexed parallel to
-        /// `finalization.execution_certificates()`.
-        ec_public_keys: Vec<Vec<ConsensusPublicKey>>,
+        /// The committee of its certificate, in committee order; `None`
+        /// for a legs half, which carries none.
+        public_keys: Option<Vec<ConsensusPublicKey>>,
     },
 
     /// Verify a Quorum Certificate's aggregated signature **and**

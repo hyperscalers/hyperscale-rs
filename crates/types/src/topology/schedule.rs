@@ -359,6 +359,17 @@ impl TopologySchedule {
         }
     }
 
+    /// Whether `wt`'s epoch lies below every retained entry, so no later
+    /// fold brings its committee back. Narrower than
+    /// [`lookup`](Self::lookup)'s [`Evicted`](WindowLookup::Evicted),
+    /// which also answers for an epoch missing between two retained ones.
+    #[must_use]
+    pub fn evicted(&self, wt: WeightedTimestamp) -> bool {
+        self.by_epoch
+            .first_key_value()
+            .is_some_and(|(oldest, _)| self.epoch_for(wt) < *oldest)
+    }
+
     /// [`at`](Self::at) with the miss reason surfaced: an epoch above every
     /// retained entry is [`NotYetCommitted`](WindowLookup::NotYetCommitted)
     /// (defer and retry), anything else absent is
@@ -1970,6 +1981,18 @@ mod tests {
             sched.lookup(WeightedTimestamp::from_millis(3500)),
             WindowLookup::Evicted
         ));
+    }
+
+    /// Only an epoch below every retained entry is evicted; one missing
+    /// between two retained entries, or above them, is not.
+    #[test]
+    fn an_epoch_is_evicted_only_below_the_oldest_retained() {
+        let mut sched = TopologySchedule::new(1000, Epoch::new(4), snapshot());
+        sched.insert(Epoch::new(8), snapshot());
+        assert!(sched.evicted(WeightedTimestamp::from_millis(3500)));
+        assert!(!sched.evicted(WeightedTimestamp::from_millis(4500)));
+        assert!(!sched.evicted(WeightedTimestamp::from_millis(6500)));
+        assert!(!sched.evicted(WeightedTimestamp::from_millis(9500)));
     }
 
     #[test]

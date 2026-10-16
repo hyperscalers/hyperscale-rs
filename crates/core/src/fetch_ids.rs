@@ -32,11 +32,6 @@ pub enum FetchIds {
     /// Cross-shard provision scopes as `(source_shard, target_shard,
     /// block_height)` — the requester's own shard is the target.
     RemoteProvisions(Vec<(ShardId, ShardId, BlockHeight)>),
-    /// Execution certificates as `(source_shard, tx_hash)`: the shard
-    /// whose outcome is wanted and the transaction it is wanted for. A
-    /// certificate answers for every transaction it covers, so a dropped
-    /// one releases each of them.
-    ExecutionCerts(Vec<(ShardId, TxHash)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
     /// Verdict questions as `(anchor, cells)`: the three cells one

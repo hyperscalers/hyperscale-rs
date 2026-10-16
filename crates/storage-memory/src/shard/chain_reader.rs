@@ -1,6 +1,5 @@
 //! `ShardChainReader` implementation for `SimShardStorage`.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
@@ -9,9 +8,9 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId,
-    ShardWitnessPayload, Transaction, TxHash, Verifiable, Verified,
+    CertifiedBlockHeader, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    TxHash, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -109,32 +108,6 @@ impl ShardChainReader for SimShardStorage {
 
     fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
         read_or_recover(&self.consensus).consensus_receipts_of(tx_hash)
-    }
-
-    fn get_execution_certificates_for_txs(
-        &self,
-        tx_hashes: &[TxHash],
-    ) -> Vec<Verified<ExecutionCertificate>> {
-        let c = read_or_recover(&self.consensus);
-        // Every finalization any asked transaction names, read once each:
-        // one finalization commonly answers for several of them.
-        let asked: BTreeSet<TxHash> = tx_hashes.iter().copied().collect();
-        let finalizations: BTreeSet<FinalizationHash> = asked
-            .iter()
-            .flat_map(|tx| {
-                c.tx_finalizations
-                    .range((*tx, FinalizationHash::from_raw(Hash::ZERO))..)
-                    .take_while(move |(at, _)| at == tx)
-                    .map(|(_, finalization)| *finalization)
-            })
-            .collect();
-        finalizations
-            .iter()
-            .filter_map(|id| c.attestation(id))
-            .filter_map(|fw| fw.local_ec().cloned())
-            .filter(|cert| asked.iter().any(|tx| cert.covers(tx)))
-            .map(Verified::<ExecutionCertificate>::from_persisted)
-            .collect()
     }
 
     fn get_beacon_witness_payloads(&self, end: BeaconWitnessLeafCount) -> Vec<ShardWitnessPayload> {

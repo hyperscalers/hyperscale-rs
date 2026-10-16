@@ -13,7 +13,7 @@
 //! ## Why a dedicated crate?
 //!
 //! Remote headers are consumed by shard consensus (deferral merkle proofs), Provision
-//! (state root verification), and Execution (expected cert tracking).
+//! (state root verification), and Execution (counterpart commit proofs).
 //! `RemoteHeaderCoordinator` is the single source of truth — it verifies,
 //! stores, and prunes headers once, then emits `RemoteHeaderAdmitted`
 //! continuations for all downstream consumers.

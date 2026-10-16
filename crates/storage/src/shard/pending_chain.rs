@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
-    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey,
-    ExecutionCertificate, Finalization, FinalizationHash, GlobalReceiptHash, QuorumCertificate,
-    RETENTION_HORIZON, SettledTxsRoot, ShardId, ShardWitnessPayload, StateRoot, SubstateKey,
-    SweepBucket, SweepFrontier, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
-    local_settled_tx_hashes, settled_txs_root_from_hashes,
+    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey, Finalization,
+    FinalizationHash, GlobalReceiptHash, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
+    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket, SweepFrontier, Transaction,
+    TxHash, Verifiable, Verified, WeightedTimestamp, local_settled_tx_hashes,
+    settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -746,15 +746,6 @@ where
         self.base.get_consensus_receipt(tx_hash, receipt_hash)
     }
 
-    /// The execution certificates carrying outcomes for `tx_hashes`,
-    /// deduplicated. Pass-through to base storage.
-    pub fn execution_certificates_for_txs(
-        &self,
-        tx_hashes: &[TxHash],
-    ) -> Vec<Verified<ExecutionCertificate>> {
-        self.base.get_execution_certificates_for_txs(tx_hashes)
-    }
-
     /// Beacon-witness payloads in leaf-index order up to (but not
     /// including) `end`. Pass-through to base storage.
     pub fn get_beacon_witness_payloads(
@@ -1365,8 +1356,8 @@ mod tests {
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, LocalKey, Provisions, Round, SettledWrites, SignerBitfield, StateWrites, TickHalf,
-        TickId, Transaction, TxHash, TxOutcome, WitnessSources,
+        Hash, LocalKey, Provisions, Role, Round, SettledWrites, SignerBitfield, StateWrites,
+        TickHalf, TickId, Transaction, TxHash, TxOutcome, WitnessSources,
     };
 
     use super::*;
@@ -1619,12 +1610,6 @@ mod tests {
             None
         }
         fn get_consensus_receipts(&self, _tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
-            Vec::new()
-        }
-        fn get_execution_certificates_for_txs(
-            &self,
-            _tx_hashes: &[TxHash],
-        ) -> Vec<Verified<ExecutionCertificate>> {
             Vec::new()
         }
         fn get_beacon_witness_payloads(
@@ -2203,24 +2188,8 @@ mod tests {
         TxHash::from(Hash::from_bytes(&tick.block_height().inner().to_le_bytes()))
     }
 
-    /// A counterpart shard's certificate for the same transaction — the
-    /// evidence that makes it reach beyond the settling shard.
-    fn remote_ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
-            TickId::new(ShardId::from_heap_index(2), tick.block_height()),
-            WeightedTimestamp::from_millis(1),
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
-                settled_tx(tick),
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )]),
-            AggregateSignature::new([0u8; 96]),
-            SignerBitfield::new(4),
-        ))
-    }
-
+    /// The tick's certificate, settling one leg that ran: what reaches
+    /// beyond this shard, and so what puts it in the settled set.
     fn ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
             *tick,
@@ -2231,7 +2200,8 @@ mod tests {
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )]),
+            )
+            .as_role(Role::Leg)]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
@@ -2255,10 +2225,7 @@ mod tests {
             Finalization::new(
                 *settles,
                 TickHalf::Determined,
-                // A counterpart's certificate for the same transaction:
-                // what makes it cross-shard, and so what puts it in the
-                // settled set.
-                &Capped::from_array([ec_for(settles), remote_ec_for(settles)]),
+                Some(ec_for(settles)),
                 Capped::from_array([]),
             )
             .into(),

@@ -3,7 +3,7 @@
 //! One `TickState` owns what a tick attests, from the moment its batch
 //! is composed to the moment its finalization is handed off: the local
 //! execution results, the vote this validator casts over them, and the
-//! awaited shards' certificates that complete each member's coverage.
+//! tick's own certificate.
 //!
 //! ## What a tick holds
 //!
@@ -31,11 +31,9 @@
 //! 4. **States** what its own certificate reached for every member
 //!    awaiting another shard, once and whole: the stating half settles
 //!    the ones it refused and states a yes for the rest.
-//! 5. **Collects certificates** from the shards its members await via
-//!    `add_execution_certificate`. A stated member is ready for
-//!    finalization once every shard it awaits has covered it (or one
-//!    has aborted it, which is terminal-covered), whatever its
-//!    tick-mates still wait for.
+//! 5. **Accepts** a stated member in a legs half once its row accepts on
+//!    what its siblings' committed state says, whatever its tick-mates
+//!    still wait for. No other shard's certificate enters.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -45,9 +43,9 @@ use hyperscale_engine::legs::Member;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, Joins, MAX_EXECUTION_CERTIFICATES_PER_TICK, MAX_FINALIZATION_DELAY, Role,
-    Settles, ShardId, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, Verified,
-    WeightedTimestamp, compute_global_receipt_root, settles,
+    GlobalReceiptRoot, Joins, MAX_FINALIZATION_DELAY, Role, Settles, ShardId, StoredReceipt,
+    TickHalf, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
+    settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -252,11 +250,6 @@ struct Seat {
     /// settles it: the transaction's own effects are discarded, the
     /// floor and the answers are not.
     refusal_receipt: Option<StoredReceipt>,
-    /// Which shards have reported on the member via a certificate.
-    covered_by: BTreeSet<ShardId>,
-    /// A certificate reported abort. Terminal — an aborted transaction
-    /// needs no further coverage.
-    aborted_anywhere: bool,
     /// A committed finalization resolved the member. The tick's
     /// certificate and tracking state drop once every seat is — which is
     /// later than the halves being emitted, since a handed-off
@@ -276,15 +269,13 @@ impl Seat {
             result: None,
             receipt: None,
             refusal_receipt: None,
-            covered_by: BTreeSet::new(),
-            aborted_anywhere: false,
             settled: false,
         }
     }
 
     /// Whether a counterpart shares the verdict on this member: a whole
     /// shape or a core member awaiting a shard other than `local`, which
-    /// settles the member against this shard's certificate.
+    /// reads this shard's verdict from its state.
     ///
     /// Read off committed membership alone, never off whether this
     /// replica has handed its own certificate off, so every replica
@@ -358,7 +349,8 @@ pub struct TickState {
     /// `TICK_OVERDUE_WARN` threshold. Under ts-based ages we can't rely on
     /// exact equality (commits can skip over any given ms value).
     overdue_warned: bool,
-    /// All collected certificates (local + remote).
+    /// Copies of this tick's own certificate: the first to arrive, and a
+    /// complete one where the first is not.
     execution_certificates: Vec<Arc<Verified<ExecutionCertificate>>>,
 }
 
@@ -464,30 +456,6 @@ impl TickState {
             .is_some_and(|seat| seat.membership.abortable(local))
     }
 
-    /// Whether `outcome`, attested by `shard`, covers its member here: the
-    /// member awaits `shard`, and a success counts only if the
-    /// counterpart awaited this shard for it — ran the shape that has
-    /// this shard in it. Two shards freeze a member's shape each at its
-    /// own anchor, and one that froze it divided while this one froze it
-    /// whole attests a leg that awaited nobody; settling a whole shape on
-    /// that would credit here what the leg escrowed there, and the
-    /// escrow's reclaim then pays it a second time. An abort settles
-    /// nothing and is terminal whoever speaks it, and the tick's own
-    /// certificate is what it awaited of itself.
-    fn covers(&self, outcome: &TxOutcome, shard: ShardId, is_local: bool) -> bool {
-        self.awaits(outcome.tx_hash(), shard)
-            && (is_local
-                || outcome.is_aborted()
-                || outcome.counterparts().contains(&self.tick_id.shard_id()))
-    }
-
-    /// Whether `tx_hash`'s settlement waits on `shard`'s certificate.
-    fn awaits(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        self.seats
-            .get(&tx_hash)
-            .is_some_and(|seat| seat.membership.awaited().contains(&shard))
-    }
-
     /// The shards other than this one that some member owes its
     /// outcome to — who this tick's certificate is projected to.
     #[must_use]
@@ -507,46 +475,16 @@ impl TickState {
             .collect()
     }
 
-    /// Every counterpart certificate this tick's members wait on, as
-    /// `(member, shard)` pairs — the coverage [`Self::covered_legs`] asks
-    /// for, stated as the certificates that would supply it.
-    ///
-    /// A member admitted as an abort names none: the tick's own
-    /// certificate carries its verdict, and no counterpart owes one for a
-    /// transaction that reached no outcome anywhere.
-    pub fn awaited_counterparts(&self) -> impl Iterator<Item = (TxHash, ShardId)> + '_ {
-        let local = self.tick_id.shard_id();
-        self.seats
-            .iter()
-            .filter(|(_, seat)| !seat.aborted)
-            .flat_map(move |(&tx_hash, seat)| {
-                seat.membership
-                    .awaited()
-                    .iter()
-                    .filter(move |&&shard| shard != local)
-                    .map(move |&shard| (tx_hash, shard))
-            })
-    }
-
     /// Whether this tick is `tx_hash`'s abandonment rather than a tick
     /// that merely holds it.
     ///
-    /// Such a tick waits on nothing and can never fail to close its
-    /// coverage, so a later commit that abandoned the member again would
+    /// Such a tick waits on nothing and can never fail to settle, so a
+    /// later commit that abandoned the member again would
     /// discard the abort this one is carrying and compose an identical
     /// one, every block, for as long as the entry stands.
     #[must_use]
     pub fn abandons(&self, tx_hash: TxHash) -> bool {
         self.seats.get(&tx_hash).is_some_and(|seat| seat.abandons)
-    }
-
-    /// The tick's members whose settlement waits on `shard` — what this
-    /// tick is waiting on that shard for.
-    pub fn txs_awaiting(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {
-        self.order
-            .iter()
-            .copied()
-            .filter(move |&tx_hash| self.awaits(tx_hash, shard))
     }
 
     /// The tick's members that owe `shard` their outcome — what its copy
@@ -642,10 +580,10 @@ impl TickState {
     /// This tick's own certificate, in the copy that carries the whole
     /// batch.
     ///
-    /// The store can hold more than one copy of a tick — a broadcast and
-    /// a narrower fetch answer both land, and the retention rule keeps
-    /// whichever covers something new — so the first match is not
-    /// necessarily the complete one. Projecting a half needs sibling
+    /// The store can hold more than one copy of a tick — the projection
+    /// a counterpart committee is sent reaches this validator when it
+    /// also sits in that committee, and a complete copy is kept beside
+    /// it — so the first match is not necessarily the complete one. Projecting a half needs sibling
     /// nodes from the whole receipt tree, which only the complete copy
     /// carries, and a shard sends its own peers exactly that.
     fn local_certificate(&self) -> Option<&Arc<Verified<ExecutionCertificate>>> {
@@ -837,76 +775,35 @@ impl TickState {
             .collect()
     }
 
-    // ── Cross-shard certificate collection ──────────────────────────────
+    // ── Own certificate ─────────────────────────────────────────────────
 
-    /// Feed a certificate into the tick: update per-member coverage, track
-    /// aborts and failures, and keep it. For our own local certificate
-    /// (`ec.tick_id() == &self.tick_id`), records the admitted root and
-    /// reconciles against the local vote when both are known. The local
-    /// certificate may arrive before the local vote when peers aggregate
-    /// it before this validator's engine finishes; the reconciliation runs
-    /// again from `build_vote_data` once the local vote lands.
+    /// Hold a copy of this tick's own certificate. The first copy records
+    /// the admitted root and reconciles it against the local vote when
+    /// both are known; the certificate may arrive before the local vote
+    /// when peers aggregate it before this validator's engine finishes,
+    /// and the reconciliation runs again from `build_vote_data` once the
+    /// local vote lands.
     ///
-    /// **A certificate is kept exactly when it covers something this tick
-    /// does not already have covered.** A certificate carries the outcomes
-    /// naming its holder, so two copies of one tick can differ — the
-    /// broadcast a shard sends and a narrower one a fetch answered with —
-    /// and dropping the second because its tick is familiar would leave
-    /// this tick believing a transaction covered by an outcome it does not
-    /// hold. That is not a missing optimisation but a hole: the outcome it
-    /// would have dropped could be the counterpart's abort, and settling
-    /// its sibling without it moves value one-sidedly.
+    /// A later copy is kept only where it is complete and none held is: a
+    /// projection sent to a counterpart committee this validator also
+    /// sits on cannot project a half, and the complete one can. Another
+    /// shard's certificate decides nothing here, and is not kept.
     ///
-    /// The same test is the bound. A peer can synthesise arbitrarily many
-    /// valid narrower copies of one tick, so keeping every distinct copy
-    /// would be unbounded; keeping only those that cover something new
-    /// caps the collection at one certificate per transaction.
-    ///
-    /// **An outcome from a shard the member does not await is not
-    /// coverage.** A leg that certifies alone owes nothing to the core's
-    /// certificate, and reading a verdict off one would discard an
-    /// escrow that is only ever reclaimed on evidence. Such a certificate
-    /// covers nothing here and is not kept.
-    ///
-    /// Readiness is the caller's next question — a certificate can make
-    /// either half settleable, or neither.
+    /// Readiness is the caller's next question — the certificate can
+    /// make either half settleable, or neither.
     pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) {
-        let shard = ec.shard_id();
-        let is_local = ec.tick_id() == &self.tick_id;
-
-        let covers_something_new = ec.tx_outcomes().iter().any(|outcome| {
-            self.covers(outcome, shard, is_local)
-                && self
-                    .seats
-                    .get(&outcome.tx_hash())
-                    .is_some_and(|seat| !seat.covered_by.contains(&shard))
-        });
-        // An empty tick's own certificate covers nothing yet still has to
-        // land: both halves gate on having emitted it.
-        let first_local = is_local && !self.local_ec_emitted;
-        if !covers_something_new && !first_local {
+        if ec.tick_id() != &self.tick_id {
             return;
         }
-
-        for outcome in ec.tx_outcomes() {
-            let tx_hash = outcome.tx_hash();
-            if !self.covers(outcome, shard, is_local) {
-                continue;
+        if self.local_ec_emitted {
+            if ec.is_complete() && self.local_certificate().is_none() {
+                self.execution_certificates.push(ec);
             }
-            if let Some(seat) = self.seats.get_mut(&tx_hash) {
-                seat.covered_by.insert(shard);
-                if outcome.is_aborted() {
-                    seat.aborted_anywhere = true;
-                }
-            }
+            return;
         }
-
-        if is_local {
-            self.admitted_local_ec_root = Some(ec.global_receipt_root());
-            self.local_ec_emitted = true;
-            self.reconcile_local_ec_root();
-        }
-
+        self.admitted_local_ec_root = Some(ec.global_receipt_root());
+        self.local_ec_emitted = true;
+        self.reconcile_local_ec_root();
         self.execution_certificates.push(ec);
     }
 
@@ -916,7 +813,7 @@ impl TickState {
     ///
     /// A later committee re-attests a tick whose certificate lapsed while
     /// its half was still owed. The outcomes and root are the held
-    /// copy's, so coverage, reconciliation and readiness stand as they
+    /// copy's, so reconciliation and readiness stand as they
     /// are; only the certificate a half is built from changes, to the one
     /// verifiers still resolve a committee for.
     pub fn adopt_later_certificate(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> bool {
@@ -1011,7 +908,7 @@ impl TickState {
 
     /// Whether the determined half can settle now.
     ///
-    /// It needs no coverage beyond the tick's own certificate, which is
+    /// It needs nothing beyond the tick's own certificate, which is
     /// the whole point: a leg waiting on a counterpart that never comes
     /// cannot hold these members, and the settlement frontier they
     /// advance therefore cannot wedge.
@@ -1282,27 +1179,6 @@ impl TickState {
 
         let total = self.order.len();
 
-        let mut missing_coverage: Vec<String> = Vec::new();
-        for tx_hash in &self.order {
-            let Some(seat) = self.seats.get(tx_hash) else {
-                continue;
-            };
-            if seat.aborted_anywhere {
-                continue;
-            }
-            let missing: BTreeSet<ShardId> = seat
-                .membership
-                .awaited()
-                .difference(&seat.covered_by)
-                .copied()
-                .collect();
-            if !missing.is_empty() {
-                let missing_list: Vec<String> =
-                    missing.iter().map(|s| s.inner().to_string()).collect();
-                missing_coverage.push(format!("{:?}→[{}]", tx_hash, missing_list.join(",")));
-            }
-        }
-
         let local_receipts_ready = self.has_local_receipts_for(&self.order);
 
         tracing::warn!(
@@ -1319,112 +1195,32 @@ impl TickState {
             local_receipts_ready,
             execution_results = self.seats.values().filter(|seat| seat.result.is_some()).count(),
             aborted = self.seats.values().filter(|seat| seat.aborted).count(),
-            aborted_anywhere = self.seats.values().filter(|seat| seat.aborted_anywhere).count(),
             ecs_collected = self.execution_certificates.len(),
             determined_ready = self.determined_ready(),
             stating_ready = self.stating_ready(),
             determined_emitted = self.determined_emitted,
             stating = ?self.stating,
             legs_offered = self.legs_offered.len(),
-            missing_coverage = missing_coverage.join(" "),
             "Tick overdue: unresolved past the deadline that bounds every member"
         );
     }
 
     /// Build one half's attestation: the tick's own certificate
-    /// projected to `members`, plus the counterpart certificates those
-    /// members still need a verdict from.
+    /// projected to `members`, and nothing else.
     ///
     /// **The projection is what makes each half account for itself.**
     /// The certificate a half carries attests exactly `members`, which
     /// are the transactions it names and the rows it deletes: every
-    /// member of the determined half, and the legs a legs half settles
-    /// now. Every projection verifies under the same signed root and
+    /// member of the determined half, and the members the stating half
+    /// states. Every projection verifies under the same signed root and
     /// signature as the copy it came from.
     ///
-    /// A remote certificate is included when it comes from a shard a
-    /// member of this half awaits and covers a member this half still
-    /// needs a verdict on, or when it is the certificate carrying that
-    /// member's abort. That second clause is what keeps the two
-    /// sides of a settlement in agreement. `tracker_aborted` is fed by
-    /// the very certificates being filtered here — a remote abort lands
-    /// as coverage *and* as an entry in that set — so pruning on
-    /// `tracker_aborted` alone discards the only artifact carrying that
-    /// verdict. Every downstream reader derives the outcome from the
-    /// certificate and nothing else ([`Finalization::tx_decisions`]), so
-    /// what that drops is not merely redundant: the local certificate's
-    /// success stands unopposed and this shard commits an accept against
-    /// the counterparty's abort.
-    ///
-    /// Returns `None` when this half has no members, when the local
-    /// certificate has not landed yet, or when the certificates the half
-    /// needs outgrow what one finalization carries.
+    /// Returns `None` when this half has no members, or when the local
+    /// certificate has not landed yet.
     #[must_use]
     fn attestation_for(&self, half: TickHalf, members: &HashSet<TxHash>) -> Option<Finalization> {
-        let local = self.local_certificate()?;
-        // What the local certificate says on its own. A member it already
-        // reports as aborted needs no remote to corroborate it.
-        let locally_aborted: HashSet<TxHash> = local
-            .tx_outcomes()
-            .iter()
-            .filter(|outcome| outcome.is_aborted())
-            .map(TxOutcome::tx_hash)
-            .collect();
-
-        let projected = local.project_to(members)?;
-
-        let required_remote_tick_ids: HashSet<TickId> = self
-            .execution_certificates
-            .iter()
-            .filter(|ec| ec.tick_id() != &self.tick_id)
-            .filter(|ec| {
-                let shard = ec.shard_id();
-                ec.tx_outcomes().iter().any(|outcome| {
-                    let tx_hash = outcome.tx_hash();
-                    if !members.contains(&tx_hash) || !self.awaits(tx_hash, shard) {
-                        return false;
-                    }
-                    // Still awaiting a verdict, or holding the only one that
-                    // says abort.
-                    !self
-                        .seats
-                        .get(&tx_hash)
-                        .is_some_and(|seat| seat.aborted_anywhere)
-                        || (outcome.is_aborted() && !locally_aborted.contains(&tx_hash))
-                })
-            })
-            .map(|ec| *ec.tick_id())
-            .collect();
-
-        let mut ecs: Vec<Verified<ExecutionCertificate>> = std::iter::once(projected)
-            .chain(
-                self.execution_certificates
-                    .iter()
-                    .filter(|ec| required_remote_tick_ids.contains(ec.tick_id()))
-                    .map(|verified| (**verified).clone()),
-            )
-            .collect();
-        ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
-
-        // The certificates are the proof, so a shorter list proves less
-        // than the members need and truncating one would assert a
-        // verdict nothing carries. A half whose evidence outgrows what a
-        // finalization holds is one this node cannot attest to, and
-        // declining leaves the half for the next pass — the caller marks
-        // it emitted only on a `Some`.
-        let carried = ecs.len();
-        let Ok(ecs) = Capped::new(ecs) else {
-            tracing::error!(
-                tick = %self.tick_id,
-                ?half,
-                carried,
-                cap = MAX_EXECUTION_CERTIFICATES_PER_TICK,
-                "a half's certificates outgrow one finalization; not attesting to it"
-            );
-            return None;
-        };
-
-        Some(Finalization::from_verified_ecs(self.tick_id, half, &ecs))
+        let projected = self.local_certificate()?.project_to(members)?;
+        Some(Finalization::from_verified_ec(half, projected))
     }
 
     /// `attestation` carrying one stored receipt per outcome it settles
@@ -1485,8 +1281,8 @@ impl TickState {
 
     /// Take the stating half's finalization, if it is ready: the tick's
     /// own certificate projected to the members awaiting another shard
-    /// that stand unsettled, carrying no counterpart's certificate, with
-    /// the receipt each refused member settles.
+    /// that stand unsettled, with the receipt each refused member
+    /// settles.
     ///
     /// It states every such member or none, since a block admits only a
     /// stating half that accounts for every row its tick holds outside
@@ -1498,11 +1294,7 @@ impl TickState {
         }
         let members: HashSet<TxHash> = self.stating_members().into_iter().collect();
         let projected = self.local_certificate()?.project_to(&members)?;
-        let attestation = Finalization::from_verified_ecs(
-            self.tick_id,
-            TickHalf::Stated,
-            &Capped::from_array([projected]),
-        );
+        let attestation = Finalization::from_verified_ec(TickHalf::Stated, projected);
         self.stating = Stating::Offered;
         Some(self.with_receipts(attestation))
     }
@@ -1540,10 +1332,10 @@ impl TickState {
     /// `abandoned` whatever it shares. Returns the released members and
     /// the kept ones, each in composition order.
     ///
-    /// What stays is a member a counterpart can settle against this
-    /// shard's certificate, which outlives the tick: dropped here,
-    /// nothing would settle it, and its entry being certified, nothing
-    /// would abandon it. Every determined seat goes, so the tick owes no
+    /// What stays is a member whose verdict a counterpart reads from this
+    /// shard's state, which the stating half writes from the tick's
+    /// certificate: dropped here, nothing would state it, and its entry
+    /// being certified, nothing would abandon it. Every determined seat goes, so the tick owes no
     /// determined half afterwards; the legs half is owed again for the
     /// kept legs, since one handed off before may name a released
     /// member. A stating half handed off and not yet committed is owed
@@ -1766,54 +1558,6 @@ mod tests {
         (tick, determined, leg)
     }
 
-    /// A counterpart that ran the member as a leg awaited nobody, and its
-    /// certificate is not the counterpart a whole shape here waits on:
-    /// the member stays uncovered until a certificate whose outcome
-    /// awaited this shard arrives.
-    #[test]
-    fn a_counterpart_that_awaited_nobody_does_not_cover_a_whole_shape() {
-        let (local, peer) = (shard(0), shard(1));
-        let member = tx(3);
-        let mut tick = TickState::new(
-            TickId::new(local, BlockHeight::new(1)),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(1_000),
-        );
-        tick.admit(
-            member,
-            Membership::whole(BTreeSet::from([local, peer])),
-            10,
-            Joins::Executes,
-        );
-        let from_peer = |counterparts: Vec<ShardId>| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-                TickId::new(peer, BlockHeight::new(7)),
-                WeightedTimestamp::from_millis(1_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(
-                    member,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: effects_hash(),
-                    },
-                )
-                .awaiting(counterparts)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            )))
-        };
-
-        tick.add_execution_certificate(from_peer(Vec::new()));
-        assert!(
-            !tick.seats[&member].covered_by.contains(&peer),
-            "a leg's certificate awaited nobody and covers nothing here"
-        );
-        tick.add_execution_certificate(from_peer(vec![local]));
-        assert!(
-            tick.seats[&member].covered_by.contains(&peer),
-            "a certificate whose outcome awaited this shard is the counterpart"
-        );
-    }
-
     /// The hostage-taking runs both ways, and neither is allowed.
     ///
     /// A determined member this validator holds no receipt for cannot
@@ -1917,10 +1661,9 @@ mod tests {
             .expect("the tick's own certificate is all its stating half needs");
         assert_eq!(half.half(), TickHalf::Stated);
         assert_eq!(half.validate_against_certificates(), Ok(()));
-        assert_eq!(
-            half.execution_certificates().len(),
-            1,
-            "a stating half carries no counterpart's certificate",
+        assert!(
+            half.local_ec().is_some(),
+            "a stating half carries its own certificate",
         );
         tick.stating_committed();
         tick.record_settled(half.tx_hashes());
@@ -1998,7 +1741,7 @@ mod tests {
         assert!(tick.legs_ready(&accepting));
         let half = take_legs(&mut tick, &accepting).expect("accepting");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
-        assert!(half.execution_certificates().is_empty());
+        assert!(half.certificate().is_none());
         assert_eq!(half.validate_against_certificates(), Ok(()));
         assert_eq!(
             (half.tx_count(), half.charged()),
@@ -2728,8 +2471,8 @@ mod tests {
     /// A leg awaiting nobody but itself settles in the determined half on
     /// the tick's own certificate, and owes that certificate to nobody:
     /// the venue reads the leg's crossing off the record it was pushed.
-    /// A certificate from the venue is neither coverage for the leg nor
-    /// part of its finalization: its verdict is not the leg's to apply.
+    /// A certificate from the venue is not held, and is no part of its
+    /// finalization: its verdict is not the leg's to apply.
     #[test]
     fn a_leg_certifies_alone_and_owes_its_certificate_to_nobody() {
         use hyperscale_types::BlockHeight;
@@ -2758,17 +2501,11 @@ mod tests {
 
         assert_eq!(tick.determined_members(), vec![leg], "it settles alone");
         assert!(tick.leg_members().is_empty());
-        assert_eq!(
-            tick.awaited_counterparts().count(),
-            0,
-            "and expects no certificate"
-        );
         assert!(
             tick.counterpart_shards().is_empty(),
             "and owes its own to nobody"
         );
         assert_eq!(tick.txs_reaching(venue).count(), 0);
-        assert_eq!(tick.txs_awaiting(venue).count(), 0);
 
         tick.record_execution_result(
             leg,
@@ -2804,8 +2541,8 @@ mod tests {
             "nothing settles before the local certificate"
         );
         assert!(
-            !tick.seats[&leg].aborted_anywhere && tick.seats[&leg].covered_by.is_empty(),
-            "a shard the leg does not await decides nothing for it"
+            tick.execution_certificates.is_empty(),
+            "another shard's certificate is not held"
         );
 
         tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
@@ -2821,90 +2558,7 @@ mod tests {
         let half = tick
             .take_determined_finalization()
             .expect("the local certificate is all it needed");
-        assert_eq!(half.execution_certificates().len(), 1, "and all it carries");
+        assert!(half.local_ec().is_some(), "and carries it");
         assert!(tick.has_spoken());
-    }
-
-    /// A half needing more certificates than one finalization carries is
-    /// declined, not fatal.
-    ///
-    /// The wire holds [`MAX_EXECUTION_CERTIFICATES_PER_TICK`] of them and
-    /// nothing holds this node's collection to that figure: a member
-    /// awaiting many counterparts takes one certificate from each, and
-    /// each is one the tick keeps because it covers a seat nothing else
-    /// does. So the list the half needs can outgrow what it fits in, and
-    /// what that must not do is take the node down with it.
-    #[test]
-    fn a_half_whose_certificates_outgrow_one_finalization_is_declined() {
-        // A trie deep enough to name every counterpart apart, which the
-        // two-shard helper above is not.
-        let at = |path: u64| ShardId::leaf(11, path);
-        let local = at(0);
-        let member = tx(3);
-        // One counterpart per certificate the wire holds: with the local
-        // projection beside them the half needs one more than it fits.
-        let peers: BTreeSet<ShardId> = (1..=MAX_EXECUTION_CERTIFICATES_PER_TICK as u64)
-            .map(at)
-            .collect();
-        let mut participating = peers.clone();
-        participating.insert(local);
-
-        let mut tick = TickState::new(
-            TickId::new(local, BlockHeight::new(1)),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(1_000),
-        );
-        tick.admit(
-            member,
-            Membership::whole(participating),
-            10,
-            Joins::Executes,
-        );
-        tick.record_execution_result(
-            member,
-            ExecutionOutcome::Succeeded {
-                receipt_hash: effects_hash(),
-            },
-        );
-        tick.record_receipt(receipt(member));
-        let (_, root, outcomes) = tick.build_vote_data().expect("the member came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
-            ExecutionCertificate::new(
-                *tick.tick_id(),
-                tick.vote_anchor_ts(),
-                root,
-                Capped::new(outcomes).expect("a list written out in a test"),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ),
-        )));
-
-        // One certificate per counterpart, each awaiting this shard for
-        // the member, so each covers a seat the others do not.
-        for peer in &peers {
-            tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
-                ExecutionCertificate::new(
-                    TickId::new(*peer, BlockHeight::new(7)),
-                    WeightedTimestamp::from_millis(1_000),
-                    GlobalReceiptRoot::ZERO,
-                    Capped::from_array([TxOutcome::new(
-                        member,
-                        ExecutionOutcome::Succeeded {
-                            receipt_hash: effects_hash(),
-                        },
-                    )
-                    .awaiting(vec![local])]),
-                    AggregateSignature::ZERO,
-                    SignerBitfield::new(4),
-                ),
-            )));
-        }
-
-        let members = HashSet::from([member]);
-        assert!(
-            tick.attestation_for(TickHalf::Determined, &members)
-                .is_none(),
-            "a half that does not fit one finalization is one this node declines"
-        );
     }
 }

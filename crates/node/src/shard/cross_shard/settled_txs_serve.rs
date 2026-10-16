@@ -209,7 +209,7 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SectionRoots,
+        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Role, Round, SectionRoots,
         SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId,
         TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp, WitnessSources,
         compute_global_receipt_root, settled_txs_root_from_hashes,
@@ -226,9 +226,9 @@ mod tests {
     }
 
     fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
-        // Cross-shard tick (non-empty `remote_shards`): the settled set
-        // commits only cross-shard ticks, so single-shard fixtures would be
-        // filtered out before the merkle root.
+        // A leg that ran: the settled set names only what reaches beyond
+        // this shard, so a single-shard fixture would be filtered out
+        // before the merkle root.
         let tick = TickId::new(SHARD, BlockHeight::new(height));
         let certificate = |tick: TickId| {
             let outcomes = [TxOutcome::new(
@@ -236,7 +236,8 @@ mod tests {
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )];
+            )
+            .as_role(Role::Leg)];
             Arc::new(ExecutionCertificate::new(
                 tick,
                 WeightedTimestamp::from_millis(1),
@@ -246,13 +247,10 @@ mod tests {
                 SignerBitfield::new(4),
             ))
         };
-        // A counterpart's certificate for the same transaction: what makes
-        // it reach beyond this shard, and so what puts it in the settled set.
-        let remote = TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height));
         Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
-            &Capped::from_array([certificate(tick), certificate(remote)]),
+            Some(certificate(tick)),
             Capped::from_array([StoredReceipt::new(
                 settled_tx(height),
                 Arc::new(ConsensusReceipt::Succeeded {

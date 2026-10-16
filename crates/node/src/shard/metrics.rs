@@ -41,7 +41,6 @@ where
         set_fetch_in_flight("transaction", s, fetches.transaction_in_flight);
         set_fetch_in_flight("provision", s, fetches.provision_in_flight);
         set_fetch_in_flight("local_provision", s, fetches.local_provision_in_flight);
-        set_fetch_in_flight("exec_cert", s, fetches.exec_cert_in_flight);
         set_fetch_in_flight("finalization", s, fetches.finalization_in_flight);
         set_fetch_oldest_in_flight_age_ms(
             "transaction",
@@ -57,11 +56,6 @@ where
             "local_provision",
             s,
             fetches.local_provision_oldest_in_flight_age_ms,
-        );
-        set_fetch_oldest_in_flight_age_ms(
-            "exec_cert",
-            s,
-            fetches.exec_cert_oldest_in_flight_age_ms,
         );
         set_fetch_oldest_in_flight_age_ms(
             "finalization",
@@ -158,7 +152,6 @@ where
             ),
             ("finalization_fetch_pending", fetches.finalization_pending),
             ("provision_fetch_pending", fetches.provision_pending),
-            ("exec_cert_fetch_pending", fetches.exec_cert_pending),
             ("remote_header_fetch_pending", rh.in_flight_ranges()),
         ] {
             set_shard_memory_gauge(field, s, value);

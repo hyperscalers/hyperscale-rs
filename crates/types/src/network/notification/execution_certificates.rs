@@ -18,10 +18,7 @@ pub struct ExecutionCertificatesNotification {
     /// The execution certificates being sent.
     ///
     /// One per tick of a block, and a tick is a partition of the block's
-    /// transactions, so the block's own transaction cap bounds them —
-    /// the same ceiling [`GetExecutionCertsRequest`] asks under.
-    ///
-    /// [`GetExecutionCertsRequest`]: crate::network::request::GetExecutionCertsRequest
+    /// transactions, so the block's own transaction cap bounds them.
     pub certificates: Capped<Vec<ExecutionCertificate>, MAX_TXS_PER_BLOCK>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,

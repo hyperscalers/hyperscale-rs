@@ -341,17 +341,6 @@ pub struct ConsensusState {
     /// Consensus receipts by transaction hash, then the receipt's own
     /// hash. Mirrors the production `consensus_receipts` CF.
     pub(crate) consensus_receipts: OrdMap<(TxHash, GlobalReceiptHash), Row>,
-    /// Index: every finalization of this shard's carrying an outcome for
-    /// a transaction, keyed by the transaction then the finalization's
-    /// hash, its key in `certificates`. Mirrors the production
-    /// `tx_finalizations` CF so simulation integration tests serve the
-    /// by-transaction certificate fetch the same way a real node does.
-    ///
-    /// A set rather than a slot: a shard can certify one transaction in
-    /// the tick that ran it and again in an abandonment that settles
-    /// what the run left, and a counterpart that asks by naming the
-    /// transaction cannot say which of them it wants.
-    pub(crate) tx_finalizations: OrdSet<(TxHash, FinalizationHash)>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard
@@ -400,7 +389,6 @@ impl ConsensusState {
             transactions: OrdMap::new(),
             certificates: OrdMap::new(),
             consensus_receipts: OrdMap::new(),
-            tx_finalizations: OrdSet::new(),
             beacon_witnesses: OrdMap::new(),
             provisions: OrdMap::new(),
             chain_origin: ChainOrigin::ROOT,
@@ -478,9 +466,6 @@ impl ConsensusState {
             for key in keys.receipts {
                 self.consensus_receipts.remove(&key);
             }
-            for key in keys.tx_finalizations {
-                self.tx_finalizations.remove(&key);
-            }
             if !hold.keeps_row(height) {
                 self.blocks.remove(&height);
             }
@@ -509,22 +494,9 @@ impl ConsensusState {
         self.blocks.insert(block.height(), encode_row(&metadata));
         self.drop_voted_blocks_through(block.height());
         self.record_transactions(block);
-        let local_shard = block.header().shard_id();
         for fw in block.certificates().iter() {
-            let hash = fw.receipt_hash();
             self.certificates
-                .insert(hash, encode_row(&fw.attestation()));
-            // Only a finalization of this shard's own tick is indexed,
-            // under what it settles or states (`indexed_tx_hashes`): a
-            // counterpart's certificate riding inside it
-            // answers a question nobody asks this shard, and an asker
-            // served its own certificate back refuses it as unsolicited
-            // and asks again.
-            if fw.tick_id().shard_id() != local_shard {
-                continue;
-            }
-            self.tx_finalizations
-                .extend(fw.indexed_tx_hashes().map(|tx_hash| (tx_hash, hash)));
+                .insert(fw.receipt_hash(), encode_row(&fw.attestation()));
         }
         self.record_provisions(block, retention_floor);
     }

@@ -1,7 +1,7 @@
 //! Cross-shard fetch bindings.
 //!
 //! The [`FetchBinding`] impls for the cross-shard data-availability payloads —
-//! provisions, execution certificates, finalizations, local provisions, and
+//! provisions, finalizations, local provisions, and
 //! the answers checked against a remote chain's committed state.
 //! Each `fetch_mut` resolves the binding's `Fetch` instance out of this shard's
 //! [`CrossShardState`](super::CrossShardState). The generic engine, the
@@ -17,17 +17,17 @@ use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
-    GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
-    GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest, GetTerminalLinesRequest,
+    GetFinalizationsRequest, GetLocalProvisionsRequest, GetProvisionsRequest, GetSettledTxsRequest,
+    GetStateProofRequest, GetTerminalLinesRequest,
 };
 use hyperscale_types::network::response::{
     GetSettledTxsResponse, GetStateProofResponse, GetTerminalLinesResponse,
 };
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
-    ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId, VerdictCells,
-    Verifiable, settled_txs_root_from_hashes,
+    Anchor, BlockHeight, Finalization, FinalizationHash, MessageClass, ProvisionHash, ShardId,
+    SubstateKey, TerminalEvidence, ValidatorId, VerdictCells, Verifiable,
+    settled_txs_root_from_hashes,
 };
 
 use crate::fetch::{
@@ -40,8 +40,6 @@ use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, pu
 pub type LocalProvisionFetch = Fetch<ProvisionHash>;
 /// Finalization fetch keyed by [`TickId`].
 pub type FinalizationFetch = Fetch<FinalizationHash>;
-/// Cross-shard execution-cert fetch keyed by [`TickId`].
-pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// Cross-shard provision fetch keyed by
 /// `(source_shard, target_shard, block_height)`. `source_shard` selects
 /// the responding committee; `target_shard` rides in the body for
@@ -223,101 +221,6 @@ impl FetchBinding for FinalizationBinding {
                 // Reject responses with unsolicited ticks (peer scoring;
                 // also avoids wasted signature verification on items we never
                 // asked for) or with any missing requested id.
-                if split.unsolicited > 0 || had_misses {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
-    }
-}
-
-/// Marker type for the cross-shard execution-cert fetch.
-pub struct ExecCertBinding;
-
-impl FetchBinding for ExecCertBinding {
-    /// `(source_shard, tx_hash)` — the shard whose outcome is missing and
-    /// the transaction it is missing for. The certificate's own identity
-    /// is not a key here: the requester knows which shards its tick waits
-    /// on, not which certificate each will put the transaction in.
-    type Id = (ShardId, TxHash);
-
-    const NAME: &'static str = "exec_cert";
-
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::ExecutionCerts(ids)
-    }
-
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<(ShardId, TxHash)> {
-        &mut shard.cross_shard.exec_cert
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<(ShardId, TxHash)>,
-        local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
-        let es = sender.clone();
-        let failed_ids = ids.clone();
-        network.request(
-            shard,
-            preferred,
-            GetExecutionCertsRequest {
-                tx_hashes: Capped::new(ids.into_iter().map(|(_, tx_hash)| tx_hash).collect())
-                    .expect("no more hashes than one block carries"),
-            },
-            class,
-            Box::new(move |result| {
-                let response = match result {
-                    Ok(response) => response,
-                    Err(error) => {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            failed_chunk(&error, Self::ids(failed_ids)),
-                        );
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                let certs = response.certificates.unwrap_or_default();
-                // One certificate answers for every transaction of its
-                // batch, so it clears every requested key it covers.
-                let split = partition_solicited(certs, &failed_ids, |c| {
-                    let cert_shard = c.shard_id();
-                    c.tx_outcomes()
-                        .iter()
-                        .map(|outcome| (cert_shard, outcome.tx_hash()))
-                        .collect::<Vec<_>>()
-                });
-                let had_misses = !split.missing.is_empty();
-                if !split.kept.is_empty() {
-                    // Refcount is 1 right after decode, so each unwrap moves.
-                    let certificates: Vec<Verifiable<ExecutionCertificate>> = split
-                        .kept
-                        .into_iter()
-                        .map(|arc| Arc::unwrap_or_clone(arc).into())
-                        .collect();
-                    push_protocol_event(
-                        &es,
-                        local_shard,
-                        ProtocolEvent::ExecutionCertificatesReceived { certificates },
-                    );
-                }
-                if had_misses {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(split.missing)),
-                    );
-                }
-                // Reject the response if the peer shipped unsolicited
-                // ECs (peer scoring; also avoids wasted signature verification
-                // on items we never asked for) or any missing id.
                 if split.unsolicited > 0 || had_misses {
                     ResponseVerdict::Reject
                 } else {
@@ -800,9 +703,9 @@ mod settled_txs_tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-        ProposerTimestamp, QuorumCertificate, Round, SectionRoots, SettledTxsRoot, SignerBitfield,
-        StateWrites, StoredReceipt, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp,
-        WitnessSources, compute_global_receipt_root,
+        ProposerTimestamp, QuorumCertificate, Role, Round, SectionRoots, SettledTxsRoot,
+        SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, Verified,
+        WeightedTimestamp, WitnessSources, compute_global_receipt_root,
     };
 
     use super::*;
@@ -822,7 +725,8 @@ mod settled_txs_tests {
             ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        )];
+        )
+        .as_role(Role::Leg)];
         Arc::new(ExecutionCertificate::new(
             tick,
             WeightedTimestamp::from_millis(1),
@@ -833,16 +737,14 @@ mod settled_txs_tests {
         ))
     }
 
-    /// A finalization settling one transaction beside a counterpart's
-    /// certificate for it: what makes it reach beyond this shard, and so
-    /// what puts it in the settled set.
+    /// A finalization settling one leg that ran: what reaches beyond this
+    /// shard, and so what puts it in the settled set.
     fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
         let tick = TickId::new(SHARD, BlockHeight::new(height));
-        let remote = TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height));
         Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
-            &Capped::from_array([certificate(tick, height), certificate(remote, height)]),
+            Some(certificate(tick, height)),
             Capped::from_array([StoredReceipt::new(
                 settled_tx(height),
                 Arc::new(ConsensusReceipt::Succeeded {
@@ -996,7 +898,7 @@ mod terminal_lines_tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Block, BlockHash, ChainOrigin, GossipMessage, LeafRoot, NetworkMessage, Request,
-        SettledTxsRoot, TerminalLines, TickLine, TickManifestRoot, WeightedTimestamp,
+        SettledTxsRoot, TerminalLines, TickLine, TickManifestRoot, TxHash, WeightedTimestamp,
     };
 
     use super::*;

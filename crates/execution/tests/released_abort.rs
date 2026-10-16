@@ -140,10 +140,11 @@ fn a_released_shared_member_settles_the_abort_its_row_names_with_no_counterpart_
     };
     assert_eq!(*half.tick_id(), seated_in);
     assert_eq!(half.half(), TickHalf::Stated);
-    let certificates = half.execution_certificates();
-    assert_eq!(certificates.len(), 1, "no certificate but this shard's");
-    assert_eq!(certificates[0].shard_id(), LEFT);
-    let [outcome] = &certificates[0].tx_outcomes()[..] else {
+    let certificate = half
+        .local_ec()
+        .expect("a stating half carries its certificate");
+    assert_eq!(certificate.shard_id(), LEFT);
+    let [outcome] = &certificate.tx_outcomes()[..] else {
         panic!("the half settles the one member");
     };
     assert_eq!(outcome.tx_hash(), hash);
@@ -188,7 +189,9 @@ fn a_replica_holding_only_the_line_settles_the_abort_its_peers_settle() {
         };
         // The two stand at different heights, so the tick differs and
         // what it attests is what is held alike.
-        let certificate = &half.execution_certificates()[0];
+        let certificate = half
+            .local_ec()
+            .expect("a stating half carries its certificate");
         let attested = (
             half.half(),
             certificate.global_receipt_root(),

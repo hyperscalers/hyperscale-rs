@@ -544,7 +544,7 @@ pub enum ExecutionCertificateVerifyError {
 /// global_receipt_root, tx_count)`. Empty signer sets must carry the
 /// zero signature.
 ///
-/// Construction goes through one of three gates:
+/// Construction goes through one of two gates:
 ///
 /// - [`<ExecutionCertificate as Verify>::verify`](Verify::verify) —
 ///   runs the predicate against a committee public-key vector.
@@ -553,8 +553,6 @@ pub enum ExecutionCertificateVerifyError {
 ///   by construction (each verified vote's signature aggregates into
 ///   the certificate's signature, the signers bitfield mirrors the
 ///   committee indices of those voters).
-/// - [`Verified::<ExecutionCertificate>::from_persisted`] — re-wraps
-///   a certificate that satisfied the predicate at write time.
 impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
     type Error = ExecutionCertificateVerifyError;
 
@@ -703,21 +701,6 @@ impl Verified<ExecutionCertificate> {
         // message and the same aggregate, so aggregate-verify against
         // the same committee succeeds exactly as it did before.
         (**self).project_to(keep).map(Self::new_unchecked)
-    }
-
-    /// Re-wrap a certificate that satisfied the predicate at write
-    /// time. ECs ride into storage embedded inside `Verified<Finalization>`
-    /// values inside the `Verified<CertifiedBlock>` argument to the
-    /// prepared commit, so unverified ECs can't reach the write path.
-    /// Storage rehydration paths use this gate to avoid re-running
-    /// aggregation on every load.
-    #[must_use]
-    pub const fn from_persisted(cert: ExecutionCertificate) -> Self {
-        // SAFETY: the certificate's predicate held at write time;
-        // storage is the trust source. Mirrors
-        // `Verified::<QuorumCertificate>::from_persisted` on the
-        // shard side.
-        Self::new_unchecked(cert)
     }
 }
 

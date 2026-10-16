@@ -248,7 +248,7 @@ fn settlement_events(
     }
     for tick in certificates.iter() {
         let tick = tick.as_unverified();
-        for certificate in tick.execution_certificates() {
+        if let Some(certificate) = tick.local_ec() {
             events.push(TraceEvent::execution_certified(
                 wt,
                 certificate.tick_id(),

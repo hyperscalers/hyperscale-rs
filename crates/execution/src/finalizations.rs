@@ -365,7 +365,7 @@ mod tests {
         let verified = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             half,
-            &Capped::from_array([Arc::new(ec)]),
+            Some(Arc::new(ec)),
             Capped::from_array([]),
         ));
         let fw = Arc::new(verified.into());

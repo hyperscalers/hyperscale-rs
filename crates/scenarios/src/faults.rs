@@ -2720,9 +2720,8 @@ pub fn cross_shard_provisions_drop_fetch_fallback(c: &mut impl FaultableCluster)
 
 /// Dropping `execution.cert.batch` changes nothing for a divided transfer.
 ///
-/// Nothing waits on a certificate from across the split, so the exec-cert
-/// fetch never engages and the transfer lands and credits as it would with
-/// the channel open. The payer's chain settles the transfer on its own verdict, and the
+/// Nothing waits on a certificate from across the split, so the transfer
+/// lands and credits as it would with the channel open. The payer's chain settles the transfer on its own verdict, and the
 /// recipient commits the delivery off the payer's committed bundle, never
 /// off a certificate. A certificate is waited for only where a route sends
 /// one shard's verdict to another — a leg with its core elsewhere — and a
@@ -2730,11 +2729,9 @@ pub fn cross_shard_provisions_drop_fetch_fallback(c: &mut impl FaultableCluster)
 ///
 /// # Panics
 ///
-/// Panics if the transfer does not settle and land, the exec-cert fetch
-/// engages, or anything aborts.
+/// Panics if the transfer does not settle and land, or anything aborts.
 pub fn cross_shard_exec_cert_drop_is_inert(c: &mut impl FaultableCluster) {
     split_lifecycle(c);
-    let fetch_before = c.metric("fetch_items_sent", Some("exec_cert"));
     let _dropped = c.drop_type("execution.cert.batch");
     let world = fault_family_world(c);
     let mut charges = Charges::default();
@@ -2752,12 +2749,6 @@ pub fn cross_shard_exec_cert_drop_is_inert(c: &mut impl FaultableCluster) {
     await_crossed(c, &crossing, "execution.cert.batch");
     world.assert_settles_within(c, &charges, epochs(8), "execution.cert.batch");
     assert_eq!(
-        c.metric("fetch_items_sent", Some("exec_cert")),
-        fetch_before,
-        "no shard waits on a certificate for a divided transfer, so the \
-         exec-cert fetch has nothing to bridge",
-    );
-    assert_eq!(
         c.metric("transactions_aborted", None),
         0,
         "the cross-shard transfer must not abort",
@@ -2773,12 +2764,10 @@ pub fn cross_shard_exec_cert_drop_is_inert(c: &mut impl FaultableCluster) {
 /// # Panics
 ///
 /// Panics if the transfer does not settle and land, the bundle drop never
-/// fires, the provision fetch never engages, the exec-cert fetch engages,
-/// or anything aborts.
+/// fires, the provision fetch never engages, or anything aborts.
 pub fn cross_shard_compound_drop_fetch_fallback(c: &mut impl FaultableCluster) {
     split_lifecycle(c);
     let provision_before = c.metric("fetch_items_sent", Some("provision"));
-    let exec_cert_before = c.metric("fetch_items_sent", Some("exec_cert"));
     let provisions_dropped = c.drop_type("provisions.broadcast");
     let _exec_cert_dropped = c.drop_type("execution.cert.batch");
     let world = fault_family_world(c);
@@ -2803,11 +2792,6 @@ pub fn cross_shard_compound_drop_fetch_fallback(c: &mut impl FaultableCluster) {
     assert!(
         c.metric("fetch_items_sent", Some("provision")) > provision_before,
         "the provision fetch fallback must engage (before={provision_before})",
-    );
-    assert_eq!(
-        c.metric("fetch_items_sent", Some("exec_cert")),
-        exec_cert_before,
-        "the exec-cert fetch has nothing to bridge for a divided transfer",
     );
     assert_eq!(
         c.metric("transactions_aborted", None),

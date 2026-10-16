@@ -119,17 +119,14 @@ pub struct BlockRowKeys {
     pub attestations: Vec<FinalizationHash>,
     /// The receipts those finalizations settled.
     pub receipts: Vec<(TxHash, GlobalReceiptHash)>,
-    /// The by-transaction index over the shard's own finalizations.
-    pub tx_finalizations: Vec<(TxHash, FinalizationHash)>,
 }
 
 impl BlockRowKeys {
     /// The rows `metadata` names, reading each attestation it names out
-    /// of `rows` for the receipts and the index entries. An attestation
-    /// `rows` no longer holds names nothing further.
+    /// of `rows` for the receipts. An attestation `rows` no longer holds
+    /// names nothing further.
     #[must_use]
     pub fn of(rows: &impl BlockRows, metadata: &BlockMetadata) -> Self {
-        let local_shard = metadata.header().shard_id();
         let manifest = metadata.manifest();
         let mut keys = Self {
             transactions: manifest.tx_hashes().to_vec(),
@@ -142,13 +139,6 @@ impl BlockRowKeys {
             };
             keys.receipts
                 .extend(attestation.settled_receipts().unwrap_or_default());
-            if attestation.tick_id().shard_id() == local_shard {
-                keys.tx_finalizations.extend(
-                    attestation
-                        .indexed_tx_hashes()
-                        .map(|tx_hash| (tx_hash, *id)),
-                );
-            }
         }
         keys
     }

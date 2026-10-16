@@ -819,4 +819,79 @@ mod tests {
 
         assert!(judge(&Precut::adopted(left, &[terminal]), left).is_ok());
     }
+
+    /// An abandonment record stands only on the departed shard's settled
+    /// set: a voter without the set defers, one whose set names a
+    /// transaction the record names refuses, and one whose set names none
+    /// of them votes. No certificate of the departed shard enters.
+    #[test]
+    fn an_abandonment_record_is_held_to_the_settled_set() {
+        use std::collections::BTreeSet;
+
+        use hyperscale_types::{
+            AbortCharge, Address, AddressClass, CommittedAt, Deadline, LocalKey, RoutePrefix,
+            SettledTxSet, TxHash, UnsettledTx,
+        };
+
+        let departed = ShardId::leaf(1, 0);
+        let terminal_wt = WeightedTimestamp::from_millis(9_000);
+        let named = TxHash::from(Hash::from_bytes(b"named"));
+        let other = TxHash::from(Hash::from_bytes(b"other"));
+        let record = AbandonmentRecord::new(
+            departed,
+            terminal_wt,
+            [UnsettledTx {
+                tx_hash: named,
+                deadline: Deadline::of(WeightedTimestamp::from_millis(8_000)),
+                charged: 1,
+                charge: AbortCharge {
+                    vault: SubstateKey {
+                        owner: Address::new([0x11; 31], AddressClass::Component),
+                        local: LocalKey([0x22; 16]),
+                    },
+                    amount: 1,
+                },
+                committed: CommittedAt {
+                    height: BlockHeight::new(3),
+                    anchor: WeightedTimestamp::from_millis(3_000),
+                    committee_anchor: WeightedTimestamp::from_millis(2_000),
+                },
+                reach: Capped::from_array([RoutePrefix::of(Address::new(
+                    [0x33; 31],
+                    AddressClass::Principal,
+                ))]),
+            }],
+        );
+        let stands = |settled: Option<BTreeSet<TxHash>>| {
+            let held = Held::nothing();
+            if let Some(txs) = settled {
+                held.mirror
+                    .record_settled(departed, SettledTxSet { txs, terminal_wt });
+            }
+            VoteFence {
+                mirror: &held.mirror,
+                proven_anchors: &held.proven_anchors,
+                precut: &held.precut,
+                cut: WeightedTimestamp::ZERO,
+                local_shard: LOCAL,
+            }
+            .record_stands(&record)
+        };
+
+        assert!(
+            matches!(stands(None), Err(Withheld::Deferred { .. })),
+            "a voter without the departed shard's set defers",
+        );
+        assert!(
+            matches!(
+                stands(Some(BTreeSet::from([named]))),
+                Err(Withheld::Refused(_))
+            ),
+            "a record naming a transaction its shard settled is refused",
+        );
+        assert!(
+            stands(Some(BTreeSet::from([other]))).is_ok(),
+            "a record naming nothing its shard settled stands",
+        );
+    }
 }

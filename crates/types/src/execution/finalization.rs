@@ -21,17 +21,6 @@ use crate::{
     Verified, Verify, WeightedTimestamp, receipt_hash_of,
 };
 
-/// Cap on execution certificates accepted in a single [`Finalization`] at
-/// decode time.
-///
-/// A tick's EC set is one local EC plus at most one EC per participating
-/// remote shard (and may include a few extras if a remote shard committed
-/// the tick's transactions across multiple blocks). 1024 is well above any
-/// realistic shard count and bounds the per-element pre-allocation that
-/// would otherwise let a peer claim billions of inner ECs and OOM the
-/// validator at decode time.
-pub const MAX_EXECUTION_CERTIFICATES_PER_TICK: usize = 1024;
-
 /// Which half of its tick a finalization settles.
 ///
 /// A tick settles in halves and they are not interchangeable: the
@@ -94,8 +83,9 @@ type Named = Capped<Vec<(TxHash, GlobalReceiptHash)>, MAX_TXS_PER_BLOCK>;
 ///
 /// # Invariant (well-formed)
 ///
-/// A well-formed determined or stating half contains **exactly one local
-/// EC** — the EC where `ec.tick_id() == fw.tick_id` — and names nobody.
+/// A well-formed determined or stating half contains **exactly one EC**,
+/// its own tick's — the EC where `ec.tick_id() == fw.tick_id` — and names
+/// nobody.
 /// The local EC is the authoritative source for the half's tx set and
 /// canonical (block) ordering. A well-formed legs half contains no
 /// certificate, names at least one member, and carries one receipt per
@@ -113,8 +103,10 @@ pub struct Finalization {
     /// Which half of `tick_id` this settles. Ordering is per half, so
     /// the identity that orders is too.
     half: TickHalf,
-    execution_certificates:
-        Capped<Vec<Arc<Verifiable<ExecutionCertificate>>>, MAX_EXECUTION_CERTIFICATES_PER_TICK>,
+    /// The tick's own certificate: present in a determined or stating
+    /// half, absent from a legs half. A sibling's verdict is read from
+    /// its committed state, so no finalization carries another tick's.
+    certificate: Option<Arc<Verifiable<ExecutionCertificate>>>,
     receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     /// The members a legs half settles; empty in a determined half,
     /// which settles every member its certificate attests, and in a
@@ -126,19 +118,16 @@ pub struct Finalization {
 
 /// The form of each half, enforced at the wire boundary.
 ///
-/// A determined or stating half carries exactly one local certificate,
-/// the authoritative source of what it settles, and names nobody: zero
-/// local certificates would leave it settling nothing, and several would
-/// let downstream code silently disagree on which one orders it. A
-/// stating half carries that certificate and no other: it says what this
-/// shard reached. A legs half carries no certificate at all, and is held
-/// to the receipts it names, each recomputed from what it carries; or,
-/// stored as an [attestation](Finalization::attestation), to no receipt,
-/// which [`Finalization::reconstruct`] restores and every block that
-/// carries the half is held to by its validation.
+/// A determined or stating half carries its own tick's certificate, the
+/// authoritative source of what it settles, and names nobody. A legs
+/// half carries no certificate at all, and is held to the receipts it
+/// names, each recomputed from what it carries; or, stored as an
+/// [attestation](Finalization::attestation), to no receipt, which
+/// [`Finalization::reconstruct`] restores and every block that carries
+/// the half is held to by its validation.
 fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
     if tick.half == TickHalf::Legs {
-        if !tick.execution_certificates.is_empty() {
+        if tick.certificate.is_some() {
             return Err("a legs half carries no certificate");
         }
         if tick.receipts.is_empty() && !tick.named.is_empty() {
@@ -148,16 +137,12 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
             .names_stand()
             .map_err(|_| "a legs half names the receipts it carries, each under its own hash");
     }
-    let local = tick
-        .execution_certificates
-        .iter()
-        .filter(|ec| ec.tick_id() == &tick.tick_id)
-        .count();
-    if local != 1 {
-        return Err("a determined or stating half carries exactly one local certificate");
-    }
-    if tick.half == TickHalf::Stated && tick.execution_certificates.len() != 1 {
-        return Err("a stating half carries its own tick's certificate and no other");
+    if tick
+        .certificate
+        .as_ref()
+        .is_none_or(|ec| ec.tick_id() != &tick.tick_id)
+    {
+        return Err("a determined or stating half carries its own tick's certificate");
     }
     tick.names_stand()
         .map_err(|_| "a determined or stating half names nobody")
@@ -331,10 +316,10 @@ impl Finalization {
 
     /// The tick's own certificate, where the finalization carries one.
     fn local_certificate(&self) -> Option<&ExecutionCertificate> {
-        self.execution_certificates
-            .iter()
-            .find(|ec| ec.tick_id() == &self.tick_id)
-            .map(|ec| ec.as_unverified())
+        self.certificate
+            .as_deref()
+            .map(Verifiable::as_unverified)
+            .filter(|ec| ec.tick_id() == &self.tick_id)
     }
 
     /// The outcomes of the tick's own certificate this finalization
@@ -411,20 +396,12 @@ impl Finalization {
             .map_or(Ok(()), |extra| Err(Some(extra.tx_hash)))
     }
 
-    /// Execution certificates from all participating shards.
-    /// Always includes the local EC (see invariant above).
-    /// May contain multiple ECs from the same remote shard — this happens when
-    /// a remote shard committed this tick's transactions across multiple blocks,
-    /// producing separate ECs.
-    /// Sorted by (`shard_id`, `tick_id`) for deterministic `receipt_hash`.
-    ///
-    /// Each EC rides as `Verifiable<ExecutionCertificate>`: wire-decoded
-    /// certificates land `Verifiable::Unverified`; locally assembled
-    /// ones carry the `Verifiable::Verified` marker from
-    /// [`Self::from_verified_ecs`].
+    /// The tick's own certificate as it rides: `Verifiable::Unverified`
+    /// off the wire, `Verifiable::Verified` where it was assembled here
+    /// ([`Self::from_verified_ec`]). `None` for a legs half.
     #[must_use]
-    pub fn execution_certificates(&self) -> &[Arc<Verifiable<ExecutionCertificate>>] {
-        &self.execution_certificates
+    pub const fn certificate(&self) -> Option<&Arc<Verifiable<ExecutionCertificate>>> {
+        self.certificate.as_ref()
     }
 
     /// The tick's own certificate, authoritative for what a determined or
@@ -450,8 +427,8 @@ impl Finalization {
 
     /// The same finalization attested by `local`, the tick's own complete
     /// certificate signed at a later anchor, projected to the members
-    /// this one settles. Receipts and every other certificate stay. A
-    /// legs half carries no certificate to re-attest.
+    /// this one settles, with the same receipts. A legs half carries no
+    /// certificate to re-attest.
     ///
     /// A tick's own certificate stops verifying anywhere once its anchor's
     /// window is evicted, and a tick whose half is still owed then is
@@ -474,26 +451,18 @@ impl Finalization {
         if projected.tx_outcomes() != held.tx_outcomes() {
             return None;
         }
-        let projected = Arc::new(Verifiable::from(projected));
         Some(Self {
             tick_id: self.tick_id,
             half: self.half,
-            execution_certificates: self.execution_certificates.map(|ec| {
-                if ec.tick_id() == &self.tick_id {
-                    Arc::clone(&projected)
-                } else {
-                    Arc::clone(ec)
-                }
-            }),
+            certificate: Some(Arc::new(Verifiable::from(projected))),
             receipts: self.receipts.clone(),
             named: self.named.clone(),
         })
     }
 
     /// The leaf a block's certificates section commits for this
-    /// finalization: its tick and half, each constituent certificate's
-    /// content, in the order the vec was sorted into at construction,
-    /// and then its names.
+    /// finalization: its tick and half, its certificate's content where
+    /// it carries one, and then its names.
     ///
     /// **The names are part of the identity.** Two legs halves of one
     /// tick carry no certificate and differ only in which members they
@@ -519,7 +488,7 @@ impl Finalization {
         let mut hasher = Hasher::new();
         hasher.update(&hbor_to_vec(&self.tick_id).unwrap());
         hasher.update(&hbor_to_vec(&self.half).unwrap());
-        for ec in &self.execution_certificates {
+        if let Some(ec) = &self.certificate {
             hasher.update(ec.wire_hash().as_bytes());
         }
         hasher.update(&hbor_to_vec(&self.named).unwrap());
@@ -584,22 +553,13 @@ impl Finalization {
         (self.half == TickHalf::Stated).then(|| self.tx_hashes().collect())
     }
 
-    /// The transactions a by-transaction index finds this finalization
-    /// under: every outcome of its own certificate it settles or states,
-    /// and a legs half's names. A core member's certificate is served off
-    /// its stating half, the only half that carries it.
-    pub fn indexed_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
-        self.tx_hashes()
-            .chain(self.stated_outcomes().map(TxOutcome::tx_hash))
-    }
-
     /// Whether this finalization settles a given tx.
     #[must_use]
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_hashes().any(|settled| settled == *tx_hash)
     }
 
-    /// This finalization's attestation half — the tick, its certificates
+    /// This finalization's attestation half — the tick, its certificate
     /// and its names, without the receipts.
     ///
     /// What the certificates column family stores: receipts live in the
@@ -611,7 +571,7 @@ impl Finalization {
         Self {
             tick_id: self.tick_id,
             half: self.half,
-            execution_certificates: self.execution_certificates.clone(),
+            certificate: self.certificate.clone(),
             receipts: Capped::empty(),
             named: self.named.clone(),
         }
@@ -679,15 +639,15 @@ impl Finalization {
         ))
     }
 
-    /// Build a determined or stating `Finalization` from raw inputs.
-    /// Each EC lands `Verifiable::Unverified` — this is the constructor
-    /// for wire reconstruction and tests, where the ECs carry no
-    /// verification marker. Locally aggregated ticks that already hold
-    /// [`Verified<ExecutionCertificate>`]s use [`Self::from_verified_ecs`]
-    /// to carry their markers through; a legs half is built by
+    /// Build a determined or stating `Finalization` from raw inputs. The
+    /// certificate lands `Verifiable::Unverified`: this is the
+    /// constructor for wire reconstruction and tests, where it carries no
+    /// verification marker. A locally aggregated tick that already holds
+    /// a [`Verified<ExecutionCertificate>`] uses [`Self::from_verified_ec`]
+    /// to carry its marker through; a legs half is built by
     /// [`Self::accepting`].
     ///
-    /// Validates neither the exactly-one-local-EC invariant nor the
+    /// Validates neither that the certificate is the tick's own nor the
     /// receipt-count cap; both are enforced at the wire boundary by the
     /// `Decode` impl, and the first also at the build boundary by
     /// `TickState::attestation`.
@@ -695,17 +655,13 @@ impl Finalization {
     pub fn new(
         tick_id: TickId,
         half: TickHalf,
-        execution_certificates: &Capped<
-            Vec<Arc<ExecutionCertificate>>,
-            MAX_EXECUTION_CERTIFICATES_PER_TICK,
-        >,
+        certificate: Option<Arc<ExecutionCertificate>>,
         receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
         Self {
             tick_id,
             half,
-            execution_certificates: execution_certificates
-                .map(|ec| Arc::new(Verifiable::from((**ec).clone()))),
+            certificate: certificate.map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec)))),
             receipts,
             named: Capped::empty(),
         }
@@ -734,38 +690,30 @@ impl Finalization {
         Self {
             tick_id,
             half: TickHalf::Legs,
-            execution_certificates: Capped::empty(),
+            certificate: None,
             receipts,
             named,
         }
     }
 
-    /// Build a receiptless `Finalization` from execution certificates
-    /// that have already cleared their per-EC signature predicate,
-    /// carrying the `Verifiable::Verified` marker on each. Receipts
+    /// Build a receiptless determined or stating `Finalization` from the
+    /// tick's own certificate, which has already cleared its signature
+    /// predicate, carrying its `Verifiable::Verified` marker. Receipts
     /// arrive through [`Self::with_receipts`], which is what the caller
-    /// needs the certificates to decide.
+    /// needs the certificate to decide.
     ///
-    /// Used by `TickState::into_finalization`, whose ECs were produced
-    /// through the [`Verified::<ExecutionCertificate>::aggregate`] gate.
-    /// Keeping the marker leaves the ECs internally consistent with the
-    /// [`Verified<Finalization>`](Verified) they're sealed into, so a
-    /// later [`Finalization::verify`](Verify::verify) short-circuits
-    /// them instead of re-checking.
+    /// Used by `TickState`, whose certificate was produced through the
+    /// [`Verified::<ExecutionCertificate>::aggregate`] gate. Keeping the
+    /// marker leaves it consistent with the
+    /// [`Verified<Finalization>`](Verified) it is sealed into, so a later
+    /// [`Finalization::verify`](Verify::verify) short-circuits it instead
+    /// of re-checking.
     #[must_use]
-    pub fn from_verified_ecs(
-        tick_id: TickId,
-        half: TickHalf,
-        execution_certificates: &Capped<
-            Vec<Verified<ExecutionCertificate>>,
-            MAX_EXECUTION_CERTIFICATES_PER_TICK,
-        >,
-    ) -> Self {
+    pub fn from_verified_ec(half: TickHalf, certificate: Verified<ExecutionCertificate>) -> Self {
         Self {
-            tick_id,
+            tick_id: *certificate.tick_id(),
             half,
-            execution_certificates: execution_certificates
-                .map(|ec| Arc::new(Verifiable::from(ec.clone()))),
+            certificate: Some(Arc::new(Verifiable::from(certificate))),
             receipts: Capped::empty(),
             named: Capped::empty(),
         }
@@ -1002,105 +950,87 @@ impl Finalization {
 #[derive(Debug, Clone, Copy)]
 pub struct FinalizationContext<'a> {
     /// Network identifier — feeds the domain-separated signing message
-    /// for each constituent EC.
+    /// for the certificate.
     pub network: &'a NetworkDefinition,
-    /// Committee public keys for each EC, parallel to
-    /// `tick.execution_certificates()`. Each inner slice is the
-    /// committee for that EC's shard, in committee order.
-    pub ec_public_keys: &'a [Vec<ConsensusPublicKey>],
-    /// Scheme verifier the EC checks run through.
+    /// The committee of the finalization's certificate, in committee
+    /// order: present exactly when the finalization carries one.
+    pub public_keys: Option<&'a [ConsensusPublicKey]>,
+    /// Scheme verifier the certificate check runs through.
     pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`Finalization`] verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum FinalizationVerifyError {
-    /// `ec_public_keys.len() != tick.execution_certificates().len()`.
-    /// Caller-side packaging error.
-    #[error(
-        "ec_public_keys length {actual} doesn't match execution_certificates length {expected}"
-    )]
-    PublicKeyVectorLengthMismatch {
-        /// Number of ECs in the tick.
-        expected: usize,
-        /// Number of public-key vectors supplied.
-        actual: usize,
-    },
-    /// One of the embedded ECs failed its own predicate.
-    #[error("execution certificate at index {index}: {source}")]
+    /// Keys supplied for a finalization carrying no certificate, or none
+    /// for one carrying it. Caller-side packaging error.
+    #[error("public keys supplied do not match the certificate carried")]
+    PublicKeysMismatch,
+    /// The certificate failed its own predicate.
+    #[error("execution certificate: {source}")]
     ExecutionCertificate {
-        /// Position in `tick.execution_certificates()` whose verify failed.
-        index: usize,
-        /// The underlying EC verifier error.
+        /// The underlying certificate verifier error.
         source: ExecutionCertificateVerifyError,
     },
 }
 
-/// Construction asserts: every [`ExecutionCertificate`] in
-/// `tick.execution_certificates()` verifies under its corresponding
-/// `ec_public_keys[i]` committee.
+/// Construction asserts: the [`ExecutionCertificate`] the finalization
+/// carries, if any, verifies under the committee its anchor resolves.
 ///
-/// Construction goes through one of four gates:
+/// Construction goes through one of three gates:
 ///
 /// - [`<Finalization as Verify>::verify`](Verify::verify) — runs the
-///   embedded-EC predicate over every constituent EC that doesn't
-///   already carry a live verification marker.
-/// - [`Verified::<Finalization>::seal`] — wraps a locally-finalized
-///   tick whose ECs were produced through the
+///   certificate's predicate unless it already carries a live
+///   verification marker.
+/// - [`Verified::<Finalization>::seal`] — wraps a locally built half
+///   whose certificate was produced through the
 ///   [`Verified::<ExecutionCertificate>::aggregate`] gate.
 /// - [`Verified::<Finalization>::from_committed_block`] — wraps a
 ///   tick reaching downstream consumers via a
 ///   [`Verified<CertifiedBlock>`], where the source committee's QC
-///   BFT-transitively attests the per-EC signature claim.
+///   BFT-transitively attests the certificate's signature claim.
 ///
 /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
 impl Verify<&FinalizationContext<'_>> for Finalization {
     type Error = FinalizationVerifyError;
 
     fn verify(&self, ctx: &FinalizationContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let ecs = self.execution_certificates();
-        if ctx.ec_public_keys.len() != ecs.len() {
-            return Err(FinalizationVerifyError::PublicKeyVectorLengthMismatch {
-                expected: ecs.len(),
-                actual: ctx.ec_public_keys.len(),
-            });
-        }
-        for (index, (ec, pks)) in ecs.iter().zip(ctx.ec_public_keys.iter()).enumerate() {
-            // A tick assembled in-memory from aggregated ECs carries each
-            // one already Verified; wire-decoded ticks arrive Unverified
-            // and run the per-EC predicate here.
-            if ec.is_verified() {
-                continue;
+        match (self.certificate(), ctx.public_keys) {
+            (None, None) => {}
+            // A half assembled in-memory carries its certificate already
+            // Verified; a wire-decoded one arrives Unverified and runs the
+            // predicate here.
+            (Some(ec), Some(public_keys)) => {
+                if !ec.is_verified() {
+                    let ec_ctx = ExecutionCertificateContext {
+                        network: ctx.network,
+                        public_keys,
+                        verifier: ctx.verifier,
+                    };
+                    ec.as_unverified().verify(&ec_ctx).map_err(|source| {
+                        FinalizationVerifyError::ExecutionCertificate { source }
+                    })?;
+                }
             }
-            let ec_ctx = ExecutionCertificateContext {
-                network: ctx.network,
-                public_keys: pks,
-                verifier: ctx.verifier,
-            };
-            ec.as_unverified().verify(&ec_ctx).map_err(|source| {
-                FinalizationVerifyError::ExecutionCertificate { index, source }
-            })?;
+            _ => return Err(FinalizationVerifyError::PublicKeysMismatch),
         }
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
 
 impl Verified<Finalization> {
-    /// Wrap a locally-finalization whose ECs were built through the
+    /// Wrap a locally built half whose certificate came through the
     /// [`Verified::<ExecutionCertificate>::aggregate`] gate.
     ///
-    /// Trust source: every EC the tick carries was produced from a
-    /// quorum of verified votes on this validator, so
-    /// the predicate (per-EC signature verify against the matching committee)
-    /// holds by construction. Used at the `TickState::into_finalization`
-    /// boundary.
+    /// Trust source: the certificate was produced from a quorum of
+    /// verified votes on this validator, so the predicate (its signature
+    /// verifies under its committee) holds by construction.
     #[must_use]
     pub const fn seal(tick: Finalization) -> Self {
-        // SAFETY: every EC in `tick.execution_certificates()` was
-        // built by the local aggregator from verified votes (see
-        // `Verified::<ExecutionCertificate>::aggregate`); the per-EC
-        // signature verify against the matching committee pubkey vector
-        // holds by construction.
+        // SAFETY: the certificate, where the half carries one, was built
+        // by the local aggregator from verified votes (see
+        // `Verified::<ExecutionCertificate>::aggregate`); its signature
+        // verifies under its committee by construction.
         Self::new_unchecked(tick)
     }
 
@@ -1110,12 +1040,12 @@ impl Verified<Finalization> {
     /// [`Verified<CertifiedBlock>`]; 2f+1 of the block's committee
     /// signed over `block.hash()`, which commits to every contained
     /// tick and to each tick's receipt set via the header's body root. Honest signers ran the
-    /// per-EC signature predicate before voting, so the predicate
+    /// certificate signature predicate before voting, so the predicate
     /// [`<Finalization as Verify>::verify`](Verify::verify) would run is
     /// BFT-transitively attested by that committee.
     ///
     /// Used at sync admission, where the QC chain replaces local
-    /// per-EC signature checks on each contained tick.
+    /// certificate signature checks on each contained tick.
     ///
     /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
     #[must_use]
@@ -1138,9 +1068,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        Address, AddressClass, AggregateSignature, BlockHeight, ExecutionVote, GlobalReceiptRoot,
-        Hash, LocalKey, Role, ShardId, SignerBitfield, StateWrites, SubstateKey, ValidatorId,
-        WeightedTimestamp, compute_global_receipt_root,
+        Address, AddressClass, AggregateSignature, BlockHeight, ExecutionVote, Hash, LocalKey,
+        Role, ShardId, SignerBitfield, StateWrites, SubstateKey, ValidatorId, WeightedTimestamp,
+        compute_global_receipt_root,
     };
 
     /// The half is part of what a finalization is, so it is part of its
@@ -1165,13 +1095,13 @@ mod tests {
         let determined = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            &Capped::from_array([Arc::clone(&ec)]),
+            Some(Arc::clone(&ec)),
             Capped::from_array([]),
         );
         let stating = Finalization::new(
             local_wid,
             TickHalf::Stated,
-            &Capped::from_array([ec]),
+            Some(ec),
             Capped::from_array([]),
         );
 
@@ -1183,16 +1113,12 @@ mod tests {
     }
 
     /// For one outcome, `settles` returns the transaction's effects or
-    /// its refusal receipt and never both; and a half carrying a
-    /// sibling's certificate naming a different refusal receipt for the
-    /// same transaction settles the local one. Two core shards each carry
-    /// their own `Never` answers, so the receipts differ.
+    /// its refusal receipt and never both.
     #[test]
-    fn a_refusal_receipt_is_the_local_certificates() {
+    fn a_success_settles_its_effects_and_a_refusal_its_receipt() {
         let tx = TxHash::from(Hash::from_bytes(&[1; 4]));
         let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
         let ours = GlobalReceiptHash::from_raw(Hash::from_bytes(b"ours"));
-        let theirs = GlobalReceiptHash::from_raw(Hash::from_bytes(b"theirs"));
         let accepted = TxOutcome::with_refusal(
             tx,
             ExecutionOutcome::Succeeded {
@@ -1207,50 +1133,6 @@ mod tests {
         );
         let refused = TxOutcome::with_refusal(tx, ExecutionOutcome::Failed, ours);
         assert_eq!(settles(&refused), Settles::Refusal(ours));
-
-        let local_wid = tick_id(0, 7, &[]);
-        let remote_wid = tick_id(1, 3, &[]);
-        let receipt = |hash: GlobalReceiptHash| StoredReceipt {
-            tx_hash: tx,
-            consensus: Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: hash,
-                writes: StateWrites::default(),
-                beacon_witness_events: Capped::empty(),
-                events: Capped::empty(),
-            }),
-        };
-        let certificate = |wid: TickId, refusal: GlobalReceiptHash| {
-            Arc::new(ExecutionCertificate::new(
-                wid,
-                WeightedTimestamp::from_millis(1),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::with_refusal(
-                    tx,
-                    ExecutionOutcome::Failed,
-                    refusal,
-                )]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(2),
-            ))
-        };
-        let tick = Finalization::new(
-            local_wid,
-            TickHalf::Determined,
-            &Capped::from_array([
-                certificate(remote_wid, theirs),
-                certificate(local_wid, ours),
-            ]),
-            Capped::from_array([]),
-        )
-        .with_receipts(Capped::from_array([receipt(ours), receipt(theirs)]));
-        assert_eq!(
-            tick.settling_receipts()
-                .iter()
-                .map(|receipt| receipt.consensus.receipt_hash())
-                .collect::<Vec<_>>(),
-            vec![ours],
-            "the local certificate's refusal receipt settles, and the sibling's does not",
-        );
     }
 
     /// A name resolves off its own outcome and nothing else: a leg's
@@ -1412,7 +1294,7 @@ mod tests {
         let hash = receipt.consensus.receipt_hash();
         assert_eq!(decoded(&half), Some(half.clone()));
         assert_eq!(half.validate_against_certificates(), Ok(()));
-        assert!(half.execution_certificates().is_empty());
+        assert!(half.certificate().is_none());
         assert!(half.local_ec().is_none());
         assert_eq!(half.settling_receipts(), vec![receipt.clone()]);
         assert_eq!(half.settled_receipts(), Some(vec![(first, hash)]));
@@ -1554,17 +1436,14 @@ mod tests {
                 SignerBitfield::new(2),
             ))
         };
-        for certificates in [
-            vec![certificate(local_wid, yes.clone())],
-            vec![
-                certificate(local_wid, yes.clone()),
-                certificate(tick_id(SIBLING, 3, &[]), yes.clone()),
-            ],
+        for certificate in [
+            certificate(local_wid, yes.clone()),
+            certificate(tick_id(SIBLING, 3, &[]), yes.clone()),
         ] {
             let carrying = Finalization::new(
                 local_wid,
                 TickHalf::Legs,
-                &Capped::new(certificates).expect("a list written out in a test"),
+                Some(certificate),
                 Capped::from_array([receipt_under(&yes, b"effects")]),
             );
             assert_eq!(decoded(&carrying), None);
@@ -1579,14 +1458,14 @@ mod tests {
         Finalization::new(
             local_wid,
             TickHalf::Stated,
-            &Capped::from_array([Arc::new(ExecutionCertificate::new(
+            Some(Arc::new(ExecutionCertificate::new(
                 local_wid,
                 WeightedTimestamp::from_millis(1),
                 compute_global_receipt_root(&outcomes),
                 Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(2),
-            ))]),
+            ))),
             Capped::empty(),
         )
     }
@@ -1701,36 +1580,12 @@ mod tests {
     }
 
     /// A stating half says what this shard's own certificate reached and
-    /// carries no other: one with a counterpart's certificate beside it
-    /// does not decode, and neither does one naming a member.
+    /// names nobody: one naming a member is misnamed.
     #[test]
-    fn a_stating_half_carrying_a_second_certificate_does_not_decode() {
+    fn a_stating_half_names_nobody() {
         let yes = core(1, b"effects", 10);
         let alone = stating_half(vec![yes.clone()]);
         assert_eq!(decoded(&alone), Some(alone.clone()));
-
-        let local_wid = tick_id(0, 7, &[]);
-        let certificate = |wid: TickId| {
-            Arc::new(ExecutionCertificate::new(
-                wid,
-                WeightedTimestamp::from_millis(1),
-                compute_global_receipt_root(std::slice::from_ref(&yes)),
-                Capped::from_array([yes.clone()]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(2),
-            ))
-        };
-        let beside = Finalization::new(
-            local_wid,
-            TickHalf::Stated,
-            &Capped::from_array([
-                certificate(local_wid),
-                certificate(tick_id(SIBLING, 3, &[])),
-            ]),
-            Capped::empty(),
-        );
-        assert_eq!(beside.execution_certificates().len(), 2);
-        assert_eq!(decoded(&beside), None);
 
         let mut naming = alone;
         naming.named = Capped::from_array([(yes.tx_hash(), GlobalReceiptHash::ZERO)]);
@@ -1784,93 +1639,66 @@ mod tests {
         Verified::<ExecutionCertificate>::aggregate(&BlsVerifier, tick_id, root, &votes, &committee)
     }
 
-    /// Honest path: every EC verifies under its committee PKs.
+    /// Honest path: the certificate verifies under its committee's keys.
     #[test]
     fn verify_accepts_finalization_with_valid_ecs() {
         let net = NetworkDefinition::simulator();
-
         let local_wid = tick_id(0, 7, &[1]);
-        let remote_wid = tick_id(1, 7, &[0]);
-
-        let shard0_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
-        let shard1_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
-        let shard0_pks: Vec<ConsensusPublicKey> =
-            shard0_signers.iter().map(BlsSigner::public_key).collect();
-        let shard1_pks: Vec<ConsensusPublicKey> =
-            shard1_signers.iter().map(BlsSigner::public_key).collect();
-
-        let local_outcomes = vec![make_outcome(1), make_outcome(2)];
-        let remote_outcomes = vec![make_outcome(1), make_outcome(2)];
-        let local_ec =
-            make_verified_ec(&net, &local_wid, &local_outcomes, &shard0_signers).into_inner();
-        let remote_ec =
-            make_verified_ec(&net, &remote_wid, &remote_outcomes, &shard1_signers).into_inner();
+        let signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
+        let pks: Vec<ConsensusPublicKey> = signers.iter().map(BlsSigner::public_key).collect();
+        let outcomes = vec![make_outcome(1), make_outcome(2)];
+        let local_ec = make_verified_ec(&net, &local_wid, &outcomes, &signers).into_inner();
 
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(local_ec), Arc::new(remote_ec)]),
+            Some(Arc::new(local_ec)),
             Capped::from_array([]),
         );
 
-        let ec_pks = vec![shard0_pks, shard1_pks];
         let ctx = FinalizationContext {
             verifier: &BlsVerifier,
             network: &net,
-            ec_public_keys: &ec_pks,
+            public_keys: Some(&pks),
         };
         tick.verify(&ctx).expect("honest finalization must verify");
     }
 
-    /// One tampered EC fails its own predicate; the error names the
-    /// failing index.
+    /// A tampered certificate fails its own predicate.
     #[test]
     fn verify_rejects_finalization_with_one_bad_ec() {
         let net = NetworkDefinition::simulator();
         let local_wid = tick_id(0, 7, &[1]);
-        let remote_wid = tick_id(1, 7, &[0]);
+        let signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
+        let pks: Vec<ConsensusPublicKey> = signers.iter().map(BlsSigner::public_key).collect();
+        let outcomes = vec![make_outcome(1)];
+        let local_ec = make_verified_ec(&net, &local_wid, &outcomes, &signers).into_inner();
 
-        let shard0_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
-        let shard1_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
-        let shard0_pks: Vec<ConsensusPublicKey> =
-            shard0_signers.iter().map(BlsSigner::public_key).collect();
-        let shard1_pks: Vec<ConsensusPublicKey> =
-            shard1_signers.iter().map(BlsSigner::public_key).collect();
-
-        let local_outcomes = vec![make_outcome(1)];
-        let remote_outcomes = vec![make_outcome(1)];
-        let local_ec =
-            make_verified_ec(&net, &local_wid, &local_outcomes, &shard0_signers).into_inner();
-        let remote_ec =
-            make_verified_ec(&net, &remote_wid, &remote_outcomes, &shard1_signers).into_inner();
-
-        // Tamper the second EC's aggregated signature.
-        let tampered_remote = ExecutionCertificate::new(
-            *remote_ec.tick_id(),
-            remote_ec.vote_anchor_ts(),
-            remote_ec.global_receipt_root(),
-            Capped::new(remote_ec.tx_outcomes().clone()).expect("a list written out in a test"),
+        let tampered = ExecutionCertificate::new(
+            *local_ec.tick_id(),
+            local_ec.vote_anchor_ts(),
+            local_ec.global_receipt_root(),
+            Capped::new(local_ec.tx_outcomes().clone()).expect("a list written out in a test"),
             AggregateSignature::new([0xFF; 96]),
-            remote_ec.signers().clone(),
+            local_ec.signers().clone(),
         );
 
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(local_ec), Arc::new(tampered_remote)]),
+            Some(Arc::new(tampered)),
             Capped::from_array([]),
         );
 
-        let ec_pks = vec![shard0_pks, shard1_pks];
         let ctx = FinalizationContext {
             verifier: &BlsVerifier,
             network: &net,
-            ec_public_keys: &ec_pks,
+            public_keys: Some(&pks),
         };
         let err = tick.verify(&ctx).expect_err("tampered EC must fail verify");
         assert!(matches!(
             err,
-            FinalizationVerifyError::ExecutionCertificate { index: 1, .. }
+            FinalizationVerifyError::ExecutionCertificate { .. }
         ));
     }
 
@@ -1878,7 +1706,7 @@ mod tests {
     /// byte-equal to the input — the gate names the trust source, it
     /// does not modify the tick. Honest signers behind a real
     /// `Verified<CertifiedBlock>` would have already cleared every
-    /// contained EC's signature predicate; this test pins the gate's
+    /// contained certificate's signature predicate; this test pins the gate's
     /// no-op-on-content shape.
     #[test]
     fn from_committed_block_wraps_input_without_modification() {
@@ -1891,7 +1719,7 @@ mod tests {
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(ec)]),
+            Some(Arc::new(ec)),
             Capped::from_array([]),
         );
 
@@ -1899,36 +1727,34 @@ mod tests {
         assert_eq!(verified.into_inner(), tick);
     }
 
-    /// `ec_public_keys` length must match the number of ECs.
+    /// Keys are supplied exactly when the finalization carries a
+    /// certificate.
     #[test]
-    fn verify_rejects_mismatched_public_key_vector_length() {
+    fn verify_rejects_keys_that_do_not_match_the_certificate_carried() {
         let net = NetworkDefinition::simulator();
         let local_wid = tick_id(0, 7, &[]);
         let sks: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
-
-        let outcomes = vec![make_outcome(1)];
-        let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
-
-        let tick = Finalization::new(
+        let ec = make_verified_ec(&net, &local_wid, &[make_outcome(1)], &sks).into_inner();
+        let determined = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(ec)]),
+            Some(Arc::new(ec)),
             Capped::from_array([]),
         );
-
-        // Supply two public-key vectors for a single-EC tick.
-        let ec_pks: Vec<Vec<ConsensusPublicKey>> = vec![vec![], vec![]];
-        let ctx = FinalizationContext {
+        let legs = Finalization::accepting(local_wid, Capped::from_array([]));
+        let keys: Vec<ConsensusPublicKey> = Vec::new();
+        let context = |public_keys| FinalizationContext {
             verifier: &BlsVerifier,
             network: &net,
-            ec_public_keys: &ec_pks,
+            public_keys,
         };
         assert_eq!(
-            tick.verify(&ctx),
-            Err(FinalizationVerifyError::PublicKeyVectorLengthMismatch {
-                expected: 1,
-                actual: 2,
-            })
+            determined.verify(&context(None)),
+            Err(FinalizationVerifyError::PublicKeysMismatch)
+        );
+        assert_eq!(
+            legs.verify(&context(Some(&keys))),
+            Err(FinalizationVerifyError::PublicKeysMismatch)
         );
     }
 }

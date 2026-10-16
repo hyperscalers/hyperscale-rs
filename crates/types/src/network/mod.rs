@@ -92,7 +92,6 @@ pub enum MessageClass {
     /// - `ExecutionVoteNotification` — an execution vote
     /// - `ExecutionCertificatesNotification` — execution certificates
     /// - `GetProvisionsRequest/Response` — cross-shard fallback
-    /// - `GetExecutionCertsRequest/Response` — EC fallback
     ///
     /// Delay stalls cross-shard progress but not local consensus.
     CrossShardProgress = 2,

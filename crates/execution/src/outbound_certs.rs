@@ -5,10 +5,8 @@
 //!
 //! Symmetric to `OutboundProvisionTracker` in `hyperscale-provisions`:
 //! that guards source→target provision delivery, this guards
-//! target→source EC delivery. Without it, a single dropped gossip leaves
-//! the source waiting on its 24s execution timeout + fallback fetch +
-//! per-peer rotation before recovery; a sustained drop wedges the
-//! cross-shard pipe.
+//! target→source EC delivery. Nothing pulls a counterpart's
+//! certificate, so without it a single dropped gossip loses it for good.
 //!
 //! No new wire message: re-broadcasts reuse the existing
 //! `BroadcastExecutionCertificate` action. Eviction is driven by local

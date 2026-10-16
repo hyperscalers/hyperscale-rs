@@ -2,15 +2,14 @@
 //!
 //! Owns the per-shard state and code for everything a shard does *across*
 //! shard boundaries: tracking other shards' certified headers, fetching and
-//! serving cross-shard data (provisions, execution certificates, finalized
-//! ticks, a departed shard's settled set).
+//! serving cross-shard data (provisions, finalized ticks, a departed
+//! shard's settled set).
 //!
 //! [`CrossShardState`] is the per-shard state struct `ShardIo` composes;
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
 //! beside it.
 
 pub mod crossing_push;
-mod exec_cert_serve;
 mod fetch;
 mod finalization_serve;
 mod local_provision_serve;
@@ -26,12 +25,11 @@ mod terminal_lines_serve;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
-    ExecCertBinding, ExecCertFetch, FinalizationBinding, FinalizationFetch, LocalProvisionBinding,
-    LocalProvisionFetch, ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch,
-    StateProofBinding, StateProofFetch, TerminalLinesBinding, TerminalLinesFetch,
-    VerdictProofBinding, VerdictProofFetch,
+    FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
+    ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
+    StateProofFetch, TerminalLinesBinding, TerminalLinesFetch, VerdictProofBinding,
+    VerdictProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
@@ -58,8 +56,6 @@ pub struct CrossShardState {
 
     /// Cross-shard provision fetch (rotates through source committee).
     pub(crate) provision: ProvisionFetch,
-    /// Cross-shard execution-cert fetch (rotates through source committee).
-    pub(crate) exec_cert: ExecCertFetch,
     /// Finalization fetch (rotates through committee).
     pub(crate) finalization: FinalizationFetch,
     /// Local-provision fetch (pinned to proposer).
@@ -177,7 +173,6 @@ impl CrossShardState {
         Self {
             remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
             provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
-            exec_cert: ExecCertFetch::new("exec_cert", config.exec_cert_fetch.clone()),
             finalization: FinalizationFetch::new(
                 "finalization",
                 FetchConfig {
@@ -226,7 +221,6 @@ impl CrossShardState {
         self.remote_header_sync.has_deferred()
             || self.remote_header_sync.is_syncing()
             || self.provision.has_pending()
-            || self.exec_cert.has_pending()
             || self.finalization.has_pending()
             || self.local_provision.has_pending()
             || self.state_proof.has_pending()

@@ -14,7 +14,7 @@ use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader,
     BlockHeaderParts, BlockHeight, BodyRoot, ConsensusReceipt, ExecutionCertificate,
     ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, ProposerTimestamp, QuorumCertificate,
-    Round, SectionRoots, SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt,
+    Role, Round, SectionRoots, SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt,
     TickHalf, TickId, TickLine, TxHash, TxOutcome, Verifiable, WeightedTimestamp, WitnessSources,
     compute_global_receipt_root,
 };
@@ -38,12 +38,15 @@ pub(super) fn end_line(seed: u8) -> TickLine {
 }
 
 fn certificate(tick: TickId, height: u64) -> Arc<ExecutionCertificate> {
-    let outcomes = vec![TxOutcome::new(
-        settled_tx(height),
-        ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
-        },
-    )];
+    let outcomes = vec![
+        TxOutcome::new(
+            settled_tx(height),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )
+        .as_role(Role::Leg),
+    ];
     Arc::new(ExecutionCertificate::new(
         tick,
         WeightedTimestamp::from_millis(1),
@@ -54,12 +57,11 @@ fn certificate(tick: TickId, height: u64) -> Arc<ExecutionCertificate> {
     ))
 }
 
-/// A finalization settling one transaction beside a counterpart's
-/// certificate for it, so the block's certificate and receipt sections
-/// have roots of their own for the header to commit.
+/// A finalization settling one leg that ran, so the block's certificate,
+/// receipt and settled sections have roots of their own for the header
+/// to commit.
 fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
     let tick = TickId::new(SHARD, BlockHeight::new(height));
-    let remote = TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height));
     let receipt = StoredReceipt::new(
         settled_tx(height),
         Arc::new(ConsensusReceipt::Succeeded {
@@ -72,7 +74,7 @@ fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
     Arc::new(Verifiable::from(Finalization::new(
         tick,
         TickHalf::Determined,
-        &Capped::from_array([certificate(tick, height), certificate(remote, height)]),
+        Some(certificate(tick, height)),
         Capped::from_array([receipt]),
     )))
 }

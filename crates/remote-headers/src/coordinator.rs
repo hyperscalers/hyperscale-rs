@@ -171,7 +171,8 @@ struct WantedProof {
 /// Downstream consumers:
 /// - **Provision**: Uses verified `state_root` for merkle proof verification;
 ///   `ticks` field to register expected provisions
-/// - **Execution**: Uses `ticks` field to register expected execution certs
+/// - **Execution**: Releases a shard's certificates and claims held on its
+///   commit proof
 pub struct RemoteHeaderCoordinator {
     /// Every remote shard's held headers. An entry is opened by the first
     /// header received from its shard and closed only when the shard's

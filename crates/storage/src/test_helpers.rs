@@ -5,7 +5,7 @@
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice::from_ref;
 use std::sync::Arc;
@@ -242,7 +242,7 @@ pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalizati
     Finalization::new(
         TickId::new(shard, height),
         TickHalf::Determined,
-        &Capped::from_array([placeholder_local_ec(shard, height)]),
+        Some(placeholder_local_ec(shard, height)),
         Capped::from_array([]),
     )
 }
@@ -498,24 +498,6 @@ pub fn make_test_execution_certificate(
     )
 }
 
-/// Build a test block that carries ECs inside its finalizations.
-///
-/// The tick's `tick_id` is taken from the first EC's `tick_id` so
-/// the local-EC decode invariant is satisfied without injecting a placeholder.
-fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
-    let block = make_test_block(height);
-    if ecs.is_empty() {
-        return block;
-    }
-    let certificate = Finalization::new(
-        *ecs[0].tick_id(),
-        TickHalf::Determined,
-        &Capped::new(ecs).expect("a list written out in a test"),
-        Capped::empty(),
-    );
-    push_certificate(block, Arc::new(certificate.into()))
-}
-
 /// Append a finalization to `block`'s certificate list, preserving
 /// the block variant.
 ///
@@ -739,7 +721,7 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
         Finalization::new(
             TickId::new(ShardId::ROOT, height),
             TickHalf::Determined,
-            &Capped::from_array([placeholder_local_ec(ShardId::ROOT, height)]),
+            Some(placeholder_local_ec(ShardId::ROOT, height)),
             Capped::from_array([receipt]),
         )
         .into(),
@@ -839,7 +821,7 @@ pub fn block_settling(height: BlockHeight, receipts: Vec<StoredReceipt>) -> Bloc
         Finalization::new(
             TickId::new(ShardId::ROOT, height),
             TickHalf::Determined,
-            &Capped::from_array([]),
+            None,
             Capped::new(receipts).expect("a list written out in a test"),
         )
         .into(),
@@ -1040,147 +1022,6 @@ pub fn test_witness_payload_range_reads(storage: &(impl ShardChainReader + TestS
     assert_eq!(storage.get_beacon_witness_payload_range(4, 9), all[4..]);
     assert!(storage.get_beacon_witness_payload_range(3, 3).is_empty());
     assert!(storage.get_beacon_witness_payload_range(7, 9).is_empty());
-}
-
-/// Shared EC roundtrip test: commit a block carrying a finalization, then
-/// read its certificate back by the transaction it attests.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + TestStore)) {
-    let ec = make_test_execution_certificate(1, BlockHeight::new(10));
-    let tick_id = *ec.tick_id();
-    let tx = attested_by(&ec);
-
-    // Absent until the finalization commits.
-    assert!(storage.get_execution_certificates_for_txs(&[tx]).is_empty());
-
-    commit_empty_blocks_below(storage, BlockHeight::new(10));
-    let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
-    let certified = make_test_certified(block);
-    commit_settled_at(storage, &certified, &[], &[], &empty_witness());
-
-    let served = storage.get_execution_certificates_for_txs(&[tx]);
-    assert_eq!(
-        served.len(),
-        1,
-        "the certificate is served by the transaction it attests"
-    );
-    assert_eq!(served[0].tick_id(), &tick_id);
-    assert_eq!(served[0].block_height(), BlockHeight::new(10));
-}
-
-/// The one transaction a [`make_test_execution_certificate`] attests.
-fn attested_by(ec: &ExecutionCertificate) -> TxHash {
-    ec.tx_outcomes()
-        .iter()
-        .next()
-        .expect("a test certificate attests one outcome")
-        .tx_hash()
-}
-
-/// Shared EC batch test: commit finalizations at two heights, then ask by
-/// transaction: every transaction certified here is answered by its own
-/// certificate, and one never certified here is skipped.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + TestStore)) {
-    let ec1 = make_test_execution_certificate(1, BlockHeight::new(10));
-    let ec2 = make_test_execution_certificate(2, BlockHeight::new(20));
-    let never = attested_by(&make_test_execution_certificate(3, BlockHeight::new(30)));
-
-    commit_empty_blocks_below(storage, BlockHeight::new(10));
-    let block10 = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec1.clone())]);
-    commit_settled_at(
-        storage,
-        &make_test_certified(block10),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-
-    for h in 11..20 {
-        let certified = make_test_certified(make_test_block(BlockHeight::new(h)));
-        commit_settled_at(storage, &certified, &[], &[], &empty_witness());
-    }
-    let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec2.clone())]);
-    commit_settled_at(
-        storage,
-        &make_test_certified(block20),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-
-    let served: BTreeSet<TickId> = storage
-        .get_execution_certificates_for_txs(&[attested_by(&ec1), attested_by(&ec2), never])
-        .iter()
-        .map(|cert| *cert.tick_id())
-        .collect();
-    assert_eq!(served, BTreeSet::from([*ec1.tick_id(), *ec2.tick_id()]));
-
-    let partial = storage.get_execution_certificates_for_txs(&[attested_by(&ec2), never]);
-    assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].tick_id(), ec2.tick_id());
-}
-
-/// Shared test: a finalization whose tick names another shard is stored
-/// with the block and indexed for no transaction.
-///
-/// The by-transaction read answers what this shard attested, and a
-/// counterpart's certificate answers a question nobody asks this shard.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_a_foreign_ticks_finalization_is_stored_and_not_indexed(
-    storage: &(impl ShardChainReader + TestStore),
-) {
-    let tx = TxHash::from(Hash::from_bytes(&[9u8; 32]));
-    let outcomes = vec![TxOutcome::new(
-        tx,
-        ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[98u8; 32])),
-        },
-    )];
-    let foreign = ExecutionCertificate::new(
-        TickId::new(ShardId::leaf(1, 1), BlockHeight::new(3)),
-        WeightedTimestamp::from_millis(4),
-        compute_global_receipt_root(&outcomes),
-        Capped::new(outcomes).expect("a list written out in a test"),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    );
-    let finalization: Verifiable<Finalization> = Finalization::new(
-        *foreign.tick_id(),
-        TickHalf::Determined,
-        &Capped::from_array([Arc::new(foreign)]),
-        Capped::from_array([]),
-    )
-    .into();
-    let id = finalization.receipt_hash();
-
-    let block = push_certificate(make_test_block(BlockHeight::new(1)), Arc::new(finalization));
-    commit_settled_at(
-        storage,
-        &make_test_certified(block),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-
-    assert_eq!(
-        storage.get_certificates_batch(&[id]).len(),
-        1,
-        "the finalization is stored with its block",
-    );
-    assert!(
-        storage.get_execution_certificates_for_txs(&[tx]).is_empty(),
-        "and answers for no transaction here",
-    );
 }
 
 /// One substate commit for `seed`: the cell [`make_settled_writes`]
@@ -2159,274 +2000,6 @@ where
     // A second import is rejected — the store is no longer empty.
     assert!(
         import_boundary_state(fresh, BlockHeight::new(6), &[], WitnessSeed::default()).is_err()
-    );
-}
-
-/// A complete EC over `tx_hashes`, every transaction succeeding — the
-/// producing shard's copy, and the only one [`ExecutionCertificate::project_to`]
-/// can narrow.
-fn execution_certificate_over(
-    block_height: BlockHeight,
-    tx_hashes: &[TxHash],
-) -> ExecutionCertificate {
-    let outcomes: Vec<TxOutcome> = tx_hashes
-        .iter()
-        .enumerate()
-        .map(|(position, tx_hash)| {
-            let seed = u8::try_from(position).expect("small fixture") + 150;
-            TxOutcome::new(
-                *tx_hash,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed; 32])),
-                },
-            )
-        })
-        .collect();
-    ExecutionCertificate::new(
-        TickId::new(ShardId::ROOT, block_height),
-        WeightedTimestamp::from_millis(block_height.inner() + 1),
-        compute_global_receipt_root(&outcomes),
-        Capped::new(outcomes).expect("a list written out in a test"),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    )
-}
-
-/// Shared coverage test for a tick's copies: every finalization of the
-/// tick that carries a transaction answers for it, and no served
-/// certificate covers none of the asked transactions.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_every_copy_of_a_tick_answers_for_what_it_carries(
-    storage: &(impl ShardChainReader + TestStore),
-) {
-    let txs: Vec<TxHash> = (1u8..=3)
-        .map(|seed| TxHash::from(Hash::from_bytes(&[seed; 32])))
-        .collect();
-    let complete = execution_certificate_over(BlockHeight::new(1), &txs);
-    let leg = |tx: TxHash| {
-        complete
-            .project_to(&HashSet::from([tx]))
-            .expect("the copy carries it")
-    };
-
-    // One leg arrives, and answers for the transaction it carries.
-    commit_empty_blocks_below(storage, BlockHeight::new(1));
-    let first = make_test_block_with_ecs(BlockHeight::new(1), vec![Arc::new(leg(txs[0]))]);
-    commit_settled_at(
-        storage,
-        &make_test_certified(first),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-    let served = storage.get_execution_certificates_for_txs(&[txs[0]]);
-    assert_eq!(served.len(), 1, "the transaction its copy carries");
-    assert!(served[0].covers(&txs[0]));
-
-    // A disjoint leg is a second answer, not a narrower one: the two
-    // halves of one tick each carry what the other does not, and nobody
-    // else holds a shard's own tick. Each answers for its own
-    // transaction and neither for the other's.
-    let second = make_test_block_with_ecs(BlockHeight::new(2), vec![Arc::new(leg(txs[1]))]);
-    commit_settled_at(
-        storage,
-        &make_test_certified(second),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-    for tx in &txs[..2] {
-        let served = storage.get_execution_certificates_for_txs(from_ref(tx));
-        assert_eq!(served.len(), 1, "one copy carries it");
-        assert!(served[0].covers(tx), "and that copy answers for it");
-    }
-
-    // The same finalization committed again is the same finalization,
-    // and adds nothing.
-    let repeat = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(leg(txs[0]))]);
-    commit_settled_at(
-        storage,
-        &make_test_certified(repeat),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-    assert_eq!(
-        storage.get_execution_certificates_for_txs(&[txs[0]]).len(),
-        1
-    );
-
-    // A finalization carrying the whole tick answers for every
-    // transaction of it, beside the halves that still answer for theirs;
-    // nothing served covers none of what was asked.
-    let fourth = make_test_block_with_ecs(BlockHeight::new(4), vec![Arc::new(complete.clone())]);
-    commit_settled_at(
-        storage,
-        &make_test_certified(fourth),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-    let served = storage.get_execution_certificates_for_txs(&txs);
-    for tx in &txs {
-        assert!(
-            served.iter().any(|cert| cert.covers(tx)),
-            "every transaction of the tick is answered",
-        );
-    }
-    assert!(
-        served
-            .iter()
-            .all(|cert| txs.iter().any(|tx| cert.covers(tx))),
-        "and nothing served covers none of the asked transactions",
-    );
-    let only_whole = storage.get_execution_certificates_for_txs(from_ref(&txs[2]));
-    assert_eq!(
-        only_whole.len(),
-        1,
-        "a transaction only the whole tick carries"
-    );
-    assert!(
-        only_whole[0].is_complete(),
-        "is answered by the complete copy",
-    );
-    assert!(
-        storage
-            .get_execution_certificates_for_txs(from_ref(&txs[1]))
-            .iter()
-            .all(|cert| cert.covers(&txs[1])),
-        "and the half that never carried it does not answer for it",
-    );
-}
-
-/// Shared index test: the by-transaction certificate lookup answers with
-/// this shard's own certificate.
-///
-/// A settled cross-shard transaction lands under both sides' certificates
-/// in one finalization, and the lookup serves the question a
-/// counterpart's fallback fetch asks this shard. The remote copy sorts
-/// after the local one in the write walk, so an unfiltered single-slot
-/// index would leave it the winner and serve the requester its own
-/// certificate back.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_tx_index_answers_with_the_local_shards_certificate(
-    storage: &(impl ShardChainReader + TestStore),
-) {
-    let tx = TxHash::from(Hash::from_bytes(&[7u8; 32]));
-    let local = execution_certificate_over(BlockHeight::new(1), from_ref(&tx));
-    let remote_outcomes = vec![TxOutcome::new(
-        tx,
-        ExecutionOutcome::Succeeded {
-            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[99u8; 32])),
-        },
-    )];
-    let remote = ExecutionCertificate::new(
-        TickId::new(ShardId::leaf(1, 1), BlockHeight::new(4)),
-        WeightedTimestamp::from_millis(5),
-        compute_global_receipt_root(&remote_outcomes),
-        Capped::new(remote_outcomes).expect("a list written out in a test"),
-        AggregateSignature::new([0u8; 96]),
-        SignerBitfield::new(4),
-    );
-
-    commit_empty_blocks_below(storage, BlockHeight::new(1));
-    let certificate = Finalization::new(
-        *local.tick_id(),
-        TickHalf::Determined,
-        &Capped::from_array([Arc::new(local.clone()), Arc::new(remote)]),
-        Capped::from_array([]),
-    );
-    let block = push_certificate(
-        make_test_block(BlockHeight::new(1)),
-        Arc::new(certificate.into()),
-    );
-    commit_settled_at(
-        storage,
-        &make_test_certified(block),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-
-    let served = storage.get_execution_certificates_for_txs(from_ref(&tx));
-    assert_eq!(served.len(), 1, "one certificate answers for the tx");
-    assert_eq!(
-        served[0].tick_id(),
-        local.tick_id(),
-        "and it is this shard's own, not the counterpart copy riding beside it",
-    );
-}
-
-/// Shared test: the transaction index answers with every certificate of
-/// this shard's naming the transaction, not the newest.
-///
-/// A shard can certify one transaction in the tick that ran it and again
-/// in an abandonment that settles what the run left. A counterpart asks
-/// by naming the transaction and cannot say which it wants, so a single
-/// slot would hand it whichever committed last, and asking again would
-/// get the same answer for as long as it asks.
-///
-/// Both certificates land in one block here, which is the case a
-/// per-certificate write would also lose: it would read the stored set
-/// before either landed and drop the first.
-///
-/// # Panics
-///
-/// Panics if any assertion fails (this is a test helper).
-pub fn test_the_tx_index_answers_with_every_certificate_of_this_shards(
-    storage: &(impl ShardChainReader + TestStore),
-) {
-    let tx = TxHash::from(Hash::from_bytes(&[8u8; 32]));
-    let verdict = execution_certificate_over(BlockHeight::new(1), from_ref(&tx));
-    let settling = execution_certificate_over(BlockHeight::new(2), from_ref(&tx));
-
-    commit_empty_blocks_below(storage, BlockHeight::new(1));
-    let block = push_certificate(
-        push_certificate(
-            make_test_block(BlockHeight::new(1)),
-            Arc::new(
-                Finalization::new(
-                    *verdict.tick_id(),
-                    TickHalf::Determined,
-                    &Capped::from_array([Arc::new(verdict.clone())]),
-                    Capped::from_array([]),
-                )
-                .into(),
-            ),
-        ),
-        Arc::new(
-            Finalization::new(
-                *settling.tick_id(),
-                TickHalf::Determined,
-                &Capped::from_array([Arc::new(settling.clone())]),
-                Capped::from_array([]),
-            )
-            .into(),
-        ),
-    );
-    commit_settled_at(
-        storage,
-        &make_test_certified(block),
-        &[],
-        &[],
-        &empty_witness(),
-    );
-
-    let served: BTreeSet<TickId> = storage
-        .get_execution_certificates_for_txs(from_ref(&tx))
-        .iter()
-        .map(|cert| *cert.tick_id())
-        .collect();
-    assert_eq!(
-        served,
-        BTreeSet::from([*verdict.tick_id(), *settling.tick_id()]),
-        "both of this shard's certificates for the transaction answer for it",
     );
 }
 

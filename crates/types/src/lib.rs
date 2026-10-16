@@ -85,8 +85,8 @@ pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
 pub use execution::finalization::{
-    Finalization, FinalizationContext, FinalizationVerifyError,
-    MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, TickHalf, settles,
+    Finalization, FinalizationContext, FinalizationVerifyError, ReceiptValidationError, Settles,
+    TickHalf, settles,
 };
 pub use execution::outcome::{ExecutionOutcome, Role, TxOutcome};
 pub use execution::receipt_tree::{

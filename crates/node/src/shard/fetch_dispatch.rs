@@ -14,8 +14,8 @@ use crate::beacon::{self, BeaconCandidateBinding, BeaconProposalBinding, ShardWi
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
-    SettledTxsBinding, StateProofBinding, TerminalLinesBinding, VerdictProofBinding,
+    FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
+    StateProofBinding, TerminalLinesBinding, VerdictProofBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -141,7 +141,6 @@ where
             FetchIds::RemoteProvisions(ids) => {
                 self.drive_fetch::<ProvisionBinding>(intent.input(ids));
             }
-            FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(intent.input(ids)),
             FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(intent.input(ids)),
             FetchIds::VerdictProofs(ids) => {
                 self.drive_fetch::<VerdictProofBinding>(intent.input(ids));
@@ -216,17 +215,6 @@ where
             ProtocolEvent::FinalizationsAdmitted { finalizations } => {
                 let ids: Vec<_> = finalizations.iter().map(|w| w.receipt_hash()).collect();
                 self.drive_fetch::<FinalizationBinding>(FetchInput::Admitted { ids });
-            }
-            ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
-                // The certificate answers for every transaction it covers,
-                // so admitting it closes each of those fetches.
-                let shard = certificate.shard_id();
-                let ids: Vec<_> = certificate
-                    .tx_outcomes()
-                    .iter()
-                    .map(|outcome| (shard, outcome.tx_hash()))
-                    .collect();
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Admitted { ids });
             }
             _ => {}
         }

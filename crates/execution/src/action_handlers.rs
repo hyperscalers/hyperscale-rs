@@ -254,12 +254,12 @@ where
         }
         Action::VerifyFinalization {
             finalization,
-            ec_public_keys,
+            public_keys,
         } => {
             let fw_ctx = FinalizationContext {
                 verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
-                ec_public_keys: &ec_public_keys,
+                public_keys: public_keys.as_deref(),
             };
             let result = Arc::unwrap_or_clone(finalization)
                 .upgrade(&fw_ctx)

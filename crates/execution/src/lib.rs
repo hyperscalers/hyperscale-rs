@@ -24,7 +24,6 @@ mod coordinator;
 mod counterparts;
 mod early_arrivals;
 mod exec_cert_store;
-mod expected_certs;
 mod finalizations;
 #[cfg(test)]
 mod fixtures;

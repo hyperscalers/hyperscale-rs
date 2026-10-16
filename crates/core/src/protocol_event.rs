@@ -610,12 +610,11 @@ pub enum ProtocolEvent {
         certificate: Arc<Verified<ExecutionCertificate>>,
     },
 
-    /// Execution certificates delivered from any source — fetch response or
-    /// peer broadcast (post sender-sig check). Each cert carries its own
-    /// `(shard_id, block_height, tick_id)`. The state machine iterates
-    /// the batch and routes each cert to `ExecutionCoordinator::on_execution_certificate`,
-    /// which dispatches signature verification. The fetch protocol drain
-    /// hooks this event by `tick_id`.
+    /// Execution certificates delivered by peer broadcast (post sender-sig
+    /// check). Each cert carries its own `(shard_id, block_height,
+    /// tick_id)`. The state machine iterates the batch and routes each
+    /// cert to `ExecutionCoordinator::on_execution_certificate`, which
+    /// dispatches signature verification.
     ExecutionCertificatesReceived {
         /// Execution certificates to admit. Wire-decoded entries land
         /// `Unverified`; a `Verifiable::Verified` entry short-circuits

@@ -586,7 +586,7 @@ mod tests {
         let fw = Verifiable::from(Finalization::new(
             tick_id,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(ec)]),
+            Some(Arc::new(ec)),
             Capped::empty(),
         ));
 

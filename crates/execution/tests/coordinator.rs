@@ -44,7 +44,6 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         unresolved_txs,
         vote_trackers,
         early_votes,
-        expected_exec_certs,
         absorbed_provisions,
         required_provision_shards,
         ticks_with_ec,
@@ -52,7 +51,6 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         tick_assignments,
         early_attestations,
         pending_routing,
-        fulfilled_exec_certs,
         outbound_certs,
         proven_remote_blocks,
         unproven_ecs,
@@ -64,7 +62,6 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     assert_eq!(ticks, 0);
     assert_eq!(vote_trackers, 0);
     assert_eq!(early_votes, 0);
-    assert_eq!(expected_exec_certs, 0);
     assert_eq!(absorbed_provisions, 0);
     assert_eq!(required_provision_shards, 0);
     assert_eq!(ticks_with_ec, 0);
@@ -72,7 +69,6 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     assert_eq!(tick_assignments, 0);
     assert_eq!(early_attestations, 0);
     assert_eq!(pending_routing, 0);
-    assert_eq!(fulfilled_exec_certs, 0);
     assert_eq!(outbound_certs, 0);
     assert_eq!(proven_remote_blocks, 0);
     assert_eq!(unproven_ecs, 0);
@@ -137,14 +133,4 @@ fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
         debug.contains("early_attestations=0"),
         "unexpected debug output: {debug}"
     );
-}
-
-/// A coordinator holding no tick expects no counterpart's outcome, so
-/// there is nothing for the commit-independent flush to request.
-#[test]
-fn a_coordinator_holding_no_tick_fetches_nothing() {
-    let (mut coord, _topology) = fresh_coordinator_with_topology();
-
-    assert_eq!(coord.memory_stats().expected_exec_certs, 0);
-    assert!(coord.flush_expected_certs().is_empty());
 }

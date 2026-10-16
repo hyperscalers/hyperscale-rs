@@ -39,16 +39,14 @@ use crate::support::wait::{
 use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 
 /// Cut every path by which `shard`'s committee obtains `peer_shard`'s execution
-/// certificate, so a cross-shard tick the two share cannot finalize on `shard`'s
-/// side.
+/// certificates and finalizations.
 ///
-/// Fault rules gate pushes (gossip) and request legs, never response legs, so EC
-/// intake is cut on the push and on the pulls, with the correct direction per
-/// leg: `peer_shard` pushes its EC by gossip (`execution.cert.batch`), and
-/// `shard` pulls the EC and the finalization that bundles it
-/// (`execution_cert.request`, `finalization.request`). Provisions and headers
-/// still flow, so `shard` still executes the tick and produces its own EC; it
-/// just never receives `peer_shard`'s.
+/// Fault rules gate pushes (gossip) and request legs, never response legs, so
+/// intake is cut on the push and on the pull, with the correct direction per
+/// leg: `peer_shard` pushes its certificates by gossip (`execution.cert.batch`),
+/// and `shard` pulls finalizations (`finalization.request`). Provisions and
+/// headers still flow, so `shard` still executes the tick and produces its own
+/// certificate; it just never receives `peer_shard`'s.
 ///
 /// Faithful only with disjoint committees — if the two shards share a host, its
 /// co-hosted vnodes hand the EC across in-process, which no network rule
@@ -63,7 +61,6 @@ pub fn isolate_ec_intake(
     let peer_hosts = member_hosts(c, peer_shard);
     let handles = [
         c.drop_type_between(&peer_hosts, &shard_hosts, "execution.cert.batch"),
-        c.drop_type_between(&shard_hosts, &peer_hosts, "execution_cert.request"),
         c.drop_type_between(&shard_hosts, &peer_hosts, "finalization.request"),
     ];
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())

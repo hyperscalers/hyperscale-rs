@@ -465,8 +465,8 @@ impl Network for Libp2pNetwork {
 
         self.tokio_handle.spawn(async move {
             // Step 1 — local-serve if we host the shard. A non-empty hit
-            // is terminal; an empty hit (e.g. our co-located vnode's
-            // `ExecCertStore` hasn't admitted the tick yet) falls through
+            // is terminal; an empty hit (e.g. our co-located vnode has
+            // not committed what was asked for yet) falls through
             // to the remote committee. Without this fall-through, a
             // cross-shard packed host would never ask any other peer.
             if let Some(registry) = registry {

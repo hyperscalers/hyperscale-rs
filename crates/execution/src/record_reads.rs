@@ -87,6 +87,14 @@ impl RecordReads {
         }
     }
 
+    /// Whether `shard`'s certificate naming `tx` is remembered.
+    #[cfg(test)]
+    pub fn heard(&self, shard: ShardId, tx: TxHash) -> bool {
+        self.certified
+            .get(&tx)
+            .is_some_and(|(shards, _)| shards.contains(&shard))
+    }
+
     /// Drop the reads of keys `live` no longer names, which have been
     /// answered or are nobody's to ask about, and the certificates
     /// remembered past one horizon of `now`.

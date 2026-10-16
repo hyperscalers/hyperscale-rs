@@ -466,7 +466,6 @@ impl TraceEvent {
         tick: &Finalization,
     ) -> Self {
         let id = tick.tick_id();
-        let certificates = tick.execution_certificates();
         let txs = tick.tx_hashes().map(Into::into).collect();
         Self {
             wt,
@@ -475,8 +474,9 @@ impl TraceEvent {
                 height: height.inner(),
                 opened_at: id.block_height().inner(),
                 tick: TickLabel::new(id.shard_id(), id.block_height()),
-                participants: certificates
-                    .iter()
+                participants: tick
+                    .local_ec()
+                    .into_iter()
                     .map(|ec| ec.tick_id().shard_id().into())
                     .collect(),
                 txs,

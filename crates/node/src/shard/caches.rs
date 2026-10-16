@@ -54,10 +54,8 @@ pub struct SharedCaches {
     /// [`ProvisionCoordinator`]: hyperscale_provisions::ProvisionCoordinator
     pub(crate) verified_headers: Arc<VerifiedHeaderBuffer>,
     /// Aggregated local-shard execution certificates awaiting block commit,
-    /// owned by the [`ExecutionCoordinator`]. Cloned here so the inbound EC
-    /// fetch handler can serve cross-shard fallback requests without taking
-    /// a coordinator lock; on cache miss the handler falls through to
-    /// storage.
+    /// owned by the [`ExecutionCoordinator`]. Cloned here for its size
+    /// gauge.
     ///
     /// [`ExecutionCoordinator`]: hyperscale_execution::ExecutionCoordinator
     pub(crate) exec_cert_store: Arc<ExecCertStore>,

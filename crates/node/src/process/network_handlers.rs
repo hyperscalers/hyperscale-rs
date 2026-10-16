@@ -28,9 +28,7 @@ use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconCandidateRequest, GetBeaconProposalRequest,
     GetShardWitnessesRequest,
 };
-use hyperscale_types::network::request::{
-    GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
-};
+use hyperscale_types::network::request::{GetFinalizationsRequest, GetLocalProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{ExecutionCertificate, ShardId, Signed, Verifiable, signed_bytes};
 use tracing::warn;
@@ -937,10 +935,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        SettledTxsCache, TerminalLinesCache, serve_cells_request, serve_execution_certs_request,
-        serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
-        serve_remote_headers_request, serve_settled_txs_request, serve_state_proof_request,
-        serve_terminal_lines_request,
+        SettledTxsCache, TerminalLinesCache, serve_cells_request, serve_finalizations_request,
+        serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
+        serve_settled_txs_request, serve_state_proof_request, serve_terminal_lines_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1256,16 +1253,6 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetFinalizationsRequest>(shard, move |req| {
             serve_finalizations_request(&pending_chain, &fw_cache, &req)
-        });
-
-    // ── execution_cert.request → cert store lookup ────────────────
-
-    let exec_cert_store = Arc::clone(&io.caches.exec_cert_store);
-    let pending_chain = Arc::clone(&io.pending_chain);
-    process
-        .network
-        .register_request_handler::<GetExecutionCertsRequest>(shard, move |req| {
-            serve_execution_certs_request(&pending_chain, &exec_cert_store, &req)
         });
 
     // ── remote_header.request → range header sync ───────────────────

@@ -150,7 +150,6 @@ impl ShardParticipation {
             .remote_headers_coordinator
             .flush_expected_headers(sched);
         actions.extend(self.provisions_coordinator.flush_expected_provisions());
-        actions.extend(self.execution_coordinator.flush_expected_certs());
         actions.extend(self.mempool_coordinator.flush_expected_txs());
         actions
     }

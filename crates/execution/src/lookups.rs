@@ -65,20 +65,6 @@ pub fn peers_excluding_self(
         .collect()
 }
 
-/// The fetch keys a dropped certificate releases: its own shard paired with
-/// every transaction it claimed an outcome for.
-///
-/// A certificate the admission path refuses answers for none of those
-/// transactions, so each goes back to being expected and re-fetchable.
-#[must_use]
-pub fn fetch_keys_covered(ec: &ExecutionCertificate) -> Vec<(ShardId, TxHash)> {
-    let shard = ec.shard_id();
-    ec.tx_outcomes()
-        .iter()
-        .map(|outcome| (shard, outcome.tx_hash()))
-        .collect()
-}
-
 /// True if `ec.signers()` represents at least 2f+1 of the voting power on
 /// `ec.shard_id()`. Mirrors `qc_has_local_quorum_power` (in the shard consensus
 /// crate) but resolves committee + voting power for the EC's own shard,
@@ -232,11 +218,7 @@ pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey,
     let executing: BTreeSet<TxHash> = if finalization.half() == TickHalf::Legs {
         finalization.accepted_names()
     } else {
-        let Some(local) = finalization
-            .execution_certificates()
-            .iter()
-            .find(|ec| ec.tick_id() == finalization.tick_id())
-        else {
+        let Some(local) = finalization.local_ec() else {
             return Vec::new();
         };
         local
@@ -448,17 +430,17 @@ mod tests {
         ))
     }
 
-    /// A finalization of `local`'s tick at height 3 carrying `certificates`
+    /// A finalization of `local`'s tick at height 3 carrying `certificate`
     /// and `receipts`.
     fn finalization(
         local: ShardId,
-        certificates: Vec<StdArc<ExecutionCertificate>>,
+        certificate: StdArc<ExecutionCertificate>,
         receipts: Vec<StoredReceipt>,
     ) -> Finalization {
         Finalization::new(
             TickId::new(local, BlockHeight::new(3)),
             TickHalf::Determined,
-            &Capped::new(certificates).expect("a list written out in a test"),
+            Some(certificate),
             Capped::from_array([]),
         )
         .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
@@ -485,13 +467,13 @@ mod tests {
 
         let finalization = finalization(
             local,
-            vec![certificate(
+            certificate(
                 tick,
                 vec![
                     TxOutcome::new(tx(0xA1), SUCCEEDED.clone()),
                     TxOutcome::new(tx(0xA5), SUCCEEDED.clone()).as_role(Role::Settling),
                 ],
-            )],
+            ),
             vec![
                 receipt(
                     tx(0xA1),
@@ -554,10 +536,10 @@ mod tests {
         let finalization = |seed: u8, id: CrossingId, key: SubstateKey| {
             StdArc::new(Verifiable::from(finalization(
                 local,
-                vec![certificate(
+                certificate(
                     TickId::new(local, BlockHeight::new(3)),
                     vec![TxOutcome::new(tx(seed), SUCCEEDED.clone())],
-                )],
+                ),
                 vec![receipt(
                     tx(seed),
                     vec![(key, Some(cell(id, tx(seed)).to_bytes()))],
@@ -597,10 +579,10 @@ mod tests {
         let cell = id.cell(issuer, ResourceAddr::new([0xE1; 31]), 7, 9_000, Terms::Owed);
         let finalization = StdArc::new(Verifiable::from(finalization(
             local,
-            vec![certificate(
+            certificate(
                 TickId::new(local, BlockHeight::new(3)),
                 vec![TxOutcome::new(issuer, SUCCEEDED.clone())],
-            )],
+            ),
             vec![receipt(issuer, vec![(key, Some(cell.to_bytes()))])],
         )));
         let pushes = record_pushes(&[finalization], &trie, local, |tx_hash, record| {

@@ -1,26 +1,22 @@
-//! The one gate a fetched certificate passes on its way to the crypto
-//! pool, whether it arrives alone or inside a finalization.
+//! The one gate an arriving certificate passes on its way to the crypto
+//! pool, whether it arrives alone or inside a fetched finalization.
 //!
-//! Every contained certificate is held to the same four checks: the
-//! halt-recovery freeze, the committee its anchor resolves, that
-//! committee's quorum power, and its keys. What differs between the two
-//! arrivals is what the slot is keyed by and what a refusal releases,
-//! which is what [`Attested`] says.
+//! Every certificate is held to the same four checks: the halt-recovery
+//! band, the committee its anchor resolves, that committee's quorum
+//! power, and its keys. What differs between the two arrivals is what
+//! the slot is keyed by, which is what [`Attested`] says.
 
 use std::sync::Arc;
 
-use hyperscale_core::FetchIds;
 use hyperscale_types::{
     ConsensusPublicKey, ExecutionCertificate, Finalization, Hash, ScheduleLookup, TickId,
     TopologySchedule, Verifiable,
 };
 
-use crate::lookups::{
-    committee_public_keys_for_shard, ec_has_shard_quorum_power, fetch_keys_covered,
-};
+use crate::lookups::{committee_public_keys_for_shard, ec_has_shard_quorum_power};
 
-/// A fetched artifact carrying certificates to verify: one, or a
-/// finalization's several.
+/// An arrival carrying a certificate to verify: one alone, or a
+/// finalization's own, which a legs half does not carry.
 pub trait Attested {
     /// The content hash an in-flight verification is keyed by, so a
     /// byte-identical retransmit does not dispatch twice. Different
@@ -32,13 +28,8 @@ pub trait Attested {
     /// The tick the artifact is about, for the log.
     fn tick_id(&self) -> &TickId;
 
-    /// Every certificate the artifact carries, in the order the keys are
-    /// returned in.
-    fn certificates(&self) -> impl Iterator<Item = &ExecutionCertificate>;
-
-    /// What refusing the artifact releases: it answers for nothing it
-    /// claimed, so each claim goes back to being fetchable.
-    fn abandon(&self) -> FetchIds;
+    /// The certificate the artifact carries, if any.
+    fn certificate(&self) -> Option<&ExecutionCertificate>;
 }
 
 impl Attested for Verifiable<ExecutionCertificate> {
@@ -50,12 +41,8 @@ impl Attested for Verifiable<ExecutionCertificate> {
         ExecutionCertificate::tick_id(self)
     }
 
-    fn certificates(&self) -> impl Iterator<Item = &ExecutionCertificate> {
-        std::iter::once(self.as_unverified())
-    }
-
-    fn abandon(&self) -> FetchIds {
-        FetchIds::ExecutionCerts(fetch_keys_covered(self))
+    fn certificate(&self) -> Option<&ExecutionCertificate> {
+        Some(self.as_unverified())
     }
 }
 
@@ -70,14 +57,8 @@ impl Attested for Arc<Verifiable<Finalization>> {
         Finalization::tick_id(self)
     }
 
-    fn certificates(&self) -> impl Iterator<Item = &ExecutionCertificate> {
-        self.execution_certificates()
-            .iter()
-            .map(|ec| ec.as_unverified())
-    }
-
-    fn abandon(&self) -> FetchIds {
-        FetchIds::Finalizations(vec![self.receipt_hash()])
+    fn certificate(&self) -> Option<&ExecutionCertificate> {
+        Finalization::certificate(self).map(|ec| ec.as_unverified())
     }
 }
 
@@ -85,7 +66,7 @@ impl Attested for Arc<Verifiable<Finalization>> {
 ///
 /// One vocabulary for both halves of the gate: what [`gate_certificate`]
 /// answers for one certificate, and what an artifact's whole pass
-/// answers for the several it carries. The artifact half adds
+/// answers for the one it carries, if any. The artifact half adds
 /// [`Self::InFlight`], which is a fact about the dispatch rather than
 /// about any certificate, so a single certificate never meets it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,12 +92,15 @@ pub enum Gate {
 /// height above that recovery's frontier, is the replaced committee's
 /// over a tick the recovered chain discards, or one it certified after
 /// the halt. Its anchor resolves the replaced committee and its
-/// signatures verify, so without the band it would settle at a
-/// counterpart what the recovered shard never settles. The band is the
-/// only refusal of such a certificate, during the recovery and after it,
-/// and nothing else refuses a certificate anchored at or past the
-/// bridge: that one resolves the fresh committee and verifies only under
-/// its keys. Then the committee that attests its tick on its own shard,
+/// signatures verify, and it carries no block hash: the recovered chain
+/// commits a new block at that height, whose tick has the same
+/// [`TickId`], so past the band the stale certificate would stand as the
+/// new tick's own, ending its votes and retries, and answering its late
+/// voters, over outcomes the new tick never ran. The band is the only
+/// refusal of such a certificate, during the recovery and after it, and
+/// nothing else refuses a certificate anchored at or past the bridge:
+/// that one resolves the fresh committee and verifies only under its
+/// keys. Then the committee that attests its tick on its own shard,
 /// which its anchor resolves: below the schedule floor it is past its
 /// retention horizon, provably terminal everywhere and never resolvable
 /// again, and in a window its shard had already left nobody was seated

@@ -31,7 +31,7 @@ use rocksdb::{ColumnFamily, DB, WriteBatch};
 
 use super::column_families::{
     BeaconWitnessesCf, BlocksCf, CertificatesCf, CfHandles, ConsensusReceiptsCf, ProvisionKeyCodec,
-    ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec, VotedBlocksCf,
+    ProvisionsCf, TransactionsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{
@@ -172,25 +172,13 @@ impl RocksDbShardStorage {
                 Some(tx.cached_wire_bytes()),
             );
         }
-        let tx_finalizations_cf = TxFinalizationsCf::handle(&cf);
-        let local_shard = block.header().shard_id();
         for fw in block.certificates().iter() {
-            let hash = fw.receipt_hash();
-            batch_put::<CertificatesCf>(batch, certificates_cf, &hash, &fw.attestation());
-            // The by-transaction index rides the same batch, so a crash
-            // cannot leave a key naming a finalization the certificates
-            // family lacks. Only a finalization of this shard's own tick
-            // is indexed, under what it settles or states
-            // (`indexed_tx_hashes`): a counterpart's certificate
-            // riding inside it answers a question nobody asks this
-            // shard, and an asker served its own certificate back
-            // refuses it as unsolicited and asks again.
-            if fw.tick_id().shard_id() != local_shard {
-                continue;
-            }
-            for tx_hash in fw.indexed_tx_hashes() {
-                batch_put::<TxFinalizationsCf>(batch, tx_finalizations_cf, &(tx_hash, hash), &());
-            }
+            batch_put::<CertificatesCf>(
+                batch,
+                certificates_cf,
+                &fw.receipt_hash(),
+                &fw.attestation(),
+            );
         }
         self.append_provisions_to_batch(batch, block, retention_floor);
     }
@@ -563,13 +551,6 @@ impl RocksDbShardStorage {
                     typed_cf::batch_delete::<ConsensusReceiptsCf>(
                         &mut writes,
                         ConsensusReceiptsCf::handle(&cf),
-                        key,
-                    );
-                }
-                for key in &keys.tx_finalizations {
-                    typed_cf::batch_delete::<TxFinalizationsCf>(
-                        &mut writes,
-                        TxFinalizationsCf::handle(&cf),
                         key,
                     );
                 }

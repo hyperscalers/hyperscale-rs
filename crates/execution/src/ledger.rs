@@ -749,13 +749,12 @@ impl Ledger {
     /// holds the core it is part of, itself included, but what it has
     /// committed is not something it fetches a proof of.
     ///
-    /// A core member waits only for its siblings, whose certificates its
-    /// own settlement needs. A sibling that refused keeps its committed
-    /// cell, so the cell reads present and answers nothing here: what
-    /// covers the waiting core is the sibling's certificate, pushed by
-    /// its outbound tracker and servable by transaction inside its
-    /// retention. Losing that road costs liveness only. A leg entry asks
-    /// nothing: the commit fold closes it on what its block carries.
+    /// A core member waits only for its siblings, whose verdicts its own
+    /// settlement needs. A sibling that refused keeps its committed cell,
+    /// so the cell reads present and answers nothing here: what covers
+    /// the waiting core is the sibling's verdict, which its row reads
+    /// from the sibling's state. A leg entry asks nothing: the commit
+    /// fold closes it on what its block carries.
     #[must_use]
     pub(crate) fn questions(&self) -> Vec<Question> {
         let mut questions = Vec::new();
@@ -1063,20 +1062,6 @@ impl Ledger {
     #[must_use]
     pub(crate) fn is_covered(&self, tx_hash: TxHash) -> bool {
         self.owed.get(&tx_hash).is_some_and(Owed::covered)
-    }
-
-    /// Whether a counterpart's certificate for `tx_hash` is still worth
-    /// having here — the entry is held and nothing committed has settled
-    /// what it waits on.
-    ///
-    /// The ledger asks for those certificates itself, when a claim reads
-    /// the counterpart's cell present, under the same fetch ids the
-    /// expectation tracker asks under — and that ask is one-shot. So a
-    /// caller retiring an id one of the two owners has finished with has
-    /// to put this question to the other first.
-    #[must_use]
-    pub(crate) fn awaits_certificate(&self, tx_hash: TxHash) -> bool {
-        self.owed.get(&tx_hash).is_some_and(|owed| !owed.covered())
     }
 
     /// Record where a departed participant's chain ended, and when what it

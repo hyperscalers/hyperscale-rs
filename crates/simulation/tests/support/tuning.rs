@@ -74,7 +74,6 @@ impl SimTuning {
         let node_config = NodeConfig {
             transaction_fetch: fetch(),
             provision_fetch: fetch(),
-            exec_cert_fetch: fetch(),
             shard_witness_fetch: fetch(),
             beacon_proposal_fetch: fetch(),
             instance_record_fetch: fetch(),

@@ -1,63 +1,36 @@
 //! Shared execution-certificate store.
 //!
-//! Single source of truth for aggregated [`ExecutionCertificate`]s during the
-//! window between local aggregation/verification and the tick's containing
-//! block committing. Held behind an `Arc` so the single-threaded execution
-//! coordinator (the sole writer) and the network worker thread (read-only,
-//! serving cross-shard EC fetch requests) can share the same map without
-//! channel-bouncing or contending on a coordinator lock.
+//! This shard's aggregated [`ExecutionCertificate`]s during the window
+//! between local aggregation or verification and the tick's containing
+//! block committing: a late voter is answered with the certificate, and a
+//! retransmit of one already verified skips verification. Held behind an
+//! `Arc` so same-shard vnodes share one map.
 //!
 //! Two writers — both inside the coordinator — feed this store:
 //!
 //! - **Tick-leader path** inserts on local EC aggregation, before the cert is
 //!   broadcast to local peers and remote shards.
 //! - **Non-leader path** inserts after verifying a local-shard EC received via
-//!   broadcast, so any node can serve fallback EC fetches for its own shard.
+//!   broadcast.
 //!
 //! Eviction is lifecycle-driven: entries are dropped in
 //! [`ExecutionCoordinator::remove_finalization`] once the tick's containing
-//! block commits, at which point the EC is durably available by
-//! transaction through
-//! [`ShardChainReader::get_execution_certificates_for_txs`], off the
-//! committed finalization itself, and the network handler reads that
-//! tier beside this one.
+//! block commits.
 //!
-//! Mirrors [`hyperscale_mempool::TxStore`] in shape and intent: a primary
-//! index keyed by the natural identifier (`TickId` here, `TxHash` there),
-//! plus a transaction index — a counterpart fetches an outcome by naming
-//! the transaction, having no way to know which certificate carries it.
-//! That index is one to many, because a shard can certify one
-//! transaction more than once: in the tick that ran it, and then in an
-//! abandonment that settles what the run left. A single slot would be
-//! taken by whichever came last, and which certificate answers a
-//! counterpart's question only the counterpart can tell.
-//!
-//! Backed by [`papaya::HashMap`] — a lock-free concurrent map. Reads from the
-//! network worker are wait-free in the common case and never contend with
-//! the single state-machine writer.
+//! Backed by [`papaya::HashMap`] — a lock-free concurrent map.
 //!
 //! [`ExecutionCertificate`]: hyperscale_types::ExecutionCertificate
 //! [`ExecutionCoordinator::remove_finalization`]: crate::ExecutionCoordinator::remove_finalization
-//! [`ShardChainReader::get_execution_certificates_for_txs`]: hyperscale_storage::ShardChainReader::get_execution_certificates_for_txs
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_types::{ExecutionCertificate, TickId, TxHash, TxOutcome, Verified};
+use hyperscale_types::{ExecutionCertificate, TickId, Verified};
 use papaya::HashMap;
 
-/// Shared, content-addressed store of aggregated [`ExecutionCertificate`]s
-/// awaiting block commit.
-///
-/// Read-heavy on the network worker thread (one lookup per inbound EC
-/// fetch); writes (insert on aggregation/verification, evict on tick-cert
-/// commit) are infrequent and single-threaded (state machine).
+/// Shared store of aggregated [`ExecutionCertificate`]s awaiting block
+/// commit, by tick.
 pub struct ExecCertStore {
     inner: HashMap<TickId, Arc<Verified<ExecutionCertificate>>>,
-    /// Attested transaction → every tick of this shard's that carried an
-    /// outcome for it. Shared behind an `Arc` so a reader never sees a
-    /// half-built set: a writer widens a copy and swaps it in.
-    by_tx: HashMap<TxHash, Arc<BTreeSet<TickId>>>,
 }
 
 impl ExecCertStore {
@@ -66,7 +39,6 @@ impl ExecCertStore {
     pub fn new() -> Self {
         Self {
             inner: HashMap::new(),
-            by_tx: HashMap::new(),
         }
     }
 
@@ -74,18 +46,14 @@ impl ExecCertStore {
     /// the same `TickId` is a no-op (the existing `Arc` is preserved so
     /// callers holding clones keep pointing at the same allocation).
     ///
-    /// A no-op for a wider copy of a held tick too: the index is a
-    /// function of the certificate held, so it names only what that copy
-    /// carries and [`evict`](Self::evict) removes exactly what this
-    /// added. The writer is single, so the check and the insert do not
-    /// race.
+    /// A no-op for a wider copy of a held tick too. The writer is single,
+    /// so the check and the insert do not race.
     ///
     /// The one copy that replaces a held one carries the same outcomes
     /// at a later anchor: a tick re-attested by a later committee. Every
     /// verifier resolves a certificate's committee at its own anchor and
     /// stops resolving an old one once that window is evicted, so the
-    /// later copy is the one still worth serving. Its index is the held
-    /// one's.
+    /// later copy is the one still worth serving.
     pub fn insert(&self, cert: Arc<Verified<ExecutionCertificate>>) {
         let tick_id = *cert.tick_id();
         let inner = self.inner.pin();
@@ -97,43 +65,7 @@ impl ExecCertStore {
             }
             return;
         }
-        // Index before the primary insert, so a concurrent reader that
-        // resolves a transaction always finds the certificate behind it.
-        let by_tx = self.by_tx.pin();
-        for tx_hash in cert.tx_outcomes().iter().map(TxOutcome::tx_hash) {
-            by_tx.update_or_insert_with(
-                tx_hash,
-                |held| {
-                    if held.contains(&tick_id) {
-                        return Arc::clone(held);
-                    }
-                    let mut widened = (**held).clone();
-                    widened.insert(tick_id);
-                    Arc::new(widened)
-                },
-                || Arc::new(BTreeSet::from([tick_id])),
-            );
-        }
         inner.get_or_insert_with(tick_id, || cert);
-    }
-
-    /// Every verified certificate held here carrying an outcome for
-    /// `tx_hash`, in tick order.
-    ///
-    /// All of them, because the asker names the transaction and not the
-    /// certificate: which of this shard's certificates answers the
-    /// question its tick is waiting on is something only the asker can
-    /// tell, once it has them.
-    #[must_use]
-    pub fn certificates_for_tx(&self, tx_hash: TxHash) -> Vec<Arc<Verified<ExecutionCertificate>>> {
-        let by_tx = self.by_tx.pin();
-        let Some(ticks) = by_tx.get(&tx_hash) else {
-            return Vec::new();
-        };
-        ticks
-            .iter()
-            .filter_map(|tick_id| self.get(tick_id))
-            .collect()
     }
 
     /// Look up a verified execution certificate by `TickId`.
@@ -142,24 +74,9 @@ impl ExecCertStore {
         self.inner.pin().get(tick_id).cloned()
     }
 
-    /// Drop the entry for `tick_id`, if any, along with its transaction
-    /// index entries.
+    /// Drop the entry for `tick_id`, if any.
     pub(crate) fn evict(&self, tick_id: &TickId) {
-        if let Some(cert) = self.inner.pin().remove(tick_id) {
-            let by_tx = self.by_tx.pin();
-            for tx_hash in cert.tx_outcomes().iter().map(TxOutcome::tx_hash) {
-                // Only this tick leaves the transaction's set; the others
-                // it names are still held and still answer for it.
-                let narrowed = by_tx.update(tx_hash, |held| {
-                    let mut narrowed = (**held).clone();
-                    narrowed.remove(tick_id);
-                    Arc::new(narrowed)
-                });
-                if narrowed.is_some_and(|ticks| ticks.is_empty()) {
-                    by_tx.remove(&tx_hash);
-                }
-            }
-        }
+        self.inner.pin().remove(tick_id);
     }
 
     /// Number of certificates currently held.
@@ -187,21 +104,13 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionOutcome, GlobalReceiptRoot, Hash, Role, ShardId,
-        SignerBitfield, WeightedTimestamp,
+        SignerBitfield, TxHash, TxOutcome, WeightedTimestamp,
     };
 
     use super::*;
 
     fn cert(block_height: u64) -> Arc<Verified<ExecutionCertificate>> {
-        attesting(block_height, vec![])
-    }
-
-    /// A certificate at `block_height` attesting `outcomes`.
-    fn attesting(
-        block_height: u64,
-        outcomes: Vec<TxOutcome>,
-    ) -> Arc<Verified<ExecutionCertificate>> {
-        anchored(block_height, WeightedTimestamp::ZERO, outcomes)
+        anchored(block_height, WeightedTimestamp::ZERO, vec![])
     }
 
     /// A certificate at `block_height` attesting `outcomes` at `anchor`.
@@ -229,74 +138,6 @@ mod tests {
         TxOutcome::new(tx_hash, ExecutionOutcome::Aborted).as_role(role)
     }
 
-    /// A transaction this shard certified twice answers with both, and
-    /// evicting one leaves the other answering.
-    ///
-    /// The second is an abandonment that settles what the first left, and
-    /// a counterpart asks by naming the transaction, so it cannot say
-    /// which it wants. A single slot would hand it whichever came last.
-    #[test]
-    fn a_transaction_certified_twice_answers_with_both() {
-        let store = ExecCertStore::new();
-        let hash = tx(9);
-        let verdict = attesting(1, vec![outcome(hash, Role::Core)]);
-        let abandonment = attesting(2, vec![outcome(hash, Role::Settling)]);
-        store.insert(Arc::clone(&verdict));
-        store.insert(Arc::clone(&abandonment));
-
-        assert_eq!(
-            store
-                .certificates_for_tx(hash)
-                .iter()
-                .map(|cert| *cert.tick_id())
-                .collect::<Vec<_>>(),
-            vec![*verdict.tick_id(), *abandonment.tick_id()],
-        );
-
-        store.evict(abandonment.tick_id());
-        assert_eq!(
-            store
-                .certificates_for_tx(hash)
-                .iter()
-                .map(|cert| *cert.tick_id())
-                .collect::<Vec<_>>(),
-            vec![*verdict.tick_id()],
-            "the one still held still answers",
-        );
-        store.evict(verdict.tick_id());
-        assert!(
-            store.certificates_for_tx(hash).is_empty(),
-            "and the last one leaving takes the entry with it",
-        );
-    }
-
-    /// A wider second copy of a held tick changes nothing: the index is
-    /// the held certificate's, and eviction removes exactly what the
-    /// held copy added.
-    #[test]
-    fn a_wider_copy_of_a_held_tick_is_not_indexed() {
-        let store = ExecCertStore::new();
-        let (carried, extra) = (tx(1), tx(2));
-        let narrow = attesting(1, vec![outcome(carried, Role::Core)]);
-        let wide = attesting(
-            1,
-            vec![outcome(carried, Role::Core), outcome(extra, Role::Core)],
-        );
-        store.insert(Arc::clone(&narrow));
-        store.insert(Arc::clone(&wide));
-
-        assert_eq!(store.len(), 1);
-        assert!(
-            store.certificates_for_tx(extra).is_empty(),
-            "the transaction only the wider copy carries is not answered",
-        );
-        assert_eq!(store.certificates_for_tx(carried).len(), 1);
-
-        store.evict(narrow.tick_id());
-        assert!(store.certificates_for_tx(carried).is_empty());
-        assert!(store.by_tx.pin().is_empty(), "and the index is empty");
-    }
-
     /// A re-attested copy of a held tick displaces the earlier one, and
     /// an earlier copy never displaces a later one.
     #[test]
@@ -313,7 +154,6 @@ mod tests {
 
         store.insert(Arc::clone(&first));
         assert_eq!(held(&store), Some(WeightedTimestamp::from_millis(500)));
-        assert_eq!(store.certificates_for_tx(tx(1)).len(), 1);
     }
 
     #[test]

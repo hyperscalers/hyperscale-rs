@@ -2272,7 +2272,7 @@ mod tests {
             Arc::new(Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                &Capped::from_array([Arc::new(ec)]),
+                Some(Arc::new(ec)),
                 Capped::empty(),
             )))
         };

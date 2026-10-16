@@ -75,7 +75,7 @@ pub enum RequestError {
 
 /// Whether a class is in the cross-shard reservation tier.
 ///
-/// `CrossShardProgress` traffic (provisions / EC fallback fetches) is
+/// `CrossShardProgress` traffic (provisions, remote headers, records) is
 /// bounded by `config.cross_shard_max_concurrent` so a cross-shard fetch
 /// storm during topology churn cannot starve the shard consensus hot path
 /// (`Consensus`, `BlockCompletion`).
@@ -133,9 +133,9 @@ pub struct RequestManagerConfig {
 
     /// Cap on concurrent in-flight requests in the `CrossShardProgress`
     /// class. Counted as a subset of `max_concurrent` — prevents a
-    /// cross-shard fetch storm (provisions / EC fallback during topology
-    /// churn) from filling the global pool and starving the shard consensus hot path
-    /// (`Consensus`, `BlockCompletion`). The hot path is therefore
+    /// cross-shard fetch storm (provisions, remote headers, records during
+    /// topology churn) from filling the global pool and starving the shard
+    /// consensus hot path (`Consensus`, `BlockCompletion`). The hot path is therefore
     /// guaranteed `max_concurrent - cross_shard_max_concurrent -
     /// sheddable_max_concurrent` slots regardless of cross-shard or
     /// sheddable load.
@@ -153,7 +153,7 @@ impl Default for RequestManagerConfig {
             sheddable_max_concurrent: 32,
             // 48/128 paired with sheddable_max=32 reserves
             // 48 = 128 - 48 - 32 slots for the shard consensus hot path. Sized so a
-            // burst of cross-shard fallback fetches can run in parallel
+            // burst of cross-shard fetches can run in parallel
             // rather than serialising on a tight cap.
             cross_shard_max_concurrent: 48,
         }

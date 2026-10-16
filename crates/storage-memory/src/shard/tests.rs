@@ -456,42 +456,6 @@ fn a_retained_bundle_drops_below_the_history_floor() {
 }
 
 #[test]
-fn every_copy_of_a_tick_answers_for_what_it_carries() {
-    let storage = SimShardStorage::default();
-    test_helpers::test_every_copy_of_a_tick_answers_for_what_it_carries(&storage);
-}
-
-#[test]
-fn the_tx_index_answers_with_the_local_shards_certificate() {
-    let storage = SimShardStorage::default();
-    test_helpers::test_tx_index_answers_with_the_local_shards_certificate(&storage);
-}
-
-#[test]
-fn the_tx_index_answers_with_every_certificate_of_this_shards() {
-    let storage = SimShardStorage::default();
-    test_helpers::test_the_tx_index_answers_with_every_certificate_of_this_shards(&storage);
-}
-
-#[test]
-fn a_foreign_ticks_finalization_is_stored_and_not_indexed() {
-    let storage = SimShardStorage::default();
-    test_helpers::test_a_foreign_ticks_finalization_is_stored_and_not_indexed(&storage);
-}
-
-#[test]
-fn test_ec_storage_roundtrip() {
-    let storage = SimShardStorage::default();
-    test_helpers::test_ec_storage_roundtrip(&storage);
-}
-
-#[test]
-fn test_ec_storage_batch() {
-    let storage = SimShardStorage::default();
-    test_helpers::test_ec_storage_batch(&storage);
-}
-
-#[test]
 fn witness_payload_range_reads() {
     let storage = SimShardStorage::default();
     test_helpers::test_witness_payload_range_reads(&storage);

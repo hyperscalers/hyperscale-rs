@@ -8,7 +8,6 @@ mod package_artifact;
 
 mod block;
 mod cells;
-mod execution_cert;
 mod finalization;
 mod local_provision;
 mod proposal;
@@ -24,7 +23,6 @@ mod witness_history;
 
 pub use block::{BlockIntent, GetBlockRequest};
 pub use cells::{CellRange, GetCellsRequest, MAX_RANGES_PER_QUERY};
-pub use execution_cert::GetExecutionCertsRequest;
 pub use finalization::GetFinalizationsRequest;
 pub use instance_record::{GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST};
 pub use local_provision::GetLocalProvisionsRequest;

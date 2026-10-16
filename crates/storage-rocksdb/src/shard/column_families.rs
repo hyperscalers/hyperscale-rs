@@ -97,21 +97,6 @@ pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 /// own.
 pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 
-/// Column family indexing every finalization of this shard's carrying an
-/// outcome for a transaction, keyed `(TxHash, FinalizationHash)` with no
-/// value.
-///
-/// A counterpart shard asks for outcomes by transaction — it learned of
-/// the transaction from our committed header and has no way to know which
-/// certificate we ended up putting it in. This index is how the fetch
-/// responder answers that from storage once the in-memory cache has
-/// evicted: the finalization's hash is its key in [`CERTIFICATES_CF`],
-/// and the certificate served is that finalization's own. Written in
-/// the same batch as the finalization, one key per attested outcome; a
-/// composite key makes every write a blind put, so nothing stored is
-/// read to widen it. Never pruned, like the finalizations it names.
-pub const TX_FINALIZATIONS_CF: &str = "tx_finalizations";
-
 /// Column family for beacon-witness leaves on this shard.
 ///
 /// Key: `leaf_index` as a big-endian `u64` — lex order matches
@@ -252,7 +237,6 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
     CONSENSUS_RECEIPTS_CF,
-    TX_FINALIZATIONS_CF,
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
     VERSION_TIME_CF,
@@ -286,7 +270,6 @@ pub struct CfHandles<'a> {
     jmt_nodes: &'a ColumnFamily,
     stale_jmt_nodes: &'a ColumnFamily,
     consensus_receipts: &'a ColumnFamily,
-    tx_finalizations: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
     version_time: &'a ColumnFamily,
@@ -322,7 +305,6 @@ impl<'a> CfHandles<'a> {
             jmt_nodes: resolve(JMT_NODES_CF),
             stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
             consensus_receipts: resolve(CONSENSUS_RECEIPTS_CF),
-            tx_finalizations: resolve(TX_FINALIZATIONS_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             version_time: resolve(VERSION_TIME_CF),
@@ -705,53 +687,6 @@ impl TypedCf for ConsensusReceiptsCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.consensus_receipts
-    }
-}
-
-// Transaction → finalization index
-
-/// Key codec for [`TxFinalizationsCf`]: the transaction hash, then the
-/// finalization's hash, 64 bytes. Transaction first so one transaction's
-/// finalizations sit together, and a forward scan from the transaction
-/// paired with the zero hash reads every one of them.
-#[derive(Default)]
-pub struct TxFinalizationKeyCodec;
-
-impl DbEncode<(TxHash, FinalizationHash)> for TxFinalizationKeyCodec {
-    fn encode_to(&self, value: &(TxHash, FinalizationHash), buf: &mut Vec<u8>) {
-        let (tx, finalization) = value;
-        buf.extend_from_slice(tx.as_bytes());
-        buf.extend_from_slice(finalization.as_bytes());
-    }
-}
-
-impl DbCodec<(TxHash, FinalizationHash)> for TxFinalizationKeyCodec {
-    fn decode(&self, bytes: &[u8]) -> (TxHash, FinalizationHash) {
-        assert_eq!(bytes.len(), 64, "tx finalization key must be 32 + 32 bytes");
-        let (tx, finalization) = bytes.split_at(32);
-        (
-            TxHash::from(Hash::from_hash_bytes(tx)),
-            FinalizationHash::from_raw(Hash::from_hash_bytes(finalization)),
-        )
-    }
-}
-
-/// Every finalization of this shard's carrying an outcome for a
-/// transaction, not the newest: a shard can certify one transaction in
-/// the tick that ran it and again in an abandonment that settles what
-/// the run left, and a counterpart fetching by transaction cannot name
-/// which of them it wants. See
-/// [`TX_FINALIZATIONS_CF`].
-pub struct TxFinalizationsCf;
-impl TypedCf for TxFinalizationsCf {
-    const NAME: &'static str = TX_FINALIZATIONS_CF;
-    type Key = (TxHash, FinalizationHash);
-    type Value = ();
-    type KeyCodec = TxFinalizationKeyCodec;
-    type ValueCodec = UnitCodec;
-    type Handles<'a> = CfHandles<'a>;
-    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
-        cf.tx_finalizations
     }
 }
 

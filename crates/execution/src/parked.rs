@@ -6,8 +6,7 @@
 //! departed partner's settled set stands in for — and goes back through
 //! the handler it came in by once that lands. Holding is bounded per
 //! reason and shard, oldest dropped: a node this far behind re-fetches
-//! through ordinary sync regardless, and the expected-certificate tracker
-//! re-fetches a certificate on timeout.
+//! through ordinary sync regardless.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;

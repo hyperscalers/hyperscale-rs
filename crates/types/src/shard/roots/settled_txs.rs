@@ -9,7 +9,6 @@
 //!
 //! [`SettledTxsRoot`]: crate::SettledTxsRoot
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::shard::roots::SetRoot;
@@ -24,9 +23,8 @@ use crate::{
 /// One entry per transaction of each committed finalization whose local
 /// execution certificate is keyed on this shard — its block's own shard,
 /// `block.header().shard_id()` — that a counterpart could ask about: one
-/// some other shard's certificate attests beside this shard's, whatever
-/// the verdict, or one this shard completed alone whose reach goes
-/// beyond it — a core's claim, a delivery, a leg that ran — and every
+/// this shard completed whose reach goes beyond it — a core's claim, a
+/// delivery, a leg that ran — and every
 /// core member a legs half accepts. The outcome states its reach, since
 /// a member that answers to nobody leaves no other trace of the shards
 /// that will ask.
@@ -52,17 +50,10 @@ pub fn local_settled_tx_hashes<'a>(
         .into_iter()
         .filter(|fw| fw.tick_id().shard_id() == shard)
         .flat_map(|fw| {
-            let reached_beyond: BTreeSet<TxHash> = fw
-                .execution_certificates()
-                .iter()
-                .filter(|ec| ec.shard_id() != shard)
-                .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
-                .collect();
             fw.settled_outcomes()
-                .filter(move |outcome| {
-                    reached_beyond.contains(&outcome.tx_hash())
-                        || (outcome.reaches_beyond()
-                            && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }))
+                .filter(|outcome| {
+                    outcome.reaches_beyond()
+                        && matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
                 })
                 .map(TxOutcome::tx_hash)
                 .chain(fw.accepted_names())
@@ -110,6 +101,8 @@ pub fn settled_txs_root_from_hashes<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use hyperscale_hbor::Capped;
 
     use super::*;
@@ -142,15 +135,11 @@ mod tests {
         assert_eq!(forward, with_dup);
     }
 
-    fn finalization(
-        local: ShardId,
-        ecs: Vec<ExecutionCertificate>,
-    ) -> Arc<Verifiable<Finalization>> {
+    fn finalization(local: ShardId, ec: ExecutionCertificate) -> Arc<Verifiable<Finalization>> {
         Arc::new(Verifiable::from(Finalization::new(
             TickId::new(local, BlockHeight::new(1)),
             TickHalf::Determined,
-            &Capped::new(ecs.into_iter().map(Arc::new).collect())
-                .expect("a list written out in a test"),
+            Some(Arc::new(ec)),
             Capped::from_array([]),
         )))
     }
@@ -172,36 +161,27 @@ mod tests {
         }
     }
 
-    /// A verdict some other shard's certificate attests beside this one's
-    /// is named whatever it was; one this shard reached alone is named
-    /// only where it completed and reaches beyond the shard.
+    /// A verdict is named only where it completed and reaches beyond the
+    /// shard.
     #[test]
     fn the_set_names_what_a_counterpart_could_ask_about() {
         let (local, remote) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
-        let (jointly_aborted, leg, refusal, abandonment, alone) =
-            (tx(1), tx(2), tx(3), tx(4), tx(5));
+        let (aborted, leg, refusal, abandonment, alone) = (tx(1), tx(2), tx(3), tx(4), tx(5));
         let fw = finalization(
             local,
-            vec![
-                certificate(
-                    local,
-                    vec![
-                        TxOutcome::new(jointly_aborted, ExecutionOutcome::Aborted)
-                            .awaiting([remote]),
-                        TxOutcome::new(leg, succeeded()).as_role(Role::Leg),
-                        TxOutcome::new(refusal, ExecutionOutcome::Failed).as_role(Role::Leg),
-                        TxOutcome::new(abandonment, ExecutionOutcome::Aborted).awaiting([remote]),
-                        TxOutcome::new(alone, succeeded()),
-                    ],
-                ),
-                certificate(
-                    remote,
-                    vec![TxOutcome::new(jointly_aborted, ExecutionOutcome::Aborted)],
-                ),
-            ],
+            certificate(
+                local,
+                vec![
+                    TxOutcome::new(aborted, ExecutionOutcome::Aborted).awaiting([remote]),
+                    TxOutcome::new(leg, succeeded()).as_role(Role::Leg),
+                    TxOutcome::new(refusal, ExecutionOutcome::Failed).as_role(Role::Leg),
+                    TxOutcome::new(abandonment, ExecutionOutcome::Aborted).awaiting([remote]),
+                    TxOutcome::new(alone, succeeded()),
+                ],
+            ),
         );
         let named: BTreeSet<TxHash> = local_settled_tx_hashes([&fw], local).into_iter().collect();
-        assert_eq!(named, BTreeSet::from([jointly_aborted, leg]));
+        assert_eq!(named, BTreeSet::from([leg]));
         assert!(
             local_settled_tx_hashes([&fw], remote).is_empty(),
             "a finalization names only its own shard's verdicts",

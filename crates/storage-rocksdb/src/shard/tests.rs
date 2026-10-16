@@ -10,8 +10,8 @@ use hyperscale_storage::test_helpers::{
     make_test_receipt, paced, placeholder_local_ec, position, registers, state_key,
     test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
-    test_a_foreign_ticks_finalization_is_stored_and_not_indexed, test_a_fresh_store_holds_nothing,
-    test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
+    test_a_fresh_store_holds_nothing, test_a_leg_entry_holds_the_floor_to_its_horizon,
+    test_a_legs_own_finalization_keeps_the_floor,
     test_a_member_row_naming_an_unheld_height_keeps_nothing,
     test_a_package_cell_lands_in_the_artifact_index, test_a_rebuilt_store_carries_signed_rounds,
     test_a_replayed_sweep_reads_what_its_block_removed, test_a_settled_tick_pulls_the_replay_down,
@@ -21,9 +21,7 @@ use hyperscale_storage::test_helpers::{
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
-    test_committed_receipts_reach_state, test_ec_storage_batch as helpers_test_ec_storage_batch,
-    test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
-    test_entries_commit_serve_and_history, test_every_copy_of_a_tick_answers_for_what_it_carries,
+    test_committed_receipts_reach_state, test_entries_commit_serve_and_history,
     test_historical_reads_resolve_per_version, test_historical_reads_respect_retention,
     test_history_reads_through_create_delete_create,
     test_prepared_commit_for_a_committed_block_applies_nothing,
@@ -35,8 +33,6 @@ use hyperscale_storage::test_helpers::{
     test_sweep_index_counts_a_pending_ancestors_move, test_sweep_index_tracks_the_leaves,
     test_sweep_stops_at_the_ceiling_or_the_cap, test_the_floor_stops_at_the_lowest_block_held,
     test_the_replay_floor_stops_at_the_chain_origin, test_the_root_is_a_function_of_the_writes,
-    test_the_tx_index_answers_with_every_certificate_of_this_shards,
-    test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
     test_witness_window_retention_and_recovery, with_provisions,
@@ -49,11 +45,11 @@ use hyperscale_storage::{
 use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, DiscardCause, ExecutionCertificate, ExecutionOutcome, Finalization,
-    FinalizationHash, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round,
-    ShardId, StateWrites, StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine,
-    TickManifest, TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable,
-    WeightedTimestamp, WitnessSources,
+    ConsensusReceipt, DiscardCause, ExecutionOutcome, Finalization, FinalizationHash,
+    FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round, ShardId, StateWrites,
+    StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
+    TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -63,10 +59,9 @@ fn no_witness() -> BeaconWitnessCommit {
 use rocksdb::{DB, Options, WriteBatch};
 use tempfile::TempDir;
 
-use super::column_families::{ALL_COLUMN_FAMILIES, STATE_HISTORY_CF, TxFinalizationsCf};
+use super::column_families::{ALL_COLUMN_FAMILIES, STATE_HISTORY_CF};
 use super::core::RocksDbShardStorage;
 use super::metadata::write_chain_origin;
-use crate::typed_cf::{TypedCf, iter_all};
 
 /// Commit `block` with no writes and no witness.
 fn commit_empty(storage: &RocksDbShardStorage, block: &Block) {
@@ -585,7 +580,7 @@ fn finalization_with_writes(
     Arc::new(Verifiable::from(Finalization::new(
         tick_id,
         TickHalf::Determined,
-        &Capped::from_array([placeholder_local_ec(ShardId::ROOT, height)]),
+        Some(placeholder_local_ec(ShardId::ROOT, height)),
         Capped::from_array([receipt]),
     )))
 }
@@ -941,33 +936,10 @@ fn a_leg_entry_holds_the_floor_to_its_horizon() {
 }
 
 #[test]
-fn test_ec_storage_roundtrip() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    helpers_test_ec_storage_roundtrip(&storage);
-}
-
-#[test]
-fn test_ec_storage_batch() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    helpers_test_ec_storage_batch(&storage);
-}
-
-#[test]
 fn witness_payload_range_reads() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     helpers_test_witness_payload_range_reads(&storage);
-}
-
-/// The one transaction a [`make_test_execution_certificate`] attests.
-fn attested_by(ec: &ExecutionCertificate) -> TxHash {
-    ec.tx_outcomes()
-        .iter()
-        .next()
-        .expect("a test certificate attests one outcome")
-        .tx_hash()
 }
 
 #[test]
@@ -975,23 +947,18 @@ fn test_ec_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
     let tick_id = *ec.tick_id();
-    let tx = attested_by(&ec);
+    let finalization = Finalization::new(
+        tick_id,
+        TickHalf::Determined,
+        Some(Arc::new(ec)),
+        Capped::from_array([]),
+    );
+    let id = finalization.receipt_hash();
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let mut block = make_test_block(BlockHeight::new(1));
-        push_finalization(
-            &mut block,
-            Arc::new(
-                Finalization::new(
-                    tick_id,
-                    TickHalf::Determined,
-                    &Capped::from_array([Arc::new(ec)]),
-                    Capped::from_array([]),
-                )
-                .into(),
-            ),
-        );
+        push_finalization(&mut block, Arc::new(finalization.into()));
         commit_settled_at(
             &storage,
             &make_test_certified(block),
@@ -1003,57 +970,14 @@ fn test_ec_survives_reopen() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let certs = storage.get_execution_certificates_for_txs(&[tx]);
-        assert_eq!(
-            certs.len(),
-            1,
-            "the certificate is served by transaction after a reopen"
-        );
-        assert_eq!(certs[0].tick_id(), &tick_id);
-        assert_eq!(certs[0].block_height(), BlockHeight::new(1));
+        let stored = storage.get_certificates_batch(&[id]);
+        let [stored] = &stored[..] else {
+            panic!("the finalization reads back after a reopen");
+        };
+        let certificate = stored.local_ec().expect("with its certificate");
+        assert_eq!(certificate.tick_id(), &tick_id);
+        assert_eq!(certificate.block_height(), BlockHeight::new(1));
     }
-}
-
-/// A historically imported block returns its finalization by hash and
-/// serves no certificate by transaction: no reader asks a backfilled
-/// replica for certificates of its imported history.
-#[test]
-fn a_historically_imported_block_serves_no_certificate_by_transaction() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let tx = attested_by(&ec);
-    let mut block = make_test_block(BlockHeight::new(1));
-    push_finalization(
-        &mut block,
-        Arc::new(
-            Finalization::new(
-                *ec.tick_id(),
-                TickHalf::Determined,
-                &Capped::from_array([Arc::new(ec)]),
-                Capped::from_array([]),
-            )
-            .into(),
-        ),
-    );
-    let id = block
-        .certificates()
-        .iter()
-        .next()
-        .expect("the block carries the finalization")
-        .receipt_hash();
-    let certified = make_test_certified(block);
-    storage.import_historical_block(&certified);
-
-    assert_eq!(
-        storage.get_certificates_batch(&[id]).len(),
-        1,
-        "the finalization is stored with the imported block",
-    );
-    assert!(
-        storage.get_execution_certificates_for_txs(&[tx]).is_empty(),
-        "and serves no certificate by transaction",
-    );
 }
 
 /// A historically imported block whose finalization settles a receipt
@@ -1203,20 +1127,15 @@ fn a_stray_column_family_is_dropped_on_open() {
 
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let tx = attested_by(&ec);
-    let mut block = make_test_block(BlockHeight::new(1));
-    push_finalization(
-        &mut block,
-        Arc::new(
-            Finalization::new(
-                *ec.tick_id(),
-                TickHalf::Determined,
-                &Capped::from_array([Arc::new(ec)]),
-                Capped::from_array([]),
-            )
-            .into(),
-        ),
+    let finalization = Finalization::new(
+        *ec.tick_id(),
+        TickHalf::Determined,
+        Some(Arc::new(ec)),
+        Capped::from_array([]),
     );
+    let id = finalization.receipt_hash();
+    let mut block = make_test_block(BlockHeight::new(1));
+    push_finalization(&mut block, Arc::new(finalization.into()));
     commit_settled_at(
         &storage,
         &make_test_certified(block),
@@ -1225,7 +1144,7 @@ fn a_stray_column_family_is_dropped_on_open() {
         &no_witness(),
     );
     assert_eq!(
-        storage.get_execution_certificates_for_txs(&[tx]).len(),
+        storage.get_certificates_batch(&[id]).len(),
         1,
         "the store commits and serves as usual",
     );
@@ -1235,62 +1154,6 @@ fn a_stray_column_family_is_dropped_on_open() {
     assert!(
         !listed.iter().any(|name| name == STRAY),
         "the stray family is gone; on disk: {listed:?}",
-    );
-}
-
-#[test]
-fn a_foreign_ticks_finalization_is_stored_and_not_indexed() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_a_foreign_ticks_finalization_is_stored_and_not_indexed(&storage);
-}
-
-#[test]
-fn test_ec_atomic_with_block_commit() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-
-    let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let tick_id = *ec.tick_id();
-    let tx = attested_by(&ec);
-    let mut block = make_test_block(BlockHeight::new(1));
-    push_finalization(
-        &mut block,
-        Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                &Capped::from_array([Arc::new(ec)]),
-                Capped::from_array([]),
-            )
-            .into(),
-        ),
-    );
-    // Commit block with EC atomically
-    commit_settled_at(
-        &storage,
-        &make_test_certified(block),
-        &[],
-        &[],
-        &no_witness(),
-    );
-
-    let certs = storage.get_execution_certificates_for_txs(&[tx]);
-    assert_eq!(certs.len(), 1, "EC must be retrievable after commit");
-    assert_eq!(certs[0].block_height(), BlockHeight::new(1));
-
-    // The index landed with the finalization: every key it holds names
-    // a finalization the certificates family holds.
-    let cf = storage.cf();
-    let indexed: Vec<FinalizationHash> =
-        iter_all::<TxFinalizationsCf>(&storage.db, TxFinalizationsCf::handle(&cf))
-            .map(|((_, id), ())| id)
-            .collect();
-    assert_eq!(indexed.len(), 1, "one key per attested outcome");
-    assert_eq!(
-        storage.get_certificates_batch(&indexed).len(),
-        1,
-        "and it names the stored finalization",
     );
 }
 
@@ -1626,27 +1489,6 @@ fn a_retained_bundle_drops_below_the_history_floor() {
     test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
         storage.load_recovered_state(ShardId::ROOT)
     });
-}
-
-#[test]
-fn every_copy_of_a_tick_answers_for_what_it_carries() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_every_copy_of_a_tick_answers_for_what_it_carries(&storage);
-}
-
-#[test]
-fn the_tx_index_answers_with_the_local_shards_certificate() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_tx_index_answers_with_the_local_shards_certificate(&storage);
-}
-
-#[test]
-fn the_tx_index_answers_with_every_certificate_of_this_shards() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    test_the_tx_index_answers_with_every_certificate_of_this_shards(&storage);
 }
 
 /// The shared package-index test, then a reopen: the index is what a
