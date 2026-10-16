@@ -29,6 +29,7 @@ hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
 hyperscale-types.workspace = true
 iroh.workspace = true
+libc = "0.2.186"
 parking_lot.workspace = true
 rand.workspace = true
 hyperscale-hbor.workspace = true
@@ -45,7 +46,6 @@ iroh-relay = { workspace = true, features = ["server"], optional = true }
 [dev-dependencies]
 arc-swap.workspace = true
 hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
-libc = "0.2.186"
 rand_chacha.workspace = true
 rustls-pki-types = { version = "1.14.0", features = ["std"] }
 hyperscale-crypto-bls.workspace = true

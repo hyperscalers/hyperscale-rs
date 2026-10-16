@@ -8,14 +8,19 @@
 //! one request, answered and finished.
 //!
 //! Requests are admitted against a global concurrency limit and a per-peer
-//! one, so no single peer (or flood of peers) can exhaust handler capacity.
+//! one, so no single peer (or flood of peers) can exhaust handler capacity,
+//! and the time a peer's handlers take is charged against a budget that
+//! time pays down (see [`crate::serve_budget`]), so no peer can keep this
+//! host busy for more than one core.
 //! A peer's notifications are judged a few at a time, and each one its
 //! handler does not take is charged against the peer, as is each stream
 //! that broke the protocol, in the budget the host's gossip shares (see
-//! [`crate::cooldown`]). A peer whose refused traffic costs more than its
-//! share is cooled down and its streams refused. All of it is kept per
-//! principal (see [`Peer`]). A request refused for capacity is answered as
-//! such rather than left to time out.
+//! [`crate::cooldown`]). A request refused, for capacity or for its
+//! budget, is answered as such rather than left to time out, and charged
+//! the same way. A peer whose refused traffic costs more than its share is
+//! cooled down: the streams it has open are stopped, and no new one is
+//! taken up until the cooldown lapses. All of it is kept per principal (see
+//! [`Peer`]).
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,13 +33,12 @@ use dashmap::DashMap;
 use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
-use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
 use tokio::spawn;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::spawn_blocking;
-use tokio::time::timeout;
+use tokio::time::{sleep_until, timeout};
 use tracing::{debug, warn};
 
 use crate::cooldown::{Cooldown, Refusal, refused_work};
@@ -48,6 +52,7 @@ use crate::protocol::{
     RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STOP_REFUSED, STREAM_GOSSIP, STREAM_NOTIFY,
     STREAM_REQUEST, STREAM_SUBSCRIBE, class_from_byte, class_priority, decode_shard,
 };
+use crate::serve_budget::{ServeBudget, processor_time};
 
 /// Timeout for reading a stream's header and its request frame.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,6 +86,8 @@ pub struct InboundRouter {
     global_semaphore: Arc<Semaphore>,
     /// Per-principal count of requests in flight.
     per_peer: DashMap<ValidatorId, AtomicUsize>,
+    /// What each principal's requests have cost this host's handlers.
+    serve_budget: ServeBudget,
     /// Turns at judging each principal's notifications.
     judging: DashMap<ValidatorId, Arc<Semaphore>>,
     /// What each peer's refused traffic has cost this host, shared with
@@ -111,6 +118,7 @@ impl InboundRouter {
             failures,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: DashMap::new(),
+            serve_budget: ServeBudget::default(),
             judging: DashMap::new(),
             fanout: OnceLock::new(),
         }
@@ -139,7 +147,11 @@ impl InboundRouter {
         let router = Arc::clone(self);
         let streams = connection.clone();
         spawn(async move {
-            while let Ok(stream) = streams.accept_uni().await {
+            loop {
+                router.sit_out_cooldown(principal).await;
+                let Ok(stream) = streams.accept_uni().await else {
+                    break;
+                };
                 let router = Arc::clone(&router);
                 spawn(async move {
                     let result = router.handle_uni(peer, stream).await;
@@ -151,7 +163,11 @@ impl InboundRouter {
         let router = Arc::clone(self);
         let streams = connection.clone();
         spawn(async move {
-            while let Ok((send, recv)) = streams.accept_bi().await {
+            loop {
+                router.sit_out_cooldown(principal).await;
+                let Ok((send, recv)) = streams.accept_bi().await else {
+                    break;
+                };
                 let router = Arc::clone(&router);
                 spawn(async move {
                     let result = router.handle_bi(peer, send, recv).await;
@@ -159,6 +175,16 @@ impl InboundRouter {
                 });
             }
         });
+    }
+
+    /// Wait out any cooldown `principal` is in. Its streams are not taken up
+    /// meanwhile, so the transport's limit on a peer's open streams holds it
+    /// to those already open, and refusing it costs this host nothing more
+    /// however fast it asks.
+    async fn sit_out_cooldown(&self, principal: ValidatorId) {
+        while let Some(until) = self.failures.cooling_until(principal) {
+            sleep_until(until).await;
+        }
     }
 
     /// Charge `peer` for a stream that failed by its fault. A stream that
@@ -373,9 +399,13 @@ impl InboundRouter {
         }
 
         let Some(permit) = self.try_admit(peer.principal) else {
+            // Being refused costs a peer what refusing it costs this host,
+            // so asking again and again while refused runs it into a
+            // cooldown.
+            self.charge(peer, refused_work(0, Refusal::Unjudged));
             return respond_status(&mut send, RESPONSE_BUSY).await;
         };
-        let result = self.serve_request(peer.endpoint, send, recv).await;
+        let result = self.serve_request(peer, send, recv).await;
         drop(permit);
         self.release(peer.principal);
         result
@@ -384,7 +414,7 @@ impl InboundRouter {
     /// Read one request, run its handler, and write the response.
     async fn serve_request(
         &self,
-        peer: EndpointId,
+        peer: Peer,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), StreamError> {
@@ -416,28 +446,38 @@ impl InboundRouter {
         }
         // A relayed path takes no response of a class it does not carry;
         // saying so before the handler runs spares the work.
-        if !self.paths.carries(peer, class) {
+        if !self.paths.carries(peer.endpoint, class) {
             return respond_status(&mut send, RESPONSE_RELAYED).await;
         }
         let Some(handler) = self.registry.get_request(&type_id, shard) else {
             respond_status(&mut send, RESPONSE_UNKNOWN_TYPE).await?;
             return Err(StreamError::UnknownMessageType);
         };
+        // A peer whose requests have cost this host its share is answered
+        // busy before anything more is spent on it, and charged for the
+        // refusal.
+        if !self.serve_budget.admits(peer.principal) {
+            self.charge(peer, refused_work(payload.len(), Refusal::Unjudged));
+            return respond_status(&mut send, RESPONSE_BUSY).await;
+        }
 
         // Handlers do heavy work (merkle proof generation) that would starve
         // the async runtime on a worker thread.
-        let (asked, answer) = spawn_blocking(move || {
-            let answer = handler(&payload);
-            (payload, answer)
+        let ((asked, answer), spent) = spawn_blocking(move || {
+            processor_time(|| {
+                let answer = handler(&payload);
+                (payload, answer)
+            })
         })
         .await
         .expect("request handler task panicked");
+        self.serve_budget.charge(peer.principal, spent);
         let response = self
             .fault_gate
-            .rewrite_response(peer, &type_id, &asked, answer);
+            .rewrite_response(peer.endpoint, &type_id, &asked, answer);
         drop(asked);
 
-        if !self.paths.admit(peer, class, response.len()) {
+        if !self.paths.admit(peer.endpoint, class, response.len()) {
             return respond_status(&mut send, RESPONSE_RELAYED).await;
         }
 
