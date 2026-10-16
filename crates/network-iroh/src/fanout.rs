@@ -56,7 +56,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_network::compression::{compress, decompress};
 use hyperscale_network::{
-    GossipVerdict, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, VerdictKey,
+    HandlerRegistry, RawGossipHandler, RawHostGossipHandler, Verdict, VerdictKey,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -74,7 +74,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep, sleep_until};
 use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
-use crate::cooldown::Cooldown;
+use crate::cooldown::{Cooldown, Refusal, refused_work};
 use crate::deferred::Waiting;
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
@@ -82,8 +82,8 @@ use crate::notify::ClassStreams;
 use crate::path::{PathKind, Readiness};
 use crate::peer::Peer;
 use crate::protocol::{
-    SCOPE_GLOBAL, SCOPE_SHARD, SHARD_WIRE_LEN, STOP_GOSSIP_REFUSED, STOP_SUBSCRIBERS_FULL,
-    STREAM_GOSSIP, STREAM_SUBSCRIBE, decode_shard, encode_shard,
+    SCOPE_GLOBAL, SCOPE_SHARD, SHARD_WIRE_LEN, STOP_REFUSED, STOP_SUBSCRIBERS_FULL, STREAM_GOSSIP,
+    STREAM_SUBSCRIBE, decode_shard, encode_shard,
 };
 use crate::record_pace::{Offer, RecordPace};
 
@@ -145,39 +145,6 @@ const DEFERRED_PER_PEER: usize = 64;
 /// Longest this host waits on a deferred verdict. An item still unsettled
 /// then is dropped as one it could not judge.
 const DEFER_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Work charged against a peer for each of its gossip items this host
-/// does not accept: reading, hashing, and dispatching it.
-const REFUSED_ITEM_WORK: Duration = Duration::from_micros(10);
-
-/// Work charged for each KiB of an item this host does not accept, for
-/// decompressing and decoding it.
-const REFUSED_KIB_WORK: Duration = Duration::from_micros(1);
-
-/// Work charged on top for an item that is its sender's fault: one that
-/// does not decode, or whose claims a check here found false. Set at what
-/// checking one signature costs, the check that finds most such items
-/// out, so a sender pays the same for any item no honest peer sends.
-const SENDER_FAULT_WORK: Duration = Duration::from_millis(2);
-
-/// Who answers for an item this host did not accept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refusal {
-    /// The sender: no honest peer sends it.
-    Fault,
-    /// Nobody: this host could not judge it, or it was not for this host.
-    Unjudged,
-}
-
-/// The work charged for an item of `bytes` this host did not accept.
-fn refused_work(bytes: usize, refusal: Refusal) -> Duration {
-    let kib = u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX);
-    let fault = match refusal {
-        Refusal::Fault => SENDER_FAULT_WORK,
-        Refusal::Unjudged => Duration::ZERO,
-    };
-    REFUSED_ITEM_WORK + REFUSED_KIB_WORK * kib + fault
-}
 
 /// Where a gossip item is addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,8 +347,9 @@ pub struct Fanout {
     seen: Mutex<SeenSet>,
     /// Each validator's turn at having its address records checked.
     records: RecordPace<HeldRecord>,
-    /// What each peer's refused items have cost this host.
-    rejects: Cooldown,
+    /// What each peer's refused traffic has cost this host, shared with the
+    /// inbound router.
+    rejects: Arc<Cooldown>,
     /// Turns at judging each principal's items.
     judging: DashMap<ValidatorId, Arc<Semaphore>>,
     /// Turns at being waited on for a deferred verdict, per principal.
@@ -420,11 +388,10 @@ impl Fanout {
                 tokio_handle.clone(),
                 latency,
             ),
-            adapter,
             registry,
             seen: Mutex::new(SeenSet::default()),
             records: RecordPace::default(),
-            rejects: Cooldown::default(),
+            rejects: Arc::clone(adapter.cooldown()),
             judging: DashMap::new(),
             deferring: DashMap::new(),
             waiting: Mutex::new(Waiting::default()),
@@ -436,6 +403,7 @@ impl Fanout {
             subscriptions: Arc::new(DashSet::new()),
             tokio_handle,
             tasks: Mutex::new(Vec::new()),
+            adapter,
         });
         let tasks = vec![
             fanout
@@ -584,7 +552,7 @@ impl Fanout {
     ) -> Result<(), FrameError> {
         loop {
             if self.rejects.cooling_down(peer.principal) {
-                let _ = recv.stop(STOP_GOSSIP_REFUSED);
+                let _ = recv.stop(STOP_REFUSED);
                 return Ok(());
             }
             let mut scope_byte = [0u8; 1];
@@ -614,13 +582,8 @@ impl Fanout {
             record_libp2p_bandwidth((scope.encode().len() + wire_bytes) as u64, 0);
             // An item may be deferred, and a peer has only so many waited
             // on at once.
-            let waits = Arc::clone(
-                &self
-                    .deferring
-                    .entry(peer.principal)
-                    .or_insert_with(|| Arc::new(Semaphore::new(DEFERRED_PER_PEER))),
-            );
-            let waiting = waits
+            let waiting = self
+                .deferring_turns(peer.principal)
                 .acquire_owned()
                 .await
                 .expect("the deferring semaphore is never closed");
@@ -639,7 +602,7 @@ impl Fanout {
             // Checked again once the frame and a turn are in hand: the wait
             // for them may have begun before the cooldown did.
             if self.rejects.cooling_down(peer.principal) {
-                let _ = recv.stop(STOP_GOSSIP_REFUSED);
+                let _ = recv.stop(STOP_REFUSED);
                 return Ok(());
             }
             self.receive(
@@ -758,10 +721,10 @@ impl Fanout {
                         host_handler(payload.clone());
                     }
                     // No handler here judged it.
-                    handler(payload, scope.shard()).unwrap_or(GossipVerdict::Ignore)
+                    handler(payload, scope.shard()).unwrap_or(Verdict::Ignore)
                 }
             };
-            if let GossipVerdict::Defer(key) = verdict {
+            if let Verdict::Defer(key) = verdict {
                 // The turn is held until the verdict comes.
                 let waits = Arc::clone(waiting.semaphore());
                 waiting.forget();
@@ -770,6 +733,44 @@ impl Fanout {
                 fanout.conclude(&arrival, verdict);
             }
         });
+    }
+
+    /// The turns `principal` has at being waited on for a deferred verdict.
+    fn deferring_turns(&self, principal: ValidatorId) -> Arc<Semaphore> {
+        Arc::clone(
+            &self
+                .deferring
+                .entry(principal)
+                .or_insert_with(|| Arc::new(Semaphore::new(DEFERRED_PER_PEER))),
+        )
+    }
+
+    /// Charge `sender` for a notification of `bytes` once the check its
+    /// handler deferred to settles the verdict on the item `key` names.
+    /// Nothing is held, for a notification is never forwarded. The wait
+    /// takes one of the sender's turns at being waited on; a sender with
+    /// none free is charged at once, as for a notification this host could
+    /// not judge.
+    pub fn await_notification_verdict(
+        self: &Arc<Self>,
+        sender: Peer,
+        class: MessageClass,
+        key: VerdictKey,
+        bytes: usize,
+    ) {
+        let arrival = Arrival {
+            sender,
+            class,
+            frame: None,
+            bytes,
+        };
+        let waits = self.deferring_turns(sender.principal);
+        let Ok(turn) = Arc::clone(&waits).try_acquire_owned() else {
+            self.conclude(&arrival, Verdict::Ignore);
+            return;
+        };
+        turn.forget();
+        self.defer(key, DeferredItem { arrival, waits });
     }
 
     /// Wait on the verdict deferred on the item `key` names, for at most
@@ -786,14 +787,14 @@ impl Fanout {
             if let Some(fanout) = fanout.upgrade() {
                 let expired = fanout.waiting.lock().expect("waiting lock").expire(key);
                 if let Some(item) = expired {
-                    fanout.finish(&item, GossipVerdict::Ignore);
+                    fanout.finish(&item, Verdict::Ignore);
                 }
             }
         });
     }
 
     /// Settle the verdict deferred on the item `key` names.
-    pub fn settle(&self, key: VerdictKey, verdict: GossipVerdict) {
+    pub fn settle(&self, key: VerdictKey, verdict: Verdict) {
         let waited = self
             .waiting
             .lock()
@@ -806,7 +807,7 @@ impl Fanout {
 
     /// Act on the verdict an item waited for, as if it had come at once,
     /// and give its sender's turn back.
-    fn finish(&self, item: &DeferredItem, verdict: GossipVerdict) {
+    fn finish(&self, item: &DeferredItem, verdict: Verdict) {
         item.waits.add_permits(1);
         self.conclude(&item.arrival, verdict);
     }
@@ -816,19 +817,19 @@ impl Fanout {
     /// answer to the hosts it reaches for whatever the item turns out to
     /// be. Anything else is charged against its sender, a rejection as its
     /// fault.
-    fn conclude(&self, arrival: &Arrival, verdict: GossipVerdict) {
+    fn conclude(&self, arrival: &Arrival, verdict: Verdict) {
         match verdict {
-            GossipVerdict::Accept => {
+            Verdict::Accept => {
                 record_network_message_received();
                 if let Some(frame) = &arrival.frame {
                     self.forward(arrival.sender.endpoint, arrival.class, frame);
                 }
             }
-            GossipVerdict::Reject => {
+            Verdict::Reject => {
                 record_invalid_message();
                 self.note_reject(arrival.sender, refused_work(arrival.bytes, Refusal::Fault));
             }
-            GossipVerdict::Ignore | GossipVerdict::Defer(_) => {
+            Verdict::Ignore | Verdict::Defer(_) => {
                 self.note_reject(
                     arrival.sender,
                     refused_work(arrival.bytes, Refusal::Unjudged),
@@ -863,14 +864,14 @@ impl Fanout {
         item: [u8; 32],
         payload: &[u8],
         arrival: &Arrival,
-    ) -> Option<GossipVerdict> {
+    ) -> Option<Verdict> {
         let Ok(record) = hbor_from_slice::<ValidatorAddressGossip>(payload) else {
-            return Some(GossipVerdict::Reject);
+            return Some(Verdict::Reject);
         };
         let validator = record.validator;
         if !self.adapter.knows_validator(validator) {
             self.forget(&item);
-            return Some(GossipVerdict::Ignore);
+            return Some(Verdict::Ignore);
         }
         if self
             .adapter
@@ -878,7 +879,7 @@ impl Fanout {
             .sequence(validator)
             .is_some_and(|held| held >= record.sequence)
         {
-            return Some(GossipVerdict::Ignore);
+            return Some(Verdict::Ignore);
         }
         let sequence = record.sequence;
         let held = HeldRecord {
@@ -908,7 +909,7 @@ impl Fanout {
             }
             Offer::Drop(held) => {
                 self.forget(&held.item);
-                Some(GossipVerdict::Ignore)
+                Some(Verdict::Ignore)
             }
         }
     }
@@ -924,11 +925,11 @@ impl Fanout {
 
     /// Verify an address record and store it if it is the newest for its
     /// validator.
-    fn check_address_record(&self, record: &ValidatorAddressGossip) -> GossipVerdict {
+    fn check_address_record(&self, record: &ValidatorAddressGossip) -> Verdict {
         match self.adapter.ingest_validator_address(record) {
-            IngestOutcome::Invalid => GossipVerdict::Reject,
-            IngestOutcome::Recorded => GossipVerdict::Accept,
-            IngestOutcome::Stale | IngestOutcome::UnknownValidator => GossipVerdict::Ignore,
+            IngestOutcome::Invalid => Verdict::Reject,
+            IngestOutcome::Recorded => Verdict::Accept,
+            IngestOutcome::Stale | IngestOutcome::UnknownValidator => Verdict::Ignore,
         }
     }
 
@@ -943,7 +944,7 @@ impl Fanout {
                 peer = %sender.endpoint.fmt_short(),
                 validator = sender.principal.inner(),
                 cooldown_secs = cooldown.as_secs_f32(),
-                "Peer's gossip keeps being rejected; refusing it for a while"
+                "Peer's traffic keeps being refused; refusing it for a while"
             );
         }
     }

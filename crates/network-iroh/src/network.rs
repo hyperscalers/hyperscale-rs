@@ -16,8 +16,8 @@ use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, ResponseVerdict, ValidatorKeyMap, VerdictKey,
+    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
+    ResponseVerdict, ValidatorKeyMap, Verdict, VerdictKey,
 };
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
@@ -150,7 +150,7 @@ impl Network for IrohNetwork {
         self.topology_snapshot.store(snapshot);
     }
 
-    fn settle(&self, key: VerdictKey, verdict: GossipVerdict) {
+    fn settle(&self, key: VerdictKey, verdict: Verdict) {
         self.fanout.settle(key, verdict);
     }
 

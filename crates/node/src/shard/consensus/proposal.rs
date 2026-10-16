@@ -16,7 +16,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{record_fetch_response_refused, record_fetch_response_sent};
-use hyperscale_network::{Network, RequestError, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict, Verdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::network::request::GetProposalRequest;
@@ -207,13 +207,14 @@ where
     /// gossiped one is at intake, before anything reads it.
     pub(in crate::shard) fn handle_proposal_fetched(&mut self, proposal: BlockHeaderNotification) {
         let topology = self.process.topology_snapshot.load();
-        if !verify_signed_by_proposer(
+        if verify_signed_by_proposer(
             self.process.verifier.as_ref(),
             &topology,
             &proposal,
             "block_header",
             "fetched block header",
-        ) {
+        ) != Verdict::Accept
+        {
             return;
         }
         self.handle_proposal_received(proposal);

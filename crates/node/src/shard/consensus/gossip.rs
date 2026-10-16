@@ -28,7 +28,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{
     record_signature_verification_failure, record_signature_verification_latency,
 };
-use hyperscale_network::{GossipVerdict, Network, VerdictKey};
+use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
@@ -166,9 +166,9 @@ where
                     network.settle(
                         VerdictKey::of(&gossip),
                         if valid {
-                            GossipVerdict::Accept
+                            Verdict::Accept
                         } else {
-                            GossipVerdict::Reject
+                            Verdict::Reject
                         },
                     );
                     if valid {

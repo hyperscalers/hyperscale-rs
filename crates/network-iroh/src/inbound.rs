@@ -8,10 +8,14 @@
 //! one request, answered and finished.
 //!
 //! Requests are admitted against a global concurrency limit and a per-peer
-//! one, and a peer whose failed streams cost more than its share is cooled
-//! down, so no single peer (or flood of peers) can exhaust handler
-//! capacity. Both are kept per principal (see [`Peer`]). A request refused
-//! for capacity is answered as such rather than left to time out.
+//! one, so no single peer (or flood of peers) can exhaust handler capacity.
+//! A peer's notifications are judged a few at a time, and each one its
+//! handler does not take is charged against the peer, as is each stream
+//! that broke the protocol, in the budget the host's gossip shares (see
+//! [`crate::cooldown`]). A peer whose refused traffic costs more than its
+//! share is cooled down and its streams refused. All of it is kept per
+//! principal (see [`Peer`]). A request refused for capacity is answered as
+//! such rather than left to time out.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,7 +26,7 @@ use std::{fmt, io};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
-use hyperscale_network::HandlerRegistry;
+use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -33,7 +37,7 @@ use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::cooldown::Cooldown;
+use crate::cooldown::{Cooldown, Refusal, refused_work};
 use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
@@ -41,8 +45,8 @@ use crate::path::PathPolicy;
 use crate::peer::Peer;
 use crate::protocol::{
     RESPONSE_BUSY, RESPONSE_OK, RESPONSE_RELAYED, RESPONSE_SHARD_UNSUPPORTED,
-    RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STREAM_GOSSIP, STREAM_NOTIFY, STREAM_REQUEST,
-    STREAM_SUBSCRIBE, class_from_byte, class_priority, decode_shard,
+    RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STOP_REFUSED, STREAM_GOSSIP, STREAM_NOTIFY,
+    STREAM_REQUEST, STREAM_SUBSCRIBE, class_from_byte, class_priority, decode_shard,
 };
 
 /// Timeout for reading a stream's header and its request frame.
@@ -63,6 +67,11 @@ const MAX_INBOUND_CONCURRENT: usize = 128;
 /// Maximum number of inbound requests handled concurrently for one peer.
 const MAX_INBOUND_PER_PEER: usize = 32;
 
+/// Notifications of one peer judged at once. A handler may check a
+/// signature, and a verdict that cools a peer down stops only what is read
+/// after it.
+const NOTIFICATIONS_JUDGED_AT_ONCE: usize = 4;
+
 /// Routes inbound streams to per-type handlers via the handler registry.
 pub struct InboundRouter {
     registry: Arc<HandlerRegistry>,
@@ -72,8 +81,11 @@ pub struct InboundRouter {
     global_semaphore: Arc<Semaphore>,
     /// Per-principal count of requests in flight.
     per_peer: DashMap<ValidatorId, AtomicUsize>,
-    /// What each peer's failed streams have cost this host.
-    failures: Cooldown,
+    /// Turns at judging each principal's notifications.
+    judging: DashMap<ValidatorId, Arc<Semaphore>>,
+    /// What each peer's refused traffic has cost this host, shared with
+    /// the fan-out.
+    failures: Arc<Cooldown>,
     /// Decides whether a response goes back over the requester's path.
     paths: Arc<PathPolicy>,
     /// The host's fault gate, which may rewrite what a handler answers.
@@ -89,15 +101,17 @@ impl InboundRouter {
         local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
         paths: Arc<PathPolicy>,
         fault_gate: Arc<FaultState>,
+        failures: Arc<Cooldown>,
     ) -> Self {
         Self {
             registry,
             local_shards,
             paths,
             fault_gate,
+            failures,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: DashMap::new(),
-            failures: Cooldown::default(),
+            judging: DashMap::new(),
             fanout: OnceLock::new(),
         }
     }
@@ -152,16 +166,21 @@ impl InboundRouter {
     fn record_outcome(&self, peer: Peer, result: &Result<(), StreamError>) {
         if let Err(error) = result {
             debug!(peer = %peer.endpoint.fmt_short(), %error, "Inbound stream failed");
-            if error.is_peers_fault()
-                && let Some(cooldown) = self.failures.charge(peer.principal, FAILED_STREAM_WORK)
-            {
-                warn!(
-                    peer = %peer.endpoint.fmt_short(),
-                    validator = peer.principal.inner(),
-                    cooldown_secs = cooldown.as_secs_f32(),
-                    "Peer entering failure cooldown; its streams will be dropped"
-                );
+            if error.is_peers_fault() {
+                self.charge(peer, FAILED_STREAM_WORK);
             }
+        }
+    }
+
+    /// Charge `peer` for `work` its refused traffic cost this host.
+    fn charge(&self, peer: Peer, work: Duration) {
+        if let Some(cooldown) = self.failures.charge(peer.principal, work) {
+            warn!(
+                peer = %peer.endpoint.fmt_short(),
+                validator = peer.principal.inner(),
+                cooldown_secs = cooldown.as_secs_f32(),
+                "Peer's traffic keeps being refused; refusing it for a while"
+            );
         }
     }
 
@@ -213,7 +232,11 @@ impl InboundRouter {
         set_inbound_streams_in_use("all", in_use);
     }
 
-    async fn handle_uni(&self, peer: Peer, mut recv: RecvStream) -> Result<(), StreamError> {
+    async fn handle_uni(
+        self: &Arc<Self>,
+        peer: Peer,
+        mut recv: RecvStream,
+    ) -> Result<(), StreamError> {
         if self.failures.cooling_down(peer.principal) {
             return Ok(());
         }
@@ -225,7 +248,7 @@ impl InboundRouter {
         match header[0] {
             STREAM_NOTIFY => {
                 let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
-                self.read_notifications(peer.endpoint, class, recv).await
+                self.read_notifications(peer, class, recv).await
             }
             STREAM_GOSSIP => {
                 let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
@@ -248,14 +271,25 @@ impl InboundRouter {
     }
 
     /// Dispatch every notification the peer writes to this stream, until it
-    /// finishes the stream or the connection closes.
+    /// finishes the stream, the connection closes, or the peer is cooled
+    /// down.
     async fn read_notifications(
-        &self,
-        peer: EndpointId,
+        self: &Arc<Self>,
+        peer: Peer,
         class: MessageClass,
         mut recv: RecvStream,
     ) -> Result<(), StreamError> {
+        let turns = Arc::clone(
+            &self
+                .judging
+                .entry(peer.principal)
+                .or_insert_with(|| Arc::new(Semaphore::new(NOTIFICATIONS_JUDGED_AT_ONCE))),
+        );
         loop {
+            if self.failures.cooling_down(peer.principal) {
+                let _ = recv.stop(STOP_REFUSED);
+                return Ok(());
+            }
             let (type_id, payload, wire_bytes) =
                 match framing::read_typed_frame(&mut recv, MAX_FRAME_SIZE).await {
                     Ok(frame) => frame,
@@ -266,19 +300,54 @@ impl InboundRouter {
                 };
             record_libp2p_bandwidth(wire_bytes as u64, 0);
             if class == MessageClass::Consensus {
-                self.paths.note_consensus(peer);
+                self.paths.note_consensus(peer.endpoint);
             }
 
-            if let Some(handler) = self.registry.get_notification(&type_id) {
-                spawn(async move { handler(payload) });
-            } else {
+            let Some(handler) = self.registry.get_notification(&type_id) else {
                 // The sender may follow with types this host does know.
                 warn!(
-                    peer = %peer.fmt_short(),
+                    peer = %peer.endpoint.fmt_short(),
                     type_id = %type_id,
                     "Unknown notification type"
                 );
+                continue;
+            };
+            // The peer's notifications are judged a few at a time, so it
+            // cannot have more read than that before the verdicts that cool
+            // it down.
+            let turn = Arc::clone(&turns)
+                .acquire_owned()
+                .await
+                .expect("the judging semaphore is never closed");
+            // Checked again once a turn is in hand: the wait for it may have
+            // begun before the cooldown did.
+            if self.failures.cooling_down(peer.principal) {
+                let _ = recv.stop(STOP_REFUSED);
+                return Ok(());
             }
+            let router = Arc::clone(self);
+            spawn(async move {
+                let bytes = payload.len();
+                let verdict = handler(payload);
+                drop(turn);
+                router.conclude(peer, class, bytes, verdict);
+            });
+        }
+    }
+
+    /// Act on a handler's verdict on a notification of `bytes` from `peer`.
+    /// Nothing that is not taken goes unpaid: a rejection is charged as the
+    /// peer's fault, a notification this host could not judge at the work
+    /// of reading it, and a deferred verdict when it settles.
+    fn conclude(&self, peer: Peer, class: MessageClass, bytes: usize, verdict: Verdict) {
+        match verdict {
+            Verdict::Accept => {}
+            Verdict::Reject => self.charge(peer, refused_work(bytes, Refusal::Fault)),
+            Verdict::Ignore => self.charge(peer, refused_work(bytes, Refusal::Unjudged)),
+            Verdict::Defer(key) => match self.fanout() {
+                Some(fanout) => fanout.await_notification_verdict(peer, class, key, bytes),
+                None => self.charge(peer, refused_work(bytes, Refusal::Unjudged)),
+            },
         }
     }
 
@@ -479,6 +548,7 @@ mod tests {
                 Arc::new(ArcSwap::from_pointee(HashSet::new())),
                 Arc::new(PathPolicy::default()),
                 Arc::new(FaultState::new()),
+                Arc::new(Cooldown::default()),
             )
         }
     }

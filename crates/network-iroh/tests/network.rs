@@ -11,7 +11,9 @@ use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
-use hyperscale_network::{HandlerRegistry, Network, RequestError, ResponseVerdict};
+use hyperscale_network::{
+    HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict, VerdictKey,
+};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::{
     IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, NetworkError, RequestManager,
@@ -24,7 +26,7 @@ use hyperscale_types::{
 use iroh::EndpointAddr;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout};
 
 /// Budget for a bind, a notification, or a request over loopback.
 const BUDGET: Duration = Duration::from_secs(10);
@@ -41,12 +43,56 @@ const BULK_REQUESTS: usize = 4;
 /// Numbers asked for of a shard one of whose responders answers garbage.
 const GARBAGE_ROUNDS: u64 = 300;
 
+/// Size of a block header stand-in.
+const HEADER_BYTES: usize = 2048;
+
+/// Headers a second an honest, busy peer sends a host that refuses them
+/// all: more than one peer sends any host in a cluster of this size.
+const HONEST_RATE: u32 = 300;
+
+/// How long the honest peer keeps sending.
+const HONEST_WATCH_SECS: u32 = 15;
+
+/// How long a peer whose headers are its own fault keeps sending.
+const REJECTED_WATCH_SECS: u32 = 5;
+
+/// Notifications that are their sender's fault whose charges fit in a
+/// peer's allowance of refused work, and the one that takes it past.
+const FORGERIES_IN_ALLOWANCE: u64 = 26;
+
+/// Notifications of one peer a host judges at once.
+const JUDGED_AT_ONCE: u64 = 4;
+
+/// Notifications of one peer a host waits on deferred verdicts for at once.
+const DEFERRED_AT_ONCE: u64 = 64;
+
+/// How long a deferred check takes.
+const CHECK_DELAY: Duration = Duration::from_millis(15);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 struct Ping(u64);
 
 impl NetworkMessage for Ping {
     fn message_type_id() -> &'static str {
         "test.ping"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+/// A block header, as far as the transport is concerned: a notification
+/// of some size whose signature its handler checks.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Header {
+    seq: u64,
+    body: Vec<u8>,
+}
+
+impl NetworkMessage for Header {
+    fn message_type_id() -> &'static str {
+        "test.header"
     }
 
     fn class() -> MessageClass {
@@ -242,12 +288,14 @@ async fn a_notification_reaches_the_validator_it_names() {
         .network
         .register_notification_handler(move |ping: Ping| {
             let _ = remote_tx.send(ping);
+            Verdict::Accept
         });
     let (local_tx, mut local_rx) = mpsc::unbounded_channel();
     host0
         .network
         .register_notification_handler(move |ping: Ping| {
             let _ = local_tx.send(ping);
+            Verdict::Accept
         });
 
     // One recipient is behind the peer, the other is this host's own.
@@ -342,6 +390,7 @@ async fn a_consensus_notification_overtakes_queued_bulk_responses() {
     let seen = Arc::clone(&notified_at);
     host0.network.register_notification_handler(move |_: Ping| {
         seen.lock().unwrap().get_or_insert_with(Instant::now);
+        Verdict::Accept
     });
 
     // Host 0 asks for several at once; each response is queued on its own
@@ -451,6 +500,7 @@ async fn a_partitioned_peer_gets_neither_notification_nor_request() {
         .network
         .register_notification_handler(move |ping: Ping| {
             let _ = tx.send(ping);
+            Verdict::Accept
         });
 
     host0
@@ -556,5 +606,117 @@ async fn a_responder_that_answers_with_garbage_is_seldom_asked() {
     assert!(
         counts[1..].iter().all(|honest| honest * 4 > total),
         "the honest responders share the load: {counts:?}"
+    );
+}
+
+/// Notify `header`s from `sender` to validator 1 at [`HONEST_RATE`] for
+/// `secs` seconds; returns how many were sent.
+async fn notify_headers(sender: &Host, secs: u32) -> u32 {
+    let sent = HONEST_RATE * secs;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.notify(
+            &[vid(1)],
+            &Header {
+                seq: u64::from(seq),
+                body: vec![7; HEADER_BYTES],
+            },
+        );
+    }
+    sent
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_notifications_are_rejected_is_cooled_down() {
+    let fixtures = TestFixtures::new(11, 2);
+    let (sender, receiver) = bound_pair(&fixtures).await;
+
+    // Every header is the sender's fault, as one whose proposer signature
+    // fails is: each costs it a signature check's worth.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    receiver
+        .network
+        .register_notification_handler(move |_: Header| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Verdict::Reject
+        });
+
+    let start = Instant::now();
+    let sent = notify_headers(&sender, REJECTED_WATCH_SECS).await;
+    sleep(SILENCE_WATCH).await;
+    let judged = handled.load(Ordering::SeqCst) as u64;
+    let secs = start.elapsed().as_secs() + 1;
+    let admitted = FORGERIES_IN_ALLOWANCE + JUDGED_AT_ONCE + secs * (5 + JUDGED_AT_ONCE);
+    assert!(judged > 0, "the headers reach the receiver");
+    assert!(
+        judged <= admitted,
+        "the sender is cooled down: {judged} of {sent} headers judged in {secs} s"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_is_behind_still_hears_a_peer_whose_notifications_it_ignores() {
+    let fixtures = TestFixtures::new(11, 2);
+    let (sender, receiver) = bound_pair(&fixtures).await;
+
+    // The receiver cannot place any header yet and ignores each one, as a
+    // host whose topology is behind ignores a proposer it has no key for.
+    // The sender is honest and busy.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    receiver
+        .network
+        .register_notification_handler(move |_: Header| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Verdict::Ignore
+        });
+
+    let sent = notify_headers(&sender, HONEST_WATCH_SECS).await;
+    timeout(BUDGET, async {
+        while handled.load(Ordering::SeqCst) < sent as usize {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every ignored header is still read");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_notifications_fail_their_deferred_check_is_cooled_down() {
+    let fixtures = TestFixtures::new(11, 2);
+    let (sender, receiver) = bound_pair(&fixtures).await;
+
+    // Every header is checked off the handler, and every check fails.
+    let checked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&checked);
+    let network = Arc::clone(&receiver.network);
+    let handle = Handle::current();
+    receiver
+        .network
+        .register_notification_handler(move |header: Header| {
+            let key = VerdictKey::of(&header);
+            let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
+            handle.spawn(async move {
+                sleep(CHECK_DELAY).await;
+                counted.fetch_add(1, Ordering::SeqCst);
+                network.settle(key, Verdict::Reject);
+            });
+            Verdict::Defer(key)
+        });
+
+    let start = Instant::now();
+    let sent = notify_headers(&sender, REJECTED_WATCH_SECS).await;
+    sleep(SILENCE_WATCH).await;
+    let judged = checked.load(Ordering::SeqCst) as u64;
+    let secs = start.elapsed().as_secs() + 1;
+    // As for rejections at once, plus what was already waiting on its check
+    // when the cooldown began.
+    let admitted = FORGERIES_IN_ALLOWANCE + DEFERRED_AT_ONCE + secs * (5 + DEFERRED_AT_ONCE);
+    assert!(judged > 0, "the headers reach the receiver");
+    assert!(
+        judged <= admitted,
+        "the sender is cooled down: {judged} of {sent} headers checked in {secs} s"
     );
 }

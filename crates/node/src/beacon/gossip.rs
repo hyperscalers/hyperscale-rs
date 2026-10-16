@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
-use hyperscale_network::{GossipVerdict, Network, VerdictKey};
+use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_types::ShardId;
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
@@ -51,14 +51,14 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     // and ignores blocks at or behind its tip.
     let s = senders.clone();
     network.register_gossip_handler::<BeaconBlockGossip>(
-        move |gossip: BeaconBlockGossip, target_shard: ShardId| -> GossipVerdict {
+        move |gossip: BeaconBlockGossip, target_shard: ShardId| -> Verdict {
             let senders = s.load();
             let Some(tx) = senders.get(&target_shard) else {
                 warn!(
                     target_shard = target_shard.inner(),
                     "Dropping beacon block gossip: shard not hosted"
                 );
-                return GossipVerdict::Ignore;
+                return Verdict::Ignore;
             };
             let key = VerdictKey::of(gossip.block());
             push_protocol_event(
@@ -68,7 +68,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     block: gossip.block,
                 },
             );
-            GossipVerdict::Defer(key)
+            Verdict::Defer(key)
         },
     );
 
@@ -91,10 +91,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     // ── beacon.candidate → ProtocolEvent::BeaconCandidateReceived ──
     let s = senders.clone();
     network.register_gossip_handler::<BeaconCandidateGossip>(
-        move |gossip: BeaconCandidateGossip, target_shard: ShardId| -> GossipVerdict {
+        move |gossip: BeaconCandidateGossip, target_shard: ShardId| -> Verdict {
             let senders = s.load();
             let Some(tx) = senders.get(&target_shard) else {
-                return GossipVerdict::Ignore;
+                return Verdict::Ignore;
             };
             let key = VerdictKey::of(gossip.candidate());
             push_protocol_event(
@@ -104,7 +104,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     candidate: gossip.candidate,
                 },
             );
-            GossipVerdict::Defer(key)
+            Verdict::Defer(key)
         },
     );
 
@@ -134,10 +134,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     // merits.
     let s = senders.clone();
     network.register_gossip_handler::<RatifyVoteGossip>(
-        move |gossip: RatifyVoteGossip, target_shard: ShardId| -> GossipVerdict {
+        move |gossip: RatifyVoteGossip, target_shard: ShardId| -> Verdict {
             let senders = s.load();
             let Some(tx) = senders.get(&target_shard) else {
-                return GossipVerdict::Ignore;
+                return Verdict::Ignore;
             };
             // The message stands on its sender's own vote; the proof votes
             // it carries are each judged as they would be alone.
@@ -149,7 +149,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     ProtocolEvent::UnverifiedRatifyVoteReceived { vote },
                 );
             }
-            GossipVerdict::Defer(key)
+            Verdict::Defer(key)
         },
     );
 

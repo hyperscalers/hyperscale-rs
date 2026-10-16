@@ -10,7 +10,7 @@ use hyperscale_metrics::{
     record_network_message_received,
 };
 use hyperscale_network::compression::decompress;
-use hyperscale_network::{GossipVerdict, HandlerRegistry, parse_topic};
+use hyperscale_network::{HandlerRegistry, Verdict, parse_topic};
 use hyperscale_types::ShardId;
 use libp2p::PeerId as Libp2pPeerId;
 use libp2p::gossipsub::{Event as GossipsubEvent, MessageAcceptance, MessageId};
@@ -231,11 +231,11 @@ pub(super) fn handle_gossipsub_event(
                         // refused like a forged one.
                         let verdict = handler(payload, topic_shard);
                         let acceptance = match verdict {
-                            Some(GossipVerdict::Accept | GossipVerdict::Defer(_)) | None => {
+                            Some(Verdict::Accept | Verdict::Defer(_)) | None => {
                                 record_network_message_received();
                                 MessageAcceptance::Accept
                             }
-                            Some(GossipVerdict::Reject | GossipVerdict::Ignore) => {
+                            Some(Verdict::Reject | Verdict::Ignore) => {
                                 record_invalid_message();
                                 MessageAcceptance::Reject
                             }

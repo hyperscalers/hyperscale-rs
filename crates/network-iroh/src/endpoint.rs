@@ -40,6 +40,7 @@ use crate::address_book::{AddressBook, IngestOutcome, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
 use crate::bind_gate::BindGate;
 use crate::config::{IrohConfig, MAX_RELAYS};
+use crate::cooldown::Cooldown;
 use crate::error::NetworkError;
 use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
@@ -137,6 +138,8 @@ struct Inner {
     bind: BindContext,
     /// Serves the streams bound peers open.
     router: Arc<InboundRouter>,
+    /// What each peer's refused traffic has cost this host.
+    cooldown: Arc<Cooldown>,
     /// Follows each connection's selected path and decides what a relayed
     /// one carries.
     paths: Arc<PathPolicy>,
@@ -235,6 +238,7 @@ impl IrohAdapter {
         let local_shards = Arc::new(ArcSwap::from_pointee(local_shards));
         let paths = Arc::new(PathPolicy::default());
         let fault_gate = Arc::new(FaultState::new());
+        let cooldown = Arc::new(Cooldown::default());
         let inner = Arc::new(Inner {
             runtime: Handle::current(),
             router: Arc::new(InboundRouter::new(
@@ -242,7 +246,9 @@ impl IrohAdapter {
                 Arc::clone(&local_shards),
                 Arc::clone(&paths),
                 Arc::clone(&fault_gate),
+                Arc::clone(&cooldown),
             )),
+            cooldown,
             redialer: Redialer::new(
                 endpoint.clone(),
                 REDIAL_ALPN,
@@ -578,6 +584,12 @@ impl IrohAdapter {
     #[must_use]
     pub fn fault_gate(&self) -> &FaultState {
         &self.inner.fault_gate
+    }
+
+    /// What each peer's refused traffic has cost this host: one budget per
+    /// principal, shared by everything that refuses a peer's traffic.
+    pub(crate) fn cooldown(&self) -> &Arc<Cooldown> {
+        &self.inner.cooldown
     }
 
     /// Configure the fault gate: this host's id and the full

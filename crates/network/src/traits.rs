@@ -66,21 +66,28 @@ pub enum RequestError {
     Shutdown,
 }
 
-/// Result of gossip message validation by the application handler.
+/// What a handler made of an inbound message.
 ///
-/// Returned by [`GossipHandler::on_message`] to tell the network layer
-/// whether the message may travel on, and whose fault it is when it may
-/// not. A transport that charges senders for refused traffic charges
-/// [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no one's.
+/// Returned by [`GossipHandler::on_message`] and
+/// [`NotificationHandler::on_notification`] to tell the network layer
+/// whether a gossip message may travel on, and whose fault it is when a
+/// message is refused. A transport that charges senders for refused traffic
+/// charges [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no
+/// one's.
 ///
 /// A handler whose check of the message finishes only after it returns
 /// says [`Self::Defer`], and the check settles the verdict through
 /// [`Network::settle`]. A transport that forwards only what it has judged
 /// holds the message until then, so a host never forwards a message whose
-/// check could still fail, and the sender answers for it when it does.
+/// check could still fail, and the sender answers for it when it does. A
+/// notification is never forwarded, so it is not held; its sender answers
+/// for it when the verdict comes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GossipVerdict {
-    /// Message is valid — accept and forward to peers.
+pub enum Verdict {
+    /// Nothing here holds the message against its sender. A gossip
+    /// message is valid and travels on; a notification was taken in, its
+    /// claims checked here or left to a check the state machine bounds
+    /// itself.
     Accept,
     /// Message is invalid, and no honest sender sends it: it does not
     /// decode, or what it claims is false by this host's own settled view.
@@ -97,7 +104,7 @@ pub enum GossipVerdict {
     Defer(VerdictKey),
 }
 
-/// Names an item whose gossip verdict waits on a check, so that the check,
+/// Names an item whose verdict waits on a check, so that the check,
 /// finishing elsewhere, can settle it.
 ///
 /// Derived from the item's encoding, so that the handler that defers and the
@@ -154,17 +161,17 @@ pub enum ResponseVerdict {
 pub trait GossipHandler<M: GossipMessage>: Send + Sync + 'static {
     /// Process a decoded gossip message for `shard`; return whether to
     /// forward it.
-    fn on_message(&self, message: M, shard: ShardId) -> GossipVerdict;
+    fn on_message(&self, message: M, shard: ShardId) -> Verdict;
 }
 
-/// Blanket impl: any `Fn(M, ShardId) -> GossipVerdict` can serve as
+/// Blanket impl: any `Fn(M, ShardId) -> Verdict` can serve as
 /// a typed gossip handler.
 impl<M, F> GossipHandler<M> for F
 where
     M: GossipMessage,
-    F: Fn(M, ShardId) -> GossipVerdict + Send + Sync + 'static,
+    F: Fn(M, ShardId) -> Verdict + Send + Sync + 'static,
 {
-    fn on_message(&self, message: M, shard: ShardId) -> GossipVerdict {
+    fn on_message(&self, message: M, shard: ShardId) -> Verdict {
         (self)(message, shard)
     }
 }
@@ -172,16 +179,22 @@ where
 /// Typed handler for inbound notification messages (fire-and-forget unicast).
 ///
 /// Called after the network layer decodes the raw payload into `M`.
-/// No return value — notifications are one-way.
+/// Nothing is answered: notifications are one-way. The returned [`Verdict`]
+/// says whether the sender is to blame for the message.
 pub trait NotificationHandler<M: NetworkMessage>: Send + Sync + 'static {
     /// Process a decoded notification.
-    fn on_notification(&self, message: M);
+    fn on_notification(&self, message: M) -> Verdict;
 }
 
-/// Blanket impl: any `Fn(M)` can serve as a typed notification handler.
-impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> NotificationHandler<M> for F {
-    fn on_notification(&self, message: M) {
-        (self)(message);
+/// Blanket impl: any `Fn(M) -> Verdict` can serve as a typed notification
+/// handler.
+impl<M, F> NotificationHandler<M> for F
+where
+    M: NetworkMessage,
+    F: Fn(M) -> Verdict + Send + Sync + 'static,
+{
+    fn on_notification(&self, message: M) -> Verdict {
+        (self)(message)
     }
 }
 
@@ -319,18 +332,18 @@ pub trait Network: Send + Sync + 'static {
     /// committee, so the head snapshot never strands a dissolved shard.
     fn update_routing_committees(&self, _committees: Arc<RoutingCommittees>) {}
 
-    // ── Deferred gossip verdicts ──
+    // ── Deferred verdicts ──
 
-    /// Settle the verdict a gossip handler deferred on the item `key`
-    /// names, once the check it waited on has finished: [`GossipVerdict::Accept`]
-    /// when the item holds up, [`GossipVerdict::Reject`] when it is false,
-    /// [`GossipVerdict::Ignore`] when this host could not finish judging it.
+    /// Settle the verdict a handler deferred on the item `key`
+    /// names, once the check it waited on has finished: [`Verdict::Accept`]
+    /// when the item holds up, [`Verdict::Reject`] when it is false,
+    /// [`Verdict::Ignore`] when this host could not finish judging it.
     /// A check runs on every copy, wherever it came from; settling an item
     /// no handler deferred is harmless.
     ///
     /// Default is a no-op, for a backend that does not wait for deferred
     /// verdicts.
-    fn settle(&self, _key: VerdictKey, _verdict: GossipVerdict) {}
+    fn settle(&self, _key: VerdictKey, _verdict: Verdict) {}
 
     // ── Request-response ──
 
@@ -400,12 +413,12 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler = move |_msg: TestMsg, _shard: ShardId| -> GossipVerdict {
+        let handler = move |_msg: TestMsg, _shard: ShardId| -> Verdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Accept
+            Verdict::Accept
         };
         let verdict = handler.on_message(TestMsg(42), ShardId::ROOT);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert_eq!(verdict, GossipVerdict::Accept);
+        assert_eq!(verdict, Verdict::Accept);
     }
 }

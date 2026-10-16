@@ -27,7 +27,7 @@ use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardId, TopicScope};
 
-use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
+use crate::traits::{GossipHandler, NotificationHandler, RequestHandler, Verdict};
 
 /// Type-erased gossip handler: receives decompressed wire bytes plus the
 /// shard the topic encoded (`None` for global-scoped topics), and returns
@@ -37,7 +37,7 @@ use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHa
 /// or its content was dispatched already under another copy's bytes (see
 /// [`GossipMessage::dedup_key`]). A message that does not decode is
 /// rejected.
-pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<GossipVerdict> + Send + Sync;
+pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<Verdict> + Send + Sync;
 
 /// Type-erased host-level gossip handler: receives decompressed wire bytes.
 ///
@@ -47,8 +47,10 @@ pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<GossipVer
 /// Global fan owns the forward verdict.
 pub type RawHostGossipHandler = dyn Fn(Vec<u8>) + Send + Sync;
 
-/// Type-erased notification handler: receives decompressed wire bytes, no return value.
-pub type RawNotificationHandler = dyn Fn(Vec<u8>) + Send + Sync;
+/// Type-erased notification handler: receives decompressed wire bytes and
+/// returns the handler's verdict on the message. A message that does not
+/// decode is rejected.
+pub type RawNotificationHandler = dyn Fn(Vec<u8>) -> Verdict + Send + Sync;
 
 /// Type-erased request handler: receives request wire bytes, returns response wire bytes.
 pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
@@ -79,7 +81,7 @@ pub(crate) trait LocalGossipDispatcher: Send + Sync {
     /// shard-scoped messages and `None` for global-scoped messages.
     /// `None` when no handler judged the message, as for
     /// [`RawGossipHandler`].
-    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<GossipVerdict>;
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<Verdict>;
 }
 
 /// Counterpart to [`LocalGossipDispatcher`] for the host-level path
@@ -174,7 +176,7 @@ where
 
     /// Hand `typed` to the handler once per target and fold the verdicts;
     /// `None` when there is no target.
-    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardId]) -> Option<GossipVerdict> {
+    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardId]) -> Option<Verdict> {
         targets
             .iter()
             .map(|&target| self.handler.on_message(typed.clone(), target))
@@ -186,14 +188,12 @@ where
 /// sender's fault whatever the other shards made of it; otherwise a shard
 /// that accepts the message carries it on, one still checking it holds it,
 /// and it is ignored only when every shard ignored it.
-const fn combine_verdicts(a: GossipVerdict, b: GossipVerdict) -> GossipVerdict {
+const fn combine_verdicts(a: Verdict, b: Verdict) -> Verdict {
     match (a, b) {
-        (GossipVerdict::Reject, _) | (_, GossipVerdict::Reject) => GossipVerdict::Reject,
-        (GossipVerdict::Accept, _) | (_, GossipVerdict::Accept) => GossipVerdict::Accept,
-        (GossipVerdict::Defer(key), _) | (_, GossipVerdict::Defer(key)) => {
-            GossipVerdict::Defer(key)
-        }
-        (GossipVerdict::Ignore, GossipVerdict::Ignore) => GossipVerdict::Ignore,
+        (Verdict::Reject, _) | (_, Verdict::Reject) => Verdict::Reject,
+        (Verdict::Accept, _) | (_, Verdict::Accept) => Verdict::Accept,
+        (Verdict::Defer(key), _) | (_, Verdict::Defer(key)) => Verdict::Defer(key),
+        (Verdict::Ignore, Verdict::Ignore) => Verdict::Ignore,
     }
 }
 
@@ -202,7 +202,7 @@ where
     M: GossipMessage + 'static,
     H: GossipHandler<M>,
 {
-    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<GossipVerdict> {
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<Verdict> {
         let typed = msg
             .downcast_ref::<M>()
             .expect("local gossip dispatch type mismatch");
@@ -246,7 +246,8 @@ where
         let typed = msg
             .downcast_ref::<M>()
             .expect("local notification dispatch type mismatch");
-        self.handler.on_notification(typed.clone());
+        // A message this host sent itself is charged to no one.
+        let _ = self.handler.on_notification(typed.clone());
     }
 }
 
@@ -422,7 +423,7 @@ impl HandlerRegistry {
                             error = ?e,
                             "Failed to decode gossip message — rejecting"
                         );
-                        Some(GossipVerdict::Reject)
+                        Some(Verdict::Reject)
                     }
                 }
             });
@@ -574,8 +575,9 @@ impl HandlerRegistry {
                         tracing::warn!(
                             message_type = M::message_type_id(),
                             error = ?e,
-                            "Failed to decode notification message — dropping"
+                            "Failed to decode notification message — rejecting"
                         );
+                        Verdict::Reject
                     }
                 },
             );
@@ -670,7 +672,7 @@ impl HandlerRegistry {
     /// for global publishes — the handler receives the same value the
     /// inbound libp2p path supplies.
     #[must_use]
-    pub fn local_dispatch_gossip<M>(&self, msg: &M, shard: Option<ShardId>) -> Option<GossipVerdict>
+    pub fn local_dispatch_gossip<M>(&self, msg: &M, shard: Option<ShardId>) -> Option<Verdict>
     where
         M: NetworkMessage + 'static,
     {
@@ -779,23 +781,55 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
-        registry.register_gossip(move |_msg: TestMsg, _shard: ShardId| -> GossipVerdict {
+        registry.register_gossip(move |_msg: TestMsg, _shard: ShardId| -> Verdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Accept
+            Verdict::Accept
         });
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = hbor_to_vec(&TestMsg(42)).unwrap();
         let verdict = handler(encoded, Some(ShardId::leaf(1, 0)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert_eq!(verdict, Some(GossipVerdict::Accept));
+        assert_eq!(verdict, Some(Verdict::Accept));
 
         // Decode failure should return Reject.
         let verdict = handler(vec![0xFF, 0xFE], Some(ShardId::leaf(1, 0)));
-        assert_eq!(verdict, Some(GossipVerdict::Reject));
+        assert_eq!(verdict, Some(Verdict::Reject));
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
         assert!(registry.get_gossip("unknown.type").is_none());
+    }
+
+    #[test]
+    fn a_notification_carries_its_handlers_verdict_and_one_that_does_not_decode_is_rejected() {
+        use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+        use hyperscale_types::NetworkMessage;
+
+        #[derive(Debug, Clone, Hbor)]
+        struct Note(u32);
+        impl NetworkMessage for Note {
+            fn message_type_id() -> &'static str {
+                "test.note"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Consensus
+            }
+        }
+
+        let registry = HandlerRegistry::default();
+        registry.register_notification(|note: Note| {
+            if note.0 == 0 {
+                Verdict::Ignore
+            } else {
+                Verdict::Accept
+            }
+        });
+        let handler = registry.get_notification("test.note").unwrap();
+
+        assert_eq!(handler(hbor_to_vec(&Note(1)).unwrap()), Verdict::Accept);
+        assert_eq!(handler(hbor_to_vec(&Note(0)).unwrap()), Verdict::Ignore);
+        assert_eq!(handler(vec![0xFF, 0xFE]), Verdict::Reject);
     }
 
     #[test]
@@ -878,9 +912,9 @@ mod tests {
         let registry = HandlerRegistry::new(std::iter::once(shard_a).collect());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = Arc::clone(&hits);
-        registry.register_gossip(move |_msg: SwapMsg, _shard: ShardId| -> GossipVerdict {
+        registry.register_gossip(move |_msg: SwapMsg, _shard: ShardId| -> Verdict {
             hits_clone.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Accept
+            Verdict::Accept
         });
         let handler = registry.get_gossip("test.hosted_swap").unwrap();
         let encoded = hbor_to_vec(&SwapMsg(1)).unwrap();
@@ -906,7 +940,7 @@ mod tests {
     fn hosted_shards_verdicts_fold_rejection_first_then_acceptance() {
         use std::sync::Mutex;
 
-        use GossipVerdict::{Accept, Ignore, Reject};
+        use Verdict::{Accept, Ignore, Reject};
         use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
         use hyperscale_types::NetworkMessage;
 
@@ -927,12 +961,12 @@ mod tests {
 
         let (a, b) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
         let registry = HandlerRegistry::new([a, b].into_iter().collect());
-        let verdicts: Arc<Mutex<HashMap<ShardId, GossipVerdict>>> = Arc::default();
+        let verdicts: Arc<Mutex<HashMap<ShardId, Verdict>>> = Arc::default();
         let answers = Arc::clone(&verdicts);
         registry.register_gossip(move |_: FoldMsg, shard: ShardId| answers.lock().unwrap()[&shard]);
         let handler = registry.get_gossip("test.fold").unwrap();
 
-        let fold = |first: GossipVerdict, second: GossipVerdict| {
+        let fold = |first: Verdict, second: Verdict| {
             *verdicts.lock().unwrap() = HashMap::from([(a, first), (b, second)]);
             handler(hbor_to_vec(&FoldMsg(1)).unwrap(), None)
         };
@@ -1029,12 +1063,8 @@ mod tests {
         }
 
         let registry = HandlerRegistry::default();
-        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> GossipVerdict {
-            GossipVerdict::Accept
-        });
-        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> GossipVerdict {
-            GossipVerdict::Accept
-        });
+        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> Verdict { Verdict::Accept });
+        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> Verdict { Verdict::Accept });
     }
 
     /// A `Verifiable::Verified` value handed to [`HandlerRegistry::local_dispatch_gossip`]
@@ -1073,16 +1103,16 @@ mod tests {
         let observed: Arc<Mutex<Option<Verifiable<u32>>>> = Arc::new(Mutex::new(None));
         let observed_clone = Arc::clone(&observed);
 
-        registry.register_gossip(move |msg: VTestMsg, _shard: ShardId| -> GossipVerdict {
+        registry.register_gossip(move |msg: VTestMsg, _shard: ShardId| -> Verdict {
             *observed_clone.lock().unwrap() = Some(msg.payload);
-            GossipVerdict::Accept
+            Verdict::Accept
         });
 
         let verified_msg = VTestMsg {
             payload: Verified::new_unchecked_for_test(42u32).into(),
         };
         let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardId::leaf(1, 0)));
-        assert_eq!(verdict, Some(GossipVerdict::Accept));
+        assert_eq!(verdict, Some(Verdict::Accept));
 
         let received = observed
             .lock()

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use hyperscale_metrics::record_fetch_response_sent;
+use hyperscale_network::Verdict;
 use hyperscale_storage::BeaconChainReader;
 use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
@@ -78,7 +79,8 @@ impl BeaconProposalCache {
 
     /// Admit a wire proposal: reuse a surviving `Verified` marker
     /// (local dispatch), otherwise verify under `sender_pk` and drop on
-    /// failure.
+    /// failure. A proposal that fails is its sender's fault: it names its
+    /// own epoch and key, so no view of the chain makes an honest one fail.
     pub(crate) fn admit_wire(
         &self,
         verifier: &dyn Verifier,
@@ -86,7 +88,7 @@ impl BeaconProposalCache {
         epoch: Epoch,
         proposal: &Verifiable<BeaconProposal>,
         sender_pk: ConsensusPublicKey,
-    ) {
+    ) -> Verdict {
         let admitted = if let Some(verified) = proposal.verified() {
             verified.clone()
         } else {
@@ -98,10 +100,11 @@ impl BeaconProposalCache {
             };
             match proposal.as_unverified().verify(&ctx) {
                 Ok(fresh) => fresh,
-                Err(_) => return,
+                Err(_) => return Verdict::Reject,
             }
         };
         self.admit(from, epoch, Arc::new(admitted));
+        Verdict::Accept
     }
 
     /// Serve an inbound fetch from the cache.
