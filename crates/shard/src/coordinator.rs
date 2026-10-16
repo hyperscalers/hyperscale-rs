@@ -150,7 +150,7 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_metrics::{
     record_accepted_rows_toward_a_sibling, record_blocks_from_stated_to_heard,
-    record_core_members_settled, record_decide_against_certificate,
+    record_claims_recarried, record_core_members_settled, record_decide_against_certificate,
     record_halt_recovery_offer_refused, record_state_claims_weight, record_verdict_cells,
     record_verdict_claims_weight,
 };
@@ -162,9 +162,9 @@ use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
     AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip,
-    Finalization, HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions,
-    QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round,
+    BlockManifest, BlockVote, CarriedClaims, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+    CommittedTip, Finalization, HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
+    Provisions, QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round,
     SafeVoteRegisters, SiblingView, Source, StandingAnswers, StandingToward, StateRoot, TickLine,
     Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot,
     Transaction, TxHash, ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify,
@@ -182,6 +182,7 @@ use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witne
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
 };
+use crate::carried::CommittedCarried;
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
@@ -557,6 +558,10 @@ pub struct ShardCoordinator {
     /// provides a bounded retention window for historical dedup.
     dedup_index: CommitDedupIndex,
 
+    /// What the committed blocks execution has not folded carry in
+    /// their claims, and the last few it has.
+    committed_carried: CommittedCarried,
+
     /// Tick membership as the committed state holds it: loaded at the
     /// seat and advanced by the fold every commit runs, so it is the
     /// state's own rows without a read of the store.
@@ -854,6 +859,7 @@ impl ShardCoordinator {
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
             dedup_index,
+            committed_carried: CommittedCarried::default(),
             member_rows: recovered
                 .members
                 .clone()
@@ -2024,6 +2030,13 @@ impl ShardCoordinator {
         }
         ancestors.reverse();
         self.answers.at(self.committed_height, ancestors)
+    }
+
+    /// Drop what the committed blocks execution has folded through
+    /// `folded` carried, but the last few. It bounds memory and nothing
+    /// else: no proposal reads an entry at or below `folded`.
+    pub fn retire_carried(&mut self, folded: BlockHeight) {
+        self.committed_carried.retire_through(folded);
     }
 
     /// Handle committed state restored from storage (recovery).
@@ -6193,6 +6206,30 @@ impl ShardCoordinator {
         self.commit_block_and_buffered(topology_schedule, certified, source)
     }
 
+    /// Keep what `block`'s claims carry, and count what they weigh and
+    /// what of them the committed blocks below carried too.
+    fn record_committed_claims(&mut self, block: &Block) {
+        let weigh = |verdict: bool| -> usize {
+            block
+                .state_claims()
+                .iter()
+                .filter(|claim| claim.is_verdict_claim() == verdict)
+                .map(StateClaim::wire_weight)
+                .sum()
+        };
+        record_state_claims_weight(weigh(false), weigh(true));
+        let recarried = self.committed_carried.record(
+            block.height(),
+            CarriedClaims::of(self.local_shard, block.state_claims()),
+        );
+        record_claims_recarried(
+            recarried.cells,
+            recarried.deletions,
+            recarried.returns,
+            recarried.local,
+        );
+    }
+
     /// Common bookkeeping for committing a block (shared between consensus and
     /// sync paths). Updates `committed_height`/`hash`, registers committed
     /// artifacts in the dedup index, resets backoff tracking, and cleans up
@@ -6234,15 +6271,7 @@ impl ShardCoordinator {
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
         self.retire_proven_anchors(topology_schedule);
-        let weigh = |verdict: bool| -> usize {
-            block
-                .state_claims()
-                .iter()
-                .filter(|claim| claim.is_verdict_claim() == verdict)
-                .map(StateClaim::wire_weight)
-                .sum()
-        };
-        record_state_claims_weight(weigh(false), weigh(true));
+        self.record_committed_claims(block);
 
         // Retire the committed block's substate delta into the count
         // frontier. Sync commits carry no delta (QC-trusted, never

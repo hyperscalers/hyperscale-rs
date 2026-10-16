@@ -32,7 +32,7 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::shard_prefix_path;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Address, Anchor, Block, BlockHash, BlockHeight,
-    BoundaryAttestation, BoundaryOffer, CounterpartMirror, Deadline, EpochWindows,
+    BoundaryAttestation, BoundaryOffer, CarriedClaims, CounterpartMirror, Deadline, EpochWindows,
     ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey, MAX_CLAIMS_PER_BLOCK,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
@@ -1975,7 +1975,10 @@ impl Counterparts {
         // from every held claim at the anchor, so a claim another
         // proposer cut differently leaves only what the block carried,
         // and the remainder of a cut claim is offered whole.
-        self.cut_carried(block.state_claims());
+        self.cut_carried(&CarriedClaims::of(
+            self.ledger.local(),
+            block.state_claims(),
+        ));
         self.fold_state_claims(block);
         let mut actions = Vec::new();
         // Every verdict this block carries resolves its transactions,
@@ -2027,36 +2030,23 @@ impl Counterparts {
         }
     }
 
-    /// Cut from the held claims the cells `claims`, a committed block's,
-    /// carried at each anchor.
+    /// Cut from the held claims what `carried`, a committed block's
+    /// claims, carried at each anchor.
     ///
     /// A claim naming members is read by the rows it names and by
-    /// nothing else, so its cells are cut from no held claim: a seat or
-    /// exit reading over the same row or leaf at that anchor is still
-    /// owed to a block whole. What is held for a verdict question goes
-    /// by its row's entry alone, where the questions are stood.
-    fn cut_carried(&mut self, claims: &[StateClaim]) {
-        let mut carried: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
-        for claim in claims.iter().filter(|claim| claim.verdicts.is_empty()) {
-            carried
-                .entry(claim.anchor)
-                .or_default()
-                .extend(claim.keys());
-        }
-        if !carried.is_empty() {
-            self.fetched.cut(&carried);
+    /// nothing else, so its cells are not among `carried`'s and are cut
+    /// from no held claim: a seat or exit reading over the same row or
+    /// leaf at that anchor is still owed to a block whole. What is held
+    /// for a verdict question goes by its row's entry alone, where the
+    /// questions are stood.
+    fn cut_carried(&mut self, carried: &CarriedClaims) {
+        if !carried.cells().is_empty() {
+            self.fetched.cut(carried.cells());
         }
         // A deletion a block carried is not offered again. The row and
         // the marker read beside it stay held: another answer of the
         // same transaction reads them too.
-        let mut deleted: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
-        for claim in claims {
-            deleted
-                .entry(claim.anchor)
-                .or_default()
-                .extend(claim.deleting());
-        }
-        self.boundaries.cut(&deleted);
+        self.boundaries.cut(carried.deleted());
     }
 
     /// Record a departed shard's settled set where the fence reads it.
@@ -5087,7 +5077,7 @@ mod tests {
         // A block carrying some of the deletions leaves the rest held,
         // and the fresh claims as they were.
         let carried = after.boundary_claims[0].carrying(5);
-        counterparts.cut_carried(&carried);
+        counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &carried));
         let left = counterparts.offers();
         assert_eq!(left.state_claims, before.state_claims);
         assert_eq!(left.boundary_claims[0].deletions.len(), cells.len() - 5);
@@ -5204,7 +5194,7 @@ mod tests {
 
         let first = offer.carrying(1);
         let carried: BTreeSet<SubstateKey> = first.iter().flat_map(StateClaim::keys).collect();
-        counterparts.cut_carried(&first);
+        counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &first));
         let left = counterparts.offers().boundary_claims.remove(0);
         assert_eq!(left.deletions.len(), 1, "the other answer is still whole");
         assert!(left.deletions[0].contains(&row));
@@ -5347,7 +5337,9 @@ mod tests {
                 "block {block} carries the first {RUN} of its run",
             );
             // Its commit deletes their answers, and cuts what it carried.
-            backlog.counterparts.cut_carried(&carried);
+            backlog
+                .counterparts
+                .cut_carried(&CarriedClaims::of(CONSUMER, &carried));
             for (record, answer) in &backlog.crossings {
                 if gone.contains(record) {
                     backlog.rows.remove(*answer);
@@ -5442,8 +5434,8 @@ mod tests {
 
             let mut by_merged = backlog(ANSWERS, 7).counterparts;
             let mut by_pieces = backlog(ANSWERS, 7).counterparts;
-            by_merged.cut_carried(&merged);
-            by_pieces.cut_carried(&pieces);
+            by_merged.cut_carried(&CarriedClaims::of(CONSUMER, &merged));
+            by_pieces.cut_carried(&CarriedClaims::of(CONSUMER, &pieces));
             assert_eq!(
                 by_merged.offers().boundary_claims,
                 by_pieces.offers().boundary_claims,
@@ -7968,7 +7960,10 @@ mod tests {
         assert_eq!(offered.len(), 1);
 
         let nameless = read_at(at, &[cells.leaf], &[cells.leaf]);
-        counterparts.cut_carried(&[nameless.clone(), nameless.hearing([question.tx])]);
+        counterparts.cut_carried(&CarriedClaims::of(
+            CONSUMER,
+            &[nameless.clone(), nameless.hearing([question.tx])],
+        ));
         counterparts.ask_verdicts(&[question], LATE);
         assert_eq!(
             counterparts.verdict_claims(),
@@ -8007,7 +8002,7 @@ mod tests {
         counterparts.hold_seat_reading(&seat, question.tx);
 
         let named = read_at(at, &[cells.leaf], &[cells.leaf]).hearing([question.tx]);
-        counterparts.cut_carried(std::slice::from_ref(&named));
+        counterparts.cut_carried(&CarriedClaims::of(CONSUMER, std::slice::from_ref(&named)));
         assert_eq!(
             counterparts.state_claims(),
             vec![seat],
@@ -8015,7 +8010,7 @@ mod tests {
         );
 
         let nameless = read_at(at, &[cells.leaf], &[cells.leaf]);
-        counterparts.cut_carried(&[named, nameless]);
+        counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &[named, nameless]));
         assert_eq!(
             counterparts
                 .state_claims()
@@ -8107,7 +8102,7 @@ mod tests {
         // The other claim rides: the verdict claim is offered again.
         let (mut counterparts, _, first) = waiting();
         let ridden = counterparts.state_claims();
-        counterparts.cut_carried(&ridden);
+        counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &ridden));
         counterparts.ask_verdicts(&[question], LATE);
         assert_eq!(counterparts.verdict_claims(), first);
 
@@ -9132,8 +9127,8 @@ mod tests {
                 );
                 if let Some(offer) = offered.first().filter(|_| draws.one_in(2)) {
                     let carried = offer.carrying(1 + draws.below(offer.deletions.len()));
-                    following.cut_carried(&carried);
-                    whole.cut_carried(&carried);
+                    following.cut_carried(&CarriedClaims::of(CONSUMER, &carried));
+                    whole.cut_carried(&CarriedClaims::of(CONSUMER, &carried));
                     // The fold deletes the answers whose records the
                     // block read absent.
                     for claim in &carried {

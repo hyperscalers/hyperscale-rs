@@ -21,7 +21,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId};
 
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::FaultableCluster;
+use crate::support::faultable::{FaultableCluster, report_claims_recarried};
 use crate::support::query::{clock, owning_shard, vault_balance};
 use crate::support::tx::{build_transfer_tx, cross_shard_cast, validity_around};
 use crate::support::wait::await_tx_terminal;
@@ -308,6 +308,10 @@ pub fn an_answer_goes_at_its_producers_boundary_with_every_push_cut<C: Faultable
         &charges,
         epochs(4),
         "a transfer whose answer went at a boundary with the payer's pushes cut",
+    );
+    report_claims_recarried(
+        c,
+        "an_answer_goes_at_its_producers_boundary_with_every_push_cut",
     );
 }
 

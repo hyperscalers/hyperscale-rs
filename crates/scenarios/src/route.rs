@@ -33,7 +33,9 @@ use crate::straddler::{
     isolate_state_reads,
 };
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::{report_accepted_measures, report_crossing_measures};
+use crate::support::faultable::{
+    report_accepted_measures, report_claims_recarried, report_crossing_measures,
+};
 use crate::support::query::{
     ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_leg_fated, declared_price,
     held, held_at, stands_at, vault_balance,
@@ -2900,6 +2902,7 @@ impl CoreLoadRun<'_> {
         self.report_standing();
         self.report_answers(c);
         self.report_counters();
+        report_claims_recarried(c, "core load");
         self.report_simulator(c);
     }
 

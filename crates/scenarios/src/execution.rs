@@ -33,7 +33,9 @@ use hyperscale_vm_types::{ARTIFACT_GRACE_MS, LegRole, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::{Crash, CrashableCluster, FaultHandle, FaultableCluster};
+use crate::support::faultable::{
+    Crash, CrashableCluster, FaultHandle, FaultableCluster, report_claims_recarried,
+};
 use crate::support::query::{
     answer_standing, await_leg_fated, beacon_epoch, clock, declared_price, escrowed_into,
     owning_shard, stands_at, vault_balance,
@@ -2131,6 +2133,7 @@ pub fn more_records_than_the_cap_are_declined_in_turn<C: FaultableCluster>(c: &m
         epochs(8),
         "more standing records than a block carries",
     );
+    report_claims_recarried(c, "more_records_than_the_cap_are_declined_in_turn");
 }
 
 /// How many payers [`a_mass_decline_brings_every_payment_home`] runs.
@@ -2220,6 +2223,7 @@ pub fn a_mass_decline_brings_every_payment_home<C: FaultableCluster>(c: &mut C) 
         "every payment must come home; {} of {staged} is still out",
         before - price - held_by_payers(c),
     );
+    report_claims_recarried(c, "a_mass_decline_brings_every_payment_home");
 }
 
 /// A recipient whose network heals past the old delivery window is paid.

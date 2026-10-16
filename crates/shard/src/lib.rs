@@ -77,6 +77,7 @@ pub mod beacon_witnesses;
 pub mod ready_signal_pool;
 
 mod block_sync;
+mod carried;
 mod chain_view;
 mod commit_dedup;
 mod commit_pipeline;

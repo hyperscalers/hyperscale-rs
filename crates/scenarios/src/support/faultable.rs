@@ -307,6 +307,56 @@ pub fn committees_on_separate_hosts(
     (a_hosts, b_hosts)
 }
 
+/// What `c`'s committed blocks carried in their claims that one of the
+/// committed blocks just below carried too, by kind, summed over
+/// replicas and shards as the counters are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimsRecarried {
+    /// Cells read at one anchor by claims that delete and return nothing.
+    pub cells: u64,
+    /// Record keys read absent.
+    pub deletions: u64,
+    /// `Never` keys read present.
+    pub returns: u64,
+    /// Crossings read at the parent.
+    pub local: u64,
+}
+
+/// Report what `c`'s committed blocks carried twice, by kind and per
+/// committed block, and hand the counts back.
+pub fn report_claims_recarried(c: &impl FaultableCluster, scenario: &str) -> ClaimsRecarried {
+    let recarried = ClaimsRecarried {
+        cells: c.metric("claims_recarried", Some("cells")),
+        deletions: c.metric("claims_recarried", Some("deletions")),
+        returns: c.metric("claims_recarried", Some("returns")),
+        local: c.metric("claims_recarried", Some("local")),
+    };
+    let blocks = c.metric_count("state_claims_weight", None);
+    let per_block = |count: u64| {
+        let exact = |count: u64| f64::from(u32::try_from(count).unwrap_or(u32::MAX));
+        if blocks == 0 {
+            0.0
+        } else {
+            exact(count) / exact(blocks)
+        }
+    };
+    println!(
+        "{scenario} [claims a committed block carried that one of the four below it carried, \
+         summed over replicas and shards, over {blocks} commits]: cells {} ({:.2} a block), \
+         deletions {} ({:.2} a block), returns {} ({:.2} a block), local crossings {} ({:.2} \
+         a block)",
+        recarried.cells,
+        per_block(recarried.cells),
+        recarried.deletions,
+        per_block(recarried.deletions),
+        recarried.returns,
+        per_block(recarried.returns),
+        recarried.local,
+        per_block(recarried.local),
+    );
+    recarried
+}
+
 /// Report what the run's crossings cost: the record presences `c`'s
 /// replicas carried and the read frontier refused, the boundary claims
 /// its blocks carried to delete answers, and the weight of the claims

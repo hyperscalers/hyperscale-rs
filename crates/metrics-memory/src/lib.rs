@@ -420,6 +420,23 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("verdict_claims_block_weight", None, verdict_bytes as f64);
     }
 
+    fn record_claims_recarried(
+        &self,
+        cells: usize,
+        deletions: usize,
+        returns: usize,
+        local: usize,
+    ) {
+        for (kind, count) in [
+            ("cells", cells),
+            ("deletions", deletions),
+            ("returns", returns),
+            ("local", local),
+        ] {
+            self.inc("claims_recarried", Some(kind), count as u64);
+        }
+    }
+
     fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {
         self.inc("verdict_cells_named", None, named as u64);
         self.inc("verdict_cells_carried", None, carried as u64);

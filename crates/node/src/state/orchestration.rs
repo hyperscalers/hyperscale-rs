@@ -119,6 +119,8 @@ impl NodeStateMachine {
             certified,
             committee_anchor,
         );
+        s.shard_coordinator
+            .retire_carried(s.execution_coordinator.committed_height());
         actions.extend(s.apply_commit_effects(effects));
         actions.extend(s.settle_tip(self.beacon_coordinator.topology_schedule()));
 

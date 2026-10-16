@@ -207,6 +207,9 @@ pub struct Metrics {
     pub crossing_fallback_asks: CounterVec,
     /// Pushed crossing readings the consumer dropped, by reason.
     pub crossing_pushes_dropped: CounterVec,
+    /// What committed blocks' claims carried that a committed block just
+    /// below carried too, by kind.
+    pub claims_recarried: CounterVec,
     /// Fetch responses a requester's own check refused, by fetch kind and
     /// the check that refused them.
     pub fetch_responses_refused: CounterVec,
@@ -923,6 +926,14 @@ impl Metrics {
             )
             .unwrap(),
 
+            claims_recarried: register_counter_vec!(
+                "hyperscale_claims_recarried_total",
+                "What committed blocks' claims carried that a committed block just below carried \
+                 too, by kind",
+                &["kind"]
+            )
+            .unwrap(),
+
             state_claims_weight: register_histogram!(
                 "hyperscale_state_claims_weight_bytes",
                 "Bytes a committed block's state claims that are not verdict claims weigh, \
@@ -1265,6 +1276,26 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .verdict_claims_block_weight
             .observe(verdict_bytes as f64);
+    }
+
+    fn record_claims_recarried(
+        &self,
+        cells: usize,
+        deletions: usize,
+        returns: usize,
+        local: usize,
+    ) {
+        for (kind, count) in [
+            ("cells", cells),
+            ("deletions", deletions),
+            ("returns", returns),
+            ("local", local),
+        ] {
+            self.metrics
+                .claims_recarried
+                .with_label_values(&[kind])
+                .inc_by(count as f64);
+        }
     }
 
     fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {

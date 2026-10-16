@@ -51,7 +51,7 @@
 //! the claim's anchor: its work is bounded by what the block carries and
 //! pays for, never by the rows that stand.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::{Bytes, Capped, Hbor};
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher};
@@ -60,7 +60,7 @@ use crate::state_key::jmt_value_hash;
 use crate::{
     Anchor, Inclusion, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
     RETENTION_HORIZON, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES,
-    STATE_CLAIM_VERDICT_BYTES, StateProofError, SubstateKey, TxHash, WeightedTimestamp,
+    STATE_CLAIM_VERDICT_BYTES, ShardId, StateProofError, SubstateKey, TxHash, WeightedTimestamp,
     member_order, verdict_leaf,
 };
 
@@ -209,6 +209,165 @@ impl BoundaryOffer {
             }
         }
         carried
+    }
+}
+
+/// What a block's claims carry, read the one way the commit fold
+/// retires it and a proposer passes it over.
+///
+/// A deletion is one answer's and a return one record's, whatever
+/// anchor reads it, so [`Self::deletes`] and [`Self::returns`] ask by
+/// key across anchors. `deleted` stays keyed by anchor, as the commit
+/// cut is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CarriedClaims {
+    /// The keys of every claim that names no member, by anchor.
+    cells: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+    /// The part of `cells` read by claims that delete and return
+    /// nothing. A deletion's row and marker are read again by the next
+    /// answer of the same transaction, and a `Never` is a return, so
+    /// neither is a cell carried twice.
+    read: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+    /// The record keys read absent under their crossing's name
+    /// ([`StateClaim::deleting`]), by anchor.
+    deleted: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+    /// The `Never` keys read present under their crossing's name
+    /// ([`StateClaim::returning`]).
+    returned: BTreeSet<SubstateKey>,
+    /// The crossings named by claims anchored on the carrying block's
+    /// own shard: the ones it reads at its parent.
+    local: BTreeSet<CrossingId>,
+}
+
+/// How many of what a block carries an earlier block carried too, by
+/// kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recarried {
+    /// Cells of claims that delete and return nothing, at one anchor.
+    pub cells: usize,
+    /// Record keys read absent, at any anchor.
+    pub deletions: usize,
+    /// `Never` keys read present.
+    pub returns: usize,
+    /// Crossings read at the parent.
+    pub local: usize,
+}
+
+impl CarriedClaims {
+    /// What `claims`, the claims of one block of `shard`'s, carry.
+    #[must_use]
+    pub fn of(shard: ShardId, claims: &[StateClaim]) -> Self {
+        let mut carried = Self::default();
+        for claim in claims {
+            if claim.verdicts.is_empty() {
+                let keys = claim.keys();
+                if claim.deleting().next().is_none() && claim.returning().next().is_none() {
+                    carried
+                        .read
+                        .entry(claim.anchor)
+                        .or_default()
+                        .extend(keys.iter().copied());
+                }
+                carried.cells.entry(claim.anchor).or_default().extend(keys);
+            }
+            let deleting: Vec<SubstateKey> = claim.deleting().collect();
+            if !deleting.is_empty() {
+                carried
+                    .deleted
+                    .entry(claim.anchor)
+                    .or_default()
+                    .extend(deleting);
+            }
+            carried
+                .returned
+                .extend(claim.returning().map(|(never, _)| never));
+            if claim.anchor.shard == shard {
+                carried
+                    .local
+                    .extend(claim.crossings.iter().map(|(_, id)| *id));
+            }
+        }
+        carried
+    }
+
+    /// Add what `other` carries.
+    pub fn extend(&mut self, other: &Self) {
+        let union = |into: &mut BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+                     from: &BTreeMap<Anchor, BTreeSet<SubstateKey>>| {
+            for (anchor, keys) in from {
+                into.entry(*anchor)
+                    .or_default()
+                    .extend(keys.iter().copied());
+            }
+        };
+        union(&mut self.cells, &other.cells);
+        union(&mut self.read, &other.read);
+        union(&mut self.deleted, &other.deleted);
+        self.returned.extend(other.returned.iter().copied());
+        self.local.extend(other.local.iter().copied());
+    }
+
+    /// The keys of claims naming no member, by anchor: what the commit
+    /// fold cuts from the claims held to offer.
+    #[must_use]
+    pub const fn cells(&self) -> &BTreeMap<Anchor, BTreeSet<SubstateKey>> {
+        &self.cells
+    }
+
+    /// The keys carried at `anchor` by claims naming no member.
+    #[must_use]
+    pub fn cells_at(&self, anchor: &Anchor) -> Option<&BTreeSet<SubstateKey>> {
+        self.cells.get(anchor)
+    }
+
+    /// The record keys read absent, by anchor: what the commit fold
+    /// cuts from the boundary readings held.
+    #[must_use]
+    pub const fn deleted(&self) -> &BTreeMap<Anchor, BTreeSet<SubstateKey>> {
+        &self.deleted
+    }
+
+    /// Whether `record` is read absent at any anchor.
+    #[must_use]
+    pub fn deletes(&self, record: SubstateKey) -> bool {
+        self.deleted.values().any(|keys| keys.contains(&record))
+    }
+
+    /// Whether `never` is read present.
+    #[must_use]
+    pub fn returns(&self, never: SubstateKey) -> bool {
+        self.returned.contains(&never)
+    }
+
+    /// Whether `id` is read at the carrying block's parent.
+    #[must_use]
+    pub fn reads_locally(&self, id: &CrossingId) -> bool {
+        self.local.contains(id)
+    }
+
+    /// How much of what this carries `earlier` carried too: cells this
+    /// reads that `earlier` carried at the same anchor, record keys and
+    /// `Never` keys by key, and crossings read at the parent.
+    #[must_use]
+    pub fn recarried(&self, earlier: &Self) -> Recarried {
+        let cells = self
+            .read
+            .iter()
+            .filter_map(|(anchor, keys)| {
+                let before = earlier.cells.get(anchor)?;
+                Some(keys.intersection(before).count())
+            })
+            .sum();
+        let deleted: BTreeSet<SubstateKey> = self.deleted.values().flatten().copied().collect();
+        Recarried {
+            cells,
+            deletions: deleted
+                .into_iter()
+                .filter(|record| earlier.deletes(*record))
+                .count(),
+            returns: self.returned.intersection(&earlier.returned).count(),
+            local: self.local.intersection(&earlier.local).count(),
+        }
     }
 }
 
@@ -531,6 +690,17 @@ impl StateClaim {
             (*key == id.record_key(&ProtocolHasher)
                 && self.reading(*key) == Some(Inclusion::Absent))
             .then_some(*key)
+        })
+    }
+
+    /// The `Never` keys read present under their crossing's name, each
+    /// with that crossing: the records a block carrying the claim takes
+    /// back.
+    pub fn returning(&self) -> impl Iterator<Item = (SubstateKey, CrossingId)> + '_ {
+        self.crossings.iter().filter_map(|(key, id)| {
+            (*key == id.answer_key(&ProtocolHasher, Answered::Never)
+                && matches!(self.reading(*key), Some(Inclusion::Present(_))))
+            .then_some((*key, *id))
         })
     }
 
@@ -1439,5 +1609,211 @@ mod tests {
             None,
             "proofs over different roots",
         );
+    }
+
+    /// The claims of one block in [`CarriedClaims`]'s terms: a fresh
+    /// fetch's cells at its anchor, a deletion's record and row, a
+    /// return's `Never`, and the crossings read at the block's parent.
+    /// A verdict claim's cells are none of them.
+    struct Carriers {
+        own: ShardId,
+        older: Anchor,
+        newer: Anchor,
+        parent: Anchor,
+    }
+
+    impl Carriers {
+        fn new() -> Self {
+            let own = ShardId::leaf(1, 0);
+            let at = |shard, height: u64| Anchor {
+                shard,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::from_bytes(&height.to_le_bytes())),
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            };
+            Self {
+                own,
+                older: at(ShardId::leaf(1, 1), 3),
+                newer: at(ShardId::leaf(1, 1), 7),
+                parent: at(own, 9),
+            }
+        }
+
+        fn crossing(seed: u8) -> CrossingId {
+            CrossingId {
+                producer: key(0x21).owner,
+                consumer: key(0x22).owner,
+                intent: IntentHash(Hash32([seed; 32])),
+                local: 0,
+                output: 0,
+            }
+        }
+
+        fn fetched(at: Anchor, keys: &[SubstateKey]) -> StateClaim {
+            StateClaim::new(
+                at,
+                keys.iter().map(|key| (*key, Inclusion::Present([1; 32]))),
+                MerkleInclusionProof::dummy(),
+            )
+        }
+
+        fn deleting(at: Anchor, id: CrossingId, row: SubstateKey) -> StateClaim {
+            let record = id.record_key(&ProtocolHasher);
+            StateClaim::new(
+                at,
+                [
+                    (record, Inclusion::Absent),
+                    (row, Inclusion::Present([2; 32])),
+                ],
+                MerkleInclusionProof::dummy(),
+            )
+            .naming([(record, id)])
+        }
+
+        fn returning(at: Anchor, id: CrossingId) -> StateClaim {
+            let never = id.answer_key(&ProtocolHasher, Answered::Never);
+            StateClaim::new(
+                at,
+                [(never, Inclusion::Present([3; 32]))],
+                MerkleInclusionProof::dummy(),
+            )
+            .naming([(never, id)])
+        }
+
+        fn local(at: Anchor, id: CrossingId) -> StateClaim {
+            let record = id.record_key(&ProtocolHasher);
+            StateClaim::new(
+                at,
+                [(record, Inclusion::Present([4; 32]))],
+                MerkleInclusionProof::dummy(),
+            )
+            .naming([(record, id)])
+        }
+    }
+
+    /// A block's claims are read into what each retires: every cell of a
+    /// claim naming no member at its anchor, a record read absent at any
+    /// anchor, a `Never` read present, and the crossings a claim at the
+    /// block's own shard names. A verdict claim's cells are not carried.
+    #[test]
+    fn what_a_block_carries_is_read_off_its_claims() {
+        let Carriers {
+            own,
+            older,
+            newer,
+            parent,
+        } = Carriers::new();
+        let (deleted, returned, local) = (
+            Carriers::crossing(1),
+            Carriers::crossing(2),
+            Carriers::crossing(3),
+        );
+        let row = key(0x31);
+        let member = TxHash::from(Hash::from_bytes(b"member"));
+        let claims = [
+            Carriers::fetched(older, &[key(1), key(2)]),
+            Carriers::deleting(older, deleted, row),
+            Carriers::returning(newer, returned),
+            Carriers::local(parent, local),
+            Carriers::fetched(newer, &[verdict_leaf(newer.shard, member)]).hearing([member]),
+        ];
+        let carried = CarriedClaims::of(own, &claims);
+        let record = deleted.record_key(&ProtocolHasher);
+        assert_eq!(
+            carried.cells_at(&older),
+            Some(&BTreeSet::from([key(1), key(2), record, row])),
+        );
+        assert_eq!(
+            carried.cells_at(&newer),
+            Some(&BTreeSet::from([
+                returned.answer_key(&ProtocolHasher, Answered::Never)
+            ])),
+            "the verdict claim's leaf is not carried",
+        );
+        assert_eq!(
+            carried.deleted(),
+            &BTreeMap::from([(older, BTreeSet::from([record]))]),
+        );
+        assert!(carried.deletes(record) && !carried.deletes(row));
+        assert!(carried.returns(returned.answer_key(&ProtocolHasher, Answered::Never)));
+        assert!(!carried.returns(deleted.answer_key(&ProtocolHasher, Answered::Never)));
+        assert!(carried.reads_locally(&local));
+        assert!(
+            !carried.reads_locally(&deleted) && !carried.reads_locally(&returned),
+            "only the crossings named at the block's own shard are read at its parent",
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .flat_map(|claim| claim.returning().map(|(_, id)| id))
+                .collect::<Vec<_>>(),
+            vec![returned],
+        );
+    }
+
+    /// A repeat is counted once by kind: a cell a fresh claim reads at
+    /// the anchor an earlier block carried it at, a record read absent
+    /// again at any anchor, a `Never` read again, and a crossing read
+    /// again at the parent. A deletion's row read again beside another
+    /// record is no repeat: the next answer of the same transaction
+    /// reads it.
+    #[test]
+    fn a_repeat_is_counted_once_by_kind() {
+        let Carriers {
+            own,
+            older,
+            newer,
+            parent,
+        } = Carriers::new();
+        let (deleted, other, returned, local) = (
+            Carriers::crossing(1),
+            Carriers::crossing(4),
+            Carriers::crossing(2),
+            Carriers::crossing(3),
+        );
+        let row = key(0x31);
+        let earlier = CarriedClaims::of(
+            own,
+            &[
+                Carriers::fetched(older, &[key(1), key(2)]),
+                Carriers::deleting(older, deleted, row),
+                Carriers::returning(newer, returned),
+                Carriers::local(parent, local),
+            ],
+        );
+        let later = CarriedClaims::of(
+            own,
+            &[
+                Carriers::fetched(older, &[key(2), key(3)]),
+                Carriers::fetched(newer, &[key(1)]),
+                Carriers::deleting(newer, deleted, row),
+                Carriers::deleting(older, other, row),
+                Carriers::returning(older, returned),
+                Carriers::local(
+                    Anchor {
+                        height: BlockHeight::new(10),
+                        ..parent
+                    },
+                    local,
+                ),
+            ],
+        );
+        assert_eq!(
+            later.recarried(&earlier),
+            Recarried {
+                cells: 1,
+                deletions: 1,
+                returns: 1,
+                local: 1,
+            },
+        );
+        assert_eq!(
+            later.recarried(&CarriedClaims::default()),
+            Recarried::default()
+        );
+        let mut both = earlier;
+        both.extend(&later);
+        assert_eq!(both.recarried(&both).deletions, 2);
+        assert!(both.deletes(other.record_key(&ProtocolHasher)));
     }
 }

@@ -238,6 +238,20 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// (`verdict_bytes`), which spend what those leave of the section's.
     fn record_state_claims_weight(&self, bytes: usize, verdict_bytes: usize) {}
 
+    /// What a committed block's claims carry that one of the
+    /// committed blocks just below it carried too, by kind: cells read
+    /// at one anchor by claims that delete and return nothing, record
+    /// keys read absent, `Never` keys read present, and crossings read
+    /// at the parent.
+    fn record_claims_recarried(
+        &self,
+        cells: usize,
+        deletions: usize,
+        returns: usize,
+        local: usize,
+    ) {
+    }
+
     /// The verdict cells of one committed block: the cells of the claims
     /// that name a member (`named`), the ones of those its hear step
     /// read for a hearing row (`carried`), and the ones of those in a
@@ -822,6 +836,13 @@ pub fn record_hold_inversions_proven(victims: usize) {
 #[inline]
 pub fn record_state_claims_weight(bytes: usize, verdict_bytes: usize) {
     recorder().record_state_claims_weight(bytes, verdict_bytes);
+}
+
+/// Record what a committed block's claims carry that a committed block
+/// just below it carried too.
+#[inline]
+pub fn record_claims_recarried(cells: usize, deletions: usize, returns: usize, local: usize) {
+    recorder().record_claims_recarried(cells, deletions, returns, local);
 }
 
 /// Record the verdict cells a committed block's rows heard.

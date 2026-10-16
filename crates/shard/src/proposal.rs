@@ -33,7 +33,7 @@ use hyperscale_types::{
     TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
     state_claims_admit_block, tick_terms_admit_block, verdict_leaf,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
+use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
 
 use crate::admission::{
@@ -792,13 +792,7 @@ fn spend_on_boundary_claims(
 fn returned_by(pieces: &[StateClaim]) -> Vec<CrossingId> {
     pieces
         .iter()
-        .flat_map(|claim| {
-            claim.crossings.iter().filter_map(|(key, id)| {
-                (*key == id.answer_key(&ProtocolHasher, Answered::Never)
-                    && matches!(claim.reading(*key), Some(Inclusion::Present(_))))
-                .then_some(*id)
-            })
-        })
+        .flat_map(|claim| claim.returning().map(|(_, id)| id))
         .collect()
 }
 
