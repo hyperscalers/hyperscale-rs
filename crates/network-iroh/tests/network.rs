@@ -1,7 +1,6 @@
 //! Notifications and requests between hosts over real loopback QUIC.
 
 use std::collections::HashSet;
-use std::hint::spin_loop;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +15,7 @@ use hyperscale_network::{
     HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict, VerdictKey,
 };
 use hyperscale_network_iroh::test_utils::TestFixtures;
+use hyperscale_network_iroh::testing::burn_processor_time;
 use hyperscale_network_iroh::{
     IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, NetworkError, RequestManager,
     RequestManagerConfig, RequestPool, RequestStreams,
@@ -774,10 +774,7 @@ fn serve_costly(host: &Host) -> Arc<Mutex<Duration>> {
     let counted = Arc::clone(&spent);
     host.network
         .register_request_handler(ShardId::ROOT, move |request: Costly| {
-            let started = Instant::now();
-            while started.elapsed() < COSTLY {
-                spin_loop();
-            }
+            burn_processor_time(COSTLY);
             *counted.lock().unwrap() += COSTLY;
             CostlyAnswer(request.0)
         });

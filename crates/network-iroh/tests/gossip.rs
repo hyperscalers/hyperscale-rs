@@ -128,8 +128,14 @@ impl NetworkMessage for Vote {
     }
 }
 
-/// Votes a second a peer sends alongside its gossip.
-const VOTE_RATE: u32 = 50;
+/// Votes a cooled down peer sends while it is watched.
+const VOTES_WHILE_COOLING: u64 = 10;
+
+/// How long a cooled down peer's votes are watched for.
+const VOTE_WATCH: Duration = Duration::from_millis(200);
+
+/// Cooldowns a watch may try, should one lapse before its watch ends.
+const COOLDOWNS_WATCHED: usize = 5;
 
 /// Items that are their sender's fault, such as forged address records,
 /// whose charges fit in a peer's allowance of refused work, and the one
@@ -996,37 +1002,48 @@ async fn a_peer_cooled_down_for_its_gossip_is_refused_its_notifications_too() {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Accept
         });
+    let heard = || heard.load(Ordering::SeqCst);
+
+    // Before anything is held against the sender, its votes are heard.
+    sender.network.notify(&[vid(0)], &Vote(0));
+    wait_for("a vote is heard", || heard() == 1).await;
 
     // The sender's gossip is all its own fault; its votes are fine, but they
     // come from a peer whose traffic is being refused.
     let flood = Arc::clone(&sender.network);
-    let gossip = spawn(async move {
+    let flooding = spawn(async move {
         let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
-        for seq in 0..HONEST_RATE * REJECTED_WATCH_SECS {
+        let mut seq = 0;
+        loop {
             tick.tick().await;
             flood.broadcast_global(&CommittedHeader {
-                seq: u64::from(seq),
+                seq,
                 body: vec![7; HEADER_BYTES],
             });
+            seq += 1;
         }
     });
-    let votes = VOTE_RATE * REJECTED_WATCH_SECS;
-    let mut tick = interval(Duration::from_secs(1) / VOTE_RATE);
-    for seq in 0..votes {
-        tick.tick().await;
-        sender.network.notify(&[vid(0)], &Vote(u64::from(seq)));
+    let mut watched = false;
+    for _ in 0..COOLDOWNS_WATCHED {
+        wait_for("the sender is cooled down", || {
+            receiver.adapter.cooling_down(vid(1))
+        })
+        .await;
+        let before = heard();
+        for seq in 1..=VOTES_WHILE_COOLING {
+            sender.network.notify(&[vid(0)], &Vote(seq));
+        }
+        sleep(VOTE_WATCH).await;
+        let during = heard() - before;
+        // Only a watch the cooldown outlasted shows anything.
+        if receiver.adapter.cooling_down(vid(1)) {
+            assert_eq!(during, 0, "a cooled down peer's votes are not taken up");
+            watched = true;
+            break;
+        }
     }
-    gossip.await.expect("the flood runs");
-    sleep(SILENCE_WATCH).await;
-    let heard = heard.load(Ordering::SeqCst);
-    assert!(
-        heard > 0,
-        "the votes reach the receiver before the cooldown"
-    );
-    assert!(
-        heard < votes as usize / 2,
-        "a cooled down peer's notifications are refused: {heard} of {votes} votes heard"
-    );
+    flooding.abort();
+    assert!(watched, "a cooldown outlasts a watch");
 }
 
 #[tokio::test(flavor = "multi_thread")]

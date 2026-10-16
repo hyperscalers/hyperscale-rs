@@ -9,6 +9,7 @@
 //! hub.
 
 use std::collections::HashSet;
+use std::hint::spin_loop;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use tokio::time::sleep;
 
 use crate::path::PathKind;
 use crate::protocol::ALPN;
+use crate::serve_budget::thread_clock;
 use crate::test_utils::TestFixtures;
 use crate::{IrohAdapter, IrohAdapterArgs, IrohConfig, bind};
 
@@ -547,6 +549,15 @@ impl Signer for CountingSigner {
 
     fn vrf_sign(&self, message: &[u8]) -> Result<VrfProof, SignError> {
         self.inner.vrf_sign(message)
+    }
+}
+
+/// Keep the calling thread busy until it has taken `work` of processor
+/// time, as a request handler charged for that much does.
+pub fn burn_processor_time(work: Duration) {
+    let started = thread_clock();
+    while thread_clock().saturating_sub(started) < work {
+        spin_loop();
     }
 }
 
