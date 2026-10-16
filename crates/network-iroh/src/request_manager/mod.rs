@@ -284,4 +284,12 @@ impl RequestManager {
     pub(crate) fn record_rejected(&self, peer: EndpointId) {
         self.health.lock().record_rejected(peer);
     }
+
+    /// Distrust the peer that gave an answer holding nothing usable: one
+    /// that did not decode, or that the caller rejected though it was not
+    /// empty.
+    pub(crate) fn record_invalid(&self, peer: EndpointId) {
+        let now = self.now();
+        self.health.lock().record_invalid(peer, now);
+    }
 }

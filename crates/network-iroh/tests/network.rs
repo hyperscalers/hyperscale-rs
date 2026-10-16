@@ -38,6 +38,9 @@ const BULK_BYTES: usize = 8 * 1024 * 1024;
 /// Bulk responses queued towards the requester at once.
 const BULK_REQUESTS: usize = 4;
 
+/// Numbers asked for of a shard one of whose responders answers garbage.
+const GARBAGE_ROUNDS: u64 = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 struct Ping(u64);
 
@@ -473,4 +476,85 @@ async fn a_partitioned_peer_gets_neither_notification_nor_request() {
     let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
     assert_eq!(delivered, Some(Ping(2)));
     assert!(ask(&host0.network, Echo(1)).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_responder_that_answers_with_garbage_is_seldom_asked() {
+    let fixtures = TestFixtures::new(21, 4);
+    let asker = host(&fixtures, &[0], &[], Vec::new()).await;
+    // Each responder, and how many requests it served.
+    let mut responders = Vec::new();
+    for index in 1..4 {
+        let responder = host(
+            &fixtures,
+            &[index],
+            &[ShardId::ROOT],
+            vec![asker.adapter.endpoint_addr()],
+        )
+        .await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        // The first responder answers every request with someone else's
+        // number; the others answer honestly.
+        let garbage = index == 1;
+        responder
+            .network
+            .register_request_handler(ShardId::ROOT, move |Echo(n)| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Echoed(if garbage { n + 1 } else { n })
+            });
+        responders.push((responder, count));
+    }
+    timeout(BUDGET, async {
+        while (1..4).any(|i| asker.adapter.peer_for_validator(vid(i)).is_none()) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the asker binds every responder");
+
+    // Each number is asked for until an honest answer lands, as a fetch
+    // retries an answer it rejects.
+    for n in 0..GARBAGE_ROUNDS {
+        loop {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            asker.network.request(
+                ShardId::ROOT,
+                None,
+                Echo(n),
+                None,
+                Box::new(move |outcome: Result<Echoed, RequestError>| {
+                    let good = matches!(outcome, Ok(Echoed(m)) if m == n);
+                    let _ = tx.send(good);
+                    if good {
+                        ResponseVerdict::Accept
+                    } else {
+                        ResponseVerdict::Reject
+                    }
+                }),
+            );
+            let good = timeout(BUDGET, rx.recv())
+                .await
+                .expect("the request resolves")
+                .expect("the callback runs");
+            if good {
+                break;
+            }
+        }
+    }
+
+    let counts: Vec<usize> = responders
+        .iter()
+        .map(|(_, served)| served.load(Ordering::SeqCst))
+        .collect();
+    let total: usize = counts.iter().sum();
+    assert!(
+        counts[0] * 20 < total,
+        "the garbage responder was asked {} of {total} times",
+        counts[0]
+    );
+    assert!(
+        counts[1..].iter().all(|honest| honest * 4 > total),
+        "the honest responders share the load: {counts:?}"
+    );
 }
