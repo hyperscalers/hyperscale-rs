@@ -23,9 +23,10 @@
 //!
 //! Samples are drawn only from hosts that proved, in the bind handshake,
 //! that they carry a validator of the beacon derived set; nothing a peer
-//! merely claims widens an audience. A peer whose items keep being rejected
-//! is cooled down: its gossip streams are stopped unread until the cooldown
-//! lapses.
+//! merely claims widens an audience. Each item a host refuses is charged
+//! against its sender at about the work it took, and a sender whose refused
+//! items cost more than its share is cooled down: its gossip streams are
+//! stopped unread until the cooldown lapses.
 //!
 //! Discovery rides the same path. Each host announces its signed address
 //! records at an interval, and hands a newly bound peer its own records and
@@ -40,7 +41,7 @@ use std::{io, mem};
 use arc_swap::ArcSwap;
 use blake3::Hasher;
 use bytes::Bytes;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::{
     record_invalid_message, record_libp2p_bandwidth, record_network_message_received,
@@ -58,12 +59,13 @@ use iroh::endpoint::RecvStream;
 use rand::{Rng, RngExt, rng};
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
-use crate::cooldown::FailureCooldown;
+use crate::cooldown::Cooldown;
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
@@ -111,6 +113,35 @@ const SUBSCRIPTION_INTERVAL: Duration = Duration::from_secs(5);
 /// under the relayed budget rather than at the class of the bulk gossip
 /// they are typed as, which a relayed path never carries.
 const ADDRESS_RECORD_CLASS: MessageClass = MessageClass::CrossShardProgress;
+
+/// Items of one peer judged at once. Judging (decompressing, decoding, and
+/// for an address record checking a signature) runs off the read loop, and
+/// a verdict that cools a peer down stops only what is read after it.
+const JUDGED_AT_ONCE_PER_PEER: usize = 4;
+
+/// Work charged against a peer for each of its gossip items this host
+/// refuses: reading, hashing, and dispatching it.
+const REFUSED_ITEM_WORK: Duration = Duration::from_micros(10);
+
+/// Work charged for each KiB of a refused item, for decompressing and
+/// decoding it.
+const REFUSED_KIB_WORK: Duration = Duration::from_micros(1);
+
+/// Work charged for a refused address record, whose signature this host
+/// checks before it can refuse it. The other items the transport carries
+/// fail, when they fail here, before any signature is checked.
+const SIGNATURE_CHECK_WORK: Duration = Duration::from_millis(2);
+
+/// The work charged for refusing an item of `bytes`.
+fn refused_work(bytes: usize, signature_checked: bool) -> Duration {
+    let kib = u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX);
+    let checked = if signature_checked {
+        SIGNATURE_CHECK_WORK
+    } else {
+        Duration::ZERO
+    };
+    REFUSED_ITEM_WORK + REFUSED_KIB_WORK * kib + checked
+}
 
 /// Where a gossip item is addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,8 +301,10 @@ pub struct Fanout {
     /// Outbound gossip streams, one per peer and class.
     streams: ClassStreams,
     seen: Mutex<SeenSet>,
-    /// Peers whose items keep being rejected.
-    rejects: FailureCooldown,
+    /// What each peer's refused items have cost this host.
+    rejects: Cooldown,
+    /// Turns at judging each peer's items.
+    judging: DashMap<EndpointId, Arc<Semaphore>>,
     topology: Arc<ArcSwap<TopologySnapshot>>,
     routing_committees: Arc<ArcSwap<RoutingCommittees>>,
     /// Hosts that asked for every global item this host accepts.
@@ -303,7 +336,8 @@ impl Fanout {
             adapter,
             registry,
             seen: Mutex::new(SeenSet::default()),
-            rejects: FailureCooldown::default(),
+            rejects: Cooldown::default(),
+            judging: DashMap::new(),
             topology,
             routing_committees,
             subscribers: DashSet::new(),
@@ -457,6 +491,10 @@ impl Fanout {
         mut recv: RecvStream,
     ) -> Result<(), FrameError> {
         loop {
+            if self.rejects.cooling_down(peer) {
+                let _ = recv.stop(STOP_GOSSIP_REFUSED);
+                return Ok(());
+            }
             let mut scope_byte = [0u8; 1];
             match AsyncReadExt::read_exact(&mut recv, &mut scope_byte).await {
                 Ok(_) => {}
@@ -482,13 +520,25 @@ impl Fanout {
             let (type_id, compressed, wire_bytes) =
                 framing::read_typed_frame_compressed(&mut recv, MAX_FRAME_SIZE).await?;
             record_libp2p_bandwidth((scope.encode().len() + wire_bytes) as u64, 0);
-            // Checked once the frame is in hand: the wait for it may have
-            // begun before the cooldown did.
+            // The peer's items are judged a few at a time, so it cannot have
+            // more read than that before the verdicts that cool it down.
+            let turns = Arc::clone(
+                &self
+                    .judging
+                    .entry(peer)
+                    .or_insert_with(|| Arc::new(Semaphore::new(JUDGED_AT_ONCE_PER_PEER))),
+            );
+            let turn = turns
+                .acquire_owned()
+                .await
+                .expect("the judging semaphore is never closed");
+            // Checked again once the frame and a turn are in hand: the wait
+            // for them may have begun before the cooldown did.
             if self.rejects.cooling_down(peer) {
                 let _ = recv.stop(STOP_GOSSIP_REFUSED);
                 return Ok(());
             }
-            self.receive(peer, class, scope, &type_id, &compressed);
+            self.receive(peer, class, scope, &type_id, &compressed, turn);
         }
     }
 
@@ -501,6 +551,7 @@ impl Fanout {
         scope: Scope,
         type_id: &str,
         compressed: &[u8],
+        turn: OwnedSemaphorePermit,
     ) {
         // Fault gate: a matching drop rule or a partition against the
         // sender suppresses both local delivery and forwarding.
@@ -547,7 +598,7 @@ impl Fanout {
             Err(error) => {
                 warn!(peer = %sender.fmt_short(), %error, "Failed to decompress gossip item");
                 record_invalid_message();
-                self.note_reject(sender);
+                self.note_reject(sender, refused_work(compressed.len(), false));
                 return;
             }
         };
@@ -564,8 +615,10 @@ impl Fanout {
             Scope::Shard(_) => None,
         };
 
+        let refused = refused_work(payload.len(), matches!(judge, Judge::AddressBook));
         let fanout = Arc::clone(self);
         self.tokio_handle.spawn(async move {
+            let _turn = turn;
             let verdict = match judge {
                 Judge::AddressBook => fanout.ingest_address_record(&payload),
                 Judge::Registry {
@@ -581,7 +634,6 @@ impl Fanout {
             match verdict {
                 GossipVerdict::Accept => {
                     record_network_message_received();
-                    fanout.rejects.record_success(sender);
                     if let Some(frame) = forward {
                         let audience = forward_audience(
                             sender,
@@ -594,7 +646,7 @@ impl Fanout {
                 }
                 GossipVerdict::Reject => {
                     record_invalid_message();
-                    fanout.note_reject(sender);
+                    fanout.note_reject(sender, refused);
                 }
             }
         });
@@ -616,8 +668,8 @@ impl Fanout {
         }
     }
 
-    fn note_reject(&self, sender: EndpointId) {
-        if let Some(cooldown) = self.rejects.record_failure(sender) {
+    fn note_reject(&self, sender: EndpointId, work: Duration) {
+        if let Some(cooldown) = self.rejects.charge(sender, work) {
             warn!(
                 peer = %sender.fmt_short(),
                 cooldown_secs = cooldown.as_secs_f32(),

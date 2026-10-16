@@ -53,6 +53,7 @@ hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 
 [[example]]
