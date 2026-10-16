@@ -223,13 +223,18 @@ pub(super) fn handle_gossipsub_event(
                         if let Some(host_handler) = host_handler {
                             host_handler(payload.clone());
                         }
+                        // Every mesh member relays what it does not refuse,
+                        // so a message no hosted shard judged travels on.
+                        // Without peer scoring a refusal only stops the
+                        // relay, so a message this host cannot judge yet is
+                        // refused like a forged one.
                         let verdict = handler(payload, topic_shard);
                         let acceptance = match verdict {
-                            GossipVerdict::Accept => {
+                            Some(GossipVerdict::Accept) | None => {
                                 record_network_message_received();
                                 MessageAcceptance::Accept
                             }
-                            GossipVerdict::Reject => {
+                            Some(GossipVerdict::Reject | GossipVerdict::Ignore) => {
                                 record_invalid_message();
                                 MessageAcceptance::Reject
                             }

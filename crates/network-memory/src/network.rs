@@ -3114,7 +3114,7 @@ mod tests {
                 let raw: Arc<RawGossipHandler> =
                     Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
                         handler_clone.received.lock().unwrap().push(payload);
-                        GossipVerdict::Accept
+                        Some(GossipVerdict::Accept)
                     });
                 adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
@@ -3913,7 +3913,7 @@ mod tests {
                 let raw: Arc<RawGossipHandler> =
                     Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
                         handler_clone.received.lock().unwrap().push(payload);
-                        GossipVerdict::Accept
+                        Some(GossipVerdict::Accept)
                     });
                 adapter
                     .registry

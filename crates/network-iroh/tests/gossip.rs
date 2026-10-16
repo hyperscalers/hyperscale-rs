@@ -77,8 +77,9 @@ impl GossipMessage for CommittedHeader {
     const SCOPE: TopicScope = TopicScope::Global;
 }
 
-/// Forged address records whose checks fit in a peer's allowance of
-/// refused work, and the one that takes it past.
+/// Items that are their sender's fault, such as forged address records,
+/// whose charges fit in a peer's allowance of refused work, and the one
+/// that takes it past.
 const FORGERIES_IN_ALLOWANCE: u64 = 26;
 
 /// Items of one peer a host judges at once.
@@ -93,6 +94,9 @@ const HONEST_RATE: u32 = 300;
 
 /// How long the honest peer keeps sending.
 const HONEST_WATCH_SECS: u32 = 15;
+
+/// How long a peer whose headers are its own fault keeps sending.
+const REJECTED_WATCH_SECS: u32 = 5;
 
 /// A batch of transactions, as far as the transport is concerned: an item
 /// for one shard.
@@ -506,8 +510,8 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
     let fixtures = TestFixtures::new(21, 2);
     let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
 
-    // The receiver cannot place any header yet and refuses each one, as a
-    // host behind the chain refuses headers signed under a committee it
+    // The receiver cannot place any header yet and ignores each one, as a
+    // host behind the chain ignores headers signed under a committee it
     // has not learned. The sender is honest and busy.
     let handled = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&handled);
@@ -515,7 +519,7 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
         .network
         .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
             counted.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Reject
+            GossipVerdict::Ignore
         });
 
     let sent = HONEST_RATE * HONEST_WATCH_SECS;
@@ -531,6 +535,43 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
         handled.load(Ordering::SeqCst) == sent as usize
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_items_are_rejected_is_cooled_down() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+
+    // The same flood as an honest peer's to a host that is behind, but every
+    // header is the sender's fault: each costs it a signature check's worth.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    receiver
+        .network
+        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Reject
+        });
+
+    let start = Instant::now();
+    let sent = HONEST_RATE * REJECTED_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.broadcast_global(&CommittedHeader {
+            seq: u64::from(seq),
+            body: vec![7; HEADER_BYTES],
+        });
+    }
+    sleep(SILENCE_WATCH).await;
+    let judged = handled.load(Ordering::SeqCst) as u64;
+    let secs = start.elapsed().as_secs() + 1;
+    let admitted = FORGERIES_IN_ALLOWANCE + JUDGED_AT_ONCE + secs * (5 + JUDGED_AT_ONCE);
+    assert!(judged > 0, "the headers reach the receiver");
+    assert!(
+        judged <= admitted,
+        "the sender is cooled down: {judged} of {sent} headers judged in {secs} s"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

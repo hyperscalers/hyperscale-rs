@@ -30,9 +30,14 @@ use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardId, TopicSco
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
 
 /// Type-erased gossip handler: receives decompressed wire bytes plus the
-/// shard the topic encoded (`None` for global-scoped topics), returns
-/// verdict.
-pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> GossipVerdict + Send + Sync;
+/// shard the topic encoded (`None` for global-scoped topics), and returns
+/// the verdict of this host's handlers on the message.
+///
+/// `None` when no handler judged it: it targets no shard this host serves,
+/// or its content was dispatched already under another copy's bytes (see
+/// [`GossipMessage::dedup_key`]). A message that does not decode is
+/// rejected.
+pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<GossipVerdict> + Send + Sync;
 
 /// Type-erased host-level gossip handler: receives decompressed wire bytes.
 ///
@@ -72,7 +77,9 @@ pub(crate) trait LocalGossipDispatcher: Send + Sync {
     /// to the typed handler. The handler consumes `M`, so the dispatcher
     /// clones internally. `shard` is the broadcast target shard for
     /// shard-scoped messages and `None` for global-scoped messages.
-    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> GossipVerdict;
+    /// `None` when no handler judged the message, as for
+    /// [`RawGossipHandler`].
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<GossipVerdict>;
 }
 
 /// Counterpart to [`LocalGossipDispatcher`] for the host-level path
@@ -165,14 +172,25 @@ where
         }
     }
 
-    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardId]) -> GossipVerdict {
-        let mut verdict = GossipVerdict::Accept;
-        for &target in targets {
-            if self.handler.on_message(typed.clone(), target) == GossipVerdict::Reject {
-                verdict = GossipVerdict::Reject;
-            }
-        }
-        verdict
+    /// Hand `typed` to the handler once per target and fold the verdicts;
+    /// `None` when there is no target.
+    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardId]) -> Option<GossipVerdict> {
+        targets
+            .iter()
+            .map(|&target| self.handler.on_message(typed.clone(), target))
+            .reduce(combine_verdicts)
+    }
+}
+
+/// The verdict of several hosted shards on one message. A rejection is the
+/// sender's fault whatever the other shards made of it; otherwise a shard
+/// that accepts the message carries it on, and it is ignored only when
+/// every shard ignored it.
+const fn combine_verdicts(a: GossipVerdict, b: GossipVerdict) -> GossipVerdict {
+    match (a, b) {
+        (GossipVerdict::Reject, _) | (_, GossipVerdict::Reject) => GossipVerdict::Reject,
+        (GossipVerdict::Accept, _) | (_, GossipVerdict::Accept) => GossipVerdict::Accept,
+        (GossipVerdict::Ignore, GossipVerdict::Ignore) => GossipVerdict::Ignore,
     }
 }
 
@@ -181,12 +199,12 @@ where
     M: GossipMessage + 'static,
     H: GossipHandler<M>,
 {
-    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> GossipVerdict {
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<GossipVerdict> {
         let typed = msg
             .downcast_ref::<M>()
             .expect("local gossip dispatch type mismatch");
         if !self.admit(typed) {
-            return GossipVerdict::Accept;
+            return None;
         }
         let targets = self.target_shards(typed, shard);
         self.dispatch_to_targets(typed, &targets)
@@ -264,11 +282,14 @@ where
 /// [`HandlerRegistry::hosted_shards`] supplied at construction:
 ///
 /// - [`TopicScope::Shard`] messages dispatch to the topic's shard if it
-///   is hosted, otherwise dropped (we still `Accept` to forward to peers).
+///   is hosted, otherwise dropped with no verdict.
 /// - [`TopicScope::Global`] messages fan into every hosted shard except
 ///   [`GossipMessage::source_shard`], so a vnode in a cross-shard pack
 ///   sees its peer's commits without the handler closure encoding any
 ///   routing logic.
+///
+/// A message no hosted shard judged carries no verdict, and each backend
+/// decides what that means for forwarding.
 pub struct HandlerRegistry {
     /// Shards hosted by the owning process. Drives the per-vnode
     /// fan-out inside [`TypedGossipDispatcher`], which loads it per
@@ -387,14 +408,10 @@ impl HandlerRegistry {
                 match hbor_from_slice::<M>(&payload) {
                     Ok(msg) => {
                         if !bytes_dispatcher.admit(&msg) {
-                            return GossipVerdict::Accept;
+                            return None;
                         }
                         let targets = bytes_dispatcher.target_shards(&msg, shard);
-                        if targets.is_empty() {
-                            GossipVerdict::Accept
-                        } else {
-                            bytes_dispatcher.dispatch_to_targets(&msg, &targets)
-                        }
+                        bytes_dispatcher.dispatch_to_targets(&msg, &targets)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -402,7 +419,7 @@ impl HandlerRegistry {
                             error = ?e,
                             "Failed to decode gossip message — rejecting"
                         );
-                        GossipVerdict::Reject
+                        Some(GossipVerdict::Reject)
                     }
                 }
             });
@@ -644,7 +661,7 @@ impl HandlerRegistry {
 
     /// Dispatch a typed gossip message into its in-process handler,
     /// skipping wire encode/decode. Returns `None` if no handler for
-    /// `M` is registered. Network backends use this to short-circuit
+    /// `M` is registered or none judged the message. Network backends use this to short-circuit
     /// local delivery for messages they publish. `shard` is the
     /// broadcast target shard for shard-scoped publishes and `None`
     /// for global publishes — the handler receives the same value the
@@ -658,7 +675,7 @@ impl HandlerRegistry {
             .local_gossip
             .load()
             .get(&TypeId::of::<M>())
-            .map(|d| d.dispatch(msg as &dyn Any, shard));
+            .and_then(|d| d.dispatch(msg as &dyn Any, shard));
         // A Global-scoped, source-`None` publish (carried with `shard ==
         // None`) also reaches any registered host-level handler, so a
         // shard-less host folds it even though the per-shard fan is empty.
@@ -768,11 +785,11 @@ mod tests {
         let encoded = hbor_to_vec(&TestMsg(42)).unwrap();
         let verdict = handler(encoded, Some(ShardId::leaf(1, 0)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert_eq!(verdict, GossipVerdict::Accept);
+        assert_eq!(verdict, Some(GossipVerdict::Accept));
 
         // Decode failure should return Reject.
         let verdict = handler(vec![0xFF, 0xFE], Some(ShardId::leaf(1, 0)));
-        assert_eq!(verdict, GossipVerdict::Reject);
+        assert_eq!(verdict, Some(GossipVerdict::Reject));
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
         assert!(registry.get_gossip("unknown.type").is_none());
@@ -865,8 +882,8 @@ mod tests {
         let handler = registry.get_gossip("test.hosted_swap").unwrap();
         let encoded = hbor_to_vec(&SwapMsg(1)).unwrap();
 
-        // Shard B isn't hosted — the message is forwarded but not delivered.
-        let _ = handler(encoded.clone(), Some(shard_b));
+        // Shard B isn't hosted — no handler here judges the message.
+        assert_eq!(handler(encoded.clone(), Some(shard_b)), None);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
         // After the swap the same registered handler receives shard B and
@@ -877,6 +894,49 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let _ = handler(encoded, Some(shard_a));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A message several hosted shards judge carries the strongest verdict:
+    /// any rejection, else any acceptance; it is ignored only when every
+    /// shard ignored it.
+    #[test]
+    fn hosted_shards_verdicts_fold_rejection_first_then_acceptance() {
+        use std::sync::Mutex;
+
+        use GossipVerdict::{Accept, Ignore, Reject};
+        use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+        use hyperscale_types::NetworkMessage;
+
+        #[derive(Debug, Clone, Hbor)]
+        struct FoldMsg(u32);
+        impl NetworkMessage for FoldMsg {
+            fn message_type_id() -> &'static str {
+                "test.fold"
+            }
+
+            fn class() -> MessageClass {
+                MessageClass::Recovery
+            }
+        }
+        impl GossipMessage for FoldMsg {
+            const SCOPE: TopicScope = TopicScope::Global;
+        }
+
+        let (a, b) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let registry = HandlerRegistry::new([a, b].into_iter().collect());
+        let verdicts: Arc<Mutex<HashMap<ShardId, GossipVerdict>>> = Arc::default();
+        let answers = Arc::clone(&verdicts);
+        registry.register_gossip(move |_: FoldMsg, shard: ShardId| answers.lock().unwrap()[&shard]);
+        let handler = registry.get_gossip("test.fold").unwrap();
+
+        let fold = |first: GossipVerdict, second: GossipVerdict| {
+            *verdicts.lock().unwrap() = HashMap::from([(a, first), (b, second)]);
+            handler(hbor_to_vec(&FoldMsg(1)).unwrap(), None)
+        };
+        assert_eq!(fold(Accept, Reject), Some(Reject));
+        assert_eq!(fold(Ignore, Reject), Some(Reject));
+        assert_eq!(fold(Ignore, Accept), Some(Accept));
+        assert_eq!(fold(Ignore, Ignore), Some(Ignore));
     }
 
     /// Per-shard request unregistration clears both dispatch maps and
