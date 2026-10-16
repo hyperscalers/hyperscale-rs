@@ -755,6 +755,11 @@ impl TickState {
     /// never at or below the anchor of the local certificate held: a
     /// certificate the tick holds lapses at its own anchor's step like
     /// any other, and a half still owed then needs a later one.
+    ///
+    /// Never once the tick has released a member ([`Self::release`]):
+    /// the seats left no longer state the outcomes the vote attested, and
+    /// a vote over the kept ones alone would certify a root no replica
+    /// ran.
     pub fn revote_at(
         &mut self,
         anchor: WeightedTimestamp,
@@ -769,11 +774,9 @@ impl TickState {
         }
         let outcomes = self.outcomes();
         let root = compute_global_receipt_root(&outcomes);
-        debug_assert_eq!(
-            Some(root),
-            self.local_vote_global_receipt_root,
-            "a re-signed vote restates the vote this validator cast"
-        );
+        if Some(root) != self.local_vote_global_receipt_root {
+            return None;
+        }
         self.reanchored = Some(anchor);
         Some((anchor, root, outcomes))
     }
@@ -1185,6 +1188,20 @@ impl TickState {
             .any(|tx_hash| self.seats.get(tx_hash).is_some_and(|seat| !seat.settled))
     }
 
+    /// Whether the chain still owes a half of this tick that carries its
+    /// certificate: its determined half, or its stating half over
+    /// members no committed block has settled.
+    ///
+    /// A legs half is not among them. It carries no certificate, and a
+    /// sibling reads a stated member's verdict from this shard's state,
+    /// so once the stating half commits the tick owes nothing a
+    /// certificate decides.
+    #[must_use]
+    pub fn unsettled(&self) -> bool {
+        self.determined_unsettled()
+            || (self.stating != Stating::Committed && !self.stating_members().is_empty())
+    }
+
     /// The anchor whose committee would have to attest this tick.
     #[must_use]
     pub const fn anchor(&self) -> WeightedTimestamp {
@@ -1560,8 +1577,8 @@ impl TickState {
 mod tests {
     use hyperscale_engine::legs::Classified;
     use hyperscale_types::{
-        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield, StateWrites,
-        receipt_hash_of,
+        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, REATTESTATION_STEP,
+        SignerBitfield, StateWrites, receipt_hash_of,
     };
 
     use super::*;
@@ -1622,6 +1639,50 @@ mod tests {
             (vec![shared, alone], vec![]),
             "the abandoned member goes whatever it shares",
         );
+    }
+
+    /// A tick that released a member no longer holds the outcomes its
+    /// vote attested, so it re-signs nothing, though its stating half is
+    /// owed again over the kept members: a vote over those alone would
+    /// certify a root no replica ran.
+    #[test]
+    fn a_tick_that_released_a_member_does_not_revote() {
+        let (local, peer) = (shard(0), shard(1));
+        let (core, alone) = (tx(1), tx(2));
+        let voted = || {
+            let mut tick = TickState::new(
+                TickId::new(local, BlockHeight::new(1)),
+                BlockHash::ZERO,
+                WeightedTimestamp::from_millis(1_000),
+            );
+            tick.admit(
+                core,
+                Membership::whole(BTreeSet::from([local, peer])),
+                0,
+                Joins::Executes,
+            );
+            tick.admit(
+                alone,
+                Membership::whole(BTreeSet::from([local])),
+                0,
+                Joins::Executes,
+            );
+            for member in [core, alone] {
+                tick.record_execution_result(member, ExecutionOutcome::Failed);
+            }
+            tick.build_vote_data().expect("a tick that ran votes");
+            tick
+        };
+        let later = WeightedTimestamp::from_millis(1_000).plus(REATTESTATION_STEP);
+
+        assert!(
+            voted().revote_at(later).is_some(),
+            "holding every member it voted on, the tick re-signs",
+        );
+        let mut released = voted();
+        assert_eq!(released.release(None), (vec![alone], vec![core]));
+        assert!(released.unsettled(), "the kept member is still unstated");
+        assert!(released.revote_at(later).is_none());
     }
 
     fn tx(seed: u8) -> TxHash {

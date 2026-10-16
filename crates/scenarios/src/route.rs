@@ -2211,6 +2211,8 @@ struct VenueLoad {
     round: usize,
     /// The last transfer submitted on each shard, in the order of `pairs`.
     last: Vec<Option<TxHash>>,
+    /// A shard the load submits nothing on while it is set.
+    paused: Option<ShardId>,
 }
 
 impl VenueLoad {
@@ -2233,6 +2235,7 @@ impl VenueLoad {
             pairs,
             round: 0,
             last: vec![None; Self::SHARDS.len()],
+            paused: None,
         }
     }
 
@@ -2244,15 +2247,35 @@ impl VenueLoad {
             .collect()
     }
 
-    /// Submit one transfer on each shard.
+    /// Submit one transfer on each shard the load is not paused on.
     fn submit<C: Cluster>(&mut self, c: &mut C) {
-        for (pairs, last) in self.pairs.iter().zip(&mut self.last) {
+        for ((pairs, last), shard) in self.pairs.iter().zip(&mut self.last).zip(Self::SHARDS) {
+            if self.paused == Some(shard) {
+                continue;
+            }
             let (key, from, to) = &pairs[self.round % LOAD_PAIRS];
             let tx = build_transfer_tx(key, *from, *to, 1, validity_around(c.now()));
             *last = Some(tx.hash());
             c.submit(Arc::new(tx));
         }
         self.round += 1;
+    }
+
+    /// Stop submitting on `shard`, and run on until the last transfer
+    /// submitted there has an outcome, so no transfer of the load is
+    /// left to share a block with what is submitted next.
+    fn pause<C: Cluster>(&mut self, c: &mut C, shard: ShardId, span: Duration) {
+        self.paused = Some(shard);
+        let index = Self::SHARDS
+            .iter()
+            .position(|&loaded| loaded == shard)
+            .expect("the load covers the shard");
+        if let Some(hash) = self.last[index] {
+            let settled = self.run(c, span, |c| {
+                c.tx_status(hash).is_some_and(|status| status.is_final())
+            });
+            assert!(settled, "the load's last transfer on {shard:?} must settle");
+        }
     }
 
     /// Run under load until `cond` holds, for at most `span`. Whether it
@@ -2318,7 +2341,41 @@ impl VenueLoad {
 /// verdict or different ones, if a row of the route stands, or if a swap
 /// on the first venue's shard does not accept after it.
 pub fn a_route_settles_on_a_certificate_delivered_past_its_life<C: FaultableCluster>(c: &mut C) {
-    route_held_past_a_certificates_life(c);
+    route_held_past_a_certificates_life(c, LateCertificate::CutOff);
+}
+
+/// The same route held with nothing cut between the venues, its second
+/// venue's certificate forming only past the life of its tick's anchor.
+///
+/// The second venue's committee cannot hear its own execution votes for
+/// the span [`a_route_settles_on_a_certificate_delivered_past_its_life`]
+/// holds its cut. Its member stands unstated through the span, and the
+/// first venue's stated row waits on it; once the votes flow, the
+/// second venue re-signs its tick for a later committee, states the
+/// member, and both venues accept. The load pauses on the second
+/// venue's shard from just before the route to the fault lifting, so
+/// the member's tick there holds it alone and owes no determined half,
+/// whose re-signing would state the member with it.
+///
+/// # Panics
+///
+/// As its sibling, with the second venue's member held unstated rather
+/// than stated while the fault stands.
+pub fn a_route_settles_on_a_certificate_formed_past_its_life<C: FaultableCluster>(c: &mut C) {
+    route_held_past_a_certificates_life(c, LateCertificate::Unformed);
+}
+
+/// What keeps a venue's verdict from its sibling past a certificate's
+/// life.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LateCertificate {
+    /// Both venues certify and state, and every road each one's
+    /// certificate and state have to the other is cut.
+    CutOff,
+    /// Nothing between the venues is cut: the second venue's committee
+    /// cannot hear its own execution votes, so no certificate forms and
+    /// its member is never stated while the fault stands.
+    Unformed,
 }
 
 /// The route's two venues: the swap that follows it runs on the first.
@@ -2353,7 +2410,7 @@ fn no_reshape_evidence<C: Cluster>(c: &C) -> bool {
     })
 }
 
-fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C) {
+fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C, late: LateCertificate) {
     let (waiting, sibling) = LATE_CERTIFICATE_VENUES;
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
@@ -2391,10 +2448,16 @@ fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C) {
         validity_around(c.now()),
     );
     let hash = route.hash();
-    let hold = hold_past_a_certificates_life(c, &mut load, route, epoch);
+    let hold = hold_past_a_certificates_life(c, &mut load, route, late, epoch);
 
     c.clear_drops();
-    let budget = epoch * LATE_CERTIFICATE_SETTLE_EPOCHS;
+    // A certificate formed late forms at the next step on its tick's
+    // anchor grid, which may sit a whole step past the fault lifting.
+    let budget = epoch * LATE_CERTIFICATE_SETTLE_EPOCHS
+        + match late {
+            LateCertificate::CutOff => Duration::ZERO,
+            LateCertificate::Unformed => REATTESTATION_STEP,
+        };
     let settled = load.run(c, budget, |c| {
         verdict_on(c, waiting, hash).is_some() && verdict_on(c, sibling, hash).is_some()
     });
@@ -2409,7 +2472,7 @@ fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C) {
     assert!(
         settled,
         "the route must reach a verdict on both venues within {budget:?} of the fault \
-         lifting (held {hold:?}): {waiting:?} verdict {:?} and row {:?}, \
+         lifting ({late:?}, held {hold:?}): {waiting:?} verdict {:?} and row {:?}, \
          {sibling:?} verdict {:?} and row {:?}, status {:?}",
         verdict_on(c, waiting, hash),
         row_on(c, waiting, hash),
@@ -2457,42 +2520,64 @@ fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C) {
     );
 }
 
-/// Cut the venues off from each other's certificates and state, submit
-/// `route`, and hold both venues' members stated for three epochs and
-/// three [`REATTESTATION_STEP`]s under load. The span held, with the
-/// fault still standing.
+/// Raise the fault `late` names, submit `route`, and hold it for three
+/// epochs and three [`REATTESTATION_STEP`]s under load. The span held,
+/// with the fault still standing.
 ///
-/// The readings are cut among every host outside the trader shard's
-/// committee, both ways: each venue's committee gains members over a
+/// A cut is raised among every host outside the committees it must
+/// leave open, both ways: each venue's committee gains members over a
 /// span this long, and a cut keyed on one committee's hosts would let a
-/// joiner through.
+/// joiner through. [`LateCertificate::CutOff`] cuts the venues'
+/// certificates both ways and readings among every host outside the
+/// trader shard's committee. [`LateCertificate::Unformed`] cuts
+/// execution votes among every host outside the trader shard's and the
+/// first venue's committees, so the second venue's committee, joiners
+/// included, cannot certify, and pauses the load on the second venue's
+/// shard until the span ends.
 ///
 /// # Panics
 ///
-/// Panics if either venue's member is never stated, if the fault never
-/// fires, if a reshape lands inside the span, or if either venue reaches
-/// a verdict while the fault stands.
+/// Panics if a venue's member is not held as `late` has it, if the fault
+/// never fires, if a reshape lands inside the span, or if either venue
+/// reaches a verdict while the fault stands.
 fn hold_past_a_certificates_life<C: FaultableCluster>(
     c: &mut C,
     load: &mut VenueLoad,
     route: Transaction,
+    late: LateCertificate,
     epoch: Duration,
 ) -> Duration {
     let (waiting, sibling) = LATE_CERTIFICATE_VENUES;
-    let fault = [
-        isolate_ec_intake(c, waiting, sibling),
-        isolate_ec_intake(c, sibling, waiting),
-        isolate_crossing_intake_among(c, &[TRADER_SHARD]),
-    ];
+    let fault = match late {
+        LateCertificate::CutOff => vec![
+            isolate_ec_intake(c, waiting, sibling),
+            isolate_ec_intake(c, sibling, waiting),
+            isolate_crossing_intake_among(c, &[TRADER_SHARD]),
+        ],
+        LateCertificate::Unformed => {
+            load.pause(c, sibling, epoch * 2);
+            vec![isolate_execution_votes_among(c, &[TRADER_SHARD, waiting])]
+        }
+    };
     let held_from = c.now();
     let hash = route.hash();
     c.submit(Arc::new(route));
 
     let stated =
         |c: &C, venue: ShardId| matches!(row_on(c, venue, hash), Some(RowState::Stated { .. }));
+    let unstated =
+        |c: &C, venue: ShardId| matches!(row_on(c, venue, hash), Some(RowState::InFlight { .. }));
+    let standing = |c: &C| {
+        stated(c, waiting)
+            && match late {
+                LateCertificate::CutOff => stated(c, sibling),
+                LateCertificate::Unformed => unstated(c, sibling),
+            }
+    };
     assert!(
-        load.run(c, epoch * 8, |c| stated(c, waiting) && stated(c, sibling)),
-        "the route's core must stand stated on both venues; its rows stand {:?} and {:?}",
+        load.run(c, epoch * 8, standing),
+        "the route's core must stand held on both venues ({late:?}); its rows stand {:?} \
+         and {:?}",
         row_on(c, waiting, hash),
         row_on(c, sibling, hash),
     );
@@ -2504,7 +2589,7 @@ fn hold_past_a_certificates_life<C: FaultableCluster>(
     load.run(c, remaining, decided);
     assert!(
         fault.iter().all(|handle| handle.fired() > 0),
-        "the fault must actually have dropped certificates and readings",
+        "the fault must actually have dropped what it cuts ({late:?})",
     );
     assert!(
         no_reshape_evidence(c),
@@ -2512,11 +2597,33 @@ fn hold_past_a_certificates_life<C: FaultableCluster>(
     );
     assert!(
         !decided(c),
-        "neither venue may settle while it cannot read the other: {:?} {:?}",
+        "neither venue may settle while it cannot read the other ({late:?}): {:?} {:?}",
         verdict_on(c, waiting, hash),
         verdict_on(c, sibling, hash),
     );
+    if late == LateCertificate::Unformed {
+        assert!(
+            unstated(c, sibling),
+            "{sibling:?} must not have stated while its votes were cut; its row stands {:?}",
+            row_on(c, sibling, hash),
+        );
+        load.paused = None;
+    }
     hold
+}
+
+/// Cut execution votes among every host outside the committees of
+/// `open`, both ways: a committee drawn from those hosts, joiners
+/// included, certifies nothing while the cut stands.
+fn isolate_execution_votes_among<C: FaultableCluster>(c: &mut C, open: &[ShardId]) -> FaultHandle {
+    let kept: BTreeSet<usize> = open
+        .iter()
+        .flat_map(|&shard| c.committee_hosts(shard))
+        .collect();
+    let cut: Vec<usize> = (0..c.host_count())
+        .filter(|host| !kept.contains(host))
+        .collect();
+    c.drop_type_between(&cut, &cut, "execution.vote")
 }
 
 /// Epochs a recovered venue gets to end the row its recovery released,

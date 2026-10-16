@@ -70,6 +70,7 @@ use hyperscale_scenarios::{
     a_route_only_the_survivor_heard_settles_on_both_venues_or_neither,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_on_a_certificate_delivered_past_its_life,
+    a_route_settles_on_a_certificate_formed_past_its_life,
     a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_shard_halted_across_an_abandon_window_settles_again,
@@ -1553,6 +1554,15 @@ fn a_shard_halted_across_an_abandon_window_settles_again_sim() {
 fn a_route_settles_on_a_certificate_delivered_past_its_life_sim() {
     let mut cluster = dedicated_route_cluster(&late_certificate_genesis_accounts());
     cluster.run_faultable(a_route_settles_on_a_certificate_delivered_past_its_life);
+}
+
+/// The same span with nothing cut between the venues: one venue's
+/// committee is cut off from its own execution votes, so its certificate
+/// forms late rather than travels late. Sim-only, as its sibling.
+#[test]
+fn a_route_settles_on_a_certificate_formed_past_its_life_sim() {
+    let mut cluster = dedicated_route_cluster(&late_certificate_genesis_accounts());
+    cluster.run_faultable(a_route_settles_on_a_certificate_formed_past_its_life);
 }
 
 fn a_route_a_halting_venue_could_read_is_settled_before_the_halt_at_seed(seed: u64) {

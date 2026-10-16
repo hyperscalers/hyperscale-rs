@@ -76,7 +76,7 @@ use hyperscale_types::{
     StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
     TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
     UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
-    WeightedTimestamp, derive_block_transactions, tick_leader,
+    WeightedTimestamp, WindowLookup, derive_block_transactions, tick_leader,
 };
 use tracing::instrument;
 
@@ -2898,16 +2898,23 @@ impl ExecutionCoordinator {
         self.lift_vote_retries(topology_schedule, effects)
     }
 
-    /// Re-sign the vote of every tick still owing its determined half
-    /// once the committed clock passes the next step on its anchor grid
-    /// ([`reattestation_anchor`]), for the committee seated there.
+    /// Re-sign the vote of every tick that has not stated — still owing
+    /// its determined half or its stating half
+    /// ([`TickState::unsettled`]) — once the committed clock passes the
+    /// next step on its anchor grid ([`reattestation_anchor`]), for the
+    /// committee seated there.
     ///
     /// A tick its own committee can no longer certify — a holder of a
     /// vote it needed was cut off until its seat was torn down, or is
-    /// gone — stalls settlement on this shard for good, since every later
-    /// determined half settles behind it. Execution is deterministic, so
-    /// a later committee certifies the outcome the tick's own would have,
-    /// and every tick that already ran on it stays as it ran. A seat
+    /// gone — is owed for good. Its determined half stalls settlement on
+    /// this shard, since every later determined half settles behind it.
+    /// Its stating half never commits, so its core members stand
+    /// unstated here and every sibling's row waiting on them stands too.
+    /// Execution is deterministic, so a later committee certifies the
+    /// outcome the tick's own would have, and every tick that already ran
+    /// on it stays as it ran. A tick whose stating half has committed
+    /// owes only legs halves, which carry no certificate, and is never
+    /// re-signed. A seat
     /// re-signs only a tick it ran, and only where it sits in that step's
     /// committee. A tick anchored below a halt recovery's bridge is left
     /// to the recovery, whose crossing block discards it: re-signed at a
@@ -2915,10 +2922,11 @@ impl ExecutionCoordinator {
     /// certificate would settle at a counterpart while this shard lets it
     /// go.
     ///
-    /// A tick that did certify is re-signed too while its half is owed:
-    /// its certificate lapses at the step like any vote, and a tick held
-    /// behind a stalled one would otherwise be left with a certificate
-    /// no verifier resolves a committee for once the stalled one settles.
+    /// A tick that did certify is re-signed too while a half is owed: its
+    /// certificate lapses at the step like any vote, and a tick held
+    /// behind a stalled one, or a stating half no block carried within a
+    /// step, would otherwise be left with a certificate no verifier
+    /// resolves a committee for.
     /// [`TickState::revote_at`] keeps a step at or below the held
     /// certificate's anchor from re-signing.
     ///
@@ -2930,7 +2938,7 @@ impl ExecutionCoordinator {
             .ticks
             .ticks_iter()
             .filter(|(_, tick)| {
-                tick.determined_unsettled()
+                tick.unsettled()
                     && !topology_schedule
                         .committee_replaced_for_anchored(local_shard, tick.anchor())
             })
@@ -3037,7 +3045,7 @@ impl ExecutionCoordinator {
 
     /// Lift fired retries to `Action::SignAndSendExecutionVote`s.
     fn lift_vote_retries(
-        &self,
+        &mut self,
         topology_schedule: &TopologySchedule,
         effects: Vec<RetryEffect>,
     ) -> Vec<Action> {
@@ -3054,16 +3062,31 @@ impl ExecutionCoordinator {
             // A retry goes to the whole committee that attests the tick —
             // the Ready-filtered set the EC's bitfield indexes — this voter
             // included, so its own vote meets its peers' in every tally,
-            // its own among them. Two ways there is nobody to send to, and
-            // both defer the retry to a later fire: the beacon is behind
+            // its own among them. Three ways there is nobody to send to.
+            // Two defer the retry to a later fire: the beacon is behind
             // the anchor, or the anchor resolves a window this shard has
             // already left, where nobody is seated and no vote can reach a
-            // quorum anyway.
+            // quorum anyway. The third ends it: the anchor's window is
+            // evicted, which no later fire resolves, and a certificate
+            // signed there is past its life wherever it lands. A seat in
+            // the tick's later committee holds a retry at that step's
+            // anchor in this one's place.
             let Some(recipients) =
                 attesting_committee(topology_schedule, self.local_shard, vote_anchor_ts)
                     .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
                     .filter(|committee| !committee.is_empty())
             else {
+                if matches!(
+                    topology_schedule.lookup(vote_anchor_ts),
+                    WindowLookup::Evicted
+                ) {
+                    tracing::debug!(
+                        tick = %tick_id,
+                        anchor = vote_anchor_ts.as_millis(),
+                        "Dropping a vote retry whose anchor's window is evicted"
+                    );
+                    self.ticks.clear_vote_retry(&tick_id);
+                }
                 continue;
             };
             tracing::info!(
@@ -8814,6 +8837,164 @@ mod tests {
             revoted_at(&mut state, &schedule, tick_id, 1_000 + 2 * step + 5),
             vec![1_000 + 2 * step],
         );
+    }
+
+    /// A retry whose anchor's window is evicted is dropped where it would
+    /// fire: no later fire resolves a committee for it. One whose window
+    /// the beacon has not reached is held for the fire that does.
+    #[test]
+    fn a_vote_retry_at_an_evicted_anchor_is_dropped() {
+        use crate::ticks::VOTE_RETRY_TIMEOUT;
+        // One-second windows retained from epoch 5 on.
+        let head = Arc::clone(make_test_topology().head());
+        let schedule = TopologySchedule::new(1_000, Epoch::new(5), head);
+        let mut state = make_test_state();
+        state.committed_ts = WeightedTimestamp::from_millis(5_500);
+        let ahead = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        state.ticks.record_vote_retry(
+            ahead,
+            PendingVoteRetry {
+                sent_at: state.committed_ts,
+                attempt: Attempt::INITIAL,
+                block_hash: BlockHash::ZERO,
+                vote_anchor_ts: WeightedTimestamp::from_millis(99_000),
+                global_receipt_root: GlobalReceiptRoot::ZERO,
+                tx_outcomes: Arc::new(Vec::new()),
+            },
+        );
+        // Anchored at genesis, below the schedule's floor.
+        state.hold_vote_retry(TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+        assert_eq!(state.ticks.retries_len(), 2);
+
+        state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
+        assert!(
+            state.check_vote_retry_timeouts(&schedule).is_empty(),
+            "neither anchor resolves a committee to send to",
+        );
+        assert_eq!(
+            state.ticks.retries_len(),
+            1,
+            "the retry below the floor is dropped, the one ahead of the beacon held",
+        );
+        state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
+        assert!(state.check_vote_retry_timeouts(&schedule).is_empty());
+        assert_eq!(state.ticks.retries_len(), 1);
+    }
+
+    /// A voted tick on the local shard holding one core member awaiting
+    /// a sibling, which ran to `outcome`: a tick with no determined
+    /// half. Returns the tick's id, and the root and outcomes it voted.
+    fn voted_core_tick(
+        state: &mut ExecutionCoordinator,
+        outcome: ExecutionOutcome,
+    ) -> (TickId, GlobalReceiptRoot, Vec<TxOutcome>) {
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let tx_hash = tx.hash();
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![(tx, BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)]))],
+        );
+        tick.record_execution_result(tx_hash, outcome);
+        let (_, root, outcomes) = tick.build_vote_data().expect("a tick that ran votes");
+        assert!(
+            !tick.determined_unsettled(),
+            "the tick runs nothing but a core member",
+        );
+        state.ticks.insert_tick(tick_id, tick);
+        state.ticks.assign_tx(tx_hash, tick_id);
+        (tick_id, root, outcomes)
+    }
+
+    /// The tick's certificate over `outcomes`, signed at `anchor_ms` by
+    /// three of four.
+    fn certified_at(
+        tick_id: TickId,
+        anchor_ms: u64,
+        root: GlobalReceiptRoot,
+        outcomes: Vec<TxOutcome>,
+    ) -> Arc<Verified<ExecutionCertificate>> {
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(anchor_ms),
+            root,
+            Capped::new(outcomes).expect("one outcome"),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        )))
+    }
+
+    /// A tick owing nothing but its stating half re-signs its vote at
+    /// each step on its anchor grid like one owing its determined half:
+    /// no sibling reads the member's verdict until the stating half
+    /// commits, and that half carries the tick's certificate, so one
+    /// never formed, or lapsed before a block carried it, leaves the
+    /// member's row unstated on this shard and its siblings' rows
+    /// waiting. Holding a certificate signed at the step, it sends
+    /// nothing until the next.
+    #[test]
+    fn a_tick_owing_only_its_stating_half_revotes_at_each_grid_point() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let (tick_id, root, outcomes) = voted_core_tick(&mut state, ExecutionOutcome::Failed);
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+
+        assert!(revoted_at(&mut state, &schedule, tick_id, 1_000 + step - 1).is_empty());
+        assert_eq!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + step),
+            vec![1_000 + step],
+            "a tick owing its stating half re-signs at the step",
+        );
+        assert_eq!(
+            state.ticks.retries_len(),
+            1,
+            "and retries the vote it re-signed",
+        );
+
+        state.on_certificate_verified(
+            &schedule,
+            Ok(certified_at(tick_id, 1_000 + step, root, outcomes)),
+        );
+        assert!(
+            revoted_at(&mut state, &schedule, tick_id, 2 * step + 999).is_empty(),
+            "a tick sends nothing while the certificate it holds is within its life",
+        );
+        assert_eq!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + 2 * step),
+            vec![1_000 + 2 * step],
+            "its stating half still owed a step on, it re-signs again",
+        );
+    }
+
+    /// Once a committed block carries a tick's stating half, its members
+    /// stated or refused, the tick re-signs nothing, though a stated yes
+    /// still owes its legs half: that half carries no certificate, and a
+    /// sibling reads the yes from this shard's state.
+    #[test]
+    fn a_tick_whose_members_all_stated_does_not_revote() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let (tick_id, root, outcomes) = voted_core_tick(
+            &mut state,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        state.on_certificate_verified(&schedule, Ok(certified_at(tick_id, 1_000, root, outcomes)));
+        let tick = state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the tick is seated");
+        tick.stating_committed();
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+
+        for at in [1_000 + step, 1_000 + 2 * step, 1_000 + 5 * step] {
+            assert!(
+                revoted_at(&mut state, &schedule, tick_id, at).is_empty(),
+                "a stated tick re-signs nothing at {at}",
+            );
+        }
     }
 
     /// A tick anchored below a halt recovery's bridge is never re-signed,
