@@ -592,6 +592,13 @@ impl IrohAdapter {
         &self.inner.cooldown
     }
 
+    /// Whether this host is refusing `validator`'s traffic for now.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn cooling_down(&self, validator: ValidatorId) -> bool {
+        self.inner.cooldown.cooling_down(validator)
+    }
+
     /// Configure the fault gate: this host's id and the full
     /// `EndpointId → HostId` map. The harness calls this once before
     /// installing faults.

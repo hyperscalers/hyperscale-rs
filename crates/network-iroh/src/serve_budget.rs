@@ -58,7 +58,7 @@ pub fn processor_time<T>(work: impl FnOnce() -> T) -> (T, Duration) {
 
 /// Processor time the calling thread has taken so far.
 #[cfg(unix)]
-fn thread_clock() -> Duration {
+pub fn thread_clock() -> Duration {
     use libc::{CLOCK_THREAD_CPUTIME_ID, clock_gettime, timespec};
 
     let mut now = timespec {
@@ -79,7 +79,7 @@ fn thread_clock() -> Duration {
 /// Time since the process first asked, standing in for a thread's
 /// processor clock where the platform keeps none.
 #[cfg(not(unix))]
-fn thread_clock() -> Duration {
+pub fn thread_clock() -> Duration {
     use std::sync::OnceLock;
     use std::time::Instant as WallClock;
 
