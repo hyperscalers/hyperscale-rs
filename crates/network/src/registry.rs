@@ -27,16 +27,16 @@ use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardId, TopicScope};
 
-use crate::traits::{GossipHandler, NotificationHandler, RequestHandler, Verdict};
+use crate::traits::{GossipHandler, NotificationHandler, RequestHandler, Verdict, VerdictKey};
 
 /// Type-erased gossip handler: receives decompressed wire bytes plus the
 /// shard the topic encoded (`None` for global-scoped topics), and returns
 /// the verdict of this host's handlers on the message.
 ///
 /// `None` when no handler judged it: it targets no shard this host serves,
-/// or its content was dispatched already under another copy's bytes (see
-/// [`GossipMessage::dedup_key`]). A message that does not decode is
-/// rejected.
+/// or its content was dispatched already under another copy's bytes and
+/// that copy still stands (see [`GossipMessage::dedup_key`]). A message
+/// that does not decode is rejected.
 pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<Verdict> + Send + Sync;
 
 /// Type-erased host-level gossip handler: receives decompressed wire bytes.
@@ -82,6 +82,9 @@ pub(crate) trait LocalGossipDispatcher: Send + Sync {
     /// `None` when no handler judged the message, as for
     /// [`RawGossipHandler`].
     fn dispatch(&self, msg: &dyn Any, shard: Option<ShardId>) -> Option<Verdict>;
+
+    /// Let a later copy of the content `content` keys reach the handler.
+    fn forget(&self, content: u64);
 }
 
 /// Counterpart to [`LocalGossipDispatcher`] for the host-level path
@@ -120,12 +123,27 @@ pub(crate) trait LocalRequestDispatcher: Send + Sync {
 /// for a few rounds of committee-size N publishes per type, well bounded.
 const DEDUP_CACHE_CAPACITY: usize = 1024;
 
+/// Copies remembered whose content is keyed and whose verdict a check
+/// settles later: as many as the dedup caches of a few types hold keys.
+const DEFERRED_CACHE_CAPACITY: usize = 4 * DEDUP_CACHE_CAPACITY;
+
+/// The type and content key of each copy whose verdict a check settles
+/// later, by the item the check settles.
+type DeferredContent = BoundedCache<VerdictKey, (TypeId, u64)>;
+
 struct TypedGossipDispatcher<M, H> {
     handler: Arc<H>,
     hosted_shards: Arc<ArcSwap<BTreeSet<ShardId>>>,
     /// Content-key dedup cache (see [`GossipMessage::dedup_key`]). Idle
-    /// for types whose `dedup_key` returns `None`.
+    /// for types whose `dedup_key` returns `None`. Holds the key of a copy
+    /// that was accepted or is still being checked; a copy found false, or
+    /// one this host could not judge, gives its key back, so that it does
+    /// not shut out a later copy of the same content. Copies differ in what
+    /// the content key leaves out, such as a sender and its signature.
     dedup: BoundedCache<u64, ()>,
+    /// Where a copy whose verdict a check settles later is remembered,
+    /// shared by every type's dispatcher.
+    deferred: Arc<DeferredContent>,
     _phantom: PhantomData<fn() -> M>,
 }
 
@@ -154,33 +172,37 @@ where
         }
     }
 
-    /// Check the dedup cache for `msg`. Returns `true` if dispatch
-    /// should proceed (key was new or type opts out of dedup), `false`
-    /// if the message is a duplicate and the caller should short-circuit.
+    /// Hand `typed` to the handler once per target and fold the verdicts,
+    /// unless a copy of its content was dispatched already and still
+    /// stands. `None` when there is no target, or for such a duplicate.
     ///
     /// `BoundedCache` has no atomic insert-if-absent, so two concurrent
     /// calls with the same key may both observe "not present" and both
     /// dispatch. The downstream handler's app-level dedup absorbs this;
     /// the cache is purely a perf optimization.
-    fn admit(&self, msg: &M) -> bool {
-        let Some(key) = msg.dedup_key() else {
-            return true;
-        };
-        if self.dedup.get(&key).is_some() {
-            false
-        } else {
+    fn deliver(&self, typed: &M, topic_shard: Option<ShardId>) -> Option<Verdict> {
+        let content = typed.dedup_key();
+        if let Some(key) = content {
+            if self.dedup.get(&key).is_some() {
+                return None;
+            }
             self.dedup.insert(key, ());
-            true
         }
-    }
-
-    /// Hand `typed` to the handler once per target and fold the verdicts;
-    /// `None` when there is no target.
-    fn dispatch_to_targets(&self, typed: &M, targets: &[ShardId]) -> Option<Verdict> {
-        targets
-            .iter()
-            .map(|&target| self.handler.on_message(typed.clone(), target))
-            .reduce(combine_verdicts)
+        let verdict = self
+            .target_shards(typed, topic_shard)
+            .into_iter()
+            .map(|target| self.handler.on_message(typed.clone(), target))
+            .reduce(combine_verdicts);
+        if let Some(key) = content {
+            match verdict {
+                Some(Verdict::Reject | Verdict::Ignore) => {
+                    self.dedup.remove(&key);
+                }
+                Some(Verdict::Defer(item)) => self.deferred.insert(item, (TypeId::of::<M>(), key)),
+                Some(Verdict::Accept) | None => {}
+            }
+        }
+        verdict
     }
 }
 
@@ -206,11 +228,11 @@ where
         let typed = msg
             .downcast_ref::<M>()
             .expect("local gossip dispatch type mismatch");
-        if !self.admit(typed) {
-            return None;
-        }
-        let targets = self.target_shards(typed, shard);
-        self.dispatch_to_targets(typed, &targets)
+        self.deliver(typed, shard)
+    }
+
+    fn forget(&self, content: u64) {
+        self.dedup.remove(&content);
     }
 }
 
@@ -321,6 +343,8 @@ pub struct HandlerRegistry {
     /// Typed host-level gossip dispatchers keyed by message `TypeId` for
     /// zero-encode local delivery (counterpart to [`Self::host_gossip`]).
     local_host_gossip: ArcSwap<HashMap<TypeId, Arc<dyn LocalHostGossipDispatcher>>>,
+    /// Copies of keyed content whose verdict a check settles later.
+    deferred_content: Arc<DeferredContent>,
 }
 
 impl HandlerRegistry {
@@ -337,6 +361,7 @@ impl HandlerRegistry {
             local_notification: ArcSwap::from_pointee(HashMap::new()),
             local_request: ArcSwap::from_pointee(HashMap::new()),
             local_host_gossip: ArcSwap::from_pointee(HashMap::new()),
+            deferred_content: Arc::new(bounded_cache(DEFERRED_CACHE_CAPACITY)),
         }
     }
 
@@ -403,6 +428,7 @@ impl HandlerRegistry {
             handler: Arc::new(handler),
             hosted_shards: Arc::clone(&self.hosted_shards),
             dedup: bounded_cache(DEDUP_CACHE_CAPACITY),
+            deferred: Arc::clone(&self.deferred_content),
             _phantom: PhantomData,
         });
 
@@ -410,13 +436,7 @@ impl HandlerRegistry {
         let raw: Arc<RawGossipHandler> =
             Arc::new(move |payload: Vec<u8>, shard: Option<ShardId>| {
                 match hbor_from_slice::<M>(&payload) {
-                    Ok(msg) => {
-                        if !bytes_dispatcher.admit(&msg) {
-                            return None;
-                        }
-                        let targets = bytes_dispatcher.target_shards(&msg, shard);
-                        bytes_dispatcher.dispatch_to_targets(&msg, &targets)
-                    }
+                    Ok(msg) => bytes_dispatcher.deliver(&msg, shard),
                     Err(e) => {
                         tracing::warn!(
                             message_type = M::message_type_id(),
@@ -690,6 +710,22 @@ impl HandlerRegistry {
             host_handler.dispatch(msg as &dyn Any);
         }
         verdict
+    }
+
+    /// Take the settled verdict on the item `key` names (see
+    /// [`crate::Network::settle`]): a copy whose check found it false, or
+    /// left this host unable to judge it, no longer keeps later copies of
+    /// its content from their handlers.
+    pub fn settle(&self, key: VerdictKey, verdict: Verdict) {
+        let Some((message_type, content)) = self.deferred_content.get(&key) else {
+            return;
+        };
+        self.deferred_content.remove(&key);
+        if matches!(verdict, Verdict::Reject | Verdict::Ignore)
+            && let Some(dispatcher) = self.local_gossip.load().get(&message_type)
+        {
+            dispatcher.forget(content);
+        }
     }
 
     /// Dispatch a typed notification message into its in-process handler,
@@ -974,6 +1010,127 @@ mod tests {
         assert_eq!(fold(Ignore, Reject), Some(Reject));
         assert_eq!(fold(Ignore, Accept), Some(Accept));
         assert_eq!(fold(Ignore, Ignore), Some(Ignore));
+    }
+
+    /// A copy of some content, as several senders publish it: `content`
+    /// is what the dedup key covers, `forged` what the handler finds.
+    #[derive(Debug, Clone, hyperscale_hbor::Hbor)]
+    struct Copy {
+        content: u32,
+        sender: u32,
+        forged: bool,
+    }
+
+    impl NetworkMessage for Copy {
+        fn message_type_id() -> &'static str {
+            "test.copy"
+        }
+
+        fn class() -> MessageClass {
+            MessageClass::CrossShardProgress
+        }
+    }
+
+    impl GossipMessage for Copy {
+        const SCOPE: TopicScope = TopicScope::Global;
+
+        fn dedup_key(&self) -> Option<u64> {
+            Some(u64::from(self.content))
+        }
+    }
+
+    /// A registry whose handler for [`Copy`] answers `verdict` for each copy
+    /// and counts the copies it is handed.
+    fn copies_judged_by(
+        verdict: impl Fn(&Copy) -> Verdict + Send + Sync + 'static,
+    ) -> (HandlerRegistry, Arc<AtomicUsize>) {
+        let registry = HandlerRegistry::new(std::iter::once(ShardId::leaf(1, 0)).collect());
+        let handled = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&handled);
+        registry.register_gossip(move |copy: Copy, _: ShardId| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            verdict(&copy)
+        });
+        (registry, handled)
+    }
+
+    fn deliver(registry: &HandlerRegistry, copy: &Copy) -> Option<Verdict> {
+        let handler = registry.get_gossip("test.copy").unwrap();
+        handler(hbor_to_vec(copy).unwrap(), None)
+    }
+
+    fn copy(sender: u32, forged: bool) -> Copy {
+        Copy {
+            content: 9,
+            sender,
+            forged,
+        }
+    }
+
+    #[test]
+    fn a_copy_found_false_does_not_shut_out_a_later_honest_one() {
+        let (registry, handled) = copies_judged_by(|copy| {
+            if copy.forged {
+                Verdict::Reject
+            } else {
+                Verdict::Accept
+            }
+        });
+
+        assert_eq!(deliver(&registry, &copy(1, true)), Some(Verdict::Reject));
+        assert_eq!(deliver(&registry, &copy(2, false)), Some(Verdict::Accept));
+        assert_eq!(
+            deliver(&registry, &copy(3, false)),
+            None,
+            "an accepted copy stands for its content"
+        );
+        assert_eq!(handled.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_copy_this_host_could_not_judge_does_not_shut_out_another() {
+        let (registry, handled) = copies_judged_by(|copy| {
+            if copy.sender == 1 {
+                Verdict::Ignore
+            } else {
+                Verdict::Accept
+            }
+        });
+
+        assert_eq!(deliver(&registry, &copy(1, false)), Some(Verdict::Ignore));
+        assert_eq!(deliver(&registry, &copy(2, false)), Some(Verdict::Accept));
+        assert_eq!(handled.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_deferred_copy_stands_until_its_check_finds_it_false() {
+        let key = |copy: &Copy| VerdictKey::of(&(copy.sender, copy.forged));
+        let (registry, handled) = copies_judged_by(move |copy| Verdict::Defer(key(copy)));
+
+        let forged = copy(1, true);
+        assert_eq!(
+            deliver(&registry, &forged),
+            Some(Verdict::Defer(key(&forged)))
+        );
+        assert_eq!(
+            deliver(&registry, &copy(2, false)),
+            None,
+            "a copy being checked stands for its content"
+        );
+        registry.settle(key(&forged), Verdict::Reject);
+
+        let honest = copy(3, false);
+        assert_eq!(
+            deliver(&registry, &honest),
+            Some(Verdict::Defer(key(&honest)))
+        );
+        registry.settle(key(&honest), Verdict::Accept);
+        assert_eq!(
+            deliver(&registry, &copy(4, false)),
+            None,
+            "a copy whose check held stands for its content"
+        );
+        assert_eq!(handled.load(Ordering::SeqCst), 2);
     }
 
     /// Per-shard request unregistration clears both dispatch maps and

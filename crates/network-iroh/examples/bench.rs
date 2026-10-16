@@ -306,6 +306,15 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         secs: u64,
     },
+    /// A peer sends a false copy of each committed header just ahead of an
+    /// honest peer's copy of the same header.
+    ShadowFlood {
+        /// Headers a second.
+        #[arg(long, default_value_t = 4)]
+        rate: u32,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// A peer floods global items its receiver refuses with one verdict.
     RefusedFlood {
         /// Items the peer sends a second.
@@ -367,6 +376,39 @@ impl NetworkMessage for Committed {
 impl GossipMessage for Committed {
     const SCOPE: TopicScope = TopicScope::Global;
 }
+
+/// One committee member's copy of a committed header: the content key
+/// covers `seq`, and the copy carries its sender's signature, which a
+/// forger's copy fails.
+#[derive(Debug, Clone, Hbor)]
+struct HeaderCopy {
+    seq: u64,
+    sender: u32,
+    forged: bool,
+    body: Vec<u8>,
+}
+
+impl NetworkMessage for HeaderCopy {
+    fn message_type_id() -> &'static str {
+        "block.committed"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
+    }
+}
+
+impl GossipMessage for HeaderCopy {
+    const SCOPE: TopicScope = TopicScope::Global;
+
+    fn dedup_key(&self) -> Option<u64> {
+        Some(self.seq)
+    }
+}
+
+/// How far an honest copy trails the false one ahead of it: past the time
+/// the receiver takes to judge the false one.
+const HONEST_COPY_LAG: Duration = Duration::from_millis(20);
 
 /// A block header notification, as far as the transport is concerned: a
 /// few KiB under its proposer's signature.
@@ -1489,6 +1531,86 @@ async fn notify_flood(rate: u32, judged: Judged, watch: Duration) {
     );
 }
 
+/// For `watch`, `rate` times a second, a forger publishes a false copy of a
+/// committed header and an honest peer publishes its own copy of the same
+/// header [`HONEST_COPY_LAG`] later. Counts the honest copies that reach
+/// the receiver's handler: the forger shuts out the rest.
+async fn shadow_flood(rate: u32, watch: Duration) {
+    let fixtures = IrohFixtures::new(SEED, 3);
+    let host = |index, bootstrap| {
+        iroh_host(
+            &fixtures,
+            index,
+            &[ShardId::ROOT],
+            bootstrap,
+            PathTimers::default(),
+            Arc::new(BlsVerifier),
+        )
+    };
+    let (receiver, receiver_network) = host(0, None).await;
+    let (forger, forger_network) = host(1, Some(receiver.endpoint_addr())).await;
+    let (honest, honest_network) = host(2, Some(receiver.endpoint_addr())).await;
+    let bound = timeout(MESH_BUDGET, async {
+        while receiver.peer_for_validator(vid(1)).is_none()
+            || receiver.peer_for_validator(vid(2)).is_none()
+            || forger.peer_for_validator(vid(0)).is_none()
+            || honest.peer_for_validator(vid(0)).is_none()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(bound.is_ok(), "the senders bind");
+    sleep(Duration::from_secs(3)).await;
+
+    let false_copies = Arc::new(AtomicU64::new(0));
+    let honest_copies = Arc::new(AtomicU64::new(0));
+    let (judged_false, judged_honest) = (Arc::clone(&false_copies), Arc::clone(&honest_copies));
+    receiver_network.register_gossip_handler(move |copy: HeaderCopy, _: ShardId| {
+        if copy.forged {
+            judged_false.fetch_add(1, Ordering::Relaxed);
+            Verdict::Reject
+        } else {
+            judged_honest.fetch_add(1, Ordering::Relaxed);
+            Verdict::Accept
+        }
+    });
+
+    let mut tick = interval(Duration::from_secs(1) / rate);
+    let start = (Instant::now(), cpu_time());
+    let mut sent = 0u64;
+    while start.0.elapsed() < watch {
+        tick.tick().await;
+        sent += 1;
+        let copy = |sender, forged| HeaderCopy {
+            seq: sent,
+            sender,
+            forged,
+            body: vec![7; HEADER_BYTES],
+        };
+        forger_network.broadcast_global(&copy(1, true));
+        sleep(HONEST_COPY_LAG).await;
+        honest_network.broadcast_global(&copy(2, false));
+    }
+    sleep(Duration::from_secs(1)).await;
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+    let reached = honest_copies.load(Ordering::Relaxed);
+    println!(
+        "{}",
+        json!({
+            "measurement": "shadow flood",
+            "backend": "iroh",
+            "secs": wall,
+            "headers": sent,
+            "false_copies_judged": false_copies.load(Ordering::Relaxed),
+            "honest_copies_handled": reached,
+            "honest_copies_shut_out": sent.saturating_sub(reached),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
 /// `dialers` strangers open bind exchanges at a host carrying `validators`
 /// validators for `watch`, each leaving once the host has signed, and the
 /// host's signatures are counted.
@@ -1833,6 +1955,9 @@ async fn main() {
             secs,
         } => {
             notify_flood(rate, verdict, Duration::from_secs(secs)).await;
+        }
+        Command::ShadowFlood { rate, secs } => {
+            shadow_flood(rate, Duration::from_secs(secs)).await;
         }
     }
 }

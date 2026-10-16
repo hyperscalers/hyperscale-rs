@@ -152,6 +152,7 @@ impl Network for IrohNetwork {
 
     fn settle(&self, key: VerdictKey, verdict: Verdict) {
         self.fanout.settle(key, verdict);
+        self.registry.settle(key, verdict);
     }
 
     fn update_routing_committees(&self, committees: Arc<RoutingCommittees>) {
