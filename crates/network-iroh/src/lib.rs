@@ -32,6 +32,7 @@ mod protocol;
 mod record_pace;
 mod request;
 mod request_manager;
+mod serve_budget;
 
 pub use address_book::{AddressBook, IngestOutcome};
 pub use bind::LocalVnodeIdentity;

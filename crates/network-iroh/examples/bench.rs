@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyperscale_crypto_bls::BlsVerifier;
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use hyperscale_network::fault::HostId;
 use hyperscale_network::{
     HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict, VerdictKey,
@@ -292,6 +292,16 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         secs: u64,
     },
+    /// A peer keeps requests for answers that cost their handler CPU in
+    /// flight at a host for as long as it watches, asking again at once
+    /// whatever the answer.
+    RequestFlood {
+        /// Requests the peer keeps in flight.
+        #[arg(long, default_value_t = 4)]
+        in_flight: u32,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// A peer floods global items whose first check holds and whose second
     /// fails, as committed headers whose sender signature holds and whose
     /// certificate does not, while a follower hears only what the receiver
@@ -488,6 +498,41 @@ impl NetworkMessage for Vote {
         MessageClass::Consensus
     }
 }
+
+/// A request whose answer costs its handler CPU, as a state range with its
+/// proof does.
+#[derive(Debug, Clone, Hbor)]
+struct GetCostly(u64);
+
+#[derive(Debug, Clone, Hbor)]
+struct Costly(u64);
+
+impl NetworkMessage for GetCostly {
+    fn message_type_id() -> &'static str {
+        "bench.get_costly"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+impl NetworkMessage for Costly {
+    fn message_type_id() -> &'static str {
+        "bench.costly"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+impl Request for GetCostly {
+    type Response = Costly;
+}
+
+/// CPU a costly answer takes its handler.
+const COSTLY_CPU: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Hbor)]
 struct GetChunk(u64);
@@ -1929,6 +1974,114 @@ async fn certificate_flood(rate: u32, checks: Checks, watch: Duration) {
     );
 }
 
+/// A peer keeps `in_flight` requests for answers that cost their handler
+/// [`COSTLY_CPU`] in flight at a host for `watch`, asking again the moment
+/// one resolves, busy or not: it sends each on a stream of its own, past
+/// any backoff a request manager would keep. Counts the handler time the
+/// host spends on it and the answers it refuses.
+async fn request_flood(in_flight: u32, watch: Duration) {
+    let fixtures = IrohFixtures::new(SEED, 2);
+    let (server, server_network) = iroh_host(
+        &fixtures,
+        0,
+        &[ShardId::ROOT],
+        None,
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let (asker, asker_network) = iroh_host(
+        &fixtures,
+        1,
+        &[],
+        Some(server.endpoint_addr()),
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let bound = timeout(MESH_BUDGET, async {
+        while server.peer_for_validator(vid(1)).is_none()
+            || asker.peer_for_validator(vid(0)).is_none()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(bound.is_ok(), "the pair binds");
+    sleep(Duration::from_secs(3)).await;
+
+    let handled = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&handled);
+    server_network.register_request_handler(ShardId::ROOT, move |request: GetCostly| {
+        let started = Instant::now();
+        while started.elapsed() < COSTLY_CPU {
+            std::hint::spin_loop();
+        }
+        counted.fetch_add(1, Ordering::Relaxed);
+        Costly(request.0)
+    });
+
+    drop(asker_network);
+    let streams = Arc::new(RequestStreams::new(Arc::clone(&asker), Duration::ZERO));
+    let target = server.local_endpoint_id();
+    let request = hbor_to_vec(&GetCostly(0)).expect("a request encodes");
+    let answered = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
+    let start = (Instant::now(), cpu_time());
+    let askers: Vec<_> = (0..in_flight)
+        .map(|_| {
+            let (streams, request, answered, refused) = (
+                Arc::clone(&streams),
+                request.clone(),
+                Arc::clone(&answered),
+                Arc::clone(&refused),
+            );
+            spawn(async move {
+                while start.0.elapsed() < watch {
+                    let outcome = streams
+                        .send(
+                            target,
+                            ShardId::ROOT,
+                            GetCostly::message_type_id(),
+                            request.clone(),
+                            GetCostly::class(),
+                            Duration::from_secs(5),
+                        )
+                        .await;
+                    if outcome.is_ok() {
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for asker in askers {
+        asker.await.expect("an asker finishes");
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+    let handled = handled.load(Ordering::Relaxed);
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "request flood",
+            "backend": "iroh",
+            "in_flight": in_flight,
+            "secs": wall,
+            "handled_per_sec": per_sec(handled),
+            "handler_cores": per_sec(handled) * COSTLY_CPU.as_secs_f64(),
+            "answered_per_sec": per_sec(answered.load(Ordering::Relaxed)),
+            "unanswered_per_sec": per_sec(refused.load(Ordering::Relaxed)),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
 /// Run `measure` over a cluster on `backend`.
 macro_rules! on_backend {
     ($backend:expr, $spec:expr, |$hosts:ident| $measure:expr) => {
@@ -2053,6 +2206,9 @@ async fn main() {
             secs,
         } => {
             notify_flood(rate, verdict, Duration::from_secs(secs)).await;
+        }
+        Command::RequestFlood { in_flight, secs } => {
+            request_flood(in_flight, Duration::from_secs(secs)).await;
         }
         Command::CertificateFlood { rate, checks, secs } => {
             certificate_flood(rate, checks, Duration::from_secs(secs)).await;

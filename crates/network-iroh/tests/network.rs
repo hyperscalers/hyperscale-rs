@@ -1,6 +1,7 @@
 //! Notifications and requests between hosts over real loopback QUIC.
 
 use std::collections::HashSet;
+use std::hint::spin_loop;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ use hyperscale_types::{
 };
 use iroh::EndpointAddr;
 use tokio::runtime::Handle;
+use tokio::spawn;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout};
 
@@ -129,6 +131,50 @@ impl NetworkMessage for Echoed {
 impl Request for Echo {
     type Response = Echoed;
 }
+
+/// A request whose answer takes its handler processor time, as a state
+/// range with its proof does.
+#[derive(Debug, Clone, Hbor)]
+struct Costly(u64);
+
+#[derive(Debug, Clone, Hbor)]
+struct CostlyAnswer(u64);
+
+impl NetworkMessage for Costly {
+    fn message_type_id() -> &'static str {
+        "test.costly"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+impl NetworkMessage for CostlyAnswer {
+    fn message_type_id() -> &'static str {
+        "test.costly_answer"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+impl Request for Costly {
+    type Response = CostlyAnswer;
+}
+
+/// Processor time a costly answer takes its handler.
+const COSTLY: Duration = Duration::from_millis(20);
+
+/// Costly requests a greedy peer keeps in flight.
+const GREEDY_IN_FLIGHT: u32 = 8;
+
+/// How long a peer keeps asking for costly answers.
+const ASKING_WATCH: Duration = Duration::from_secs(5);
+
+/// Handler time a peer may run up at once beyond what time pays down.
+const SERVE_ALLOWANCE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Hbor)]
 struct GetBulk(u64);
@@ -719,4 +765,76 @@ async fn a_peer_whose_notifications_fail_their_deferred_check_is_cooled_down() {
         judged <= admitted,
         "the sender is cooled down: {judged} of {sent} headers checked in {secs} s"
     );
+}
+
+/// Host 1 answers [`Costly`] requests, each taking its handler [`COSTLY`];
+/// returns the handler time it spent.
+fn serve_costly(host: &Host) -> Arc<Mutex<Duration>> {
+    let spent: Arc<Mutex<Duration>> = Arc::default();
+    let counted = Arc::clone(&spent);
+    host.network
+        .register_request_handler(ShardId::ROOT, move |request: Costly| {
+            let started = Instant::now();
+            while started.elapsed() < COSTLY {
+                spin_loop();
+            }
+            *counted.lock().unwrap() += COSTLY;
+            CostlyAnswer(request.0)
+        });
+    spent
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_asking_for_costly_answers_is_held_to_one_core() {
+    let fixtures = TestFixtures::new(11, 2);
+    let (asker, server) = bound_pair(&fixtures).await;
+    let spent = serve_costly(&server);
+
+    // The asker keeps several requests in flight for as long as it watches,
+    // asking again the moment one resolves, answered or not.
+    let network = Arc::clone(&asker.network);
+    let askers: Vec<_> = (0..GREEDY_IN_FLIGHT)
+        .map(|_| {
+            let network = Arc::clone(&network);
+            spawn(async move {
+                let started = Instant::now();
+                let mut answered = 0u64;
+                while started.elapsed() < ASKING_WATCH {
+                    if ask(&network, Costly(answered)).await.is_ok() {
+                        answered += 1;
+                    }
+                }
+                answered
+            })
+        })
+        .collect();
+    for asker in askers {
+        asker.await.expect("an asker finishes");
+    }
+    let spent = *spent.lock().unwrap();
+    // Time pays the debt down as fast as it passes; what was in flight when
+    // the allowance ran out was already admitted.
+    let bound = ASKING_WATCH + SERVE_ALLOWANCE + COSTLY * GREEDY_IN_FLIGHT * 2;
+    assert!(
+        spent <= bound,
+        "the server spent {spent:?} of handler time on one peer in {ASKING_WATCH:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_asking_one_at_a_time_is_always_answered() {
+    let fixtures = TestFixtures::new(11, 2);
+    let (asker, server) = bound_pair(&fixtures).await;
+    let _spent = serve_costly(&server);
+
+    let started = Instant::now();
+    let mut seq = 0u64;
+    while started.elapsed() < ASKING_WATCH {
+        let answer = ask(&asker.network, Costly(seq)).await;
+        assert!(
+            answer.is_ok(),
+            "request {seq} of a peer asking one at a time: {answer:?}"
+        );
+        seq += 1;
+    }
 }

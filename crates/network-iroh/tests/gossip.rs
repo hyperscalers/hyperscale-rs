@@ -900,6 +900,7 @@ async fn a_validator_binding_again_under_a_new_endpoint_is_still_cooled_down() {
 
     // The sender runs past its allowance and is cooled down: the receiver
     // stops judging its items long before the last.
+    let start = Instant::now();
     flood(&sender, 0);
     let before = loop {
         let judged = handled.load(Ordering::SeqCst);
@@ -930,8 +931,13 @@ async fn a_validator_binding_again_under_a_new_endpoint_is_still_cooled_down() {
     flood(&again, ROTATION_FLOOD);
     sleep(SILENCE_WATCH).await;
     let judged = handled.load(Ordering::SeqCst) as u64 - before;
+    // The new endpoint's items wait out the cooldown and are judged against
+    // what time has paid back of the validator's debt since, not against
+    // an allowance of their own.
+    let secs = start.elapsed().as_secs() + 1;
+    let admitted = JUDGED_AT_ONCE + secs * 5;
     assert!(
-        judged <= JUDGED_AT_ONCE,
+        judged <= admitted && admitted < FORGERIES_IN_ALLOWANCE,
         "the validator's debt follows it: {judged} of {ROTATION_FLOOD} judged from the new endpoint"
     );
 }

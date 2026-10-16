@@ -150,11 +150,16 @@ impl Cooldown {
 
     /// Whether `peer` is cooling down.
     pub fn cooling_down(&self, peer: ValidatorId) -> bool {
-        self.peers.get(&peer).is_some_and(|state| {
-            state
-                .cooldown_until
-                .is_some_and(|until| Instant::now() < until)
-        })
+        self.cooling_until(peer).is_some()
+    }
+
+    /// When the cooldown `peer` is in ends, if it is in one.
+    pub fn cooling_until(&self, peer: ValidatorId) -> Option<Instant> {
+        let now = Instant::now();
+        self.peers
+            .get(&peer)
+            .and_then(|state| state.cooldown_until)
+            .filter(|until| now < *until)
     }
 }
 
