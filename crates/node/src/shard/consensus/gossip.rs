@@ -16,7 +16,10 @@
 //!    `ProtocolEvent::UnverifiedRemoteHeaderReceived` (the marker tracks
 //!    the QC predicate, which the envelope check doesn't establish), and
 //!    the state machine still dispatches `Action::VerifyRemoteHeaderQc`
-//!    against them.
+//!    against them. The check settles the gossip verdict the inbound
+//!    handler deferred to it, so the transport forwards a header only once
+//!    its sender signature holds up, and charges the peer that delivered
+//!    one that does not.
 
 use std::sync::Arc;
 
@@ -25,7 +28,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{
     record_signature_verification_failure, record_signature_verification_latency,
 };
-use hyperscale_network::Network;
+use hyperscale_network::{GossipVerdict, Network, VerdictKey};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
@@ -137,6 +140,7 @@ where
         let event_tx = self.event_sender().clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
+        let network = Arc::clone(&self.process.network);
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
@@ -158,6 +162,14 @@ where
                     record_signature_verification_latency(
                         "certified_header",
                         start.elapsed().as_secs_f64(),
+                    );
+                    network.settle(
+                        VerdictKey::of(&gossip),
+                        if valid {
+                            GossipVerdict::Accept
+                        } else {
+                            GossipVerdict::Reject
+                        },
                     );
                     if valid {
                         let raw = Arc::unwrap_or_clone(gossip.certified_header).into_unverified();

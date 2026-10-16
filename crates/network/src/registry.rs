@@ -184,12 +184,15 @@ where
 
 /// The verdict of several hosted shards on one message. A rejection is the
 /// sender's fault whatever the other shards made of it; otherwise a shard
-/// that accepts the message carries it on, and it is ignored only when
-/// every shard ignored it.
+/// that accepts the message carries it on, one still checking it holds it,
+/// and it is ignored only when every shard ignored it.
 const fn combine_verdicts(a: GossipVerdict, b: GossipVerdict) -> GossipVerdict {
     match (a, b) {
         (GossipVerdict::Reject, _) | (_, GossipVerdict::Reject) => GossipVerdict::Reject,
         (GossipVerdict::Accept, _) | (_, GossipVerdict::Accept) => GossipVerdict::Accept,
+        (GossipVerdict::Defer(key), _) | (_, GossipVerdict::Defer(key)) => {
+            GossipVerdict::Defer(key)
+        }
         (GossipVerdict::Ignore, GossipVerdict::Ignore) => GossipVerdict::Ignore,
     }
 }

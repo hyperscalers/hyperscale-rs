@@ -9,7 +9,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_execution::attesting_committee;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::{record_crossing_push_dropped, record_fetch_response_sent};
-use hyperscale_network::Network;
+use hyperscale_network::{Network, VerdictKey};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -167,6 +167,10 @@ where
                         return GossipVerdict::Ignore;
                     };
 
+                    // The shard loop checks the sender signature off this
+                    // thread and settles the verdict, so the header travels
+                    // on only once it holds up.
+                    let key = VerdictKey::of(&gossip);
                     push_shard_input(
                         tx,
                         target_shard,
@@ -177,7 +181,7 @@ where
                             sender_signature: gossip.sender_signature,
                         },
                     );
-                    GossipVerdict::Accept
+                    GossipVerdict::Defer(key)
                 },
             );
 

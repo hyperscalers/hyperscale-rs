@@ -16,6 +16,7 @@ mod bind;
 mod bind_gate;
 mod config;
 mod cooldown;
+mod deferred;
 mod endpoint;
 mod error;
 mod fanout;

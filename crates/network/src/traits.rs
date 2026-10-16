@@ -11,12 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_hbor::{HborEncode, to_vec as hbor_to_vec};
 // Re-export for back-compat call sites; the canonical definition lives in
 // `hyperscale_types`.
 pub use hyperscale_types::TopicScope;
 use hyperscale_types::{
-    ConsensusPublicKey, GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees,
-    ShardId, TopologySnapshot, ValidatorId,
+    ConsensusPublicKey, GossipMessage, Hash, MessageClass, NetworkMessage, Request,
+    RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
 };
 
 /// Maps `ValidatorId` to consensus public key for identity verification (e.g. validator-bind).
@@ -71,6 +72,12 @@ pub enum RequestError {
 /// whether the message may travel on, and whose fault it is when it may
 /// not. A transport that charges senders for refused traffic charges
 /// [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no one's.
+///
+/// A handler whose check of the message finishes only after it returns
+/// says [`Self::Defer`], and the check settles the verdict through
+/// [`Network::settle`]. A transport that forwards only what it has judged
+/// holds the message until then, so a host never forwards a message whose
+/// check could still fail, and the sender answers for it when it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GossipVerdict {
     /// Message is valid — accept and forward to peers.
@@ -85,6 +92,32 @@ pub enum GossipVerdict {
     /// sender's fault; a host that is behind refuses honest messages this
     /// way.
     Ignore,
+    /// The message is being checked, and the check settles the verdict
+    /// on the item `key` names through [`Network::settle`].
+    Defer(VerdictKey),
+}
+
+/// Names an item whose gossip verdict waits on a check, so that the check,
+/// finishing elsewhere, can settle it.
+///
+/// Derived from the item's encoding, so that the handler that defers and the
+/// check that settles name the same item from the value each holds, and two
+/// copies that differ in any signed byte are two items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VerdictKey([u8; 32]);
+
+impl VerdictKey {
+    /// The key of `item`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `item` does not encode; every value that decoded from the
+    /// wire does.
+    #[must_use]
+    pub fn of<T: HborEncode + ?Sized>(item: &T) -> Self {
+        let bytes = hbor_to_vec(item).expect("a decoded item encodes");
+        Self(*Hash::from_bytes(&bytes).as_bytes())
+    }
 }
 
 /// Result of request-response evaluation by the application callback.
@@ -285,6 +318,19 @@ pub trait Network: Send + Sync + 'static {
     /// Default is a no-op — simulation impls route by subscription, not
     /// committee, so the head snapshot never strands a dissolved shard.
     fn update_routing_committees(&self, _committees: Arc<RoutingCommittees>) {}
+
+    // ── Deferred gossip verdicts ──
+
+    /// Settle the verdict a gossip handler deferred on the item `key`
+    /// names, once the check it waited on has finished: [`GossipVerdict::Accept`]
+    /// when the item holds up, [`GossipVerdict::Reject`] when it is false,
+    /// [`GossipVerdict::Ignore`] when this host could not finish judging it.
+    /// A check runs on every copy, wherever it came from; settling an item
+    /// no handler deferred is harmless.
+    ///
+    /// Default is a no-op, for a backend that does not wait for deferred
+    /// verdicts.
+    fn settle(&self, _key: VerdictKey, _verdict: GossipVerdict) {}
 
     // ── Request-response ──
 
