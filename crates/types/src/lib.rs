@@ -171,7 +171,7 @@ pub use shard::header::{
     BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderParts, BlockHeaderVerifyError,
     CommittedTip,
 };
-pub use shard::intake::{IntakeView, StandingToward};
+pub use shard::intake::{AnswerDelta, IntakeView, StandingAnswers, StandingToward};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     ABANDONMENT_RECORD_BYTES, BLOCK_CAPS, BLOCK_RESPONSE_INLINE_BYTES, ENGAGEMENT_BYTES,
@@ -216,8 +216,8 @@ pub use shard::state_claim::{BoundaryOffer, Issuer, StateClaim, Stated, answer_h
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::tick_manifest::{
-    Crossings, DiscardCause, Holds, Joins, MemberTerms, Reach, Reserves, Settlement, StatedTerms,
-    TermsSection, TickLine, TickManifest,
+    Crossings, DiscardCause, Holds, Joins, MemberTerms, Owes, Reach, Reserves, Settlement,
+    StatedTerms, TermsSection, TickLine, TickManifest,
 };
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::timeout_cert::{

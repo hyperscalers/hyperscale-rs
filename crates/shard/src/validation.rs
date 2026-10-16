@@ -14,13 +14,12 @@
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad, TickLine,
-    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, tick_manifest_admits_block,
+    TopologySnapshot, Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
     tick_manifest_admits_members, tick_terms_admit_block,
 };
 
@@ -29,6 +28,7 @@ use crate::admission::{
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_all, unwrapped,
 };
+use crate::tick_members::{run_by, states_entry};
 
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
@@ -461,9 +461,11 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
 }
 
 /// The terms section is one a block may carry: its entries weigh within
-/// the section's byte budget between them, and every transaction of the
-/// block is named by exactly one of an entry and a member line that runs
-/// it, the entries in the block's transaction order.
+/// the section's byte budget between them, every transaction of the
+/// block is named by an entry or a member line that runs it, and one a
+/// line runs is named by an entry as well only where that entry's
+/// crossings are not empty, the entries in the block's transaction
+/// order.
 ///
 /// Read against transactions already held to strictly ascending hash
 /// order, so one walk of the two lists holds the entries to that order
@@ -480,25 +482,21 @@ fn validate_terms_section(block: &Block) -> Result<(), String> {
             "terms section weighs {weight} bytes, over its budget"
         ));
     }
-    let run: BTreeSet<TxHash> = block
-        .tick_manifest()
-        .iter()
-        .filter_map(|line| match line {
-            TickLine::Member { tx, joins, .. } => joins.dispatched().then_some(*tx),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
-        })
-        .collect();
-    let mut stated = block.terms().iter().map(|entry| entry.tx).peekable();
+    let run = run_by(block.tick_manifest());
+    let mut stated = block.terms().iter().peekable();
     for tx in block.transactions().iter() {
         let tx = tx.hash();
-        match (stated.next_if_eq(&tx).is_some(), run.contains(&tx)) {
-            (true, false) | (false, true) => {}
-            (true, true) => {
-                return Err(format!(
-                    "terms section states {tx}, which a line of the block runs"
-                ));
+        let runs = run.contains(&tx);
+        match (stated.next_if(|entry| entry.tx == tx), runs) {
+            (Some(_), false) | (None, true) => {}
+            (Some(entry), true) => {
+                if !states_entry(true, &entry.terms) {
+                    return Err(format!(
+                        "terms section states {tx}, which a line of the block runs and whose terms carry no crossing"
+                    ));
+                }
             }
-            (false, false) => {
+            (None, false) => {
                 return Err(format!(
                     "transaction {tx} has neither its terms stated nor a line running it"
                 ));
@@ -507,7 +505,8 @@ fn validate_terms_section(block: &Block) -> Result<(), String> {
     }
     if let Some(stray) = stated.next() {
         return Err(format!(
-            "terms section states {stray}, which no transaction of the block matches in order"
+            "terms section states {}, which no transaction of the block matches in order",
+            stray.tx
         ));
     }
     Ok(())
@@ -607,7 +606,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{CommittedSets, awaited_core, member_lines, member_of};
@@ -631,7 +630,7 @@ pub mod tests {
         MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
         MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
         MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
-        MemberTerms, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
+        MemberTerms, MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
         ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
         RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId,
         ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
@@ -738,6 +737,7 @@ pub mod tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             covered: false,
             executed: !matches!(state, RowState::Pending),
@@ -4724,6 +4724,10 @@ pub mod tests {
             "a member that ran keeps the crossings an abort answers only where its \
              settlement is shared",
         );
+        assert!(
+            !row.owes.is_empty(),
+            "a member that ran owes its crossings until its row goes",
+        );
         let answered = if row.covered {
             Capped::empty()
         } else {
@@ -5664,32 +5668,49 @@ pub mod tests {
         }
     }
 
-    /// A transaction a line of the block runs has no entry: its row is
-    /// the line's to write. And the entries stand in the block's
-    /// transaction order, each naming a transaction the block commits,
-    /// once.
+    /// A block of `txs` stating stub terms for each of `entries`, every
+    /// entry's crossings cleared unless `crossings`, beside `lines`.
+    fn carrying_terms(
+        txs: &[Arc<Verifiable<Transaction>>],
+        entries: Vec<TxHash>,
+        crossings: bool,
+        lines: Vec<TickLine>,
+    ) -> Block {
+        naming_lines(
+            stating(
+                block_with_transactions(BlockHeight::new(1), txs.to_vec()),
+                entries
+                    .into_iter()
+                    .map(|tx| {
+                        let mut entry = stub_stated_terms(tx, 3);
+                        if !crossings {
+                            entry.terms.crossings = Capped::empty();
+                        }
+                        entry
+                    })
+                    .collect(),
+            ),
+            lines,
+        )
+    }
+
+    /// A transaction a line of the block runs has no entry where its
+    /// terms carry no crossing: its row is the line's to write. And the
+    /// entries stand in the block's transaction order, each naming a
+    /// transaction the block commits, once.
     #[test]
     fn a_block_stating_terms_for_a_member_it_runs_is_refused() {
         let txs = transactions_in_order(3);
         let [first, second, third] = [txs[0].hash(), txs[1].hash(), txs[2].hash()];
         let stray = TxHash::from(Hash::from_bytes(b"committed by no block"));
         let carrying = |entries: Vec<TxHash>, lines: Vec<TickLine>| {
-            naming_lines(
-                stating(
-                    block_with_transactions(BlockHeight::new(1), txs.clone()),
-                    entries
-                        .into_iter()
-                        .map(|tx| stub_stated_terms(tx, 3))
-                        .collect(),
-                ),
-                lines,
-            )
+            carrying_terms(&txs, entries, false, lines)
         };
         let err = validate_terms_section(&carrying(
             vec![first, second, third],
             vec![joining(second, Joins::Executes)],
         ))
-        .expect_err("stated and run");
+        .expect_err("stated without crossings and run");
         assert!(err.contains("which a line of the block runs"), "{err}");
         assert!(
             validate_terms_section(&carrying(
@@ -5710,6 +5731,36 @@ pub mod tests {
             assert!(
                 validate_terms_section(&carrying(entries, vec![])).is_err(),
                 "{why}",
+            );
+        }
+    }
+
+    /// A transaction a line of the block runs whose terms carry
+    /// crossings may have its entry stated beside the line, which its
+    /// row owes from, and may go without one: the block's equality with
+    /// the section its proposer derives is what holds the entry there.
+    #[test]
+    fn a_block_stating_crossing_terms_for_a_member_it_runs_is_admitted() {
+        let txs = transactions_in_order(3);
+        let [first, second, third] = [txs[0].hash(), txs[1].hash(), txs[2].hash()];
+        for runs in [Joins::Executes, Joins::ExecutesAborted] {
+            assert_eq!(
+                validate_terms_section(&carrying_terms(
+                    &txs,
+                    vec![first, second, third],
+                    true,
+                    vec![joining(second, runs)],
+                )),
+                Ok(())
+            );
+            assert_eq!(
+                validate_terms_section(&carrying_terms(
+                    &txs,
+                    vec![first, third],
+                    true,
+                    vec![joining(second, runs)],
+                )),
+                Ok(())
             );
         }
     }

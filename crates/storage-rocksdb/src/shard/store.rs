@@ -209,10 +209,10 @@ impl RocksDbShardStorage {
         write_opts.set_sync(sync);
 
         let batch_size = write_batch.len();
+        self.record_crossings(new_version, rows.crossings);
         self.db.write_opt(write_batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
-        self.record_crossings(new_version, rows.crossings);
         record_storage_batch_size(batch_size);
         record_block_persisted();
         record_certificates_persisted(block.certificates().len());

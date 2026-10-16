@@ -60,10 +60,12 @@ use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
 use hyperscale_network::Network;
-use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
+use hyperscale_storage::{
+    AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
+};
 use hyperscale_types::{
     Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, TopologySnapshot,
-    TransactionStatus, TxHash, ValidatorId, Verified,
+    TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
 };
 pub use io::ShardIo;
 
@@ -440,6 +442,10 @@ where
     /// Seats waiting for the store to come to rest at the last height
     /// the loop fanned out. See [`Self::admit_seats`].
     pub(crate) pending_seats: Vec<VnodeSeat>,
+    /// The answers under this shard's prefix at the persisted head,
+    /// followed while a seat on the loop votes and dropped while none
+    /// does. One per store, whatever the seats on it.
+    pub(crate) answer_follow: Option<AnswerFollow>,
 }
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -928,6 +934,7 @@ where
         )));
 
         self.seed_genesis_substate_frontier(genesis);
+        self.seed_genesis_standing_answers(genesis);
         std::mem::take(&mut self.pending_timer_ops)
     }
 
@@ -948,6 +955,27 @@ where
             committed_state_restored(recovered),
         )));
         std::mem::take(&mut self.pending_timer_ops)
+    }
+
+    /// Seed every vnode's answer count at `genesis` with one whole read
+    /// of the genesis store, which nothing else writes yet, and start
+    /// the follow from it.
+    pub(crate) fn seed_genesis_standing_answers(&mut self, genesis: &Block) {
+        let under = shard_prefix_path(self.shard);
+        let at = (genesis.height(), genesis.hash());
+        let follow = AnswerFollow::whole(&self.io.pending_chain, at, &under);
+        let count = follow.count().clone();
+        self.answer_follow = self.seats_a_voter().then_some(follow);
+        for vnode_idx in 0..self.vnodes.len() {
+            self.vnode_mut(vnode_idx)
+                .state
+                .seed_standing_answers(genesis.height(), count.clone());
+        }
+    }
+
+    /// Whether any vnode on the loop is seated to vote.
+    pub(crate) fn seats_a_voter(&self) -> bool {
+        self.vnodes.iter().any(|vnode| vnode.state.seated_to_vote())
     }
 
     /// Seed every vnode's reshape-trigger count frontier from the genesis

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::{Block, TxHash, Verified};
+use crate::{AnswerDelta, Block, TxHash, Verified};
 
 /// One check the pipeline runs on a block before voting on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -96,10 +96,14 @@ impl Verified<Demands> {
 pub enum CheckOutcome {
     /// The block's claim holds. The state root's replay also measures
     /// the net substate byte change the block makes, which reshape
-    /// predicates read; no other check measures anything.
+    /// predicates read, and what it does to the answers its chain
+    /// holds; no other check measures anything.
     Checked {
         /// The net substate byte change the check measured.
         bytes_delta: i64,
+        /// The block's change to its chain's answers, measured from its
+        /// settled writes against its parent's.
+        answers: AnswerDelta,
     },
     /// The block's claim does not hold; the block never gets a vote.
     Refused,
@@ -107,6 +111,17 @@ pub enum CheckOutcome {
     /// pending and the check is dispatched again when the vote is
     /// re-driven.
     Deferred(DeferOn),
+}
+
+impl CheckOutcome {
+    /// A pass from a check that measures nothing.
+    #[must_use]
+    pub fn checked() -> Self {
+        Self::Checked {
+            bytes_delta: 0,
+            answers: AnswerDelta::default(),
+        }
+    }
 }
 
 /// What a deferred check waits on.

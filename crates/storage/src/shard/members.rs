@@ -29,7 +29,8 @@
 //! reader of the root derives one set. What only a routing replica can
 //! derive of a member, the block states: in its terms section for a
 //! transaction it commits and does not run, and on the member line for
-//! one it runs.
+//! one it runs, beside a terms entry where that one's terms carry
+//! crossings.
 //!
 //! A stated or accepted row hears its siblings through the block's state
 //! claims: a claim names the members whose verdict cells it holds, and
@@ -46,8 +47,8 @@ use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Anchor, Block, BlockHeight, CollectionId, Crossings,
     Deadline, DiscardCause, EntryKey, EntryLeaf, EpochWindows, ExecutionOutcome, Finalization,
     GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins, MAX_PREFIXES_PER_TX,
-    MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection, MemberTerms, Movement, Reach,
-    ReadMark, Reserves, Said, SettledEntries, Settlement, ShardId, StateClaim, StateWrites,
+    MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection, MemberTerms, Movement, Owes,
+    Reach, ReadMark, Reserves, Said, SettledEntries, Settlement, ShardId, StateClaim, StateWrites,
     StatedTerms, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
     TxOutcome, VerdictQuestion, Verifiable, Verified, WeightedTimestamp, entry_leaf_key,
     member_order, said_at, verdict_leaf,
@@ -572,7 +573,8 @@ pub struct Waiting {
 ///
 /// Its terms stand from the block that committed it: stated by that
 /// block's terms section, or by the member line of a transaction the
-/// block itself names to run.
+/// block itself names to run, beside the entry that block keeps for it
+/// where its terms carry crossings.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct MemberRow {
     /// The transaction, whole, so a key two hashes share is visible.
@@ -605,6 +607,10 @@ pub struct MemberRow {
     /// to run, unless its settlement is shared with a sibling, and once
     /// it stands accepted.
     pub crossings: Crossings,
+    /// The per-route counts of the escrowed crossings it consumes, as
+    /// they stood at its commit: kept through naming and release, and
+    /// empty once it stands accepted, since its writes have landed.
+    pub owes: Owes,
     /// What it is judged on until a line names it: `Some` exactly while
     /// it stands `Pending`.
     pub waiting: Option<Waiting>,
@@ -642,6 +648,7 @@ impl MemberRow {
             share: terms.share,
             reserves: terms.reserves.clone(),
             crossings: terms.crossings.clone(),
+            owes: Owes::of(&terms.crossings),
             waiting: Some(Waiting {
                 leg: terms.leg,
                 settlement: terms.settlement,
@@ -794,8 +801,9 @@ pub struct MemberInputs {
     pub covered: Vec<TxHash>,
     /// Its tick manifest.
     pub manifest: Arc<TickManifest>,
-    /// The terms it states of the transactions it commits and does not
-    /// run.
+    /// The terms it states of the transactions it commits: each one no
+    /// line of it runs, and each one a line runs whose terms carry
+    /// crossings.
     pub terms: Vec<StatedTerms>,
     /// What its claims carry at each anchor where one names a verdict,
     /// ascending by anchor.
@@ -1275,6 +1283,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             row.holds = Capped::empty();
             row.reserves = Capped::empty();
             row.crossings = Capped::empty();
+            row.owes = Owes::default();
             self.set_member(tx, Some(row));
         }
     }
@@ -1373,16 +1382,18 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// block's own tick.
     ///
     /// A line naming one of the block's own transactions to run writes
-    /// the row itself, whatever stands under its key: the block states
-    /// no entry for it, and the row a proposer or voter folded from the
-    /// terms it derived must come to the same bytes. So a named row keeps
-    /// nothing its line does not state, and nothing it heard. A row
-    /// standing from an earlier block keeps where it was committed,
-    /// whether a record covers it and whether a line ever ran it, and an
-    /// abort keeps the crossings its row lists. A run keeps the crossings
-    /// its line states, which only a line running a member a sibling
-    /// shares the verdict on does: its effects may never apply, and an
-    /// abort of it then answers them. The row's deadline is
+    /// the row itself, whatever stands under its key, and the row a
+    /// proposer or voter folded from the terms it derived must come to
+    /// the same bytes. So a named row keeps nothing its line does not
+    /// state, and nothing it heard, but what it owes: the counts of the
+    /// crossings the block's entry for it carries, which the block keeps
+    /// exactly where they are not empty. A row standing from an earlier
+    /// block keeps where it was committed, whether a record covers it,
+    /// whether a line ever ran it and what it owes, and an abort keeps
+    /// the crossings its row lists. A run keeps the crossings its line
+    /// states, which only a line running a member a sibling shares the
+    /// verdict on does: its effects may never apply, and an abort of it
+    /// then answers them. The row's deadline is
     /// the transaction's own, read off the block that committed it and
     /// never off a line; the deadline and the answers an abort line
     /// carries are for the replica seating it.
@@ -1392,6 +1403,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     fn name(&mut self, inputs: &MemberInputs) {
         let height = inputs.height;
         let own: BTreeMap<TxHash, Deadline> = inputs.transactions.iter().copied().collect();
+        let owed_by_entry = owed_by_entries(&inputs.terms);
         let mut composed = TickRow::default();
         let mut members = Vec::new();
         for line in inputs.manifest.iter() {
@@ -1407,7 +1419,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     share,
                     reserves,
                     deadline: _,
-                    crossings: stated,
+                    crossings: line_crossings,
                 } => {
                     if self
                         .keyed(*tx)
@@ -1416,19 +1428,20 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         continue;
                     }
                     let runs = joins.dispatched();
-                    // A run consumes the member's crossings, and a run
-                    // whose effects a sibling's verdict can still discard
-                    // keeps the ones its line states until its row ends.
-                    let consumed = if *settlement == Settlement::Shared {
-                        stated.clone()
-                    } else {
-                        Capped::empty()
-                    };
-                    let (deadline, committed, committed_at, covered, executed, crossings) =
+                    let kept = kept_by_a_run(*settlement, line_crossings);
+                    let (deadline, committed, committed_at, covered, executed, crossings, owes) =
                         if let Some(&deadline) = own.get(tx).filter(|_| runs) {
-                            (deadline, inputs.committed, height, false, true, consumed)
+                            (
+                                deadline,
+                                inputs.committed,
+                                height,
+                                false,
+                                true,
+                                kept,
+                                owed_by_entry.get(tx).cloned().unwrap_or_default(),
+                            )
                         } else if let Some(row) = self.member(*tx) {
-                            let crossings = if runs { consumed } else { row.crossings };
+                            let crossings = if runs { kept } else { row.crossings };
                             (
                                 row.deadline,
                                 row.committed,
@@ -1436,6 +1449,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                                 row.covered,
                                 runs || row.executed,
                                 crossings,
+                                row.owes,
                             )
                         } else {
                             continue;
@@ -1457,6 +1471,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         share: *share,
                         reserves: reserves.clone(),
                         crossings,
+                        owes,
                         waiting: None,
                         covered,
                         executed,
@@ -1587,6 +1602,28 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 }
 
+/// The crossings a row keeps through a line that runs it: a run consumes
+/// them, and one whose effects a sibling's verdict can still discard
+/// keeps those its line states until its row ends.
+fn kept_by_a_run(settlement: Settlement, stated: &Crossings) -> Crossings {
+    if settlement == Settlement::Shared {
+        stated.clone()
+    } else {
+        Capped::empty()
+    }
+}
+
+/// What each transaction `terms` names owes, off the first entry naming
+/// it.
+fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
+    let mut owed = BTreeMap::new();
+    for entry in terms {
+        owed.entry(entry.tx)
+            .or_insert_with(|| Owes::of(&entry.terms.crossings));
+    }
+    owed
+}
+
 /// The entry writes one block makes to the tick membership family.
 ///
 /// In a fixed order: the finalizations delete the rows of the members
@@ -1599,7 +1636,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// records cover the rows they name; each of the block's transactions
 /// its terms section names gets a `Pending` row on those terms; and the
 /// manifest's member lines put rows in flight in the block's own tick,
-/// writing the row of a transaction the block both commits and runs;
+/// writing the row of a transaction the block both commits and runs,
+/// which owes the crossings its entry carries where the block keeps one;
 /// each stated or accepted row a claim names then hears what the claim's
 /// shard says of it; and its fates delete the rows they name, so a
 /// member the block's own discard or finalization released ends deleted;
@@ -2133,9 +2171,10 @@ mod tests {
         AddressClass, AggregateSignature, Declared, Derivation, DerivationError, Derived, Epoch,
         ExecutionCertificate, GlobalReceiptRoot, LocalKey, MAX_CLAIMS_PER_BLOCK,
         MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_PER_BLOCK,
-        MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, Role, SignerBitfield, StateRoot,
-        TransactionEnvelope, ValidatorId, shard_prefix_path,
+        MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, Role, RoutePrefix, SignerBitfield,
+        StateRoot, TransactionEnvelope, ValidatorId, shard_prefix_path,
     };
+    use hyperscale_vm_effects::CrossingId;
     use proptest::collection::vec;
     use proptest::option;
     use proptest::prelude::*;
@@ -2221,8 +2260,8 @@ mod tests {
         }
     }
 
-    /// `block` as it is carried: stating no terms for a transaction a
-    /// line of it runs.
+    /// `block` as it is carried: stating terms for a transaction a line
+    /// of it runs only where they carry crossings.
     fn carried(block: &MemberInputs) -> MemberInputs {
         let run: BTreeSet<TxHash> = block
             .manifest
@@ -2236,7 +2275,7 @@ mod tests {
             terms: block
                 .terms
                 .iter()
-                .filter(|entry| !run.contains(&entry.tx))
+                .filter(|entry| !run.contains(&entry.tx) || !entry.terms.crossings.is_empty())
                 .cloned()
                 .collect(),
             ..block.clone()
@@ -3693,7 +3732,8 @@ mod tests {
     /// every transaction on the terms they derive and then the block as
     /// carried, so there the line names a `Pending` row an entry wrote; a
     /// replica committing the block folds what it carries, which states
-    /// no entry for the transaction, so there the line writes the row
+    /// an entry for the transaction only where its terms carry
+    /// crossings, so there the line writes the row beside that entry or
     /// alone. Every entry of the family is the same bytes on both roads,
     /// and so the root over them is one.
     #[test]
@@ -3702,9 +3742,10 @@ mod tests {
         parent.fold(&committing(1, &[1, 2]));
         parent.fold(&naming(2, vec![joining(1, Joins::Executes)]));
         // Runs two of its own on either dispatched terms, one of them
-        // under a record naming it; aborts a third; leaves a fourth
-        // waiting; and names a standing row beside them.
-        let block = MemberInputs {
+        // under a record naming it and the other consuming no crossing;
+        // aborts a third; leaves a fourth waiting; and names a standing
+        // row beside them.
+        let mut block = MemberInputs {
             covered: vec![tx(3), tx(6)],
             manifest: Arc::new(Capped::from_array([
                 joining(3, Joins::Executes),
@@ -3714,10 +3755,11 @@ mod tests {
             ])),
             ..committing(3, &[3, 4, 5, 6])
         };
+        block.terms[1].terms.crossings = Capped::empty();
         let stated = carried(&block);
         assert_eq!(
             stated.terms.iter().map(|e| e.tx).collect::<Vec<_>>(),
-            [tx(5), tx(6)]
+            [tx(3), tx(5), tx(6)]
         );
 
         let mut derived = Entries(parent.0.clone());
@@ -3737,6 +3779,11 @@ mod tests {
             assert_eq!((row.waiting, row.crossings.len()), (None, 0));
             assert!(!row.covered, "a record covers standing rows only");
         }
+        assert_eq!(
+            row_of(&committed, 3).expect("run").owes,
+            Owes::of(&stub_stated_terms(tx(3), 3).terms.crossings),
+        );
+        assert!(row_of(&committed, 4).expect("run").owes.is_empty());
     }
 
     /// The fold is total over any section: an entry naming no
@@ -3781,17 +3828,23 @@ mod tests {
         );
     }
 
-    /// A block that runs a transaction as it commits it states no entry
-    /// for it, and the row its line writes carries what the line states:
-    /// the share, the charge, the reach and the reservations, under the
-    /// block's own clock and the transaction's own deadline.
+    /// A block that runs a transaction as it commits it states its entry
+    /// only for the crossings it carries, and the row its line writes
+    /// carries what the line states: the share, the charge, the reach
+    /// and the reservations, under the block's own clock and the
+    /// transaction's own deadline, owing what the entry's crossings
+    /// count.
     #[test]
     fn a_row_named_in_its_committing_block_carries_its_share() {
         let block = carried(&MemberInputs {
             manifest: Arc::new(Capped::from_array([joining(1, Joins::Executes)])),
             ..committing(4, &[1])
         });
-        assert!(block.terms.is_empty());
+        assert_eq!(
+            block.terms.iter().map(|entry| entry.tx).collect::<Vec<_>>(),
+            [tx(1)],
+            "its terms carry a crossing",
+        );
         let mut store = Entries::default();
         store.fold(&block);
 
@@ -3811,6 +3864,7 @@ mod tests {
             (block.transactions[0].1, block.committed, block.height),
         );
         assert_eq!((row.waiting, row.crossings.len()), (None, 0));
+        assert_eq!(row.owes, Owes::of(&terms.crossings));
     }
 
     /// A line naming a `Pending` row to run ends what the row waited on:
@@ -3830,11 +3884,154 @@ mod tests {
         assert_eq!((named.waiting, named.crossings.len()), (None, 0));
         assert_eq!(named.holds, terms.declared);
         assert_eq!(named.reserves, pending.reserves);
+        assert!(!pending.owes.is_empty());
+        assert_eq!(named.owes, pending.owes, "naming leaves what it owes");
         assert_eq!(
             (named.deadline, named.committed, named.height),
             (pending.deadline, pending.committed, pending.height),
             "a row keeps where it was committed",
         );
+    }
+
+    /// A row owes the counts of the crossings its committing block's
+    /// terms carry from its commit until its writes land: pending, in
+    /// flight, released and stated alike, and nothing once it stands
+    /// accepted. A finalization deleting it takes what it owes with it.
+    #[test]
+    fn a_row_owes_its_crossings_until_its_writes_land() {
+        let owed = Owes::of(&stub_stated_terms(tx(1), 1).terms.crossings);
+        assert!(!owed.is_empty());
+
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1]));
+        let pending = row_of(&store, 1).expect("committed");
+        assert_eq!((pending.state, &pending.owes), (RowState::Pending, &owed));
+        store.fold(&naming(2, vec![joining(1, Joins::Executes)]));
+        let in_flight = row_of(&store, 1).expect("named");
+        assert!(matches!(in_flight.state, RowState::InFlight { .. }));
+        assert_eq!(in_flight.owes, owed);
+        store.fold(&discarding(3, 2, DiscardCause::Abandoned(tx(1))));
+        let released = row_of(&store, 1).expect("released");
+        assert!(matches!(released.state, RowState::Released { .. }));
+        assert_eq!(released.owes, owed, "a release lands nothing");
+        store.fold(&settling(4, 2, TickHalf::Determined, &[1]));
+        assert_eq!(row_of(&store, 1), None, "its deletion takes what it owes");
+
+        let mut store = stated_beside_peer();
+        let stated = row_of(&store, 1).expect("stated");
+        assert!(matches!(stated.state, RowState::Stated { .. }));
+        assert_eq!(stated.owes, owed, "a stated yes lands nothing");
+        store.fold(&accepting(4, 2, &[1]));
+        let accepted = row_of(&store, 1).expect("accepted");
+        assert_eq!(accepted.state, RowState::Accepted);
+        assert!(accepted.owes.is_empty(), "its writes landed");
+    }
+
+    /// A transaction its own block commits and runs owes, from that
+    /// block, the per-route counts of the crossings the block's kept
+    /// entry carries, ascending by route; one whose terms carry none
+    /// keeps no entry and owes nothing.
+    #[test]
+    fn a_row_run_in_its_committing_block_owes_its_crossings() {
+        let mut block = MemberInputs {
+            manifest: Arc::new(Capped::from_array([
+                joining(1, Joins::Executes),
+                joining(2, Joins::Executes),
+            ])),
+            ..committing(4, &[1, 2])
+        };
+        let first = block.terms[0].terms.crossings[0];
+        let far = Address::new([0xF0; 31], AddressClass::Component);
+        block.terms[0].terms.crossings = Capped::from_array([
+            first,
+            CrossingId {
+                producer: far,
+                ..first
+            },
+            CrossingId { output: 9, ..first },
+        ]);
+        block.terms[1].terms.crossings = Capped::empty();
+        let block = carried(&block);
+        assert_eq!(
+            block.terms.iter().map(|entry| entry.tx).collect::<Vec<_>>(),
+            [tx(1)]
+        );
+        let mut store = Entries::default();
+        store.fold(&block);
+
+        let row = row_of(&store, 1).expect("run");
+        assert!(matches!(row.state, RowState::InFlight { .. }));
+        assert_eq!(row.crossings.len(), 0);
+        let near = RoutePrefix::of(first.producer);
+        let far = RoutePrefix::of(far);
+        assert!(near < far);
+        assert_eq!(row.owes.iter().collect::<Vec<_>>(), [(near, 2), (far, 1)]);
+        assert!(row_of(&store, 2).expect("run").owes.is_empty());
+    }
+
+    /// A member a sibling shares the verdict on, which its own block
+    /// commits and runs, keeps the crossings its line states and owes
+    /// the counts its kept entry carries, whichever way the fold reaches
+    /// it: over the `Pending` row the entry wrote, or off the block as
+    /// carried.
+    #[test]
+    fn a_shared_member_run_in_its_committing_block_keeps_its_crossings_and_owes_them() {
+        let terms = stub_stated_terms(tx(1), 1).terms;
+        assert!(!terms.crossings.is_empty());
+        let TickLine::Member {
+            tx: named,
+            joins,
+            holds,
+            reach,
+            awaits,
+            charge,
+            share,
+            reserves,
+            deadline,
+            ..
+        } = joining(1, Joins::Executes)
+        else {
+            unreachable!("a member line");
+        };
+        let block = MemberInputs {
+            manifest: Arc::new(Capped::from_array([TickLine::Member {
+                tx: named,
+                joins,
+                settlement: Settlement::Shared,
+                holds,
+                reach,
+                awaits,
+                charge,
+                share,
+                reserves,
+                deadline,
+                crossings: terms.crossings.clone(),
+            }])),
+            ..committing(1, &[1])
+        };
+        let stated = carried(&block);
+        assert_eq!(stated.terms.len(), 1, "its terms carry crossings");
+
+        let mut derived = Entries::default();
+        derived.fold(&MemberInputs {
+            manifest: Arc::new(Capped::empty()),
+            ..block
+        });
+        derived.fold(&stated);
+        let mut committed = Entries::default();
+        committed.fold(&stated);
+        assert_eq!(derived.0, committed.0);
+
+        let row = row_of(&committed, 1).expect("run");
+        assert!(matches!(
+            row.state,
+            RowState::InFlight {
+                settlement: Settlement::Shared,
+                ..
+            }
+        ));
+        assert_eq!(row.crossings, terms.crossings);
+        assert_eq!(row.owes, Owes::of(&terms.crossings));
     }
 
     /// A transaction a block both commits and aborts has its entry and
@@ -3908,13 +4105,15 @@ mod tests {
         assert!(executed(&store, 1), "aborted after it ran");
         assert!(!executed(&store, 2), "aborted twice, and never run");
 
-        let own = carried(&MemberInputs {
+        let mut own = MemberInputs {
             manifest: Arc::new(Capped::from_array([
                 joining(3, Joins::ExecutesAborted),
                 joining(4, Joins::Aborted),
             ])),
             ..committing(5, &[3, 4])
-        });
+        };
+        own.terms[0].terms.crossings = Capped::empty();
+        let own = carried(&own);
         assert_eq!(
             own.terms.len(),
             1,
@@ -4038,14 +4237,28 @@ mod tests {
         assert_eq!(reserved(&store, 8), 5);
         assert_eq!(reserved(&store, 7), 0, "a vault nobody reserves");
 
-        let block = carried(&MemberInputs {
+        let mut block = MemberInputs {
             manifest: Arc::new(Capped::from_array([joining(4, Joins::Executes)])),
             ..committing(2, &[4])
-        });
+        };
+        block.terms[0].terms.crossings = Capped::empty();
+        let block = carried(&block);
         assert!(block.terms.is_empty(), "its line alone writes its row");
         store.fold(&block);
         assert_eq!(reserved(&store, 4), 4);
         assert_eq!(reserved(&store, 9), 42);
+
+        let block = carried(&MemberInputs {
+            manifest: Arc::new(Capped::from_array([joining(5, Joins::Executes)])),
+            ..committing(3, &[5])
+        });
+        assert_eq!(block.terms.len(), 1, "its terms carry a crossing");
+        store.fold(&block);
+        assert_eq!(
+            reserved(&store, 5),
+            5,
+            "its entry and its line reserve once"
+        );
 
         let (left, _) = LOCAL.children();
         assert_eq!(reserved_total(&store, left, vault(9)), 0);

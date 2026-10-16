@@ -1,12 +1,15 @@
 //! What a shard's intake of core transactions is held to: the member
 //! rows standing toward each sibling, against
-//! [`MAX_STANDING_TOWARD_SHARD`].
+//! [`MAX_STANDING_TOWARD_SHARD`], and the answers a consumer's chain
+//! holds per producer route.
 
 use std::collections::{BTreeMap, HashSet};
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::LazyLock;
 
-use crate::{MAX_STANDING_TOWARD_SHARD, ShardId, ShardTrie, Terminating, TxHash, TxsInFlight};
+use crate::{
+    MAX_STANDING_TOWARD_SHARD, RoutePrefix, ShardId, ShardTrie, Terminating, TxHash, TxsInFlight,
+};
 
 /// The member rows standing toward each shard: for a shard, the rows
 /// whose settlement awaits it.
@@ -57,6 +60,103 @@ impl StandingToward {
         for &shard in awaited {
             let count = self.0.entry(shard).or_default();
             *count = count.saturating_add(1);
+        }
+    }
+}
+
+/// The answers a consumer's chain holds, per producer route: for each
+/// route, how many answer leaves under the chain's prefix answer a
+/// crossing whose producer it places.
+///
+/// It holds an entry only for a route some answer names, so it holds no
+/// more entries than answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StandingAnswers(BTreeMap<RoutePrefix, u64>);
+
+impl StandingAnswers {
+    /// The answers standing for crossings out of `route`.
+    #[must_use]
+    pub fn from_route(&self, route: RoutePrefix) -> u64 {
+        self.0.get(&route).copied().unwrap_or(0)
+    }
+
+    /// Every answer standing.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.0.values().sum()
+    }
+
+    /// Count one more answer out of `route`.
+    pub fn add(&mut self, route: RoutePrefix) {
+        *self.0.entry(route).or_default() += 1;
+    }
+
+    /// Count one answer out of `route` fewer, where one stands.
+    pub fn remove(&mut self, route: RoutePrefix) {
+        if let Some(count) = self.0.get_mut(&route) {
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(&route);
+            }
+        }
+    }
+
+    /// Advance by `delta`, or leave the count as it was and name the
+    /// first route `delta` would take below zero.
+    ///
+    /// # Errors
+    ///
+    /// The route `delta` takes more answers off than stand.
+    pub fn advance(&mut self, delta: &AnswerDelta) -> Result<(), RoutePrefix> {
+        let mut advanced = self.0.clone();
+        for (&route, &change) in &delta.0 {
+            let held = advanced.get(&route).copied().unwrap_or(0);
+            let count = held.checked_add_signed(change).ok_or(route)?;
+            if count == 0 {
+                advanced.remove(&route);
+            } else {
+                advanced.insert(route, count);
+            }
+        }
+        self.0 = advanced;
+        Ok(())
+    }
+}
+
+/// What a block does to the answers its chain holds, per producer
+/// route: an answer it writes counts one up, an answer it removes or
+/// writes over one down. It holds no route whose change nets to zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerDelta(BTreeMap<RoutePrefix, i64>);
+
+impl AnswerDelta {
+    /// One answer out of `route` written.
+    pub fn put(&mut self, route: RoutePrefix) {
+        self.change(route, 1);
+    }
+
+    /// One answer out of `route` removed or written over.
+    pub fn take(&mut self, route: RoutePrefix) {
+        self.change(route, -1);
+    }
+
+    /// The net change out of `route`.
+    #[must_use]
+    pub fn of(&self, route: RoutePrefix) -> i64 {
+        self.0.get(&route).copied().unwrap_or(0)
+    }
+
+    /// Whether the block changes no route's count.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn change(&mut self, route: RoutePrefix, by: i64) {
+        let net = self.0.entry(route).or_default();
+        *net += by;
+        if *net == 0 {
+            self.0.remove(&route);
         }
     }
 }

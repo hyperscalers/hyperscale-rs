@@ -1094,6 +1094,7 @@ impl BlockCommitCoordinator {
                 ProtocolEvent::BlockPersisted {
                     height: max_persisted,
                     substate_bytes: 0,
+                    standing_answers: None,
                 },
             );
         });

@@ -307,13 +307,10 @@ impl RocksDbShardStorage {
                 seal_final_batch(&mut batch, &cf, height, witnesses, bytes_total, root)?;
             }
 
+            self.restart_crossings(batch_version);
             self.db
                 .write(batch)
                 .map_err(|e| format!("snap-sync import write: {e}"))?;
-            self.crossing_journal
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .restart();
 
             parent = Some(batch_version);
             batch_version += 1;
@@ -730,10 +727,11 @@ impl BoundaryStore for RocksDbShardStorage {
             height,
         );
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, height.inner());
-        self.db
-            .write(batch)
-            .map_err(|e| format!("follow write failed: {e}"))?;
         self.record_crossings(height.inner(), rows.crossings);
+        self.db.write(batch).map_err(|e| {
+            self.restart_crossings(height.inner());
+            format!("follow write failed: {e}")
+        })?;
         Ok(new_root)
     }
 
@@ -1027,6 +1025,118 @@ mod tests {
             assert!(reads > 10, "the reader ran beside the commits: {reads}");
             assert_eq!(followed, whole, "after {reads} reads, at {cursor:?}");
         });
+    }
+
+    /// A commit records its crossing rows before its head moves, so a
+    /// follow stepping while a commit stands between the two counts the
+    /// answers the head it names holds. Read the other way round, the
+    /// follow names the new head with only the journal's older keys, and
+    /// tags a count short of that head's answers with its height and
+    /// block. `ChainCrossings` reads its rows the same way: head, then
+    /// the changes through it, then each at the head.
+    #[test]
+    fn a_follow_beside_a_commit_in_flight_counts_at_the_head_it_names() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use hyperscale_storage::test_helpers::{
+            answer_leaf, commit_settled_at, make_test_block, make_test_certified,
+        };
+        use hyperscale_storage::{AnswerFollow, AnswerSource, CrossingJournal, PendingChain};
+        use hyperscale_types::{
+            BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, ChainOrigin,
+        };
+        use hyperscale_vm_effects::Answered;
+
+        /// The store's chain, its journal read through a lock the test
+        /// holds.
+        struct Held<'a> {
+            chain: &'a Arc<PendingChain<RocksDbShardStorage>>,
+            journal: &'a CrossingJournal,
+        }
+        impl AnswerSource for Held<'_> {
+            fn head(&self) -> Option<(BlockHeight, BlockHash)> {
+                self.chain.head()
+            }
+            fn rows(&self, under: &NibblePath) -> Vec<SubstateKey> {
+                self.chain.rows(under)
+            }
+            fn changes(
+                &self,
+                under: &NibblePath,
+                since: Option<CrossingCursor>,
+                through: BlockHeight,
+            ) -> (Option<Vec<SubstateKey>>, CrossingCursor) {
+                self.journal.since(under, since, through.inner())
+            }
+            fn read_at(
+                &self,
+                at: (BlockHeight, BlockHash),
+                keys: &[SubstateKey],
+            ) -> Vec<Option<Vec<u8>>> {
+                self.chain.read_at(at, keys)
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let storage = open_storage(dir.path());
+        let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
+        let producer = Address::new([0x10; 31], AddressClass::Component);
+        let consumer = Address::new([0x20; 31], AddressClass::Component);
+        let leaf = |output| answer_leaf(producer, consumer, output, Answered::Taken, 1);
+        commit_settled_at(
+            &storage,
+            &make_test_certified(make_test_block(BlockHeight::new(1))),
+            &[leaf(1)],
+            &[],
+            &witness,
+        );
+        let chain = Arc::new(PendingChain::new(
+            Arc::new(storage.clone()),
+            ChainOrigin::ROOT,
+        ));
+        let under = NibblePath::empty();
+        let mut follow = None;
+        let step = |follow: &mut Option<AnswerFollow>, journal: &CrossingJournal| {
+            let held = Held {
+                chain: &chain,
+                journal,
+            };
+            let (height, block, count) =
+                AnswerFollow::step(follow, &held, &under).expect("a follow caught up counts");
+            let whole = AnswerFollow::whole(&held, (height, block), &under);
+            assert_eq!(
+                &count,
+                whole.count(),
+                "the count tagged with height {height:?} is the store's there",
+            );
+            height
+        };
+        assert_eq!(AnswerFollow::step(&mut follow, &chain, &under), None);
+
+        let journal = storage.crossing_journal.lock().unwrap();
+        let writer = {
+            let storage = storage.clone();
+            let certified = make_test_certified(make_test_block(BlockHeight::new(2)));
+            let creations = [leaf(2)];
+            std::thread::spawn(move || {
+                commit_settled_at(&storage, &certified, &creations, &[], &witness);
+            })
+        };
+        let started = Instant::now();
+        while storage.committed_head().0 < BlockHeight::new(2)
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(step(&mut follow, &journal), BlockHeight::new(1));
+        drop(journal);
+        writer.join().unwrap();
+        assert_eq!(
+            step(&mut follow, &storage.crossing_journal.lock().unwrap()),
+            BlockHeight::new(2)
+        );
+        assert_eq!(follow.expect("following").count().total(), 2);
     }
 
     /// The crossing journal names every row a commit moves, and a

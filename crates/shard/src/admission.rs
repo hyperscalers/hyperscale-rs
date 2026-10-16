@@ -1546,7 +1546,7 @@ pub(crate) mod fixtures {
     use hyperscale_types::test_utils::stub_abort_charge;
     use hyperscale_types::{
         Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch, Finalization,
-        GlobalReceiptHash, Hash, Joins, NetworkDefinition, Settlement, ShardAnchor, ShardId,
+        GlobalReceiptHash, Hash, Joins, NetworkDefinition, Owes, Settlement, ShardAnchor, ShardId,
         StateRoot, TickHalf, TopologySchedule, TopologySnapshot, ValidatorSet, Verifiable,
         WeightedTimestamp, WindowLookup,
     };
@@ -1598,6 +1598,7 @@ pub(crate) mod fixtures {
                     share: 0,
                     reserves: Capped::empty(),
                     crossings: Capped::empty(),
+                    owes: Owes::default(),
                     waiting: None,
                     covered: false,
                     executed: true,
@@ -1768,9 +1769,9 @@ mod state_claim_tests {
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, GlobalReceiptHash, Hash,
-        Inclusion, MerkleInclusionProof, NetworkDefinition, RETENTION_HORIZON, RecoveryBinding,
-        RecoveryCause, ShardId, ShardRecovery, StateClaim, Stated, SubstateKey, TopologySchedule,
-        TopologySnapshot, TxHash, ValidatorSet, WeightedTimestamp, verdict_leaf,
+        Inclusion, MerkleInclusionProof, NetworkDefinition, Owes, RETENTION_HORIZON,
+        RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, StateClaim, Stated, SubstateKey,
+        TopologySchedule, TopologySnapshot, TxHash, ValidatorSet, WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2420,6 +2421,7 @@ mod state_claim_tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             covered: false,
             executed: true,

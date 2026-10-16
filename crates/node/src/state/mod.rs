@@ -39,8 +39,8 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    Block, BlockHeight, Derivation, LocalTimestamp, ShardId, StateRoot, TopologySchedule,
-    TopologySnapshot, ValidatorId,
+    Block, BlockHeight, Derivation, LocalTimestamp, ShardId, StandingAnswers, StateRoot,
+    TopologySchedule, TopologySnapshot, ValidatorId,
 };
 use participation::ShardParticipation;
 use tracing::instrument;
@@ -300,6 +300,25 @@ impl NodeStateMachine {
             s.shard_coordinator
                 .seed_substate_bytes_frontier(height, count);
         }
+    }
+
+    /// Seed the answer count at a chain's genesis. See
+    /// [`hyperscale_shard::ShardCoordinator::seed_standing_answers`].
+    pub(crate) fn seed_standing_answers(&mut self, height: BlockHeight, count: StandingAnswers) {
+        let schedule = self.beacon_coordinator.topology_schedule();
+        if let Some(s) = self.shard.as_mut() {
+            s.shard_coordinator
+                .seed_standing_answers(schedule, height, count);
+        }
+    }
+
+    /// Whether this vnode is seated on a shard and sits in its committee.
+    /// See [`hyperscale_shard::ShardCoordinator::seated_to_vote`].
+    pub(crate) fn seated_to_vote(&self) -> bool {
+        self.shard.as_ref().is_some_and(|s| {
+            s.shard_coordinator
+                .seated_to_vote(self.beacon_coordinator.topology_schedule())
+        })
     }
 
     /// Tell execution how far the store this seat reads is written, as

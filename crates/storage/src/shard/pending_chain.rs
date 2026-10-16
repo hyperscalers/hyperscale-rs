@@ -195,6 +195,11 @@ where
         }
     }
 
+    /// The persisted store the chain hangs off.
+    pub(crate) const fn base(&self) -> &Arc<S> {
+        &self.base
+    }
+
     /// Append an entry, or restate the prepared state of one already held.
     ///
     /// Every seat on a host prepares the blocks it applies into this one

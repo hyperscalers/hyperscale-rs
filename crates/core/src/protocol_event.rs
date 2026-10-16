@@ -13,8 +13,8 @@ use hyperscale_storage::FeeTerms;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
+    Anchor, AnswerDelta, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader,
+    BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
     CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CheckOutcome, Epoch, ExecutionCertificate,
     ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
@@ -23,9 +23,9 @@ use hyperscale_types::{
     QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
     Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateClaim, StoredReceipt, SubstateKey, TickId, Timeout,
-    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable,
-    VerificationKind, Verified, WeightedTimestamp,
+    SpcProposalObjectVerifyError, SpcView, StandingAnswers, StateClaim, StoredReceipt, SubstateKey,
+    TickId, Timeout, Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells,
+    Verifiable, VerificationKind, Verified, WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, QcSubject};
@@ -272,6 +272,12 @@ pub enum ProtocolEvent {
         /// machine — the shard loop fills it from storage while
         /// re-dispatching; the io worker's raw emission carries zero.
         substate_bytes: u64,
+        /// The answers the chain holds, with the height and block of the
+        /// persisted view they were read at, which stands at or above
+        /// `height`. The shard loop fills it while a seat on it votes,
+        /// and only where its follow of the store caught up rather than
+        /// read whole.
+        standing_answers: Option<(BlockHeight, BlockHash, StandingAnswers)>,
     },
 
     /// Quorum Certificate verification and building result.
@@ -430,6 +436,9 @@ pub enum ProtocolEvent {
         /// computation. Feeds the coordinator's count frontier for
         /// reshape-trigger derivation.
         bytes_delta: i64,
+        /// The block's change to its chain's answers, from the same
+        /// computation.
+        answers: AnswerDelta,
         /// Provisions included in the block.
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     },

@@ -56,7 +56,7 @@ use hyperscale_types::network::Signed;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
-    AggregateSignature, Anchor, BeaconWitnessRoot, BeaconWitnessRootContext,
+    AggregateSignature, Anchor, AnswerDelta, BeaconWitnessRoot, BeaconWitnessRootContext,
     BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockManifest, BlockVote, BodyRootContext, CertificateRoot, CertifiedBlock, ChainOrigin,
     CheckOutcome, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch, Finalization,
@@ -275,6 +275,7 @@ enum SimEvent {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         bytes_delta: i64,
+        answers: AnswerDelta,
     },
     QcResult {
         block_hash: BlockHash,
@@ -301,12 +302,12 @@ enum SimEvent {
 }
 
 /// The completion event the sim loops back for one check.
-const fn check_completed(block_hash: BlockHash, kind: VerificationKind, passed: bool) -> SimEvent {
+fn check_completed(block_hash: BlockHash, kind: VerificationKind, passed: bool) -> SimEvent {
     SimEvent::BlockCheckCompleted {
         block_hash,
         kind,
         outcome: if passed {
-            CheckOutcome::Checked { bytes_delta: 0 }
+            CheckOutcome::checked()
         } else {
             CheckOutcome::Refused
         },
@@ -1317,6 +1318,7 @@ impl ShardCoordinatorSim {
                 finalizations,
                 provisions,
                 bytes_delta,
+                answers,
             } => coord.on_proposal_built(
                 topology_schedule,
                 height,
@@ -1326,6 +1328,7 @@ impl ShardCoordinatorSim {
                 finalizations,
                 provisions,
                 bytes_delta,
+                answers,
             ),
             SimEvent::QcResult {
                 block_hash,
@@ -1421,6 +1424,7 @@ impl ShardCoordinatorSim {
                 finalizations,
                 provisions,
                 bytes_delta,
+                answers,
             } = event
             else {
                 panic!(
@@ -1438,6 +1442,7 @@ impl ShardCoordinatorSim {
                     finalizations,
                     provisions,
                     bytes_delta,
+                    answers,
                 },
             });
         }
@@ -1862,6 +1867,9 @@ impl ShardCoordinatorSim {
                 .expect("the sim persists a block only after its proposal is built");
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;
+                let answers = result
+                    .jmt_snapshot
+                    .answer_delta(&view.snapshot(), &shard_prefix_path(shard_id));
                 // Mirror `make_commit_prepared`: stash the JMT
                 // snapshot into `pending_chain` so subsequent
                 // child verifications see the overlay.
@@ -1885,6 +1893,7 @@ impl ShardCoordinatorSim {
                         finalizations,
                         provisions,
                         bytes_delta,
+                        answers,
                     },
                 });
             }
@@ -2141,6 +2150,8 @@ impl ShardCoordinatorSim {
                     terminal_settled_txs_required,
                 });
                 let bytes_delta = jmt_snapshot.bytes_delta;
+                let answers =
+                    jmt_snapshot.answer_delta(&view.snapshot(), &shard_prefix_path(self.shard));
                 if verify_result.is_ok() {
                     self.pending_chains[emitter_idx].insert(
                         block_hash,
@@ -2165,7 +2176,10 @@ impl ShardCoordinatorSim {
                         block_hash,
                         kind: VerificationKind::StateRoot,
                         outcome: match verify_result {
-                            Ok(_) => CheckOutcome::Checked { bytes_delta },
+                            Ok(_) => CheckOutcome::Checked {
+                                bytes_delta,
+                                answers,
+                            },
                             Err(_) => CheckOutcome::Refused,
                         },
                     },

@@ -133,6 +133,7 @@ impl ShardParticipation {
                 finalizations,
                 provisions,
                 bytes_delta,
+                answers,
             } => self.shard_coordinator.on_proposal_built(
                 topology_schedule,
                 height,
@@ -142,6 +143,7 @@ impl ShardParticipation {
                 finalizations,
                 provisions,
                 bytes_delta,
+                answers,
             ),
             // `BlockPersisted` advances `last_persisted_height`, a fallback
             // gate for deferred state root verifications. Steady-state
@@ -155,11 +157,13 @@ impl ShardParticipation {
             ProtocolEvent::BlockPersisted {
                 height,
                 substate_bytes,
+                standing_answers,
             } => {
                 let mut actions = self.shard_coordinator.on_block_persisted(
                     topology_schedule,
                     height,
                     substate_bytes,
+                    standing_answers,
                 );
                 // If shard consensus just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
@@ -713,6 +717,7 @@ mod tests {
             ProtocolEvent::BlockPersisted {
                 height: BlockHeight::new(10),
                 substate_bytes: 0,
+                standing_answers: None,
             },
         );
 
@@ -782,6 +787,7 @@ mod tests {
             ProtocolEvent::BlockPersisted {
                 height: BlockHeight::new(1),
                 substate_bytes: 0,
+                standing_answers: None,
             },
         );
         assert!(

@@ -263,7 +263,7 @@ impl BoundaryStore for SimShardStorage {
                 .insert(leaf.key, Arc::from(leaf.value.into_inner()));
         }
         state.sweep_index.fold(&sweep_rows);
-        state.crossing_journal.restart();
+        state.crossing_journal.restart(height.inner());
 
         // Seed the substate byte total: a fresh-tree import's byte delta IS
         // the imported leaves' value bytes.

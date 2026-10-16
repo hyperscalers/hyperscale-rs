@@ -1188,7 +1188,7 @@ mod tests {
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, ExecutionOutcome,
         GlobalReceiptHash, Hash, Heard, LocalKey, MAX_CLAIMS_BYTES, MAX_INTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_VALIDITY_RANGE,
-        MAX_VERDICT_CLAIMS_BYTES, NetworkDefinition, RETENTION_HORIZON, RoutePrefix, Said,
+        MAX_VERDICT_CLAIMS_BYTES, NetworkDefinition, Owes, RETENTION_HORIZON, RoutePrefix, Said,
         ShardAnchor, StateRoot, TimestampRange, TopologySchedule, TransactionDecision, TxHash,
         TxOutcome, UnsettledTx, ValidatorSet,
     };
@@ -1903,6 +1903,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             covered: false,
             executed: true,

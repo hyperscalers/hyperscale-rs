@@ -76,6 +76,7 @@ pub use shard::pending_chain::{
 pub use shard::read_frontier::{load_read_frontier, read_frontier_writes, with_frontier};
 pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_headers};
 pub use shard::retention::{Retired, retire_dated};
+pub use shard::standing_answers::{AnswerFollow, AnswerSource, answer_delta, answer_route};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
     BlockSweep, CommittedHere, SweepIndex, SweepRow, SweepRows, colliding_committed_cell,

@@ -61,7 +61,7 @@ use crate::parent_checks::{
     AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
     without_refused_reclaims,
 };
-use crate::tick_members::{derived_terms, stated_terms};
+use crate::tick_members::{derived_terms, stated_terms, states_entry};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -342,8 +342,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let tick_manifest: Arc<TickManifest> =
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"));
     // What the block states: the terms of every transaction it commits
-    // and no line of it runs. The fold below reads this section and not
-    // the derived set, as every replica committing the block does.
+    // that no line of it runs, or whose terms carry crossings. The fold
+    // below reads this section and not the derived set, as every replica
+    // committing the block does.
     let stated = stated_terms(std::mem::take(&mut pending.terms), &tick_manifest);
     let terms: Arc<TermsSection> = Arc::new(
         Capped::new(stated.clone()).expect("one entry at most for each transaction of the block"),
@@ -689,14 +690,16 @@ impl Naming<'_> {
     /// Selection charged the entry of every transaction reaching beyond
     /// this shard and nothing for the rest, which are ready in their own
     /// block unless a standing hold or the manifest's budget keeps them
-    /// out of its tick. Where the entries of those kept out carry the
-    /// section past its budget, the transactions no line names and
-    /// selection did not charge are dropped from the tail of the block's
-    /// order until what is left fits, and the lines are named once more
-    /// over the kept list. A dropped transaction claimed no hold and
-    /// spent no budget, so the second naming names every line of the
-    /// first and leaves a section no heavier than the drop left. A
-    /// dropped transaction stays pooled.
+    /// out of its tick. A transaction the block runs keeps its entry only
+    /// where its terms carry crossings, which only one reaching beyond
+    /// the shard does, so selection charged every entry so kept. Where
+    /// the entries of those kept out carry the section past its budget,
+    /// the transactions no line names and selection did not charge are
+    /// dropped from the tail of the block's order until what is left
+    /// fits, and the lines are named once more over the kept list. A
+    /// dropped transaction claimed no hold and spent no budget, so the
+    /// second naming names every line of the first and leaves a section
+    /// no heavier than the drop left. A dropped transaction stays pooled.
     pub(crate) fn within_terms_budget(
         &self,
         transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
@@ -713,8 +716,9 @@ impl Naming<'_> {
 
 impl Named {
     /// The transactions to drop so the section these lines leave fits
-    /// its budget: from the tail of `transactions`, the block's order,
-    /// those no line names that reach no further than this shard.
+    /// its budget, weighing every entry [`stated_terms`] keeps: from the
+    /// tail of `transactions`, the block's order, those no line names
+    /// that reach no further than this shard.
     fn past_terms_budget(
         &self,
         transactions: &[Arc<Verified<Transaction>>],
@@ -732,7 +736,7 @@ impl Named {
             .pending
             .terms
             .iter()
-            .filter(|entry| named.get(&entry.tx) != Some(&true))
+            .filter(|entry| states_entry(named.get(&entry.tx) == Some(&true), &entry.terms))
             .map(|entry| entry.terms.wire_weight())
             .sum();
         let mut dropped = BTreeSet::new();
@@ -780,7 +784,7 @@ fn check_completed<T, E: std::fmt::Display>(
     result: Result<T, E>,
 ) -> ProtocolEvent {
     let outcome = match result {
-        Ok(_) => CheckOutcome::Checked { bytes_delta: 0 },
+        Ok(_) => CheckOutcome::checked(),
         Err(reason) => {
             tracing::warn!(?block_hash, ?kind, %reason, "Block check FAILED");
             CheckOutcome::Refused
@@ -1156,7 +1160,7 @@ where
             // name this validator's store never held is neither — the
             // check waits for the body.
             let outcome = match verdict {
-                Resolutions::Exact => CheckOutcome::Checked { bytes_delta: 0 },
+                Resolutions::Exact => CheckOutcome::checked(),
                 Resolutions::Wrong(tx_hash) => {
                     tracing::warn!(
                         ?block_hash,
@@ -1416,6 +1420,7 @@ where
             });
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
+            let answers = jmt_snapshot.answer_delta(&anchored, &shard_prefix_path(ctx.shard));
             if verify_result.is_ok() {
                 absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());
                 // SAFETY: `prepared` belongs to the same JMT replay that just
@@ -1431,7 +1436,10 @@ where
                 });
             }
             let outcome = match verify_result {
-                Ok(_) => CheckOutcome::Checked { bytes_delta },
+                Ok(_) => CheckOutcome::Checked {
+                    bytes_delta,
+                    answers,
+                },
                 Err(e) => {
                     tracing::warn!(
                         block_hash = ?block_hash,
@@ -1685,6 +1693,9 @@ where
             };
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;
+            let answers = result
+                .jmt_snapshot
+                .answer_delta(&view.snapshot(), &shard_prefix_path(shard_id));
             absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());
             (ctx.commit_prepared)(PreparedBlock {
                 block_hash,
@@ -1702,6 +1713,7 @@ where
                 finalizations: finalizations.into_inner(),
                 provisions: provisions.into_inner(),
                 bytes_delta,
+                answers,
             });
         }
 

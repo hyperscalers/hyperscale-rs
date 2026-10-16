@@ -258,7 +258,9 @@ impl TestRows {
     /// Start the journal over, as a store its readers no longer follow:
     /// the next read is whole.
     pub fn restart(&self) {
-        self.cells().journal.restart();
+        let mut cells = self.cells();
+        let version = cells.version;
+        cells.journal.restart(version);
     }
 
     fn cells(&self) -> std::sync::MutexGuard<'_, TestCells> {

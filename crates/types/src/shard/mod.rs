@@ -13,7 +13,9 @@
 //! - [`header`]: [`BlockHeader`] (shard-voted metadata).
 //! - [`intake`]: [`StandingToward`](intake::StandingToward), the member
 //!   rows standing toward each shard, which a shard's intake of core
-//!   transactions is capped on.
+//!   transactions is capped on, and
+//!   [`StandingAnswers`](intake::StandingAnswers), the answers a
+//!   consumer's chain holds per producer route.
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
 //! - [`load`]: [`ShardLoad`](load::ShardLoad) — the attested-work and
 //!   stored-byte totals a header attests, which the beacon reweights

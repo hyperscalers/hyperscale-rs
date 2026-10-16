@@ -137,13 +137,10 @@ impl RocksDbShardStorage {
         write_chain_origin(&mut batch, origin);
         write_genesis_installed(&mut batch, genesis.height());
         self.append_genesis_tip_to_batch(&mut batch, genesis);
+        self.restart_crossings(genesis_version);
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(format!("reshape adoption write: {e}")))?;
-        self.crossing_journal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .restart();
         Ok(adopted)
     }
 

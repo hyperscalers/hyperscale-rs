@@ -470,7 +470,9 @@ pub trait BoundaryStore {
     /// where the store cannot say and a reader reads the rows whole,
     /// with where the reader stands once it has read them at `through`:
     /// [`CrossingJournal::since`](crate::CrossingJournal::since) over the
-    /// store's journal.
+    /// store's journal, which never lags the head
+    /// [`ShardChainReader::committed_head`](crate::ShardChainReader::committed_head)
+    /// names.
     fn crossing_changes(
         &self,
         under: &NibblePath,

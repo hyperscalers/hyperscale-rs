@@ -8031,3 +8031,27 @@ where
         "a walk from the chain's start takes what the parent's frontier does",
     );
 }
+
+/// The answer `consumer` holds, `answered` for transaction `tx`, to the
+/// `output`th crossing out of `producer`: its key and its bytes.
+#[must_use]
+pub fn answer_leaf(
+    producer: Address,
+    consumer: Address,
+    output: u32,
+    answered: Answered,
+    tx: u8,
+) -> (SubstateKey, Vec<u8>) {
+    let id = CrossingId {
+        producer,
+        consumer,
+        intent: IntentHash(Hash32([0x1A; 32])),
+        local: 0,
+        output,
+    };
+    (
+        id.answer_key(&ProtocolHasher, answered),
+        id.answer(VmTxHash(Hash32([tx; 32])), answered, 9_000)
+            .to_bytes(),
+    )
+}

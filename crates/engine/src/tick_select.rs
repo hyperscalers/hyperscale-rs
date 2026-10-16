@@ -1624,11 +1624,11 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
         Heard, LocalKey, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkId, PrincipalAddr,
-        ProtocolHasher, RETENTION_HORIZON, ReadMark, ResourceAddr, Routing, Said, StateRoot,
-        StateWrites, Stated, StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms,
-        TickHalf, TimestampRange, TransactionEnvelope, Unpublished, encode_amount, entry_leaf_key,
-        tick_manifest_admits_members,
+        MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkId, Owes,
+        PrincipalAddr, ProtocolHasher, RETENTION_HORIZON, ReadMark, ResourceAddr, Routing, Said,
+        StateRoot, StateWrites, Stated, StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON,
+        Terms, TickHalf, TimestampRange, TransactionEnvelope, Unpublished, encode_amount,
+        entry_leaf_key, tick_manifest_admits_members,
     };
     use hyperscale_vm_effects::{Answered, Hash32, IntentHash, Terms as CrossingTerms};
     use hyperscale_vm_types::Moves;
@@ -1852,6 +1852,7 @@ mod tests {
             share: terms.share,
             reserves: terms.reserves.clone(),
             crossings: terms.crossings.clone(),
+            owes: Owes::of(&terms.crossings),
             waiting: Some(Waiting {
                 leg: terms.leg,
                 settlement: terms.settlement,
@@ -2531,6 +2532,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             executed: joins.dispatched(),
             hearing: Capped::empty(),
@@ -2596,6 +2598,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             executed: true,
             hearing: Capped::empty(),
@@ -3733,6 +3736,7 @@ mod tests {
             ..consuming()
         };
         assert!(!core.crossings.is_empty());
+        let owed = Owes::of(&core.crossings);
         let shard = ShardId::ROOT;
         let at = BlockHeight::new;
         let live = Evidence::Live { terminating: false };
@@ -3757,10 +3761,12 @@ mod tests {
                         crossings: core.crossings.clone(),
                     }],
                 );
+                let named = &rows.members[&tx(1)];
                 assert_eq!(
-                    rows.members[&tx(1)].crossings,
-                    core.crossings,
-                    "the line that runs a shared member leaves its crossings on its row",
+                    (&named.crossings, &named.owes),
+                    (&core.crossings, &owed),
+                    "the line that runs a shared member leaves its crossings on its row, \
+                     which owes them until its writes land",
                 );
                 if stated {
                     rows.advance(&MemberInputs {
@@ -3797,7 +3803,10 @@ mod tests {
                         covered,
                     ),
                 );
-                assert_eq!(released.crossings, core.crossings);
+                assert_eq!(
+                    (&released.crossings, &released.owes),
+                    (&core.crossings, &owed)
+                );
                 assert_eq!(released.share, if stated { 0 } else { 9 });
 
                 let answered = if covered {
@@ -3818,14 +3827,6 @@ mod tests {
                     "covered {covered}, stated {stated}",
                 );
                 assert_eq!(abort_of(&lines, 1), (deadline, answered));
-                assert!(
-                    matches!(
-                        lines[..],
-                        [TickLine::Member { share, charge, .. }]
-                            if share == released.share && charge == released.charge
-                    ),
-                    "{lines:?}",
-                );
             }
         }
     }
@@ -4240,6 +4241,7 @@ mod tests {
                 share: 0,
                 reserves: Capped::empty(),
                 crossings: Capped::empty(),
+                owes: Owes::default(),
                 waiting: None,
                 executed: true,
                 hearing: Capped::empty(),
@@ -4340,6 +4342,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             executed: true,
             hearing: Capped::empty(),
@@ -4419,6 +4422,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             crossings: Capped::empty(),
+            owes: Owes::default(),
             waiting: None,
             covered: false,
             executed: true,

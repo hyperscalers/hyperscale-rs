@@ -12,9 +12,9 @@ use hyperscale_engine::tick_select::{CommittedSets, Judged, SiblingViews, terms_
 use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, record_arrivals};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CounterpartMirror, Decision, Engagement, EpochWindows, Hears,
-    Joins, Settlement, ShardId, SiblingView, Source, StatedTerms, SubstateKey, TickHalf, TickLine,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, decide,
-    partner_evidence, source_of,
+    Joins, MemberTerms, Settlement, ShardId, SiblingView, Source, StatedTerms, SubstateKey,
+    TickHalf, TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
+    decide, partner_evidence, source_of,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -37,18 +37,34 @@ pub fn derived_terms<'a>(
 }
 
 /// The terms section of a block whose transactions derive `derived` and
-/// whose manifest is `lines`: the entry of every transaction no line
-/// names to run, in the block's transaction order.
+/// whose manifest is `lines`, in the block's transaction order: the
+/// entry of every transaction no line names to run, and of every one a
+/// line runs whose terms carry crossings, which its row owes from the
+/// block that commits it.
 pub fn stated_terms(mut derived: Vec<StatedTerms>, lines: &[TickLine]) -> Vec<StatedTerms> {
-    let run: BTreeSet<TxHash> = lines
+    let run = run_by(lines);
+    derived.retain(|entry| states_entry(run.contains(&entry.tx), &entry.terms));
+    derived
+}
+
+/// Whether a block keeps the terms entry of a transaction it commits:
+/// always where no line of it `runs` the transaction, and otherwise
+/// exactly where the terms carry crossings.
+#[must_use]
+pub fn states_entry(runs: bool, terms: &MemberTerms) -> bool {
+    !runs || !terms.crossings.is_empty()
+}
+
+/// The transactions `lines` name to run.
+#[must_use]
+pub fn run_by(lines: &[TickLine]) -> BTreeSet<TxHash> {
+    lines
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { tx, joins, .. } => joins.dispatched().then_some(*tx),
             TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
         })
-        .collect();
-    derived.retain(|entry| !run.contains(&entry.tx));
-    derived
+        .collect()
 }
 
 /// The chain between the committed tip and a block's parent: tick
@@ -408,4 +424,66 @@ pub fn committed_sets(
         }
     }
     sets
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_hbor::Capped;
+    use hyperscale_types::test_utils::{stub_abort_charge, stub_stated_terms};
+    use hyperscale_types::{Deadline, Hash, Joins, Settlement, WeightedTimestamp};
+
+    use super::*;
+
+    fn tx(seed: u8) -> TxHash {
+        TxHash::from(Hash::from_bytes(&[seed; 32]))
+    }
+
+    fn line(seed: u8, joins: Joins) -> TickLine {
+        TickLine::Member {
+            tx: tx(seed),
+            joins,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(seed),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
+            crossings: Capped::empty(),
+        }
+    }
+
+    /// A block keeps the entry of every transaction no line of it runs,
+    /// and of one a line runs only where its terms carry crossings, in
+    /// the order derived.
+    #[test]
+    fn a_run_transaction_keeps_its_terms_entry_only_with_crossings() {
+        let entry = |seed: u8, crossings: bool| {
+            let mut entry = stub_stated_terms(tx(seed), seed);
+            if !crossings {
+                entry.terms.crossings = Capped::empty();
+            }
+            entry
+        };
+        let derived = vec![
+            entry(1, true),
+            entry(2, false),
+            entry(3, true),
+            entry(4, false),
+            entry(5, false),
+            entry(6, true),
+        ];
+        let lines = [
+            line(3, Joins::Executes),
+            line(4, Joins::Executes),
+            line(5, Joins::Aborted),
+            line(6, Joins::ExecutesAborted),
+        ];
+        let kept: Vec<TxHash> = stated_terms(derived, &lines)
+            .into_iter()
+            .map(|entry| entry.tx)
+            .collect();
+        assert_eq!(kept, [tx(1), tx(2), tx(3), tx(5), tx(6)]);
+    }
 }

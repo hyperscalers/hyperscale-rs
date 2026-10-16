@@ -670,7 +670,8 @@ impl RocksDbShardStorage {
         }
     }
 
-    /// Record the crossing rows a written batch at `version` moved.
+    /// Record the crossing rows the batch at `version` moves, before the
+    /// batch is written: see [`CrossingJournal::record`].
     pub(crate) fn record_crossings(&self, version: u64, crossings: Vec<SubstateKey>) {
         if !crossings.is_empty() {
             self.crossing_journal
@@ -678,6 +679,15 @@ impl RocksDbShardStorage {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record(version, crossings);
         }
+    }
+
+    /// Start the crossing journal over at the batch at `version`, before
+    /// the batch is written: see [`CrossingJournal::restart`].
+    pub(crate) fn restart_crossings(&self, version: u64) {
+        self.crossing_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restart(version);
     }
 
     /// The entries half of a substate write batch: each entry's leaf row
@@ -810,10 +820,10 @@ impl RocksDbShardStorage {
         fold_sweep_rows(&self.db, &mut batch, &self.cf(), &rows.sweep);
 
         // Substates only — no JMT, no sync (genesis isn't durability-critical).
+        self.record_crossings(0, rows.crossings);
         self.db
             .write(batch)
             .expect("genesis substate-only commit failed");
-        self.record_crossings(0, rows.crossings);
     }
 
     /// Compute the JMT once at version 0 from the merged genesis updates.

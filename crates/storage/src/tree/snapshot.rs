@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use hyperscale_jmt::{Child, EMPTY_HASH, Node, NodeKey};
-use hyperscale_types::{BlockHeight, SettledWrites, StateRoot, SubstateKey};
+use hyperscale_jmt::{Child, EMPTY_HASH, NibblePath, Node, NodeKey};
+use hyperscale_types::{AnswerDelta, BlockHeight, SettledWrites, StateRoot, SubstateKey};
 
 use super::{CollectedWrites, state_root_from_jmt};
 use crate::shard::writes::entry_leaf_rows;
+use crate::{Substates, answer_delta};
 
 /// A block's settled writes, with every leaf they put in the tree
 /// findable by its key.
@@ -118,6 +119,17 @@ impl JmtSnapshot {
             bytes_delta: collected.bytes_delta,
             settled: settled.into(),
         }
+    }
+
+    /// What these writes do to the answers under `under` that
+    /// `parent`, the state they land on, holds: see [`answer_delta`].
+    #[must_use]
+    pub fn answer_delta(
+        &self,
+        parent: &(impl Substates + ?Sized),
+        under: &NibblePath,
+    ) -> AnswerDelta {
+        answer_delta(self.settled.cells(), parent, under)
     }
 
     /// The two child hashes of the internal node behind `result_root`

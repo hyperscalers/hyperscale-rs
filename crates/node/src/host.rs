@@ -277,6 +277,7 @@ where
                     seated: Vec::new(),
                     reseat: false,
                     pending_seats: Vec::new(),
+                    answer_follow: None,
                 };
                 shard_loop.share_host_seats();
                 (shard, shard_loop)
@@ -774,6 +775,7 @@ where
         seated: Vec::new(),
         reseat: false,
         pending_seats: Vec::new(),
+        answer_follow: None,
     };
     shard_loop.share_host_seats();
     register_shard_request_handlers(process, &shard_loop.io, shard);

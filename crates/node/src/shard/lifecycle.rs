@@ -51,6 +51,8 @@ where
         }
         self.shard_loop_mut(shard)
             .seed_genesis_substate_frontier(genesis_block);
+        self.shard_loop_mut(shard)
+            .seed_genesis_standing_answers(genesis_block);
     }
 
     /// Resume a seated shard's consensus from its recovered committed

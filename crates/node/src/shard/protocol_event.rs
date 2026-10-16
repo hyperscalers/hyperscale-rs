@@ -12,8 +12,8 @@
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
-use hyperscale_storage::{FloorInputs, ShardStorage, chain_floor};
-use hyperscale_types::BlockHeight;
+use hyperscale_storage::{AnswerFollow, FloorInputs, ShardStorage, chain_floor};
+use hyperscale_types::{BlockHash, BlockHeight, StandingAnswers, shard_prefix_path};
 
 use crate::shard::ShardLoop;
 
@@ -46,10 +46,31 @@ where
             .storage
             .substate_bytes_at(height)
             .expect("the just-persisted height must carry its committed byte total");
+        let standing_answers = self.follow_answers();
         self.dispatch_event(ProtocolEvent::BlockPersisted {
             height,
             substate_bytes,
+            standing_answers,
         });
+    }
+
+    /// The answers under this shard's prefix at the store's persisted
+    /// head, tagged with the height and block they were read at, while a
+    /// seat on the loop votes. The head can stand above the persist that
+    /// asks: a flush the drain tail started can land before its event
+    /// is handled.
+    pub(in crate::shard) fn follow_answers(
+        &mut self,
+    ) -> Option<(BlockHeight, BlockHash, StandingAnswers)> {
+        if !self.seats_a_voter() {
+            self.answer_follow = None;
+            return None;
+        }
+        AnswerFollow::step(
+            &mut self.answer_follow,
+            &self.io.pending_chain,
+            &shard_prefix_path(self.shard),
+        )
     }
 
     /// Hold the tick chain and the store's history at the lowest baseline
@@ -142,17 +163,116 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_storage::test_helpers::{
-        commit_settled_at, make_test_block, make_test_certified,
+        answer_leaf, commit_settled_at, make_test_block, make_test_certified,
     };
-    use hyperscale_storage::{RecoveredState, ShardChainReader, ShardChainWriter};
+    use hyperscale_storage::{
+        AnswerFollow, PendingChain, RecoveredState, ShardChainReader, ShardChainWriter,
+    };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, ShardAnchor,
-        StateRoot, WeightedTimestamp, shard_prefix_path,
+        Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight,
+        ChainOrigin, ShardAnchor, StandingAnswers, StateRoot, SubstateKey, WeightedTimestamp,
+        shard_prefix_path,
     };
+    use hyperscale_vm_effects::Answered;
 
     use crate::shard::seated_host::{Fixture, SHARD, loop_of};
+
+    /// `count` answers under [`SHARD`]'s prefix out of one producer, the
+    /// `from`th onward.
+    fn answers_from(from: u32, count: u32) -> Vec<(SubstateKey, Vec<u8>)> {
+        let producer = Address::new([0x10; 31], AddressClass::Component);
+        let consumer = Address::new([0x20; 31], AddressClass::Component);
+        (from..from + count)
+            .map(|output| answer_leaf(producer, consumer, output, Answered::Taken, 1))
+            .collect()
+    }
+
+    /// Persist the next block on `storage`, writing `creations`, and
+    /// say which block it was.
+    fn persist(storage: &SimShardStorage, creations: &[(SubstateKey, Vec<u8>)]) -> BlockHash {
+        let block = make_test_block(storage.committed_height().next());
+        let hash = block.hash();
+        commit_settled_at(
+            storage,
+            &make_test_certified(block),
+            creations,
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
+        hash
+    }
+
+    /// The follow a loop over `storage` keeps.
+    struct Following {
+        chain: Arc<PendingChain<SimShardStorage>>,
+        follow: Option<AnswerFollow>,
+    }
+
+    impl Following {
+        fn over(storage: &SimShardStorage) -> Self {
+            Self {
+                chain: Arc::new(PendingChain::new(
+                    Arc::new(storage.clone()),
+                    ChainOrigin::ROOT,
+                )),
+                follow: None,
+            }
+        }
+
+        fn step(&mut self) -> Option<(BlockHeight, BlockHash, StandingAnswers)> {
+            AnswerFollow::step(&mut self.follow, &self.chain, &shard_prefix_path(SHARD))
+        }
+    }
+
+    /// A flush the drain tail started can land before the event of the
+    /// one before it is handled. The count the loop carries then is the
+    /// one its view read, tagged with that view's height and block, not
+    /// with the height of the persist that asked.
+    #[test]
+    fn a_count_is_tagged_with_the_height_its_view_read() {
+        let storage = SimShardStorage::new(shard_prefix_path(SHARD));
+        persist(&storage, &answers_from(0, 1));
+        let mut follow = Following::over(&storage);
+        assert_eq!(follow.step(), None, "the first persist reads whole");
+
+        persist(&storage, &answers_from(1, 2));
+        let landed = persist(&storage, &answers_from(3, 4));
+        let (height, block, count) = follow.step().expect("the persist of block 2 catches up");
+        assert_eq!((height, block), (BlockHeight::new(3), landed));
+        assert_eq!(count.total(), 7);
+    }
+
+    /// Where the store's journal cannot say what moved since the follow's
+    /// cursor, the loop reads whole again and carries no count, and
+    /// catches up exactly at the next persist: past the journal's keys,
+    /// and on a store restored from an image, whose journal is another
+    /// line.
+    #[test]
+    fn the_follow_reads_whole_again_where_the_journal_cannot_say() {
+        let storage = SimShardStorage::new(shard_prefix_path(SHARD));
+        persist(&storage, &answers_from(0, 3));
+        let image = storage.image();
+        let mut follow = Following::over(&storage);
+        assert_eq!(follow.step(), None);
+
+        let past = u32::try_from(1usize << 16).expect("fits") + 1;
+        persist(&storage, &answers_from(3, past));
+        assert_eq!(follow.step(), None, "past the journal's keys");
+        persist(&storage, &answers_from(3 + past, 1));
+        let (_, _, count) = follow.step().expect("caught up");
+        assert_eq!(count.total(), u64::from(3 + past + 1));
+
+        storage.restore(&image);
+        persist(&storage, &answers_from(10, 2));
+        assert_eq!(follow.step(), None, "another line");
+        persist(&storage, &answers_from(20, 1));
+        let (height, _, count) = follow.step().expect("caught up");
+        assert_eq!((height, count.total()), (BlockHeight::new(3), 6));
+    }
 
     /// A store that began at an imported anchor holds no block beneath
     /// its first, and says so only once its floor is derived. The floor

@@ -22,8 +22,7 @@ pub struct CrossingCursor {
 }
 
 /// The keys whose crossing index row a store has put or removed, each
-/// with the version that wrote it, in the order the writes became
-/// readable.
+/// with the version that wrote it, in the order the store wrote them.
 ///
 /// One line per run of forward commits. Anything else that moves the
 /// index, an import or a re-rooting, a restore from an image, a write
@@ -55,8 +54,14 @@ impl CrossingJournal {
         }
     }
 
-    /// Record `keys` as put or removed by the write at `version`, once
-    /// that write is readable.
+    /// Record `keys` as put or removed by the write at `version`.
+    ///
+    /// The journal never lags the committed head a reader can see: a
+    /// store records a write no later than its head names the write, so
+    /// a reader that takes the head and then the changes through it is
+    /// never handed a cursor at a version whose keys it was not given.
+    /// A write recorded before it lands is harmless, since [`Self::since`]
+    /// names nothing above the version a reader reads at.
     ///
     /// Every key one version moves is recorded in one call: a reader
     /// that has read through `version` takes nothing more at it, so a
@@ -68,7 +73,7 @@ impl CrossingJournal {
             .back()
             .is_some_and(|(newest, _)| *newest > version)
         {
-            self.restart();
+            self.restart(version);
         }
         let mut keys: Vec<SubstateKey> = keys.into_iter().collect();
         let over = (self.keys.len() + keys.len()).saturating_sub(JOURNAL_KEYS);
@@ -82,10 +87,21 @@ impl CrossingJournal {
         self.keys.extend(keys.into_iter().map(|key| (version, key)));
     }
 
-    /// Start a new line: what the index holds no longer follows from the
-    /// keys recorded.
-    pub fn restart(&mut self) {
-        *self = Self::new();
+    /// Start a new line at the write at `version`: what the index holds
+    /// no longer follows from the keys recorded.
+    ///
+    /// A store restarts no later than its head names the write, as it
+    /// records one. Nothing at or below `version` is followed on the new
+    /// line, so a reader that takes a cursor on it while the head still
+    /// stands below `version` reads whole again rather than following
+    /// across the write. The floor covers a write that moves the head
+    /// forward only: a store restarts at a version above every head a
+    /// reader may hold, or with no reader on it.
+    pub fn restart(&mut self, version: u64) {
+        *self = Self {
+            floor: version,
+            ..Self::new()
+        };
     }
 
     /// The keys under `under` written above `since` and at or below
@@ -251,6 +267,29 @@ mod tests {
             None,
             "a read at 5 stands no higher than 5, and version 10's write is behind the floor",
         );
+    }
+
+    /// A restart lands before the write it is for: a reader taking its
+    /// cursor on the new line while its head still stands below the
+    /// write reads whole again, rather than following across a write the
+    /// line holds no keys for.
+    #[test]
+    fn a_cursor_taken_below_a_restart_reads_whole_again() {
+        let mut journal = CrossingJournal::new();
+        let all = NibblePath::empty();
+        journal.record(4, [test_key(1)]);
+        journal.restart(6);
+        let (whole, below) = journal.since(&all, None, 5);
+        assert_eq!(whole, None);
+        assert_eq!(
+            journal.since(&all, Some(below), 6).0,
+            None,
+            "a cursor at 5 does not follow across the write at 6",
+        );
+        let (whole, at) = journal.since(&all, Some(below), 6);
+        assert_eq!(whole, None);
+        journal.record(7, [test_key(2)]);
+        assert_eq!(journal.since(&all, Some(at), 7).0, Some(vec![test_key(2)]));
     }
 
     #[test]

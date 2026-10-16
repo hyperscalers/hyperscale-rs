@@ -25,6 +25,7 @@ pub mod pending_chain;
 pub mod read_frontier;
 pub mod recovered_state;
 pub mod retention;
+pub mod standing_answers;
 pub mod store;
 pub mod sweep;
 pub mod tick_chain;

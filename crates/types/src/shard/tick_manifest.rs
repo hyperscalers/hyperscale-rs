@@ -4,15 +4,17 @@
 //! section in which a block states the terms a transaction it commits
 //! stands on.
 
+use std::collections::BTreeMap;
+
 use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
 
 use crate::{
     AbortCharge, Deadline, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
-    MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, ShardId, SubstateKey, TICK_CROSSING_BYTES,
-    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
-    TickId, TxHash,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, RoutePrefix, ShardId, SubstateKey,
+    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES,
+    TICK_TERMS_BYTES, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -107,6 +109,47 @@ pub type Reserves = Capped<Vec<(SubstateKey, u128)>, MAX_HOLDS_PER_MEMBER>;
 
 /// The escrowed crossings a member consumes.
 pub type Crossings = Capped<Vec<CrossingId>, MAX_CROSSINGS_PER_TX>;
+
+/// How many of a member's escrowed crossings each producer route
+/// carries: one pair per route, ascending by route, each count at
+/// least one. What a row owes its consumer's answers until its writes
+/// land.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hbor)]
+#[hbor(transparent)]
+pub struct Owes(Capped<Vec<(RoutePrefix, u8)>, MAX_CROSSINGS_PER_TX>);
+
+impl Owes {
+    /// The per-route counts of `crossings`, each counted under its
+    /// producer's route.
+    ///
+    /// # Panics
+    ///
+    /// Never: there are no more routes than crossings, and no more
+    /// crossings on one route than [`MAX_CROSSINGS_PER_TX`], which
+    /// fits a `u8`.
+    #[must_use]
+    pub fn of(crossings: &Crossings) -> Self {
+        let mut counts: BTreeMap<RoutePrefix, u8> = BTreeMap::new();
+        for id in crossings.iter() {
+            let count = counts.entry(RoutePrefix::of(id.producer)).or_default();
+            *count = count
+                .checked_add(1)
+                .expect("a member's crossings fit a u8 per route");
+        }
+        Self(Capped::new(counts.into_iter().collect()).expect("no more routes than crossings"))
+    }
+
+    /// Each route with its count, ascending by route.
+    pub fn iter(&self) -> impl Iterator<Item = (RoutePrefix, u8)> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Whether no crossing is owed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// One line of a block's tick manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]

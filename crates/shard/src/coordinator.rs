@@ -161,14 +161,15 @@ use hyperscale_storage::{
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
-    BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext,
-    QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
-    SiblingView, Source, StandingToward, StateRoot, TickLine, Timeout, TimeoutCertificate,
-    TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
-    asks, counts, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip,
+    Finalization, HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions,
+    QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round,
+    SafeVoteRegisters, SiblingView, Source, StandingAnswers, StandingToward, StateRoot, TickLine,
+    Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify,
+    VoteCount, VotePosition, asks, counts, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -199,6 +200,7 @@ use crate::proposal::{
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
+use crate::standing_answers::HeldAnswers;
 use crate::tick_members::{
     Ancestry, OwnContent, accepted_rows, agreements, committed_sets, derived_terms, sibling_view,
     sibling_views, stated_terms,
@@ -453,6 +455,11 @@ pub struct ShardCoordinator {
     /// Net substate delta per uncommitted block. Entries retire into
     /// the byte frontier at commit and are pruned with their blocks.
     pending_bytes_deltas: HashMap<BlockHash, i64>,
+
+    /// The answers the chain holds, as this voter can rebuild them: a
+    /// count at a committed height and the deltas above it. Held only
+    /// while this validator is seated to vote.
+    answers: HeldAnswers,
 
     /// Vote accounting: per-block vote sets and received-vote equivocation
     /// tracking. The safe-vote lock itself lives on the coordinator
@@ -805,6 +812,7 @@ impl ShardCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
+            answers: HeldAnswers::default(),
             // A fresh start's tip is the chain's genesis, whose header
             // carries zero of everything — known, not guessed. A real tip
             // whose header was not recovered stays `None` and defers the
@@ -1972,6 +1980,50 @@ impl ShardCoordinator {
     /// reads from storage.
     pub const fn seed_substate_bytes_frontier(&mut self, height: BlockHeight, count: u64) {
         self.substate_bytes_frontier = (height, count);
+    }
+
+    /// Seed the answer count at a chain's genesis, read whole off the
+    /// genesis store before anything else can write it.
+    pub fn seed_standing_answers(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        height: BlockHeight,
+        count: StandingAnswers,
+    ) {
+        let seated = self.seated_to_vote(topology_schedule);
+        self.answers.seeded(height, count, seated);
+    }
+
+    /// Whether this validator sits in its shard's committee, at the
+    /// head or for the block extending the committed tip, and so may
+    /// vote on what its chain proposes.
+    #[must_use]
+    pub fn seated_to_vote(&self, topology_schedule: &TopologySchedule) -> bool {
+        let seats = |snapshot: &TopologySnapshot| {
+            snapshot
+                .committee_for_shard(self.local_shard)
+                .contains(&self.me)
+        };
+        seats(topology_schedule.head()) || self.tip_committee(topology_schedule).is_some_and(seats)
+    }
+
+    /// The answers the chain holds behind `parent`, rebuilt from the
+    /// committed count over every pending block from the tip's child to
+    /// `parent`, or `None` where this voter cannot rebuild them.
+    #[must_use]
+    pub fn standing_answers_at(&self, parent: BlockHash) -> Option<StandingAnswers> {
+        let mut ancestors = Vec::new();
+        let mut hash = parent;
+        while hash != self.committed_hash {
+            let header = self.pending_blocks.get(hash)?.header();
+            if header.height() <= self.committed_height {
+                return None;
+            }
+            ancestors.push(hash);
+            hash = header.parent_block_hash();
+        }
+        ancestors.reverse();
+        self.answers.at(self.committed_height, ancestors)
     }
 
     /// Handle committed state restored from storage (recovery).
@@ -5202,9 +5254,13 @@ impl ShardCoordinator {
                 self.verification.deferred(block_hash, kind);
                 return vec![];
             }
-            CheckOutcome::Checked { bytes_delta } => {
+            CheckOutcome::Checked {
+                bytes_delta,
+                answers,
+            } => {
                 if kind == VerificationKind::StateRoot {
                     self.pending_bytes_deltas.insert(block_hash, bytes_delta);
+                    self.answers.measured(block_hash, answers);
                 }
                 self.verification.checked(block_hash, kind);
             }
@@ -5465,6 +5521,7 @@ impl ShardCoordinator {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         bytes_delta: i64,
+        answers: AnswerDelta,
     ) -> Vec<Action> {
         match self.proposal.take_matching(height, round) {
             TakeResult::Matched => {}
@@ -5538,6 +5595,7 @@ impl ShardCoordinator {
 
         self.pending_blocks.insert(pending_block);
         self.pending_bytes_deltas.insert(block_hash, bytes_delta);
+        self.answers.measured(block_hash, answers);
         self.record_leader_activity();
 
         // The proposer built the block, so all roots are inherently correct.
@@ -5591,13 +5649,21 @@ impl ShardCoordinator {
     /// unblocks any deferred verifications still waiting on persistence
     /// (boot-time catch-up or fallback if the consensus-commit hook was
     /// missed).
+    ///
+    /// The answers `standing_answers` carries, read by the shard loop at
+    /// a persisted block, re-base the held count where this voter
+    /// committed that block; see [`HeldAnswers::persisted`].
     pub fn on_block_persisted(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_height: BlockHeight,
         substate_bytes: u64,
+        standing_answers: Option<(BlockHeight, BlockHash, StandingAnswers)>,
     ) -> Vec<Action> {
         self.verification.on_block_persisted(block_height);
+        let seated = self.seated_to_vote(topology_schedule);
+        self.answers
+            .persisted(block_height, standing_answers, seated);
 
         // Reconcile the byte frontier from storage. Strictly newer
         // heights only: live commits already advanced the frontier via
@@ -6192,6 +6258,9 @@ impl ShardCoordinator {
                 .expect("substate byte total must not go negative");
             self.substate_bytes_frontier = (height, count);
         }
+
+        let seated = self.seated_to_vote(topology_schedule);
+        self.answers.committed(height, block_hash, seated);
 
         // Register committed artifacts synchronously. The retention maps
         // are populated here so the just-committed block's contents are
@@ -8192,6 +8261,9 @@ impl ShardCoordinator {
             .cleanup(&self.pending_blocks, committed_height);
         self.pending_bytes_deltas
             .retain(|hash, _| self.pending_blocks.get(*hash).is_some());
+        let pending_blocks = &self.pending_blocks;
+        self.answers
+            .retain_pending(|hash| pending_blocks.get(hash).is_some());
 
         orphaned.into_abandon_actions()
     }
@@ -8741,7 +8813,7 @@ impl ShardCoordinator {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -8749,21 +8821,25 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::NibblePath;
     use hyperscale_mempool::MempoolCoordinator;
-    use hyperscale_storage::test_helpers::commit_writes;
+    use hyperscale_storage::test_helpers::{
+        answer_leaf, commit_settled_at, commit_writes, make_test_block_with_anchor_wt,
+        make_test_certified,
+    };
     use hyperscale_storage::{
-        BlockSweep, BoundaryStore, ChainWrites, DedupWindow, FeeTerms, MemberRow, ParentAnchor,
-        PendingChain, RowState, ShardChainWriter, SubstateStore, Substates, TickRow,
-        committed_tx_cell_key, fate_writes, held_total, member_writes, read_frontier_writes,
+        AnswerFollow, AnswerSource, BlockSweep, BoundaryStore, ChainWrites, CrossingCursor,
+        DedupWindow, FeeTerms, MemberRow, ParentAnchor, PendingChain, RowState, ShardChainWriter,
+        SubstateStore, Substates, TickRow, answer_delta, answer_route, committed_tx_cell_key,
+        fate_writes, held_total, key_under_prefix, member_writes, read_frontier_writes,
         reserved_total, with_fee_holds,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, CommittedAt,
-        ConsensusSignature, CounterpartMirror, Deadline, Decision, Declared, DeclaredKey,
-        DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch, Evidence,
-        ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
+        BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, ChainOrigin, CollectionId,
+        CommittedAt, ConsensusSignature, CounterpartMirror, Deadline, Decision, Declared,
+        DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
+        Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER,
         MAX_STANDING_TOWARD_SHARD, MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY,
         MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
@@ -8781,7 +8857,8 @@ mod tests {
         tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
-    use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
+    use hyperscale_vm_effects::{Answered, Hash32, IntentHash, ProtocolHasher, protocol_resource};
+    use hyperscale_vm_types::{LegRole, LegShape, Moves, ValueEdge};
 
     use super::*;
     use crate::action_handlers::{Named, Naming, build_proposal};
@@ -9317,7 +9394,8 @@ mod tests {
 
     /// `block` carrying `transactions` and naming `lines`, and stating
     /// what its proposer states: the terms its committee derives for
-    /// every transaction no line of it runs.
+    /// every transaction no line of it runs, and for every one a line
+    /// runs whose terms carry crossings.
     fn carrying(block: Block, transactions: &[Transaction], lines: Vec<TickLine>) -> Block {
         let local = block.header().shard_id();
         let terms = Arc::new(
@@ -12790,7 +12868,8 @@ mod tests {
         .expect("a list written out in a test")
     }
 
-    /// The weight of the section `named`'s lines leave unstated.
+    /// The weight of the section `named`'s lines leave: the entries
+    /// [`stated_terms`] keeps.
     fn stated_weight(named: &Named) -> usize {
         stated_terms(named.pending.terms.clone(), &named.lines)
             .iter()
@@ -13128,6 +13207,204 @@ mod tests {
             "with the refused one dropped, the walk names past where it stood",
         );
         assert!(tick_terms_admit_block(stated_weight(&fitted)));
+    }
+
+    /// A derivation under which a transaction is a swap: its payer's
+    /// inbound leg escrowing `outputs` values into a core node on
+    /// `venue`.
+    struct Swapping {
+        venue: Address,
+        outputs: u32,
+    }
+
+    impl Derivation for Swapping {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            let stub = test_utils::StubTree::decode(vm)?;
+            let payer = stub.terms.fee_payer;
+            let resource = protocol_resource(&ProtocolHasher);
+            let mut declared_modes = vec![
+                (
+                    DeclaredKey::Cell(vault_cell(&ProtocolHasher, payer, resource)),
+                    Mode::Reserve { amount: 1 },
+                ),
+                (
+                    DeclaredKey::substate(self.venue, [0x5E; 16]),
+                    Mode::Delta { moves: Moves::Both },
+                ),
+            ];
+            declared_modes.sort_unstable();
+            let intent = IntentHash(Hash32(*Hash::from_bytes(&stub.body).as_bytes()));
+            let leg = |target: Address, role, edges: Vec<ValueEdge>, local| LegShape {
+                target,
+                role,
+                edges,
+                presents: Vec::new(),
+                declares: vec![target],
+                intent,
+                local,
+            };
+            let work = DeclaredWork {
+                compute: stub.terms.gas_limit_total(),
+                footprint: declared_modes.len() as u64,
+                ..DeclaredWork::ZERO
+            };
+            Ok(Derived {
+                accounts: vec![payer.address()],
+                effective_window: stub.window(),
+                network: stub.network,
+                routing: Routing {
+                    read_keys: Vec::new(),
+                    write_keys: declared_modes.iter().map(|(key, _)| *key).collect(),
+                    read_prefixes: Vec::new(),
+                    write_prefixes: declared_modes.iter().map(|(key, _)| key.owner()).collect(),
+                    provision_keys: Vec::new(),
+                    provision_prefixes: Vec::new(),
+                    declared_modes,
+                },
+                attested_by: vec![payer],
+                attestations: Vec::new(),
+                fee_vault_local: vault_cell(&ProtocolHasher, payer, resource).local.0,
+                auth_cell_local: [0xAE; 16],
+                work,
+                shares: Vec::new(),
+                node_terms: Vec::new(),
+                artifacts: Vec::new(),
+                everywhere: work,
+                legs: vec![
+                    leg(payer.address(), LegRole::Inbound, Vec::new(), 0),
+                    leg(
+                        self.venue,
+                        LegRole::Core,
+                        (0..self.outputs)
+                            .map(|output| ValueEdge {
+                                source: 0,
+                                output,
+                                non_fungible: false,
+                            })
+                            .collect(),
+                        1,
+                    ),
+                ],
+                nullifiers: Vec::new(),
+                packages: Vec::new(),
+                terms: stub.terms,
+            })
+        }
+    }
+
+    /// The `nth` swap `payer` pays for into `venue`, consuming `outputs`
+    /// escrowed crossings there.
+    fn swapping(payer: PrincipalAddr, venue: Address, nth: u32, outputs: u32) -> Transaction {
+        let vm = test_utils::StubTree {
+            terms: Terms {
+                fee_payer: payer,
+                max_fee: u128::MAX >> 1,
+                gas_limits: Capped::from_array([1_000_000]),
+                priority_bp: 0,
+                message: Bytes::empty(),
+            },
+            network: NetworkId::from(&NetworkDefinition::simulator()),
+            members: 0,
+            validity: test_utils::test_validity_range(),
+            body: nth.to_le_bytes().to_vec(),
+        }
+        .envelope();
+        let tx = Transaction::new(vm);
+        tx.try_derived(&Swapping { venue, outputs })
+            .expect("the fixture derivation routes it");
+        tx
+    }
+
+    /// A transaction a block runs keeps its terms entry only where its
+    /// terms carry crossings, and only one reaching beyond the shard
+    /// carries any, so selection charged every entry a block keeps: run
+    /// or not, the section never weighs more than what selection charged
+    /// for the transactions it carries.
+    #[test]
+    fn a_run_entry_never_passes_what_selection_charged() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let principal_on = |shard: ShardId| {
+            (0u8..=255)
+                .map(test_utils::test_principal)
+                .find(|payer| committee.shard_for_prefix(payer.address()) == shard)
+                .expect("a payer routes to each shard")
+        };
+        let owner_on = |shard: ShardId, nth: u32| {
+            (0u32..1 << 16)
+                .map(|at| {
+                    let mut bytes = [0xD3; 31];
+                    bytes[0] = at.to_le_bytes()[0].wrapping_mul(0x9D);
+                    bytes[1..5].copy_from_slice(&at.to_le_bytes());
+                    bytes[5..9].copy_from_slice(&nth.to_le_bytes());
+                    Address::new(bytes, AddressClass::Component)
+                })
+                .find(|owner| committee.shard_for_prefix(*owner) == shard)
+                .expect("an owner routes to each shard")
+        };
+        let remote_payer = principal_on(ENGAGING_PAYER);
+        let local_payer = principal_on(local);
+        let mut transactions: Vec<Transaction> = (0..6)
+            .map(|nth| swapping(remote_payer, owner_on(local, nth), nth, 1 + nth % 3))
+            .collect();
+        transactions.extend((0..6).map(|nth| {
+            test_utils::stub_transaction(
+                local_payer,
+                &[owner_on(local, 100 + nth)],
+                1_000,
+                test_utils::test_validity_range(),
+            )
+        }));
+        transactions.sort_by_key(Transaction::hash);
+
+        let charged: usize = transactions
+            .iter()
+            .filter(|tx| !committee.is_single_shard_transaction(tx))
+            .map(|tx| terms_of(tx, &committee, local).wire_weight())
+            .sum();
+        let derived = derived_terms(&committee, local, &transactions);
+        for (tx, entry) in transactions.iter().zip(&derived) {
+            assert_eq!(
+                entry.terms.crossings.is_empty(),
+                committee.is_single_shard_transaction(tx),
+                "only a swap consumes a crossing here",
+            );
+        }
+        let run_all: Vec<TickLine> = transactions
+            .iter()
+            .map(|tx| TickLine::Member {
+                tx: tx.hash(),
+                joins: Joins::Executes,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+                reach: Capped::empty(),
+                awaits: Capped::empty(),
+                charge: stub_abort_charge(0),
+                share: 0,
+                reserves: Capped::empty(),
+                deadline: Deadline::of_transaction(tx),
+                crossings: Capped::empty(),
+            })
+            .collect();
+        for lines in [Vec::new(), run_all] {
+            let stated = stated_terms(derived.clone(), &lines);
+            let weight: usize = stated.iter().map(|entry| entry.terms.wire_weight()).sum();
+            assert!(
+                stated.iter().all(|entry| {
+                    let tx = transactions
+                        .iter()
+                        .find(|tx| tx.hash() == entry.tx)
+                        .expect("an entry names a transaction of the block");
+                    lines.is_empty() || !committee.is_single_shard_transaction(tx)
+                }),
+                "a run entry is one selection charged",
+            );
+            if !lines.is_empty() {
+                assert_eq!(stated.len(), 6, "every swap run keeps its entry");
+                assert!(weight <= charged, "{weight} over the {charged} charged");
+            }
+        }
     }
 
     /// A voter that cannot route a transaction of the block has no terms
@@ -15619,13 +15896,13 @@ mod tests {
             &topology_schedule,
             block_hash,
             VerificationKind::BodyRoot,
-            CheckOutcome::Checked { bytes_delta: 0 },
+            CheckOutcome::checked(),
         );
         let after_state = state.on_block_check_completed(
             &topology_schedule,
             block_hash,
             VerificationKind::StateRoot,
-            CheckOutcome::Checked { bytes_delta: 0 },
+            CheckOutcome::checked(),
         );
         assert!(
             !after_state
@@ -15638,7 +15915,7 @@ mod tests {
             &topology_schedule,
             block_hash,
             VerificationKind::BeaconWitnessRoot,
-            CheckOutcome::Checked { bytes_delta: 0 },
+            CheckOutcome::checked(),
         );
         assert!(
             after_roots
@@ -15745,13 +16022,13 @@ mod tests {
             &topology_schedule,
             block_hash,
             VerificationKind::BodyRoot,
-            CheckOutcome::Checked { bytes_delta: 0 },
+            CheckOutcome::checked(),
         );
         let after_state = state.on_block_check_completed(
             &topology_schedule,
             block_hash,
             VerificationKind::StateRoot,
-            CheckOutcome::Checked { bytes_delta: 0 },
+            CheckOutcome::checked(),
         );
         assert!(
             !after_state
@@ -15765,7 +16042,7 @@ mod tests {
             &topology_schedule,
             block_hash,
             VerificationKind::BeaconWitnessRoot,
-            CheckOutcome::Checked { bytes_delta: 0 },
+            CheckOutcome::checked(),
         );
         assert!(
             !after_roots
@@ -16053,6 +16330,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             0,
+            AnswerDelta::default(),
         );
         assert!(actions.is_empty(), "got {actions:?}");
     }
@@ -17316,6 +17594,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             0,
+            AnswerDelta::default(),
         );
         assert!(actions.is_empty(), "got {actions:?}");
         assert_eq!(cut.state.last_voted_round, last_voted);
@@ -19815,7 +20094,7 @@ mod tests {
         );
 
         // Persistence reconciles the frontier from storage.
-        let _ = state.on_block_persisted(&snapshot, BlockHeight::new(3), 4_096);
+        let _ = state.on_block_persisted(&snapshot, BlockHeight::new(3), 4_096, None);
         assert!(
             state.take_ready_proposal(),
             "the reconcile must latch a proposal retry"
@@ -23384,12 +23663,7 @@ mod tests {
         coord
             .verification
             .initiate_resolutions_verification(block_hash, &block, &sched);
-        coord.on_block_check_completed(
-            &sched,
-            block_hash,
-            kind,
-            CheckOutcome::Checked { bytes_delta: 0 },
-        );
+        coord.on_block_check_completed(&sched, block_hash, kind, CheckOutcome::checked());
         assert!(
             coord.verification.is_root_verified(block_hash, kind),
             "an exact restatement verifies the root"
@@ -24072,5 +24346,687 @@ mod tests {
             !released.is_empty(),
             "recording the settled set must release the deferred block into verification",
         );
+    }
+
+    /// The persisted chain the answer follow reads, through a source that
+    /// can land one more flush between a whole read's pin and its
+    /// listing.
+    struct Racing {
+        chain: Arc<PendingChain<SimShardStorage>>,
+        store: SimShardStorage,
+        race: std::cell::RefCell<Option<Flush>>,
+    }
+
+    /// One committed block's writes on their way to the store.
+    #[derive(Clone)]
+    struct Flush {
+        block: Block,
+        creations: Vec<(SubstateKey, Vec<u8>)>,
+        removals: Vec<SubstateKey>,
+    }
+
+    impl Flush {
+        fn land(self, store: &SimShardStorage) {
+            commit_settled_at(
+                store,
+                &make_test_certified(self.block),
+                &self.creations,
+                &self.removals,
+                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            );
+        }
+    }
+
+    impl AnswerSource for Racing {
+        fn head(&self) -> Option<(BlockHeight, BlockHash)> {
+            self.chain.head()
+        }
+
+        fn rows(&self, under: &NibblePath) -> Vec<SubstateKey> {
+            if let Some(flush) = self.race.borrow_mut().take() {
+                flush.land(&self.store);
+            }
+            self.chain.rows(under)
+        }
+
+        fn changes(
+            &self,
+            under: &NibblePath,
+            since: Option<CrossingCursor>,
+            through: BlockHeight,
+        ) -> (Option<Vec<SubstateKey>>, CrossingCursor) {
+            self.chain.changes(under, since, through)
+        }
+
+        fn read_at(
+            &self,
+            at: (BlockHeight, BlockHash),
+            keys: &[SubstateKey],
+        ) -> Vec<Option<Vec<u8>>> {
+            self.chain.read_at(at, keys)
+        }
+    }
+
+    /// The answers `cells` hold under `under`, read whole.
+    fn whole_read(cells: &BTreeMap<SubstateKey, Vec<u8>>, under: &NibblePath) -> StandingAnswers {
+        let mut count = StandingAnswers::default();
+        for (key, value) in cells {
+            if key_under_prefix(&key.to_bytes(), under)
+                && let Some(route) = answer_route(*key, value)
+            {
+                count.add(route);
+            }
+        }
+        count
+    }
+
+    /// Cells as a model chain holds them.
+    struct Model(BTreeMap<SubstateKey, Vec<u8>>);
+
+    impl Substates for Model {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.get(&key).cloned()
+        }
+
+        fn entries_in_range(
+            &self,
+            _: Address,
+            _: CollectionId,
+            _: u128,
+            _: u128,
+            _: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    /// A block's writes over a model chain's cells: puts, overwrites by
+    /// another producer's answer at one key, deletions, and now and then
+    /// an answer's bytes at a key that is not its own.
+    struct Writer(u64);
+
+    impl Writer {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below
+        }
+
+        fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+            from[usize::try_from(self.next(from.len() as u64)).expect("small")]
+        }
+
+        fn writes(
+            &mut self,
+            cells: &BTreeMap<SubstateKey, Vec<u8>>,
+            consumers: &[Address],
+        ) -> (Vec<(SubstateKey, Vec<u8>)>, Vec<SubstateKey>) {
+            let producers = [0x10u8, 0x50, 0x90, 0xD0]
+                .map(|seed| Address::new([seed; 31], AddressClass::Component));
+            let mut written: BTreeMap<SubstateKey, Option<Vec<u8>>> = BTreeMap::new();
+            for _ in 0..self.next(5) {
+                let answered = self.pick(&[Answered::Taken, Answered::Never]);
+                let (key, bytes) = answer_leaf(
+                    self.pick(&producers),
+                    self.pick(consumers),
+                    u32::try_from(self.next(24)).expect("small"),
+                    answered,
+                    u8::try_from(self.next(200)).expect("small"),
+                );
+                match self.next(8) {
+                    0 | 1 if !cells.is_empty() => {
+                        let at = usize::try_from(self.next(cells.len() as u64)).expect("small");
+                        let gone = *cells.keys().nth(at).expect("in range");
+                        written.insert(gone, None);
+                    }
+                    2 => {
+                        let (elsewhere, _) = answer_leaf(
+                            self.pick(&producers),
+                            self.pick(consumers),
+                            100 + u32::try_from(self.next(4)).expect("small"),
+                            answered,
+                            1,
+                        );
+                        written.insert(elsewhere, Some(bytes));
+                    }
+                    _ => {
+                        written.insert(key, Some(bytes));
+                    }
+                }
+            }
+            let removals = written
+                .iter()
+                .filter(|(key, value)| value.is_none() && cells.contains_key(key))
+                .map(|(key, _)| *key)
+                .collect();
+            let creations = written
+                .into_iter()
+                .filter_map(|(key, value)| Some((key, value?)))
+                .collect();
+            (creations, removals)
+        }
+    }
+
+    fn apply(
+        cells: &mut BTreeMap<SubstateKey, Vec<u8>>,
+        creations: &[(SubstateKey, Vec<u8>)],
+        removals: &[SubstateKey],
+    ) {
+        for key in removals {
+            cells.remove(key);
+        }
+        for (key, value) in creations {
+            cells.insert(*key, value.clone());
+        }
+    }
+
+    fn delta_of(
+        cells: &BTreeMap<SubstateKey, Vec<u8>>,
+        creations: &[(SubstateKey, Vec<u8>)],
+        removals: &[SubstateKey],
+        under: &NibblePath,
+    ) -> AnswerDelta {
+        let writes: BTreeMap<SubstateKey, Option<Vec<u8>>> = removals
+            .iter()
+            .map(|key| (*key, None))
+            .chain(
+                creations
+                    .iter()
+                    .map(|(key, value)| (*key, Some(value.clone()))),
+            )
+            .collect();
+        answer_delta(&writes, &Model(cells.clone()), under)
+    }
+
+    /// One chain's store and the loop's follow of it.
+    struct Loop {
+        store: SimShardStorage,
+        source: Racing,
+        follow: Option<AnswerFollow>,
+        queued: VecDeque<Flush>,
+        events: VecDeque<BlockHeight>,
+    }
+
+    impl Loop {
+        fn over(store: SimShardStorage) -> Self {
+            let chain = Arc::new(PendingChain::new(
+                Arc::new(store.clone()),
+                ChainOrigin::ROOT,
+            ));
+            Self {
+                source: Racing {
+                    chain,
+                    store: store.clone(),
+                    race: std::cell::RefCell::new(None),
+                },
+                store,
+                follow: None,
+                queued: VecDeque::new(),
+                events: VecDeque::new(),
+            }
+        }
+
+        /// Land the oldest `count` queued flushes as one batch.
+        fn flush(&mut self, count: usize) {
+            let mut landed = None;
+            for _ in 0..count {
+                let Some(flush) = self.queued.pop_front() else {
+                    break;
+                };
+                landed = Some(flush.block.height());
+                flush.land(&self.store);
+            }
+            self.events.extend(landed);
+        }
+
+        /// Handle the oldest persist event, as the shard loop does, and
+        /// hand `voter` what it carries.
+        fn persist(&mut self, voter: &mut HeldAnswers, under: &NibblePath, race: bool) {
+            let Some(height) = self.events.pop_front() else {
+                return;
+            };
+            if race || self.follow.is_none() {
+                *self.source.race.borrow_mut() = self.queued.pop_front();
+            }
+            let raced = self
+                .source
+                .race
+                .borrow()
+                .as_ref()
+                .map(|flush| flush.block.height());
+            let count = AnswerFollow::step(&mut self.follow, &self.source, under);
+            if let Some(unraced) = self.source.race.borrow_mut().take() {
+                unraced.land(&self.store);
+            }
+            self.events.extend(raced);
+            voter.persisted(height, count, true);
+        }
+    }
+
+    /// The differential's run: the voter's chain as a model, the loop
+    /// following its store, and the voter.
+    struct Differential {
+        writer: Writer,
+        under: NibblePath,
+        consumers: Vec<Address>,
+        cells: BTreeMap<SubstateKey, Vec<u8>>,
+        chain: Loop,
+        voter: HeldAnswers,
+        /// A second chain diverging from the voter's: the store follows
+        /// it while the voter commits its own, until the seat rebuilds.
+        fork: Option<BTreeMap<SubstateKey, Vec<u8>>>,
+        resolved: u32,
+        at_parents: u32,
+    }
+
+    const LOW_CONSUMER: Address = Address::new([0x20; 31], AddressClass::Component);
+    const HIGH_CONSUMER: Address = Address::new([0xA0; 31], AddressClass::Component);
+
+    impl Differential {
+        fn new() -> Self {
+            let mut voter = HeldAnswers::default();
+            voter.seeded(BlockHeight::GENESIS, StandingAnswers::default(), true);
+            Self {
+                writer: Writer(0x9E37_79B9_7F4A_7C15),
+                under: NibblePath::empty(),
+                consumers: vec![LOW_CONSUMER, HIGH_CONSUMER],
+                cells: BTreeMap::new(),
+                chain: Loop::over(SimShardStorage::default()),
+                voter,
+                fork: None,
+                resolved: 0,
+                at_parents: 0,
+            }
+        }
+
+        /// A successor's seat at its genesis over `under`: every flush
+        /// landed, and one whole read seeds a fresh voter.
+        fn reseat(&mut self, under: NibblePath, consumers: Vec<Address>) {
+            self.chain.flush(usize::MAX);
+            self.chain.events.clear();
+            self.under = under;
+            self.consumers = consumers;
+            let head = self.chain.source.head().expect("persisted");
+            let follow = AnswerFollow::whole(&self.chain.source, head, &self.under);
+            assert_eq!(follow.count(), &whole_read(&self.cells, &self.under));
+            self.voter = HeldAnswers::default();
+            self.voter.seeded(head.0, follow.count().clone(), true);
+            self.chain.follow = Some(follow);
+        }
+
+        /// A fresh coordinator and a fresh loop over the same store.
+        fn restart(&mut self) {
+            self.chain.flush(usize::MAX);
+            self.chain.events.clear();
+            self.chain.follow = None;
+            self.voter = HeldAnswers::default();
+        }
+
+        fn at(&mut self, height: u64) {
+            match height {
+                300 => {
+                    let mut low = NibblePath::empty();
+                    low.push_bits(0, 1);
+                    self.reseat(low, vec![LOW_CONSUMER]);
+                }
+                600 => self.reseat(NibblePath::empty(), vec![LOW_CONSUMER, HIGH_CONSUMER]),
+                750 => {
+                    self.chain.flush(usize::MAX);
+                    self.fork = Some(self.cells.clone());
+                }
+                800 => {
+                    self.cells = self.fork.take().expect("diverged");
+                    self.restart();
+                }
+                _ if self.writer.next(60) == 0 => self.restart(),
+                _ => {}
+            }
+            let at = BlockHeight::new(height);
+            let (creations, removals) = self.writer.writes(&self.cells, &self.consumers);
+            let block = make_test_block_with_anchor_wt(at, 0);
+            if self.writer.next(6) == 0 {
+                self.sibling(at);
+            }
+            if self.writer.next(12) != 0 {
+                let delta = delta_of(&self.cells, &creations, &removals, &self.under);
+                self.voter.measured(block.hash(), delta);
+            }
+            self.voter.committed(at, block.hash(), true);
+            apply(&mut self.cells, &creations, &removals);
+            let flush = match self.fork.as_mut() {
+                Some(theirs) => {
+                    let (creations, removals) = self.writer.writes(theirs, &self.consumers);
+                    apply(theirs, &creations, &removals);
+                    let block = make_test_block_with_anchor_wt(at, 3);
+                    Flush {
+                        block,
+                        creations,
+                        removals,
+                    }
+                }
+                None => Flush {
+                    block,
+                    creations,
+                    removals,
+                },
+            };
+            self.chain.queued.push_back(flush);
+            let flushes = usize::try_from(self.writer.next(3)).expect("small");
+            self.chain.flush(flushes);
+            for _ in 0..=self.writer.next(2) {
+                let race = self.writer.next(4) == 0;
+                self.chain.persist(&mut self.voter, &self.under, race);
+            }
+            if let Some(count) = self.voter.at_tip(at) {
+                assert_eq!(count, &whole_read(&self.cells, &self.under), "at {height}");
+                self.resolved += 1;
+            }
+        }
+
+        /// A sibling of the block at `at` the voter measures and never
+        /// commits, and the count behind it.
+        fn sibling(&mut self, at: BlockHeight) {
+            let (creations, removals) = self.writer.writes(&self.cells, &self.consumers);
+            let sibling = make_test_block_with_anchor_wt(at, 7);
+            let delta = delta_of(&self.cells, &creations, &removals, &self.under);
+            self.voter.measured(sibling.hash(), delta);
+            let tip = BlockHeight::new(at.inner() - 1);
+            if let Some(count) = self.voter.at(tip, [sibling.hash()]) {
+                let mut left = self.cells.clone();
+                apply(&mut left, &creations, &removals);
+                assert_eq!(
+                    count,
+                    whole_read(&left, &self.under),
+                    "behind a sibling at {at:?}"
+                );
+                self.at_parents += 1;
+            }
+        }
+    }
+
+    /// A voter's held answer count, wherever it resolves, equals a whole
+    /// read of the answer leaves its committed tip holds: over blocks
+    /// it measured and blocks it synced, pending forks, persists whose
+    /// store stands above them, flushes landing inside a whole read,
+    /// restarts, a split and a merge of the consumer, producers on every
+    /// lineage of the trie, and a store that followed another fork until
+    /// the seat rebuilt onto it. The count at a pending parent equals
+    /// the read of what that parent leaves, and the count resolves at
+    /// most commits.
+    #[test]
+    fn the_held_count_equals_a_whole_read_at_every_commit() {
+        let mut run = Differential::new();
+        let commits = 900u32;
+        for height in 1..=u64::from(commits) {
+            run.at(height);
+        }
+        assert!(
+            run.resolved * 2 > commits,
+            "resolved at {} of {commits} commits",
+            run.resolved
+        );
+        assert!(
+            run.at_parents > 20,
+            "{} counts behind a sibling",
+            run.at_parents
+        );
+    }
+
+    /// `count` blocks on the root chained from `from`.
+    fn answer_chain(from: BlockHash, count: u64) -> Vec<Block> {
+        let mut parent = from;
+        (1..=count)
+            .map(|height| {
+                let block = block_on_chained_on(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    parent,
+                    height * 1_000,
+                );
+                parent = block.hash();
+                block
+            })
+            .collect()
+    }
+
+    /// A count of `n` answers out of one producer.
+    fn answers(n: u64) -> StandingAnswers {
+        let mut count = StandingAnswers::default();
+        for _ in 0..n {
+            count.add(RoutePrefix::of(Address::new(
+                [0x10; 31],
+                AddressClass::Component,
+            )));
+        }
+        count
+    }
+
+    /// One answer out of the producer [`answers`] counts.
+    fn one_more() -> AnswerDelta {
+        let mut delta = AnswerDelta::default();
+        delta.put(RoutePrefix::of(Address::new(
+            [0x10; 31],
+            AddressClass::Component,
+        )));
+        delta
+    }
+
+    /// A coordinator seeded with no answers at genesis, which measured
+    /// one answer more in each of `measured` among `blocks` and committed
+    /// them all.
+    fn committing_answers(
+        blocks: &[Block],
+        measured: &[u64],
+    ) -> (ShardCoordinator, TopologySchedule) {
+        let (mut state, schedule) = make_test_state();
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = blocks[0].header().parent_block_hash();
+        state.seed_standing_answers(&schedule, BlockHeight::GENESIS, StandingAnswers::default());
+        let state = measuring(state, &schedule, blocks, measured);
+        assert_eq!(state.committed_height, blocks[blocks.len() - 1].height());
+        (state, schedule)
+    }
+
+    /// A block this voter committed without measuring, a sync commit,
+    /// leaves the count unresolved from it on, through a persist carrying
+    /// no count and one whose view stands below the hole. The first
+    /// persist whose view reaches it resolves the count at that view,
+    /// though the persist's own height stands below.
+    #[test]
+    fn a_hole_closes_at_the_first_persist_whose_view_reaches_it() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"answer tip"));
+        let blocks = answer_chain(from, 5);
+        let (mut state, schedule) = committing_answers(&blocks, &[1, 2, 4, 5]);
+        let tip = state.committed_hash;
+        assert_eq!(state.answers.hole(), Some(BlockHeight::new(3)));
+        assert_eq!(state.standing_answers_at(tip), None);
+
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(1), 0, None);
+        assert_eq!(state.standing_answers_at(tip), None);
+        let below = Some((BlockHeight::new(2), blocks[1].hash(), answers(2)));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(2), 0, below);
+        assert_eq!(
+            state.standing_answers_at(tip),
+            None,
+            "its view stands below the hole"
+        );
+
+        let reaching = Some((BlockHeight::new(4), blocks[3].hash(), answers(3)));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(2), 0, reaching);
+        assert_eq!(state.standing_answers_at(tip), Some(answers(4)));
+        assert_eq!(state.answers.hole(), None);
+        assert_eq!(
+            state.answers.committed_len(),
+            1,
+            "block 5's delta stays until a persist reaches it"
+        );
+    }
+
+    /// The committed blocks a voter holds deltas for are those above the
+    /// newest persist: a block sync of thousands of blocks, its persists
+    /// carrying a count or none, never holds more, and a co-hosted seat
+    /// replaying below its loop's persisted head records nothing until it
+    /// passes it.
+    #[test]
+    fn the_committed_answer_map_stays_within_the_unpersisted_run() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"synced tip"));
+        let blocks = answer_chain(from, 3_000);
+        let (mut state, schedule) = make_test_state();
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        let mut persisted = 0u64;
+        for chunk in blocks.chunks(40) {
+            state = committed_on_tip(state, &schedule, chunk.iter().cloned());
+            let tip = state.committed_height.inner();
+            assert!(state.answers.committed_len() as u64 <= tip - persisted);
+            persisted = tip - 7;
+            let carried = persisted.is_multiple_of(3).then(|| {
+                let at = usize::try_from(persisted - 1).expect("small");
+                (BlockHeight::new(persisted), blocks[at].hash(), answers(0))
+            });
+            let _ = state.on_block_persisted(&schedule, BlockHeight::new(persisted), 0, carried);
+            assert!(state.answers.committed_len() as u64 <= tip - persisted);
+        }
+
+        let (mut trailing, schedule) = make_test_state();
+        trailing.committed_height = BlockHeight::GENESIS;
+        trailing.committed_hash = from;
+        let head = Some((BlockHeight::new(100), blocks[99].hash(), answers(0)));
+        let _ = trailing.on_block_persisted(&schedule, BlockHeight::new(100), 0, head);
+        trailing = committed_on_tip(trailing, &schedule, blocks[..100].iter().cloned());
+        assert_eq!(
+            trailing.answers.committed_len(),
+            0,
+            "its loop's persist covers them"
+        );
+        trailing = committed_on_tip(trailing, &schedule, blocks[100..110].iter().cloned());
+        assert_eq!(trailing.answers.committed_len(), 10);
+    }
+
+    /// Commit `blocks` on `state` from its present tip, measuring one
+    /// answer more in each block whose height `measured` names as its
+    /// state-root check completes ahead of the commit.
+    fn measuring(
+        mut state: ShardCoordinator,
+        schedule: &TopologySchedule,
+        blocks: &[Block],
+        measured: &[u64],
+    ) -> ShardCoordinator {
+        for block in blocks {
+            if measured.contains(&block.height().inner()) {
+                state.answers.measured(block.hash(), one_more());
+            }
+            state = committed_on_tip(state, schedule, [block.clone()]);
+        }
+        state
+    }
+
+    /// Commit `blocks` on `state` from its present tip.
+    fn committed_on_tip(
+        mut state: ShardCoordinator,
+        schedule: &TopologySchedule,
+        blocks: impl IntoIterator<Item = Block>,
+    ) -> ShardCoordinator {
+        for block in blocks {
+            let qc = make_test_qc(block.hash(), block.height());
+            let _ = state.on_block_ready_to_commit(
+                schedule,
+                Arc::new(Verified::new_unchecked_for_test(
+                    CertifiedBlock::new_unchecked(block, qc),
+                )),
+                CommitSource::Aggregator,
+            );
+        }
+        state
+    }
+
+    /// A count read at a block of another chain, as a store rebuilt onto
+    /// another fork reads, at the height of a block this voter committed
+    /// without measuring, is not adopted; nor is one read above the
+    /// voter's committed tip. The frontier neither could be checked
+    /// against goes, and the count stays unresolved until a count read at
+    /// a block this voter committed.
+    #[test]
+    fn a_count_above_the_committed_tip_or_across_a_rebuild_is_not_adopted() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"rebuilt tip"));
+        let blocks = answer_chain(from, 6);
+        let (mut state, schedule) = committing_answers(&blocks[..3], &[1, 2]);
+        let tip = state.committed_hash;
+        assert_eq!(state.answers.hole(), Some(BlockHeight::new(3)));
+        let other =
+            block_on_chained_on(ShardId::ROOT, BlockHeight::new(3), blocks[1].hash(), 9_000);
+        let rebuilt = Some((BlockHeight::new(3), other.hash(), answers(9)));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(1), 0, rebuilt);
+        assert_eq!(state.standing_answers_at(tip), None);
+
+        let above = Some((BlockHeight::new(5), blocks[4].hash(), answers(5)));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(1), 0, above);
+        assert_eq!(state.standing_answers_at(tip), None);
+
+        state = measuring(state, &schedule, &blocks[3..], &[4, 5, 6]);
+        assert_eq!(state.standing_answers_at(state.committed_hash), None);
+        let ours = Some((BlockHeight::new(4), blocks[3].hash(), answers(3)));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(1), 0, ours);
+        assert_eq!(
+            state.standing_answers_at(state.committed_hash),
+            Some(answers(5))
+        );
+    }
+
+    /// A count read short at a block this voter committed, as a store
+    /// whose crossing journal lagged its head would read, against a
+    /// frontier the voter already folded past it: a build with debug
+    /// assertions fails on the disagreement, and a release build re-bases
+    /// onto the short count and then onto the next count at a committed
+    /// block, which puts the frontier right.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "folds to another frontier than the one held")
+    )]
+    fn a_short_count_holds_only_until_the_next_count() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"short tip"));
+        let blocks = answer_chain(from, 3);
+        let mut voter = HeldAnswers::default();
+        voter.seeded(BlockHeight::GENESIS, answers(0), true);
+        for block in &blocks {
+            voter.measured(block.hash(), one_more());
+            voter.committed(block.height(), block.hash(), true);
+        }
+        let tip = BlockHeight::new(3);
+        assert_eq!(voter.at_tip(tip), Some(&answers(3)));
+        let short = Some((BlockHeight::new(1), blocks[0].hash(), answers(0)));
+        voter.persisted(BlockHeight::new(1), short, true);
+        assert_eq!(voter.at_tip(tip), Some(&answers(2)));
+        let exact = Some((BlockHeight::new(2), blocks[1].hash(), answers(2)));
+        voter.persisted(BlockHeight::new(2), exact, true);
+        assert_eq!(voter.at_tip(tip), Some(&answers(3)));
+    }
+
+    /// A voter its shard's committee does not seat holds no count and no
+    /// committed delta, whatever it commits, measures or is handed.
+    #[test]
+    fn an_unseated_vnode_holds_no_committed_deltas() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"unseated tip"));
+        let blocks = answer_chain(from, 4);
+        let (_, schedule) = make_test_state();
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(99),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+        assert!(!state.seated_to_vote(&schedule));
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        state.seed_standing_answers(&schedule, BlockHeight::GENESIS, StandingAnswers::default());
+        state = measuring(state, &schedule, &blocks, &[1, 2, 3, 4]);
+        assert_eq!(state.answers.committed_len(), 0);
+        let count = Some((BlockHeight::new(4), blocks[3].hash(), answers(4)));
+        let _ = state.on_block_persisted(&schedule, BlockHeight::new(2), 0, count);
+        assert_eq!(state.standing_answers_at(state.committed_hash), None);
+        assert_eq!(state.answers.committed_len(), 0);
     }
 }
