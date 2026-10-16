@@ -12,6 +12,7 @@ use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::{DropSpec, HostId};
 use hyperscale_network::{GossipVerdict, HandlerRegistry, Network};
 use hyperscale_network_iroh::test_utils::TestFixtures;
+use hyperscale_network_iroh::testing::CountingVerifier;
 use hyperscale_network_iroh::{
     IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager, RequestManagerConfig,
     RequestPool, RequestStreams,
@@ -19,7 +20,7 @@ use hyperscale_network_iroh::{
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees, ShardId,
-    TopicScope, TopologySnapshot, ValidatorId,
+    TopicScope, TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
 };
 use iroh::EndpointAddr;
 use tokio::runtime::Handle;
@@ -89,6 +90,17 @@ async fn host(
     shards: &[ShardId],
     bootstrap: Vec<EndpointAddr>,
 ) -> Host {
+    host_checking_with(fixtures, index, shards, bootstrap, Arc::new(BlsVerifier)).await
+}
+
+/// [`host`], checking signatures with `verifier`.
+async fn host_checking_with(
+    fixtures: &TestFixtures,
+    index: u32,
+    shards: &[ShardId],
+    bootstrap: Vec<EndpointAddr>,
+    verifier: Arc<dyn Verifier>,
+) -> Host {
     let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let mut config = IrohConfig::for_testing(fixtures.network_key(index), bind_addr);
     config.bootstrap_peers = bootstrap;
@@ -100,7 +112,7 @@ async fn host(
         local_shards: shards.iter().copied().collect::<HashSet<_>>(),
         registry: Arc::clone(&registry),
         validator_keys: fixtures.validator_key_map(),
-        verifier: Arc::new(BlsVerifier),
+        verifier,
     })
     .await
     .expect("the host binds");
@@ -165,6 +177,132 @@ async fn seated_mesh(hosts: &[Host]) {
             })
     })
     .await;
+}
+
+/// A receiver whose signature checks are counted, serving `shards`, and a
+/// sender bound to it whose own address record the receiver already holds.
+async fn counted_pair(
+    fixtures: &TestFixtures,
+    shards: &[ShardId],
+) -> (Host, Arc<CountingVerifier>, Host) {
+    let counted = Arc::new(CountingVerifier::default());
+    let receiver = host_checking_with(
+        fixtures,
+        0,
+        shards,
+        Vec::new(),
+        Arc::clone(&counted) as Arc<dyn Verifier>,
+    )
+    .await;
+    let sender = host(
+        fixtures,
+        1,
+        &[ShardId::ROOT],
+        vec![receiver.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for(
+        "the pair binds and the receiver holds the sender's record",
+        || {
+            receiver.adapter.peer_for_validator(vid(1)).is_some()
+                && sender.adapter.peer_for_validator(vid(0)).is_some()
+                && !receiver.adapter.address_book().is_empty()
+        },
+    )
+    .await;
+    (receiver, counted, sender)
+}
+
+/// `host`'s own address record at `sequence`: signed when `forged` is
+/// false, carrying a signature over other bytes when it is true.
+fn address_record(
+    fixtures: &TestFixtures,
+    index: u32,
+    host: &Host,
+    sequence: u64,
+    forged: bool,
+) -> ValidatorAddressGossip {
+    let own = host.adapter.address_records().remove(0);
+    let message = if forged {
+        b"not this record".to_vec()
+    } else {
+        signed_bytes(
+            &ValidatorAddressMessage::new(&own.peer_id, &own.addresses, sequence),
+            &NetworkDefinition::simulator(),
+        )
+    };
+    ValidatorAddressGossip {
+        sequence,
+        signature: fixtures.signer(index).sign(&message).expect("signs"),
+        ..own
+    }
+}
+
+/// Wait until `counted` has seen no new signature check for a while.
+async fn checks_settle(counted: &CountingVerifier) -> u64 {
+    loop {
+        let before = counted.checked();
+        sleep(SILENCE_WATCH).await;
+        if counted.checked() == before {
+            return before;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_address_record_is_checked_once() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (_receiver, counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+    let settled = checks_settle(&counted).await;
+    let refused = counted.refused();
+
+    for sequence in 0..4 {
+        sender.network.broadcast_global(&address_record(
+            &fixtures,
+            1,
+            &sender,
+            1_000 + sequence,
+            true,
+        ));
+    }
+    wait_for("the forged records are checked", || {
+        counted.refused() >= refused + 4
+    })
+    .await;
+    assert_eq!(
+        checks_settle(&counted).await - settled,
+        4,
+        "a host serving a shard checks each record once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_serves_no_shard_refuses_forged_address_records() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (_receiver, counted, sender) = counted_pair(&fixtures, &[]).await;
+    checks_settle(&counted).await;
+    let refused = counted.refused();
+
+    // A refusal is a verdict against the sender, so a flood of forged
+    // records cools it down before the receiver has checked them all.
+    let sent = 400;
+    for sequence in 0..sent {
+        sender.network.broadcast_global(&address_record(
+            &fixtures,
+            1,
+            &sender,
+            1_000 + sequence,
+            true,
+        ));
+        sleep(Duration::from_millis(5)).await;
+    }
+    checks_settle(&counted).await;
+    let checked = counted.refused() - refused;
+    assert!(checked > 0, "the forged records reach the receiver");
+    assert!(
+        checked < sent / 2,
+        "the sender is cooled down: {checked} of {sent} checked"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

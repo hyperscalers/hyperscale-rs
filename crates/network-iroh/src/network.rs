@@ -16,10 +16,9 @@ use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, ResponseVerdict, ValidatorKeyMap,
+    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
+    ResponseVerdict, ValidatorKeyMap,
 };
-use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
     TopologySnapshot, ValidatorId,
@@ -28,7 +27,6 @@ use iroh::EndpointId;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
-use crate::address_book::IngestOutcome;
 use crate::endpoint::IrohAdapter;
 use crate::fanout::{Fanout, Scope};
 use crate::framing::encode_typed_frame;
@@ -110,7 +108,7 @@ impl IrohNetwork {
         );
         adapter.install_fanout(&fanout);
 
-        let network = Self {
+        Self {
             adapter,
             request_manager,
             tokio_handle,
@@ -120,29 +118,7 @@ impl IrohNetwork {
             peer_unreachable_count: Arc::new(AtomicUsize::new(0)),
             notify_pool,
             fanout,
-        };
-
-        // The validator address book is a transport concern, so the network
-        // registers its own ingest handlers rather than the node layer: the
-        // gossip handler covers hosts that serve a shard, the host handler
-        // one that serves none, whose warm book is exactly what a later
-        // committee draw depends on. Ingest is idempotent, so the overlap
-        // on a host with several shards is harmless.
-        let ingest = Arc::clone(&network.adapter);
-        network.register_gossip_handler(move |gossip: ValidatorAddressGossip, _shard: ShardId| {
-            match ingest.ingest_validator_address(&gossip) {
-                IngestOutcome::Invalid => GossipVerdict::Reject,
-                IngestOutcome::Recorded
-                | IngestOutcome::Stale
-                | IngestOutcome::UnknownValidator => GossipVerdict::Accept,
-            }
-        });
-        let ingest = Arc::clone(&network.adapter);
-        network.register_host_gossip_handler(move |gossip: ValidatorAddressGossip| {
-            let _ = ingest.ingest_validator_address(&gossip);
-        });
-
-        network
+        }
     }
 
     /// How this host reaches the other members of the committees it sits
