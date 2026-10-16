@@ -19,23 +19,36 @@ new_ns() {
     ns "$1" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 }
 
-# Make the internet segment.
+# The core's address on every link, the gateway of every site.
+CORE4=192.0.0.1
+CORE6=fe80::1
+
+# Make the internet's core router.
 make_inet() {
     new_ns inet
-    ns inet ip link add br0 type bridge
-    ns inet ip link set br0 up
 }
 
-# Attach namespace $1 to the internet segment as interface `wan`, with the
-# given addresses in prefix notation ("-" for none).
+# Attach namespace $1 to the internet as interface `wan`, with the given
+# addresses ("-" for none). The core routes each address to its site.
 attach() {
     local name=$1 v4=$2 v6=$3
     ip link add "w-$name" type veth peer name wan netns "$name"
     ip link set "w-$name" netns inet
-    ns inet ip link set "w-$name" master br0 up
+    ns inet ip link set "w-$name" up
     ns "$name" ip link set wan up
-    if [ "$v4" != - ]; then ns "$name" ip addr add "$v4" dev wan; fi
-    if [ "$v6" != - ]; then ns "$name" ip addr add "$v6" dev wan nodad; fi
+    if [ "$v4" != - ]; then
+        ns inet ip addr add "$CORE4/32" dev "w-$name"
+        ns inet ip route add "$v4/32" dev "w-$name"
+        ns "$name" ip addr add "$v4/32" dev wan
+        ns "$name" ip route add "$CORE4" dev wan
+        ns "$name" ip route add default via "$CORE4" dev wan
+    fi
+    if [ "$v6" != - ]; then
+        ns inet ip addr add "$CORE6/64" dev "w-$name" nodad
+        ns inet ip -6 route add "$v6/128" dev "w-$name"
+        ns "$name" ip addr add "$v6/128" dev wan nodad
+        ns "$name" ip -6 route add default via "$CORE6" dev wan
+    fi
 }
 
 # Give router $1 a private side, bridge `lan`, at $2.1/24, so that more than

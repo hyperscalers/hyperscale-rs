@@ -8,8 +8,8 @@
 # Usage: testbed.sh [--rtt-ms "20 150"] [--secs 75] [--types "..."]
 #                   [--involving TYPE] [--out DIR]
 #
-# Each run joins two hosts of the given types through their routers to one
-# shared segment, the "internet", where the relay and public hosts sit. Host
+# Each run joins two hosts of the given types through their routers to the
+# "internet" (netns.sh), where the relay and public hosts sit. Host
 # one listens and host two dials. Both name the relay by a hostname that the
 # container's hosts file maps to its IPv4 and its IPv6 address, so a host of
 # either family reaches it (iroh 1.3.0 refuses a relay named by an IPv6
@@ -74,20 +74,20 @@ make_site() {
     new_ns "$host"
     case "$type" in
         public)
-            attach "$host" "198.51.100.1$n/24" "2001:db8:1::1$n/64"
+            attach "$host" "198.51.100.1$n" "2001:db8:1::1$n"
             delay_uplink "$host" "$delay"
             printf -v "BIND_$n" '%s' \
                 "--bind 198.51.100.1$n:$PORT --bind [2001:db8:1::1$n]:$PORT"
             ;;
         ipv6-only)
-            attach "$host" - "2001:db8:1::1$n/64"
+            attach "$host" - "2001:db8:1::1$n"
             reply_only_firewall "$host"
             delay_uplink "$host" "$delay"
             printf -v "BIND_$n" '%s' "--bind [2001:db8:1::1$n]:$PORT"
             ;;
         full-cone | port-restricted | symmetric | udp-blocked)
             new_ns "r$n"
-            attach "r$n" "198.51.100.2$n/24" -
+            attach "r$n" "198.51.100.2$n" -
             private_side "r$n" "10.$n.0"
             join_private "r$n" "$host" "10.$n.0.2" eth0 "10.$n.0.1"
             case "$type" in
@@ -106,7 +106,7 @@ make_site() {
         double)
             new_ns "c$n"
             new_ns "r$n"
-            attach "c$n" "198.51.100.3$n/24" -
+            attach "c$n" "198.51.100.3$n" -
             private_side "c$n" "100.64.$n"
             join_private "c$n" "r$n" "100.64.$n.2" wan "100.64.$n.1"
             private_side "r$n" "10.$n.0"
@@ -124,7 +124,7 @@ make_site() {
 # uplink.
 make_lan() {
     new_ns r1
-    attach r1 198.51.100.21/24 -
+    attach r1 198.51.100.21 -
     private_side r1 10.1.0
     nat_router r1 ""
     delay_uplink r1 "$1"
@@ -143,7 +143,7 @@ run_pair() {
 
     make_inet
     new_ns relay
-    attach relay "$RELAY4/24" "$RELAY6/64"
+    attach relay "$RELAY4" "$RELAY6"
     ns relay "$RELAY" --config-path "$WORK/relay.toml" >"$dir/relay.log" 2>&1 &
     sleep 2
 
