@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use hyperscale_network_iroh::{
-    IrohConfig, RedialSchedule, RelayUrl, VersionInteroperabilityMode, load_or_generate_secret_key,
-    parse_endpoint_addr,
+    IrohConfig, RedialBudget, RedialSchedule, RelayUrl, VersionInteroperabilityMode,
+    load_or_generate_secret_key, parse_endpoint_addr,
 };
 use serde::Deserialize;
 use tracing::info;
@@ -73,6 +73,14 @@ pub struct NetworkConfig {
     /// Re-dials of a peer while its connection stays relayed; zero turns
     /// re-dialing off. Unset keeps the backend's default.
     pub redial_attempts: Option<u32>,
+
+    /// Re-dials the host makes or admits at once, across all its peers.
+    /// Unset keeps the backend's default.
+    pub redial_budget_burst: Option<u32>,
+
+    /// Time in which the host earns one more re-dial, in milliseconds.
+    /// Unset keeps the backend's default.
+    pub redial_budget_refill_ms: Option<u64>,
 }
 
 const fn default_upnp_enabled() -> bool {
@@ -135,6 +143,14 @@ pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
                 .redial_max_interval_ms
                 .map_or(defaults.redial.max_interval, Duration::from_millis),
             attempts: network.redial_attempts.unwrap_or(defaults.redial.attempts),
+        },
+        redial_budget: RedialBudget {
+            burst: network
+                .redial_budget_burst
+                .unwrap_or(defaults.redial_budget.burst),
+            refill: network
+                .redial_budget_refill_ms
+                .map_or(defaults.redial_budget.refill, Duration::from_millis),
         },
         version_interop_mode: network
             .version_interop_mode

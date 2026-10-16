@@ -22,7 +22,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::ShardId;
+use hyperscale_types::{MessageClass, ShardId};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
@@ -208,7 +208,10 @@ impl InboundRouter {
             .await
             .map_err(StreamError::Io)?;
         match header[0] {
-            STREAM_NOTIFY => self.read_notifications(peer, recv).await,
+            STREAM_NOTIFY => {
+                let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
+                self.read_notifications(peer, class, recv).await
+            }
             STREAM_GOSSIP => {
                 let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
                 match self.fanout() {
@@ -234,6 +237,7 @@ impl InboundRouter {
     async fn read_notifications(
         &self,
         peer: EndpointId,
+        class: MessageClass,
         mut recv: RecvStream,
     ) -> Result<(), StreamError> {
         loop {
@@ -246,6 +250,9 @@ impl InboundRouter {
                     Err(e) => return Err(StreamError::Frame(e)),
                 };
             record_libp2p_bandwidth(wire_bytes as u64, 0);
+            if class == MessageClass::Consensus {
+                self.paths.note_consensus(peer);
+            }
 
             if let Some(handler) = self.registry.get_notification(&type_id) {
                 spawn(async move { handler(payload) });
