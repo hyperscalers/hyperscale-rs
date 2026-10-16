@@ -14,6 +14,7 @@
 //! bench delayed-idle --rtt-ms 40 --connections 500
 //! bench reject-flood --rate 1000 --forged-per-signed 7 [--follower]
 //! bench refused-flood --rate 1000 --verdict reject|ignore
+//! bench bind-flood --validators 4 --dialers 16
 //! bench garbage-responder --backend iroh|libp2p --requests 2000
 //! ```
 //!
@@ -39,7 +40,9 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::{GossipVerdict, HandlerRegistry, Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
-use hyperscale_network_iroh::testing::{CountingVerifier, Star, UdpBridge};
+use hyperscale_network_iroh::testing::{
+    CountingSigner, CountingVerifier, Star, UdpBridge, bind_hello,
+};
 use hyperscale_network_iroh::{
     EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind,
     RequestManager as IrohRequestManager, RequestManagerConfig as IrohRequestManagerConfig,
@@ -57,6 +60,8 @@ use hyperscale_types::{
     RoutingCommittees, ShardId, Signer, TopicScope, TopologySnapshot, ValidatorAddressMessage,
     ValidatorId, Verifier, signed_bytes,
 };
+use iroh::RelayMode;
+use iroh::endpoint::{Builder, presets};
 use libc::{RUSAGE_SELF, getrusage, rusage, timeval};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
@@ -256,6 +261,19 @@ enum Command {
         #[arg(long, default_value_t = 2000)]
         requests: u64,
     },
+    /// Strangers open bind exchanges at a host as fast as they can and
+    /// leave once it has signed.
+    BindFlood {
+        /// Validators the host carries, each of which signs every exchange
+        /// it answers.
+        #[arg(long, default_value_t = 4)]
+        validators: u32,
+        /// Exchanges in flight at once.
+        #[arg(long, default_value_t = 16)]
+        dialers: u32,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// A peer floods global items its receiver refuses with one verdict.
     RefusedFlood {
         /// Items the peer sends a second.
@@ -419,6 +437,17 @@ fn topology(genesis: GenesisValidators) -> Arc<ArcSwap<TopologySnapshot>> {
         1,
         genesis.validators,
     )))
+}
+
+/// The servers of a shard, meshed, and one host asking them.
+fn range_cluster() -> ClusterSpec {
+    ClusterSpec {
+        hosts: RANGE_SERVERS + 1,
+        seated: RANGE_SERVERS,
+        serves: |index| index < RANGE_SERVERS,
+        meshed: true,
+        timers: PathTimers::default(),
+    }
 }
 
 fn root_committee(spec: &ClusterSpec) -> Arc<RoutingCommittees> {
@@ -1295,6 +1324,92 @@ async fn refused_flood(rate: u32, refusal: Refusal, watch: Duration) {
     );
 }
 
+/// `dialers` strangers open bind exchanges at a host carrying `validators`
+/// validators for `watch`, each leaving once the host has signed, and the
+/// host's signatures are counted.
+async fn bind_flood(validators: u32, dialers: u32, watch: Duration) {
+    let fixtures = IrohFixtures::new(SEED, validators);
+    let signers: Vec<Arc<CountingSigner>> = (0..validators)
+        .map(|index| Arc::new(CountingSigner::new(fixtures.signer(index))))
+        .collect();
+    let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let host = IrohAdapter::bind(IrohAdapterArgs {
+        config: IrohConfig::for_testing(fixtures.network_key(0), bind_addr),
+        network: NetworkDefinition::simulator(),
+        vnodes: signers
+            .iter()
+            .enumerate()
+            .map(|(index, signer)| {
+                (
+                    vid(u32::try_from(index).expect("few validators")),
+                    Arc::clone(signer) as Arc<dyn Signer>,
+                )
+            })
+            .collect(),
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
+    .await
+    .expect("the host binds");
+    let target = host.endpoint_addr();
+
+    let signed = || signers.iter().map(|signer| signer.signed()).sum::<u64>();
+    let before = signed();
+    let start = (Instant::now(), cpu_time());
+    let answered = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
+    let floods: Vec<_> = (0..dialers)
+        .map(|_| {
+            let (target, answered, refused) =
+                (target.clone(), Arc::clone(&answered), Arc::clone(&refused));
+            spawn(async move {
+                let stranger = Builder::empty()
+                    .preset(presets::Minimal)
+                    .relay_mode(RelayMode::Disabled)
+                    .clear_ip_transports()
+                    .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .expect("a loopback socket")
+                    .bind()
+                    .await
+                    .expect("the stranger binds");
+                let deadline = Instant::now() + watch;
+                while Instant::now() < deadline {
+                    if bind_hello(&stranger, target.clone()).await.is_ok() {
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                stranger.close().await;
+            })
+        })
+        .collect();
+    for flood in floods {
+        flood.await.expect("a dialer finishes");
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "bind flood",
+            "backend": "iroh",
+            "validators": validators,
+            "dialers": dialers,
+            "secs": wall,
+            "answered_per_sec": per_sec(answered.load(Ordering::Relaxed)),
+            "refused_per_sec": per_sec(refused.load(Ordering::Relaxed)),
+            "host_signatures_per_sec": per_sec(signed() - before),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
 /// Run `measure` over a cluster on `backend`.
 macro_rules! on_backend {
     ($backend:expr, $spec:expr, |$hosts:ident| $measure:expr) => {
@@ -1325,13 +1440,7 @@ async fn main() {
             on_backend!(backend, spec, |hosts| notify(backend, hosts, peers).await);
         }
         Command::Range { backend } => {
-            let spec = ClusterSpec {
-                hosts: RANGE_SERVERS + 1,
-                seated: RANGE_SERVERS,
-                serves: |index| index < RANGE_SERVERS,
-                meshed: true,
-                timers: PathTimers::default(),
-            };
+            let spec = range_cluster();
             on_backend!(backend, spec, |hosts| range(backend, hosts).await);
         }
         Command::Committee { backend, size } => {
@@ -1391,17 +1500,18 @@ async fn main() {
             reject_flood(rate, forged_per_signed, Duration::from_secs(secs), follower).await;
         }
         Command::GarbageResponder { backend, requests } => {
-            let spec = ClusterSpec {
-                hosts: RANGE_SERVERS + 1,
-                seated: RANGE_SERVERS,
-                serves: |index| index < RANGE_SERVERS,
-                meshed: true,
-                timers: PathTimers::default(),
-            };
+            let spec = range_cluster();
             on_backend!(backend, spec, |hosts| garbage_responder(
                 backend, hosts, requests
             )
             .await);
+        }
+        Command::BindFlood {
+            validators,
+            dialers,
+            secs,
+        } => {
+            bind_flood(validators, dialers, Duration::from_secs(secs)).await;
         }
         Command::RefusedFlood {
             rate,

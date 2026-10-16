@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hyperscale_crypto::{
-    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, VerifiedSignature,
-    Verifier, VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, SignError, Signer,
+    VerifiedSignature, Verifier, VrfProof,
 };
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
-use iroh::{EndpointAddr, RelayUrl};
+use iroh::{Endpoint, EndpointAddr, RelayUrl};
 use iroh_relay::server::{RelayConfig, Server, ServerConfig, SpawnError, SupervisorError};
 use tokio::net::UdpSocket;
 use tokio::spawn;
@@ -30,8 +30,9 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::path::PathKind;
+use crate::protocol::ALPN;
 use crate::test_utils::TestFixtures;
-use crate::{IrohAdapter, IrohAdapterArgs, IrohConfig};
+use crate::{IrohAdapter, IrohAdapterArgs, IrohConfig, bind};
 
 /// Largest UDP payload the bridge forwards.
 const MAX_DATAGRAM_BYTES: usize = 65_535;
@@ -508,6 +509,67 @@ impl Verifier for CountingVerifier {
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
         self.inner.verify_vrf(key, message, proof)
     }
+}
+
+/// A [`Signer`] that counts what it signs.
+#[derive(Debug)]
+pub struct CountingSigner {
+    inner: Arc<dyn Signer>,
+    signed: AtomicU64,
+}
+
+impl CountingSigner {
+    /// Count what `inner` signs.
+    #[must_use]
+    pub fn new(inner: Arc<dyn Signer>) -> Self {
+        Self {
+            inner,
+            signed: AtomicU64::new(0),
+        }
+    }
+
+    /// Messages signed so far.
+    #[must_use]
+    pub fn signed(&self) -> u64 {
+        self.signed.load(Ordering::Relaxed)
+    }
+}
+
+impl Signer for CountingSigner {
+    fn public_key(&self) -> ConsensusPublicKey {
+        self.inner.public_key()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<ConsensusSignature, SignError> {
+        self.signed.fetch_add(1, Ordering::Relaxed);
+        self.inner.sign(message)
+    }
+
+    fn vrf_sign(&self, message: &[u8]) -> Result<VrfProof, SignError> {
+        self.inner.vrf_sign(message)
+    }
+}
+
+/// Open a bind handshake at `target` from `endpoint` as a dialer that
+/// proves nothing, and return how many validators the listener signed for.
+///
+/// The dialer states a version and a nonce, reads the listener's
+/// signatures, and closes.
+///
+/// # Errors
+///
+/// Describes the failure when the dial fails or the listener closes the
+/// connection instead of signing.
+pub async fn bind_hello(endpoint: &Endpoint, target: EndpointAddr) -> Result<usize, String> {
+    let connection = endpoint
+        .connect(target, ALPN)
+        .await
+        .map_err(|e| e.to_string())?;
+    let signed = bind::hello_only(&connection)
+        .await
+        .map_err(|e| e.to_string());
+    connection.close(0u32.into(), b"done");
+    signed
 }
 
 #[cfg(test)]

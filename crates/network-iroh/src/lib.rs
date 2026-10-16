@@ -13,6 +13,7 @@
 
 mod address_book;
 mod bind;
+mod bind_gate;
 mod config;
 mod cooldown;
 mod endpoint;

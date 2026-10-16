@@ -4,15 +4,18 @@
 use std::collections::{BTreeSet, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_iroh::test_utils::TestFixtures;
+use hyperscale_network_iroh::testing::{CountingSigner, bind_hello};
 use hyperscale_network_iroh::{ALPN, IrohAdapter, IrohAdapterArgs, IrohConfig, LocalVnodeIdentity};
 use hyperscale_types::{NetworkDefinition, ShardId, Signer, ValidatorId};
 use iroh::endpoint::{Builder, presets};
-use iroh::{EndpointAddr, RelayMode};
+use iroh::{Endpoint, EndpointAddr, RelayMode};
+use tokio::spawn;
 use tokio::time::{sleep, timeout};
 
 /// Budget for a connection and its validator-bind handshake over loopback.
@@ -20,6 +23,14 @@ const BIND_BUDGET: Duration = Duration::from_secs(10);
 
 /// How long a binding that must not form is watched for.
 const REFUSAL_WATCH: Duration = Duration::from_secs(2);
+
+/// Binds strangers together may open at once at a host, and how often they
+/// earn another.
+const STRANGER_BURST: u64 = 32;
+const STRANGER_REFILL: Duration = Duration::from_millis(125);
+
+/// Bind exchanges a stranger opens in a flood.
+const FLOOD: u64 = 300;
 
 fn loopback() -> SocketAddr {
     (Ipv4Addr::LOCALHOST, 0).into()
@@ -90,6 +101,19 @@ fn resolves(host: &IrohAdapter, validators: &[u32], peer: &IrohAdapter) -> bool 
     validators
         .iter()
         .all(|&i| host.peer_for_validator(vid(i)) == Some(peer.local_endpoint_id()))
+}
+
+/// An endpoint that carries no validator, on loopback.
+async fn stranger() -> Endpoint {
+    Builder::empty()
+        .preset(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr(loopback())
+        .expect("a loopback socket")
+        .bind()
+        .await
+        .expect("the stranger binds")
 }
 
 async fn wait_for(budget: Duration, mut check: impl FnMut() -> bool) -> bool {
@@ -297,4 +321,75 @@ async fn a_connection_that_never_binds_is_closed() {
     assert!(closed.is_ok(), "an unbound connection is closed");
     assert_eq!(host.cached_peer_count(), 0);
     stranger.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_makes_a_host_sign_only_within_its_budget() {
+    let fixtures = TestFixtures::new(7, 2);
+    let counted = Arc::new(CountingSigner::new(fixtures.signer(0)));
+    let mut spec = HostSpec::new(&fixtures, &[0]);
+    spec.signers = Some(vec![Arc::clone(&counted) as Arc<dyn Signer>]);
+    let host = spec.bind().await;
+    let stranger = stranger().await;
+
+    let start = Instant::now();
+    let mut answered = 0;
+    for _ in 0..FLOOD {
+        if bind_hello(&stranger, host.endpoint_addr()).await.is_ok() {
+            answered += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    let earned = u64::try_from(elapsed.as_millis() / STRANGER_REFILL.as_millis()).unwrap();
+    assert!(answered > 0, "a stranger may still bind");
+    assert!(
+        answered <= STRANGER_BURST + earned + 1,
+        "{answered} of {FLOOD} bind exchanges answered in {elapsed:?}"
+    );
+    assert_eq!(
+        counted.signed(),
+        answered,
+        "one signature per answered exchange"
+    );
+    stranger.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_its_book_names_binds_while_strangers_flood() {
+    let fixtures = TestFixtures::new(7, 2);
+    let host0 = HostSpec::new(&fixtures, &[0]).bind().await;
+    let host1 = HostSpec::new(&fixtures, &[1]).bind().await;
+    for record in host1.address_records() {
+        let _ = host0.ingest_validator_address(&record);
+    }
+
+    // Strangers spend every turn the host gives dialers it cannot vouch for.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let (stop, target) = (Arc::clone(&stop), host0.endpoint_addr());
+        spawn(async move {
+            let stranger = stranger().await;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = bind_hello(&stranger, target.clone()).await;
+            }
+            stranger.close().await;
+        })
+    };
+    sleep(REFUSAL_WATCH).await;
+
+    // Host 1 dials host 0, whose book names it.
+    for record in host0.address_records() {
+        let _ = host1.ingest_validator_address(&record);
+    }
+    host1.update_wanted_validators(BTreeSet::from([vid(0)]));
+    let bound = wait_for(BIND_BUDGET, || {
+        resolves(&host0, &[1], &host1) && resolves(&host1, &[0], &host0)
+    })
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    flood.await.expect("the flood ends");
+    assert!(
+        bound,
+        "a validator the book vouches for binds through the flood"
+    );
 }
