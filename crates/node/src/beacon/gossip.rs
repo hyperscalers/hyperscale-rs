@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
-use hyperscale_network::{GossipVerdict, Network};
+use hyperscale_network::{GossipVerdict, Network, VerdictKey};
 use hyperscale_types::ShardId;
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
@@ -32,6 +32,12 @@ use crate::shard::push_protocol_event;
 ///   registration nor backs the channel up.
 /// - `beacon.candidate` and `beacon.ratify_vote` route to the named
 ///   shard's consensus.
+///
+/// Each defers its gossip verdict to the coordinator's signature check,
+/// whose action handler settles it, so the transport forwards a beacon
+/// item only once it holds up. An item the coordinator drops unchecked,
+/// one it holds already or cannot place, is never settled and so never
+/// forwarded from here.
 pub fn register_beacon_gossip_handlers<N: Network>(
     network: &N,
     senders: &SharedShardSenders,
@@ -54,6 +60,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                 );
                 return GossipVerdict::Ignore;
             };
+            let key = VerdictKey::of(gossip.block());
             push_protocol_event(
                 tx,
                 target_shard,
@@ -61,7 +68,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     block: gossip.block,
                 },
             );
-            GossipVerdict::Accept
+            GossipVerdict::Defer(key)
         },
     );
 
@@ -89,6 +96,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
             let Some(tx) = senders.get(&target_shard) else {
                 return GossipVerdict::Ignore;
             };
+            let key = VerdictKey::of(gossip.candidate());
             push_protocol_event(
                 tx,
                 target_shard,
@@ -96,7 +104,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     candidate: gossip.candidate,
                 },
             );
-            GossipVerdict::Accept
+            GossipVerdict::Defer(key)
         },
     );
 
@@ -131,6 +139,9 @@ pub fn register_beacon_gossip_handlers<N: Network>(
             let Some(tx) = senders.get(&target_shard) else {
                 return GossipVerdict::Ignore;
             };
+            // The message stands on its sender's own vote; the proof votes
+            // it carries are each judged as they would be alone.
+            let key = VerdictKey::of(gossip.vote());
             for vote in gossip.into_votes() {
                 push_protocol_event(
                     tx,
@@ -138,7 +149,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
                     ProtocolEvent::UnverifiedRatifyVoteReceived { vote },
                 );
             }
-            GossipVerdict::Accept
+            GossipVerdict::Defer(key)
         },
     );
 

@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
-use hyperscale_network::{GossipVerdict, HandlerRegistry, Network};
+use hyperscale_network::{GossipVerdict, HandlerRegistry, Network, VerdictKey};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::CountingVerifier;
 use hyperscale_network_iroh::{
@@ -108,6 +108,16 @@ const FLOOD_WATCH: Duration = Duration::from_secs(6);
 
 /// How long a peer whose headers are its own fault keeps sending.
 const REJECTED_WATCH_SECS: u32 = 5;
+
+/// How long a deferred check takes, as long as the shard loop's batch
+/// window holds a committed header.
+const CHECK_DELAY: Duration = Duration::from_millis(15);
+
+/// Items of one peer a host waits on deferred verdicts for at once.
+const DEFERRED_AT_ONCE: u64 = 64;
+
+/// Time a follower takes to subscribe to the hosts it is bound to.
+const SUBSCRIBE_WAIT: Duration = Duration::from_secs(6);
 
 /// A batch of transactions, as far as the transport is concerned: an item
 /// for one shard.
@@ -672,6 +682,129 @@ async fn a_peer_whose_items_are_rejected_is_cooled_down() {
     assert!(
         judged <= admitted,
         "the sender is cooled down: {judged} of {sent} headers judged in {secs} s"
+    );
+}
+
+/// A host that relays a sender's global items onward to a follower that
+/// hears nothing else: the follower refuses whatever the sender sends it.
+async fn relay_line(fixtures: &TestFixtures) -> (Host, Host, Host) {
+    let relay = host(fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let sender = host(
+        fixtures,
+        1,
+        &[ShardId::ROOT],
+        vec![relay.adapter.endpoint_addr()],
+    )
+    .await;
+    let follower = host(fixtures, 2, &[], vec![relay.adapter.endpoint_addr()]).await;
+    wait_for("the line binds", || {
+        relay.adapter.peer_for_validator(vid(1)).is_some()
+            && relay.adapter.peer_for_validator(vid(2)).is_some()
+    })
+    .await;
+    follower.adapter.fault_configure(
+        HostId(2),
+        [
+            (relay.adapter.local_endpoint_id(), HostId(0)),
+            (sender.adapter.local_endpoint_id(), HostId(1)),
+        ],
+    );
+    follower.adapter.fault_gate().block_host(HostId(1));
+    // The follower subscribes to the hosts it is bound to.
+    sleep(SUBSCRIBE_WAIT).await;
+    (relay, sender, follower)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
+    let fixtures = TestFixtures::with_surplus(21, 1, 2);
+    let (relay, sender, follower) = relay_line(&fixtures).await;
+
+    let (keys_tx, mut keys) = mpsc::unbounded_channel();
+    relay
+        .network
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+            let key = VerdictKey::of(&block);
+            let _ = keys_tx.send(key);
+            GossipVerdict::Defer(key)
+        });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    follower
+        .network
+        .register_host_gossip_handler(move |block: BeaconBlock| {
+            let _ = tx.send(block);
+        });
+    follower
+        .network
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId| GossipVerdict::Accept);
+
+    sender.network.broadcast_global(&BeaconBlock(7));
+    let key = timeout(BUDGET, keys.recv())
+        .await
+        .expect("the relay judges the item")
+        .expect("a key");
+    assert!(
+        timeout(SILENCE_WATCH, rx.recv()).await.is_err(),
+        "nothing travels on while the check runs"
+    );
+    relay.network.settle(key, GossipVerdict::Accept);
+    let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
+    assert_eq!(delivered, Some(BeaconBlock(7)));
+
+    // One whose check fails stops at the relay.
+    sender.network.broadcast_global(&BeaconBlock(8));
+    let key = timeout(BUDGET, keys.recv())
+        .await
+        .expect("the relay judges the item")
+        .expect("a key");
+    relay.network.settle(key, GossipVerdict::Reject);
+    assert!(timeout(SILENCE_WATCH, rx.recv()).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_items_fail_their_deferred_check_is_cooled_down() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+
+    // Every header is checked off the handler, as the shard loop checks a
+    // committed header's sender signature, and every check fails.
+    let checked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&checked);
+    let network = Arc::clone(&receiver.network);
+    let handle = Handle::current();
+    receiver
+        .network
+        .register_gossip_handler(move |header: CommittedHeader, _: ShardId| {
+            let key = VerdictKey::of(&header);
+            let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
+            handle.spawn(async move {
+                sleep(CHECK_DELAY).await;
+                counted.fetch_add(1, Ordering::SeqCst);
+                network.settle(key, GossipVerdict::Reject);
+            });
+            GossipVerdict::Defer(key)
+        });
+
+    let start = Instant::now();
+    let sent = HONEST_RATE * REJECTED_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.broadcast_global(&CommittedHeader {
+            seq: u64::from(seq),
+            body: vec![7; HEADER_BYTES],
+        });
+    }
+    sleep(SILENCE_WATCH).await;
+    let judged = checked.load(Ordering::SeqCst) as u64;
+    let secs = start.elapsed().as_secs() + 1;
+    // As for rejections at once, plus what was already waiting on its check
+    // when the cooldown began.
+    let admitted = FORGERIES_IN_ALLOWANCE + DEFERRED_AT_ONCE + secs * (5 + DEFERRED_AT_ONCE);
+    assert!(judged > 0, "the headers reach the receiver");
+    assert!(
+        judged <= admitted,
+        "the sender is cooled down: {judged} of {sent} headers checked in {secs} s"
     );
 }
 

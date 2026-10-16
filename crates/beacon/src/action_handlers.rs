@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
-use hyperscale_network::Network;
+use hyperscale_network::{GossipVerdict, Network, VerdictKey};
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyProof, RatifyVoteGossip,
 };
@@ -24,8 +24,8 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     BeaconProposal, BeaconVote, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, PcScope,
     PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka, RatifyVerifyContext,
-    RatifyVote, SpcEmptyViewMsg, SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable,
-    Verified, signed_bytes,
+    RatifyVote, RatifyVoteVerifyError, SpcEmptyViewMsg, SpcRelayKind, SpcRelayMessage,
+    SpcVerifyContext, Verifiable, Verified, signed_bytes,
 };
 
 /// Admit `vote` through the durable beacon consensus register before
@@ -331,6 +331,10 @@ where
             active_pool,
             equivocation_signers,
         } => {
+            // A gossip handler deferred its verdict on the block to this
+            // check; the coordinator dispatches it only for a block it can
+            // place, so a failure is the block's own.
+            let key = VerdictKey::of(block.as_unverified());
             let result = Arc::unwrap_or_clone(block)
                 .upgrade(&CertifiedBeaconBlockVerifyContext {
                     verifier: ctx.verifier,
@@ -341,6 +345,7 @@ where
                 })
                 .map(Arc::new)
                 .map_err(|(_, e)| e);
+            ctx.network.settle(key, checked(result.is_ok()));
             ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { result });
         }
         Action::VerifyRatifyVote { vote, signers } => {
@@ -349,6 +354,7 @@ where
             let round = vote.round();
             let phase = vote.phase();
             let signer = vote.signer();
+            let key = VerdictKey::of(vote.as_unverified());
             let result = (*vote)
                 .upgrade(&RatifyVerifyContext {
                     verifier: ctx.verifier,
@@ -356,6 +362,16 @@ where
                     active_pool: &signers,
                 })
                 .map_err(|(_, e)| e);
+            // A signer outside this host's view of the pool may be one its
+            // view has not caught up with; a bad signature is the vote's.
+            ctx.network.settle(
+                key,
+                match result {
+                    Ok(_) => GossipVerdict::Accept,
+                    Err(RatifyVoteVerifyError::BadSignature) => GossipVerdict::Reject,
+                    Err(RatifyVoteVerifyError::SignerNotInPool) => GossipVerdict::Ignore,
+                },
+            );
             ctx.notify_protocol(ProtocolEvent::RatifyVoteVerified {
                 anchor,
                 epoch,
@@ -370,6 +386,7 @@ where
             committee,
             equivocation_signers,
         } => {
+            let key = VerdictKey::of(candidate.as_unverified());
             let result = Arc::unwrap_or_clone(candidate)
                 .upgrade(&CandidateVerifyContext {
                     verifier: ctx.verifier,
@@ -382,6 +399,7 @@ where
             if let Ok(verified) = &result {
                 (ctx.cache_beacon_candidate)(Arc::clone(verified));
             }
+            ctx.network.settle(key, checked(result.is_ok()));
             ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { result });
         }
         Action::VerifyPcVote1 {
@@ -508,5 +526,15 @@ where
             });
         }
         _ => unreachable!("hyperscale_beacon::handle_action called with non-beacon action"),
+    }
+}
+
+/// The gossip verdict of a check that either holds or fails on the item
+/// itself.
+const fn checked(valid: bool) -> GossipVerdict {
+    if valid {
+        GossipVerdict::Accept
+    } else {
+        GossipVerdict::Reject
     }
 }

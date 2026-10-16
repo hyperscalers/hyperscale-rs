@@ -14,6 +14,7 @@
 //! bench delayed-idle --rtt-ms 40 --connections 500
 //! bench reject-flood --rate 1000 --forged-per-signed 7 [--follower]
 //! bench refused-flood --rate 1000 --verdict reject|ignore
+//! bench forged-flood --rate 1000 --verdict accept|defer
 //! bench bind-flood --validators 4 --dialers 16
 //! bench garbage-responder --backend iroh|libp2p --requests 2000
 //! ```
@@ -38,7 +39,10 @@ use arc_swap::ArcSwap;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
-use hyperscale_network::{GossipVerdict, HandlerRegistry, Network, RequestError, ResponseVerdict};
+use hyperscale_network::fault::HostId;
+use hyperscale_network::{
+    GossipVerdict, HandlerRegistry, Network, RequestError, ResponseVerdict, VerdictKey,
+};
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
 use hyperscale_network_iroh::testing::{
     CountingSigner, CountingVerifier, Star, UdpBridge, bind_hello,
@@ -274,6 +278,20 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         secs: u64,
     },
+    /// A peer floods global items that fail a check its receiver runs off
+    /// the handler, while a follower hears only what the receiver forwards.
+    ForgedFlood {
+        /// Items the peer sends a second.
+        #[arg(long, default_value_t = 1000)]
+        rate: u32,
+        /// What the receiver's handler answers before the check: `accept`
+        /// forwards at once and leaves the check unattributed, `defer`
+        /// waits on it.
+        #[arg(long, value_enum)]
+        verdict: Checked,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// A peer floods global items its receiver refuses with one verdict.
     RefusedFlood {
         /// Items the peer sends a second.
@@ -285,6 +303,15 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         secs: u64,
     },
+}
+
+/// What a forged flood's receiver answers before its check.
+#[derive(Clone, Copy, ValueEnum)]
+enum Checked {
+    /// Accept at once; the check that fails later is no one's to answer.
+    Accept,
+    /// Defer to the check, which settles it.
+    Defer,
 }
 
 /// The verdict a refused flood's receiver gives every item.
@@ -1410,6 +1437,140 @@ async fn bind_flood(validators: u32, dialers: u32, watch: Duration) {
     );
 }
 
+/// A receiver, a sender bound to it, and a follower bound to it that
+/// refuses what the sender sends it, so it hears only what the receiver
+/// forwards.
+async fn relay_line(
+    fixtures: &IrohFixtures,
+) -> (Arc<IrohNetwork>, Arc<IrohNetwork>, Arc<IrohNetwork>) {
+    let (receiver, receiver_network) = iroh_host(
+        fixtures,
+        0,
+        &[ShardId::ROOT],
+        None,
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let (sender, sender_network) = iroh_host(
+        fixtures,
+        1,
+        &[ShardId::ROOT],
+        Some(receiver.endpoint_addr()),
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let (follower, follower_network) = iroh_host(
+        fixtures,
+        2,
+        &[],
+        Some(receiver.endpoint_addr()),
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    for network in [&receiver_network, &sender_network, &follower_network] {
+        network.update_routing_committees(Arc::new(RoutingCommittees::from([(
+            ShardId::ROOT,
+            vec![vid(0)],
+        )])));
+    }
+    let bound = timeout(MESH_BUDGET, async {
+        while receiver.peer_for_validator(vid(1)).is_none()
+            || receiver.peer_for_validator(vid(2)).is_none()
+            || sender.peer_for_validator(vid(0)).is_none()
+            || follower.peer_for_validator(vid(0)).is_none()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(bound.is_ok(), "the line binds");
+    // The follower refuses what the sender sends it, so it hears only what
+    // the receiver forwards.
+    follower.fault_configure(
+        HostId(2),
+        [
+            (receiver.local_endpoint_id(), HostId(0)),
+            (sender.local_endpoint_id(), HostId(1)),
+        ],
+    );
+    follower.fault_gate().block_host(HostId(1));
+    // The follower subscribes to the hosts it is bound to.
+    sleep(Duration::from_secs(6)).await;
+
+    (receiver_network, sender_network, follower_network)
+}
+
+/// A sender floods a receiver with 2 KiB global items at `rate` for
+/// `watch`. The receiver hands each to a check that takes as long as the
+/// shard loop's batch window and finds it false, answering `checked` first;
+/// a follower bound to the receiver alone counts what reaches it.
+async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
+    /// How long the check takes.
+    const CHECK: Duration = Duration::from_millis(15);
+    let fixtures = IrohFixtures::with_surplus(SEED, 1, 2);
+    let (receiver_network, sender_network, follower_network) = relay_line(&fixtures).await;
+
+    let checks = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&checks);
+    let network = Arc::clone(&receiver_network);
+    let handle = Handle::current();
+    receiver_network.register_gossip_handler(move |item: Committed, _: ShardId| {
+        let key = VerdictKey::of(&item);
+        let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
+        handle.spawn(async move {
+            sleep(CHECK).await;
+            counted.fetch_add(1, Ordering::Relaxed);
+            network.settle(key, GossipVerdict::Reject);
+        });
+        match checked {
+            Checked::Accept => GossipVerdict::Accept,
+            Checked::Defer => GossipVerdict::Defer(key),
+        }
+    });
+    let reached = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&reached);
+    follower_network.register_host_gossip_handler(move |_: Committed| {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+    follower_network.register_gossip_handler(|_: Committed, _: ShardId| GossipVerdict::Accept);
+
+    let mut tick = interval(Duration::from_secs(1) / rate);
+    let start = (Instant::now(), cpu_time());
+    let mut sent = 0u64;
+    while start.0.elapsed() < watch {
+        tick.tick().await;
+        sent += 1;
+        sender_network.broadcast_global(&Committed {
+            seq: sent,
+            body: vec![7; HEADER_BYTES],
+        });
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "forged flood",
+            "backend": "iroh",
+            "verdict": match checked {
+                Checked::Accept => "accept",
+                Checked::Defer => "defer",
+            },
+            "secs": wall,
+            "sent_per_sec": per_sec(sent),
+            "receiver_checks_per_sec": per_sec(checks.load(Ordering::Relaxed)),
+            "follower_reached_per_sec": per_sec(reached.load(Ordering::Relaxed)),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
 /// Run `measure` over a cluster on `backend`.
 macro_rules! on_backend {
     ($backend:expr, $spec:expr, |$hosts:ident| $measure:expr) => {
@@ -1512,6 +1673,13 @@ async fn main() {
             secs,
         } => {
             bind_flood(validators, dialers, Duration::from_secs(secs)).await;
+        }
+        Command::ForgedFlood {
+            rate,
+            verdict,
+            secs,
+        } => {
+            forged_flood(rate, verdict, Duration::from_secs(secs)).await;
         }
         Command::RefusedFlood {
             rate,

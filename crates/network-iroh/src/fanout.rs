@@ -24,7 +24,8 @@
 //! Samples are drawn only from hosts that proved, in the bind handshake,
 //! that they carry a validator of the beacon derived set; nothing a peer
 //! merely claims widens an audience. A host forwards only what one of its
-//! own handlers accepted. Each item it does not accept is charged against
+//! own handlers accepted, and an item whose handler deferred its verdict to
+//! a check that finishes later travels on only once that check holds up. Each item it does not accept is charged against
 //! its sender at about the work it took, and one that is the sender's fault
 //! (a rejection, not an item this host could not judge) at the cost of a
 //! signature check on top. A sender whose refused items cost more than its
@@ -53,7 +54,9 @@ use hyperscale_metrics::{
     record_network_message_sent,
 };
 use hyperscale_network::compression::{compress, decompress};
-use hyperscale_network::{GossipVerdict, HandlerRegistry, RawGossipHandler, RawHostGossipHandler};
+use hyperscale_network::{
+    GossipVerdict, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, VerdictKey,
+};
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, RoutingCommittees, ShardId, TopologySnapshot,
@@ -71,6 +74,7 @@ use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
 use crate::cooldown::Cooldown;
+use crate::deferred::Waiting;
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
@@ -124,6 +128,15 @@ const ADDRESS_RECORD_CLASS: MessageClass = MessageClass::CrossShardProgress;
 /// for an address record checking a signature) runs off the read loop, and
 /// a verdict that cools a peer down stops only what is read after it.
 const JUDGED_AT_ONCE_PER_PEER: usize = 4;
+
+/// Items of one peer whose deferred verdicts this host waits on at once.
+/// Each check runs on this host's own pools, so the bound is on the work a
+/// peer can have queued before the verdicts that cool it down arrive.
+const DEFERRED_PER_PEER: usize = 64;
+
+/// Longest this host waits on a deferred verdict. An item still unsettled
+/// then is dropped as one it could not judge.
+const DEFER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Work charged against a peer for each of its gossip items this host
 /// does not accept: reading, hashing, and dispatching it.
@@ -295,16 +308,39 @@ impl SeenSet {
     }
 }
 
+/// The turns a peer's item holds while it is judged.
+struct Turns {
+    /// At being judged, given back once its handlers have answered.
+    judging: OwnedSemaphorePermit,
+    /// At being waited on, given back with its verdict.
+    waiting: OwnedSemaphorePermit,
+}
+
+/// A gossip item as it arrived: who sent it, its size, and the frame and
+/// class it travels on with when accepted.
+#[derive(Clone)]
+struct Arrival {
+    sender: EndpointId,
+    class: MessageClass,
+    /// `None` for an item that is not forwarded.
+    frame: Option<Bytes>,
+    bytes: usize,
+}
+
+/// An item whose verdict waits on a check.
+struct DeferredItem {
+    arrival: Arrival,
+    /// Where the sender's turn at being waited on goes back with the
+    /// verdict.
+    waits: Arc<Semaphore>,
+}
+
 /// An address record held for its validator's turn to be checked.
 struct HeldRecord {
     record: ValidatorAddressGossip,
     /// The item it arrived as, forgotten if the record is let go unchecked.
     item: [u8; 32],
-    /// Who sent it, and the frame and class it is forwarded with.
-    sender: EndpointId,
-    class: MessageClass,
-    frame: Option<Bytes>,
-    bytes: usize,
+    arrival: Arrival,
 }
 
 /// What decides whether a received item is accepted.
@@ -340,6 +376,10 @@ pub struct Fanout {
     rejects: Cooldown,
     /// Turns at judging each peer's items.
     judging: DashMap<EndpointId, Arc<Semaphore>>,
+    /// Turns at being waited on for a deferred verdict, per peer.
+    deferring: DashMap<EndpointId, Arc<Semaphore>>,
+    /// Items waiting on a deferred verdict.
+    waiting: Mutex<Waiting<DeferredItem>>,
     topology: Arc<ArcSwap<TopologySnapshot>>,
     routing_committees: Arc<ArcSwap<RoutingCommittees>>,
     /// Hosts that asked for every global item this host accepts.
@@ -374,6 +414,8 @@ impl Fanout {
             records: RecordPace::default(),
             rejects: Cooldown::default(),
             judging: DashMap::new(),
+            deferring: DashMap::new(),
+            waiting: Mutex::new(Waiting::default()),
             topology,
             routing_committees,
             subscribers: DashSet::new(),
@@ -556,6 +598,18 @@ impl Fanout {
             let (type_id, compressed, wire_bytes) =
                 framing::read_typed_frame_compressed(&mut recv, MAX_FRAME_SIZE).await?;
             record_libp2p_bandwidth((scope.encode().len() + wire_bytes) as u64, 0);
+            // An item may be deferred, and a peer has only so many waited
+            // on at once.
+            let waits = Arc::clone(
+                &self
+                    .deferring
+                    .entry(peer)
+                    .or_insert_with(|| Arc::new(Semaphore::new(DEFERRED_PER_PEER))),
+            );
+            let waiting = waits
+                .acquire_owned()
+                .await
+                .expect("the deferring semaphore is never closed");
             // The peer's items are judged a few at a time, so it cannot have
             // more read than that before the verdicts that cool it down.
             let turns = Arc::clone(
@@ -574,7 +628,17 @@ impl Fanout {
                 let _ = recv.stop(STOP_GOSSIP_REFUSED);
                 return Ok(());
             }
-            self.receive(peer, class, scope, &type_id, &compressed, turn);
+            self.receive(
+                peer,
+                class,
+                scope,
+                &type_id,
+                &compressed,
+                Turns {
+                    judging: turn,
+                    waiting,
+                },
+            );
         }
     }
 
@@ -587,7 +651,7 @@ impl Fanout {
         scope: Scope,
         type_id: &str,
         compressed: &[u8],
-        turn: OwnedSemaphorePermit,
+        turns: Turns,
     ) {
         // Fault gate: a matching drop rule or a partition against the
         // sender suppresses both local delivery and forwarding.
@@ -647,19 +711,26 @@ impl Fanout {
             Scope::Shard(_) => None,
         };
 
-        let bytes = payload.len();
+        let arrival = Arrival {
+            sender,
+            class,
+            frame: forward,
+            bytes: payload.len(),
+        };
         let fanout = Arc::clone(self);
         self.tokio_handle.spawn(async move {
-            let _turn = turn;
+            let Turns {
+                judging: _judging,
+                waiting,
+            } = turns;
             let verdict = match judge {
                 Judge::AddressBook => {
-                    let Some(verdict) =
-                        fanout.offer_address_record(sender, class, item, &payload, forward.clone())
+                    let Some(verdict) = fanout.offer_address_record(item, &payload, &arrival)
                     else {
                         // Held for its validator's turn; judged then.
                         return;
                     };
-                    Some(verdict)
+                    verdict
                 }
                 Judge::Registry {
                     handler,
@@ -668,28 +739,84 @@ impl Fanout {
                     if let Some(host_handler) = host_handler {
                         host_handler(payload.clone());
                     }
-                    handler(payload, scope.shard())
+                    // No handler here judged it.
+                    handler(payload, scope.shard()).unwrap_or(GossipVerdict::Ignore)
                 }
             };
-            // Only what a handler here accepted is forwarded: a host that
-            // forwards an item it did not judge would answer to the hosts
-            // it reaches for whatever the item turns out to be.
-            match verdict {
-                Some(GossipVerdict::Accept) => {
-                    record_network_message_received();
-                    if let Some(frame) = forward {
-                        fanout.forward(sender, class, &frame);
-                    }
-                }
-                Some(GossipVerdict::Reject) => {
-                    record_invalid_message();
-                    fanout.note_reject(sender, refused_work(bytes, Refusal::Fault));
-                }
-                Some(GossipVerdict::Ignore) | None => {
-                    fanout.note_reject(sender, refused_work(bytes, Refusal::Unjudged));
+            if let GossipVerdict::Defer(key) = verdict {
+                // The turn is held until the verdict comes.
+                let waits = Arc::clone(waiting.semaphore());
+                waiting.forget();
+                fanout.defer(key, DeferredItem { arrival, waits });
+            } else {
+                fanout.conclude(&arrival, verdict);
+            }
+        });
+    }
+
+    /// Wait on the verdict deferred on the item `key` names, for at most
+    /// [`DEFER_TIMEOUT`].
+    fn defer(self: &Arc<Self>, key: VerdictKey, item: DeferredItem) {
+        let settled = self.waiting.lock().expect("waiting lock").defer(key, item);
+        if let Some((item, verdict)) = settled {
+            self.finish(&item, verdict);
+            return;
+        }
+        let fanout = Arc::downgrade(self);
+        self.tokio_handle.spawn(async move {
+            sleep(DEFER_TIMEOUT).await;
+            if let Some(fanout) = fanout.upgrade() {
+                let expired = fanout.waiting.lock().expect("waiting lock").expire(key);
+                if let Some(item) = expired {
+                    fanout.finish(&item, GossipVerdict::Ignore);
                 }
             }
         });
+    }
+
+    /// Settle the verdict deferred on the item `key` names.
+    pub fn settle(&self, key: VerdictKey, verdict: GossipVerdict) {
+        let waited = self
+            .waiting
+            .lock()
+            .expect("waiting lock")
+            .settle(key, verdict);
+        if let Some(item) = waited {
+            self.finish(&item, verdict);
+        }
+    }
+
+    /// Act on the verdict an item waited for, as if it had come at once,
+    /// and give its sender's turn back.
+    fn finish(&self, item: &DeferredItem, verdict: GossipVerdict) {
+        item.waits.add_permits(1);
+        self.conclude(&item.arrival, verdict);
+    }
+
+    /// Act on an item's verdict. Only what a handler here accepted is
+    /// forwarded: a host that forwards an item it did not judge would
+    /// answer to the hosts it reaches for whatever the item turns out to
+    /// be. Anything else is charged against its sender, a rejection as its
+    /// fault.
+    fn conclude(&self, arrival: &Arrival, verdict: GossipVerdict) {
+        match verdict {
+            GossipVerdict::Accept => {
+                record_network_message_received();
+                if let Some(frame) = &arrival.frame {
+                    self.forward(arrival.sender, arrival.class, frame);
+                }
+            }
+            GossipVerdict::Reject => {
+                record_invalid_message();
+                self.note_reject(arrival.sender, refused_work(arrival.bytes, Refusal::Fault));
+            }
+            GossipVerdict::Ignore | GossipVerdict::Defer(_) => {
+                self.note_reject(
+                    arrival.sender,
+                    refused_work(arrival.bytes, Refusal::Unjudged),
+                );
+            }
+        }
     }
 
     /// Forward an accepted global item `sender` sent to this host's
@@ -704,7 +831,7 @@ impl Fanout {
         self.send(&audience, class, frame);
     }
 
-    /// Judge an address record `sender` sent as `item`, or hold it for its
+    /// Judge an address record that arrived as `item`, or hold it for its
     /// validator's turn to be checked and return `None`.
     ///
     /// A record this host cannot check, because the topology gives its
@@ -715,11 +842,9 @@ impl Fanout {
     /// so a copy arriving later is judged afresh.
     fn offer_address_record(
         self: &Arc<Self>,
-        sender: EndpointId,
-        class: MessageClass,
         item: [u8; 32],
         payload: &[u8],
-        frame: Option<Bytes>,
+        arrival: &Arrival,
     ) -> Option<GossipVerdict> {
         let Ok(record) = hbor_from_slice::<ValidatorAddressGossip>(payload) else {
             return Some(GossipVerdict::Reject);
@@ -741,10 +866,7 @@ impl Fanout {
         let held = HeldRecord {
             record,
             item,
-            sender,
-            class,
-            frame,
-            bytes: payload.len(),
+            arrival: arrival.clone(),
         };
         match self
             .records
@@ -779,21 +901,7 @@ impl Fanout {
         let Some(held) = self.records.release(validator, Instant::now()) else {
             return;
         };
-        match self.check_address_record(&held.record) {
-            GossipVerdict::Accept => {
-                record_network_message_received();
-                if let Some(frame) = &held.frame {
-                    self.forward(held.sender, held.class, frame);
-                }
-            }
-            GossipVerdict::Reject => {
-                record_invalid_message();
-                self.note_reject(held.sender, refused_work(held.bytes, Refusal::Fault));
-            }
-            GossipVerdict::Ignore => {
-                self.note_reject(held.sender, refused_work(held.bytes, Refusal::Unjudged));
-            }
-        }
+        self.conclude(&held.arrival, self.check_address_record(&held.record));
     }
 
     /// Verify an address record and store it if it is the newest for its
