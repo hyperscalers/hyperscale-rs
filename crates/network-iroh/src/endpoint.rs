@@ -45,6 +45,7 @@ use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
 use crate::inbound::InboundRouter;
 use crate::path::{PathPolicy, PathStatus, Redialer};
+use crate::peer::Peer;
 use crate::protocol::{
     ALPN, CLOSE_BIND_FAILED, CLOSE_BIND_REFUSED, CLOSE_REDIAL_REFUSED, CLOSE_SHUTDOWN,
     CLOSE_SUPERSEDED, REDIAL_ALPN,
@@ -75,6 +76,8 @@ struct Link {
     /// The side that dialed it, which decides which of two simultaneous
     /// connections between a pair is kept.
     dialed_by: EndpointId,
+    /// The validator the peer answers as.
+    principal: ValidatorId,
 }
 
 /// Bytes a host has exchanged in UDP datagrams over its bound connections,
@@ -441,7 +444,16 @@ impl IrohAdapter {
     pub(crate) fn install_fanout(&self, fanout: &Arc<Fanout>) {
         self.inner.router.install_fanout(fanout);
         // Peers that bound before now have not been greeted.
-        for peer in self.connected_peers() {
+        let bound: Vec<Peer> = self
+            .inner
+            .links
+            .iter()
+            .map(|link| Peer {
+                endpoint: *link.key(),
+                principal: link.principal,
+            })
+            .collect();
+        for peer in bound {
             fanout.on_link(peer);
         }
     }
@@ -847,6 +859,12 @@ impl Inner {
         validators: &[ValidatorId],
     ) {
         let peer = connection.remote_id();
+        // A bind proves at least one validator; the lowest is the one the
+        // peer answers as.
+        let Some(&principal) = validators.iter().min() else {
+            connection.close(CLOSE_BIND_FAILED, b"no validator");
+            return;
+        };
         if let Some(existing) = self.links.get(&peer)
             && existing.connection.close_reason().is_none()
             && existing.dialed_by < dialed_by
@@ -862,6 +880,7 @@ impl Inner {
             Link {
                 connection: connection.clone(),
                 dialed_by,
+                principal,
             },
         );
         if let Some(superseded) = superseded {
@@ -877,7 +896,7 @@ impl Inner {
         info!(peer = %peer.fmt_short(), ?validators, "Peer bound");
         self.paths.track(&connection, &self.runtime);
         self.redialer.follow(&connection, &self.runtime);
-        self.router.serve(&connection);
+        self.router.serve(&connection, principal);
 
         // Evict the link and its bindings when this connection closes,
         // unless a later connection to the same peer has replaced it.

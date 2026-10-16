@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use dashmap::DashMap;
-use iroh::EndpointId;
+use hyperscale_types::ValidatorId;
 use tokio::time::Instant;
 
 /// Refused work a peer may run up at once before it cools down.
@@ -91,17 +91,18 @@ impl PeerState {
 }
 
 /// Charges each peer for the work its refused traffic costs and says which
-/// peers are cooling down.
+/// peers are cooling down. A peer is kept by its principal (see
+/// [`crate::peer::Peer`]), so the map holds at most one entry per validator.
 #[derive(Default)]
 pub struct Cooldown {
-    peers: DashMap<EndpointId, PeerState>,
+    peers: DashMap<ValidatorId, PeerState>,
 }
 
 impl Cooldown {
     /// Charge `peer` for `work` spent on traffic this host refused. Returns
     /// the cooldown the peer has just entered when the charge took it past
     /// its allowance.
-    pub fn charge(&self, peer: EndpointId, work: Duration) -> Option<Duration> {
+    pub fn charge(&self, peer: ValidatorId, work: Duration) -> Option<Duration> {
         let now = Instant::now();
         self.peers
             .entry(peer)
@@ -110,7 +111,7 @@ impl Cooldown {
     }
 
     /// Whether `peer` is cooling down.
-    pub fn cooling_down(&self, peer: EndpointId) -> bool {
+    pub fn cooling_down(&self, peer: ValidatorId) -> bool {
         self.peers.get(&peer).is_some_and(|state| {
             state
                 .cooldown_until
@@ -121,13 +122,15 @@ impl Cooldown {
 
 #[cfg(test)]
 mod tests {
-    use iroh::SecretKey;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use tokio::time::advance;
 
     use super::*;
 
-    fn random_peer() -> EndpointId {
-        SecretKey::generate().public()
+    fn random_peer() -> ValidatorId {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        ValidatorId::new(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
     /// About what checking one signature costs.

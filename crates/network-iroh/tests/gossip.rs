@@ -22,7 +22,7 @@ use hyperscale_types::{
     GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees, ShardId,
     TopicScope, TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
 };
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, SecretKey};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout};
@@ -103,6 +103,9 @@ const HONEST_RATE: u32 = 300;
 /// How long the honest peer keeps sending.
 const HONEST_WATCH_SECS: u32 = 15;
 
+/// Items a validator sends from each endpoint it binds as.
+const ROTATION_FLOOD: u64 = 200;
+
 /// How long a validator signs records without pause.
 const FLOOD_WATCH: Duration = Duration::from_secs(6);
 
@@ -165,8 +168,28 @@ async fn host_checking_with(
     bootstrap: Vec<EndpointAddr>,
     verifier: Arc<dyn Verifier>,
 ) -> Host {
+    host_keyed(
+        fixtures,
+        index,
+        fixtures.network_key(index),
+        shards,
+        bootstrap,
+        verifier,
+    )
+    .await
+}
+
+/// [`host_checking_with`], binding as the endpoint `key` names.
+async fn host_keyed(
+    fixtures: &TestFixtures,
+    index: u32,
+    key: SecretKey,
+    shards: &[ShardId],
+    bootstrap: Vec<EndpointAddr>,
+    verifier: Arc<dyn Verifier>,
+) -> Host {
     let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let mut config = IrohConfig::for_testing(fixtures.network_key(index), bind_addr);
+    let mut config = IrohConfig::for_testing(key, bind_addr);
     config.bootstrap_peers = bootstrap;
     let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
     let adapter = IrohAdapter::bind(IrohAdapterArgs {
@@ -805,6 +828,59 @@ async fn a_peer_whose_items_fail_their_deferred_check_is_cooled_down() {
     assert!(
         judged <= admitted,
         "the sender is cooled down: {judged} of {sent} headers checked in {secs} s"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validator_binding_again_under_a_new_endpoint_is_still_cooled_down() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    receiver
+        .network
+        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Reject
+        });
+    let flood = |host: &Host, from: u64| {
+        for seq in from..from + ROTATION_FLOOD {
+            host.network.broadcast_global(&CommittedHeader {
+                seq,
+                body: vec![7; HEADER_BYTES],
+            });
+        }
+    };
+
+    // The sender runs past its allowance and is cooled down.
+    flood(&sender, 0);
+    wait_for("the sender runs past its allowance", || {
+        handled.load(Ordering::SeqCst) as u64 >= FORGERIES_IN_ALLOWANCE
+    })
+    .await;
+    sleep(SILENCE_WATCH).await;
+    let before = handled.load(Ordering::SeqCst) as u64;
+
+    // The same validator binds again under an endpoint it just made.
+    let again = host_keyed(
+        &fixtures,
+        1,
+        SecretKey::generate(),
+        &[ShardId::ROOT],
+        vec![receiver.adapter.endpoint_addr()],
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    wait_for("the new endpoint binds", || {
+        receiver.adapter.peer_for_validator(vid(1)) == Some(again.adapter.local_endpoint_id())
+    })
+    .await;
+    flood(&again, ROTATION_FLOOD);
+    sleep(SILENCE_WATCH).await;
+    let judged = handled.load(Ordering::SeqCst) as u64 - before;
+    assert!(
+        judged <= JUDGED_AT_ONCE,
+        "the validator's debt follows it: {judged} of {ROTATION_FLOOD} judged from the new endpoint"
     );
 }
 
