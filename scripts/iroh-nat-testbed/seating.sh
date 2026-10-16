@@ -51,9 +51,9 @@ for entry in $MIX; do
 done
 HOSTS=${#TYPES[@]}
 
-# Outside addresses on the internet segment, a /15, and in 2001:db8:1::/64.
-outer4() { echo "198.18.$(($1 / 250)).$(($1 % 250 + 2))/15"; }
-outer6() { printf '2001:db8:1::1:%x/64' "$1"; }
+# Outside addresses, in 198.18.0.0/15 and 2001:db8:1::/64.
+outer4() { echo "198.18.$(($1 / 250)).$(($1 % 250 + 2))"; }
+outer6() { printf '2001:db8:1::1:%x' "$1"; }
 inner_net() { echo "10.$(($1 / 256)).$(($1 % 256))"; }
 
 # The site of host $1, of type $2, with $3 ms on its uplink. Sets BIND to
@@ -117,7 +117,7 @@ run_round() {
 
     make_inet
     new_ns relay
-    attach relay "$RELAY4/15" "$RELAY6/64"
+    attach relay "$RELAY4" "$RELAY6"
     ns relay "$RELAY" --config-path "$WORK/relay.toml" >"$dir/relay.log" 2>&1 &
     sleep 2
 
