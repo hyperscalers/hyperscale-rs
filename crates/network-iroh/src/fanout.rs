@@ -34,7 +34,9 @@
 //! Discovery rides the same path. Each host announces its signed address
 //! records at an interval, and hands a newly bound peer its own records and
 //! every record in its book, so a host that knows one peer soon knows them
-//! all.
+//! all. A host checks at most one record of each validator an interval (see
+//! [`crate::record_pace`]), so no validator can make the network check its
+//! records faster, however fast it signs them.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -64,7 +66,7 @@ use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, sleep_until};
 use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
@@ -77,6 +79,7 @@ use crate::protocol::{
     SCOPE_GLOBAL, SCOPE_SHARD, SHARD_WIRE_LEN, STOP_GOSSIP_REFUSED, STOP_SUBSCRIBERS_FULL,
     STREAM_GOSSIP, STREAM_SUBSCRIBE, decode_shard, encode_shard,
 };
+use crate::record_pace::{Offer, RecordPace};
 
 /// Most members of a shard committee a publisher sends a shard scoped item
 /// to.
@@ -274,6 +277,12 @@ struct SeenSet {
 }
 
 impl SeenSet {
+    /// Forget `item`, so that a copy arriving later is handled afresh.
+    fn forget(&mut self, item: &[u8; 32]) {
+        self.current.remove(item);
+        self.previous.remove(item);
+    }
+
     /// Remember `item`. Returns whether it is new.
     fn insert(&mut self, item: [u8; 32]) -> bool {
         if self.current.contains(&item) || self.previous.contains(&item) {
@@ -284,6 +293,18 @@ impl SeenSet {
         }
         self.current.insert(item)
     }
+}
+
+/// An address record held for its validator's turn to be checked.
+struct HeldRecord {
+    record: ValidatorAddressGossip,
+    /// The item it arrived as, forgotten if the record is let go unchecked.
+    item: [u8; 32],
+    /// Who sent it, and the frame and class it is forwarded with.
+    sender: EndpointId,
+    class: MessageClass,
+    frame: Option<Bytes>,
+    bytes: usize,
 }
 
 /// What decides whether a received item is accepted.
@@ -313,6 +334,8 @@ pub struct Fanout {
     /// Outbound gossip streams, one per peer and class.
     streams: ClassStreams,
     seen: Mutex<SeenSet>,
+    /// Each validator's turn at having its address records checked.
+    records: RecordPace<HeldRecord>,
     /// What each peer's refused items have cost this host.
     rejects: Cooldown,
     /// Turns at judging each peer's items.
@@ -348,6 +371,7 @@ impl Fanout {
             adapter,
             registry,
             seen: Mutex::new(SeenSet::default()),
+            records: RecordPace::default(),
             rejects: Cooldown::default(),
             judging: DashMap::new(),
             topology,
@@ -614,12 +638,8 @@ impl Fanout {
                 return;
             }
         };
-        if !self
-            .seen
-            .lock()
-            .expect("seen set lock")
-            .insert(digest(scope, type_id, &payload))
-        {
+        let item = digest(scope, type_id, &payload);
+        if !self.seen.lock().expect("seen set lock").insert(item) {
             return;
         }
         let forward = match scope {
@@ -632,7 +652,15 @@ impl Fanout {
         self.tokio_handle.spawn(async move {
             let _turn = turn;
             let verdict = match judge {
-                Judge::AddressBook => Some(fanout.ingest_address_record(&payload)),
+                Judge::AddressBook => {
+                    let Some(verdict) =
+                        fanout.offer_address_record(sender, class, item, &payload, forward.clone())
+                    else {
+                        // Held for its validator's turn; judged then.
+                        return;
+                    };
+                    Some(verdict)
+                }
                 Judge::Registry {
                     handler,
                     host_handler,
@@ -650,13 +678,7 @@ impl Fanout {
                 Some(GossipVerdict::Accept) => {
                     record_network_message_received();
                     if let Some(frame) = forward {
-                        let audience = forward_audience(
-                            sender,
-                            &fanout.adapter.connected_peers(),
-                            fanout.subscribers.iter().map(|peer| *peer),
-                            &mut rng(),
-                        );
-                        fanout.send(&audience, class, &frame);
+                        fanout.forward(sender, class, &frame);
                     }
                 }
                 Some(GossipVerdict::Reject) => {
@@ -670,20 +692,123 @@ impl Fanout {
         });
     }
 
-    /// Verify an address record and store it if it is the newest for its
-    /// validator. Only a record that cannot be right is refused: one whose
-    /// validator this host does not know yet, or that it holds a newer
-    /// record for, is still news to others.
-    fn ingest_address_record(&self, payload: &[u8]) -> GossipVerdict {
+    /// Forward an accepted global item `sender` sent to this host's
+    /// forward audience.
+    fn forward(&self, sender: EndpointId, class: MessageClass, frame: &Bytes) {
+        let audience = forward_audience(
+            sender,
+            &self.adapter.connected_peers(),
+            self.subscribers.iter().map(|peer| *peer),
+            &mut rng(),
+        );
+        self.send(&audience, class, frame);
+    }
+
+    /// Judge an address record `sender` sent as `item`, or hold it for its
+    /// validator's turn to be checked and return `None`.
+    ///
+    /// A record this host cannot check, because the topology gives its
+    /// validator no key yet, or that is no newer than the one it holds, is
+    /// ignored and never forwarded: forwarding what nobody here checked
+    /// would let anyone send every host a stream of records naming
+    /// validators no host knows. One that cannot be taken now is forgotten,
+    /// so a copy arriving later is judged afresh.
+    fn offer_address_record(
+        self: &Arc<Self>,
+        sender: EndpointId,
+        class: MessageClass,
+        item: [u8; 32],
+        payload: &[u8],
+        frame: Option<Bytes>,
+    ) -> Option<GossipVerdict> {
         let Ok(record) = hbor_from_slice::<ValidatorAddressGossip>(payload) else {
-            return GossipVerdict::Reject;
+            return Some(GossipVerdict::Reject);
         };
-        match self.adapter.ingest_validator_address(&record) {
-            IngestOutcome::Invalid => GossipVerdict::Reject,
-            IngestOutcome::Recorded | IngestOutcome::Stale | IngestOutcome::UnknownValidator => {
-                GossipVerdict::Accept
+        let validator = record.validator;
+        if !self.adapter.knows_validator(validator) {
+            self.forget(&item);
+            return Some(GossipVerdict::Ignore);
+        }
+        if self
+            .adapter
+            .address_book()
+            .sequence(validator)
+            .is_some_and(|held| held >= record.sequence)
+        {
+            return Some(GossipVerdict::Ignore);
+        }
+        let sequence = record.sequence;
+        let held = HeldRecord {
+            record,
+            item,
+            sender,
+            class,
+            frame,
+            bytes: payload.len(),
+        };
+        match self
+            .records
+            .offer(validator, sequence, held, Instant::now())
+        {
+            Offer::Check(held) => Some(self.check_address_record(&held.record)),
+            Offer::Hold { displaced, wake_at } => {
+                if let Some(displaced) = displaced {
+                    self.forget(&displaced.item);
+                }
+                if let Some(at) = wake_at {
+                    let fanout = Arc::downgrade(self);
+                    self.tokio_handle.spawn(async move {
+                        sleep_until(at).await;
+                        if let Some(fanout) = fanout.upgrade() {
+                            fanout.release_address_record(validator);
+                        }
+                    });
+                }
+                None
+            }
+            Offer::Drop(held) => {
+                self.forget(&held.item);
+                Some(GossipVerdict::Ignore)
             }
         }
+    }
+
+    /// Check the record held for `validator`, whose turn has come, and
+    /// forward it or charge its sender as if it had just arrived.
+    fn release_address_record(&self, validator: ValidatorId) {
+        let Some(held) = self.records.release(validator, Instant::now()) else {
+            return;
+        };
+        match self.check_address_record(&held.record) {
+            GossipVerdict::Accept => {
+                record_network_message_received();
+                if let Some(frame) = &held.frame {
+                    self.forward(held.sender, held.class, frame);
+                }
+            }
+            GossipVerdict::Reject => {
+                record_invalid_message();
+                self.note_reject(held.sender, refused_work(held.bytes, Refusal::Fault));
+            }
+            GossipVerdict::Ignore => {
+                self.note_reject(held.sender, refused_work(held.bytes, Refusal::Unjudged));
+            }
+        }
+    }
+
+    /// Verify an address record and store it if it is the newest for its
+    /// validator.
+    fn check_address_record(&self, record: &ValidatorAddressGossip) -> GossipVerdict {
+        match self.adapter.ingest_validator_address(record) {
+            IngestOutcome::Invalid => GossipVerdict::Reject,
+            IngestOutcome::Recorded => GossipVerdict::Accept,
+            IngestOutcome::Stale | IngestOutcome::UnknownValidator => GossipVerdict::Ignore,
+        }
+    }
+
+    /// Forget `item`, so that a copy arriving later is handled afresh.
+    fn forget(&self, item: &[u8; 32]) {
+        self.seen.lock().expect("seen set lock").forget(item);
     }
 
     fn note_reject(&self, sender: EndpointId, work: Duration) {

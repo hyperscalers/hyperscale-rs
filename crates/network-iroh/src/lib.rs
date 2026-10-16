@@ -26,6 +26,7 @@ mod notify;
 pub mod path;
 mod peer_backoff;
 mod protocol;
+mod record_pace;
 mod request;
 mod request_manager;
 
