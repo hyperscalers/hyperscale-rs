@@ -1,26 +1,31 @@
-//! Who may make this host sign before proving anything.
+//! Who may make this host work before proving anything.
 //!
-//! The side that accepts a connection signs the dialer's nonce once for
-//! every validator it hosts before the dialer has proved it carries any
-//! validator at all. The QUIC handshake proves only that the dialer holds
-//! its endpoint key, and anyone may make one. So before it signs, the host
-//! asks two things of the dialer's endpoint:
+//! The side that accepts a connection runs a QUIC handshake with the dialer
+//! and then signs the dialer's nonce once for every validator it hosts, all
+//! before the dialer has proved it carries any validator at all. The
+//! handshake proves only that the dialer holds its endpoint key, and anyone
+//! may make one. So before any of that work the host asks what it can see
+//! of the dialer:
 //!
 //! - **Vouched for.** A validator's signed address record in this host's
-//!   book names the endpoint, so the validator stands behind it. Such a
-//!   dialer binds at once, [`VOUCHED_BURST`] times and then once every
-//!   [`VOUCHED_REFILL`]: enough for every reconnect an honest host makes.
-//! - **Anyone else** shares one budget of [`UNVOUCHED_BURST`] binds and then
-//!   one every [`UNVOUCHED_REFILL`]. A host joining for the first time, whose
-//!   record has not reached this host yet, binds from it; so does a host
-//!   that knows only its bootstrap peers.
+//!   book names where the connection comes from: the endpoint a relay says
+//!   it is, or the socket address it arrives from directly. Such a dialer
+//!   goes on to its handshake. Its endpoint, once the handshake shows it,
+//!   binds [`VOUCHED_BURST`] times and then once every [`VOUCHED_REFILL`]:
+//!   enough for every reconnect an honest host makes.
+//! - **Anyone else** shares one budget of [`UNVOUCHED_BURST`] handshakes and
+//!   then one every [`UNVOUCHED_REFILL`], taken before the handshake. A host
+//!   joining for the first time, whose record has not reached this host
+//!   yet, binds from it; so does a host that knows only its bootstrap peers.
 //!
-//! A dialer with no turn has its connection closed before anything is
-//! signed, and dials again on its own backoff. The handshake keeps its
-//! three messages and gains no round trip: the decision is a lookup made
-//! between the transport handshake and the first signature.
+//! A dialer with no turn is refused before its handshake, for one packet
+//! each way, and dials again on its own backoff. A dialer whose address
+//! vouched for it but whose handshake shows an endpoint no record names
+//! takes a stranger's turn then, before anything is signed. The bind keeps
+//! its three messages and gains no round trip: each decision is a lookup.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -33,15 +38,34 @@ const VOUCHED_BURST: u32 = 4;
 /// Time in which a vouched endpoint earns another bind.
 const VOUCHED_REFILL: Duration = Duration::from_secs(2);
 
-/// Binds unvouched endpoints may make at once, together.
+/// Handshakes unvouched dialers may start at once, together.
 const UNVOUCHED_BURST: u32 = 32;
 
-/// Time in which unvouched endpoints together earn another bind.
+/// Time in which unvouched dialers together earn another handshake.
 const UNVOUCHED_REFILL: Duration = Duration::from_millis(125);
 
 /// Vouched endpoints whose budgets are remembered before the full ones,
 /// which a fresh budget would equal, are let go.
 const VOUCHED_REMEMBERED: usize = 4096;
+
+/// What an inbound connection shows of its dialer before its handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Origin {
+    /// It came through a relay, which names the dialer's endpoint.
+    Relayed(EndpointId),
+    /// It came straight from this socket address.
+    Direct(SocketAddr),
+}
+
+/// How an inbound connection was let on to its handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ticket {
+    /// A record names where it comes from. `paid` is the endpoint whose
+    /// own turn at binding was taken already, when the relay named it.
+    Vouched { paid: Option<EndpointId> },
+    /// Nothing names it, and it took a turn from the strangers' budget.
+    Stranger,
+}
 
 /// Turns at something, earned back over time up to a burst.
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +103,7 @@ impl Bucket {
     }
 }
 
-/// Decides which dialers this host signs for.
+/// Decides which dialers this host works for.
 pub struct BindGate {
     unvouched: Mutex<Bucket>,
     vouched: Mutex<HashMap<EndpointId, Bucket>>,
@@ -95,17 +119,39 @@ impl Default for BindGate {
 }
 
 impl BindGate {
-    /// Whether `peer`, which the book vouches for or not, may have this host
-    /// sign for it now.
-    pub fn admit(&self, peer: EndpointId, vouched: bool) -> bool {
-        let now = Instant::now();
-        if !vouched {
-            return self.unvouched.lock().expect("bind gate lock").take(
-                UNVOUCHED_BURST,
-                UNVOUCHED_REFILL,
-                now,
-            );
+    /// Before its handshake: whether a connection from `origin`, which a
+    /// record in the book names or not, may go on to it, and on what
+    /// ticket.
+    pub fn admit_incoming(&self, origin: Origin, named: bool) -> Option<Ticket> {
+        match (origin, named) {
+            (Origin::Relayed(peer), true) => self
+                .take_vouched(peer)
+                .then_some(Ticket::Vouched { paid: Some(peer) }),
+            (Origin::Direct(_), true) => Some(Ticket::Vouched { paid: None }),
+            (_, false) => self.take_unvouched().then_some(Ticket::Stranger),
         }
+    }
+
+    /// After its handshake: whether this host signs for `peer`, which the
+    /// book vouches for or not, let on to its handshake with `ticket`.
+    pub fn admit_bind(&self, peer: EndpointId, vouched: bool, ticket: Ticket) -> bool {
+        match ticket {
+            Ticket::Stranger => true,
+            Ticket::Vouched { paid } if vouched => paid == Some(peer) || self.take_vouched(peer),
+            Ticket::Vouched { .. } => self.take_unvouched(),
+        }
+    }
+
+    fn take_unvouched(&self) -> bool {
+        self.unvouched.lock().expect("bind gate lock").take(
+            UNVOUCHED_BURST,
+            UNVOUCHED_REFILL,
+            Instant::now(),
+        )
+    }
+
+    fn take_vouched(&self, peer: EndpointId) -> bool {
+        let now = Instant::now();
         let mut vouched = self.vouched.lock().expect("bind gate lock");
         if vouched.len() >= VOUCHED_REMEMBERED && !vouched.contains_key(&peer) {
             vouched.retain(|_, bucket| {
@@ -130,7 +176,19 @@ mod tests {
         SecretKey::generate().public()
     }
 
-    /// How many of `attempts` binds, one every `spacing`, `gate` admits.
+    fn address() -> SocketAddr {
+        "192.0.2.1:4000".parse().unwrap()
+    }
+
+    /// Whether a dialer at `origin` is let on and, once its handshake shows
+    /// `peer`, signed for.
+    fn admit(gate: &BindGate, origin: Origin, peer: EndpointId, vouched: bool) -> bool {
+        gate.admit_incoming(origin, vouched)
+            .is_some_and(|ticket| gate.admit_bind(peer, vouched, ticket))
+    }
+
+    /// How many of `attempts` dialers relayed from `peer`, one every
+    /// `spacing`, `gate` signs for.
     async fn admitted(
         gate: &BindGate,
         peer: impl Fn() -> EndpointId,
@@ -140,7 +198,8 @@ mod tests {
     ) -> u32 {
         let mut admitted = 0;
         for _ in 0..attempts {
-            admitted += u32::from(gate.admit(peer(), vouched));
+            let peer = peer();
+            admitted += u32::from(admit(gate, Origin::Relayed(peer), peer, vouched));
             advance(spacing).await;
         }
         admitted
@@ -163,10 +222,19 @@ mod tests {
         let gate = BindGate::default();
         let _ = admitted(&gate, random_peer, false, 1_000, Duration::ZERO).await;
         assert!(
-            !gate.admit(random_peer(), false),
+            gate.admit_incoming(Origin::Direct(address()), false)
+                .is_none(),
             "the strangers' budget is spent"
         );
-        assert!(gate.admit(random_peer(), true), "a vouched endpoint binds");
+        let peer = random_peer();
+        assert!(
+            admit(&gate, Origin::Relayed(peer), peer, true),
+            "a vouched endpoint binds"
+        );
+        assert!(
+            admit(&gate, Origin::Direct(address()), random_peer(), true),
+            "so does one from a vouched address"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -179,9 +247,46 @@ mod tests {
             got >= VOUCHED_BURST + earned - 1 && got <= VOUCHED_BURST + earned + 1,
             "{got} admitted"
         );
+        let other = random_peer();
         assert!(
-            gate.admit(random_peer(), true),
+            admit(&gate, Origin::Relayed(other), other, true),
             "another vouched endpoint is not held up"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vouched_endpoint_pays_its_turn_once() {
+        let gate = BindGate::default();
+        let peer = random_peer();
+        for _ in 0..VOUCHED_BURST {
+            assert!(admit(&gate, Origin::Relayed(peer), peer, true));
+        }
+        assert!(
+            gate.admit_incoming(Origin::Relayed(peer), true).is_none(),
+            "its turns are spent before the handshake"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vouched_address_hiding_a_stranger_pays_a_strangers_turn() {
+        let gate = BindGate::default();
+        let ticket = gate
+            .admit_incoming(Origin::Direct(address()), true)
+            .expect("a vouched address goes on to its handshake");
+        let _ = admitted(&gate, random_peer, false, 1_000, Duration::ZERO).await;
+        assert!(
+            !gate.admit_bind(random_peer(), false, ticket),
+            "an endpoint no record names waits for a stranger's turn"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stranger_let_on_is_signed_for_without_paying_again() {
+        let gate = BindGate::default();
+        let ticket = gate
+            .admit_incoming(Origin::Direct(address()), false)
+            .expect("a stranger's turn");
+        let _ = admitted(&gate, random_peer, false, 1_000, Duration::ZERO).await;
+        assert!(gate.admit_bind(random_peer(), false, ticket));
     }
 }

@@ -154,11 +154,29 @@ pub fn sign_records(
         .collect()
 }
 
+/// Something a record names that an inbound connection can show before its
+/// handshake: the endpoint a relay says it comes from, or the socket address
+/// it comes from directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Named {
+    Endpoint(EndpointId),
+    Address(SocketAddr),
+}
+
+/// What `endpoint`'s record names.
+fn named_by(endpoint: &EndpointAddr) -> impl Iterator<Item = Named> + '_ {
+    std::iter::once(Named::Endpoint(endpoint.id))
+        .chain(endpoint.ip_addrs().map(|addr| Named::Address(*addr)))
+}
+
 /// Concurrent `ValidatorId → AddressRecord` map. Shared between the gossip
 /// ingest path and the dial passes.
 #[derive(Default)]
 pub struct AddressBook {
     records: DashMap<ValidatorId, AddressRecord>,
+    /// How many records name each endpoint and each direct address, so an
+    /// inbound connection is placed without a walk of the book.
+    named: DashMap<Named, u32>,
 }
 
 impl AddressBook {
@@ -218,13 +236,29 @@ impl AddressBook {
                 if gossip.sequence <= occupied.get().announcement.sequence {
                     return (IngestOutcome::Stale, None);
                 }
-                occupied.insert(record);
+                let replaced = occupied.insert(record);
+                self.forget_names(&replaced.endpoint);
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(record);
             }
         }
+        for named in named_by(&endpoint) {
+            *self.named.entry(named).or_default() += 1;
+        }
         (IngestOutcome::Recorded, Some(endpoint))
+    }
+
+    /// Take back what a record no longer held named.
+    fn forget_names(&self, endpoint: &EndpointAddr) {
+        for named in named_by(endpoint) {
+            if let Entry::Occupied(mut count) = self.named.entry(named) {
+                *count.get_mut() -= 1;
+                if *count.get() == 0 {
+                    count.remove();
+                }
+            }
+        }
     }
 
     /// The sequence of the newest verified record for `validator`, if any.
@@ -245,9 +279,15 @@ impl AddressBook {
     /// behind it.
     #[must_use]
     pub(crate) fn names(&self, endpoint: EndpointId) -> bool {
-        self.records
-            .iter()
-            .any(|record| record.endpoint.id == endpoint)
+        self.named.contains_key(&Named::Endpoint(endpoint))
+    }
+
+    /// Whether a verified record names `addr` as a direct address of its
+    /// endpoint: a connection from there likely comes from a validator's
+    /// host, though only its handshake shows which endpoint it is.
+    #[must_use]
+    pub(crate) fn names_address(&self, addr: SocketAddr) -> bool {
+        self.named.contains_key(&Named::Address(addr))
     }
 
     /// Endpoints to dial so every validator in `wanted` becomes reachable:
@@ -405,6 +445,39 @@ mod tests {
             IngestOutcome::Recorded
         );
         assert_eq!(book.get(vid).unwrap().endpoint.id, endpoint(2).id);
+    }
+
+    #[test]
+    fn the_book_names_what_its_newest_records_name() {
+        let book = AddressBook::default();
+        let (first, second) = (ValidatorId::new(4), ValidatorId::new(5));
+        let keys = keys_for(&[first, second]);
+        let moved =
+            EndpointAddr::new(endpoint(1).id).with_ip_addr("127.0.0.1:4002".parse().unwrap());
+        let (old_addr, new_addr): (SocketAddr, SocketAddr) = (
+            "127.0.0.1:4001".parse().unwrap(),
+            "127.0.0.1:4002".parse().unwrap(),
+        );
+
+        // Two validators on one host announce the same endpoint.
+        ingest(&book, &keys, &announce(first, &endpoint(1), 1));
+        ingest(&book, &keys, &announce(second, &endpoint(1), 1));
+        assert!(book.names(endpoint(1).id));
+        assert!(book.names_address(old_addr));
+
+        // One moves: the address it left is still the other's.
+        ingest(&book, &keys, &announce(first, &moved, 2));
+        assert!(book.names_address(old_addr));
+        assert!(book.names_address(new_addr));
+
+        // Both move: nobody names the old address any more.
+        ingest(&book, &keys, &announce(second, &moved, 2));
+        assert!(!book.names_address(old_addr));
+        assert!(book.names(endpoint(1).id));
+        ingest(&book, &keys, &announce(first, &endpoint(2), 3));
+        ingest(&book, &keys, &announce(second, &endpoint(2), 3));
+        assert!(!book.names(endpoint(1).id));
+        assert!(book.names(endpoint(2).id));
     }
 
     #[test]

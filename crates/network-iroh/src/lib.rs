@@ -33,6 +33,7 @@ mod record_pace;
 mod request;
 mod request_manager;
 mod serve_budget;
+mod unbound;
 
 pub use address_book::{AddressBook, IngestOutcome};
 pub use bind::LocalVnodeIdentity;
