@@ -14,6 +14,7 @@
 #     --secs 75           how long each dial holds its connection
 #     --types "..."       subset of: public full-cone port-restricted
 #                         symmetric double udp-blocked ipv6-only
+#     --involving TYPE    only the pairs with a host of this type
 #
 # Results: OUT_DIR/matrix.jsonl, one line per pair of NAT types and round
 # trip, with the dialer's report: `selected_after_a_minute` is "direct" or
