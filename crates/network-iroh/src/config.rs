@@ -7,7 +7,7 @@ use clap::ValueEnum;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 
-use crate::path::RedialSchedule;
+use crate::path::{RedialBudget, RedialSchedule};
 
 /// Most relays a host names in its signed address record. The endpoint
 /// homes on one at a time, so the second is a failover, and more would
@@ -38,6 +38,16 @@ const REDIAL_MAX_INTERVAL: Duration = Duration::from_secs(30);
 /// four and a half minutes, after which the library's own check once a
 /// minute takes over.
 const REDIAL_ATTEMPTS: u32 = 12;
+
+/// Re-dials a host makes or admits at once, across all its peers: enough
+/// for the peers it votes with to be re-dialed together.
+const REDIAL_BURST: u32 = 8;
+
+/// Time in which a host earns one more re-dial. A re-dial costs about 20 kB
+/// through the relay, so a host whose every connection fell back spends at
+/// most about 20 kB/s on re-dialing: with the relayed idle cost of 500
+/// connections, under the 100 kB/s an idle host may cost.
+const REDIAL_REFILL: Duration = Duration::from_secs(1);
 
 /// Configuration for the iroh network adapter.
 #[derive(Debug, Clone)]
@@ -83,6 +93,10 @@ pub struct IrohConfig {
     /// connection is relayed, to bring it back to a direct path.
     pub redial: RedialSchedule,
 
+    /// How much re-dialing the host does across all its peers, made and
+    /// admitted together.
+    pub redial_budget: RedialBudget,
+
     /// Version interoperability mode.
     pub version_interop_mode: VersionInteroperabilityMode,
 
@@ -111,6 +125,10 @@ impl IrohConfig {
                 interval: REDIAL_INTERVAL,
                 max_interval: REDIAL_MAX_INTERVAL,
                 attempts: REDIAL_ATTEMPTS,
+            },
+            redial_budget: RedialBudget {
+                burst: REDIAL_BURST,
+                refill: REDIAL_REFILL,
             },
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             simulated_outbound_latency: Duration::ZERO,

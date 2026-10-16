@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
 use hyperscale_network_iroh::IrohConfig;
-use hyperscale_network_iroh::path::{PathKind, RedialSchedule, Redialer, selected};
+use hyperscale_network_iroh::path::{PathKind, PathPolicy, RedialSchedule, Redialer, selected};
 use hyperscale_network_iroh::testing::{LocalRelay, UdpBridge};
 use iroh::endpoint::{
     Builder, Connection, PathEvent, PortmapperConfig, QuicTransportConfig, presets,
@@ -898,7 +898,14 @@ async fn blip(
     recorder.watch("dialer", &connection);
     let pinger = Pinger::start(&connection, &recorder).await?;
     let redialer = redial.map(|schedule| {
-        let redialer = Redialer::new(dialer.clone(), ALPN, schedule);
+        let budget = IrohConfig::new(SecretKey::from_bytes(&[0; 32])).redial_budget;
+        let redialer = Redialer::new(
+            dialer.clone(),
+            ALPN,
+            schedule,
+            budget,
+            Arc::new(PathPolicy::default()),
+        );
         redialer.follow(&connection, &Handle::current());
         redialer
     });

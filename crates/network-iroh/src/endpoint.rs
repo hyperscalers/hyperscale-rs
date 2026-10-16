@@ -25,8 +25,8 @@ use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
-    Builder, Connection, Incoming, PortmapperConfig, QuicTransportConfig, RecvStream, SendStream,
-    presets,
+    Builder, Connection, Incoming, IncomingAddr, PortmapperConfig, QuicTransportConfig, RecvStream,
+    SendStream, presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, TransportAddr};
 use tokio::runtime::Handle;
@@ -231,8 +231,14 @@ impl IrohAdapter {
                 Arc::clone(&local_shards),
                 Arc::clone(&paths),
             )),
+            redialer: Redialer::new(
+                endpoint.clone(),
+                REDIAL_ALPN,
+                config.redial,
+                config.redial_budget,
+                Arc::clone(&paths),
+            ),
             paths,
-            redialer: Redialer::new(endpoint.clone(), REDIAL_ALPN, config.redial),
             redials_held: DashMap::new(),
             fault_gate: FaultState::new(),
             bind: BindContext {
@@ -495,6 +501,13 @@ impl IrohAdapter {
         self.inner.redialer.redials()
     }
 
+    /// Re-dials from peers this host refused because its re-dial budget
+    /// had no turn for them.
+    #[must_use]
+    pub fn redials_refused(&self) -> u64 {
+        self.inner.redialer.refused()
+    }
+
     /// Advertise `addr` as one at which this host is reachable from
     /// outside, beside what the endpoint discovers for itself.
     pub async fn add_external_addr(&self, addr: SocketAddr) {
@@ -541,6 +554,19 @@ impl Drop for IrohAdapter {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Whether `incoming` asks for the re-dial protocol, read from its first
+/// packet before any handshake work. A re-dial's hello fits that packet;
+/// one that cannot be read is treated as an ordinary connection, which
+/// binds or is closed.
+fn is_redial(incoming: &Incoming) -> bool {
+    incoming
+        .decrypt()
+        .and_then(|initial| initial.alpns())
+        .is_some_and(|mut alpns| {
+            alpns.any(|alpn| alpn.is_ok_and(|alpn| alpn.as_ref() == REDIAL_ALPN))
+        })
 }
 
 async fn build_endpoint(
@@ -619,6 +645,10 @@ impl Inner {
     /// Accept inbound connections until the endpoint closes.
     async fn accept_loop(self: Arc<Self>) {
         while let Some(incoming) = self.endpoint.accept().await {
+            if is_redial(&incoming) && !self.admit_redial(&incoming) {
+                incoming.refuse();
+                continue;
+            }
             let Ok(permit) = Arc::clone(&self.unbound).try_acquire_owned() else {
                 warn!("Refusing inbound connection: too many are mid-handshake");
                 incoming.refuse();
@@ -657,6 +687,21 @@ impl Inner {
                 connection.close(CLOSE_BIND_FAILED, b"bind timed out");
             }
         }
+    }
+
+    /// Whether a re-dial may go on to its handshake: it must come from a
+    /// bound peer, when the relay it arrived through names one, and find a
+    /// turn in the host's re-dial budget. A refusal costs the relay one
+    /// packet each way where a re-dial costs about twenty kilobytes.
+    fn admit_redial(&self, incoming: &Incoming) -> bool {
+        let peer = match incoming.remote_addr() {
+            IncomingAddr::Relay { endpoint_id, .. } => Some(endpoint_id),
+            _ => None,
+        };
+        if peer.is_some_and(|peer| !self.is_linked(peer)) {
+            return false;
+        }
+        self.redialer.admit(peer)
     }
 
     /// Hold a bound peer's re-dial connection until the peer closes it.

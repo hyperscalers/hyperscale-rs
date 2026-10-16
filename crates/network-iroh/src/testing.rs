@@ -5,20 +5,29 @@
 //! loopback and the other to IPv6 loopback leaves the pair with no route of
 //! their own; a [`UdpBridge`] between them is then the only direct path, and
 //! closing it is a UDP blackout between the two hosts that leaves each one's
-//! relay link untouched.
+//! relay link untouched. A [`Star`] puts many such bridged peers around one
+//! hub.
 
+use std::collections::HashSet;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use iroh::RelayUrl;
+use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_network::HandlerRegistry;
+use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
+use iroh::{EndpointAddr, RelayUrl};
 use iroh_relay::server::{RelayConfig, Server, ServerConfig, SpawnError, SupervisorError};
 use tokio::net::UdpSocket;
 use tokio::spawn;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+
+use crate::path::PathKind;
+use crate::test_utils::TestFixtures;
+use crate::{IrohAdapter, IrohAdapterArgs, IrohConfig};
 
 /// Largest UDP payload the bridge forwards.
 const MAX_DATAGRAM_BYTES: usize = 65_535;
@@ -245,6 +254,152 @@ async fn deliver(to: &UdpSocket, datagram: &[u8], dest: SocketAddr, link: &Link)
         link.forwarded.fetch_add(1, Ordering::Relaxed);
     } else {
         link.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A free port on loopback address `ip`, for a host whose bridge must exist
+/// before it binds.
+fn free_loopback_port(ip: IpAddr) -> SocketAddr {
+    StdUdpSocket::bind((ip, 0))
+        .and_then(|socket| socket.local_addr())
+        .expect("a loopback port is free")
+}
+
+/// A hub holding an iroh connection to each of its peers over a bridge.
+///
+/// Every peer has a [`UdpBridge`] of its own, and all are homed on one
+/// [`LocalRelay`]. The hub sits on
+/// IPv4 loopback and every peer on IPv6, so each bridge is that peer's only
+/// direct path and closing them all is the hub's UDP failing while its
+/// relay link holds. Peers meet the hub at its bridge address and through
+/// the relay, as hosts behind NAT do, so every connection also keeps its
+/// relayed path open.
+pub struct Star {
+    /// The host every peer connects to.
+    pub hub: Arc<IrohAdapter>,
+    /// The hub's peers, validator `1..` of the fixtures in order.
+    pub peers: Vec<Arc<IrohAdapter>>,
+    /// The direct path of each peer, in the order of `peers`.
+    pub bridges: Vec<UdpBridge>,
+    relay: LocalRelay,
+}
+
+impl Star {
+    /// Stand up a hub with `peers` peers on seeded keys, with `rtt` on every
+    /// bridge. The hub dials the first `hub_dials` peers; the others dial
+    /// the hub. `configure` adjusts every host's configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the relay, a bridge or a host cannot start.
+    pub async fn bind(
+        seed: u64,
+        peers: u32,
+        hub_dials: u32,
+        rtt: Duration,
+        configure: impl Fn(&mut IrohConfig),
+    ) -> Self {
+        let fixtures = TestFixtures::new(seed, peers + 1);
+        let relay = LocalRelay::spawn().await.expect("the relay starts");
+        let bind = |index: u32, addr: SocketAddr, bootstrap: Vec<EndpointAddr>| {
+            let (fixtures, relay, configure) = (&fixtures, &relay, &configure);
+            async move {
+                let mut config = IrohConfig::for_testing(fixtures.network_key(index), addr);
+                config.relays = vec![relay.url()];
+                config.relay_address_discovery = false;
+                config.bootstrap_peers = bootstrap;
+                configure(&mut config);
+                IrohAdapter::bind(IrohAdapterArgs {
+                    config,
+                    network: NetworkDefinition::simulator(),
+                    vnodes: vec![(ValidatorId::new(u64::from(index)), fixtures.signer(index))],
+                    local_shards: HashSet::from([ShardId::ROOT]),
+                    registry: Arc::new(HandlerRegistry::default()),
+                    validator_keys: fixtures.validator_key_map(),
+                    verifier: Arc::new(BlsVerifier),
+                })
+                .await
+                .expect("the host binds")
+            }
+        };
+
+        let hub_socket = free_loopback_port(Ipv4Addr::LOCALHOST.into());
+        let mut sockets = Vec::new();
+        let mut bridges = Vec::new();
+        for _ in 0..peers {
+            let socket = free_loopback_port(Ipv6Addr::LOCALHOST.into());
+            let bridge = UdpBridge::spawn(hub_socket, socket)
+                .await
+                .expect("the bridge opens");
+            bridge.set_delay(rtt / 2);
+            sockets.push(socket);
+            bridges.push(bridge);
+        }
+
+        let dialed = usize::try_from(hub_dials.min(peers)).unwrap_or(usize::MAX);
+        let mut bound = Vec::new();
+        let mut hub_bootstrap = Vec::new();
+        for (slot, (socket, bridge)) in sockets.iter().zip(&bridges).enumerate().take(dialed) {
+            let index = u32::try_from(slot).unwrap_or(u32::MAX) + 1;
+            let peer = bind(index, *socket, Vec::new()).await;
+            hub_bootstrap.push(
+                EndpointAddr::new(peer.local_endpoint_id())
+                    .with_ip_addr(bridge.seen_by_left())
+                    .with_relay_url(relay.url()),
+            );
+            bound.push(peer);
+        }
+        let hub = bind(0, hub_socket, hub_bootstrap).await;
+        for (slot, (socket, bridge)) in sockets.iter().zip(&bridges).enumerate().skip(dialed) {
+            let index = u32::try_from(slot).unwrap_or(u32::MAX) + 1;
+            let hub_addr = EndpointAddr::new(hub.local_endpoint_id())
+                .with_ip_addr(bridge.seen_by_right())
+                .with_relay_url(relay.url());
+            bound.push(bind(index, *socket, vec![hub_addr]).await);
+        }
+        for (peer, bridge) in bound.iter().zip(&bridges) {
+            peer.add_external_addr(bridge.seen_by_left()).await;
+        }
+        Self {
+            hub,
+            peers: bound,
+            bridges,
+            relay,
+        }
+    }
+
+    /// Peers whose connection the hub sees selecting a path of `kind`.
+    #[must_use]
+    pub fn on(&self, kind: PathKind) -> usize {
+        self.peers
+            .iter()
+            .filter(|peer| {
+                self.hub
+                    .path_status(peer.local_endpoint_id())
+                    .and_then(|status| status.kind)
+                    == Some(kind)
+            })
+            .count()
+    }
+
+    /// Open or close every bridge at once.
+    pub fn set_open(&self, open: bool) {
+        for bridge in &self.bridges {
+            bridge.set_open(open);
+        }
+    }
+
+    /// Stop every host and the relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the relay's error when it does not stop cleanly.
+    pub async fn shutdown(self) -> Result<(), SupervisorError> {
+        self.hub.shutdown();
+        for peer in &self.peers {
+            peer.shutdown();
+        }
+        self.relay.shutdown().await
     }
 }
 

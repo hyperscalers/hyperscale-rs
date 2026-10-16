@@ -26,9 +26,16 @@
 //! and a path that punch finds serves every connection to the peer.
 //! [`Redialer`] uses that: while a connection this host dialed is relayed,
 //! it opens a short lived connection to the peer on a [`RedialSchedule`],
-//! so a pair is back on a direct path seconds after an outage ends.
+//! so a pair is back on a direct path seconds after an outage ends. When
+//! many connections fall back together, as when the host's own network
+//! stops passing UDP, every re-dial it makes or admits draws on one
+//! [`RedialBudget`], so the relay carries a bounded amount of re-dialing
+//! however many peers fell back.
 
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::future::pending;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -40,7 +47,7 @@ use iroh::endpoint::{Connection, Path, PathEvent, TransportAddrInfo, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::Notify;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep_until, timeout};
 use tracing::{debug, info, warn};
 
@@ -56,11 +63,6 @@ const RTT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long a re-dial has to complete its handshake through the relay.
 const REDIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Re-dials one host has in flight at once, across all its peers, so that
-/// a fallback of many connections together does not become a burst of
-/// handshakes through the relay.
-const MAX_REDIALS_IN_FLIGHT: usize = 16;
 
 /// Close code of a re-dial connection the dialer no longer needs.
 const CLOSE_REDIAL_DONE: VarInt = VarInt::from_u32(0);
@@ -167,6 +169,9 @@ struct PeerPath {
     relayed_consensus_bytes: AtomicU64,
     relayed_budgeted_bytes: AtomicU64,
     refused: AtomicU64,
+    /// When `Consensus` traffic last went either way, in milliseconds
+    /// since the policy's epoch; zero when none has.
+    last_consensus_ms: AtomicU64,
     budget: Mutex<Budget>,
 }
 
@@ -220,9 +225,19 @@ impl Readiness {
 
 /// Follows every bound connection's selected path and decides what is sent
 /// on it.
-#[derive(Default)]
 pub struct PathPolicy {
+    /// Origin of the per-peer consensus times.
+    epoch: Instant,
     peers: DashMap<EndpointId, Arc<PeerPath>>,
+}
+
+impl Default for PathPolicy {
+    fn default() -> Self {
+        Self {
+            epoch: Instant::now(),
+            peers: DashMap::new(),
+        }
+    }
 }
 
 impl PathPolicy {
@@ -241,6 +256,7 @@ impl PathPolicy {
             relayed_consensus_bytes: AtomicU64::new(0),
             relayed_budgeted_bytes: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            last_consensus_ms: AtomicU64::new(0),
             budget: Mutex::new(Budget {
                 window_start: Instant::now(),
                 spent: 0,
@@ -307,6 +323,9 @@ impl PathPolicy {
         let Some(state) = self.peers.get(&peer).map(|state| Arc::clone(&state)) else {
             return true;
         };
+        if class == MessageClass::Consensus {
+            self.stamp_consensus(&state);
+        }
         if state.kind() != Some(PathKind::Relayed) {
             return true;
         }
@@ -333,6 +352,29 @@ impl PathPolicy {
             state.refused.fetch_add(1, Ordering::Relaxed);
         }
         admitted
+    }
+
+    /// Note that `Consensus` traffic arrived from `peer`.
+    pub(crate) fn note_consensus(&self, peer: EndpointId) {
+        if let Some(state) = self.peers.get(&peer) {
+            self.stamp_consensus(&state);
+        }
+    }
+
+    fn stamp_consensus(&self, state: &PeerPath) {
+        // One millisecond past the epoch at least, so that zero stays "never".
+        let since = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        state
+            .last_consensus_ms
+            .store(since.max(1), Ordering::Relaxed);
+    }
+
+    /// Where a re-dial of `peer` stands among others waiting for the
+    /// host's re-dial budget.
+    fn redial_rank(&self, peer: EndpointId) -> RedialRank {
+        RedialRank(Reverse(self.peers.get(&peer).map_or(0, |state| {
+            state.last_consensus_ms.load(Ordering::Relaxed)
+        })))
     }
 
     /// The path of `peer`'s connection and what it has carried while
@@ -370,6 +412,162 @@ fn note_selection(peer: EndpointId, state: &PeerPath, kind: Option<PathKind>) {
             info!(peer = %peer.fmt_short(), "Connection is on a direct path");
         }
         _ => {}
+    }
+}
+
+/// How much re-dialing one host does across all its peers: a bucket of
+/// `burst` re-dials that refills by one every `refill`. Re-dials this host
+/// makes and re-dials it admits from peers both draw on it.
+///
+/// A peer is re-dialed at most once every few seconds, so a single peer's
+/// recovery never waits on the bucket. When many connections fall back at
+/// once the bucket sets the pace, and the relay carries at most `burst`
+/// re-dials and then one every `refill`, however many peers fell back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedialBudget {
+    /// Re-dials available at once.
+    pub burst: u32,
+    /// Time in which one more re-dial becomes available.
+    pub refill: Duration,
+}
+
+/// Which of several re-dials waiting for the budget goes first: the one to
+/// the peer this host exchanged `Consensus` traffic with most recently. A
+/// relayed path carries that traffic over the relay's TCP links, so those
+/// are the peers a direct path matters most for now; the committees a
+/// host's votes and headers go to are exactly the ones it keeps exchanging
+/// them with. Peers it never did go last, in the order they asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RedialRank(Reverse<u64>);
+
+/// One re-dial waiting for the budget: its rank, then its arrival.
+type RedialClaim = (RedialRank, u64);
+
+/// The budget's bucket and the re-dials waiting on it.
+struct Bucket {
+    available: u32,
+    /// When the last token was added, or the bucket last seen full.
+    refilled_at: TokioInstant,
+    waiting: BTreeSet<RedialClaim>,
+    next_ticket: u64,
+}
+
+impl Bucket {
+    fn refill(&mut self, budget: RedialBudget, now: TokioInstant) {
+        if self.available >= budget.burst {
+            self.refilled_at = now;
+            return;
+        }
+        let earned = now.saturating_duration_since(self.refilled_at).as_nanos()
+            / budget.refill.as_nanos().max(1);
+        if earned == 0 {
+            return;
+        }
+        let earned = u32::try_from(earned).unwrap_or(u32::MAX);
+        self.available = self.available.saturating_add(earned).min(budget.burst);
+        self.refilled_at = if self.available >= budget.burst {
+            now
+        } else {
+            self.refilled_at + budget.refill * earned
+        };
+    }
+}
+
+/// The host's re-dial budget.
+struct RedialTokens {
+    budget: RedialBudget,
+    bucket: Mutex<Bucket>,
+    /// Woken whenever a token is taken or a waiting re-dial gives up, so
+    /// the next in line looks again.
+    changed: Notify,
+}
+
+impl RedialTokens {
+    fn new(budget: RedialBudget) -> Self {
+        Self {
+            budget,
+            bucket: Mutex::new(Bucket {
+                available: budget.burst,
+                refilled_at: TokioInstant::now(),
+                waiting: BTreeSet::new(),
+                next_ticket: 0,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Wait for a token, behind every waiting re-dial of better rank.
+    async fn take(&self, rank: RedialRank) {
+        let claim = {
+            let mut bucket = self.bucket.lock();
+            let claim = (rank, bucket.next_ticket);
+            bucket.next_ticket += 1;
+            bucket.waiting.insert(claim);
+            claim
+        };
+        let _queued = Queued {
+            tokens: self,
+            claim,
+        };
+        loop {
+            let mut changed = pin!(self.changed.notified());
+            changed.as_mut().enable();
+            let next_token = {
+                let mut bucket = self.bucket.lock();
+                let now = TokioInstant::now();
+                bucket.refill(self.budget, now);
+                if bucket.available > 0 && bucket.waiting.first() == Some(&claim) {
+                    bucket.available -= 1;
+                    bucket.waiting.remove(&claim);
+                    drop(bucket);
+                    self.changed.notify_waiters();
+                    return;
+                }
+                bucket.refilled_at + self.budget.refill
+            };
+            tokio::select! {
+                () = sleep_until(next_token) => {}
+                () = changed => {}
+            }
+        }
+    }
+
+    /// Take a token now if one is free and no re-dial of at least `rank`
+    /// is waiting for it.
+    fn try_take(&self, rank: RedialRank) -> bool {
+        let mut bucket = self.bucket.lock();
+        bucket.refill(self.budget, TokioInstant::now());
+        let behind = bucket
+            .waiting
+            .first()
+            .is_some_and(|(ahead, _)| *ahead <= rank);
+        if bucket.available == 0 || behind {
+            return false;
+        }
+        bucket.available -= 1;
+        true
+    }
+
+    /// Return a token a re-dial took and did not use.
+    fn give_back(&self) {
+        let mut bucket = self.bucket.lock();
+        bucket.available = (bucket.available + 1).min(self.budget.burst);
+        drop(bucket);
+        self.changed.notify_waiters();
+    }
+}
+
+/// A re-dial's place in line, given up when its wait ends either way.
+struct Queued<'a> {
+    tokens: &'a RedialTokens,
+    claim: RedialClaim,
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        if self.tokens.bucket.lock().waiting.remove(&self.claim) {
+            self.tokens.changed.notify_waiters();
+        }
     }
 }
 
@@ -412,29 +610,41 @@ impl RedialSchedule {
 /// A peer is re-dialed only while the endpoint knows a direct address for
 /// it; a peer reachable only through the relay never gets a direct path
 /// from a punch. Each peer holds at most one re-dial connection, closed as
-/// soon as the next replaces it or the connection is direct again, and the
-/// whole host has at most [`MAX_REDIALS_IN_FLIGHT`] handshakes in flight.
-/// Nothing here selects a path: the library still picks which one carries
-/// the connection.
+/// soon as the next replaces it or the connection is direct again. Every
+/// re-dial made, and every one admitted from a peer, takes a turn from the
+/// host's [`RedialBudget`]. Nothing here selects a path: the library still
+/// picks which one carries the connection.
 pub struct Redialer {
     endpoint: Endpoint,
     alpn: Vec<u8>,
     schedule: RedialSchedule,
-    in_flight: Semaphore,
+    tokens: RedialTokens,
+    paths: Arc<PathPolicy>,
     redials: AtomicU64,
+    refused: AtomicU64,
 }
 
 impl Redialer {
     /// A redialer that opens its connections on `endpoint` under protocol
     /// `alpn`, which the peer accepts and holds without serving anything.
+    /// `paths` says which peers this host exchanges consensus traffic
+    /// with, and so whose re-dials go first when the budget is short.
     #[must_use]
-    pub fn new(endpoint: Endpoint, alpn: &[u8], schedule: RedialSchedule) -> Arc<Self> {
+    pub fn new(
+        endpoint: Endpoint,
+        alpn: &[u8],
+        schedule: RedialSchedule,
+        budget: RedialBudget,
+        paths: Arc<PathPolicy>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
             alpn: alpn.to_vec(),
             schedule,
-            in_flight: Semaphore::new(MAX_REDIALS_IN_FLIGHT),
+            tokens: RedialTokens::new(budget),
+            paths,
             redials: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
         })
     }
 
@@ -442,6 +652,24 @@ impl Redialer {
     #[must_use]
     pub fn redials(&self) -> u64 {
         self.redials.load(Ordering::Relaxed)
+    }
+
+    /// Re-dials from peers refused because the budget had no turn for them.
+    #[must_use]
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Whether a re-dial arriving from `peer` may complete its handshake,
+    /// taking a turn from the budget if so. `None` is a peer whose identity
+    /// is not known before the handshake; it ranks last.
+    pub(crate) fn admit(&self, peer: Option<EndpointId>) -> bool {
+        let rank = peer.map_or(RedialRank(Reverse(0)), |peer| self.paths.redial_rank(peer));
+        let admitted = self.tokens.try_take(rank);
+        if !admitted {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
     }
 
     /// Re-dial `connection`'s peer on the schedule whenever the connection
@@ -456,7 +684,6 @@ impl Redialer {
         let redialer = Arc::clone(self);
         let connection = connection.clone();
         runtime.spawn(async move {
-            let peer = connection.remote_id();
             let mut kind = selected(&connection);
             let mut made = 0u32;
             let mut spare: Option<Connection> = None;
@@ -492,7 +719,7 @@ impl Redialer {
                             continue;
                         }
                         made += 1;
-                        if let Some(fresh) = redialer.redial(peer).await {
+                        if let Some(fresh) = redialer.redial(&connection).await {
                             close_spare(&mut spare);
                             spare = Some(fresh);
                         }
@@ -518,10 +745,12 @@ impl Redialer {
         }
     }
 
-    /// Open a connection to `peer` at every address the endpoint knows for
-    /// it, unless it knows no direct one. Returns the connection once its
+    /// Open a connection to `connection`'s peer at every address the
+    /// endpoint knows for it, unless it knows no direct one, once the
+    /// budget gives this re-dial its turn. Returns the connection once its
     /// handshake completes; the library has then tried a hole punch.
-    async fn redial(&self, peer: EndpointId) -> Option<Connection> {
+    async fn redial(&self, connection: &Connection) -> Option<Connection> {
+        let peer = connection.remote_id();
         let info = self.endpoint.remote_info(peer).await?;
         let addrs: Vec<TransportAddr> = info
             .into_addrs()
@@ -531,7 +760,16 @@ impl Redialer {
             debug!(peer = %peer.fmt_short(), "Not re-dialing: no direct address is known");
             return None;
         }
-        let _permit = self.in_flight.acquire().await.ok()?;
+        tokio::select! {
+            () = self.tokens.take(self.paths.redial_rank(peer)) => {}
+            _ = connection.closed() => return None,
+        }
+        // The wait for a turn can be long; the library may have found a
+        // direct path meanwhile.
+        if selected(connection) != Some(PathKind::Relayed) {
+            self.tokens.give_back();
+            return None;
+        }
         self.redials.fetch_add(1, Ordering::Relaxed);
         let target = EndpointAddr::from_parts(peer, addrs);
         match timeout(
@@ -562,8 +800,12 @@ fn close_spare(spare: &mut Option<Connection>) {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::thread;
 
     use iroh::SecretKey;
+    use tokio::spawn;
+    use tokio::task::yield_now;
+    use tokio::time::advance;
 
     use super::*;
 
@@ -576,6 +818,7 @@ mod tests {
             relayed_consensus_bytes: AtomicU64::new(0),
             relayed_budgeted_bytes: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            last_consensus_ms: AtomicU64::new(0),
             budget: Mutex::new(Budget {
                 window_start: Instant::now(),
                 spent: 0,
@@ -714,5 +957,141 @@ mod tests {
         let socket = TransportAddr::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 4001)));
         assert_eq!(PathKind::of(&relay), PathKind::Relayed);
         assert_eq!(PathKind::of(&socket), PathKind::Direct);
+    }
+
+    const BUDGET: RedialBudget = RedialBudget {
+        burst: 4,
+        refill: Duration::from_secs(1),
+    };
+
+    fn rank(last_consensus_ms: u64) -> RedialRank {
+        RedialRank(Reverse(last_consensus_ms))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_re_dial_never_waits_for_the_budget() {
+        let tokens = RedialTokens::new(BUDGET);
+        let start = TokioInstant::now();
+        tokens.take(rank(0)).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_re_dials_at_once_keep_to_the_budget() {
+        let tokens = Arc::new(RedialTokens::new(BUDGET));
+        let start = TokioInstant::now();
+        let waiting: Vec<_> = (0..20)
+            .map(|_| {
+                let tokens = Arc::clone(&tokens);
+                spawn(async move {
+                    tokens.take(rank(0)).await;
+                    start.elapsed()
+                })
+            })
+            .collect();
+        let mut granted = Vec::new();
+        for wait in waiting {
+            granted.push(wait.await.unwrap());
+        }
+        granted.sort();
+        for (turn, at) in granted.iter().enumerate() {
+            let turn = u32::try_from(turn).unwrap();
+            let earliest = BUDGET.refill * turn.saturating_sub(BUDGET.burst - 1);
+            assert!(
+                *at >= earliest,
+                "turn {turn} came at {at:?}, before {earliest:?}"
+            );
+        }
+        assert_eq!(
+            granted[19],
+            BUDGET.refill * 16,
+            "and no later than the budget allows"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_peer_with_the_most_recent_consensus_traffic_goes_first() {
+        let tokens = Arc::new(RedialTokens::new(BUDGET));
+        for _ in 0..BUDGET.burst {
+            tokens.take(rank(0)).await;
+        }
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiting = Vec::new();
+        for (name, last) in [("silent", 0), ("older", 10), ("recent", 500)] {
+            let (tokens, order) = (Arc::clone(&tokens), Arc::clone(&order));
+            waiting.push(spawn(async move {
+                tokens.take(rank(last)).await;
+                order.lock().push(name);
+            }));
+            yield_now().await;
+        }
+        for wait in waiting {
+            wait.await.unwrap();
+        }
+        assert_eq!(*order.lock(), ["recent", "older", "silent"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_admitted_re_dial_waits_behind_a_better_ranked_one() {
+        let tokens = Arc::new(RedialTokens::new(RedialBudget {
+            burst: 1,
+            refill: Duration::from_secs(1),
+        }));
+        assert!(tokens.try_take(rank(0)), "the bucket starts full");
+        assert!(!tokens.try_take(rank(0)), "and is then empty");
+
+        let waiter = {
+            let tokens = Arc::clone(&tokens);
+            spawn(async move { tokens.take(rank(10)).await })
+        };
+        yield_now().await;
+        advance(Duration::from_millis(1500)).await;
+        assert!(
+            !tokens.try_take(rank(5)),
+            "the free token goes to the better ranked waiter"
+        );
+        waiter.await.unwrap();
+
+        advance(Duration::from_secs(1)).await;
+        assert!(
+            tokens.try_take(rank(5)),
+            "with nobody waiting it is admitted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unused_turn_goes_back_to_the_bucket() {
+        let tokens = RedialTokens::new(RedialBudget {
+            burst: 1,
+            refill: Duration::from_secs(60),
+        });
+        assert!(tokens.try_take(rank(0)));
+        tokens.give_back();
+        assert!(tokens.try_take(rank(0)));
+    }
+
+    #[test]
+    fn consensus_traffic_either_way_ranks_a_peer() {
+        let (policy, peer) = policy_with(Some(PathKind::Direct));
+        let stranger = SecretKey::generate().public();
+        assert_eq!(policy.redial_rank(peer), rank(0), "no traffic yet");
+
+        assert!(policy.admit(peer, MessageClass::Bulk, 1));
+        assert_eq!(policy.redial_rank(peer), rank(0), "only consensus counts");
+
+        assert!(policy.admit(peer, MessageClass::Consensus, 1));
+        let sent = policy.redial_rank(peer);
+        assert!(
+            sent < rank(0),
+            "a peer sent consensus ranks ahead of one never sent any"
+        );
+
+        thread::sleep(Duration::from_millis(5));
+        policy.note_consensus(peer);
+        assert!(
+            policy.redial_rank(peer) < sent,
+            "a later exchange ranks it higher"
+        );
+        assert_eq!(policy.redial_rank(stranger), rank(0));
     }
 }

@@ -11,10 +11,10 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::{GossipVerdict, HandlerRegistry, Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::test_utils::TestFixtures;
-use hyperscale_network_iroh::testing::{LocalRelay, UdpBridge};
+use hyperscale_network_iroh::testing::{LocalRelay, Star, UdpBridge};
 use hyperscale_network_iroh::{
-    EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind, RequestManager,
-    RequestManagerConfig, RequestPool, RequestStreams,
+    EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind, RedialBudget,
+    RequestManager, RequestManagerConfig, RequestPool, RequestStreams,
 };
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, Request, RoutingCommittees,
@@ -466,4 +466,72 @@ async fn without_re_dials_a_relayed_pair_waits_for_the_library() {
     );
 
     pair.relay.shutdown().await.expect("the relay stops");
+}
+
+/// Peers of the hub in the mass fallback test: half dialed by the hub, half
+/// dialing it.
+const STAR_PEERS: u32 = 12;
+
+/// The hub's budget in the mass fallback test, small enough that its
+/// peers' schedules ask for several times more.
+const HUB_BUDGET: RedialBudget = RedialBudget {
+    burst: 2,
+    refill: Duration::from_secs(2),
+};
+
+/// How long the mass fallback is watched once every peer is relayed.
+const FALLBACK_WATCH: Duration = Duration::from_secs(16);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_whose_every_connection_falls_back_keeps_to_its_re_dial_budget() {
+    let hub_key = TestFixtures::new(34, STAR_PEERS + 1)
+        .network_key(0)
+        .public();
+    let star = Star::bind(34, STAR_PEERS, STAR_PEERS / 2, Duration::ZERO, |config| {
+        config.path_idle_timeout = PATH_IDLE_TIMEOUT;
+        config.path_keep_alive = PATH_KEEP_ALIVE;
+        if config.secret_key.public() == hub_key {
+            config.redial_budget = HUB_BUDGET;
+        }
+    })
+    .await;
+    let peers = STAR_PEERS as usize;
+    wait_for("every peer reaches a direct path", || {
+        star.on(PathKind::Direct) == peers
+    })
+    .await;
+
+    // The hub's UDP fails; every connection falls back at once.
+    star.set_open(false);
+    wait_for("every peer is relayed", || {
+        star.on(PathKind::Relayed) == peers
+    })
+    .await;
+
+    // The hub re-dials the peers it dialed and is re-dialed by the others;
+    // both come out of its budget.
+    let spent = |star: &Star| {
+        let asked: u64 = star.peers.iter().map(|peer| peer.redials()).sum();
+        star.hub.redials() + asked - star.hub.redials_refused()
+    };
+    let (spent_before, refused_before) = (spent(&star), star.hub.redials_refused());
+    let start = Instant::now();
+    sleep(FALLBACK_WATCH).await;
+    let elapsed = start.elapsed();
+    let spent = spent(&star) - spent_before;
+    let refused = star.hub.redials_refused() - refused_before;
+
+    let earned = elapsed.as_millis() / HUB_BUDGET.refill.as_millis() + 1;
+    let allowed = u64::from(HUB_BUDGET.burst) + u64::try_from(earned).unwrap();
+    assert!(
+        spent <= allowed,
+        "the hub spent {spent} re-dials in {elapsed:?}, more than its budget's {allowed}"
+    );
+    assert!(spent >= 1, "the budget still lets re-dials through");
+    assert!(
+        refused >= 1,
+        "the peers asked for more than the budget, and the excess was refused"
+    );
+
+    star.shutdown().await.expect("the relay stops");
 }
