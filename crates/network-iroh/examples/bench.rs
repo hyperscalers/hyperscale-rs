@@ -12,6 +12,7 @@
 //! bench committee --backend iroh|libp2p --size 32
 //! bench idle      --backend iroh|libp2p --connections 150
 //! bench delayed-idle --rtt-ms 40 --connections 500
+//! bench reject-flood --rate 1000 --forged-per-signed 7 [--follower]
 //! ```
 //!
 //! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
@@ -36,7 +37,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::{HandlerRegistry, Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
-use hyperscale_network_iroh::testing::{Star, UdpBridge};
+use hyperscale_network_iroh::testing::{CountingVerifier, Star, UdpBridge};
 use hyperscale_network_iroh::{
     EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind,
     RequestManager as IrohRequestManager, RequestManagerConfig as IrohRequestManagerConfig,
@@ -48,9 +49,11 @@ use hyperscale_network_libp2p::{
     RequestManager as Libp2pRequestManager, RequestManagerConfig as Libp2pRequestManagerConfig,
     RequestStreamPool,
 };
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GenesisValidators, MessageClass, NetworkDefinition, NetworkMessage, Request, RoutingCommittees,
-    ShardId, TopologySnapshot, ValidatorId,
+    ShardId, Signer, TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier,
+    signed_bytes,
 };
 use libc::{RUSAGE_SELF, getrusage, rusage, timeval};
 use serde_json::{Value, json};
@@ -228,6 +231,21 @@ enum Command {
         #[command(flatten)]
         timers: PathTimers,
     },
+    /// Signature checks one peer makes a receiver do by sending forged
+    /// address records, each run of them followed by a record it signed.
+    RejectFlood {
+        /// Items the peer sends a second.
+        #[arg(long, default_value_t = 1000)]
+        rate: u32,
+        /// Forged records the peer sends before each signed one.
+        #[arg(long, default_value_t = 7)]
+        forged_per_signed: u32,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+        /// The receiver serves no shard.
+        #[arg(long)]
+        follower: bool,
+    },
 }
 
 #[derive(Debug, Clone, Hbor)]
@@ -371,38 +389,16 @@ async fn iroh_cluster(spec: &ClusterSpec) -> Vec<Host<IrohNetwork>> {
     let mut hosts: Vec<Host<IrohNetwork>> = Vec::new();
     let mut first: Option<EndpointAddr> = None;
     for index in 0..spec.hosts {
-        let shards = shards_of(spec, index);
-        let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let mut config = IrohConfig::for_testing(fixtures.network_key(index), bind_addr);
-        config.bootstrap_peers = first.iter().cloned().collect();
-        spec.timers.apply(&mut config);
-        let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
-        let adapter = IrohAdapter::bind(IrohAdapterArgs {
-            config,
-            network: NetworkDefinition::simulator(),
-            vnodes: vec![(vid(index), fixtures.signer(index))],
-            local_shards: shards.iter().copied().collect::<HashSet<_>>(),
-            registry: Arc::clone(&registry),
-            validator_keys: fixtures.validator_key_map(),
-            verifier: Arc::new(BlsVerifier),
-        })
-        .await
-        .expect("the host binds");
+        let (adapter, network) = iroh_host(
+            &fixtures,
+            index,
+            &shards_of(spec, index),
+            first.clone(),
+            spec.timers,
+            Arc::new(BlsVerifier),
+        )
+        .await;
         first.get_or_insert_with(|| adapter.endpoint_addr());
-
-        let pool: Arc<dyn RequestPool> =
-            Arc::new(RequestStreams::new(Arc::clone(&adapter), Duration::ZERO));
-        let network = Arc::new(IrohNetwork::new(
-            Arc::clone(&adapter),
-            Arc::new(IrohRequestManager::new(
-                pool,
-                IrohRequestManagerConfig::default(),
-            )),
-            Handle::current(),
-            registry,
-            topology(fixtures.genesis_validators()),
-            Duration::ZERO,
-        ));
         if spec.meshed {
             network.update_routing_committees(root_committee(spec));
         }
@@ -941,6 +937,153 @@ async fn delayed_idle(
     star.shutdown().await.expect("the relay stops");
 }
 
+/// One iroh host carrying validator `index` of `fixtures`, checking
+/// signatures with `verifier`.
+async fn iroh_host(
+    fixtures: &IrohFixtures,
+    index: u32,
+    shards: &[ShardId],
+    bootstrap: Option<EndpointAddr>,
+    timers: PathTimers,
+    verifier: Arc<dyn Verifier>,
+) -> (Arc<IrohAdapter>, Arc<IrohNetwork>) {
+    let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut config = IrohConfig::for_testing(fixtures.network_key(index), bind_addr);
+    config.bootstrap_peers = bootstrap.into_iter().collect();
+    timers.apply(&mut config);
+    let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
+    let adapter = IrohAdapter::bind(IrohAdapterArgs {
+        config,
+        network: NetworkDefinition::simulator(),
+        vnodes: vec![(vid(index), fixtures.signer(index))],
+        local_shards: shards.iter().copied().collect::<HashSet<_>>(),
+        registry: Arc::clone(&registry),
+        validator_keys: fixtures.validator_key_map(),
+        verifier,
+    })
+    .await
+    .expect("the host binds");
+    let pool: Arc<dyn RequestPool> =
+        Arc::new(RequestStreams::new(Arc::clone(&adapter), Duration::ZERO));
+    let network = Arc::new(IrohNetwork::new(
+        Arc::clone(&adapter),
+        Arc::new(IrohRequestManager::new(
+            pool,
+            IrohRequestManagerConfig::default(),
+        )),
+        Handle::current(),
+        registry,
+        topology(fixtures.genesis_validators()),
+        Duration::ZERO,
+    ));
+    (adapter, network)
+}
+
+/// `record` at `sequence`, signed by `signer` when `forged` is false and
+/// carrying a signature over other bytes when it is true.
+fn address_record(
+    record: &ValidatorAddressGossip,
+    sequence: u64,
+    signer: &dyn Signer,
+    forged: bool,
+) -> ValidatorAddressGossip {
+    let message = if forged {
+        b"not this record".to_vec()
+    } else {
+        signed_bytes(
+            &ValidatorAddressMessage::new(&record.peer_id, &record.addresses, sequence),
+            &NetworkDefinition::simulator(),
+        )
+    };
+    ValidatorAddressGossip {
+        sequence,
+        signature: signer.sign(&message).expect("the fixture key signs"),
+        ..record.clone()
+    }
+}
+
+/// A peer sends a receiver forged address records at `rate`, a record it
+/// signed after every `forged_per_signed` of them, for `watch`. Signature
+/// checks are the receiver's alone; CPU is the whole process, the sender's
+/// signing included.
+async fn reject_flood(rate: u32, forged_per_signed: u32, watch: Duration, follower: bool) {
+    let fixtures = IrohFixtures::new(SEED, 2);
+    let counted = Arc::new(CountingVerifier::default());
+    let receiver_shards = if follower {
+        Vec::new()
+    } else {
+        vec![ShardId::ROOT]
+    };
+    let (receiver, _receiver_network) = iroh_host(
+        &fixtures,
+        0,
+        &receiver_shards,
+        None,
+        PathTimers::default(),
+        Arc::clone(&counted) as Arc<dyn Verifier>,
+    )
+    .await;
+    let (sender, sender_network) = iroh_host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        Some(receiver.endpoint_addr()),
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let bound = timeout(MESH_BUDGET, async {
+        while receiver.peer_for_validator(vid(1)).is_none()
+            || sender.peer_for_validator(vid(0)).is_none()
+            || sender.address_records().is_empty()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(bound.is_ok(), "the pair binds");
+    // Let the pair's own records and handshakes settle before watching.
+    sleep(Duration::from_secs(3)).await;
+
+    let own = sender.address_records().remove(0);
+    let signer = fixtures.signer(1);
+    let mut tick = interval(Duration::from_secs(1) / rate);
+    let before = (counted.checked(), counted.refused(), counted.time());
+    let start = (Instant::now(), cpu_time());
+    let mut sent = 0u64;
+    while start.0.elapsed() < watch {
+        tick.tick().await;
+        sent += 1;
+        let forged = !sent.is_multiple_of(u64::from(forged_per_signed + 1));
+        let record = address_record(&own, own.sequence + sent, signer.as_ref(), forged);
+        sender_network.broadcast_global(&record);
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+    let checked = counted.checked() - before.0;
+    let refused = counted.refused() - before.1;
+    let verify_time = counted.time().saturating_sub(before.2);
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "reject flood",
+            "backend": "iroh",
+            "receiver_serves_a_shard": !follower,
+            "forged_per_signed": forged_per_signed,
+            "secs": wall,
+            "sent_per_sec": per_sec(sent),
+            "receiver_checks_per_sec": per_sec(checked),
+            "receiver_refused_checks_per_sec": per_sec(refused),
+            "receiver_check_cores": verify_time.as_secs_f64() / wall,
+            "receiver_mean_check_us": verify_time.as_secs_f64() * 1e6 / per_sec(checked) / wall,
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
 /// Run `measure` over a cluster on `backend`.
 macro_rules! on_backend {
     ($backend:expr, $spec:expr, |$hosts:ident| $measure:expr) => {
@@ -1027,6 +1170,14 @@ async fn main() {
                 timers,
             )
             .await;
+        }
+        Command::RejectFlood {
+            rate,
+            forged_per_signed,
+            secs,
+            follower,
+        } => {
+            reject_flood(rate, forged_per_signed, Duration::from_secs(secs), follower).await;
         }
     }
 }

@@ -13,8 +13,12 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use hyperscale_crypto::{
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, VerifiedSignature,
+    Verifier, VrfProof,
+};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
@@ -415,6 +419,94 @@ impl Star {
             peer.shutdown();
         }
         self.relay.shutdown().await
+    }
+}
+
+/// A BLS verifier that counts the single signatures it checks and the time
+/// they take, so a test can see the signature work a host's peers make it
+/// do. Aggregate and VRF checks pass through uncounted.
+#[derive(Debug, Default)]
+pub struct CountingVerifier {
+    inner: BlsVerifier,
+    checked: AtomicU64,
+    refused: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl CountingVerifier {
+    /// Single signatures checked so far.
+    #[must_use]
+    pub fn checked(&self) -> u64 {
+        self.checked.load(Ordering::Relaxed)
+    }
+
+    /// Single signatures checked so far that did not verify.
+    #[must_use]
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Wall time spent checking single signatures so far.
+    #[must_use]
+    pub fn time(&self) -> Duration {
+        Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+    }
+}
+
+impl Verifier for CountingVerifier {
+    fn verify(&self, key: &ConsensusPublicKey, message: &[u8], sig: &ConsensusSignature) -> bool {
+        let start = Instant::now();
+        let valid = self.inner.verify(key, message, sig);
+        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.checked.fetch_add(1, Ordering::Relaxed);
+        if !valid {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        valid
+    }
+
+    fn aggregate(&self, sigs: &[ConsensusSignature]) -> Result<AggregateSignature, AggregateError> {
+        self.inner.aggregate(sigs)
+    }
+
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError> {
+        self.inner.aggregate_verified(sigs)
+    }
+
+    fn verify_aggregate_same_message(
+        &self,
+        message: &[u8],
+        agg: &AggregateSignature,
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.inner.verify_aggregate_same_message(message, agg, keys)
+    }
+
+    fn verify_aggregate_different_messages(
+        &self,
+        messages: &[&[u8]],
+        agg: &AggregateSignature,
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.inner
+            .verify_aggregate_different_messages(messages, agg, keys)
+    }
+
+    fn verify_each(
+        &self,
+        messages: &[&[u8]],
+        sigs: &[ConsensusSignature],
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.inner.verify_each(messages, sigs, keys)
+    }
+
+    fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
+        self.inner.verify_vrf(key, message, proof)
     }
 }
 
