@@ -1,12 +1,40 @@
-//! What the committed blocks carry in their claims.
+//! What the committed blocks a proposer's execution has not folded
+//! carry in their claims.
 //!
-//! Kept for every block execution's commit fold, which can trail the
-//! shard's committed tip, has not reached, and for the few below it a
-//! committed block's claims are counted against.
+//! Execution's offer is cut by the commit fold, which can trail the
+//! shard's committed tip, so a proposer reads the committed blocks above
+//! execution's folded height here and the pending ones off the chain to
+//! the parent.
 
 use std::collections::BTreeMap;
 
-use hyperscale_types::{BlockHeight, CarriedClaims, Recarried};
+use hyperscale_types::{BlockHash, BlockHeight, CarriedClaims, Recarried, ShardId};
+
+use crate::chain_view::ChainView;
+
+/// What the blocks above the committed height on the chain to `parent`
+/// carry in their claims, `local_shard`'s blocks all.
+///
+/// Read off complete blocks, pending or certified: a proposal is built
+/// only once the coordinator's ancestry holds every block between the
+/// committed tip and the parent. A parent at or below the committed
+/// height carries nothing here.
+pub fn carried_behind(
+    chain: &ChainView<'_>,
+    local_shard: ShardId,
+    parent: BlockHash,
+) -> CarriedClaims {
+    let mut carried = CarriedClaims::default();
+    let mut current = parent;
+    while let Some(block) = chain.get_block(current) {
+        if block.height() <= chain.committed_height() {
+            break;
+        }
+        carried.extend(&CarriedClaims::of(local_shard, block.state_claims()));
+        current = block.header().parent_block_hash();
+    }
+    carried
+}
 
 /// How many committed blocks at or below execution's folded height are
 /// kept: the blocks a committed block's claims are counted as repeating.
@@ -43,6 +71,13 @@ impl CommittedCarried {
         let recarried = carried.recarried(&earlier);
         self.by_height.insert(height, carried);
         recarried
+    }
+
+    /// What the committed blocks above `folded` carry.
+    pub fn above(&self, folded: BlockHeight) -> impl Iterator<Item = &CarriedClaims> {
+        self.by_height
+            .range(folded.next()..)
+            .map(|(_, carried)| carried)
     }
 
     /// Drop the entries execution has folded, but the last

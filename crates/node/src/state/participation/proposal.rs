@@ -37,14 +37,19 @@ impl ProposalSources<'_> {
         // What departed counterparts left of this chain's business, while
         // the settled sets that say so can still be read, and the proofs
         // of counterparts' cells this validator's fetches answered, for
-        // every replica to fold at commit.
+        // every replica to fold at commit, less what the chain from
+        // execution's folded height to the parent carries: execution may
+        // park a commit the shard has announced, so its own height is
+        // the gate.
         let Offers {
             state_claims,
             verdict_claims,
             boundary_claims,
             abandonment_records,
             local_crossings,
-        } = self.execution.offers();
+        } = self
+            .execution
+            .offers(&ask.carried_above(self.execution.committed_height()));
         let queued = self.provisions.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard

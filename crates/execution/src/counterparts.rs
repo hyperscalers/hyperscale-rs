@@ -1438,6 +1438,15 @@ impl BoundaryClaims {
     }
 }
 
+/// Whether a key of `keys` falls inside `claim`'s span of keys.
+fn meets(claim: &StateClaim, keys: &BTreeSet<SubstateKey>) -> bool {
+    claim
+        .cells
+        .first()
+        .zip(claim.cells.last())
+        .is_some_and(|((lo, _), (hi, _))| keys.range(*lo..=*hi).next().is_some())
+}
+
 /// `claims`, all at one anchor, as one key-ordered list cut into claims
 /// whose key spans are disjoint: the form a block carries one anchor's
 /// readings in. A cell two of them read is kept in the first.
@@ -2129,15 +2138,25 @@ impl Counterparts {
             .collect()
     }
 
-    /// What this validator holds to offer in a block it proposes.
+    /// What this validator holds to offer in a block it proposes,
+    /// passing over what `carried`, the chain from the folded tip to the
+    /// block's parent, carries: a fetched cell at the anchor it was
+    /// carried at, an answer whose record was deleted at any anchor, a
+    /// `Never` read present, and a crossing read at a parent. Each comes
+    /// back once its carrier folds, where the fold has not retired it.
     #[must_use]
-    pub(crate) fn offers(&self) -> Offers {
+    pub(crate) fn offers(&self, carried: &CarriedClaims) -> Offers {
         Offers {
-            state_claims: self.state_claims(),
+            state_claims: self.state_claims(carried),
             verdict_claims: self.verdict_claims(),
-            boundary_claims: self.boundary_claims(),
+            boundary_claims: self.boundary_claims(carried),
             abandonment_records: self.abandonment_records(),
-            local_crossings: self.local_crossings.iter().copied().collect(),
+            local_crossings: self
+                .local_crossings
+                .iter()
+                .filter(|id| !carried.reads_locally(id))
+                .copied()
+                .collect(),
         }
     }
 
@@ -2779,14 +2798,15 @@ impl Counterparts {
     /// An anchor's deletions are taken in its record keys' order, from
     /// the first whose answer still stands: the records a block deletes
     /// then sit side by side in their producer's tree, and the proofs a
-    /// block merges for them share their paths. A block's commit cuts
-    /// what it carried, so the next block is offered the run after it.
+    /// block merges for them share their paths. What the chain to the
+    /// parent carries, `carried`, is passed over before the bound below
+    /// is charged, so the next block is offered the run after it.
     ///
     /// What is offered is cut to those deletions' cells, and to no more
     /// of them than a block's claims could hold if no proof weighed
     /// anything, so the offer costs a proposal no more than the block it
     /// builds whatever stands behind it.
-    fn boundary_claims(&self) -> Vec<BoundaryOffer> {
+    fn boundary_claims(&self, carried: &CarriedClaims) -> Vec<BoundaryOffer> {
         let mut anchors: Vec<(&Anchor, &BoundaryReadings)> = self
             .boundaries
             .at
@@ -2803,6 +2823,7 @@ impl Counterparts {
                 if row.holder != anchor.shard
                     || offered.contains(never)
                     || !at.cells.contains(never)
+                    || carried.returns(*never)
                 {
                     continue;
                 }
@@ -2814,6 +2835,9 @@ impl Counterparts {
                 returns.push(vec![*never]);
             }
             'records: for record in &at.cells {
+                if carried.deletes(*record) {
+                    continue;
+                }
                 for (answer, row) in self.rows.answers_to(*record) {
                     if row.holder != anchor.shard || offered.contains(answer) {
                         continue;
@@ -3675,12 +3699,25 @@ impl Counterparts {
     /// lineage. Only a producer for which nothing but unsolicited
     /// records is held is offered after every producer holding a wanted
     /// reading.
-    fn state_claims(&self) -> Vec<StateClaim> {
+    fn state_claims(&self, carried: &CarriedClaims) -> Vec<StateClaim> {
         // Per producer: whether only unsolicited records are held for
         // it, and its oldest anchor.
         let mut producers: BTreeMap<ShardId, (bool, WeightedTimestamp)> = BTreeMap::new();
         let mut claims: Vec<StateClaim> = Vec::new();
-        for claim in self.fetched.claims() {
+        for held in self.fetched.claims() {
+            // What the chain to the parent carries at the claim's anchor
+            // is passed over, and the rest offered as a claim of its own.
+            let rest;
+            let claim = match carried.cells_at(&held.anchor) {
+                Some(keys) if meets(held, keys) => {
+                    let Some(cut) = held.restrict(|key| !keys.contains(&key)) else {
+                        continue;
+                    };
+                    rest = cut;
+                    &rest
+                }
+                _ => held,
+            };
             let unsolicited: Vec<(SubstateKey, CrossingId)> = claim
                 .keys()
                 .into_iter()
@@ -4565,7 +4602,7 @@ mod tests {
             "once per boundary",
         );
         producer.on_proof_fetched(first, &[never], &refusing, &[]);
-        let offers = producer.offers();
+        let offers = producer.offers(&CarriedClaims::default());
         assert!(
             offers.boundary_claims.is_empty(),
             "another transaction's Never returns nothing of this record",
@@ -4579,7 +4616,7 @@ mod tests {
             "the next boundary is asked again",
         );
         producer.on_proof_fetched(second, &[never], &declining, &[]);
-        let offers = producer.offers();
+        let offers = producer.offers(&CarriedClaims::default());
         assert_eq!(offers.boundary_claims.len(), 1);
         assert_eq!(offers.boundary_claims[0].deletions, vec![vec![never]]);
         assert!(
@@ -4592,7 +4629,7 @@ mod tests {
         rows.remove(record);
         producer.derive_asks(&trie);
         let _ = producer.settle_boundaries(&schedule, end);
-        let offers = producer.offers();
+        let offers = producer.offers(&CarriedClaims::default());
         assert!(
             offers.boundary_claims.is_empty(),
             "a record gone asks and offers nothing",
@@ -4674,7 +4711,7 @@ mod tests {
     /// offered.
     fn offered_returns(producer: &Counterparts) -> Vec<SubstateKey> {
         producer
-            .offers()
+            .offers(&CarriedClaims::default())
             .boundary_claims
             .iter()
             .flat_map(|offer| offer.deletions.iter())
@@ -4747,7 +4784,12 @@ mod tests {
         let credit = producer_record(0xD6);
         let record = escrowed(0, credit, 1_000);
         let (counterparts, _, ids) = declined_on_one_chain(&[record], &[(credit, vec![1, 2, 3])]);
-        assert_eq!(counterparts.offers().local_crossings, ids);
+        assert_eq!(
+            counterparts
+                .offers(&CarriedClaims::default())
+                .local_crossings,
+            ids
+        );
     }
 
     /// An answer whose record's shard has departed is deleted at a
@@ -4848,11 +4890,11 @@ mod tests {
         let at_the_horizon = now.plus(RETENTION_HORIZON);
         anchors.retire_below(at_the_horizon);
         producer.release_answered_fetches();
-        assert_eq!(producer.state_claims().len(), 1);
+        assert_eq!(producer.state_claims(&CarriedClaims::default()).len(), 1);
 
         anchors.retire_below(at_the_horizon.plus(Duration::from_millis(1)));
         producer.release_answered_fetches();
-        assert!(producer.state_claims().is_empty());
+        assert!(producer.state_claims(&CarriedClaims::default()).is_empty());
     }
 
     /// A consumer of `PRODUCER`'s holding `count` `Taken` answers, each
@@ -4889,6 +4931,7 @@ mod tests {
     /// next boundary and holds nothing.
     #[test]
     fn a_deletion_is_offered_whole_once_its_cells_are_held() {
+        let nothing = CarriedClaims::default();
         let (
             Answering {
                 mut counterparts, ..
@@ -4912,10 +4955,10 @@ mod tests {
 
         fetched(&mut counterparts, &records);
         assert!(
-            counterparts.offers().boundary_claims.is_empty(),
+            counterparts.offers(&nothing).boundary_claims.is_empty(),
             "a record's absence without its member's row leaf deletes nothing",
         );
-        assert!(counterparts.offers().state_claims.is_empty());
+        assert!(counterparts.offers(&nothing).state_claims.is_empty());
 
         // The row leaves come back in two answers whose cells straddle
         // one another's.
@@ -4923,7 +4966,7 @@ mod tests {
         sorted.sort_unstable();
         fetched(&mut counterparts, &[sorted[0], sorted[2]]);
         fetched(&mut counterparts, &[sorted[1], sorted[3]]);
-        let offered = counterparts.offers().boundary_claims;
+        let offered = counterparts.offers(&nothing).boundary_claims;
         assert_eq!(offered.len(), 1, "one offer an anchor");
         let offer = &offered[0];
         let mut whole: Vec<Vec<SubstateKey>> = cells[..2]
@@ -4984,7 +5027,10 @@ mod tests {
                 "the readings beside a refuted one are let go",
             );
         }
-        assert_eq!(counterparts.offers().boundary_claims[0].deletions, whole);
+        assert_eq!(
+            counterparts.offers(&nothing).boundary_claims[0].deletions,
+            whole
+        );
     }
 
     /// A burst of deletions, every answer of a producer readable at one
@@ -5034,7 +5080,7 @@ mod tests {
             anchors.record(anchor);
             counterparts.on_proof_fetched(anchor, &[key], &proof, &[]);
         }
-        let before = counterparts.offers();
+        let before = counterparts.offers(&CarriedClaims::default());
         assert_eq!(before.state_claims.len(), 2);
         assert!(before.boundary_claims.is_empty());
 
@@ -5055,7 +5101,7 @@ mod tests {
             counterparts.on_proof_fetched(boundary, chunk, &proof, &[]);
         }
 
-        let after = counterparts.offers();
+        let after = counterparts.offers(&CarriedClaims::default());
         assert_eq!(
             after.state_claims, before.state_claims,
             "the burst takes no place among the readings something waits on",
@@ -5078,7 +5124,7 @@ mod tests {
         // and the fresh claims as they were.
         let carried = after.boundary_claims[0].carrying(5);
         counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &carried));
-        let left = counterparts.offers();
+        let left = counterparts.offers(&CarriedClaims::default());
         assert_eq!(left.state_claims, before.state_claims);
         assert_eq!(left.boundary_claims[0].deletions.len(), cells.len() - 5);
     }
@@ -5110,11 +5156,17 @@ mod tests {
         );
         counterparts.on_proof_fetched(newer, &asked, &newer_proof, &[]);
         assert!(
-            counterparts.offers().boundary_claims.is_empty(),
+            counterparts
+                .offers(&CarriedClaims::default())
+                .boundary_claims
+                .is_empty(),
             "a reading at a boundary this replica has not folded is not held",
         );
         assert!(
-            counterparts.offers().state_claims.is_empty(),
+            counterparts
+                .offers(&CarriedClaims::default())
+                .state_claims
+                .is_empty(),
             "among the boundary claims or anywhere else",
         );
 
@@ -5139,7 +5191,12 @@ mod tests {
             "the fetch still out at the evicted boundary is let go: {released:?}",
         );
         assert!(counterparts.boundaries.cells(&older).is_empty());
-        assert!(counterparts.offers().boundary_claims.is_empty());
+        assert!(
+            counterparts
+                .offers(&CarriedClaims::default())
+                .boundary_claims
+                .is_empty()
+        );
 
         // And it asks, holds and offers at the boundary it now records.
         assert_eq!(
@@ -5147,7 +5204,9 @@ mod tests {
             vec![(newer, asked.clone())]
         );
         counterparts.on_proof_fetched(newer, &asked, &newer_proof, &[]);
-        let offered = counterparts.offers().boundary_claims;
+        let offered = counterparts
+            .offers(&CarriedClaims::default())
+            .boundary_claims;
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].deletions, vec![asked]);
     }
@@ -5189,13 +5248,19 @@ mod tests {
             "one row leaf serves both answers",
         );
         counterparts.on_proof_fetched(boundary, &asked, &proof, &[]);
-        let offer = counterparts.offers().boundary_claims.remove(0);
+        let offer = counterparts
+            .offers(&CarriedClaims::default())
+            .boundary_claims
+            .remove(0);
         assert_eq!(offer.deletions.len(), 2);
 
         let first = offer.carrying(1);
         let carried: BTreeSet<SubstateKey> = first.iter().flat_map(StateClaim::keys).collect();
         counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &first));
-        let left = counterparts.offers().boundary_claims.remove(0);
+        let left = counterparts
+            .offers(&CarriedClaims::default())
+            .boundary_claims
+            .remove(0);
         assert_eq!(left.deletions.len(), 1, "the other answer is still whole");
         assert!(left.deletions[0].contains(&row));
         assert!(
@@ -5307,7 +5372,11 @@ mod tests {
             .collect();
         let mut deleted = 0;
         for block in 0..4 {
-            let offer = backlog.counterparts.offers().boundary_claims.remove(0);
+            let offer = backlog
+                .counterparts
+                .offers(&CarriedClaims::default())
+                .boundary_claims
+                .remove(0);
             assert!(
                 offer
                     .claims
@@ -5350,6 +5419,137 @@ mod tests {
         }
     }
 
+    /// A proposer whose fold trails its parent by two blocks passes over
+    /// what those two carry: with no commit cut between them, each of
+    /// three pipelined blocks is offered the run after the one the block
+    /// before it carried, and as many deletions as the first, since what
+    /// is passed over is not charged to the room. Once a carrier folds,
+    /// the carried set it leaves behind changes nothing the cut has not
+    /// already retired.
+    #[test]
+    fn pipelined_offers_take_successive_runs_of_an_anchors_backlog() {
+        const RUN: usize = 200;
+        let mut backlog = backlog(2_400, MAX_PROOFS_PER_QUERY);
+        let records: Vec<SubstateKey> = backlog
+            .crossings
+            .iter()
+            .map(|(record, _)| *record)
+            .collect();
+        let mut carried = CarriedClaims::default();
+        let mut first = None;
+        let mut full = None;
+        for block in 0..3 {
+            let offer = backlog
+                .counterparts
+                .offers(&carried)
+                .boundary_claims
+                .remove(0);
+            let offered: Vec<SubstateKey> = offer
+                .deletions
+                .iter()
+                .map(|cells| record_read(&backlog, cells))
+                .collect();
+            assert_eq!(
+                offered[..RUN],
+                records[block * RUN..(block + 1) * RUN],
+                "block {block} is offered the run after the ones its unfolded ancestors carry",
+            );
+            assert!(
+                records.len() - block * RUN > offered.len(),
+                "the backlog left to block {block} outruns the room",
+            );
+            assert_eq!(
+                offered.len(),
+                *full.get_or_insert(offered.len()),
+                "block {block}'s room is charged for nothing its ancestors carry",
+            );
+            let pieces = CarriedClaims::of(CONSUMER, &offer.carrying(RUN));
+            carried.extend(&pieces);
+            first.get_or_insert(pieces);
+        }
+
+        let first = first.expect("three blocks");
+        backlog.counterparts.cut_carried(&first);
+        for (record, answer) in &backlog.crossings[..RUN] {
+            assert!(first.deletes(*record));
+            backlog.rows.remove(*answer);
+        }
+        backlog.counterparts.derive_asks(&backlog.trie);
+        assert_eq!(
+            backlog.counterparts.offers(&first).boundary_claims,
+            backlog
+                .counterparts
+                .offers(&CarriedClaims::default())
+                .boundary_claims,
+            "a folded carrier's set passes over nothing the fold left",
+        );
+    }
+
+    /// A return and a crossing read at the parent are passed over while
+    /// a block carrying them is unfolded. The fold does not cut either:
+    /// a return its block did not land, and a crossing its read did not
+    /// settle, are offered again once the block folds.
+    #[test]
+    fn a_carried_return_and_local_crossing_come_back_after_the_fold() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let credit = producer_record(0xD7);
+        let record = escrowed(0, credit, 1_000);
+        let (mut producer, _, _) = declined_at_one_boundary(
+            PRODUCER,
+            &trie,
+            &[record],
+            &[(credit, encode_amount(5).to_vec())],
+        );
+        assert_eq!(offered_returns(&producer), vec![decline_of(&record)]);
+        let offer = producer
+            .offers(&CarriedClaims::default())
+            .boundary_claims
+            .remove(0);
+        let carried = CarriedClaims::of(PRODUCER, &offer.carrying(1));
+        assert!(carried.returns(decline_of(&record)));
+        assert!(
+            producer.offers(&carried).boundary_claims.is_empty(),
+            "the return its unfolded block carries is passed over",
+        );
+        producer.cut_carried(&carried);
+        producer.derive_asks(&trie);
+        assert_eq!(
+            offered_returns(&producer),
+            vec![decline_of(&record)],
+            "a return the block did not land is offered again once it folds",
+        );
+
+        let (mut local, _, ids) =
+            declined_on_one_chain(&[escrowed(1, credit, 1_000)], &[(credit, vec![1, 2, 3])]);
+        let parent = Anchor {
+            shard: ShardId::ROOT,
+            height: BlockHeight::new(9),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"parent")),
+            ts: WeightedTimestamp::from_millis(9_000),
+        };
+        let read = StateClaim::new(
+            parent,
+            [(
+                ids[0].record_key(&ProtocolHasher),
+                Inclusion::Present([1; 32]),
+            )],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(ids[0].record_key(&ProtocolHasher), ids[0])]);
+        let carried = CarriedClaims::of(ShardId::ROOT, &[read]);
+        assert!(
+            local.offers(&carried).local_crossings.is_empty(),
+            "the crossing its unfolded block reads at the parent is passed over",
+        );
+        local.cut_carried(&carried);
+        local.derive_asks(&ShardTrie::from_leaves([ShardId::ROOT]));
+        assert_eq!(
+            local.offers(&CarriedClaims::default()).local_crossings,
+            ids,
+            "and offered again once the block folds",
+        );
+    }
+
     /// The claims a block carries of an offer are its pieces merged: one
     /// claim for each run of [`MAX_PROOFS_PER_QUERY`] cells, its proof
     /// the union of the pieces', where the pieces are cut from the held
@@ -5363,7 +5563,7 @@ mod tests {
         const ANSWERS: u32 = 600;
         let offer = backlog(ANSWERS, 7)
             .counterparts
-            .offers()
+            .offers(&CarriedClaims::default())
             .boundary_claims
             .remove(0);
         assert_eq!(offer.deletions.len(), ANSWERS as usize);
@@ -5437,8 +5637,8 @@ mod tests {
             by_merged.cut_carried(&CarriedClaims::of(CONSUMER, &merged));
             by_pieces.cut_carried(&CarriedClaims::of(CONSUMER, &pieces));
             assert_eq!(
-                by_merged.offers().boundary_claims,
-                by_pieces.offers().boundary_claims,
+                by_merged.offers(&CarriedClaims::default()).boundary_claims,
+                by_pieces.offers(&CarriedClaims::default()).boundary_claims,
                 "{carried} deletions leave the same behind either way",
             );
         }
@@ -5517,7 +5717,12 @@ mod tests {
             "a fresh absence of the record is nothing this shard keeps to offer",
         );
         counterparts.on_proof_fetched(suffix, &[record], &suffix_proof, &[]);
-        assert!(counterparts.offers().state_claims.is_empty());
+        assert!(
+            counterparts
+                .offers(&CarriedClaims::default())
+                .state_claims
+                .is_empty()
+        );
         assert!(rows.cell(taken).is_some(), "so the Taken stands");
 
         // The producer is recovered to its boundary sixteen epochs on,
@@ -5550,7 +5755,7 @@ mod tests {
             !counterparts.offer_pushed(&pushed, &[], now),
             "with the Taken standing the recovered chain's push is dropped",
         );
-        let offered = counterparts.offers().state_claims;
+        let offered = counterparts.offers(&CarriedClaims::default()).state_claims;
         let writes = owed_credits(&offered, &StateWrites::default(), &NoCells);
         assert_eq!(
             writes.movements.values().map(|m| m.credit).sum::<u128>(),
@@ -5562,7 +5767,7 @@ mod tests {
         // kept and would credit the record a second time.
         rows.remove(taken);
         assert!(counterparts.offer_pushed(&pushed, &[], now));
-        let offered = counterparts.offers().state_claims;
+        let offered = counterparts.offers(&CarriedClaims::default()).state_claims;
         let writes = owed_credits(&offered, &StateWrites::default(), &NoCells);
         assert_eq!(
             writes.movements.values().map(|m| m.credit).sum::<u128>(),
@@ -5603,7 +5808,10 @@ mod tests {
             },
         );
         assert!(
-            producer.offers().abandonment_records.is_empty(),
+            producer
+                .offers(&CarriedClaims::default())
+                .abandonment_records
+                .is_empty(),
             "the departure names nothing off the record's leaf",
         );
     }
@@ -5637,7 +5845,7 @@ mod tests {
             let _ = counterparts.fetched.hold(held);
         }
         let offered: Vec<(ShardId, u64)> = counterparts
-            .state_claims()
+            .state_claims(&CarriedClaims::default())
             .iter()
             .map(|claim| (claim.anchor.shard, claim.anchor.height.inner()))
             .collect();
@@ -5645,6 +5853,53 @@ mod tests {
             offered,
             vec![(PRODUCER, 10), (PRODUCER, 30), (other, 20)],
             "the producer with the oldest anchor goes first, whole, then the next",
+        );
+    }
+
+    /// A fetched claim is offered less the cells the chain to the parent
+    /// carries at its anchor, and not at all where the chain carries
+    /// every one. Cells carried at another anchor pass over nothing.
+    #[test]
+    fn a_fetched_claim_is_offered_less_what_the_chain_carries() {
+        let Answering {
+            mut counterparts, ..
+        } = answering();
+        let mut keys: Vec<SubstateKey> = (0x61..0x64).map(producer_record).collect();
+        keys.sort_unstable();
+        let (state_root, proof) = state_and_proof_holding(PRODUCER, &[(keys[0], vec![1])], &keys);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(10),
+            state_root,
+            ts: WeightedTimestamp::from_millis(10_000),
+        };
+        let cells = proof
+            .inclusions(state_root, PRODUCER, &keys)
+            .expect("the proof answers for its keys");
+        let held = StateClaim::new(anchor, cells, proof);
+        let _ = counterparts.fetched.hold(held.clone());
+        let middle = held.restrict(|key| key == keys[1]).expect("a held cell");
+        let carried = |claims: &[StateClaim]| CarriedClaims::of(CONSUMER, claims);
+
+        assert_eq!(
+            counterparts.state_claims(&carried(std::slice::from_ref(&middle))),
+            vec![held.restrict(|key| key != keys[1]).expect("the rest")],
+        );
+        assert!(
+            counterparts
+                .state_claims(&carried(std::slice::from_ref(&held)))
+                .is_empty()
+        );
+        let elsewhere = StateClaim {
+            anchor: Anchor {
+                height: BlockHeight::new(11),
+                ..anchor
+            },
+            ..middle
+        };
+        assert_eq!(
+            counterparts.state_claims(&carried(&[elsewhere])),
+            vec![held],
         );
     }
 
@@ -5757,7 +6012,9 @@ mod tests {
                 asked.is_empty(),
                 "nothing is fetched of this shard's own state"
             );
-            counterparts.offers().local_crossings
+            counterparts
+                .offers(&CarriedClaims::default())
+                .local_crossings
         };
 
         assert!(
@@ -5814,7 +6071,9 @@ mod tests {
                     .is_empty(),
                 "nothing is fetched of this shard's own state",
             );
-            counterparts.offers().local_crossings
+            counterparts
+                .offers(&CarriedClaims::default())
+                .local_crossings
         };
         assert_eq!(
             offered(true),
@@ -5982,7 +6241,11 @@ mod tests {
             proof,
         );
         assert!(producer.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000)));
-        assert_eq!(producer.state_claims().len(), 1, "and offered in a block");
+        assert_eq!(
+            producer.state_claims(&CarriedClaims::default()).len(),
+            1,
+            "and offered in a block"
+        );
     }
 
     /// A standing owed record is pushed to its consumer again from its
@@ -6062,7 +6325,7 @@ mod tests {
             );
             let kept =
                 counterparts.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000));
-            (kept, counterparts.state_claims())
+            (kept, counterparts.state_claims(&CarriedClaims::default()))
         };
 
         let (kept, claims) = offered(CONSUMER, Arc::new(TestRows::default()));
@@ -6293,7 +6556,7 @@ mod tests {
             "one its transaction's answer stands for is held for no later want",
         );
         assert!(
-            consumer.state_claims().is_empty(),
+            consumer.state_claims(&CarriedClaims::default()).is_empty(),
             "and is not kept: it is already answered",
         );
         rows.put(
@@ -6314,7 +6577,7 @@ mod tests {
             ),
             "an answer of another transaction answers nothing for this record",
         );
-        let offered = consumer.state_claims();
+        let offered = consumer.state_claims(&CarriedClaims::default());
         assert_eq!(
             offered
                 .iter()
@@ -6337,7 +6600,7 @@ mod tests {
         let now = WeightedTimestamp::from_millis(100_000);
         let held = |consumer: &Counterparts| -> BTreeSet<SubstateKey> {
             consumer
-                .state_claims()
+                .state_claims(&CarriedClaims::default())
                 .iter()
                 .flat_map(StateClaim::keys)
                 .collect()
@@ -6375,7 +6638,7 @@ mod tests {
         }
         let (again, _, again_cell) = record(7);
         assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 31, again, &again_cell), &[], now));
-        assert_eq!(consumer.state_claims().len(), 16);
+        assert_eq!(consumer.state_claims(&CarriedClaims::default()).len(), 16);
 
         // An older one takes the youngest's place.
         let (older, _, older_cell) = record(1);
@@ -6397,7 +6660,7 @@ mod tests {
             &wanted,
             now
         ));
-        let offered = consumer.state_claims();
+        let offered = consumer.state_claims(&CarriedClaims::default());
         assert_eq!(offered.len(), 17);
         assert!(
             offered
@@ -6434,7 +6697,7 @@ mod tests {
             assert!(consumer.offer_pushed(&claim, &wanted, now));
         }
         let offered: Vec<(ShardId, u64)> = consumer
-            .state_claims()
+            .state_claims(&CarriedClaims::default())
             .iter()
             .map(|claim| (claim.anchor.shard, claim.anchor.height.inner()))
             .collect();
@@ -6453,7 +6716,7 @@ mod tests {
             assert!(unasking.offer_pushed(&claim, &[], now));
         }
         let offered: Vec<(ShardId, u64)> = unasking
-            .state_claims()
+            .state_claims(&CarriedClaims::default())
             .iter()
             .map(|claim| (claim.anchor.shard, claim.anchor.height.inner()))
             .collect();
@@ -6480,7 +6743,7 @@ mod tests {
     /// The crossings the claims `consumer` offers are named for.
     fn named(consumer: &Counterparts) -> Vec<(SubstateKey, CrossingId)> {
         consumer
-            .state_claims()
+            .state_claims(&CarriedClaims::default())
             .iter()
             .flat_map(|claim| claim.crossings.iter().copied())
             .collect()
@@ -6489,7 +6752,7 @@ mod tests {
     /// The keys the claims `consumer` offers read.
     fn offered_keys(consumer: &Counterparts) -> BTreeSet<SubstateKey> {
         consumer
-            .state_claims()
+            .state_claims(&CarriedClaims::default())
             .iter()
             .flat_map(StateClaim::keys)
             .collect()
@@ -6513,7 +6776,7 @@ mod tests {
                 "past its validity end the record is held for no later want",
             );
             assert!(
-                consumer.state_claims().is_empty(),
+                consumer.state_claims(&CarriedClaims::default()).is_empty(),
                 "the push at height {height} is kept by nothing while the row stands",
             );
         }
@@ -6541,7 +6804,7 @@ mod tests {
                 &[],
                 now
             ));
-            assert!(consumer.state_claims().is_empty());
+            assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
         }
         let (younger, younger_id, younger_cell) = record(21);
         assert!(consumer.offer_pushed(
@@ -6599,7 +6862,7 @@ mod tests {
         );
         consumer.release_answered_fetches();
         assert!(
-            consumer.state_claims().is_empty(),
+            consumer.state_claims(&CarriedClaims::default()).is_empty(),
             "the decline is written, and the reading answers nothing more",
         );
 
@@ -6608,7 +6871,7 @@ mod tests {
         rows.put(member_row_leaf(CONSUMER, cell.tx), vec![1]);
         consumer.release_answered_fetches();
         assert!(
-            consumer.state_claims().is_empty(),
+            consumer.state_claims(&CarriedClaims::default()).is_empty(),
             "a member of the transaction stands, and may yet take the record",
         );
     }
@@ -6684,7 +6947,7 @@ mod tests {
         let mut offered_at = |clock: WeightedTimestamp| {
             merged.clock = clock;
             merged.derive_asks(&trie);
-            merged.offers().local_crossings
+            merged.offers(&CarriedClaims::default()).local_crossings
         };
 
         assert!(
@@ -6781,7 +7044,7 @@ mod tests {
         );
         let mut consumer = consuming(&rows);
         assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 4, key, &cell), &[], end));
-        let mut block = consumer.state_claims();
+        let mut block = consumer.state_claims(&CarriedClaims::default());
         assert_eq!(named(&consumer), vec![(key, id)]);
         block.push(StateClaim::new(
             Anchor {
@@ -6806,7 +7069,7 @@ mod tests {
         assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 5, key, &cell), &[], end));
         assert!(
             consumer
-                .state_claims()
+                .state_claims(&CarriedClaims::default())
                 .iter()
                 .all(|held| held.anchor.height != BlockHeight::new(5)),
             "declined once: the record's own answer stands, and the next push is not kept",
@@ -7047,7 +7310,7 @@ mod tests {
         producer.release_answered_fetches();
         assert!(
             producer
-                .state_claims()
+                .state_claims(&CarriedClaims::default())
                 .iter()
                 .all(|carried| carried.reading(decline).is_none()),
             "a fresh refusal is held to offer by nothing",
@@ -7101,7 +7364,7 @@ mod tests {
         // beside the proof, it rides in the claim as a held reading.
         let served = (claim0, Bytes::new(claim0.to_bytes().to_vec()).unwrap());
         producer.on_proof_fetched(anchor, &[claim0, claim1], &first, &[served]);
-        let held = producer.state_claims();
+        let held = producer.state_claims(&CarriedClaims::default());
         assert_eq!(held.len(), 1);
         assert_eq!(
             held[0].held(claim0),
@@ -7121,7 +7384,7 @@ mod tests {
         );
 
         producer.on_proof_fetched(anchor, &[claim1, claim2], &second, &[]);
-        let held = producer.state_claims();
+        let held = producer.state_claims(&CarriedClaims::default());
         assert_eq!(held.len(), 2, "the overlap is held once");
         let fresh = held
             .iter()
@@ -7748,7 +8011,11 @@ mod tests {
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].keys(), vec![cells.leaf], "a yes is its one cell");
         assert_eq!(held[0].verdicts.to_vec(), vec![question.tx]);
-        assert!(counterparts.state_claims().is_empty());
+        assert!(
+            counterparts
+                .state_claims(&CarriedClaims::default())
+                .is_empty()
+        );
 
         anchors.record(producer_at(9, &[cells.leaf]));
         assert!(
@@ -8004,7 +8271,7 @@ mod tests {
         let named = read_at(at, &[cells.leaf], &[cells.leaf]).hearing([question.tx]);
         counterparts.cut_carried(&CarriedClaims::of(CONSUMER, std::slice::from_ref(&named)));
         assert_eq!(
-            counterparts.state_claims(),
+            counterparts.state_claims(&CarriedClaims::default()),
             vec![seat],
             "the seat reading keeps the leaf a verdict claim carried",
         );
@@ -8013,7 +8280,7 @@ mod tests {
         counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &[named, nameless]));
         assert_eq!(
             counterparts
-                .state_claims()
+                .state_claims(&CarriedClaims::default())
                 .iter()
                 .flat_map(StateClaim::keys)
                 .collect::<Vec<_>>(),
@@ -8087,7 +8354,7 @@ mod tests {
                 "no newer header to ask at yet",
             );
             assert_eq!(
-                counterparts.state_claims(),
+                counterparts.state_claims(&CarriedClaims::default()),
                 vec![crossing],
                 "the other claim is offered as it is held, byte for byte",
             );
@@ -8101,7 +8368,7 @@ mod tests {
 
         // The other claim rides: the verdict claim is offered again.
         let (mut counterparts, _, first) = waiting();
-        let ridden = counterparts.state_claims();
+        let ridden = counterparts.state_claims(&CarriedClaims::default());
         counterparts.cut_carried(&CarriedClaims::of(CONSUMER, &ridden));
         counterparts.ask_verdicts(&[question], LATE);
         assert_eq!(counterparts.verdict_claims(), first);
@@ -8140,7 +8407,10 @@ mod tests {
         assert_eq!(offered.len(), 1, "one reading a question");
         assert_eq!(offered[0].anchor, next, "the newest");
         assert_eq!(counterparts.heard.claims.len(), 1);
-        assert_eq!(counterparts.state_claims().len(), 1);
+        assert_eq!(
+            counterparts.state_claims(&CarriedClaims::default()).len(),
+            1
+        );
     }
 
     /// A reading for another question is held whole though a verdict
@@ -8162,7 +8432,7 @@ mod tests {
         let reading = read_at(at, &[cells.marker], &[cells.row, cells.leaf]);
         counterparts.hold_seat_reading(&reading, question.tx);
         assert_eq!(
-            counterparts.state_claims(),
+            counterparts.state_claims(&CarriedClaims::default()),
             vec![reading],
             "the seat reading holds every cell of its own",
         );
@@ -8200,7 +8470,7 @@ mod tests {
         let _ = counterparts.fetched.hold(newer.clone());
         let _ = counterparts.fetched.hold(older.clone());
         assert_eq!(
-            counterparts.state_claims(),
+            counterparts.state_claims(&CarriedClaims::default()),
             vec![older, newer],
             "the producers ride by the oldest anchor of the claims held for them",
         );
@@ -9119,10 +9389,13 @@ mod tests {
                 );
                 serve_at_random(&mut draws, &trees, [&mut following, &mut whole]);
                 // A block carrying part of the first offer.
-                let offered = following.offers().boundary_claims;
+                let offered = following.offers(&CarriedClaims::default()).boundary_claims;
                 assert_eq!(
                     format!("{offered:?}"),
-                    format!("{:?}", whole.offers().boundary_claims),
+                    format!(
+                        "{:?}",
+                        whole.offers(&CarriedClaims::default()).boundary_claims
+                    ),
                     "seed {seed} step {step}"
                 );
                 if let Some(offer) = offered.first().filter(|_| draws.one_in(2)) {

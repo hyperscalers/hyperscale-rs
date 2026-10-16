@@ -182,7 +182,7 @@ use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witne
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
 };
-use crate::carried::CommittedCarried;
+use crate::carried::{CommittedCarried, carried_behind};
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
@@ -2201,8 +2201,9 @@ impl ShardCoordinator {
     /// every reading taken at `parent`: `committee`, which the block is
     /// classified under, the shards `terminating` at the block's anchor,
     /// the rows of `members` standing toward each shard, the drain on the
-    /// parent's header, the transactions `chain` carries, and the
-    /// engagements committed behind them.
+    /// parent's header, the transactions `chain` carries, the engagements
+    /// committed behind them, and the claims `carried` by the blocks
+    /// above the committed tip beside those of the committed blocks.
     fn ask_at<'a>(
         &'a self,
         committee: &'a TopologySnapshot,
@@ -2210,6 +2211,7 @@ impl ShardCoordinator {
         parent: BlockHash,
         members: &MemberIndex,
         chain: &'a QcChainSets,
+        carried: &'a CarriedClaims,
     ) -> ProposalAsk<'a> {
         ProposalAsk {
             intake: IntakeView {
@@ -2223,6 +2225,8 @@ impl ShardCoordinator {
             local_shard: self.local_shard,
             dedup: &self.dedup_index,
             committed_anchor: self.committed_block_anchor_wt,
+            pending_carried: carried,
+            committed_carried: &self.committed_carried,
         }
     }
 
@@ -2851,6 +2855,7 @@ impl ShardCoordinator {
         let Some(gather) = gather else {
             return Some(ProposalPayload::default());
         };
+        let carried = carried_behind(&self.chain_view(), self.local_shard, parent_block_hash);
         let ProposalInputs {
             ready_txs,
             finalizations,
@@ -2866,6 +2871,7 @@ impl ShardCoordinator {
             parent_block_hash,
             &members,
             &chain,
+            &carried,
         ));
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
@@ -13892,6 +13898,8 @@ mod tests {
             local_shard: local,
             dedup: &state.dedup_index,
             committed_anchor: state.committed_block_anchor_wt,
+            pending_carried: &CarriedClaims::default(),
+            committed_carried: &state.committed_carried,
         };
         assert!(
             ask.engagement_held(&tx, |_, _| false),
@@ -19725,6 +19733,158 @@ mod tests {
         let mut txs: Vec<Transaction> = (1..=4).map(test_transaction).collect();
         txs.sort_by_key(Transaction::hash);
         txs
+    }
+
+    /// A seat leading the round after the QC over the block at height 4,
+    /// with the committed tip at height 2 and the blocks at 3 and 4 each
+    /// carrying one claim of a sibling's: the blocks, and the QC.
+    fn leading_on_two_carriers() -> (
+        ShardCoordinator,
+        TopologySchedule,
+        [Block; 2],
+        Verified<QuorumCertificate>,
+    ) {
+        test_utils::install_stub_protocol_statics();
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(40_000));
+        let header = |height: u64, parent_qc: QuorumCertificate| {
+            BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(height),
+                parent_block_hash: parent_qc.block_hash(),
+                parent_qc: parent_qc.into(),
+                proposer: ValidatorId::new(height % 4),
+                timestamp: ProposerTimestamp::from_millis(10_000 * height),
+                round: Round::new(height),
+                ..Default::default()
+            })
+        };
+        let qc_over = |header: &BlockHeader| {
+            QuorumCertificate::new(
+                header.hash(),
+                ShardId::ROOT,
+                header.height(),
+                header.parent_block_hash(),
+                header.round(),
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(10_000 * header.height().inner()),
+            )
+        };
+        let carrying = |header: BlockHeader, seed: u8| {
+            let anchor = Anchor {
+                shard: ShardId::leaf(1, 1),
+                height: BlockHeight::new(2),
+                state_root: StateRoot::from_raw(Hash::from_bytes(b"sibling")),
+                ts: WeightedTimestamp::from_millis(2_000),
+            };
+            let claim = StateClaim::new(
+                anchor,
+                [(test_utils::test_key(seed), Inclusion::Present([seed; 32]))],
+                MerkleInclusionProof::dummy(),
+            );
+            Block::Live {
+                header,
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::from_array([claim])),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            }
+        };
+
+        let tip = header(
+            2,
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+        );
+        state.committed_height = tip.height();
+        state.committed_hash = tip.hash();
+        let committing = carrying(header(3, qc_over(&tip)), 1);
+        let certified = carrying(header(4, qc_over(committing.header())), 2);
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            tip,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+        install_complete_block(&mut state, &committing);
+        install_complete_block(&mut state, &certified);
+        let qc = Verified::new_unchecked_for_test(qc_over(certified.header()));
+        state.verification.on_block_persisted(qc.height());
+        state.me = schedule
+            .head()
+            .proposer_for(ShardId::ROOT, qc.round().next());
+        (state, schedule, [committing, certified], qc)
+    }
+
+    /// The proposal a QC over `B+1` opens is asked with what `B` and
+    /// `B+1` carry in their claims, where execution has folded neither:
+    /// both above the committed tip while `B`'s commit is in flight, and
+    /// `B` from the committed blocks once it lands. What execution has
+    /// folded through is passed over by nothing.
+    #[test]
+    fn a_proposal_on_a_formed_qc_skips_what_the_block_it_commits_carried() {
+        let (mut state, schedule, [committing, certified], qc) = leading_on_two_carriers();
+        let (in_committing, in_certified) =
+            (&committing.state_claims()[0], &certified.state_claims()[0]);
+        let both: BTreeSet<SubstateKey> = [in_committing, in_certified]
+            .into_iter()
+            .flat_map(StateClaim::keys)
+            .collect();
+        let carried_at = |carried: &CarriedClaims| {
+            carried
+                .cells_at(&in_committing.anchor)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let asked = Cell::new(false);
+        let actions = state.on_qc_formed(&schedule, qc.block_hash(), &qc, |ask| {
+            asked.set(true);
+            assert_eq!(
+                carried_at(&ask.carried_above(BlockHeight::new(2))),
+                both,
+                "both unfolded blocks above the committed tip",
+            );
+            ProposalInputs::default()
+        });
+        assert!(
+            asked.get(),
+            "the seat leads the round the QC opens: {actions:?}"
+        );
+
+        // B's commit lands; execution has not folded it.
+        state.committed_carried.record(
+            committing.height(),
+            CarriedClaims::of(ShardId::ROOT, committing.state_claims()),
+        );
+        state.committed_height = committing.height();
+        state.committed_hash = committing.hash();
+        let round = qc.round().next();
+        let frame = state
+            .proposal_frame(&schedule, qc.height().next(), round)
+            .expect("the block's frame resolves");
+        let mut seen = Vec::new();
+        state
+            .gathered_payload(
+                &schedule,
+                &frame,
+                Some(|ask: &ProposalAsk<'_>| {
+                    seen.push(carried_at(&ask.carried_above(BlockHeight::new(2))));
+                    seen.push(carried_at(&ask.carried_above(committing.height())));
+                    ProposalInputs::default()
+                }),
+            )
+            .expect("the chain to the parent is held");
+        assert_eq!(
+            seen[0], both,
+            "B from the committed blocks, B+1 above the tip"
+        );
+        assert_eq!(
+            seen[1],
+            in_certified.keys().into_iter().collect(),
+            "a folded B is passed over by nothing",
+        );
     }
 
     /// The block a QC certifies is the parent of the proposal the QC

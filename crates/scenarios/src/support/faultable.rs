@@ -324,6 +324,17 @@ pub struct ClaimsRecarried {
 
 /// Report what `c`'s committed blocks carried twice, by kind and per
 /// committed block, and hand the counts back.
+///
+/// A proposer passes over what the chain to its parent carries, so an
+/// honest run carries no cell and no deletion twice. A return or a
+/// crossing read at the parent that its carrier does not settle is
+/// offered again once the carrier folds, so those two are reported and
+/// not held to zero.
+///
+/// # Panics
+///
+/// Panics if a committed block carried a cell or a deletion that one of
+/// the four below it carried.
 pub fn report_claims_recarried(c: &impl FaultableCluster, scenario: &str) -> ClaimsRecarried {
     let recarried = ClaimsRecarried {
         cells: c.metric("claims_recarried", Some("cells")),
@@ -353,6 +364,11 @@ pub fn report_claims_recarried(c: &impl FaultableCluster, scenario: &str) -> Cla
         per_block(recarried.returns),
         recarried.local,
         per_block(recarried.local),
+    );
+    assert_eq!(
+        (recarried.cells, recarried.deletions),
+        (0, 0),
+        "{scenario}: no committed block carries a cell or a deletion the chain below it carried",
     );
     recarried
 }

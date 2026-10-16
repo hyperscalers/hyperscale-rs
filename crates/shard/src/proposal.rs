@@ -24,14 +24,15 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, BoundaryAttestation,
-    BoundaryOffer, Epoch, EpochWindows, Finalization, FrontierInputs, Hash, Inclusion, IntakeView,
-    LocalTimestamp, MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
-    MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MemberCollection,
-    ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal, ReshapeTrigger, RevealChain,
-    Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId,
-    StateClaim, SubstateClaim, SubstateKey, TimeoutCertificate, TopologySnapshot, Transaction,
-    TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
-    state_claims_admit_block, tick_terms_admit_block, verdict_leaf,
+    BoundaryOffer, CarriedClaims, Epoch, EpochWindows, Finalization, FrontierInputs, Hash,
+    Inclusion, IntakeView, LocalTimestamp, MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    MemberCollection, ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, SubstateKey,
+    TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, claims_admit_block, state_claims_admit_block,
+    tick_terms_admit_block, verdict_leaf,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -41,6 +42,7 @@ use crate::admission::{
     RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
     TransactionsSection, admit_each, predated_at, unwrapped,
 };
+use crate::carried::CommittedCarried;
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
 use crate::precut::Precut;
@@ -60,9 +62,28 @@ pub struct ProposalAsk<'a> {
     pub(crate) local_shard: ShardId,
     pub(crate) dedup: &'a CommitDedupIndex,
     pub(crate) committed_anchor: WeightedTimestamp,
+    /// What the blocks between the committed tip and the parent carry in
+    /// their claims.
+    pub(crate) pending_carried: &'a CarriedClaims,
+    /// What the committed blocks carry in their claims, by height.
+    pub(crate) committed_carried: &'a CommittedCarried,
 }
 
 impl ProposalAsk<'_> {
+    /// What the chain from `folded`, the height a node's execution has
+    /// folded through, up to the parent carries in its claims: the
+    /// blocks above the committed tip, and the committed blocks above
+    /// `folded`. The offer passes over all of it, since the fold that
+    /// retires it has not run.
+    #[must_use]
+    pub fn carried_above(&self, folded: BlockHeight) -> CarriedClaims {
+        let mut carried = self.pending_carried.clone();
+        for committed in self.committed_carried.above(folded) {
+            carried.extend(committed);
+        }
+        carried
+    }
+
     /// Whether the engagement evidence for `tx` is in hand, as the
     /// block's committee places it: it is single-shard, this shard is
     /// the payer's, the payer's bundle rides the proposal, or a
@@ -435,7 +456,8 @@ pub fn select_abandonment_records(
 /// that does not fit is cut to the longest key prefix whose piece fits,
 /// that piece is kept and the spending ends there: a claim is split by
 /// key, never dropped whole, and the composer offers the remainder at
-/// the next proposal once the commit retires what this block carried.
+/// the next proposal, which passes over what the chain to its parent
+/// carries.
 /// What was kept is then sorted into the section's order and admitted.
 /// What the order rule refuses waits a block, with every claim of its
 /// producer's lineage anchored above it, so the frontier this block

@@ -67,15 +67,15 @@ use hyperscale_metrics::{
 use hyperscale_storage::{FeeTerms, ProvisionalTx, RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock, CommittedAt,
-    ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause, EpochWindows,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
-    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Joins,
-    MerkleInclusionProof, Mode, Movement, ProvenAnchors, Provisions, REATTESTATION_STEP,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
+    Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CarriedClaims, CertifiedBlock,
+    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
+    EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
+    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
+    Hash, Joins, MerkleInclusionProof, Mode, Movement, ProvenAnchors, Provisions,
+    REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId,
+    ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
     WeightedTimestamp, derive_block_transactions, settled_set_verdict, tick_leader,
 };
 use tracing::instrument;
@@ -2603,10 +2603,12 @@ impl ExecutionCoordinator {
             .on_verdict_proof_fetched(anchor, questions, proof, windows);
     }
 
-    /// What this validator holds to offer in a block it proposes.
+    /// What this validator holds to offer in a block it proposes,
+    /// passing over what `carried`, the chain from this coordinator's
+    /// folded tip to the block's parent, carries.
     #[must_use]
-    pub fn offers(&self) -> Offers {
-        self.counterparts.offers()
+    pub fn offers(&self, carried: &CarriedClaims) -> Offers {
+        self.counterparts.offers(carried)
     }
 
     /// Ask the seat questions the committed tip stands, at the committed
@@ -12623,7 +12625,10 @@ mod tests {
                 "{outcome:?}: the mempool hears nothing off the core's certificate"
             );
             assert!(
-                state.offers().abandonment_records.is_empty(),
+                state
+                    .offers(&CarriedClaims::default())
+                    .abandonment_records
+                    .is_empty(),
                 "{outcome:?}: and no record restates it"
             );
         }
@@ -12884,7 +12889,10 @@ mod tests {
             "and its silence is written down",
         );
         assert!(
-            state.offers().abandonment_records.is_empty(),
+            state
+                .offers(&CarriedClaims::default())
+                .abandonment_records
+                .is_empty(),
             "with no record to restate it"
         );
 
@@ -13170,7 +13178,10 @@ mod tests {
             },
         );
         assert!(
-            state.offers().abandonment_records.is_empty(),
+            state
+                .offers(&CarriedClaims::default())
+                .abandonment_records
+                .is_empty(),
             "the departure names nothing off the record's leaf",
         );
     }
@@ -13245,7 +13256,7 @@ mod tests {
         state.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
         assert!(
             state
-                .offers()
+                .offers(&CarriedClaims::default())
                 .state_claims
                 .iter()
                 .all(|reading| reading.crossing_of(decline).is_none()),
@@ -13804,14 +13815,18 @@ mod tests {
     fn holds_record(state: &ExecutionCoordinator, key: SubstateKey, tx: TxHash) -> bool {
         use hyperscale_vm_effects::CrossingLeaf;
 
-        state.offers().state_claims.iter().any(|claim| {
-            claim.held(key).is_some_and(|bytes| {
-                matches!(
-                    CrossingLeaf::read(&ProtocolHasher, key, bytes),
-                    Some(CrossingLeaf::Record { cell, .. }) if cell.tx == tx
-                )
+        state
+            .offers(&CarriedClaims::default())
+            .state_claims
+            .iter()
+            .any(|claim| {
+                claim.held(key).is_some_and(|bytes| {
+                    matches!(
+                        CrossingLeaf::read(&ProtocolHasher, key, bytes),
+                        Some(CrossingLeaf::Record { cell, .. }) if cell.tx == tx
+                    )
+                })
             })
-        })
     }
 
     /// A consumer waiting on one record, its want filed one finalization
@@ -13908,7 +13923,7 @@ mod tests {
         }
 
         assert_eq!(
-            state.offers().state_claims.len(),
+            state.offers(&CarriedClaims::default()).state_claims.len(),
             1,
             "the pushed reading is what the next block carries",
         );
@@ -13986,7 +14001,12 @@ mod tests {
             state.parked_claims.is_empty(),
             "not parked: the anchor is proven, differently"
         );
-        assert!(state.offers().state_claims.is_empty());
+        assert!(
+            state
+                .offers(&CarriedClaims::default())
+                .state_claims
+                .is_empty()
+        );
     }
 
     #[test]
@@ -14004,7 +14024,10 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            state.offers().state_claims.is_empty(),
+            state
+                .offers(&CarriedClaims::default())
+                .state_claims
+                .is_empty(),
             "nothing wants the reading yet, so nothing is offered",
         );
         assert_eq!(state.parked_claims.len(), 1, "and it is held for the want");
@@ -14047,7 +14070,13 @@ mod tests {
                     .on_crossing_readings(&schedule, vec![claim])
                     .is_empty()
             );
-            assert!(state.offers().state_claims.is_empty(), "kept at {height}");
+            assert!(
+                state
+                    .offers(&CarriedClaims::default())
+                    .state_claims
+                    .is_empty(),
+                "kept at {height}"
+            );
             assert!(state.parked_claims.is_empty(), "parked at {height}");
         }
 
@@ -14211,7 +14240,7 @@ mod tests {
         state.counterparts.proven_anchors.record(earlier_anchor);
         state.on_crossing_readings(&schedule, vec![later, earlier]);
         let offered: Vec<Anchor> = state
-            .offers()
+            .offers(&CarriedClaims::default())
             .state_claims
             .iter()
             .map(|claim| claim.anchor)
@@ -15190,7 +15219,7 @@ mod tests {
             },
         );
 
-        let records = state.offers().abandonment_records;
+        let records = state.offers(&CarriedClaims::default()).abandonment_records;
         assert_eq!(records.len(), 1, "the peer's departure is answerable");
         assert_eq!(records[0].shard(), PEER);
         assert_eq!(
@@ -15208,7 +15237,10 @@ mod tests {
 
         // And what it does not offer twice.
         assert!(
-            state.offers().abandonment_records.is_empty(),
+            state
+                .offers(&CarriedClaims::default())
+                .abandonment_records
+                .is_empty(),
             "a departure is answered once",
         );
 
@@ -15301,7 +15333,7 @@ mod tests {
         state.record_settled_txs(&sched, LOWER, set(120_000));
         state.record_settled_txs(&sched, UPPER, set(60_000));
 
-        let records = state.offers().abandonment_records;
+        let records = state.offers(&CarriedClaims::default()).abandonment_records;
         assert_eq!(
             records
                 .iter()
@@ -15341,7 +15373,7 @@ mod tests {
         state.record_settled_txs(&sched, peer_left, set(120_000));
         state.record_settled_txs(&sched, PEER, set(60_000));
 
-        let records = state.offers().abandonment_records;
+        let records = state.offers(&CarriedClaims::default()).abandonment_records;
         assert_eq!(
             records
                 .iter()
