@@ -4,15 +4,19 @@
 # container (see ../iroh-nat-testbed.sh); every host, router and the relay
 # gets its own network namespace, and the routers translate with nftables.
 #
-# Usage: testbed.sh [--rtt-ms "20 150"] [--secs 75] [--types "..."] [--out DIR]
+# Usage: testbed.sh [--rtt-ms "20 150"] [--secs 75] [--types "..."]
+#                   [--involving TYPE] [--out DIR]
 #
 # Each run joins two hosts of the given types through their routers to one
 # shared segment, the "internet", where the relay and public hosts sit. Host
-# one listens and host two dials. Both name the relay by its IPv4 and its
-# IPv6 address and trust its self-signed certificate, so the relay also
-# serves QUIC address discovery. netem on each site's uplink makes the round
+# one listens and host two dials. Both name the relay by a hostname that the
+# container's hosts file maps to its IPv4 and its IPv6 address, so a host of
+# either family reaches it (iroh 1.3.0 refuses a relay named by an IPv6
+# literal), and trust its self-signed certificate, so the relay also serves
+# QUIC address discovery. netem on each site's uplink makes the round
 # trip between the two hosts the given value. Every ordered pair of types is
-# run, plus two hosts behind one router (`lan`). One JSON line per run is
+# run, or with --involving only the pairs one of whose hosts is of that
+# type, plus two hosts behind one router (`lan`). One JSON line per run is
 # appended to DIR/matrix.jsonl; each run's full output stays in
 # DIR/rtt-<ms>/<listener>--<dialer>/.
 #
@@ -35,12 +39,14 @@ set -euo pipefail
 RTTS="20 150"
 SECS=75
 TYPES="public full-cone port-restricted symmetric double udp-blocked ipv6-only"
+INVOLVING=""
 OUT=/out
 while [ $# -gt 0 ]; do
     case "$1" in
         --rtt-ms) RTTS="$2"; shift 2 ;;
         --secs) SECS="$2"; shift 2 ;;
         --types) TYPES="$2"; shift 2 ;;
+        --involving) INVOLVING="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -53,15 +59,21 @@ PORT=7000
 
 RELAY4=198.51.100.2
 RELAY6=2001:db8:1::2
-RELAY_URLS="--relay https://$RELAY4/ --relay https://[$RELAY6]/"
+RELAY_NAME=relay.testbed
+RELAY_URLS="--relay https://$RELAY_NAME/"
 
 mkdir -p "$WORK" "$OUT"
+
+# Every namespace shares the container's hosts file, which iroh's resolver
+# reads before any nameserver.
+grep -q " $RELAY_NAME\$" /etc/hosts || printf '%s %s\n%s %s\n' \
+    "$RELAY4" "$RELAY_NAME" "$RELAY6" "$RELAY_NAME" >>/etc/hosts
 
 # One certificate for the relay, trusted by every probe through --relay-ca.
 # rustls refuses a certificate authority as a server certificate, so this
 # self-signed one is marked as a leaf.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -days 30 -subj /CN=relay -addext "subjectAltName=IP:$RELAY4,IP:$RELAY6" \
+    -days 30 -subj /CN=relay -addext "subjectAltName=DNS:$RELAY_NAME,IP:$RELAY4,IP:$RELAY6" \
     -addext "basicConstraints=critical,CA:FALSE" -addext "extendedKeyUsage=serverAuth" \
     -keyout "$WORK/relay.key" -out "$WORK/relay.crt" 2>/dev/null
 
@@ -312,6 +324,9 @@ trap teardown EXIT
 for rtt in $RTTS; do
     for first in $TYPES; do
         for second in $TYPES; do
+            if [ -n "$INVOLVING" ] && [ "$first" != "$INVOLVING" ] && [ "$second" != "$INVOLVING" ]; then
+                continue
+            fi
             run_pair "$first" "$second" "$rtt"
         done
     done
