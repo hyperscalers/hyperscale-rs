@@ -179,13 +179,17 @@ run_pair() {
     ns h2 "$PROBE" dial $RELAY_URLS --relay-ca "$WORK/relay.crt" --seed 2 $BIND_2 \
         --peer "$id" $addrs --secs "$SECS" >"$dir/dial.jsonl" 2>"$dir/dial.log" || true
 
-    # The report is the trailing pretty-printed object; the path events
-    # before it are one per line.
+    # The report is the pretty-printed object with an `overall` section. A
+    # path event can still follow it, one per line, and a dial that failed
+    # leaves no report at all.
     local report
-    report=$(sed -n '/^{$/,$p' "$dir/dial.jsonl" | jq -c \
-        '{time_to_direct_ms, selected_after_a_minute, fallbacks,
-          rtt_p50_us: .overall.rtt_p50_us, on_relay: .overall.on_relay,
-          on_direct: .overall.on_direct}' 2>/dev/null || echo '{"error":"no report"}')
+    report=$(sed -n '/^{$/,$p' "$dir/dial.jsonl" | jq -c -s \
+        'map(select(type == "object" and has("overall"))) | last
+         | if . == null then {error: "no report"} else
+           {time_to_direct_ms, selected_after_a_minute, fallbacks,
+            rtt_p50_us: .overall.rtt_p50_us, on_relay: .overall.on_relay,
+            on_direct: .overall.on_direct} end' 2>/dev/null \
+        || echo '{"error":"no report"}')
     echo "{\"listener\":\"$first\",\"dialer\":\"$second\",\"rtt_ms\":$rtt,\"report\":$report}" \
         | tee -a "$OUT/matrix.jsonl"
 }
