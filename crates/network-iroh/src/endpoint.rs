@@ -7,8 +7,12 @@
 //! else, and an inbound connection that has not bound within
 //! [`BIND_TIMEOUT`] is closed. Anyone who learns an endpoint id can reach
 //! the host through its relay without knowing its address, so unbound
-//! inbound connections are capped as well as timed, and the host signs for
-//! a dialer only when the dialer has a turn (see [`crate::bind_gate`]).
+//! inbound connections are capped as well as timed, and the host starts a
+//! handshake and signs for a dialer only when the dialer has a turn (see
+//! [`crate::bind_gate`]).
+//!
+//! Before its handshake an inbound connection shows where it comes from,
+//! and that decides which unbound slots it may take (see [`crate::unbound`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -31,14 +35,13 @@ use iroh::endpoint::{
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, TransportAddr};
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 
 use crate::address_book::{AddressBook, IngestOutcome, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
-use crate::bind_gate::BindGate;
+use crate::bind_gate::{BindGate, Origin, Ticket};
 use crate::config::{IrohConfig, MAX_RELAYS};
 use crate::cooldown::Cooldown;
 use crate::error::NetworkError;
@@ -51,16 +54,13 @@ use crate::protocol::{
     ALPN, CLOSE_BIND_FAILED, CLOSE_BIND_REFUSED, CLOSE_REDIAL_REFUSED, CLOSE_SHUTDOWN,
     CLOSE_SUPERSEDED, REDIAL_ALPN,
 };
+use crate::unbound::{Admission, Slot, UnboundSlots};
 
 /// How long a connection has to complete the validator-bind handshake.
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a dial has to establish its connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Inbound connections that may be mid-handshake at once. Further ones are
-/// refused until a slot frees.
-const MAX_UNBOUND_INBOUND: usize = 64;
 
 /// Interval of the sweep that re-dials bootstrap peers and wanted
 /// validators with no bound connection.
@@ -168,7 +168,7 @@ struct Inner {
     /// does not hammer an unreachable one.
     dial_backoff: Mutex<HashMap<EndpointId, StreamBackoff<Instant>>>,
     /// Slots for inbound connections that have not bound yet.
-    unbound: Arc<Semaphore>,
+    unbound: UnboundSlots,
     /// Which dialers this host signs for before they prove anything.
     bind_gate: BindGate,
     /// This host's address records and the addresses they were signed for.
@@ -278,7 +278,7 @@ impl IrohAdapter {
             bootstrap_peers: config.bootstrap_peers,
             dialing: DashSet::new(),
             dial_backoff: Mutex::new(HashMap::new()),
-            unbound: Arc::new(Semaphore::new(MAX_UNBOUND_INBOUND)),
+            unbound: UnboundSlots::default(),
             bind_gate: BindGate::default(),
             signed_records: Mutex::new(None),
         });
@@ -718,26 +718,79 @@ impl Inner {
     /// Accept inbound connections until the endpoint closes.
     async fn accept_loop(self: Arc<Self>) {
         while let Some(incoming) = self.endpoint.accept().await {
-            if is_redial(&incoming) && !self.admit_redial(&incoming) {
-                incoming.refuse();
+            if is_redial(&incoming) {
+                if !self.admit_redial(&incoming) {
+                    incoming.refuse();
+                    continue;
+                }
+                let Some(slot) = self.unbound.redial() else {
+                    incoming.refuse();
+                    continue;
+                };
+                // A re-dial never binds, so it has no use for a ticket.
+                let ticket = Ticket::Vouched { paid: None };
+                self.spawn_accept(incoming, ticket, slot);
                 continue;
             }
-            let Ok(permit) = Arc::clone(&self.unbound).try_acquire_owned() else {
-                warn!("Refusing inbound connection: too many are mid-handshake");
-                incoming.refuse();
-                continue;
-            };
-            let inner = Arc::clone(&self);
-            self.runtime.spawn(async move {
-                let _permit = permit;
-                inner.accept(incoming).await;
-            });
+            self.admit(incoming);
         }
+    }
+
+    /// Let `incoming` on to its handshake if its origin has a slot and a
+    /// turn, send it a retry if it must first show its address is its own,
+    /// or refuse it. Each is decided from its first packet.
+    fn admit(self: &Arc<Self>, incoming: Incoming) {
+        let origin = match incoming.remote_addr() {
+            IncomingAddr::Relay { endpoint_id, .. } => Origin::Relayed(endpoint_id),
+            IncomingAddr::Ip(addr) => Origin::Direct(addr),
+            _ => {
+                incoming.refuse();
+                return;
+            }
+        };
+        let named = match origin {
+            Origin::Relayed(peer) => self.address_book.names(peer),
+            Origin::Direct(addr) => self.address_book.names_address(addr),
+        };
+        let slot = match self
+            .unbound
+            .admit(origin, named, incoming.remote_addr_validated())
+        {
+            Admission::Admit(slot) => slot,
+            Admission::Retry => {
+                if let Err(error) = incoming.retry() {
+                    error.into_incoming().refuse();
+                }
+                return;
+            }
+            Admission::Refuse(reason) => {
+                debug!(?origin, named, reason, "Refusing inbound connection");
+                incoming.refuse();
+                return;
+            }
+        };
+        let Some(ticket) = self.bind_gate.admit_incoming(origin, named) else {
+            debug!(
+                ?origin,
+                "Refusing inbound connection: no turn for this dialer"
+            );
+            incoming.refuse();
+            return;
+        };
+        self.spawn_accept(incoming, ticket, slot);
+    }
+
+    fn spawn_accept(self: &Arc<Self>, incoming: Incoming, ticket: Ticket, slot: Slot) {
+        let inner = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let _slot = slot;
+            inner.accept(incoming, ticket).await;
+        });
     }
 
     /// Take one inbound connection through the bind handshake, closing it
     /// if the handshake fails or outlasts [`BIND_TIMEOUT`].
-    async fn accept(self: &Arc<Self>, incoming: Incoming) {
+    async fn accept(self: &Arc<Self>, incoming: Incoming, ticket: Ticket) {
         let deadline = Instant::now() + BIND_TIMEOUT;
         let Ok(Ok(connection)) = timeout(BIND_TIMEOUT, incoming).await else {
             debug!("Inbound connection did not complete its handshake");
@@ -750,7 +803,10 @@ impl Inner {
         }
         // The listener signs before the dialer proves anything, so it signs
         // only for a dialer with a turn.
-        if !self.bind_gate.admit(peer, self.address_book.names(peer)) {
+        if !self
+            .bind_gate
+            .admit_bind(peer, self.address_book.names(peer), ticket)
+        {
             debug!(peer = %peer.fmt_short(), "Refusing to bind: no turn for this dialer");
             connection.close(CLOSE_BIND_REFUSED, b"no turn");
             return;

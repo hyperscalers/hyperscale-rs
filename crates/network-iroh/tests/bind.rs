@@ -393,3 +393,29 @@ async fn a_host_its_book_names_binds_while_strangers_flood() {
         "a validator the book vouches for binds through the flood"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_without_a_turn_is_refused_before_its_handshake() {
+    let fixtures = TestFixtures::new(7, 2);
+    let host = HostSpec::new(&fixtures, &[0]).bind().await;
+    let stranger = stranger().await;
+
+    // Each connection that completes its handshake cost the host one; the
+    // rest were refused from their first packet.
+    let start = Instant::now();
+    let mut handshakes = 0;
+    for _ in 0..FLOOD {
+        if let Ok(connection) = stranger.connect(host.endpoint_addr(), ALPN).await {
+            handshakes += 1;
+            connection.close(0u32.into(), b"done");
+        }
+    }
+    let elapsed = start.elapsed();
+    let earned = u64::try_from(elapsed.as_millis() / STRANGER_REFILL.as_millis()).unwrap();
+    assert!(handshakes > 0, "a stranger may still connect");
+    assert!(
+        handshakes <= STRANGER_BURST + earned + 1,
+        "{handshakes} of {FLOOD} handshakes completed in {elapsed:?}"
+    );
+    stranger.close().await;
+}
