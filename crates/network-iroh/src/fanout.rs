@@ -41,13 +41,13 @@ use arc_swap::ArcSwap;
 use blake3::Hasher;
 use bytes::Bytes;
 use dashmap::DashSet;
-use hyperscale_hbor::to_vec as hbor_to_vec;
+use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::{
     record_invalid_message, record_libp2p_bandwidth, record_network_message_received,
     record_network_message_sent,
 };
 use hyperscale_network::compression::{compress, decompress};
-use hyperscale_network::{GossipVerdict, HandlerRegistry};
+use hyperscale_network::{GossipVerdict, HandlerRegistry, RawGossipHandler, RawHostGossipHandler};
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, RoutingCommittees, ShardId, TopologySnapshot,
@@ -62,6 +62,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, warn};
 
+use crate::address_book::IngestOutcome;
 use crate::cooldown::FailureCooldown;
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
@@ -240,6 +241,19 @@ impl SeenSet {
         }
         self.current.insert(item)
     }
+}
+
+/// What decides whether a received item is accepted.
+enum Judge {
+    /// The transport's own address records: this host's address book, on
+    /// every host whether or not it serves a shard, so a record is checked
+    /// once and a forged one is refused wherever it lands.
+    AddressBook,
+    /// The handlers the node registered for the item's type.
+    Registry {
+        handler: Arc<RawGossipHandler>,
+        host_handler: Option<Arc<RawHostGossipHandler>>,
+    },
 }
 
 /// Encode one gossip frame: its scope, then a typed frame.
@@ -509,6 +523,25 @@ impl Fanout {
             );
             return;
         }
+        let judge =
+            if scope == Scope::Global && type_id == ValidatorAddressGossip::message_type_id() {
+                Judge::AddressBook
+            } else if let Some(handler) = self.registry.get_gossip(type_id) {
+                // A global item also reaches a host that serves no shard,
+                // through the host level handler.
+                let host_handler = match scope {
+                    Scope::Global => self.registry.get_host_gossip(type_id),
+                    Scope::Shard(_) => None,
+                };
+                Judge::Registry {
+                    handler,
+                    host_handler,
+                }
+            } else {
+                // No handler is not the sender's fault.
+                debug!(type_id, "No gossip handler registered for message type");
+                return;
+            };
         let payload = match decompress(compressed) {
             Ok(payload) => payload,
             Err(error) => {
@@ -526,17 +559,6 @@ impl Fanout {
         {
             return;
         }
-        let Some(handler) = self.registry.get_gossip(type_id) else {
-            // No handler is not the sender's fault.
-            debug!(type_id, "No gossip handler registered for message type");
-            return;
-        };
-        // A global item also reaches a host that serves no shard, through
-        // the host level handler.
-        let host_handler = match scope {
-            Scope::Global => self.registry.get_host_gossip(type_id),
-            Scope::Shard(_) => None,
-        };
         let forward = match scope {
             Scope::Global => encode_frame(scope, type_id, compressed).ok(),
             Scope::Shard(_) => None,
@@ -544,10 +566,19 @@ impl Fanout {
 
         let fanout = Arc::clone(self);
         self.tokio_handle.spawn(async move {
-            if let Some(host_handler) = host_handler {
-                host_handler(payload.clone());
-            }
-            match handler(payload, scope.shard()) {
+            let verdict = match judge {
+                Judge::AddressBook => fanout.ingest_address_record(&payload),
+                Judge::Registry {
+                    handler,
+                    host_handler,
+                } => {
+                    if let Some(host_handler) = host_handler {
+                        host_handler(payload.clone());
+                    }
+                    handler(payload, scope.shard())
+                }
+            };
+            match verdict {
                 GossipVerdict::Accept => {
                     record_network_message_received();
                     fanout.rejects.record_success(sender);
@@ -567,6 +598,22 @@ impl Fanout {
                 }
             }
         });
+    }
+
+    /// Verify an address record and store it if it is the newest for its
+    /// validator. Only a record that cannot be right is refused: one whose
+    /// validator this host does not know yet, or that it holds a newer
+    /// record for, is still news to others.
+    fn ingest_address_record(&self, payload: &[u8]) -> GossipVerdict {
+        let Ok(record) = hbor_from_slice::<ValidatorAddressGossip>(payload) else {
+            return GossipVerdict::Reject;
+        };
+        match self.adapter.ingest_validator_address(&record) {
+            IngestOutcome::Invalid => GossipVerdict::Reject,
+            IngestOutcome::Recorded | IngestOutcome::Stale | IngestOutcome::UnknownValidator => {
+                GossipVerdict::Accept
+            }
+        }
     }
 
     fn note_reject(&self, sender: EndpointId) {
