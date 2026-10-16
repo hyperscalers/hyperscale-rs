@@ -15,8 +15,8 @@ use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, ResponseVerdict, Topic, ValidatorKeyMap,
+    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
+    ResponseVerdict, Topic, ValidatorKeyMap, Verdict,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -150,10 +150,10 @@ impl Libp2pNetwork {
         let ingest = Arc::clone(&network.adapter);
         network.register_gossip_handler(move |gossip: ValidatorAddressGossip, _shard: ShardId| {
             match ingest.ingest_validator_address(&gossip) {
-                IngestOutcome::Invalid => GossipVerdict::Reject,
+                IngestOutcome::Invalid => Verdict::Reject,
                 IngestOutcome::Recorded
                 | IngestOutcome::Stale
-                | IngestOutcome::UnknownValidator => GossipVerdict::Accept,
+                | IngestOutcome::UnknownValidator => Verdict::Accept,
             }
         });
         let ingest = Arc::clone(&network.adapter);

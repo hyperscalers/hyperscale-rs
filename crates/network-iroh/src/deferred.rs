@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use hyperscale_network::{GossipVerdict, VerdictKey};
+use hyperscale_network::{Verdict, VerdictKey};
 
 /// Settlements remembered for an item whose wait was not recorded yet.
 /// Checks settle every copy they run on, local ones included, so this is
@@ -20,7 +20,7 @@ const EARLY_SETTLED: usize = 1024;
 /// item's wait was recorded.
 pub struct Waiting<T> {
     items: HashMap<VerdictKey, T>,
-    early: HashMap<VerdictKey, GossipVerdict>,
+    early: HashMap<VerdictKey, Verdict>,
     early_order: VecDeque<VerdictKey>,
 }
 
@@ -38,12 +38,12 @@ impl<T> Waiting<T> {
     /// Record that `item` waits on the verdict `key` names. Returns the item
     /// and its verdict when the verdict came already, or when a copy of the
     /// item waits already, in which case this one goes unjudged.
-    pub fn defer(&mut self, key: VerdictKey, item: T) -> Option<(T, GossipVerdict)> {
+    pub fn defer(&mut self, key: VerdictKey, item: T) -> Option<(T, Verdict)> {
         if let Some(verdict) = self.early.remove(&key) {
             return Some((item, verdict));
         }
         if self.items.contains_key(&key) {
-            return Some((item, GossipVerdict::Ignore));
+            return Some((item, Verdict::Ignore));
         }
         self.items.insert(key, item);
         None
@@ -51,7 +51,7 @@ impl<T> Waiting<T> {
 
     /// Settle the verdict `key` names. Returns the item that waited on it,
     /// or remembers the verdict for an item whose wait is still to come.
-    pub fn settle(&mut self, key: VerdictKey, verdict: GossipVerdict) -> Option<T> {
+    pub fn settle(&mut self, key: VerdictKey, verdict: Verdict) -> Option<T> {
         if let Some(item) = self.items.remove(&key) {
             return Some(item);
         }
@@ -84,17 +84,17 @@ mod tests {
     fn a_verdict_reaches_the_item_that_waits_on_it_once() {
         let mut waiting = Waiting::default();
         assert_eq!(waiting.defer(key(1), "item"), None);
-        assert_eq!(waiting.settle(key(1), GossipVerdict::Accept), Some("item"));
+        assert_eq!(waiting.settle(key(1), Verdict::Accept), Some("item"));
         assert_eq!(waiting.expire(key(1)), None, "settled items do not expire");
     }
 
     #[test]
     fn a_verdict_that_comes_before_its_wait_is_kept_for_it() {
         let mut waiting = Waiting::default();
-        assert_eq!(waiting.settle(key(1), GossipVerdict::Reject), None);
+        assert_eq!(waiting.settle(key(1), Verdict::Reject), None);
         assert_eq!(
             waiting.defer(key(1), "item"),
-            Some(("item", GossipVerdict::Reject))
+            Some(("item", Verdict::Reject))
         );
         assert_eq!(waiting.defer(key(1), "again"), None, "taken once");
     }
@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(waiting.defer(key(1), "first"), None);
         assert_eq!(
             waiting.defer(key(1), "copy"),
-            Some(("copy", GossipVerdict::Ignore))
+            Some(("copy", Verdict::Ignore))
         );
         assert_eq!(waiting.expire(key(1)), Some("first"));
     }
@@ -114,7 +114,7 @@ mod tests {
     fn early_verdicts_are_a_bounded_window() {
         let mut waiting: Waiting<&str> = Waiting::default();
         for n in 0..(EARLY_SETTLED as u64 * 3) {
-            assert_eq!(waiting.settle(key(n), GossipVerdict::Accept), None);
+            assert_eq!(waiting.settle(key(n), Verdict::Accept), None);
         }
         assert_eq!(waiting.early.len(), EARLY_SETTLED);
         assert_eq!(

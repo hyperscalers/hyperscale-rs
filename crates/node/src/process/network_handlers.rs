@@ -9,7 +9,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_execution::attesting_committee;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::{record_crossing_push_dropped, record_fetch_response_sent};
-use hyperscale_network::{Network, VerdictKey};
+use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -67,8 +67,6 @@ where
     /// Closures here just translate into `ShardScopedInput`.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per gossip type
     pub(crate) fn register_gossip_handlers(&self) {
-        use hyperscale_network::GossipVerdict;
-
         // ── transaction.gossip → ShardScopedInput::TransactionGossipReceived ─
 
         let senders = self.process.shard_event_senders.clone();
@@ -76,14 +74,14 @@ where
         self.process
             .network
             .register_gossip_handler::<TransactionGossip>(
-                move |gossip: TransactionGossip, shard: ShardId| -> GossipVerdict {
+                move |gossip: TransactionGossip, shard: ShardId| -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
                         warn!(
                             shard = shard.inner(),
                             "Dropping tx gossip: shard not hosted"
                         );
-                        return GossipVerdict::Ignore;
+                        return Verdict::Ignore;
                     };
                     for transaction in gossip.transactions {
                         // A cross-shard tx arrives once per hosted shard
@@ -96,7 +94,7 @@ where
                             ShardScopedInput::TransactionGossipReceived { tx: transaction },
                         );
                     }
-                    GossipVerdict::Accept
+                    Verdict::Accept
                 },
             );
 
@@ -112,14 +110,14 @@ where
         self.process
             .network
             .register_gossip_handler::<CertifiedBlockHeaderGossip>(
-                move |gossip: CertifiedBlockHeaderGossip, target_shard: ShardId| -> GossipVerdict {
+                move |gossip: CertifiedBlockHeaderGossip, target_shard: ShardId| -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
                             "Dropping certified header gossip: shard not hosted"
                         );
-                        return GossipVerdict::Ignore;
+                        return Verdict::Ignore;
                     };
                     let sender = gossip.sender;
                     let header = gossip.certified_header.header();
@@ -142,7 +140,7 @@ where
                             shard = header_shard.inner(),
                             "certified header gossip at a window the schedule does not hold"
                         );
-                        return GossipVerdict::Ignore;
+                        return Verdict::Ignore;
                     };
                     // The schedule holds the window, so it says who signed
                     // there: a sender outside that committee is false on
@@ -154,7 +152,7 @@ where
                             shard = header_shard.inner(),
                             "certified header sender not in the committee that signed it"
                         );
-                        return GossipVerdict::Reject;
+                        return Verdict::Reject;
                     }
                     let topo = topology_snapshot.load();
                     let Some(public_key) = resolve_sender_key(
@@ -164,7 +162,7 @@ where
                         header_shard,
                         "certified header",
                     ) else {
-                        return GossipVerdict::Ignore;
+                        return Verdict::Ignore;
                     };
 
                     // The shard loop checks the sender signature off this
@@ -181,7 +179,7 @@ where
                             sender_signature: gossip.sender_signature,
                         },
                     );
-                    GossipVerdict::Defer(key)
+                    Verdict::Defer(key)
                 },
             );
 
@@ -195,14 +193,14 @@ where
         self.process
             .network
             .register_gossip_handler::<ShardForkProofGossip>(
-                move |gossip: ShardForkProofGossip, target_shard: ShardId| -> GossipVerdict {
+                move |gossip: ShardForkProofGossip, target_shard: ShardId| -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
                             "Dropping fork proof gossip: shard not hosted"
                         );
-                        return GossipVerdict::Ignore;
+                        return Verdict::Ignore;
                     };
                     push_shard_input(
                         tx,
@@ -211,7 +209,7 @@ where
                             proof: gossip.proof,
                         },
                     );
-                    GossipVerdict::Accept
+                    Verdict::Accept
                 },
             );
 
@@ -222,16 +220,14 @@ where
         self.process
             .network
             .register_gossip_handler::<ShardVoteEquivocationGossip>(
-                move |gossip: ShardVoteEquivocationGossip,
-                      target_shard: ShardId|
-                      -> GossipVerdict {
+                move |gossip: ShardVoteEquivocationGossip, target_shard: ShardId| -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
                             "Dropping double-vote gossip: shard not hosted"
                         );
-                        return GossipVerdict::Ignore;
+                        return Verdict::Ignore;
                     };
                     push_shard_input(
                         tx,
@@ -240,7 +236,7 @@ where
                             evidence: gossip.evidence,
                         },
                     );
-                    GossipVerdict::Accept
+                    Verdict::Accept
                 },
             );
 
@@ -276,7 +272,7 @@ where
         self.process
             .network
             .register_notification_handler::<BlockVoteNotification>(
-                move |gossip: BlockVoteNotification| {
+                move |gossip: BlockVoteNotification| -> Verdict {
                     let shard = gossip.vote.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -284,13 +280,14 @@ where
                             target_shard = shard.inner(),
                             "Dropping block vote: shard not hosted"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
                     let event = match gossip.vote.into_verified() {
                         Ok(vote) => ProtocolEvent::VerifiedBlockVoteReceived { vote },
                         Err(vote) => ProtocolEvent::UnverifiedBlockVoteReceived { vote },
                     };
                     push_protocol_event(tx, shard, event);
+                    Verdict::Accept
                 },
             );
 
@@ -299,7 +296,7 @@ where
         self.process
             .network
             .register_notification_handler::<TimeoutNotification>(
-                move |gossip: TimeoutNotification| {
+                move |gossip: TimeoutNotification| -> Verdict {
                     let shard = gossip.timeout.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -307,13 +304,14 @@ where
                             target_shard = shard.inner(),
                             "Dropping timeout: shard not hosted"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
                     let event = match gossip.timeout.into_verified() {
                         Ok(timeout) => ProtocolEvent::VerifiedTimeoutReceived { timeout },
                         Err(timeout) => ProtocolEvent::UnverifiedTimeoutReceived { timeout },
                     };
                     push_protocol_event(tx, shard, event);
+                    Verdict::Accept
                 },
             );
 
@@ -325,17 +323,18 @@ where
         self.process
             .network
             .register_notification_handler::<QcAnnouncementNotification>(
-                move |announcement: QcAnnouncementNotification| {
+                move |announcement: QcAnnouncementNotification| -> Verdict {
                     let shard = announcement.qc.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
-                        return;
+                        return Verdict::Ignore;
                     };
                     push_protocol_event(
                         tx,
                         shard,
                         ProtocolEvent::QcAnnouncementReceived { announcement },
                     );
+                    Verdict::Accept
                 },
             );
 
@@ -347,7 +346,7 @@ where
         self.process
             .network
             .register_notification_handler::<BlockHeaderNotification>(
-                move |gossip: BlockHeaderNotification| {
+                move |gossip: BlockHeaderNotification| -> Verdict {
                     let shard = gossip.header.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -355,25 +354,26 @@ where
                             target_shard = shard.inner(),
                             "Dropping block header: shard not hosted"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
                     let topo = topology_snapshot.load();
-                    if !verify_signed_by_proposer(
+                    let verdict = verify_signed_by_proposer(
                         verifier.as_ref(),
                         &topo,
                         &gossip,
                         "block_header",
                         "block header",
-                    ) {
-                        return;
-                    }
-                    push_shard_input(
-                        tx,
-                        shard,
-                        ShardScopedInput::ProposalReceived {
-                            proposal: Box::new(gossip),
-                        },
                     );
+                    if verdict == Verdict::Accept {
+                        push_shard_input(
+                            tx,
+                            shard,
+                            ShardScopedInput::ProposalReceived {
+                                proposal: Box::new(gossip),
+                            },
+                        );
+                    }
+                    verdict
                 },
             );
 
@@ -392,7 +392,7 @@ where
         self.process
             .network
             .register_notification_handler::<ProvisionsNotification>(
-                move |notification: ProvisionsNotification| {
+                move |notification: ProvisionsNotification| -> Verdict {
                     let target_shard = notification.provisions.target_shard();
                     // Drop provisions not destined for any hosted shard before
                     // paying the signature verification cost.
@@ -403,7 +403,7 @@ where
                             target_shard = target_shard.inner(),
                             "Dropping provisions notification: target_shard not hosted"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
 
                     let source_shard = notification.provisions.source_shard();
@@ -418,7 +418,7 @@ where
                         }
                     } else {
                         let topo = topology_snapshot.load();
-                        if !verify_signed_by_committee(
+                        let verdict = verify_signed_by_committee(
                             verifier.as_ref(),
                             &topo,
                             &topo,
@@ -426,8 +426,9 @@ where
                             &notification,
                             "state_provisions",
                             "state provision",
-                        ) {
-                            return;
+                        );
+                        if verdict != Verdict::Accept {
+                            return verdict;
                         }
                         let raw = Arc::unwrap_or_clone(notification.provisions).into_unverified();
                         ProtocolEvent::UnverifiedProvisionsReceived {
@@ -435,6 +436,7 @@ where
                         }
                     };
                     push_protocol_event(tx, target_shard, event);
+                    Verdict::Accept
                 },
             );
 
@@ -455,24 +457,24 @@ where
         self.process
             .network
             .register_notification_handler::<CrossingReadingsNotification>(
-                move |notification: CrossingReadingsNotification| {
+                move |notification: CrossingReadingsNotification| -> Verdict {
                     let target_shard = notification.target_shard;
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         record_crossing_push_dropped("unhosted");
-                        return;
+                        return Verdict::Ignore;
                     };
                     let anchor = match crossing_push::shaped(&notification) {
                         Ok(anchor) => anchor,
                         Err(reason) => {
                             record_crossing_push_dropped(reason);
-                            return;
+                            return Verdict::Reject;
                         }
                     };
                     let schedule = process.topology_schedule();
                     let Some((signing, _)) = schedule.at_for_shard(anchor.shard, anchor.ts) else {
                         record_crossing_push_dropped("unscheduled_anchor");
-                        return;
+                        return Verdict::Ignore;
                     };
                     let topo = topology_snapshot.load();
                     let Some(public_key) = resolve_sender_key(
@@ -483,7 +485,7 @@ where
                         "crossing readings",
                     ) else {
                         record_crossing_push_dropped("sender");
-                        return;
+                        return Verdict::Ignore;
                     };
                     let msg = notification.signing_message(topo.network());
                     if !verify_sig_with_metrics(
@@ -494,11 +496,13 @@ where
                         "crossing_readings",
                     ) {
                         record_crossing_push_dropped("signature");
-                        return;
+                        return Verdict::Reject;
                     }
+                    // The claims ride under the producer's signature, so a
+                    // claim that proves nothing is the producer's.
                     if let Err(reason) = crossing_push::proven(&notification.claims) {
                         record_crossing_push_dropped(reason);
-                        return;
+                        return Verdict::Reject;
                     }
                     push_protocol_event(
                         tx,
@@ -507,6 +511,7 @@ where
                             claims: notification.claims.into_inner(),
                         },
                     );
+                    Verdict::Accept
                 },
             );
 
@@ -516,7 +521,7 @@ where
         self.process
             .network
             .register_notification_handler::<ExecutionVoteNotification>(
-                move |gossip: ExecutionVoteNotification| {
+                move |gossip: ExecutionVoteNotification| -> Verdict {
                     let shard = gossip.vote.tick_id().shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -524,7 +529,7 @@ where
                             target_shard = shard.inner(),
                             "Dropping execution vote: shard not hosted"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
                     // Wire decode lands the wrapper as
                     // `Verifiable::Unverified`; local-dispatched sends
@@ -541,6 +546,7 @@ where
                             vote: gossip.into_vote(),
                         },
                     );
+                    Verdict::Accept
                 },
             );
 
@@ -560,9 +566,10 @@ where
         self.process
             .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
-                move |batch: ExecutionCertificatesNotification| {
+                move |batch: ExecutionCertificatesNotification| -> Verdict {
+                    // No honest leader sends an empty batch.
                     if batch.certificates.is_empty() {
-                        return;
+                        return Verdict::Reject;
                     }
 
                     let sender = batch.sender;
@@ -576,7 +583,7 @@ where
                             sender = sender.inner(),
                             "Execution certificate batch contains mixed shard_ids — dropping"
                         );
-                        return;
+                        return Verdict::Reject;
                     }
                     // The sender is the tick leader that aggregated the
                     // certificates, so it sits in the committee attesting
@@ -597,8 +604,11 @@ where
                             shard = source_shard.inner(),
                             "Execution certificate batch at a window the schedule does not hold"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
+                    // The schedule holds every certificate's window, so it
+                    // says who attests there: a sender outside one of those
+                    // committees is false on its face.
                     if attesting.iter().any(|committee| {
                         !committee
                             .committee_for_shard(source_shard)
@@ -609,10 +619,10 @@ where
                             shard = source_shard.inner(),
                             "Execution certificate batch sender does not attest every certificate"
                         );
-                        return;
+                        return Verdict::Reject;
                     }
                     let topo = topology_snapshot.load();
-                    if !verify_signed_by_committee(
+                    let verdict = verify_signed_by_committee(
                         verifier.as_ref(),
                         attesting[0],
                         &topo,
@@ -620,8 +630,9 @@ where
                         &batch,
                         "exec_cert_batch",
                         "execution certificate batch",
-                    ) {
-                        return;
+                    );
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
 
                     let certificates: Vec<Verifiable<ExecutionCertificate>> = batch
@@ -642,6 +653,7 @@ where
                             },
                         );
                     }
+                    Verdict::Accept
                 },
             );
 
@@ -658,7 +670,7 @@ where
         self.process
             .network
             .register_notification_handler::<ReadySignalNotification>(
-                move |notification: ReadySignalNotification| {
+                move |notification: ReadySignalNotification| -> Verdict {
                     let topo = topology_snapshot.load();
                     let signal = notification.signal;
                     let sender = signal.validator_id();
@@ -667,7 +679,7 @@ where
                             sender = sender.inner(),
                             "Dropping ready signal: unknown sender"
                         );
-                        return;
+                        return Verdict::Ignore;
                     };
                     let msg = signed_bytes(&signal, topo.network());
                     if !verify_sig_with_metrics(
@@ -681,7 +693,7 @@ where
                             sender = sender.inner(),
                             "Ready signal signature verify failed — dropping"
                         );
-                        return;
+                        return Verdict::Reject;
                     }
                     for (hosted_shard, tx) in senders.load().iter() {
                         push_protocol_event(
@@ -692,6 +704,7 @@ where
                             },
                         );
                     }
+                    Verdict::Accept
                 },
             );
 
@@ -713,24 +726,28 @@ where
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
-                move |gossip: BeaconProposalNotification| {
+                move |gossip: BeaconProposalNotification| -> Verdict {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
-                    if let Some(sender_pk) = topology_snapshot.load().public_key(from) {
-                        proposal_cache.admit_wire(
+                    // The coordinators judge the proposal themselves, so it
+                    // reaches them whatever the cache made of it.
+                    let verdict = match topology_snapshot.load().public_key(from) {
+                        Some(sender_pk) => proposal_cache.admit_wire(
                             verifier.as_ref(),
                             from,
                             epoch,
                             &gossip.proposal,
                             sender_pk,
-                        );
-                    }
+                        ),
+                        None => Verdict::Ignore,
+                    };
                     let event = ProtocolEvent::BeaconProposalReceived {
                         from,
                         epoch,
                         proposal: gossip.proposal,
                     };
                     fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    verdict
                 },
             );
 
@@ -744,7 +761,7 @@ where
                 let beacon_tx = self.process.beacon_event_sender.clone();
                 let route_active = self.process.beacon_route_active();
                 self.process.network.register_notification_handler::<$note_ty>(
-                    move |gossip: $note_ty| {
+                    move |gossip: $note_ty| -> Verdict {
                         let view = gossip.view;
                         let event = match Arc::unwrap_or_clone(gossip.vote).into_verified() {
                             Ok(verified) => ProtocolEvent::$ver {
@@ -757,6 +774,7 @@ where
                             },
                         };
                         fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                        Verdict::Accept
                     },
                 );
             }};
@@ -801,16 +819,17 @@ where
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
-                move |gossip: SpcNewViewNotification| {
+                move |gossip: SpcNewViewNotification| -> Verdict {
                     let topo = topology_snapshot.load();
-                    if !verify_signed_by_proposer(
+                    let verdict = verify_signed_by_proposer(
                         verifier.as_ref(),
                         &topo,
                         &gossip,
                         "spc_new_view",
                         "SPC new view",
-                    ) {
-                        return;
+                    );
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
                     let from = gossip.sender;
                     let event = ProtocolEvent::SpcNewViewReceived {
@@ -818,6 +837,7 @@ where
                         proposal: gossip.proposal,
                     };
                     fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    Verdict::Accept
                 },
             );
 
@@ -830,16 +850,17 @@ where
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
-                move |gossip: SpcNewCommitNotification| {
+                move |gossip: SpcNewCommitNotification| -> Verdict {
                     let topo = topology_snapshot.load();
-                    if !verify_signed_by_proposer(
+                    let verdict = verify_signed_by_proposer(
                         verifier.as_ref(),
                         &topo,
                         &gossip,
                         "spc_new_commit",
                         "SPC new commit",
-                    ) {
-                        return;
+                    );
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
                     let from = gossip.sender;
                     let event = ProtocolEvent::SpcNewCommitReceived {
@@ -847,6 +868,7 @@ where
                         msg: gossip.msg,
                     };
                     fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    Verdict::Accept
                 },
             );
 
@@ -867,17 +889,18 @@ where
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
-                move |gossip: SpcEmptyViewMsgNotification| {
+                move |gossip: SpcEmptyViewMsgNotification| -> Verdict {
                     if !gossip.msg.is_verified() {
                         let topo = topology_snapshot.load();
-                        if !verify_signed_by_proposer(
+                        let verdict = verify_signed_by_proposer(
                             verifier.as_ref(),
                             &topo,
                             &gossip,
                             "spc_empty_view",
                             "SPC empty view",
-                        ) {
-                            return;
+                        );
+                        if verdict != Verdict::Accept {
+                            return verdict;
                         }
                     }
                     let event = match Arc::unwrap_or_clone(gossip.msg).into_verified() {
@@ -889,6 +912,7 @@ where
                         },
                     };
                     fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    Verdict::Accept
                 },
             );
     }

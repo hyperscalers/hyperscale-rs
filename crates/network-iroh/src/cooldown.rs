@@ -20,6 +20,11 @@
 //! A cooldown, once begun, runs its course. Work charged while it lasts is
 //! for traffic read before it began, so it adds to the debt without
 //! starting another.
+//!
+//! A host keeps one budget per principal for everything it refuses: gossip
+//! items, notifications, and streams that broke the protocol. A peer that is
+//! cooling down has all its traffic refused, so what it can make this host
+//! spend on refusals is bounded once, not once per kind of traffic.
 
 use std::time::Duration;
 
@@ -44,6 +49,39 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(30);
 /// A peer whose last cooldown ended this long ago starts over at
 /// [`INITIAL_COOLDOWN`].
 const FORGIVEN_AFTER: Duration = Duration::from_secs(120);
+
+/// Work charged against a peer for each of its items this host does not
+/// accept: reading, hashing, and dispatching it.
+const REFUSED_ITEM_WORK: Duration = Duration::from_micros(10);
+
+/// Work charged for each KiB of an item this host does not accept, for
+/// decompressing and decoding it.
+const REFUSED_KIB_WORK: Duration = Duration::from_micros(1);
+
+/// Work charged on top for an item that is its sender's fault: one that
+/// does not decode, or whose claims a check here found false. Set at what
+/// checking one signature costs, the check that finds most such items
+/// out, so a sender pays the same for any item no honest peer sends.
+const SENDER_FAULT_WORK: Duration = Duration::from_millis(2);
+
+/// Who answers for an item this host did not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The sender: no honest peer sends it.
+    Fault,
+    /// Nobody: this host could not judge it, or it was not for this host.
+    Unjudged,
+}
+
+/// The work charged for an item of `bytes` this host did not accept.
+pub fn refused_work(bytes: usize, refusal: Refusal) -> Duration {
+    let kib = u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX);
+    let fault = match refusal {
+        Refusal::Fault => SENDER_FAULT_WORK,
+        Refusal::Unjudged => Duration::ZERO,
+    };
+    REFUSED_ITEM_WORK + REFUSED_KIB_WORK * kib + fault
+}
 
 /// Debt and cooldown state of one peer.
 struct PeerState {

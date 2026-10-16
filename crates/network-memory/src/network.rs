@@ -2013,7 +2013,8 @@ impl SimulatedNetwork {
                 );
                 return false;
             };
-            handler(payload);
+            // The simulator charges no peer, so the verdict changes nothing.
+            let _ = handler(payload);
             true
         });
         (delivered, stats)
@@ -3103,7 +3104,7 @@ mod tests {
     /// Registers directly on the shared registry since these tests exercise
     /// the `SimulatedNetwork` infrastructure, not the typed handler API.
     fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
-        use hyperscale_network::GossipVerdict;
+        use hyperscale_network::Verdict;
         use hyperscale_network::registry::RawGossipHandler;
         let total = network.total_nodes();
         (0..total as NodeIndex)
@@ -3114,7 +3115,7 @@ mod tests {
                 let raw: Arc<RawGossipHandler> =
                     Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
                         handler_clone.received.lock().unwrap().push(payload);
-                        Some(GossipVerdict::Accept)
+                        Some(Verdict::Accept)
                     });
                 adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
@@ -3671,6 +3672,7 @@ mod tests {
         // The tier every vote, timeout and ready signal travels on. Without a
         // rewrite here a byzantine sender can only be made silent, and a drop
         // exercises the fetch fallback rather than the content check.
+        use hyperscale_network::Verdict;
         use hyperscale_network::registry::RawNotificationHandler;
         const TYPE: &str = "test.notification";
 
@@ -3691,6 +3693,7 @@ mod tests {
                 let sink = handler.clone();
                 let raw: Arc<RawNotificationHandler> = Arc::new(move |payload: Vec<u8>| {
                     sink.received.lock().unwrap().push(payload);
+                    Verdict::Accept
                 });
                 adapter.registry.register_raw_notification(TYPE, raw);
                 handler
@@ -3886,7 +3889,7 @@ mod tests {
 
     #[test]
     fn test_full_gossip_roundtrip() {
-        use hyperscale_network::GossipVerdict;
+        use hyperscale_network::Verdict;
         use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_types::ShardId;
         use hyperscale_types::network::gossip::TransactionGossip;
@@ -3913,7 +3916,7 @@ mod tests {
                 let raw: Arc<RawGossipHandler> =
                     Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
                         handler_clone.received.lock().unwrap().push(payload);
-                        Some(GossipVerdict::Accept)
+                        Some(Verdict::Accept)
                     });
                 adapter
                     .registry

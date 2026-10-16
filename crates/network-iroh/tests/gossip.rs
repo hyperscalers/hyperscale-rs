@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
-use hyperscale_network::{GossipVerdict, HandlerRegistry, Network, VerdictKey};
+use hyperscale_network::{HandlerRegistry, Network, Verdict, VerdictKey};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::CountingVerifier;
 use hyperscale_network_iroh::{
@@ -24,6 +24,7 @@ use hyperscale_types::{
 };
 use iroh::{EndpointAddr, SecretKey};
 use tokio::runtime::Handle;
+use tokio::spawn;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout};
 
@@ -84,6 +85,23 @@ impl NetworkMessage for CommittedHeader {
 impl GossipMessage for CommittedHeader {
     const SCOPE: TopicScope = TopicScope::Global;
 }
+
+/// A vote, as far as the transport is concerned: a small notification.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Vote(u64);
+
+impl NetworkMessage for Vote {
+    fn message_type_id() -> &'static str {
+        "block.vote"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+/// Votes a second a peer sends alongside its gossip.
+const VOTE_RATE: u32 = 50;
 
 /// Items that are their sender's fault, such as forged address records,
 /// whose charges fit in a peer's allowance of refused work, and the one
@@ -432,11 +450,11 @@ async fn a_host_that_serves_no_shard_receives_a_beacon_block() {
     // one that accepts keeps the type known to its registry.
     follower
         .network
-        .register_gossip_handler(|_: BeaconBlock, _: ShardId| GossipVerdict::Accept);
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
     for seated in &hosts[..SEATED as usize] {
         seated
             .network
-            .register_gossip_handler(|_: BeaconBlock, _: ShardId| GossipVerdict::Accept);
+            .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
     }
 
     // The follower learned the committee from the host it bootstrapped to.
@@ -466,7 +484,7 @@ async fn a_shard_item_reaches_its_committee_and_nobody_else() {
         host.network
             .register_gossip_handler(move |item: Transactions, shard: ShardId| {
                 let _ = tx.send((item, shard));
-                GossipVerdict::Accept
+                Verdict::Accept
             });
         receivers.push(rx);
     }
@@ -502,7 +520,7 @@ async fn a_global_item_is_handled_once_however_many_copies_arrive() {
         host.network
             .register_gossip_handler(move |_: BeaconBlock, _: ShardId| {
                 counted.fetch_add(1, Ordering::SeqCst);
-                GossipVerdict::Accept
+                Verdict::Accept
             });
         handled.push(count);
     }
@@ -653,7 +671,7 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
         .network
         .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
             counted.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Ignore
+            Verdict::Ignore
         });
 
     let sent = HONEST_RATE * HONEST_WATCH_SECS;
@@ -684,7 +702,7 @@ async fn a_peer_whose_items_are_rejected_is_cooled_down() {
         .network
         .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
             counted.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Reject
+            Verdict::Reject
         });
 
     let start = Instant::now();
@@ -749,7 +767,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
         .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
             let key = VerdictKey::of(&block);
             let _ = keys_tx.send(key);
-            GossipVerdict::Defer(key)
+            Verdict::Defer(key)
         });
     let (tx, mut rx) = mpsc::unbounded_channel();
     follower
@@ -759,7 +777,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
         });
     follower
         .network
-        .register_gossip_handler(|_: BeaconBlock, _: ShardId| GossipVerdict::Accept);
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
 
     sender.network.broadcast_global(&BeaconBlock(7));
     let key = timeout(BUDGET, keys.recv())
@@ -770,7 +788,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
         timeout(SILENCE_WATCH, rx.recv()).await.is_err(),
         "nothing travels on while the check runs"
     );
-    relay.network.settle(key, GossipVerdict::Accept);
+    relay.network.settle(key, Verdict::Accept);
     let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
     assert_eq!(delivered, Some(BeaconBlock(7)));
 
@@ -780,7 +798,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
         .await
         .expect("the relay judges the item")
         .expect("a key");
-    relay.network.settle(key, GossipVerdict::Reject);
+    relay.network.settle(key, Verdict::Reject);
     assert!(timeout(SILENCE_WATCH, rx.recv()).await.is_err());
 }
 
@@ -803,9 +821,9 @@ async fn a_peer_whose_items_fail_their_deferred_check_is_cooled_down() {
             handle.spawn(async move {
                 sleep(CHECK_DELAY).await;
                 counted.fetch_add(1, Ordering::SeqCst);
-                network.settle(key, GossipVerdict::Reject);
+                network.settle(key, Verdict::Reject);
             });
-            GossipVerdict::Defer(key)
+            Verdict::Defer(key)
         });
 
     let start = Instant::now();
@@ -841,7 +859,7 @@ async fn a_validator_binding_again_under_a_new_endpoint_is_still_cooled_down() {
         .network
         .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
             counted.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Reject
+            Verdict::Reject
         });
     let flood = |host: &Host, from: u64| {
         for seq in from..from + ROTATION_FLOOD {
@@ -912,7 +930,7 @@ async fn gossip_does_not_cross_a_partition() {
         .network
         .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
             let _ = tx.send(block);
-            GossipVerdict::Accept
+            Verdict::Accept
         });
 
     // The gate sits at the receiver: it refuses what the far side sends.
@@ -927,4 +945,52 @@ async fn gossip_does_not_cross_a_partition() {
     first.network.broadcast_global(&BeaconBlock(2));
     let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
     assert_eq!(delivered, Some(BeaconBlock(2)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_cooled_down_for_its_gossip_is_refused_its_notifications_too() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+    receiver
+        .network
+        .register_gossip_handler(|_: CommittedHeader, _: ShardId| Verdict::Reject);
+    let heard = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&heard);
+    receiver
+        .network
+        .register_notification_handler(move |_: Vote| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Verdict::Accept
+        });
+
+    // The sender's gossip is all its own fault; its votes are fine, but they
+    // come from a peer whose traffic is being refused.
+    let flood = Arc::clone(&sender.network);
+    let gossip = spawn(async move {
+        let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+        for seq in 0..HONEST_RATE * REJECTED_WATCH_SECS {
+            tick.tick().await;
+            flood.broadcast_global(&CommittedHeader {
+                seq: u64::from(seq),
+                body: vec![7; HEADER_BYTES],
+            });
+        }
+    });
+    let votes = VOTE_RATE * REJECTED_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / VOTE_RATE);
+    for seq in 0..votes {
+        tick.tick().await;
+        sender.network.notify(&[vid(0)], &Vote(u64::from(seq)));
+    }
+    gossip.await.expect("the flood runs");
+    sleep(SILENCE_WATCH).await;
+    let heard = heard.load(Ordering::SeqCst);
+    assert!(
+        heard > 0,
+        "the votes reach the receiver before the cooldown"
+    );
+    assert!(
+        heard < votes as usize / 2,
+        "a cooled down peer's notifications are refused: {heard} of {votes} votes heard"
+    );
 }

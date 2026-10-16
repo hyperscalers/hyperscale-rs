@@ -60,8 +60,8 @@ pub const RESPONSE_RELAYED: u8 = 4;
 /// Length of a shard id on the wire: its depth, then its path.
 pub const SHARD_WIRE_LEN: usize = 4 + 8;
 
-/// Stop code: the reader is not taking gossip from this peer for now.
-pub const STOP_GOSSIP_REFUSED: VarInt = VarInt::from_u32(1);
+/// Stop code: the reader is not taking this peer's traffic for now.
+pub const STOP_REFUSED: VarInt = VarInt::from_u32(1);
 
 /// Stop code: the reader holds as many subscribers as it allows.
 pub const STOP_SUBSCRIBERS_FULL: VarInt = VarInt::from_u32(2);

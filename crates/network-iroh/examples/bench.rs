@@ -41,7 +41,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
 use hyperscale_network::{
-    GossipVerdict, HandlerRegistry, Network, RequestError, ResponseVerdict, VerdictKey,
+    HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict, VerdictKey,
 };
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
 use hyperscale_network_iroh::testing::{
@@ -60,9 +60,9 @@ use hyperscale_network_libp2p::{
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
-    GenesisValidators, GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, Request,
-    RoutingCommittees, ShardId, Signer, TopicScope, TopologySnapshot, ValidatorAddressMessage,
-    ValidatorId, Verifier, signed_bytes,
+    ConsensusSignature, GenesisValidators, GossipMessage, MessageClass, NetworkDefinition,
+    NetworkMessage, Request, RoutingCommittees, ShardId, Signer, TopicScope, TopologySnapshot,
+    ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
 };
 use iroh::RelayMode;
 use iroh::endpoint::{Builder, presets};
@@ -292,6 +292,20 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         secs: u64,
     },
+    /// A peer floods notifications whose signature its receiver checks
+    /// and finds false.
+    NotifyFlood {
+        /// Notifications the peer sends a second.
+        #[arg(long, default_value_t = 1000)]
+        rate: u32,
+        /// What the receiver's handler answers after its check: `accept`
+        /// holds nothing against the sender, as a handler that returns no
+        /// verdict does; `reject` is the check's own verdict.
+        #[arg(long, value_enum)]
+        verdict: Judged,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// A peer floods global items its receiver refuses with one verdict.
     RefusedFlood {
         /// Items the peer sends a second.
@@ -312,6 +326,15 @@ enum Checked {
     Accept,
     /// Defer to the check, which settles it.
     Defer,
+}
+
+/// What a notify flood's receiver answers after its check fails.
+#[derive(Clone, Copy, ValueEnum)]
+enum Judged {
+    /// Nothing held against the sender.
+    Accept,
+    /// The sender's fault.
+    Reject,
 }
 
 /// The verdict a refused flood's receiver gives every item.
@@ -343,6 +366,25 @@ impl NetworkMessage for Committed {
 
 impl GossipMessage for Committed {
     const SCOPE: TopicScope = TopicScope::Global;
+}
+
+/// A block header notification, as far as the transport is concerned: a
+/// few KiB under its proposer's signature.
+#[derive(Debug, Clone, Hbor)]
+struct SignedHeader {
+    seq: u64,
+    body: Vec<u8>,
+    signature: ConsensusSignature,
+}
+
+impl NetworkMessage for SignedHeader {
+    fn message_type_id() -> &'static str {
+        "block.header"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
 }
 
 #[derive(Debug, Clone, Hbor)]
@@ -665,6 +707,7 @@ fn vote_on_headers<N: Network>(
                     signature: vec![7; 96],
                 };
                 network.notify(&recipients(&header, index), &vote);
+                Verdict::Accept
             });
     }
 }
@@ -681,7 +724,7 @@ async fn notify<N: Network>(backend: Backend, hosts: Vec<Host<N>>, peers: u32) {
         .network
         .register_notification_handler(move |vote: Vote| {
             if vote.voter != 1 {
-                return;
+                return Verdict::Accept;
             }
             let now = Instant::now();
             let slot = usize::try_from(vote.seq).ok();
@@ -689,6 +732,7 @@ async fn notify<N: Network>(backend: Backend, hosts: Vec<Host<N>>, peers: u32) {
             if let Some(started) = started {
                 let _ = arrivals_tx.send((now, now - started));
             }
+            Verdict::Accept
         });
 
     let hub = Arc::clone(&hosts[0].network);
@@ -940,6 +984,7 @@ async fn committee<N: Network>(backend: Backend, hosts: Vec<Host<N>>, size: u32)
         let votes = Arc::clone(&votes);
         host.network.register_notification_handler(move |_: Vote| {
             votes.fetch_add(1, Ordering::Relaxed);
+            Verdict::Accept
         });
     }
 
@@ -1312,8 +1357,8 @@ async fn refused_flood(rate: u32, refusal: Refusal, watch: Duration) {
     receiver_network.register_gossip_handler(move |_: Committed, _: ShardId| {
         counted.fetch_add(1, Ordering::Relaxed);
         match refusal {
-            Refusal::Reject => GossipVerdict::Reject,
-            Refusal::Ignore => GossipVerdict::Ignore,
+            Refusal::Reject => Verdict::Reject,
+            Refusal::Ignore => Verdict::Ignore,
         }
     });
 
@@ -1346,6 +1391,99 @@ async fn refused_flood(rate: u32, refusal: Refusal, watch: Duration) {
             "sent_per_sec": per_sec(sent),
             "receiver_judged_per_sec": per_sec(judged.load(Ordering::Relaxed)),
             "receiver_judged": judged.load(Ordering::Relaxed),
+            "process_cpu_cores": cpu.as_secs_f64() / wall,
+        })
+    );
+}
+
+/// A peer notifies a receiver 2 KiB headers at `rate` for `watch`, each under
+/// a signature over other bytes. The receiver checks every one it is handed
+/// and answers `judged`. Signature checks are the receiver's alone.
+async fn notify_flood(rate: u32, judged: Judged, watch: Duration) {
+    let fixtures = IrohFixtures::new(SEED, 2);
+    let counted = Arc::new(CountingVerifier::default());
+    let (receiver, receiver_network) = iroh_host(
+        &fixtures,
+        0,
+        &[ShardId::ROOT],
+        None,
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let (sender, sender_network) = iroh_host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        Some(receiver.endpoint_addr()),
+        PathTimers::default(),
+        Arc::new(BlsVerifier),
+    )
+    .await;
+    let bound = timeout(MESH_BUDGET, async {
+        while receiver.peer_for_validator(vid(1)).is_none()
+            || sender.peer_for_validator(vid(0)).is_none()
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(bound.is_ok(), "the pair binds");
+    sleep(Duration::from_secs(3)).await;
+
+    let proposer = fixtures.validator_key_map()[&vid(1)];
+    let check = Arc::clone(&counted);
+    receiver_network.register_notification_handler(move |header: SignedHeader| {
+        if check.verify(&proposer, &header.body, &header.signature) {
+            return Verdict::Accept;
+        }
+        match judged {
+            Judged::Accept => Verdict::Accept,
+            Judged::Reject => Verdict::Reject,
+        }
+    });
+
+    let forged = fixtures
+        .signer(1)
+        .sign(b"not this header")
+        .expect("the fixture key signs");
+    let mut tick = interval(Duration::from_secs(1) / rate);
+    let before = (counted.checked(), counted.time());
+    let start = (Instant::now(), cpu_time());
+    let mut sent = 0u64;
+    while start.0.elapsed() < watch {
+        tick.tick().await;
+        sent += 1;
+        sender_network.notify(
+            &[vid(0)],
+            &SignedHeader {
+                seq: sent,
+                body: vec![7; HEADER_BYTES],
+                signature: forged,
+            },
+        );
+    }
+    let cpu = cpu_time().saturating_sub(start.1);
+    let wall = start.0.elapsed().as_secs_f64();
+    let checked = counted.checked() - before.0;
+    let verify_time = counted.time().saturating_sub(before.1);
+
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let per_sec = |count: u64| count as f64 / wall;
+    println!(
+        "{}",
+        json!({
+            "measurement": "notify flood",
+            "backend": "iroh",
+            "verdict": match judged {
+                Judged::Accept => "accept",
+                Judged::Reject => "reject",
+            },
+            "secs": wall,
+            "sent_per_sec": per_sec(sent),
+            "receiver_checks_per_sec": per_sec(checked),
+            "receiver_checks": checked,
+            "receiver_check_cores": verify_time.as_secs_f64() / wall,
             "process_cpu_cores": cpu.as_secs_f64() / wall,
         })
     );
@@ -1523,11 +1661,11 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
         handle.spawn(async move {
             sleep(CHECK).await;
             counted.fetch_add(1, Ordering::Relaxed);
-            network.settle(key, GossipVerdict::Reject);
+            network.settle(key, Verdict::Reject);
         });
         match checked {
-            Checked::Accept => GossipVerdict::Accept,
-            Checked::Defer => GossipVerdict::Defer(key),
+            Checked::Accept => Verdict::Accept,
+            Checked::Defer => Verdict::Defer(key),
         }
     });
     let reached = Arc::new(AtomicU64::new(0));
@@ -1535,7 +1673,7 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
     follower_network.register_host_gossip_handler(move |_: Committed| {
         counted.fetch_add(1, Ordering::Relaxed);
     });
-    follower_network.register_gossip_handler(|_: Committed, _: ShardId| GossipVerdict::Accept);
+    follower_network.register_gossip_handler(|_: Committed, _: ShardId| Verdict::Accept);
 
     let mut tick = interval(Duration::from_secs(1) / rate);
     let start = (Instant::now(), cpu_time());
@@ -1588,6 +1726,7 @@ macro_rules! on_backend {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // one arm per subcommand
 async fn main() {
     match Cli::parse().command {
         Command::Notify { backend, peers } => {
@@ -1687,6 +1826,13 @@ async fn main() {
             secs,
         } => {
             refused_flood(rate, verdict, Duration::from_secs(secs)).await;
+        }
+        Command::NotifyFlood {
+            rate,
+            verdict,
+            secs,
+        } => {
+            notify_flood(rate, verdict, Duration::from_secs(secs)).await;
         }
     }
 }

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
-use hyperscale_network::{GossipVerdict, Network, VerdictKey};
+use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyProof, RatifyVoteGossip,
 };
@@ -367,9 +367,9 @@ where
             ctx.network.settle(
                 key,
                 match result {
-                    Ok(_) => GossipVerdict::Accept,
-                    Err(RatifyVoteVerifyError::BadSignature) => GossipVerdict::Reject,
-                    Err(RatifyVoteVerifyError::SignerNotInPool) => GossipVerdict::Ignore,
+                    Ok(_) => Verdict::Accept,
+                    Err(RatifyVoteVerifyError::BadSignature) => Verdict::Reject,
+                    Err(RatifyVoteVerifyError::SignerNotInPool) => Verdict::Ignore,
                 },
             );
             ctx.notify_protocol(ProtocolEvent::RatifyVoteVerified {
@@ -531,10 +531,10 @@ where
 
 /// The gossip verdict of a check that either holds or fails on the item
 /// itself.
-const fn checked(valid: bool) -> GossipVerdict {
+const fn checked(valid: bool) -> Verdict {
     if valid {
-        GossipVerdict::Accept
+        Verdict::Accept
     } else {
-        GossipVerdict::Reject
+        Verdict::Reject
     }
 }

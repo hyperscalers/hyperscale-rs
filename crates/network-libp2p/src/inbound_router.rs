@@ -549,7 +549,10 @@ impl InboundRouter {
 
             // Look up the per-type notification handler.
             if let Some(handler) = self.registry.get_notification(&type_id) {
-                spawn(async move { handler(wire_payload) });
+                // Nothing here charges a peer, so the verdict changes nothing.
+                spawn(async move {
+                    let _ = handler(wire_payload);
+                });
             } else {
                 warn!(
                     peer = %peer,
