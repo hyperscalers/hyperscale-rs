@@ -134,6 +134,7 @@ impl ShardParticipation {
                 provisions,
                 bytes_delta,
                 answers,
+                additions,
             } => self.shard_coordinator.on_proposal_built(
                 topology_schedule,
                 height,
@@ -144,6 +145,7 @@ impl ShardParticipation {
                 provisions,
                 bytes_delta,
                 answers,
+                additions,
             ),
             // `BlockPersisted` advances `last_persisted_height`, a fallback
             // gate for deferred state root verifications. Steady-state

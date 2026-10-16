@@ -2058,6 +2058,119 @@ impl Signer for WithholdingSigner {
     }
 }
 
+/// A derivation under which a transaction is a swap: its payer's
+/// inbound leg escrowing `outputs` values into a core node on
+/// `venue`.
+pub struct Swapping {
+    /// The core node's address.
+    pub venue: Address,
+    /// How many escrowed crossings it consumes.
+    pub outputs: u32,
+}
+
+impl Derivation for Swapping {
+    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+        let stub = StubTree::decode(vm)?;
+        let payer = stub.terms.fee_payer;
+        let resource = protocol_resource(&ProtocolHasher);
+        let mut declared_modes = vec![
+            (
+                DeclaredKey::Cell(vault_cell(&ProtocolHasher, payer, resource)),
+                Mode::Reserve { amount: 1 },
+            ),
+            (
+                DeclaredKey::substate(self.venue, [0x5E; 16]),
+                Mode::Delta { moves: Moves::Both },
+            ),
+        ];
+        declared_modes.sort_unstable();
+        let intent = IntentHash(Hash32(*Hash::from_bytes(&stub.body).as_bytes()));
+        let leg = |target: Address, role, edges: Vec<ValueEdge>, local| LegShape {
+            target,
+            role,
+            edges,
+            presents: Vec::new(),
+            declares: vec![target],
+            intent,
+            local,
+        };
+        let work = DeclaredWork {
+            compute: stub.terms.gas_limit_total(),
+            footprint: declared_modes.len() as u64,
+            ..DeclaredWork::ZERO
+        };
+        Ok(Derived {
+            accounts: vec![payer.address()],
+            effective_window: stub.window(),
+            network: stub.network,
+            routing: Routing {
+                read_keys: Vec::new(),
+                write_keys: declared_modes.iter().map(|(key, _)| *key).collect(),
+                read_prefixes: Vec::new(),
+                write_prefixes: declared_modes.iter().map(|(key, _)| key.owner()).collect(),
+                provision_keys: Vec::new(),
+                provision_prefixes: Vec::new(),
+                declared_modes,
+            },
+            attested_by: vec![payer],
+            attestations: Vec::new(),
+            fee_vault_local: vault_cell(&ProtocolHasher, payer, resource).local.0,
+            auth_cell_local: [0xAE; 16],
+            work,
+            shares: Vec::new(),
+            node_terms: Vec::new(),
+            artifacts: Vec::new(),
+            everywhere: work,
+            legs: vec![
+                leg(payer.address(), LegRole::Inbound, Vec::new(), 0),
+                leg(
+                    self.venue,
+                    LegRole::Core,
+                    (0..self.outputs)
+                        .map(|output| ValueEdge {
+                            source: 0,
+                            output,
+                            non_fungible: false,
+                        })
+                        .collect(),
+                    1,
+                ),
+            ],
+            nullifiers: Vec::new(),
+            packages: Vec::new(),
+            terms: stub.terms,
+        })
+    }
+}
+
+/// The `nth` swap `payer` pays for into `venue`, consuming `outputs`
+/// escrowed crossings there.
+///
+/// # Panics
+///
+/// Never: [`Swapping`] routes every stub tree.
+#[must_use]
+pub fn stub_swap(payer: PrincipalAddr, venue: Address, nth: u32, outputs: u32) -> Transaction {
+    let vm = StubTree {
+        terms: Terms {
+            fee_payer: payer,
+            max_fee: u128::MAX >> 1,
+            gas_limits: Capped::from_array([1_000_000]),
+            priority_bp: 0,
+            message: Bytes::empty(),
+        },
+        network: NetworkId::from(&NetworkDefinition::simulator()),
+        members: 0,
+        validity: test_validity_range(),
+        body: nth.to_le_bytes().to_vec(),
+    }
+    .envelope();
+    let tx = Transaction::new(vm);
+    tx.try_derived(&Swapping { venue, outputs })
+        .expect("the fixture derivation routes it");
+    tx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

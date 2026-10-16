@@ -815,13 +815,14 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_jmt::NibblePath;
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{stub_abort_charge, stub_stated_terms, test_key};
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, EpochWindows,
         FrontierInputs, Hash, LocalKey, MemberTerms, MerkleInclusionProof, RETENTION_HORIZON,
-        ReadFence, ReadFrontier, ReadMark, Reading, ResourceAddr, Settlement, ShardId, StateRoot,
-        Stated, StatedTerms, TickLine, TxHash, WeightedTimestamp, encode_amount,
+        ReadFence, ReadFrontier, ReadMark, Reading, ResourceAddr, RoutePrefix, Settlement, ShardId,
+        StateRoot, Stated, StatedTerms, TickLine, TxHash, WeightedTimestamp, encode_amount,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
@@ -830,6 +831,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::answer_additions;
     use crate::shard::members::{MemberIndex, MemberInputs, RowState};
 
     /// A store of cells alone.
@@ -3719,5 +3721,54 @@ mod tests {
                 prop_assert_eq!(declines(&left), StateWrites::default());
             }
         }
+    }
+
+    /// A block adds what its terms entries owe, the `Taken` its owed
+    /// credit writes and the `Never` its decline writes, each under its
+    /// producer's route, and nothing for an escrowed record a member of
+    /// its chain still stands to take, which writes no answer.
+    #[test]
+    fn a_blocks_additions_are_its_terms_its_owed_credits_and_its_declines() {
+        let route = |id: &CrossingId| RoutePrefix::of(id.producer);
+        let (owed, declining, arriving) = (
+            homed_crossing(0x21),
+            homed_crossing(0x23),
+            homed_crossing(0x25),
+        );
+        let entry = stub_stated_terms(later(), 7);
+        let members = MemberInputs {
+            committed: at(VALIDITY_END_MS),
+            terms: vec![entry.clone()],
+            ..MemberInputs::still(HOME)
+        };
+        let claims = [
+            record_held(9, &owed, issuer(), Terms::Owed),
+            record_held(9, &declining, issuer(), escrowed_terms()),
+            record_held(9, &arriving, later(), escrowed_terms()),
+            row_read(HOME, issuer(), Inclusion::Absent),
+        ];
+        let empty = Cells(BTreeMap::new());
+        let additions = answer_additions(&members, &claims, &empty, &NibblePath::empty());
+        assert_eq!(additions.of(route(&owed)), 1, "the owed credit's Taken");
+        assert_eq!(additions.of(route(&declining)), 1, "the decline's Never");
+        assert_eq!(additions.of(route(&arriving)), 0, "an arrival a row awaits");
+        assert_eq!(
+            additions.of(route(&entry.terms.crossings[0])),
+            1,
+            "the entry's crossing"
+        );
+        assert_eq!(additions.total(), 3);
+
+        let standing_taken = Cells(BTreeMap::from([(
+            owed.answer_key(&ProtocolHasher, Answered::Taken),
+            owed.answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+                .to_bytes(),
+        )]));
+        assert_eq!(
+            answer_additions(&members, &claims, &standing_taken, &NibblePath::empty())
+                .of(route(&owed)),
+            0,
+            "a record its Taken already answers is credited no more"
+        );
     }
 }

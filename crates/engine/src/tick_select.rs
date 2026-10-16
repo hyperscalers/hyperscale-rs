@@ -358,6 +358,28 @@ pub fn awaited_core(member: &Member) -> Reach {
     remote(member.awaited(), member.local())
 }
 
+/// The escrowed crossings `member` consumes, which its terms carry and
+/// its row owes: none for a member reaching no further than its shard
+/// or one not decomposed.
+///
+/// # Panics
+///
+/// Never: a star's edges are capped.
+#[must_use]
+pub fn crossings_consumed(member: &Member) -> Crossings {
+    let classified = member.classified();
+    if !member.reaches_beyond() || !classified.decomposed() {
+        return Capped::empty();
+    }
+    Capped::new(
+        classified
+            .refusable_consumed(member.local())
+            .map(|edge| edge.crossing.id)
+            .collect(),
+    )
+    .expect("a star's edges are capped")
+}
+
 /// The terms of `member`, `tx`'s member classified under `trie`, priced
 /// at `prices`.
 ///
@@ -393,15 +415,7 @@ pub fn terms_of_member(
                 Requirement::CommittedState(shard) => Some(shard),
                 Requirement::Crossing { .. } => None,
             });
-        let crossings = classified
-            .refusable_consumed(local)
-            .map(|edge| edge.crossing.id)
-            .collect();
-        (
-            remote(engages, local),
-            Capped::new(crossings).expect("a star's edges are capped"),
-            false,
-        )
+        (remote(engages, local), crossings_consumed(member), false)
     } else {
         let payer = trie.shard_for_prefix(tx.fee_payer());
         let provisioning = tx

@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use hyperscale_types::{AnswerDelta, BlockHash, BlockHeight, StandingAnswers};
+use hyperscale_types::{AnswerAdditions, AnswerDelta, BlockHash, BlockHeight, StandingAnswers};
 use tracing::warn;
 
 /// A voter's hold on the answers its chain stands at.
@@ -26,8 +26,9 @@ use tracing::warn;
 pub struct HeldAnswers {
     /// The count at a committed height.
     frontier: Option<(BlockHeight, StandingAnswers)>,
-    /// The delta each pending block measured, by block.
-    pending: HashMap<BlockHash, AnswerDelta>,
+    /// The delta each pending block measured, and what it adds, by
+    /// block.
+    pending: HashMap<BlockHash, (AnswerDelta, AnswerAdditions)>,
     /// The committed blocks above the newest persist and above the
     /// newest count the frontier re-based on, each with its delta where
     /// this voter measured one. The frontier folds over them without taking them,
@@ -35,13 +36,22 @@ pub struct HeldAnswers {
     committed: BTreeMap<BlockHeight, (BlockHash, Option<AnswerDelta>)>,
     /// The newest height a persist reported.
     persisted: BlockHeight,
+    /// How many times a count read off the store has been taken: a vote
+    /// held for want of a count is re-driven when it moves.
+    adopted: u64,
 }
 
 impl HeldAnswers {
     /// Hold `delta`, what `block`'s writes do to the answers its parent
-    /// stands at.
-    pub fn measured(&mut self, block: BlockHash, delta: AnswerDelta) {
-        self.pending.insert(block, delta);
+    /// stands at, and `additions`, what it adds to them and to the
+    /// crossings the chain's rows owe.
+    pub fn measured(&mut self, block: BlockHash, delta: AnswerDelta, additions: AnswerAdditions) {
+        self.pending.insert(block, (delta, additions));
+    }
+
+    /// What pending `block` adds, where this voter measured it.
+    pub fn additions(&self, block: BlockHash) -> Option<&AnswerAdditions> {
+        self.pending.get(&block).map(|(_, additions)| additions)
     }
 
     /// Keep the pending deltas of the blocks `keep` names.
@@ -55,7 +65,7 @@ impl HeldAnswers {
     /// the newest persist is not recorded: that persist's count already
     /// covers it, so a frontier standing below it can go no further.
     pub fn committed(&mut self, height: BlockHeight, block: BlockHash, seated: bool) {
-        let delta = self.pending.remove(&block);
+        let delta = self.pending.remove(&block).map(|(delta, _)| delta);
         if !seated {
             self.unseat();
             return;
@@ -97,6 +107,7 @@ impl HeldAnswers {
                 .get(&at)
                 .is_some_and(|(committed, _)| *committed == block);
             if ours {
+                self.adopted += 1;
                 let held = self.frontier.replace((at, count));
                 self.committed = self.committed.split_off(&at.next());
                 self.fold();
@@ -127,7 +138,13 @@ impl HeldAnswers {
         }
         self.committed = self.committed.split_off(&height.next());
         self.frontier = Some((height, count));
+        self.adopted += 1;
         self.fold();
+    }
+
+    /// How many counts read off the store this voter has taken.
+    pub const fn adopted(&self) -> u64 {
+        self.adopted
     }
 
     /// The count at `tip`, this voter's committed tip, where it holds
@@ -149,7 +166,7 @@ impl HeldAnswers {
     ) -> Option<StandingAnswers> {
         let mut count = self.at_tip(tip)?.clone();
         for block in ancestors {
-            let advanced = count.advance(self.pending.get(&block)?);
+            let advanced = count.advance(&self.pending.get(&block)?.0);
             debug_assert!(
                 advanced.is_ok(),
                 "the answer count behind {block:?} falls below zero"

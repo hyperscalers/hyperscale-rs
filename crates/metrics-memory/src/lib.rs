@@ -483,6 +483,18 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("accepted_rows_toward_a_sibling", None, rows as f64);
     }
 
+    fn set_standing_answers_by_lineage(&self, lineage: &str, standing: u64) {
+        self.set(
+            "standing_answers_by_lineage",
+            Some(lineage),
+            standing as f64,
+        );
+    }
+
+    fn record_intake_capped(&self, what: &str, count: u64) {
+        self.inc("intake_capped", Some(what), count);
+    }
+
     fn record_record_ask(&self) {
         self.inc("record_asks", None, 1);
     }

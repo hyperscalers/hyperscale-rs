@@ -750,6 +750,30 @@ pub const MAX_UNSETTLED_TXS: u64 = MAX_UNSETTLED_PER_BLOCK as u64;
 /// fill it.
 pub const MAX_STANDING_TOWARD_SHARD: usize = MAX_UNSETTLED_PER_BLOCK / 4;
 
+/// Hard cap on what a consumer's chain stands holding toward one lineage.
+///
+/// A lineage is the shard of the chain's trie that places a producer
+/// route. What stands toward it is the answer leaves the chain holds for
+/// crossings out of that shard, plus the crossings its committed members
+/// still owe it.
+///
+/// A vote refuses a block whose additions would carry one lineage past
+/// it, so a lineage takes in no more than its producers' boundaries
+/// drain.
+pub const MAX_STANDING_ANSWERS_FROM_SHARD: u64 = 1 << 16;
+
+/// Hard cap on what a consumer's chain stands holding toward every
+/// producer together, answers and owed crossings both.
+///
+/// Four full lineages, so one producer holding its lineage full and one
+/// busy producer cannot close the consumer to the rest.
+pub const MAX_STANDING_ANSWERS: u64 = 4 * MAX_STANDING_ANSWERS_FROM_SHARD;
+
+/// Hard cap on the escrowed crossings the member rows standing toward
+/// one shard owe: a quarter of [`MAX_STANDING_ANSWERS`], so one silent
+/// sibling holds at most one lineage's worth of a consumer's intake.
+pub const MAX_OWED_TOWARD_SHARD: u64 = MAX_STANDING_ANSWERS / 4;
+
 /// Whether a block carrying `tx_count` transactions, and leaving the
 /// drain holding `in_flight`, is one a validator may vote for.
 ///

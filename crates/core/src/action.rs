@@ -20,11 +20,11 @@ use hyperscale_types::{
     RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     ResolvedCommittee, RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg,
-    SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim,
-    StateRoot, SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout,
-    TimeoutCertificate, TopologySchedule, TopologySnapshot, Transaction, TransactionStatus, TxHash,
-    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
-    WeightedTimestamp,
+    SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StandingAnswers,
+    StateClaim, StateRoot, SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId,
+    Timeout, TimeoutCertificate, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified,
+    VoteCount, VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -1086,6 +1086,11 @@ pub enum Action {
         /// The certificate for the round before `round`, when the block
         /// skips rounds past `parent_qc`.
         timeout_cert: Option<TimeoutCertificate>,
+        /// The answers and owed crossings the chain stands holding at the
+        /// parent, `None` where the proposer cannot rebuild them; the
+        /// handler leaves out what would carry them past the cap, and
+        /// without a count every addition.
+        standing_answers: Option<StandingAnswers>,
     },
 
     /// Execute one tick's whole batch: the committing block's

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::{AnswerDelta, Block, TxHash, Verified};
+use crate::{AnswerAdditions, AnswerDelta, Block, TxHash, Verified};
 
 /// One check the pipeline runs on a block before voting on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,6 +104,9 @@ pub enum CheckOutcome {
         /// The block's change to its chain's answers, measured from its
         /// settled writes against its parent's.
         answers: AnswerDelta,
+        /// What the block adds to its chain's answers and owed
+        /// crossings, which the vote holds to the cap.
+        additions: AnswerAdditions,
     },
     /// The block's claim does not hold; the block never gets a vote.
     Refused,
@@ -120,6 +123,7 @@ impl CheckOutcome {
         Self::Checked {
             bytes_delta: 0,
             answers: AnswerDelta::default(),
+            additions: AnswerAdditions::default(),
         }
     }
 }

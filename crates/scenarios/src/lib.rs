@@ -59,12 +59,13 @@ pub use execution::{
 };
 pub use faults::{
     a_fresh_committee_recovered_again_before_its_crossing_folds,
+    a_halt_recovery_with_answers_in_its_suffix_completes,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
     a_harvested_tick_over_a_discarded_tick_settles_nothing,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_is_inert,
-    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
-    cross_shard_provisions_fetch_with_request_loss,
+    a_silent_sibling_holds_no_more_than_a_quarter, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, gossip_drop_engages_fetch_fallback,
     halted_shard_recovers_by_committee_redraw,
@@ -122,7 +123,8 @@ pub use route::{
     routes_held_in_a_ring_wait_for_their_deadline,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     routes_seated_the_other_way_lose_the_later_to_the_cycle,
-    stated_venues_hear_each_others_yes_by_asking, stated_venues_hear_each_others_yes_by_push,
+    standing_answers_level_off_under_sustained_load, stated_venues_hear_each_others_yes_by_asking,
+    stated_venues_hear_each_others_yes_by_push,
 };
 pub use route_reshape::{
     LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,

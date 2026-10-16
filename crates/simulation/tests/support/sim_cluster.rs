@@ -34,13 +34,17 @@ use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
     ArchivedChain, CrashKind, EPOCH_MS, ExecutionMode, ProcessingTimes, SimConfig, SimulationRunner,
 };
-use hyperscale_storage::{MemberIndex, RowState, ShardChainReader, SubstateStore};
+use hyperscale_storage::{
+    BoundaryStore, MemberIndex, RowState, ShardChainReader, SubstateStore, Substates, answer_route,
+};
+use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
     ConsensusReceipt, Derivation, Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds,
-    ShardId, Signer, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxsInFlight, ValidatorId, Verified,
+    ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified,
+    shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -911,10 +915,7 @@ impl Cluster for SimCluster {
     }
 
     fn member_rows(&self, shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
-        // Tallest chain, as the in-flight count reads it.
-        let store = (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .max_by_key(|store| ShardChainReader::committed_height(*store))?;
+        let store = self.tallest_store(shard)?;
         Some(
             MemberIndex::load(&store.snapshot(), shard)
                 .members
@@ -922,6 +923,34 @@ impl Cluster for SimCluster {
                 .map(|(tx, row)| (tx, row.state))
                 .collect(),
         )
+    }
+
+    fn standing_answers(&self, shard: ShardId) -> Option<StandingAnswers> {
+        let store = self.tallest_store(shard)?;
+        let snapshot = store.snapshot();
+        let mut count = StandingAnswers::default();
+        for key in store.crossing_rows(&shard_prefix_path(shard)) {
+            if let Some(route) = snapshot
+                .cell(key)
+                .and_then(|value| answer_route(key, &value))
+            {
+                count.add(route);
+            }
+        }
+        for row in MemberIndex::load(&snapshot, shard).members.values() {
+            count.owe(&row.owes);
+        }
+        Some(count)
+    }
+
+    fn standing_toward(&self, shard: ShardId) -> Option<StandingToward> {
+        let store = self.tallest_store(shard)?;
+        let rows = MemberIndex::load(&store.snapshot(), shard);
+        Some(StandingToward::over(
+            rows.members
+                .values()
+                .map(|row| (row.awaits.as_slice(), row.owes.total())),
+        ))
     }
 
     fn heard(&self, shard: ShardId, tx: TxHash) -> Vec<Heard> {
@@ -1039,6 +1068,14 @@ impl SimCluster {
     /// `shard`'s archived chain, walked up to now.
     fn history(&self, shard: ShardId) -> History<'_> {
         History(self.runner.archive().chain(shard))
+    }
+
+    /// The store of the host holding `shard`'s tallest chain: a
+    /// terminated predecessor's store still answers for the shard id.
+    fn tallest_store(&self, shard: ShardId) -> Option<&SimShardStorage> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| ShardChainReader::committed_height(*store))
     }
 }
 

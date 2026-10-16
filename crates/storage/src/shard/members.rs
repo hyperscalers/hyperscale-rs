@@ -1619,7 +1619,7 @@ fn kept_by_a_run(settlement: Settlement, stated: &Crossings) -> Crossings {
 
 /// What each transaction `terms` names owes, off the first entry naming
 /// it.
-fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
+pub(crate) fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
     let mut owed = BTreeMap::new();
     for entry in terms {
         owed.entry(entry.tx)

@@ -19,11 +19,11 @@ use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_CLAIMS_BYTES,
-    MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_TOWARD_SHARD,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr,
-    REATTESTATION_STEP, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
-    verdict_leaf,
+    MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_ANSWERS,
+    MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr, REATTESTATION_STEP,
+    ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window, verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -39,7 +39,7 @@ use crate::support::faultable::{
 };
 use crate::support::query::{
     ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_leg_fated, declared_price,
-    held, held_at, stands_at, vault_balance,
+    epoch_duration_ms, held, held_at, stands_at, vault_balance,
 };
 use crate::support::tx::{
     build_route_tx, build_sponsored_route_tx, build_swap_tx, build_transfer_tx, validity_around,
@@ -3026,6 +3026,8 @@ struct Flight {
     walked: [BlockHeight; 2],
     /// Offers not made for want of a free pair.
     short: usize,
+    /// Routes the pool held past their window, given up on.
+    lapsed: usize,
     /// Whether every offer was made at the instant it was spread to.
     spread: bool,
     samples: Vec<CoreLoadSample>,
@@ -3041,6 +3043,7 @@ impl Flight {
             free: (0..pairs).collect(),
             decided: BTreeMap::new(),
             short: 0,
+            lapsed: 0,
             spread: true,
             samples: Vec::new(),
         }
@@ -3118,6 +3121,39 @@ impl Flight {
             println!("core load, {phase}: {sample}");
         }
         self.samples.push(sample);
+    }
+
+    /// Give back the pair of every route still out that neither venue
+    /// chain carries [`LAPSE_SLACK`] past its window: one the pool held
+    /// until it lapsed, which no chain commits now.
+    fn lapse<C: Cluster>(&mut self, c: &C) {
+        let now = WeightedTimestamp::ZERO.plus(c.now());
+        let Self {
+            routes,
+            flying,
+            free,
+            lives,
+            lapsed,
+            ..
+        } = self;
+        flying.retain(|hash, pair| {
+            let carried = lives
+                .get(hash)
+                .is_some_and(|[first, second]| first.committed.or(second.committed).is_some());
+            let ended = routes.get(hash).is_some_and(|route| {
+                route
+                    .validity_range()
+                    .end_timestamp_exclusive
+                    .plus(LAPSE_SLACK)
+                    <= now
+            });
+            if carried || !ended {
+                return true;
+            }
+            *lapsed += 1;
+            free.push_back(*pair);
+            false
+        });
     }
 
     /// How many of the routes the venue shards decided as `wanted`.
@@ -3403,6 +3439,137 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
             .iter()
             .find(|(_, decision)| **decision != TransactionDecision::Accept),
     );
+}
+
+/// How near its cap [`standing_answers_level_off_under_sustained_load`]
+/// reads a lineage as standing at the ceiling: within a sixteenth.
+const AT_THE_CEILING: u64 = MAX_STANDING_ANSWERS_FROM_SHARD - MAX_STANDING_ANSWERS_FROM_SHARD / 16;
+
+/// How many epochs [`standing_answers_level_off_under_sustained_load`]
+/// holds its load once a lineage stands at the ceiling.
+const LEVEL_OFF_EPOCHS: u32 = 8;
+
+/// How long past a route's validity a load waits for the venue chains
+/// to show it before it reads the route as one the pool held past its
+/// window: the chains it walks may trail their tips.
+const LAPSE_SLACK: Duration = Duration::from_secs(30);
+
+/// A consumer's standing answers level off at the cap under a load
+/// that would carry them past it.
+///
+/// [`core_routes_under_load`]'s routes are offered until some lineage of
+/// some load shard stands within a sixteenth of
+/// [`MAX_STANDING_ANSWERS_FROM_SHARD`], then for [`LEVEL_OFF_EPOCHS`]
+/// epochs more. `load.duration` bounds the wait for the ceiling. A route
+/// the cap keeps in its pool past its window lapses there, and its pair
+/// takes the next. At every reading, through the offering and the
+/// drain, every load shard stands within the cap on every lineage and
+/// in total. Once the routes still out settle, both sides of the pair
+/// are conserved and every route is decided or lapsed.
+///
+/// Requires a grown four-shard cluster over
+/// [`core_load_genesis_accounts`] of `load.traders`, one that walks its
+/// shards' chains.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, a cap is passed at
+/// any reading, no lineage reaches the ceiling within `load.duration`,
+/// either side of the pair is not conserved, or a route is still out
+/// once its window and the drain have passed.
+pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
+    c: &mut C,
+    load: CoreLoad,
+) {
+    let cast = LoadCast::stand_up(c, load);
+    let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
+    let units = cast.world(c, cast.firsts[0].unit);
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let height = |c: &C, shard: ShardId| c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+    let opened_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard).next());
+    let opened = c.now();
+    let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
+    let mut ceiling_at: Option<Duration> = None;
+    let mut held_low = u64::MAX;
+    loop {
+        cast.offer(c, load, &mut flight);
+        flight.tick(c, "offering");
+        flight.lapse(c);
+        let highest = highest_within_the_answer_caps(c);
+        match ceiling_at {
+            Some(at) => {
+                held_low = held_low.min(highest);
+                if c.now() >= at + epoch * LEVEL_OFF_EPOCHS {
+                    break;
+                }
+            }
+            None if highest >= AT_THE_CEILING => {
+                println!(
+                    "standing answers at the ceiling at {:?}: {highest}",
+                    c.now()
+                );
+                ceiling_at = Some(c.now());
+            }
+            None => assert!(
+                c.now() < opened + load.duration,
+                "no lineage reached the ceiling within {:?}; the highest stands at {highest}",
+                load.duration,
+            ),
+        }
+    }
+    println!(
+        "standing answers held {LEVEL_OFF_EPOCHS} epochs at the ceiling, the highest lineage \
+         never below {held_low}; {} routes lapsed in the pool",
+        flight.lapsed,
+    );
+    let closed = c.now();
+    while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
+        flight.tick(c, "draining");
+        flight.lapse(c);
+        highest_within_the_answer_caps(c);
+    }
+    let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
+    highest_within_the_answer_caps(c);
+    for (side, before, held, burned) in conserved {
+        assert_eq!(
+            held + burned,
+            before,
+            "the load's {side} must be conserved: held {held} and burned {burned} against \
+             {before} before",
+        );
+    }
+    assert!(
+        flight.flying.is_empty(),
+        "{} of {} routes were still out {LOAD_DRAIN:?} past the last offer",
+        flight.flying.len(),
+        flight.routes.len(),
+    );
+}
+
+/// The most any lineage stands at on any of [`LOAD_SHARDS`], asserting
+/// each shard stands within the cap on every lineage and in total.
+fn highest_within_the_answer_caps<C: Cluster>(c: &C) -> u64 {
+    let trie = ShardTrie::uniform_from_count(4);
+    let mut highest = 0;
+    for (name, shard) in LOAD_SHARDS {
+        let standing = c
+            .standing_answers(shard)
+            .expect("the harness reads a load shard's standing answers");
+        assert!(
+            standing.total() <= MAX_STANDING_ANSWERS,
+            "the {name} stands {}, past the total cap",
+            standing.total(),
+        );
+        for (lineage, count) in standing.per_lineage(&trie) {
+            assert!(
+                count <= MAX_STANDING_ANSWERS_FROM_SHARD,
+                "the {name} stands {count} toward lineage {lineage:?}, past its cap",
+            );
+            highest = highest.max(count);
+        }
+    }
+    highest
 }
 
 /// Everything one run of [`core_routes_under_load`] is reported from.

@@ -305,6 +305,17 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// cap on rows toward one shard.
     fn record_accepted_rows_toward_a_sibling(&self, rows: usize) {}
 
+    /// What a consumer chain stands holding toward one lineage of its
+    /// trie (`lineage`), or toward all of them (`"total"`), at a commit:
+    /// its answers and the crossings its rows owe, which the cap holds.
+    fn set_standing_answers_by_lineage(&self, lineage: &str, standing: u64) {}
+
+    /// What a proposal left out to stay within the cap on its chain's
+    /// standing answers, by what it was: `"arrival"` for a record a
+    /// claim would have answered, `"transaction"` for one owing
+    /// crossings.
+    fn record_intake_capped(&self, what: &str, count: u64) {}
+
     /// A consumer asking a producer's chain for a crossing record it
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
@@ -893,6 +904,20 @@ pub fn record_blocks_from_stated_to_heard(blocks: u64) {
 #[inline]
 pub fn record_accepted_rows_toward_a_sibling(rows: usize) {
     recorder().record_accepted_rows_toward_a_sibling(rows);
+}
+
+/// Record what a consumer chain stands holding toward a lineage.
+#[inline]
+pub fn set_standing_answers_by_lineage(lineage: &str, standing: u64) {
+    recorder().set_standing_answers_by_lineage(lineage, standing);
+}
+
+/// Record what a proposal left out to stay within the answer cap.
+#[inline]
+pub fn record_intake_capped(what: &str, count: u64) {
+    if count != 0 {
+        recorder().record_intake_capped(what, count);
+    }
 }
 
 /// Record a consumer's ask for a crossing record.

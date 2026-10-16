@@ -194,6 +194,8 @@ pub struct Metrics {
     pub blocks_from_stated_to_heard: Histogram,
     /// Accepted rows standing toward the most awaited sibling, a commit.
     pub accepted_rows_toward_a_sibling: Histogram,
+    pub standing_answers_by_lineage: GaugeVec,
+    pub intake_capped: CounterVec,
     /// Consumers' asks for crossing records: the fallback reads.
     pub record_asks: Counter,
     /// Fenced claims committed blocks carried, by what they read.
@@ -833,6 +835,20 @@ impl Metrics {
             )
             .unwrap(),
 
+            standing_answers_by_lineage: register_gauge_vec!(
+                "hyperscale_standing_answers_by_lineage",
+                "Answers and owed crossings a consumer chain stands holding, per lineage and in total",
+                &["lineage"]
+            )
+            .unwrap(),
+
+            intake_capped: register_counter_vec!(
+                "hyperscale_intake_capped_total",
+                "Arrivals and transactions a proposal left out under the standing answer cap",
+                &["what"]
+            )
+            .unwrap(),
+
             record_asks: register_counter!(
                 "hyperscale_record_asks_total",
                 "Asks a consumer put to a producer's chain for a crossing record it waits on"
@@ -1348,6 +1364,20 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .accepted_rows_toward_a_sibling
             .observe(rows as f64);
+    }
+
+    fn set_standing_answers_by_lineage(&self, lineage: &str, standing: u64) {
+        self.metrics
+            .standing_answers_by_lineage
+            .with_label_values(&[lineage])
+            .set(standing as f64);
+    }
+
+    fn record_intake_capped(&self, what: &str, count: u64) {
+        self.metrics
+            .intake_capped
+            .with_label_values(&[what])
+            .inc_by(count as f64);
     }
 
     fn record_record_ask(&self) {

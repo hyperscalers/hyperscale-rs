@@ -10,11 +10,12 @@ use hyperscale_storage::{RowState, committed_tx_cell_key};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     BlockHeight, Deadline, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, Joins,
-    MAX_STANDING_TOWARD_SHARD, MAX_TXS_PER_BLOCK, PrincipalAddr, SWEEP_BUCKET_MS, ShardId,
-    ShardTrie, StateRoot, TimestampRange, TransactionDecision, TransactionStatus, TxHash,
-    ValidatorId, WeightedTimestamp, Window,
+    MAX_STANDING_ANSWERS, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
+    MAX_TXS_PER_BLOCK, PrincipalAddr, SWEEP_BUCKET_MS, ShardId, ShardTrie, StateRoot,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    Window,
 };
-use hyperscale_vm_types::COMMITTED_GRACE_MS;
+use hyperscale_vm_types::{COMMITTED_GRACE_MS, MAX_CROSSINGS_PER_TX};
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, sponsor, stand_up_venues, traders};
@@ -23,10 +24,10 @@ use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::{FaultableCluster, report_crossing_measures};
 use crate::support::query::{beacon_epoch, clock, epoch_duration_ms, vault_balance};
 use crate::support::tx::{
-    HALT_STRADDLER_BATCH, HarvestedTickSetup, PaymentLeg, account_shard, build_composed_tx,
-    build_probe_transfer_tx, build_route_tx, build_sponsored_bounded_transfer_tx,
-    build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup, harvested_tick_setup,
-    payment_request_for, validity_around,
+    HALT_STRADDLER_BATCH, HaltStraddlerSetup, HarvestedTickSetup, PaymentLeg, account_shard,
+    build_composed_tx, build_probe_transfer_tx, build_route_tx,
+    build_sponsored_bounded_transfer_tx, build_transfer_tx, cross_shard_fault_cast,
+    halt_straddler_setup, harvested_tick_setup, payment_request_for, validity_around,
 };
 use crate::support::wait::{
     await_beacon_epoch, await_crossings_end, await_height, await_tx_terminal,
@@ -457,6 +458,197 @@ pub fn halted_shard_recovery_replays_a_sweep_its_suffix_walked<C: FaultableClust
     );
 }
 
+/// The opening part of an epoch, as a share of it in eighths, the
+/// answered-suffix scenario waits past before it submits: past the
+/// epoch's boundary block on the halting shard, so what the transfers
+/// write lands above it.
+const ANSWERED_SUFFIX_OPENING_EIGHTHS: u64 = 1;
+
+/// The part of an epoch, in eighths, the answered-suffix scenario's
+/// answers must land inside, so the shard freezes before the epoch's
+/// next boundary is committed.
+const ANSWERED_SUFFIX_CLOSING_EIGHTHS: u64 = 6;
+
+/// A halted shard's recovery completes where the suffix its fresh
+/// committee commits on the halted committee's certificates carries
+/// answers, with the cap on standing answers armed throughout.
+///
+/// Every transfer [`halt_straddler_setup`] pays from the surviving shard
+/// into the halting one is submitted early in an epoch. The halting
+/// shard credits each off the survivor's record, writing its answer,
+/// and freezes before the epoch's next boundary: the blocks writing the
+/// answers sit above the frontier the beacon last attested, in the
+/// suffix. A fresh member commits that suffix as certified, never
+/// judging the cap on it, and the first block it builds on it stands in
+/// the recovery's suffix band, where the cap is out of play; every
+/// later block is judged against the count the suffix left. The
+/// recovered shard resumes, its replicas agree on one state root, each
+/// transfer is credited once, a transfer each way settles after the
+/// recovery, the world settles, and every answer ends.
+///
+/// The closing check on the recovered shard's count is a smoke check
+/// only. A handful of answers never nears a cap, and the band's
+/// exemption is not what lets this recovery through: a fresh member
+/// holds no count until a persist of a block it committed itself
+/// re-bases one, so its leaders build blocks that add nothing. Biting
+/// on the band needs a fresh leader holding a count over voters that
+/// hold none, which no harness seam arranges; the band's rule is the
+/// coordinator's `a_block_with_its_parent_in_a_suffix_band_is_not_capped`.
+///
+/// Requires [`halt_straddler_setup`] at genesis and two committees'
+/// worth of pool surplus, as [`halted_shard_recovers_by_committee_redraw`]
+/// does.
+///
+/// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
+///
+/// # Panics
+///
+/// Panics if no answer lands on the halting shard inside the epoch the
+/// transfers were submitted in, the blocks writing them are not above
+/// the recovery's frontier, the halt or its recovery misses a lifecycle
+/// budget, the recovered shard's replicas never agree on a state root,
+/// a transfer is not credited exactly once, a post-recovery transfer
+/// fails to settle, the world does not settle, an answer outlives its
+/// budget, or the standing count of the recovered shard passes a cap.
+pub fn a_halt_recovery_with_answers_in_its_suffix_completes<C: FaultableCluster>(c: &mut C) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = halt_straddler_setup();
+    split_lifecycle(c);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        setup
+            .straddlers
+            .iter()
+            .chain(&setup.post_recovery)
+            .flat_map(|(_, from, _, to)| [from.address(), to.address()]),
+        [],
+    );
+    let mut charges = Charges::default();
+
+    let (probes, unanswered) = answer_early_in_an_epoch(c, &setup, &mut charges);
+
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    let seated_at = await_recovery_draw(c, &halt);
+    let frontier = c
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .pending_recoveries
+                .get(&halted)
+                .map(|recovery| recovery.attested_frontier)
+        })
+        .expect("the pending recovery names its attested frontier");
+    assert!(
+        frontier <= unanswered,
+        "the blocks writing the answers must sit above the recovery's frontier, in the \
+         suffix the fresh committee commits on certificates: frontier {frontier:?}, \
+         no answer through {unanswered:?}",
+    );
+    await_recovery_resume(c, &halt, seated_at);
+    assert!(
+        c.run_until(epochs(4), |c| agreed_state_root(c, halted).is_some()),
+        "the recovered shard's replicas must agree on one state root",
+    );
+    assert!(
+        c.run_until(epochs(20), |c| {
+            probes
+                .iter()
+                .all(|p| chain_settled(c, p.payer_shard, p.hash) && credited_once(c, p))
+        }),
+        "every transfer into the halted shard must settle and credit its recipient once",
+    );
+
+    let revived: Vec<Probe> = setup
+        .post_recovery
+        .iter()
+        .map(|leg| submit_probe(c, &mut charges, leg))
+        .collect();
+    assert!(
+        c.run_until(epochs(40), |c| {
+            revived
+                .iter()
+                .all(|p| chain_settled(c, p.payer_shard, p.hash) && credited_once(c, p))
+        }),
+        "a post-recovery transfer per direction must settle and credit its recipient once; {}",
+        revival_report(c, halted, survivor, &revived),
+    );
+    world.assert_settles_within(c, &charges, epochs(8), "a recovery over answers");
+    await_crossings_end(
+        c,
+        &charges.crossings(c),
+        epochs(12),
+        "every answer ends after the recovery",
+    );
+    let standing = c
+        .standing_answers(halted)
+        .expect("the harness reads the recovered shard's standing answers");
+    assert!(
+        standing.total() <= MAX_STANDING_ANSWERS
+            && standing
+                .per_lineage(&ShardTrie::uniform_from_count(2))
+                .values()
+                .all(|count| *count <= MAX_STANDING_ANSWERS_FROM_SHARD),
+        "the recovered shard stands within the caps: {standing:?}",
+    );
+}
+
+/// Submit every transfer `setup` pays from the surviving shard into the
+/// halting one past the next epoch's opening, and run until the first
+/// lands, inside that epoch. Returns the transfers, and the halting
+/// shard's tip read last before any credit stood: a credit lands in the
+/// block that writes its transfer's answer, so every block writing one
+/// sits above it.
+fn answer_early_in_an_epoch<C: FaultableCluster>(
+    c: &mut C,
+    setup: &HaltStraddlerSetup,
+    charges: &mut Charges,
+) -> (Vec<Probe>, BlockHeight) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let now_ms = |c: &C| clock(c).as_millis();
+    let opening = epoch_ms * ANSWERED_SUFFIX_OPENING_EIGHTHS / 8;
+    let next_start = (now_ms(c) / epoch_ms + 1) * epoch_ms + opening;
+    assert!(
+        c.run_until(epochs(2), |c| now_ms(c) >= next_start),
+        "the cluster's clock must reach the next epoch's opening",
+    );
+    let epoch_of_submission = now_ms(c) / epoch_ms;
+
+    let height = |c: &C| c.committed_height(halted).unwrap_or(BlockHeight::GENESIS);
+    let probes: Vec<Probe> = setup
+        .straddlers
+        .iter()
+        .filter(|(_, from, _, _)| account_shard(*from, 2) == survivor)
+        .map(|leg| submit_probe(c, charges, leg))
+        .collect();
+    let credited = |c: &C| probes.iter().any(|p| credited_once(c, p));
+    let mut unanswered = height(c);
+    while !credited(c) {
+        unanswered = height(c);
+        assert!(
+            c.run_until(epochs(1), |c| height(c) > unanswered),
+            "the halting shard must keep committing while the transfers land",
+        );
+    }
+    let closing = epoch_ms * ANSWERED_SUFFIX_CLOSING_EIGHTHS / 8;
+    assert!(
+        now_ms(c) / epoch_ms == epoch_of_submission && now_ms(c) % epoch_ms < closing,
+        "the answers must stand inside the epoch the transfers were submitted in, \
+         before its next boundary: submitted in epoch {epoch_of_submission}, at {}ms now",
+        now_ms(c),
+    );
+    assert!(
+        c.standing_answers(halted)
+            .expect("the harness reads the halting shard's standing answers")
+            .total()
+            > 0,
+        "the credited transfers' answers must stand on the halting shard",
+    );
+
+    (probes, unanswered)
+}
+
 /// Routes the capped-sibling scenario offers toward the halted venue:
 /// the cap, and more than a block of them still pooled once it is
 /// reached.
@@ -595,6 +787,185 @@ pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
         "the sibling must stay halted through the run: {frozen} past {}",
         halt.frozen_at,
     );
+}
+
+/// The crossings a silent sibling's rows may owe toward it on one
+/// consumer before one more row is refused: a quarter of everything the
+/// consumer may stand holding. The row admitted last may carry them up
+/// to one transaction's crossings past it.
+const SILENT_SIBLING_SHARE: u64 = MAX_STANDING_ANSWERS / 4;
+
+/// A silent sibling holds at most a quarter of what its consumer may
+/// stand holding, and its consumer's intake toward it lifts once it is
+/// recovered.
+///
+/// As in [`a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues`],
+/// the second venue's shard freezes and the traders offer more routes
+/// through both venues than may stand toward it. At every block the
+/// survivor commits, the rows standing toward the frozen shard and the
+/// crossings they owe stay within [`MAX_STANDING_TOWARD_SHARD`] and a
+/// quarter of [`MAX_STANDING_ANSWERS`] plus one transaction's
+/// crossings, and what the survivor stands holding, answers and owed
+/// crossings, stays within the cap on each lineage and in total.
+///
+/// The row cap is what closes intake here: a route row owes far fewer
+/// than the 22 crossings a row would need for the quarter to bind
+/// before [`MAX_STANDING_TOWARD_SHARD`] rows do, and no builder makes a
+/// transaction owing that many. The quarter is asserted at every block
+/// and is not what closes intake; the dimension itself is covered by
+/// the intake unit tests.
+///
+/// Once intake toward the sibling has stood closed for three blocks
+/// with more than a block of routes still pooled, local transfers on
+/// the survivor settle beside it. The frozen shard is then recovered,
+/// and a fresh route through both venues commits on the survivor and
+/// settles.
+///
+/// Requires the route scenarios' grown four-shard cluster and genesis
+/// accounts, with a committee's worth of pool surplus beyond the grow
+/// cohort for the recovery.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, a bound above
+/// is passed at any block, intake toward the sibling never closes,
+/// fewer than a block of routes are still pooled once it has, a local
+/// transfer fails to settle beside it, the halt or its recovery misses a
+/// lifecycle budget, or the route offered after the recovery does not
+/// settle as an accept.
+pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mut C) {
+    let (survivor, halted) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (_, control_to) = sponsor(&mut taken);
+    let (control_key, control_from) = grind_onto(survivor, &mut Vec::new());
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+
+    let window = validity_around(c.now());
+    let mut offered: BTreeSet<TxHash> = BTreeSet::new();
+    for nth in 0..CAPPED_SIBLING_LOAD {
+        let (key, trader) = &traders[nth % traders.len()];
+        let route = build_route_tx(
+            key,
+            *trader,
+            (&first.meta, &second.meta),
+            *PROTOCOL_RESOURCE,
+            1 + u128::try_from(nth).expect("a count of routes"),
+            0,
+            window,
+        );
+        offered.insert(route.hash());
+        c.submit(Arc::new(route));
+    }
+
+    let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
+    let mut blocks_closed = 0;
+    let mut committed: BTreeSet<TxHash> = BTreeSet::new();
+    while blocks_closed < 3 {
+        let from = height(c);
+        assert!(
+            c.run_until(epochs(1), |c| height(c) > from),
+            "the survivor must keep committing beside its silent sibling",
+        );
+        if silent_sibling_within_its_share(c, survivor, halted) {
+            blocks_closed += 1;
+        }
+        committed.extend(standing_of(c, survivor, &offered));
+        assert!(
+            window.contains(WeightedTimestamp::ZERO.plus(c.now())),
+            "the routes' window closed before intake toward {halted:?} closed",
+        );
+    }
+    let pooled = offered.len() - committed.len();
+    assert!(
+        pooled > MAX_TXS_PER_BLOCK,
+        "more than a block of routes must still be pooled once intake closes; {pooled} are",
+    );
+
+    for nth in 0..CAPPED_SIBLING_CONTROLS {
+        let control = build_transfer_tx(
+            &control_key,
+            control_from,
+            control_to,
+            100 + nth,
+            validity_around(c.now()),
+        );
+        let hash = control.hash();
+        c.submit(Arc::new(control));
+        let status = await_tx_terminal(c, hash, epochs(2));
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "local transfer {nth} must settle beside the silent sibling; status = {status:?}",
+        );
+        silent_sibling_within_its_share(c, survivor, halted);
+    }
+
+    await_halt_recovery(c, &halt);
+    silent_sibling_within_its_share(c, survivor, halted);
+    let (key, trader) = &traders[0];
+    let fresh = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        u128::try_from(CAPPED_SIBLING_LOAD + 1).expect("a count of routes"),
+        0,
+        validity_around(c.now()),
+    );
+    let hash = fresh.hash();
+    c.submit(Arc::new(fresh));
+    let status = await_tx_terminal(c, hash, epochs(8));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a route toward the recovered sibling must settle once its intake lifts; \
+         status = {status:?}",
+    );
+}
+
+/// Assert that the rows `survivor` holds toward `silent` stand within
+/// their caps, that their owed crossings stand under a quarter of
+/// [`MAX_STANDING_ANSWERS`] plus one transaction's crossings, and that `survivor` stands within the cap
+/// on its answers and owed crossings, on every lineage and in total.
+/// Returns whether intake toward `silent` stands closed: the rows at
+/// their cap, or the owed crossings within one transaction's of their
+/// share.
+fn silent_sibling_within_its_share<C: Cluster>(c: &C, survivor: ShardId, silent: ShardId) -> bool {
+    let toward = c
+        .standing_toward(survivor)
+        .expect("the harness reads the survivor's rows");
+    let (rows, owed) = (toward.toward(silent), toward.owed_toward(silent));
+    assert!(
+        rows <= MAX_STANDING_TOWARD_SHARD,
+        "{rows} rows stand toward {silent:?}, past the cap",
+    );
+    let crossings = u64::try_from(MAX_CROSSINGS_PER_TX).expect("a crossing count");
+    assert!(
+        owed < SILENT_SIBLING_SHARE + crossings,
+        "rows toward {silent:?} owe {owed} crossings, past a quarter of the total and a \
+         transaction's crossings",
+    );
+    let standing = c
+        .standing_answers(survivor)
+        .expect("the harness reads the survivor's standing answers");
+    assert!(
+        standing.total() <= MAX_STANDING_ANSWERS,
+        "the survivor stands {}, past the total cap",
+        standing.total(),
+    );
+    for (lineage, count) in standing.per_lineage(&ShardTrie::uniform_from_count(4)) {
+        assert!(
+            count <= MAX_STANDING_ANSWERS_FROM_SHARD,
+            "the survivor stands {count} toward lineage {lineage:?}, past its cap",
+        );
+    }
+    rows == MAX_STANDING_TOWARD_SHARD || owed + crossings > SILENT_SIBLING_SHARE
 }
 
 /// The transactions of `offered` whose row `shard` holds and no abort

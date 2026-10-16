@@ -9,8 +9,8 @@ use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_storage::RowState;
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, Heard, PriceTable, ShardId,
-    Signer, StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, TxsInFlight, ValidatorId,
+    Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
 };
 
 use super::Budget;
@@ -220,6 +220,25 @@ pub trait Cluster {
     /// as its own is a fact about committed state no status reports, and
     /// so is which member a tick holds while another waits on it.
     fn member_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
+        None
+    }
+
+    /// What `shard`'s tip stands holding as its answer cap counts it:
+    /// every answer its crossing rows hold, by producer route, and the
+    /// crossings its member rows still owe, read whole off the store;
+    /// `None` where this cluster cannot read state entries.
+    ///
+    /// An observation seam, like [`Self::member_rows`]: a recount
+    /// independent of the count the coordinator keeps, so a scenario can
+    /// hold the cap's bound against committed state.
+    fn standing_answers(&self, _shard: ShardId) -> Option<StandingAnswers> {
+        None
+    }
+
+    /// The rows `shard`'s tip holds toward each shard their settlement
+    /// awaits, with the crossings they owe, or `None` where this cluster
+    /// cannot read state entries.
+    fn standing_toward(&self, _shard: ShardId) -> Option<StandingToward> {
         None
     }
 

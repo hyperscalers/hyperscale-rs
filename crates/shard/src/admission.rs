@@ -23,12 +23,12 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_engine::tick_select::{awaited_core, member_of};
+use hyperscale_engine::tick_select::{awaited_core, crossings_consumed, member_of};
 use hyperscale_storage::{MemberIndex, MemberRow, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
     Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_OWED_TOWARD_SHARD,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, Settlement,
     ShardId, StandingToward, StateClaim, SubstateKey, Terminating, TickHalf, TopologySchedule,
@@ -306,9 +306,14 @@ impl<'a> TransactionsFold<'a> {
 }
 
 /// The rows of `rows` standing toward each shard: every row, in whatever
-/// state, counted once for each shard its settlement awaits.
+/// state, counted once for each shard its settlement awaits, with the
+/// crossings it owes.
 pub(crate) fn standing_toward(rows: &MemberIndex) -> StandingToward {
-    StandingToward::over(rows.members.values().map(|row| row.awaits.as_slice()))
+    StandingToward::over(
+        rows.members
+            .values()
+            .map(|row| (row.awaits.as_slice(), row.owes.total())),
+    )
 }
 
 impl<'p> Section for TransactionsSection<'p> {
@@ -320,7 +325,8 @@ impl<'p> Section for TransactionsSection<'p> {
     /// elsewhere, under its own ceilings in every dimension, and fitting
     /// the block's sweepable-cell cap and its per-dimension caps over
     /// the share this shard bears, and awaiting no shard that
-    /// [`MAX_STANDING_TOWARD_SHARD`] rows already stand toward.
+    /// [`MAX_STANDING_TOWARD_SHARD`] rows, or rows owing
+    /// [`MAX_OWED_TOWARD_SHARD`] crossings, already stand toward.
     ///
     /// **One life across the block's two anchors.** A member awaiting
     /// another shard is refused where a shard it reaches runs another
@@ -346,7 +352,10 @@ impl<'p> Section for TransactionsSection<'p> {
     /// answering pins every row awaiting it. Such a transaction is
     /// refused where the rows at the parent awaiting one of its awaited
     /// shards, with the ones this block has already admitted, number the
-    /// cap. Counted off the parent's rows and the block alone, so a
+    /// cap, or owe [`MAX_OWED_TOWARD_SHARD`] crossings between them, so
+    /// one silent sibling holds no more than a quarter of what the chain
+    /// may stand holding toward its producers. Counted off the parent's
+    /// rows and the block alone, so a
     /// proposer and every voter count alike, and under the trie the
     /// block's terms are derived under, so what is counted for an
     /// admitted transaction is what its row records.
@@ -415,8 +424,8 @@ impl<'p> Section for TransactionsSection<'p> {
             && let Some(shard) = fold.standing(ctx).capped(&awaited)
         {
             return Err(format!(
-                "transaction {tx_hash} awaits {shard:?}, which {MAX_STANDING_TOWARD_SHARD} rows \
-                 already stand toward"
+                "transaction {tx_hash} awaits {shard:?}, which {MAX_STANDING_TOWARD_SHARD} rows, \
+                 or rows owing {MAX_OWED_TOWARD_SHARD} crossings, already stand toward"
             ));
         }
 
@@ -484,7 +493,8 @@ impl<'p> Section for TransactionsSection<'p> {
         fold.sweepable = sweepable;
         fold.budget = budget;
         if !awaited.is_empty() {
-            fold.standing(ctx).add(&awaited);
+            let owed = crossings_consumed(&member).len() as u64;
+            fold.standing(ctx).add(&awaited, owed);
         }
         Ok(())
     }

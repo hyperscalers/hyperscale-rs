@@ -53,16 +53,16 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
-use hyperscale_engine::tick_select::{awaited_core, member_of};
+use hyperscale_engine::tick_select::{awaited_core, crossings_consumed, member_of};
 use hyperscale_metrics::{
     record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
 };
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CommittedClock, Deadline, DeclaredWork, ForkFence, IntakeView,
-    LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass, RETENTION_HORIZON, Reach,
-    ShardId, ShardTrie, TickLine, TopologySnapshot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, TxResolution, Verified, WeightedTimestamp, Window,
-    budget_admits_block, caps_admit_transaction,
+    AnswerAdditions, BlockHeight, CertifiedBlock, CommittedClock, Deadline, DeclaredWork,
+    ForkFence, IntakeView, LocalTimestamp, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MessageClass,
+    Owes, RETENTION_HORIZON, Reach, ShardId, ShardTrie, TickLine, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxResolution, Verified, WeightedTimestamp,
+    Window, budget_admits_block, caps_admit_transaction,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -228,6 +228,8 @@ struct Placed {
     /// The remote shards its settlement awaits, which its row would
     /// stand toward.
     awaited: Reach,
+    /// The escrowed crossings its row would owe, per producer route.
+    owes: Owes,
 }
 
 impl PoolEntry {
@@ -244,6 +246,7 @@ impl PoolEntry {
                 trie: trie.clone(),
                 work: member.classified().local_work(&self.tx, local),
                 awaited: awaited_core(&member),
+                owes: Owes::of(&crossings_consumed(&member)),
             });
         }
         Ref::map(self.placed.borrow(), |placed| {
@@ -1156,8 +1159,10 @@ impl MempoolCoordinator {
     /// are judged the way admission judges them, and its standing counts
     /// are the rows awaiting each shard at the parent. A transaction
     /// whose member here would await a shard already at
-    /// [`MAX_STANDING_TOWARD_SHARD`], counting the ones selected ahead of
-    /// it, is passed over as one too heavy is: admission refuses it, and
+    /// [`MAX_STANDING_TOWARD_SHARD`] rows or rows owing
+    /// [`MAX_OWED_TOWARD_SHARD`] crossings, counting the ones selected
+    /// ahead of it, is passed over as one too heavy is: admission refuses
+    /// it, and
     /// offered anyway it would take its place from a transaction that can
     /// go in every block until the shard answers. So is a transaction
     /// whose member here awaits another shard, where this shard or one it
@@ -1167,7 +1172,14 @@ impl MempoolCoordinator {
     /// which admission refuses a second time: one is never a candidate,
     /// so it takes neither a place nor a share of the caps.
     ///
+    /// So is one whose crossings would carry the answers and owed
+    /// crossings the intake counts at the parent past the cap
+    /// ([`StandingAnswers::admits`]), with the ones selected ahead of it,
+    /// and every one owing a crossing where the intake holds no count.
+    ///
     /// [`MAX_STANDING_TOWARD_SHARD`]: hyperscale_types::MAX_STANDING_TOWARD_SHARD
+    /// [`MAX_OWED_TOWARD_SHARD`]: hyperscale_types::MAX_OWED_TOWARD_SHARD
+    /// [`StandingAnswers::admits`]: hyperscale_types::StandingAnswers::admits
     ///
     /// `engaged` answers whether a cross-shard transaction's payer
     /// evidence rides the proposal being built, which the pool cannot
@@ -1228,6 +1240,7 @@ impl MempoolCoordinator {
 
         let mut filled = DeclaredWork::ZERO;
         let mut standing = intake.standing.clone();
+        let mut added = AnswerAdditions::default();
         let mut selected: Vec<(TxHash, Arc<Verified<Transaction>>)> = Vec::new();
         for (_, hash, entry) in candidates {
             if selected.len() >= room {
@@ -1239,6 +1252,21 @@ impl MempoolCoordinator {
             // still carry.
             if standing.capped(&member.awaited).is_some() {
                 continue;
+            }
+            // So is one owing crossings its consumer's chain cannot
+            // stand holding beside what stands at the parent and what
+            // the ones ahead of it owe, and every one owing a crossing
+            // where the proposer holds no count: the build drops each.
+            let mut owing = added.clone();
+            if !member.owes.is_empty() {
+                owing.owe(&member.owes);
+                if intake
+                    .answers
+                    .as_ref()
+                    .is_none_or(|answers| answers.admits(&owing, intake.trie).is_err())
+                {
+                    continue;
+                }
             }
             // So is one awaiting a verdict across a shard that leaves the
             // trie at the end of the block's window, this one included:
@@ -1260,7 +1288,8 @@ impl MempoolCoordinator {
                 continue;
             }
             filled = next;
-            standing.add(&member.awaited);
+            standing.add(&member.awaited, member.owes.total());
+            added = owing;
             selected.push((hash, Arc::clone(&entry.tx)));
         }
         // Offered in hash order whatever anyone paid: a priority buys a
@@ -1489,14 +1518,15 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, install_stub_protocol_statics, make_finalization, make_live_block,
-        naming, stub_abort_charge, stub_transaction, stub_transaction_declaring, test_prefix,
-        test_principal, test_transaction, test_transaction_at_priority,
+        naming, stub_abort_charge, stub_swap, stub_transaction, stub_transaction_declaring,
+        test_prefix, test_principal, test_transaction, test_transaction_at_priority,
         test_transaction_with_prefixes, test_validity_range,
     };
     use hyperscale_types::{
-        Address, Epoch, Hash, MAX_BLOCK_COMPUTE, MAX_STANDING_TOWARD_SHARD, PrincipalAddr,
-        StandingToward, TickLine, TopologySchedule, TxsInFlight, Verified, WeightedTimestamp,
-        WitnessSources,
+        Address, AddressClass, AnswerDelta, Epoch, Hash, MAX_BLOCK_COMPUTE,
+        MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, PrincipalAddr, RoutePrefix,
+        StandingAnswers, StandingToward, TickLine, TopologySchedule, TxsInFlight, Verified,
+        WeightedTimestamp, WitnessSources,
     };
 
     /// Intake under `trie` on a parent whose header records `in_flight`.
@@ -3375,6 +3405,110 @@ mod tests {
         );
     }
 
+    /// A pool on the first of two shards holding a swap paid from the
+    /// second, engaged and owing its venue's crossings, and a
+    /// transaction that owes none; the swap, the other, the swap's owed
+    /// route and how many it owes.
+    fn a_swap_beside_a_crossing_free_transaction(
+        topology: &TopologySnapshot,
+    ) -> (MempoolCoordinator, TxHash, TxHash, RoutePrefix, u64) {
+        install_stub_protocol_statics();
+        let local = ShardId::leaf(1, 0);
+        let payer_on = |shard: ShardId| {
+            (0u8..=255)
+                .map(test_principal)
+                .find(|payer| topology.shard_for_prefix(payer.address()) == shard)
+                .expect("a payer routes to each shard")
+        };
+        let venue = (0u8..=255)
+            .map(|at| Address::new([at; 31], AddressClass::Component))
+            .find(|owner| topology.shard_for_prefix(*owner) == local)
+            .expect("a venue routes to the local shard");
+        let paying = ShardId::leaf(1, 1);
+        let swap = stub_swap(payer_on(paying), venue, 0, 3);
+        let member = member_of(&swap, topology.shard_trie(), local);
+        let consumed = Owes::of(&crossings_consumed(&member));
+        let (route, _) = consumed.iter().next().expect("the swap owes its venue");
+        let owed = consumed.total();
+        let payer = payer_on(local);
+        let free = stub_transaction(payer, &[payer.address()], 1_000, test_validity_range());
+        let mut mempool = MempoolCoordinator::new(local);
+        let hashes = (swap.hash(), free.hash());
+        for tx in [swap, free] {
+            mempool.on_transaction_gossip(
+                topology,
+                Arc::new(verified(tx)),
+                false,
+                LocalTimestamp::ZERO,
+            );
+        }
+        mempool.on_engagement_evidence(topology.shard_trie(), paying, [hashes.0]);
+        (mempool, hashes.0, hashes.1, route, owed)
+    }
+
+    /// `standing` answers out of `route`.
+    fn answers_out_of(route: RoutePrefix, standing: u64) -> StandingAnswers {
+        let mut delta = AnswerDelta::default();
+        for _ in 0..standing {
+            delta.put(route);
+        }
+        let mut count = StandingAnswers::default();
+        count.advance(&delta).expect("only adds");
+        count
+    }
+
+    /// A transaction owing more crossings than its producer's lineage
+    /// has left under the cap at the parent is passed over, and one
+    /// owing none behind it still fills; one owing exactly what is left
+    /// is offered.
+    #[test]
+    fn a_transaction_owing_past_the_cap_is_passed_over() {
+        let topology = TestCommittee::new(4, 42).topology_snapshot(2);
+        let (mempool, swap, free, route, owed) =
+            a_swap_beside_a_crossing_free_transaction(&topology);
+        let now = LocalTimestamp::from_millis(1_000);
+        let offered = |standing: u64| -> BTreeSet<TxHash> {
+            let intake = IntakeView {
+                answers: Some(answers_out_of(route, standing)),
+                ..IntakeView::idle(topology.shard_trie())
+            };
+            mempool
+                .ready_transactions(10, &intake, now, |_| true)
+                .iter()
+                .map(|tx| tx.hash())
+                .collect()
+        };
+        assert_eq!(
+            offered(MAX_STANDING_ANSWERS_FROM_SHARD - owed + 1),
+            BTreeSet::from([free]),
+            "one crossing short: the swap is passed over",
+        );
+        assert_eq!(
+            offered(MAX_STANDING_ANSWERS_FROM_SHARD - owed),
+            BTreeSet::from([free, swap]),
+            "exactly what is left: the swap is offered",
+        );
+    }
+
+    /// A proposer holding no count at its parent fills with what owes no
+    /// crossing and passes over what owes one, which the build would
+    /// drop.
+    #[test]
+    fn without_a_count_a_transaction_owing_crossings_is_passed_over() {
+        let topology = TestCommittee::new(4, 42).topology_snapshot(2);
+        let (mempool, _, free, _, _) = a_swap_beside_a_crossing_free_transaction(&topology);
+        let intake = IntakeView {
+            answers: None,
+            ..IntakeView::idle(topology.shard_trie())
+        };
+        let offered: BTreeSet<TxHash> = mempool
+            .ready_transactions(10, &intake, LocalTimestamp::from_millis(1_000), |_| true)
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        assert_eq!(offered, BTreeSet::from([free]));
+    }
+
     /// A transaction the uncommitted chain behind the parent carries
     /// stays pending until its block commits, and takes neither a place
     /// nor a share of the block's caps: a pool whose highest bidders the
@@ -3537,7 +3671,7 @@ mod tests {
         assert_eq!((refused.len(), rest.len()), (9, 12));
 
         let at = |standing: usize| IntakeView {
-            standing: StandingToward::over(repeat_n(&[capped][..], standing)),
+            standing: StandingToward::over(repeat_n((&[capped][..], 0), standing)),
             ..IntakeView::idle(trie)
         };
         let now = LocalTimestamp::from_millis(1_000);

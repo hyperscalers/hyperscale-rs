@@ -13,19 +13,19 @@ use hyperscale_storage::FeeTerms;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, AnswerDelta, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader,
-    BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
-    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CheckOutcome, Epoch, ExecutionCertificate,
-    ExecutionCertificateVerifyError, ExecutionVote, Finalization, FinalizationVerifyError, Hash,
-    LeafIndex, MerkleInclusionProof, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError,
-    PcVote3, PcVote3VerifyError, Provisions, ProvisionsVerifyError, QcVerifyError,
-    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal,
-    Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StandingAnswers, StateClaim, StoredReceipt, SubstateKey,
-    TickId, Timeout, Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells,
-    Verifiable, VerificationKind, Verified, WeightedTimestamp,
+    Anchor, AnswerAdditions, AnswerDelta, BeaconBlockHash, BeaconProposal, Block, BlockHash,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
+    CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
+    CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome, Epoch,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
+    FinalizationVerifyError, Hash, LeafIndex, MerkleInclusionProof, PcVote1, PcVote1VerifyError,
+    PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions, ProvisionsVerifyError,
+    QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError,
+    ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
+    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StandingAnswers, StateClaim,
+    StoredReceipt, SubstateKey, TickId, Timeout, Transaction, TxHash, TxOutcome, TxResolution,
+    ValidatorId, VerdictCells, Verifiable, VerificationKind, Verified, WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, QcSubject};
@@ -439,6 +439,9 @@ pub enum ProtocolEvent {
         /// The block's change to its chain's answers, from the same
         /// computation.
         answers: AnswerDelta,
+        /// What the block adds to its chain's answers and owed
+        /// crossings, which the build held to the cap.
+        additions: AnswerAdditions,
         /// Provisions included in the block.
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     },

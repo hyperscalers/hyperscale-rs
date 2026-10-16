@@ -15,16 +15,16 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
-    record_hold_contentions, record_hold_inversions_proven, record_signature_verification_failure,
-    record_signature_verification_latency,
+    record_hold_contentions, record_hold_inversions_proven, record_intake_capped,
+    record_signature_verification_failure, record_signature_verification_latency,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
     MemberSections, ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage,
-    SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells,
-    creations_of, record_arrivals, settling_writes, without_colliding_committed_cells,
-    without_colliding_member_rows,
+    SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore, answer_additions,
+    committed_tx_cells, creations_of, record_arrivals, settling_writes,
+    without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
@@ -35,31 +35,32 @@ use hyperscale_types::network::notification::{
     ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
-    AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
-    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
-    BlockVoteMessage, BodyRootContext, CertificateRoot, CertifiedBlockHeader,
-    CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, CheckOutcome, CommitWindow,
-    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeferOn, Derivation, Engagement,
-    EngagementRoot, Epoch, EpochWindows, Finalization, FrontierInputs, Hash, LeafRoot,
-    LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    AbandonmentRecord, AbandonmentRoot, AnswerAdditions, BeaconWitnessLeafCount,
+    BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+    BlockProposalMessage, BlockVote, BlockVoteMessage, BodyRootContext, CertificateRoot,
+    CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError,
+    CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeferOn,
+    Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization, FrontierInputs,
+    Hash, LeafRoot, LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
-    SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot,
-    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim, SubstateKey,
-    SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest, TickManifestRoot, Timeout,
-    TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot, TxHash,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells,
-    commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, shard_prefix_path, shard_reveal_sign,
-    signed_bytes, tick_terms_admit_block, verify_shard_vote_equivocation, vrf_output_from_proof,
+    SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StandingAnswers, StateClaim,
+    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
+    SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest, TickManifestRoot,
+    Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified,
+    Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
+    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    shard_prefix_path, shard_reveal_sign, signed_bytes, tick_terms_admit_block,
+    verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 use crate::parent_checks::{
     AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
-    without_refused_reclaims,
+    within_the_cap, without_refused_reclaims,
 };
 use crate::tick_members::{derived_terms, stated_terms, states_entry};
 
@@ -210,6 +211,9 @@ pub struct ProposalResult {
     /// Inserted into `PendingChain` so child verifications can chain on
     /// top.
     pub jmt_snapshot: Arc<JmtSnapshot>,
+    /// What the block adds to its chain's answers and owed crossings,
+    /// measured as a voter's state-root check measures it.
+    pub additions: AnswerAdditions,
 }
 
 /// Build a proposal block, always computing the state root via `prepare_block_commit`.
@@ -270,6 +274,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     frontier: &FrontierInputs,
     manifest: &ManifestInputs,
     timeout_cert: Option<TimeoutCertificate>,
+    standing: Option<&StandingAnswers>,
 ) -> Result<ProposalResult, PersistedPastAnchor> {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
@@ -290,6 +295,24 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     without_colliding_committed_cells(local_shard, chain_origin, &mut transactions, &anchored);
     // The same for a transaction whose member row key another's takes.
     without_colliding_member_rows(local_shard, &mut transactions, &anchored);
+    // What would carry the chain's standing answers past the cap goes
+    // before anything is named over it: a record its credit or decline
+    // would answer is cut from its claim, and a transaction owing
+    // crossings goes back to the pool. Without a count every addition
+    // goes.
+    let (state_claims, records_capped, transactions_capped) = within_the_cap(
+        standing,
+        topology_snapshot.shard_trie(),
+        local_shard,
+        parent_qc.weighted_timestamp(),
+        &anchored,
+        state_claims.into_inner(),
+        &mut transactions,
+    );
+    let state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK> =
+        Capped::new(state_claims).expect("cutting a reading adds no claim");
+    record_intake_capped("arrival", records_capped as u64);
+    record_intake_capped("transaction", transactions_capped as u64);
     // The sweep, before the root it moves. Removals are ordinary writes,
     // so they fold in with the block's settling receipts and land under
     // `state_root` like anything else — and the frontier the walk stops
@@ -373,6 +396,18 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         without_refused_reclaims(state_claims.into_inner(), &members, &merged, &anchored),
     )
     .expect("cutting a reading adds no claim");
+    let additions = answer_additions(
+        &members,
+        &state_claims,
+        &anchored,
+        &shard_prefix_path(local_shard),
+    );
+    debug_assert!(
+        standing.map_or(additions.is_empty(), |standing| standing
+            .admits(&additions, topology_snapshot.shard_trie())
+            .is_ok()),
+        "a proposal adds what its own cap left out"
+    );
     // The read marks of the claims carried: a parent claim the cut left
     // reading nothing raises none.
     let frontier = &FrontierInputs::for_block(
@@ -572,6 +607,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         block_hash,
         prepared_commit: prepared,
         jmt_snapshot,
+        additions,
     })
 }
 
@@ -1422,6 +1458,12 @@ where
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
             let answers = jmt_snapshot.answer_delta(&anchored, &shard_prefix_path(ctx.shard));
+            let additions = answer_additions(
+                &members,
+                &state_claims,
+                &anchored,
+                &shard_prefix_path(ctx.shard),
+            );
             if verify_result.is_ok() {
                 absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());
                 // SAFETY: `prepared` belongs to the same JMT replay that just
@@ -1440,6 +1482,7 @@ where
                 Ok(_) => CheckOutcome::Checked {
                     bytes_delta,
                     answers,
+                    additions,
                 },
                 Err(e) => {
                     tracing::warn!(
@@ -1498,6 +1541,7 @@ where
             rowless,
             manifest,
             timeout_cert,
+            standing_answers,
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
@@ -1676,6 +1720,7 @@ where
                 &frontier,
                 &manifest,
                 timeout_cert,
+                standing_answers.as_ref(),
             );
             // A store persisted past the parent holds a committed block at
             // this height; the slot has nothing left to fill.
@@ -1715,6 +1760,7 @@ where
                 provisions: provisions.into_inner(),
                 bytes_delta,
                 answers,
+                additions: result.additions,
             });
         }
 

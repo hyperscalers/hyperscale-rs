@@ -29,7 +29,7 @@ use hyperscale_types::{
     MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
     MemberCollection, ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal,
     ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, SubstateKey,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StandingAnswers, StateClaim, SubstateClaim, SubstateKey,
     TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
     Verifiable, Verified, WeightedTimestamp, claims_admit_block, state_claims_admit_block,
     tick_terms_admit_block, verdict_leaf,
@@ -156,6 +156,42 @@ pub enum ProposalKind {
     /// Syncing proposer: empty payload, normal timestamp. Proposer is
     /// online with an accurate clock but can't execute transactions.
     Sync,
+}
+
+impl ProposalKind {
+    /// The block's timestamp, whether it is a fallback, its payload, the
+    /// label its build is logged under and whether it records leader
+    /// activity, for a proposal of this kind built at `now` on a parent
+    /// certified at `parent_wt`.
+    fn into_terms(
+        self,
+        now: LocalTimestamp,
+        parent_wt: WeightedTimestamp,
+    ) -> (ProposerTimestamp, bool, ProposalPayload, &'static str, bool) {
+        match self {
+            Self::Normal(payload) => (
+                ProposerTimestamp::from_local(now),
+                false,
+                *payload,
+                "Requesting block build for proposal",
+                false,
+            ),
+            Self::Fallback => (
+                ProposerTimestamp::from_millis(parent_wt.as_millis()),
+                true,
+                ProposalPayload::default(),
+                "Building fallback block (leader timeout)",
+                true,
+            ),
+            Self::Sync => (
+                ProposerTimestamp::from_local(now),
+                false,
+                ProposalPayload::default(),
+                "Building sync block (syncing, empty payload)",
+                true,
+            ),
+        }
+    }
 }
 
 /// What a normal proposal carries, each list already selected against
@@ -477,11 +513,11 @@ pub fn select_state_claims(
     ctx: &Committed<'_>,
     fold: &mut StateClaimsFold,
     state_claims: Vec<StateClaim>,
+    (reserved, mut weight): (usize, usize),
 ) -> Vec<StateClaim> {
     let mut kept = Vec::new();
-    let mut weight = 0usize;
     for claim in state_claims {
-        if kept.len() >= MAX_STATE_CLAIMS_PER_BLOCK {
+        if reserved.saturating_add(kept.len()) >= MAX_STATE_CLAIMS_PER_BLOCK {
             break;
         }
         if claim.at_boundary(ctx.anchor) {
@@ -543,8 +579,12 @@ pub struct ParentReads {
     pub rowless: Vec<TxHash>,
 }
 
-/// The claims section of a block, spent in the order of what it gates:
-/// the claims held for crossing, seat and ledger questions first, as
+/// The claims section of a block, spent in the order of what it gates,
+/// after the reserve: the boundary claims that delete at a boundary of a
+/// lineage `capped` names first of all, in [`RESERVED_BYTES`] and
+/// [`RESERVED_PLACES`], by [`spend_the_reserve`], so a lineage standing
+/// near its cap drains whatever else waits; then the claims held for
+/// crossing, seat and ledger questions, as
 /// [`select_state_claims`] takes them; then the parent's readings, the
 /// member rows a decline of those claims reads, as [`rowless_issuers`]
 /// names them, and the local crossings, as [`trim_parent_reads`] fits
@@ -584,7 +624,8 @@ pub struct ParentReads {
 /// An epoch's become offerable together, at the beacon fold that records
 /// the boundary they are read at, and a boundary is the oldest anchor
 /// any producer is read at. So `boundary_claims` are held apart from
-/// every order above and spent last, by [`spend_on_boundary_claims`]:
+/// every order above and, but for the reserve's, spent last, by
+/// [`spend_on_boundary_claims`]:
 /// they take no byte and no place from a reading a member waits on,
 /// whatever their number, and never ride ahead of their producer's fresh
 /// claims. One carried a block later is still admissible, since no floor
@@ -594,39 +635,36 @@ pub struct ParentReads {
 /// `Never` that carries it, and hands the record's crossing back to be
 /// read there.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // one list per kind of claim the section spends on
 pub fn select_claims(
     ctx: &Committed<'_>,
     fold: &mut StateClaimsFold,
     state_claims: Vec<StateClaim>,
     verdict_claims: Vec<StateClaim>,
     boundary_claims: &[BoundaryOffer],
+    capped: &[ShardId],
     local_crossings: Vec<CrossingId>,
     finalizations: &[Arc<Verifiable<Finalization>>],
 ) -> (Vec<StateClaim>, ParentReads) {
-    let mut selected = select_state_claims(ctx, fold, state_claims);
+    let (mut selected, taken_back, rest) = spend_the_reserve(ctx, fold, boundary_claims, capped);
+    let reserved = (fold.count, fold.weight);
+    selected.extend(select_state_claims(ctx, fold, state_claims, reserved));
     let rowless = rowless_issuers(ctx, &selected);
     let crossings = local_crossings;
-    let mut at_parent = trim_parent_reads(&selected, ParentReads { crossings, rowless });
+    let offered = ParentReads { crossings, rowless };
+    let mut at_parent = trim_parent_reads((fold.count, fold.weight), offered);
     let (local_claims, local_weight) =
         parent_reads_weight(at_parent.crossings.len(), at_parent.rowless.len());
     let others = fold.weight.saturating_add(local_weight);
     let mut weight = fold.verdict_weight;
-    let fresh = selected.len().saturating_add(local_claims);
+    let fresh = fold.count.saturating_add(local_claims);
     let mut count = fresh;
-    let mut spans: BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> = BTreeMap::new();
-    for claim in &selected {
-        if let Some(((lo, _), (hi, _))) = claim.cells.first().zip(claim.cells.last()) {
-            spans.entry(claim.anchor).or_default().push((*lo, *hi));
-        }
-    }
+    let mut spans = spans_of(&selected);
     let verdict_claims = stated_readings_first(ctx, verdict_claims);
-    let settled: BTreeSet<TxHash> = if verdict_claims.is_empty() {
+    let settled = if verdict_claims.is_empty() {
         BTreeSet::new()
     } else {
-        finalizations
-            .iter()
-            .flat_map(|fw| SettledHalf::of(fw.as_unverified()).deleted)
-            .collect()
+        deleted_by(finalizations)
     };
     for claim in verdict_claims {
         if count >= MAX_CLAIMS_PER_BLOCK {
@@ -696,12 +734,14 @@ pub fn select_claims(
     let (boundary, returned) = spend_on_boundary_claims(
         ctx,
         &mut left,
-        MAX_CLAIMS_PER_BLOCK.saturating_sub(count),
-        boundary_claims,
+        (MAX_CLAIMS_PER_BLOCK.saturating_sub(count), usize::MAX),
+        &rest,
     );
     selected.extend(boundary);
     selected.sort_unstable();
-    at_parent.crossings.extend(returned);
+    at_parent
+        .crossings
+        .extend(taken_back.into_iter().chain(returned));
     (selected, at_parent)
 }
 
@@ -724,6 +764,84 @@ fn stated_readings_first(
         });
     }
     verdict_claims
+}
+
+/// The deletions of the lineages `capped` names among `offers`, spent
+/// ahead of every other claim in [`RESERVED_BYTES`] and
+/// [`RESERVED_PLACES`] and charged to `fold`, with the crossings they
+/// take back and the offers of every other lineage. What they leave of
+/// the reserve is the section's.
+fn spend_the_reserve(
+    ctx: &Committed<'_>,
+    fold: &mut StateClaimsFold,
+    offers: &[BoundaryOffer],
+    capped: &[ShardId],
+) -> (Vec<StateClaim>, Vec<CrossingId>, Vec<BoundaryOffer>) {
+    let (offers, rest): (Vec<BoundaryOffer>, Vec<BoundaryOffer>) = offers
+        .iter()
+        .cloned()
+        .partition(|offer| drains_a_capped_lineage(offer, capped));
+    if offers.is_empty() {
+        return (Vec::new(), Vec::new(), rest);
+    }
+    let mut reserve = StateClaimsFold {
+        weight: fold.weight,
+        verdict_weight: fold.verdict_weight,
+        count: fold.count,
+        previous: None,
+    };
+    let carried = spend_on_boundary_claims(
+        ctx,
+        &mut reserve,
+        (RESERVED_PLACES, fold.weight.saturating_add(RESERVED_BYTES)),
+        &offers,
+    );
+    fold.weight = reserve.weight;
+    fold.count = reserve.count;
+    (carried.0, carried.1, rest)
+}
+
+/// The transactions whose rows `finalizations` delete.
+fn deleted_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> BTreeSet<TxHash> {
+    finalizations
+        .iter()
+        .flat_map(|fw| SettledHalf::of(fw.as_unverified()).deleted)
+        .collect()
+}
+
+/// The span of keys each of `claims` reads, by anchor.
+fn spans_of(claims: &[StateClaim]) -> BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> {
+    let mut spans: BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> = BTreeMap::new();
+    for claim in claims {
+        if let Some(((lo, _), (hi, _))) = claim.cells.first().zip(claim.cells.last()) {
+            spans.entry(claim.anchor).or_default().push((*lo, *hi));
+        }
+    }
+    spans
+}
+
+/// The bytes of [`MAX_STATE_CLAIMS_BYTES`] the deletions of a lineage
+/// standing near its cap are spent in first: half, which balances what a
+/// capped lineage drains against what it takes in, since an arrival and
+/// a deletion weigh about alike.
+const RESERVED_BYTES: usize = MAX_STATE_CLAIMS_BYTES / 2;
+
+/// The places of [`MAX_STATE_CLAIMS_PER_BLOCK`] held beside
+/// [`RESERVED_BYTES`], so no count of places spends the reserved bytes
+/// out from under the deletions.
+const RESERVED_PLACES: usize = MAX_STATE_CLAIMS_PER_BLOCK / 2;
+
+/// Whether `offer` deletes at a boundary of a shard that `capped`, the
+/// lineages of the proposer's trie its parent's count drains
+/// (`StandingAnswers::draining`), place: one of them holds the anchor's shard, or the anchor's shard
+/// holds one.
+fn drains_a_capped_lineage(offer: &BoundaryOffer, capped: &[ShardId]) -> bool {
+    offer.claims.first().is_some_and(|claim| {
+        let producer = claim.anchor.shard;
+        capped
+            .iter()
+            .any(|lineage| lineage.is_ancestor_of(producer) || producer.is_ancestor_of(*lineage))
+    })
 }
 
 /// The transactions whose member rows a block carrying `selected` may
@@ -785,7 +903,7 @@ fn rowless_issuers(ctx: &Committed<'_>, selected: &[StateClaim]) -> Vec<TxHash> 
 fn spend_on_boundary_claims(
     ctx: &Committed<'_>,
     spent: &mut StateClaimsFold,
-    places: usize,
+    (places, bytes): (usize, usize),
     offers: &[BoundaryOffer],
 ) -> (Vec<StateClaim>, Vec<CrossingId>) {
     let mut carried: Vec<StateClaim> = Vec::new();
@@ -813,8 +931,9 @@ fn spend_on_boundary_claims(
                 && taken.saturating_add(pieces.len()).saturating_add(claims) <= places
                 && pieces
                     .iter()
-                    .all(|piece| StateClaimsSection::admit(ctx, &mut after, piece).is_ok()))
-            .then_some((pieces, returns, after))
+                    .all(|piece| StateClaimsSection::admit(ctx, &mut after, piece).is_ok())
+                && after.weight <= bytes)
+                .then_some((pieces, returns, after))
         };
         let taken = || carried.len() + return_reads(0, returned.len()).0;
         let whole = admitted(offer.deletions.len(), &*spent, taken());
@@ -974,17 +1093,16 @@ const LOCAL_CROSSING_BYTES: usize =
 const LOCAL_CROSSINGS_PER_CLAIM: usize = MAX_PROOFS_PER_QUERY / 3;
 
 /// The readings of `offered` the budget of the claims that are not
-/// verdict claims still carries once `selected` is in it, read at the
-/// parent with the empty proof and cut into claims of
+/// verdict claims still carries once `(places, spent)` of it are taken,
+/// read at the parent with the empty proof and cut into claims of
 /// [`MAX_PROOFS_PER_QUERY`] readings: the member rows first, each of
-/// which completes a record reading `selected` already spends on, and
-/// the local crossings in what those leave. What does not fit waits a
-/// block.
-#[must_use]
-pub fn trim_parent_reads(selected: &[StateClaim], mut offered: ParentReads) -> ParentReads {
-    let spent: usize = selected.iter().map(StateClaim::wire_weight).sum();
+/// which completes a record reading a selected claim already spends on,
+/// and the local crossings in what those leave. What is taken counts
+/// every claim the fold has charged, the readings of the records the
+/// reserve takes back among them. What does not fit waits a block.
+fn trim_parent_reads((places, spent): (usize, usize), mut offered: ParentReads) -> ParentReads {
     let room = MAX_STATE_CLAIMS_BYTES.saturating_sub(spent);
-    let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(selected.len());
+    let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(places);
     let fits = |crossings: usize, rows: usize| {
         let (claims, weight) = parent_reads_weight(crossings, rows);
         weight <= room && claims <= claims_left
@@ -1074,6 +1192,7 @@ pub fn assemble_build_action(
     windows: EpochWindows,
     manifest: ManifestInputs,
     timeout_cert: Option<TimeoutCertificate>,
+    standing_answers: Option<StandingAnswers>,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -1082,29 +1201,8 @@ pub fn assemble_build_action(
     let sweep = chain.block_sweep(parent_block_hash, coasting);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
-    let (timestamp, is_fallback, payload, log_label, record_leader_activity) = match kind {
-        ProposalKind::Normal(payload) => (
-            ProposerTimestamp::from_local(now),
-            false,
-            *payload,
-            "Requesting block build for proposal",
-            false,
-        ),
-        ProposalKind::Fallback => (
-            ProposerTimestamp::from_millis(parent_qc.weighted_timestamp().as_millis()),
-            true,
-            ProposalPayload::default(),
-            "Building fallback block (leader timeout)",
-            true,
-        ),
-        ProposalKind::Sync => (
-            ProposerTimestamp::from_local(now),
-            false,
-            ProposalPayload::default(),
-            "Building sync block (syncing, empty payload)",
-            true,
-        ),
-    };
+    let (timestamp, is_fallback, payload, log_label, record_leader_activity) =
+        kind.into_terms(now, parent_qc.weighted_timestamp());
     let ProposalPayload {
         transactions,
         finalizations,
@@ -1172,6 +1270,7 @@ pub fn assemble_build_action(
         rowless,
         manifest,
         timeout_cert,
+        standing_answers,
     };
 
     BuildActionPlan {
@@ -1879,7 +1978,7 @@ mod tests {
         let (_, wide) = wide_claims(ShardId::leaf(1, 0));
         let ctx = finalizations_against(CommitDedupIndex::new());
         let mut fold = StateClaimsFold::default();
-        let selected = select_state_claims(&ctx.ctx(), &mut fold, wide.clone());
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, wide.clone(), (0, 0));
         assert!(!selected.is_empty() && selected.len() < wide.len());
         assert!(state_claims_admit_block(
             selected.iter().map(StateClaim::wire_weight).sum()
@@ -1916,7 +2015,7 @@ mod tests {
             .expect("the cut left something");
         let mut next = StateClaimsFold::default();
         assert_eq!(
-            select_state_claims(&ctx.ctx(), &mut next, vec![remainder.clone()]),
+            select_state_claims(&ctx.ctx(), &mut next, vec![remainder.clone()], (0, 0)),
             vec![remainder],
             "the remainder rides the next proposal whole",
         );
@@ -2018,6 +2117,7 @@ mod tests {
             gating.clone(),
             Vec::new(),
             &[],
+            &[],
             local.clone(),
             &[],
         );
@@ -2043,6 +2143,7 @@ mod tests {
             &mut StateClaimsFold::default(),
             gating.clone(),
             verdicts,
+            &[],
             &[],
             local.clone(),
             &[],
@@ -2109,6 +2210,7 @@ mod tests {
             &mut fold,
             gating,
             verdicts,
+            &[],
             &[],
             vec![crossing(1)],
             &[],
@@ -2247,6 +2349,7 @@ mod tests {
                     state.to_vec(),
                     verdicts.to_vec(),
                     boundary,
+                    &[],
                     vec![crossing(1)],
                     &[],
                 );
@@ -2289,6 +2392,73 @@ mod tests {
             );
             whole_deletions(&sorted, &carried);
         }
+    }
+
+    /// The deletions of a lineage standing at its cap are spent first,
+    /// in half the bytes and half the places of the section, and every
+    /// other claim in what they leave: a section the fresh claims would
+    /// fill carries the burst up to the reserve beside them, where an
+    /// uncapped lineage's burst waits behind them.
+    #[test]
+    fn a_capped_lineage_drains_in_its_reserved_half() {
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (burst, sorted) = boundary_burst();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let mut against = recording(
+            Against::window(TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(Vec::new()),
+            )),
+            &burst.claims[0].anchor,
+        );
+        against.anchor = past_the_boundary(1);
+        let ctx = against.ctx();
+        let selecting = |capped: &[ShardId]| {
+            let (selected, _) = select_claims(
+                &ctx,
+                &mut StateClaimsFold::default(),
+                filling.clone(),
+                Vec::new(),
+                from_ref(&burst),
+                capped,
+                Vec::new(),
+                &[],
+            );
+            let mut checked = StateClaimsFold::default();
+            assert_eq!(
+                admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+                Ok(()),
+                "what is selected passes admission",
+            );
+            let (carried, others): (Vec<StateClaim>, Vec<StateClaim>) = selected
+                .into_iter()
+                .partition(|claim| claim.at_boundary(ctx.anchor));
+            let weight = |claims: &[StateClaim]| -> usize {
+                claims.iter().map(StateClaim::wire_weight).sum()
+            };
+            (
+                whole_deletions(&sorted, &carried),
+                carried.len(),
+                weight(&carried),
+                weight(&others),
+            )
+        };
+
+        let (uncapped, _, _, filled) = selecting(&[]);
+        let (drained, places, reserved, beside) = selecting(&[SIBLING]);
+        assert_eq!(
+            uncapped, 0,
+            "an uncapped burst waits behind the fresh claims"
+        );
+        assert!(drained > 0, "the capped burst drains");
+        assert!(reserved <= MAX_STATE_CLAIMS_BYTES / 2, "{reserved} bytes");
+        assert!(places <= MAX_STATE_CLAIMS_PER_BLOCK / 2, "{places} places");
+        assert!(
+            beside > 0 && beside < filled,
+            "the fresh claims take what is left"
+        );
+        assert!(state_claims_admit_block(reserved + beside));
     }
 
     /// A record a block reads at its parent to take back rides only
@@ -2334,6 +2504,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 offers,
+                &[],
                 vec![held],
                 &[],
             );
@@ -2414,6 +2585,7 @@ mod tests {
                     fresh,
                     Vec::new(),
                     from_ref(&offer),
+                    &[],
                     Vec::new(),
                     &[],
                 );
@@ -2449,6 +2621,108 @@ mod tests {
         }
     }
 
+    /// The reserve's return readings are charged before the parent's own
+    /// readings are fitted, so a proposer whose capped lineage takes
+    /// records back carries no more than the section holds: fresh claims
+    /// fill the section, the capped lineage's offer takes 120 records
+    /// back, and of 400 local crossings only those ride that fit in what
+    /// the claims and the returns leave, in bytes and in places, as every
+    /// voter charges them.
+    #[test]
+    fn a_reserve_leaves_the_parent_reads_what_its_returns_did_not_spend() {
+        let (boundary_height, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let ids: Vec<CrossingId> = (0..120u64)
+            .map(|at| {
+                let mut intent = [0xA1; 32];
+                intent[..8].copy_from_slice(&at.to_le_bytes());
+                CrossingId {
+                    producer: test_prefix(0xA1),
+                    consumer: test_prefix(0x21),
+                    intent: IntentHash(Hash32(intent)),
+                    local: 0,
+                    output: 0,
+                }
+            })
+            .collect();
+        let mut nevers: Vec<(SubstateKey, CrossingId)> = ids
+            .iter()
+            .map(|id| (id.answer_key(&ProtocolHasher, Answered::Never), *id))
+            .collect();
+        nevers.sort_unstable();
+        let keys: Vec<SubstateKey> = nevers.iter().map(|(key, _)| *key).collect();
+        let claims: Vec<StateClaim> = nevers
+            .chunks(200)
+            .map(|chunk| {
+                let asked: Vec<SubstateKey> = chunk.iter().map(|(key, _)| *key).collect();
+                proven_claim(SIBLING, boundary_height, &keys, &asked).naming(chunk.iter().copied())
+            })
+            .collect();
+        let offer = BoundaryOffer {
+            claims: claims.clone(),
+            deletions: keys.iter().map(|key| vec![*key]).collect(),
+        };
+        let locals: Vec<CrossingId> = (0..400u64)
+            .map(|at| {
+                let mut intent = [0xB7; 32];
+                intent[..8].copy_from_slice(&at.to_le_bytes());
+                CrossingId {
+                    producer: test_prefix(0xA2),
+                    consumer: test_prefix(0xA3),
+                    intent: IntentHash(Hash32(intent)),
+                    local: 0,
+                    output: 0,
+                }
+            })
+            .collect();
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = SURVIVOR;
+        let mut against = recording(against, &claims[0].anchor);
+        against.anchor = past_the_boundary(1);
+        let ctx = against.ctx();
+        for capped in [Vec::new(), vec![SIBLING]] {
+            let (selected, at_parent) = select_claims(
+                &ctx,
+                &mut StateClaimsFold::default(),
+                filling.clone(),
+                Vec::new(),
+                from_ref(&offer),
+                &capped,
+                locals.clone(),
+                &[],
+            );
+            let mut checked = StateClaimsFold::default();
+            assert_eq!(
+                admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+                Ok(())
+            );
+            let returns = at_parent
+                .crossings
+                .iter()
+                .filter(|id| ids.contains(id))
+                .count();
+            let local = at_parent.crossings.len() - returns;
+            if !capped.is_empty() {
+                assert!(returns > 0, "the reserve takes records back");
+            }
+            let (local_claims, local_weight) = parent_reads_weight(local, at_parent.rowless.len());
+            let (return_claims, return_weight) = return_reads(0, returns);
+            let weight = checked.weight + local_weight + return_weight;
+            assert!(
+                state_claims_admit_block(weight),
+                "capped {capped:?}: {weight} bytes over {MAX_STATE_CLAIMS_BYTES}",
+            );
+            assert!(
+                checked.count + local_claims + return_claims <= MAX_STATE_CLAIMS_PER_BLOCK,
+                "capped {capped:?}: more places than the section holds",
+            );
+        }
+    }
+
     /// A claim held for a ledger or seat question rides among a block's
     /// ordinary claims up to the horizon and not a millisecond past it,
     /// whether or not the proposer's schedule records its anchor: past
@@ -2473,6 +2747,7 @@ mod tests {
                 &mut fold,
                 vec![held.clone(), younger.clone()],
                 Vec::new(),
+                &[],
                 &[],
                 Vec::new(),
                 &[],
@@ -2513,6 +2788,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 from_ref(&burst),
+                &[],
                 Vec::new(),
                 &[],
             )
@@ -2600,6 +2876,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 &[first.clone(), other.clone()],
+                &[],
                 Vec::new(),
                 &[],
             );
@@ -2648,6 +2925,7 @@ mod tests {
             Vec::new(),
             vec![claim.clone()],
             &[],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2668,6 +2946,7 @@ mod tests {
             &mut StateClaimsFold::default(),
             Vec::new(),
             vec![claim],
+            &[],
             &[],
             Vec::new(),
             &[],
@@ -2730,6 +3009,7 @@ mod tests {
             Vec::new(),
             vec![claim.clone()],
             &[],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2789,6 +3069,7 @@ mod tests {
                 Vec::new(),
                 vec![claim.clone()],
                 &[],
+                &[],
                 Vec::new(),
                 finalizations,
             )
@@ -2831,6 +3112,7 @@ mod tests {
                 &mut StateClaimsFold::default(),
                 gating,
                 verdicts,
+                &[],
                 &[],
                 Vec::new(),
                 &[],
@@ -2879,6 +3161,7 @@ mod tests {
                 &mut fold,
                 Vec::new(),
                 verdicts,
+                &[],
                 &[],
                 Vec::new(),
                 &[],
@@ -2961,6 +3244,7 @@ mod tests {
                 Vec::new(),
                 vec![accepted.clone(), stated.clone()],
                 &[],
+                &[],
                 Vec::new(),
                 &[],
             )
@@ -3015,6 +3299,7 @@ mod tests {
             Vec::new(),
             vec![batch, after],
             &[],
+            &[],
             Vec::new(),
             &[],
         );
@@ -3062,6 +3347,7 @@ mod tests {
             Vec::new(),
             vec![unproven, after.clone()],
             &[],
+            &[],
             Vec::new(),
             &[],
         );
@@ -3104,6 +3390,7 @@ mod tests {
             &mut fold,
             Vec::new(),
             vec![wide, after.clone()],
+            &[],
             &[],
             Vec::new(),
             &[],
@@ -3159,6 +3446,7 @@ mod tests {
                     Vec::new(),
                     vec![whole.clone()],
                     &[],
+                    &[],
                     Vec::new(),
                     &[],
                 );
@@ -3178,6 +3466,7 @@ mod tests {
             &mut fold,
             Vec::new(),
             vec![whole],
+            &[],
             &[],
             Vec::new(),
             &[],
@@ -3228,6 +3517,7 @@ mod tests {
             &mut fold,
             gating,
             heard.clone(),
+            &[],
             &[],
             local.to_vec(),
             &[],
@@ -3364,6 +3654,7 @@ mod tests {
                 Vec::new(),
                 heard.clone(),
                 &[],
+                &[],
                 Vec::new(),
                 &[],
             );
@@ -3439,6 +3730,7 @@ mod tests {
             vec![gating.clone(), crossing.clone()],
             vec![verdict.clone()],
             &[],
+            &[],
             Vec::new(),
             &[],
         );
@@ -3455,6 +3747,7 @@ mod tests {
             &mut proposer,
             vec![gating.clone(), mixed],
             vec![verdict.clone()],
+            &[],
             &[],
             Vec::new(),
             &[],
@@ -3481,7 +3774,7 @@ mod tests {
 
         let both = vec![at_a1[0].clone(), at_a2[0].clone()];
         let mut fold = StateClaimsFold::default();
-        let selected = select_state_claims(&ctx.ctx(), &mut fold, both.clone());
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, both.clone(), (0, 0));
         assert_eq!(selected.len(), 2, "with room for both, both ride");
         assert!(selected.iter().all(|claim| is_whole(claim, &both)));
 
@@ -3507,7 +3800,7 @@ mod tests {
         );
         offered.push(at_a2[0].clone());
         let mut fold = StateClaimsFold::default();
-        let selected = select_state_claims(&ctx.ctx(), &mut fold, offered.clone());
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, offered.clone(), (0, 0));
         let (carried_a1, carried_a2): (Vec<&StateClaim>, Vec<&StateClaim>) = selected
             .iter()
             .partition(|claim| claim.anchor.height == BlockHeight::new(3));
@@ -3655,6 +3948,7 @@ mod tests {
             &ctx.ctx(),
             &mut fold,
             vec![first.clone(), interleaved, newer, elsewhere.clone()],
+            (0, 0),
         );
         assert_eq!(selected, vec![first, elsewhere]);
     }
@@ -3725,6 +4019,7 @@ mod tests {
                 &mut StateClaimsFold::default(),
                 vec![claim.clone()],
                 Vec::new(),
+                &[],
                 &[],
                 Vec::new(),
                 &[],
@@ -3873,6 +4168,7 @@ mod tests {
                 vec![claim.clone()],
                 Vec::new(),
                 &[],
+                &[],
                 Vec::new(),
                 &[],
             );
@@ -3949,6 +4245,7 @@ mod tests {
             vec![older.clone(), younger.clone()],
             Vec::new(),
             &[],
+            &[],
             Vec::new(),
             &[],
         );
@@ -4024,6 +4321,7 @@ mod tests {
                 offered,
                 Vec::new(),
                 &[],
+                &[],
                 Vec::new(),
                 &[],
             )
@@ -4083,7 +4381,7 @@ mod tests {
             crossings: crossings.clone(),
             rowless: rowless.clone(),
         };
-        assert_eq!(trim_parent_reads(&[], offered.clone()), offered);
+        assert_eq!(trim_parent_reads((0, 0), offered.clone()), offered);
 
         let (_, wide) = wide_claims(ShardId::leaf(1, 0));
         let mut selected: Vec<StateClaim> = Vec::new();
@@ -4094,13 +4392,14 @@ mod tests {
                 selected.push(claim);
             }
         }
-        let kept = trim_parent_reads(&selected, offered.clone());
+        let spent = (selected.len(), weight);
+        let kept = trim_parent_reads(spent, offered.clone());
         assert_eq!(kept.rowless, rowless, "every row rides");
         assert!(kept.crossings.len() < crossings.len());
         assert_eq!(
             kept.crossings,
             trim_parent_reads(
-                &selected,
+                spent,
                 ParentReads {
                     crossings,
                     rowless: Vec::new()
@@ -4113,13 +4412,8 @@ mod tests {
         assert!(state_claims_admit_block(weight + carried));
         assert!(selected.len() + claims <= MAX_STATE_CLAIMS_PER_BLOCK);
 
-        let full: Vec<StateClaim> = selected
-            .iter()
-            .cycle()
-            .take(MAX_STATE_CLAIMS_PER_BLOCK)
-            .cloned()
-            .collect();
-        assert_eq!(trim_parent_reads(&full, offered), ParentReads::default());
+        let full = (MAX_STATE_CLAIMS_PER_BLOCK, weight);
+        assert_eq!(trim_parent_reads(full, offered), ParentReads::default());
     }
 
     /// The crossings whose ends share this shard ride in the room the
@@ -4143,9 +4437,9 @@ mod tests {
             }
         };
         let offered: Vec<CrossingId> = (0..200).map(crossing).collect();
-        let trim = |selected: &[StateClaim]| {
+        let trim = |spent: (usize, usize)| {
             trim_parent_reads(
-                selected,
+                spent,
                 ParentReads {
                     crossings: offered.clone(),
                     rowless: Vec::new(),
@@ -4153,7 +4447,7 @@ mod tests {
             )
             .crossings
         };
-        assert_eq!(trim(&[]), offered, "an empty section carries them all");
+        assert_eq!(trim((0, 0)), offered, "an empty section carries them all");
 
         let (_, wide) = wide_claims(ShardId::leaf(1, 0));
         let mut selected: Vec<StateClaim> = Vec::new();
@@ -4164,7 +4458,7 @@ mod tests {
                 selected.push(claim);
             }
         }
-        let kept = trim(&selected);
+        let kept = trim((selected.len(), weight));
         assert!(
             !kept.is_empty() && kept.len() < offered.len(),
             "a section near its budget carries some and not all: {}",

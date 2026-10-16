@@ -15,16 +15,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use hyperscale_engine::tick_select::{crossings_consumed, member_of};
+use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::{
     CommittedHere, FeeTerms, MemberInputs, Substates, colliding_committed_cell,
     colliding_member_row, decline_rows, held_total, key_under_prefix, load_read_frontier,
-    reclaim_credits, reclaimed, reserved_total, settling_writes,
+    owed_credits, reclaim_credits, reclaimed, reserved_total, settling_writes, unclaimed_declines,
 };
 use hyperscale_types::{
-    Anchor, Finalization, FrontierInputs, FrontierRefusal, ReadFence, ShardId, SharedTransactions,
+    Anchor, AnswerAdditions, Finalization, FrontierInputs, FrontierRefusal, MAX_TXS_PER_BLOCK,
+    Owes, ReadFence, RoutePrefix, ShardId, ShardTrie, SharedTransactions, StandingAnswers,
     StateClaim, StateWrites, Stated, StoredReceipt, SubstateKey, Transaction, TxHash, Verifiable,
-    shard_prefix_path,
+    Verified, WeightedTimestamp, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
 
@@ -181,6 +184,124 @@ pub fn reclaim_stands(
         .map(|(key, _)| key)
         .filter(|key| !landed.cells.contains_key(key))
         .collect()
+}
+
+/// What a block built on a parent standing at `standing` keeps of
+/// `transactions` and `claims` to stay within the cap.
+///
+/// Its additions are held to [`StandingAnswers::admits`] under `trie`;
+/// it hands back how many records and transactions it left out.
+///
+/// The records first, in the order the claims carry them: each owed
+/// record its owed credit would answer and each record its decline
+/// would answer adds one answer out of its producer's route, and one
+/// that does not fit beside those kept ahead of it is cut from its
+/// claim. Then the transactions in block order: each owes the crossings
+/// its member consumes, and one that does not fit is dropped and stays
+/// pooled. Where `standing` is `None` the proposer holds no count, so
+/// every addition goes, and everything else the block carries stays:
+/// voters judge such a block without a count.
+///
+/// Every addition is judged as [`answer_additions`] measures the block
+/// a voter checks, which the block's own lines and terms cannot raise:
+/// a member's terms entry owes the crossings judged here, and the claims
+/// lose readings only, which licenses no further credit or decline.
+///
+/// [`answer_additions`]: hyperscale_storage::answer_additions
+#[allow(clippy::too_many_arguments)] // the block's two sections beside the parent it lands on
+pub(crate) fn within_the_cap(
+    standing: Option<&StandingAnswers>,
+    trie: &ShardTrie,
+    local: ShardId,
+    anchor: WeightedTimestamp,
+    parent: &(impl Substates + ?Sized),
+    claims: Vec<StateClaim>,
+    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+) -> (Vec<StateClaim>, usize, usize) {
+    let under = shard_prefix_path(local);
+    let owed = owed_credits(&claims, &StateWrites::default(), parent);
+    let declined = unclaimed_declines(&claims, local, anchor, parent);
+    let answered = |key: SubstateKey| {
+        key_under_prefix(&key.to_bytes(), &under)
+            && [&owed, &declined]
+                .iter()
+                .any(|writes| matches!(writes.cells.get(&key), Some(Some(_))))
+    };
+    let fits = |added: &AnswerAdditions| {
+        standing.is_some_and(|standing| standing.admits(added, trie).is_ok())
+    };
+    let mut added = AnswerAdditions::default();
+    let mut judged: BTreeSet<SubstateKey> = BTreeSet::new();
+    let mut cut: BTreeSet<SubstateKey> = BTreeSet::new();
+    for claim in &claims {
+        for (key, id) in claim.crossings.iter() {
+            if *key != id.record_key(&ProtocolHasher) || !judged.insert(*key) {
+                continue;
+            }
+            let answers = [Answered::Taken, Answered::Never]
+                .into_iter()
+                .filter(|answer| answered(id.answer_key(&ProtocolHasher, *answer)))
+                .count();
+            if answers == 0 {
+                continue;
+            }
+            let mut with = added.clone();
+            with.add(RoutePrefix::of(id.producer), answers as u64);
+            if fits(&with) {
+                added = with;
+            } else {
+                cut.insert(*key);
+            }
+        }
+    }
+    let claims: Vec<StateClaim> = if cut.is_empty() {
+        claims
+    } else {
+        claims
+            .into_iter()
+            .filter_map(|claim| {
+                if !claim.keys().into_iter().any(|key| cut.contains(&key)) {
+                    return Some(claim);
+                }
+                if claim.anchor.shard != local {
+                    return claim.restrict(|key| !cut.contains(&key));
+                }
+                // Read at the parent under the empty proof, so the reading
+                // is dropped from the claim rather than cut from a proof.
+                let cells: Vec<(SubstateKey, Stated)> = claim
+                    .cells
+                    .iter()
+                    .filter(|(key, _)| !cut.contains(key))
+                    .cloned()
+                    .collect();
+                let named: Vec<(SubstateKey, CrossingId)> = claim
+                    .crossings
+                    .iter()
+                    .filter(|(key, _)| !cut.contains(key))
+                    .copied()
+                    .collect();
+                (!cells.is_empty()).then(|| {
+                    StateClaim::new(claim.anchor, cells, claim.proof.clone()).naming(named)
+                })
+            })
+            .collect()
+    };
+    let before = transactions.len();
+    transactions.retain(|tx| {
+        let consumed = Owes::of(&crossings_consumed(&member_of(tx, trie, local)));
+        if consumed.is_empty() {
+            return true;
+        }
+        let mut with = added.clone();
+        with.owe(&consumed);
+        if fits(&with) {
+            added = with;
+            true
+        } else {
+            false
+        }
+    });
+    (claims, cut.len(), before - transactions.len())
 }
 
 /// `claims` less the consumer's `Never` of every record their block
@@ -431,11 +552,11 @@ mod tests {
         state_and_proof, state_and_proof_holding, stub_stated_terms, stub_transaction, test_key,
     };
     use hyperscale_types::{
-        Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
-        Hash, Inclusion, LocalKey, MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON,
-        ReadFrontier, ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, StateWrites,
-        Stated, TickHalf, TickId, TimestampRange, Verifiable, WeightedTimestamp, encode_amount,
-        entry_leaf_key,
+        Address, AddressClass, AnswerDelta, BlockHeight, CollectionId, Deadline, EntryKey, Epoch,
+        EpochWindows, Hash, Inclusion, LocalKey, MAX_STANDING_ANSWERS_FROM_SHARD,
+        MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON, ReadFrontier, ReadMark, Reading,
+        SettledEntries, SettledWrites, StateRoot, StateWrites, Stated, TickHalf, TickId,
+        TimestampRange, Verifiable, WeightedTimestamp, encode_amount, entry_leaf_key,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -1956,5 +2077,63 @@ mod tests {
             id.answer_key(&ProtocolHasher, Answered::Never)
         ));
         assert!(reads(&cut, record));
+    }
+
+    /// A proposer cuts from its claims every owed record whose `Taken`
+    /// the count at its parent cannot take beside the ones kept ahead of
+    /// it, and every one where it holds no count; the rest of the claim
+    /// stays, under its proof restricted to what is kept.
+    #[test]
+    fn a_proposer_cuts_the_owed_records_the_cap_refuses() {
+        let producer = ShardId::leaf(1, 1);
+        let ids = [crossing(0xA0), crossing(0xB0)];
+        let records: Vec<SubstateKey> = ids
+            .iter()
+            .map(|id| id.record_key(&ProtocolHasher))
+            .collect();
+        let (state_root, proof) = state_and_proof(producer, &records, &records);
+        let claim = StateClaim::new(
+            Anchor {
+                state_root,
+                ..anchor(producer, 4)
+            },
+            ids.iter().zip(&records).map(|(id, record)| {
+                (
+                    *record,
+                    Stated::Held(Bytes::new(record_cell(*id, Terms::Owed).to_bytes()).unwrap()),
+                )
+            }),
+            proof,
+        )
+        .naming(records.iter().copied().zip(ids));
+        let first = claim.crossings.iter().next().expect("two named").0;
+        let trie = ShardTrie::single();
+        let parent = Parent::default();
+        let cut = |standing: Option<&StandingAnswers>| {
+            let mut none = Capped::empty();
+            let (claims, cut, _) = within_the_cap(
+                standing,
+                &trie,
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(5_000),
+                &parent,
+                vec![claim.clone()],
+                &mut none,
+            );
+            (
+                claims.iter().flat_map(StateClaim::keys).collect::<Vec<_>>(),
+                cut,
+            )
+        };
+
+        let mut one_short = StandingAnswers::default();
+        let mut delta = AnswerDelta::default();
+        for _ in 0..MAX_STANDING_ANSWERS_FROM_SHARD - 1 {
+            delta.put(RoutePrefix::of(ids[0].producer));
+        }
+        one_short.advance(&delta).expect("only adds");
+        assert_eq!(cut(Some(&one_short)), (vec![first], 1));
+        assert_eq!(cut(None), (vec![], 2));
+        assert_eq!(cut(Some(&StandingAnswers::default())).1, 0);
     }
 }

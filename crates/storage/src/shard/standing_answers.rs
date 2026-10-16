@@ -11,12 +11,15 @@ use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    AnswerDelta, BlockHash, BlockHeight, RoutePrefix, StandingAnswers, SubstateKey,
+    AnswerAdditions, AnswerDelta, BlockHash, BlockHeight, RoutePrefix, StandingAnswers, StateClaim,
+    StateWrites, SubstateKey,
 };
 use hyperscale_vm_effects::{CrossingLeaf, ProtocolHasher};
 
+use crate::shard::members::owed_by_entries;
 use crate::{
-    CrossingCursor, PendingChain, ShardStorage, SubstateStore, Substates, key_under_prefix,
+    CrossingCursor, MemberInputs, PendingChain, ShardStorage, SubstateStore, Substates,
+    key_under_prefix, owed_credits, unclaimed_declines,
 };
 
 /// The producer route of the answer `value` at `key` is, or `None`
@@ -55,6 +58,45 @@ pub fn answer_delta<'a>(
         }
     }
     delta
+}
+
+/// What a block adds to the answers and owed crossings its chain stands
+/// holding under `under`.
+///
+/// The crossings each transaction its `members` state terms for owes,
+/// and the answers its owed credits and its declines write over
+/// `parent`.
+///
+/// Reads the block's terms and claims and the parent points they name,
+/// and no row: an owed credit's `Taken` counts whatever row stands for
+/// its transaction, and an escrowed arrival writes no answer. A credit
+/// writing over another transaction's `Taken` counts one it does not
+/// add, which errs toward refusing.
+#[must_use]
+pub fn answer_additions(
+    members: &MemberInputs,
+    state_claims: &[StateClaim],
+    parent: &(impl Substates + ?Sized),
+    under: &NibblePath,
+) -> AnswerAdditions {
+    let mut additions = AnswerAdditions::default();
+    for owes in owed_by_entries(&members.terms).values() {
+        additions.owe(owes);
+    }
+    let owed = owed_credits(state_claims, &StateWrites::default(), parent);
+    let declined = unclaimed_declines(state_claims, members.shard, members.committed, parent);
+    for (key, written) in owed.cells.iter().chain(declined.cells.iter()) {
+        if !key_under_prefix(&key.to_bytes(), under) {
+            continue;
+        }
+        if let Some(route) = written
+            .as_deref()
+            .and_then(|value| answer_route(*key, value))
+        {
+            additions.add(route, 1);
+        }
+    }
+    additions
 }
 
 /// The persisted chain a follow reads its count off.

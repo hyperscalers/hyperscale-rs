@@ -46,31 +46,31 @@ use hyperscale_shard::parent_checks::{
 };
 use hyperscale_shard::{ProposalInputs, ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor,
-    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore,
-    Substates, TerminalWindow, TickChain, colliding_committed_cell, colliding_member_row,
-    creations_of, filter_writes_to_prefix,
+    AnswerFollow, BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex,
+    ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
+    SubstateStore, Substates, TerminalWindow, TickChain, answer_additions,
+    colliding_committed_cell, colliding_member_row, creations_of, filter_writes_to_prefix,
 };
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
-    AggregateSignature, Anchor, AnswerDelta, BeaconWitnessRoot, BeaconWitnessRootContext,
-    BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
-    BlockManifest, BlockVote, BodyRootContext, CertificateRoot, CertifiedBlock, ChainOrigin,
-    CheckOutcome, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch, Finalization,
-    FrontierInputs, GossipMessage, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp,
-    MessageClass, NetworkDefinition, NetworkMessage, ProposerTimestamp, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, ReadySignal, Request, Round, RoutingCommittees, SectionRoots,
-    SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
-    SharedTransactions, Signer, SignerBitfield, StateClaim, StateRoot, StateRootContext,
-    StateRootVerifyError, StoredReceipt, SubstateKey, SweepFrontier, Timeout, TimeoutContext,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifiable, VerificationKind, Verified, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_prefix_path, shard_reveal_sign,
-    signed_bytes,
+    AggregateSignature, Anchor, AnswerAdditions, AnswerDelta, BeaconWitnessRoot,
+    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
+    BlockHeaderParts, BlockHeight, BlockManifest, BlockVote, BodyRootContext, CertificateRoot,
+    CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey, ConsensusReceipt,
+    ConsensusSignature, Epoch, Finalization, FrontierInputs, GossipMessage, Hash, HborSigned,
+    LocalReceiptRoot, LocalTimestamp, MessageClass, NetworkDefinition, NetworkMessage,
+    ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Request,
+    Round, RoutingCommittees, SectionRoots, SettledWrites, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, SharedTransactions, Signer, SignerBitfield,
+    StateClaim, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, SubstateKey,
+    SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    VerificationKind, Verified, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    local_settled_tx_hashes, shard_prefix_path, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -276,6 +276,7 @@ enum SimEvent {
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         bytes_delta: i64,
         answers: AnswerDelta,
+        additions: AnswerAdditions,
     },
     QcResult {
         block_hash: BlockHash,
@@ -577,6 +578,12 @@ impl ShardCoordinatorSim {
             let genesis_proposer = members[0].0;
             let genesis = build_genesis_block(&storages[idx], genesis_proposer, shard);
             let actions = coord.initialize_genesis(&genesis);
+            seed_genesis_answers(
+                &mut coord,
+                &topology_schedule,
+                &pending_chains[idx],
+                &genesis,
+            );
             // `initialize_genesis` only emits `SetTimer`; tripwire
             // in case that ever changes.
             assert!(
@@ -1319,6 +1326,7 @@ impl ShardCoordinatorSim {
                 provisions,
                 bytes_delta,
                 answers,
+                additions,
             } => coord.on_proposal_built(
                 topology_schedule,
                 height,
@@ -1329,6 +1337,7 @@ impl ShardCoordinatorSim {
                 provisions,
                 bytes_delta,
                 answers,
+                additions,
             ),
             SimEvent::QcResult {
                 block_hash,
@@ -1425,6 +1434,7 @@ impl ShardCoordinatorSim {
                 provisions,
                 bytes_delta,
                 answers,
+                additions,
             } = event
             else {
                 panic!(
@@ -1443,6 +1453,7 @@ impl ShardCoordinatorSim {
                     provisions,
                     bytes_delta,
                     answers,
+                    additions,
                 },
             });
         }
@@ -1711,6 +1722,7 @@ impl ShardCoordinatorSim {
                 rowless,
                 manifest,
                 timeout_cert,
+                standing_answers,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
@@ -1863,6 +1875,7 @@ impl ShardCoordinatorSim {
                     &frontier,
                     &manifest,
                     timeout_cert,
+                    standing_answers.as_ref(),
                 )
                 .expect("the sim persists a block only after its proposal is built");
                 let block_hash = result.block_hash;
@@ -1894,6 +1907,7 @@ impl ShardCoordinatorSim {
                         provisions,
                         bytes_delta,
                         answers,
+                        additions: result.additions,
                     },
                 });
             }
@@ -2152,6 +2166,12 @@ impl ShardCoordinatorSim {
                 let bytes_delta = jmt_snapshot.bytes_delta;
                 let answers =
                     jmt_snapshot.answer_delta(&view.snapshot(), &shard_prefix_path(self.shard));
+                let additions = answer_additions(
+                    &members,
+                    &state_claims,
+                    &view.snapshot(),
+                    &shard_prefix_path(self.shard),
+                );
                 if verify_result.is_ok() {
                     self.pending_chains[emitter_idx].insert(
                         block_hash,
@@ -2179,6 +2199,7 @@ impl ShardCoordinatorSim {
                             Ok(_) => CheckOutcome::Checked {
                                 bytes_delta,
                                 answers,
+                                additions,
                             },
                             Err(_) => CheckOutcome::Refused,
                         },
@@ -2403,4 +2424,22 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         timestamp: ProposerTimestamp::from_millis(h.timestamp().as_millis().saturating_add(1)),
         ..h.clone().into_parts()
     })
+}
+
+/// Seed `coord`'s answer count at `genesis` with a whole read of the
+/// store, as the node's shard loop seeds a seat at its chain's genesis.
+fn seed_genesis_answers(
+    coord: &mut ShardCoordinator,
+    schedule: &TopologySchedule,
+    pending_chain: &Arc<PendingChain<SimShardStorage>>,
+    genesis: &Block,
+) {
+    let count = AnswerFollow::whole(
+        pending_chain,
+        (genesis.height(), genesis.hash()),
+        &shard_prefix_path(genesis.header().shard_id()),
+    )
+    .count()
+    .clone();
+    coord.seed_standing_answers(schedule, genesis.height(), count);
 }

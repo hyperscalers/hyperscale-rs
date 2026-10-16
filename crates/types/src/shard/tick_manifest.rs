@@ -149,6 +149,12 @@ impl Owes {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// How many crossings are owed, over every route.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.0.iter().map(|(_, count)| u64::from(*count)).sum()
+    }
 }
 
 /// One line of a block's tick manifest.
