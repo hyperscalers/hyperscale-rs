@@ -257,12 +257,26 @@ async fn deliver(to: &UdpSocket, datagram: &[u8], dest: SocketAddr, link: &Link)
     }
 }
 
-/// A free port on loopback address `ip`, for a host whose bridge must exist
-/// before it binds.
-fn free_loopback_port(ip: IpAddr) -> SocketAddr {
-    StdUdpSocket::bind((ip, 0))
-        .and_then(|socket| socket.local_addr())
-        .expect("a loopback port is free")
+/// A port on loopback address `ip` held for a host whose bridge must exist
+/// before it binds. The port stays taken until the reservation is dropped,
+/// just before the host binds it, so no socket opened meanwhile gets it.
+struct Reserved {
+    socket: StdUdpSocket,
+    addr: SocketAddr,
+}
+
+impl Reserved {
+    fn on(ip: IpAddr) -> Self {
+        let socket = StdUdpSocket::bind((ip, 0)).expect("a loopback port is free");
+        let addr = socket.local_addr().expect("a bound socket has an address");
+        Self { socket, addr }
+    }
+
+    /// Give the port up for its host to bind.
+    fn release(self) -> SocketAddr {
+        drop(self.socket);
+        self.addr
+    }
 }
 
 /// A hub holding an iroh connection to each of its peers over a bridge.
@@ -323,12 +337,12 @@ impl Star {
             }
         };
 
-        let hub_socket = free_loopback_port(Ipv4Addr::LOCALHOST.into());
+        let hub_socket = Reserved::on(Ipv4Addr::LOCALHOST.into());
         let mut sockets = Vec::new();
         let mut bridges = Vec::new();
         for _ in 0..peers {
-            let socket = free_loopback_port(Ipv6Addr::LOCALHOST.into());
-            let bridge = UdpBridge::spawn(hub_socket, socket)
+            let socket = Reserved::on(Ipv6Addr::LOCALHOST.into());
+            let bridge = UdpBridge::spawn(hub_socket.addr, socket.addr)
                 .await
                 .expect("the bridge opens");
             bridge.set_delay(rtt / 2);
@@ -337,11 +351,12 @@ impl Star {
         }
 
         let dialed = usize::try_from(hub_dials.min(peers)).unwrap_or(usize::MAX);
+        let mut sockets = sockets.into_iter();
         let mut bound = Vec::new();
         let mut hub_bootstrap = Vec::new();
-        for (slot, (socket, bridge)) in sockets.iter().zip(&bridges).enumerate().take(dialed) {
+        for (slot, (socket, bridge)) in sockets.by_ref().zip(&bridges).enumerate().take(dialed) {
             let index = u32::try_from(slot).unwrap_or(u32::MAX) + 1;
-            let peer = bind(index, *socket, Vec::new()).await;
+            let peer = bind(index, socket.release(), Vec::new()).await;
             hub_bootstrap.push(
                 EndpointAddr::new(peer.local_endpoint_id())
                     .with_ip_addr(bridge.seen_by_left())
@@ -349,13 +364,13 @@ impl Star {
             );
             bound.push(peer);
         }
-        let hub = bind(0, hub_socket, hub_bootstrap).await;
-        for (slot, (socket, bridge)) in sockets.iter().zip(&bridges).enumerate().skip(dialed) {
-            let index = u32::try_from(slot).unwrap_or(u32::MAX) + 1;
+        let hub = bind(0, hub_socket.release(), hub_bootstrap).await;
+        for (slot, (socket, bridge)) in sockets.zip(bridges.iter().skip(dialed)).enumerate() {
+            let index = u32::try_from(slot + dialed).unwrap_or(u32::MAX) + 1;
             let hub_addr = EndpointAddr::new(hub.local_endpoint_id())
                 .with_ip_addr(bridge.seen_by_right())
                 .with_relay_url(relay.url());
-            bound.push(bind(index, *socket, vec![hub_addr]).await);
+            bound.push(bind(index, socket.release(), vec![hub_addr]).await);
         }
         for (peer, bridge) in bound.iter().zip(&bridges) {
             peer.add_external_addr(bridge.seen_by_left()).await;
