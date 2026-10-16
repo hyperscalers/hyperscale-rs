@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -160,6 +160,8 @@ struct Inner {
     dial_backoff: Mutex<HashMap<EndpointId, StreamBackoff<Instant>>>,
     /// Slots for inbound connections that have not bound yet.
     unbound: Arc<Semaphore>,
+    /// This host's address records and the addresses they were signed for.
+    signed_records: Mutex<Option<(EndpointAddr, Vec<ValidatorAddressGossip>)>>,
 }
 
 /// iroh-based network adapter: the host's endpoint and its bound
@@ -261,6 +263,7 @@ impl IrohAdapter {
             dialing: DashSet::new(),
             dial_backoff: Mutex::new(HashMap::new()),
             unbound: Arc::new(Semaphore::new(MAX_UNBOUND_INBOUND)),
+            signed_records: Mutex::new(None),
         });
 
         let tasks = vec![
@@ -363,8 +366,25 @@ impl IrohAdapter {
     /// One signed address record per hosted vnode, naming where this host
     /// can currently be reached. Empty while the endpoint knows no address
     /// for itself.
+    ///
+    /// The records are signed again only when the addresses change. Every
+    /// newly bound peer is handed them, and peers forward what they accept,
+    /// so records signed afresh for each link would each travel the whole
+    /// network and be verified by every host: on a freshly seated committee
+    /// of n hosts, n squared distinct records verified n times over.
     #[must_use]
     pub fn address_records(&self) -> Vec<ValidatorAddressGossip> {
+        let endpoint = self.inner.endpoint_addr();
+        let mut signed = self
+            .inner
+            .signed_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((addressed, records)) = signed.as_ref()
+            && *addressed == endpoint
+        {
+            return records.clone();
+        }
         // Wall-clock milliseconds: orders re-announcements across process
         // restarts, which a per-process counter cannot.
         let sequence = u64::try_from(
@@ -374,12 +394,14 @@ impl IrohAdapter {
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        sign_records(
-            &self.inner.endpoint_addr(),
+        let records = sign_records(
+            &endpoint,
             sequence,
             &self.inner.bind.network,
             &self.inner.bind.local_vnodes,
-        )
+        );
+        *signed = Some((endpoint, records.clone()));
+        records
     }
 
     /// The newest signed address announcement of every recorded validator.
