@@ -26,6 +26,10 @@
 //! || their_nonce)`. The verifier checks every signature against that
 //! validator's consensus key from the topology; any failure rejects the
 //! whole exchange.
+//!
+//! The listener signs before the dialer has proved anything, so the
+//! endpoint runs the exchange only for a dialer that has a turn at it
+//! (see [`crate::bind_gate`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -424,6 +428,27 @@ pub async fn respond(
     ctx.verify(remote, &our_nonce, &remote_attestations)?;
 
     Ok(proven(remote, &remote_attestations, "listener"))
+}
+
+/// Open a bind exchange on `connection` as a dialer that proves nothing:
+/// state a version and a nonce, read the listener's signatures, and stop.
+/// Returns how many validators the listener signed for.
+#[cfg(feature = "test-utils")]
+pub async fn hello_only(connection: &Connection) -> Result<usize, BindError> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| BindError::StreamOpen(e.to_string()))?;
+    send.write_all(&[STREAM_BIND])
+        .await
+        .map_err(|e| BindError::Io(io::Error::other(e)))?;
+    let nonce: [u8; VALIDATOR_BIND_NONCE_LEN] = random();
+    write(&mut send, &BindContext::version_statement()).await?;
+    write(&mut send, &nonce).await?;
+    let _version = read(&mut recv).await?;
+    let (attestations, _) =
+        decode_response(&read(&mut recv).await?).ok_or(BindError::InvalidMessage)?;
+    Ok(attestations.len())
 }
 
 #[cfg(test)]

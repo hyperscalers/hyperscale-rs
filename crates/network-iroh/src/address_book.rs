@@ -241,6 +241,15 @@ impl AddressBook {
         self.records.get(&validator).map(|r| r.clone())
     }
 
+    /// Whether a verified record names `endpoint`: some validator stands
+    /// behind it.
+    #[must_use]
+    pub(crate) fn names(&self, endpoint: EndpointId) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.endpoint.id == endpoint)
+    }
+
     /// Endpoints to dial so every validator in `wanted` becomes reachable:
     /// the wanted validators with no live bind entry in `bound` whose
     /// address is known, deduplicated by endpoint (a multi-vnode host

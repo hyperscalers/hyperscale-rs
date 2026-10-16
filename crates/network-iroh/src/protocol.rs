@@ -76,6 +76,9 @@ pub const CLOSE_SUPERSEDED: VarInt = VarInt::from_u32(2);
 /// bound or has opened a newer one.
 pub const CLOSE_REDIAL_REFUSED: VarInt = VarInt::from_u32(4);
 
+/// Close code: the host signs for no more dialers like this one for now.
+pub const CLOSE_BIND_REFUSED: VarInt = VarInt::from_u32(5);
+
 /// Close code: the host is shutting down.
 pub const CLOSE_SHUTDOWN: VarInt = VarInt::from_u32(3);
 

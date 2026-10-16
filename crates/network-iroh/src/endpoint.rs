@@ -7,7 +7,8 @@
 //! else, and an inbound connection that has not bound within
 //! [`BIND_TIMEOUT`] is closed. Anyone who learns an endpoint id can reach
 //! the host through its relay without knowing its address, so unbound
-//! inbound connections are capped as well as timed.
+//! inbound connections are capped as well as timed, and the host signs for
+//! a dialer only when the dialer has a turn (see [`crate::bind_gate`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -37,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::address_book::{AddressBook, IngestOutcome, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
+use crate::bind_gate::BindGate;
 use crate::config::{IrohConfig, MAX_RELAYS};
 use crate::error::NetworkError;
 use crate::fanout::Fanout;
@@ -44,7 +46,8 @@ use crate::fault_gate::FaultState;
 use crate::inbound::InboundRouter;
 use crate::path::{PathPolicy, PathStatus, Redialer};
 use crate::protocol::{
-    ALPN, CLOSE_BIND_FAILED, CLOSE_REDIAL_REFUSED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED, REDIAL_ALPN,
+    ALPN, CLOSE_BIND_FAILED, CLOSE_BIND_REFUSED, CLOSE_REDIAL_REFUSED, CLOSE_SHUTDOWN,
+    CLOSE_SUPERSEDED, REDIAL_ALPN,
 };
 
 /// How long a connection has to complete the validator-bind handshake.
@@ -160,6 +163,8 @@ struct Inner {
     dial_backoff: Mutex<HashMap<EndpointId, StreamBackoff<Instant>>>,
     /// Slots for inbound connections that have not bound yet.
     unbound: Arc<Semaphore>,
+    /// Which dialers this host signs for before they prove anything.
+    bind_gate: BindGate,
     /// This host's address records and the addresses they were signed for.
     signed_records: Mutex<Option<(EndpointAddr, Vec<ValidatorAddressGossip>)>>,
 }
@@ -263,6 +268,7 @@ impl IrohAdapter {
             dialing: DashSet::new(),
             dial_backoff: Mutex::new(HashMap::new()),
             unbound: Arc::new(Semaphore::new(MAX_UNBOUND_INBOUND)),
+            bind_gate: BindGate::default(),
             signed_records: Mutex::new(None),
         });
 
@@ -714,6 +720,13 @@ impl Inner {
         let peer = connection.remote_id();
         if connection.alpn() == REDIAL_ALPN {
             self.hold_redial(connection);
+            return;
+        }
+        // The listener signs before the dialer proves anything, so it signs
+        // only for a dialer with a turn.
+        if !self.bind_gate.admit(peer, self.address_book.names(peer)) {
+            debug!(peer = %peer.fmt_short(), "Refusing to bind: no turn for this dialer");
+            connection.close(CLOSE_BIND_REFUSED, b"no turn");
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
