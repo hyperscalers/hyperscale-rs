@@ -47,6 +47,14 @@ const EMA_ALPHA: f64 = 0.2;
 /// Selection weight of a peer never asked.
 const NEUTRAL_WEIGHT: f64 = 0.5;
 
+/// Time over which the distrust an answer the requester could not use earns
+/// a peer halves.
+const DISTRUST_HALF_LIFE: Duration = Duration::from_mins(1);
+
+/// Least share of its selection weight a distrusted peer keeps, so it is
+/// still asked now and then.
+const DISTRUSTED_FLOOR: f64 = 0.02;
+
 /// Whether `class` runs the relaxed retry regime.
 ///
 /// `Recovery` and `Bulk` are the sheddable classes; every other class retries
@@ -117,6 +125,11 @@ struct PeerHealth {
     last_success: Option<Duration>,
     /// Attempts the peer answered, whether or not it held what was asked.
     round_trips: u64,
+    /// How far the peer is distrusted for answering with something the
+    /// requester could not use, from 0 to 1, as of `distrusted_at`. Only
+    /// time pays it down.
+    distrust: f64,
+    distrusted_at: Duration,
 }
 
 impl Default for PeerHealth {
@@ -127,6 +140,8 @@ impl Default for PeerHealth {
             in_flight: 0,
             last_success: None,
             round_trips: 0,
+            distrust: 0.0,
+            distrusted_at: Duration::ZERO,
         }
     }
 }
@@ -154,6 +169,25 @@ impl PeerHealth {
         self.penalise(kind);
     }
 
+    /// The peer's answer did not hold up: it was the attempt's success in
+    /// form only. The peer loses the recency that answer earned and is
+    /// distrusted in full; time alone pays that back, so answering again,
+    /// whatever with, buys nothing.
+    fn distrust(&mut self, now: Duration) {
+        self.penalise(FailureKind::Other);
+        self.last_success = None;
+        self.distrust = 1.0;
+        self.distrusted_at = now;
+    }
+
+    /// The peer's distrust at `now`, halved for each half-life since it was
+    /// last distrusted.
+    fn distrust_at(&self, now: Duration) -> f64 {
+        let half_lives =
+            now.saturating_sub(self.distrusted_at).as_secs_f64() / DISTRUST_HALF_LIFE.as_secs_f64();
+        self.distrust * 0.5f64.powf(half_lives)
+    }
+
     fn penalise(&mut self, kind: FailureKind) {
         let penalty = match kind {
             FailureKind::Timeout => EMA_ALPHA * 0.5,
@@ -163,7 +197,8 @@ impl PeerHealth {
     }
 
     /// Higher is likelier to be picked: success rate (floored so no peer is
-    /// shut out), lower RTT, fewer requests in flight, and a recent success.
+    /// shut out), lower RTT, fewer requests in flight, a recent success, and
+    /// no answer distrusted lately.
     fn selection_weight(&self, now: Duration) -> f64 {
         let success_factor = self.success_rate_ema.max(0.05);
         let rtt_factor = 1.0 / (1.0 + self.rtt_ema_secs);
@@ -173,7 +208,8 @@ impl PeerHealth {
             Some(since) if since < Duration::from_mins(1) => 1.0,
             _ => 0.9,
         };
-        success_factor * rtt_factor * load_factor * recency_factor
+        let trust_factor = (1.0 - self.distrust_at(now)).max(DISTRUSTED_FLOOR);
+        success_factor * rtt_factor * load_factor * recency_factor * trust_factor
     }
 }
 
@@ -219,6 +255,16 @@ impl<P: Ord + Copy> PeerHealthBook<P> {
             .entry(peer)
             .or_default()
             .penalise(FailureKind::Other);
+    }
+
+    /// Record that an answer `peer` gave at `now` held up to nothing: it did
+    /// not decode, or what it carried was false. Unlike an answer the
+    /// requester merely could not use, which [`Self::record_rejected`]
+    /// counts, no honest peer gives one, so the peer is distrusted until
+    /// time pays it back. The attempt already resolved as a success, so
+    /// nothing of it is still in flight.
+    pub fn record_invalid(&mut self, peer: P, now: Duration) {
+        self.peers.entry(peer).or_default().distrust(now);
     }
 
     /// Record an attempt to `peer` abandoned without an outcome.
@@ -615,6 +661,75 @@ mod tests {
         book.record_rejected(1);
         assert_eq!(book.peers[&1].in_flight, 1);
         assert!(book.peers[&1].success_rate_ema < before);
+    }
+
+    /// What a peer that answers with garbage, a slow honest one, and a
+    /// fresh one weigh after `rounds` rounds of being asked at `NOW`.
+    fn weights_after_garbage(rounds: u32, invalid: bool) -> (f64, f64, f64) {
+        let mut book = PeerHealthBook::default();
+        let (garbage, slow, fresh) = (1u32, 2, 3);
+        for _ in 0..rounds {
+            book.record_success(garbage, Duration::from_millis(5), NOW);
+            if invalid {
+                book.record_invalid(garbage, NOW);
+            } else {
+                book.record_rejected(garbage);
+            }
+            book.record_success(slow, Duration::from_secs(1), NOW);
+        }
+        let weight = |peer: u32| {
+            book.peers
+                .get(&peer)
+                .map_or(NEUTRAL_WEIGHT, |health| health.selection_weight(NOW))
+        };
+        (weight(garbage), weight(slow), weight(fresh))
+    }
+
+    #[test]
+    fn a_peer_answering_garbage_ranks_far_below_fresh_and_slow_honest_peers() {
+        let (garbage, slow, fresh) = weights_after_garbage(20, true);
+        assert!(
+            garbage < fresh / 10.0,
+            "garbage {garbage} against fresh {fresh}"
+        );
+        assert!(
+            garbage < slow / 10.0,
+            "garbage {garbage} against slow {slow}"
+        );
+
+        // An answer the requester merely could not use costs far less.
+        let (unusable, _, fresh) = weights_after_garbage(20, false);
+        assert!(
+            unusable > fresh * 0.8,
+            "unusable {unusable} against fresh {fresh}"
+        );
+    }
+
+    #[test]
+    fn only_time_pays_distrust_back() {
+        let mut book = PeerHealthBook::default();
+        book.record_success(1u32, Duration::from_millis(5), NOW);
+        book.record_invalid(1, NOW);
+        let distrusted = book.peers[&1].selection_weight(NOW);
+
+        // Good answers at once restore the success rate, not the trust.
+        for _ in 0..50 {
+            book.record_success(1, Duration::from_millis(5), NOW);
+        }
+        let answered = book.peers[&1].selection_weight(NOW);
+        assert!(
+            answered < NEUTRAL_WEIGHT / 10.0,
+            "answering again buys nothing back: {answered}"
+        );
+        assert!(answered >= distrusted);
+
+        let later = NOW + DISTRUST_HALF_LIFE * 6;
+        assert!(
+            book.peers[&1].selection_weight(later) > NEUTRAL_WEIGHT,
+            "time pays the distrust back"
+        );
+        let half = book.peers[&1].selection_weight(NOW + DISTRUST_HALF_LIFE);
+        assert!(half > answered && half < book.peers[&1].selection_weight(later));
     }
 
     #[test]

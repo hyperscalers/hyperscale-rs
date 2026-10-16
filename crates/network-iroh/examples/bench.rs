@@ -14,6 +14,7 @@
 //! bench delayed-idle --rtt-ms 40 --connections 500
 //! bench reject-flood --rate 1000 --forged-per-signed 7 [--follower]
 //! bench refused-flood --rate 1000 --verdict reject|ignore
+//! bench garbage-responder --backend iroh|libp2p --requests 2000
 //! ```
 //!
 //! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
@@ -246,6 +247,14 @@ enum Command {
         /// The receiver serves no shard.
         #[arg(long)]
         follower: bool,
+    },
+    /// One of a shard's responders answers every request with garbage.
+    GarbageResponder {
+        #[arg(long, value_enum)]
+        backend: Backend,
+        /// Requests the asker needs answered.
+        #[arg(long, default_value_t = 2000)]
+        requests: u64,
     },
     /// A peer floods global items its receiver refuses with one verdict.
     RefusedFlood {
@@ -779,6 +788,87 @@ async fn range<N: Network>(backend: Backend, hosts: Vec<Host<N>>) {
     );
 }
 
+/// The asker of a range cluster needs `requests` small chunks, each asked
+/// until a good answer lands, while the first server answers every request
+/// with a chunk the asker rejects. Counts what each server was asked.
+async fn garbage_responder<N: Network>(backend: Backend, hosts: Vec<Host<N>>, requests: u64) {
+    const GOOD: usize = 64;
+    let asker = RANGE_SERVERS;
+    let pairs: Vec<(u32, u32)> = (0..RANGE_SERVERS).map(|server| (asker, server)).collect();
+    let (link_time, unbound) = await_links(&hosts, &pairs).await;
+
+    let served: Vec<Arc<AtomicU64>> = (0..RANGE_SERVERS)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+    for (index, server) in hosts[..RANGE_SERVERS as usize].iter().enumerate() {
+        let count = Arc::clone(&served[index]);
+        let len = if index == 0 { 1 } else { GOOD };
+        server
+            .network
+            .register_request_handler(ShardId::ROOT, move |_: GetChunk| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Chunk(vec![1; len])
+            });
+    }
+
+    let next = Arc::new(AtomicU64::new(0));
+    let network = Arc::clone(&hosts[asker as usize].network);
+    let start = Instant::now();
+    let workers: Vec<_> = (0..RANGE_WORKERS)
+        .map(|_| {
+            let (network, next) = (Arc::clone(&network), Arc::clone(&next));
+            spawn(async move {
+                while next.fetch_add(1, Ordering::Relaxed) < requests {
+                    loop {
+                        let (tx, rx) = oneshot::channel();
+                        network.request(
+                            ShardId::ROOT,
+                            None,
+                            GetChunk(0),
+                            None,
+                            Box::new(move |outcome: Result<Chunk, RequestError>| {
+                                let good =
+                                    matches!(&outcome, Ok(Chunk(body)) if body.len() == GOOD);
+                                let _ = tx.send(good);
+                                if good {
+                                    ResponseVerdict::Accept
+                                } else {
+                                    ResponseVerdict::Reject
+                                }
+                            }),
+                        );
+                        if rx.await == Ok(true) {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.await.expect("a worker finishes");
+    }
+    let elapsed = start.elapsed();
+    let counts: Vec<u64> = served.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let total: u64 = counts.iter().sum();
+    #[allow(clippy::cast_precision_loss)] // a share for a report
+    let share = counts[0] as f64 / total as f64;
+    println!(
+        "{}",
+        json!({
+            "measurement": "garbage responder",
+            "backend": backend.name(),
+            "links_unbound": unbound,
+            "link_secs": link_time.as_secs_f64(),
+            "requests": requests,
+            "secs": elapsed.as_secs_f64(),
+            "served_per_server": counts,
+            "garbage_share": share,
+            "wasted_attempts": counts[0],
+        })
+    );
+}
+
 async fn committee<N: Network>(backend: Backend, hosts: Vec<Host<N>>, size: u32) {
     let (link_time, unbound) = await_links(&hosts, &mesh_pairs(size)).await;
     // A vote goes to the round's proposer and the next two, as consensus
@@ -1299,6 +1389,19 @@ async fn main() {
             follower,
         } => {
             reject_flood(rate, forged_per_signed, Duration::from_secs(secs), follower).await;
+        }
+        Command::GarbageResponder { backend, requests } => {
+            let spec = ClusterSpec {
+                hosts: RANGE_SERVERS + 1,
+                seated: RANGE_SERVERS,
+                serves: |index| index < RANGE_SERVERS,
+                meshed: true,
+                timers: PathTimers::default(),
+            };
+            on_backend!(backend, spec, |hosts| garbage_responder(
+                backend, hosts, requests
+            )
+            .await);
         }
         Command::RefusedFlood {
             rate,

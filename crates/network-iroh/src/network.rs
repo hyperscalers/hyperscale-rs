@@ -396,18 +396,29 @@ impl Network for IrohNetwork {
                 .await
             {
                 Ok((peer, bytes)) => {
-                    let verdict = match hbor_from_slice::<R::Response>(&bytes) {
-                        Ok(response) => on_response(Ok(response)),
+                    // An empty answer the caller rejects says the peer did
+                    // not hold what was asked; any other it rejects, or one
+                    // that does not decode, says the peer answered falsely.
+                    match hbor_from_slice::<R::Response>(&bytes) {
+                        Ok(response) => {
+                            let empty = R::is_empty_response(&response);
+                            if matches!(on_response(Ok(response)), ResponseVerdict::Reject) {
+                                if empty {
+                                    rm.record_rejected(peer);
+                                } else {
+                                    rm.record_invalid(peer);
+                                }
+                                record_request_retry("app_rejected");
+                            }
+                        }
                         Err(e) => {
                             warn!(error = ?e, "Failed to decode response");
-                            on_response(Err(RequestError::PeerError(format!(
+                            let _ = on_response(Err(RequestError::PeerError(format!(
                                 "decode error: {e:?}"
-                            ))))
+                            ))));
+                            rm.record_invalid(peer);
+                            record_request_retry("app_rejected");
                         }
-                    };
-                    if matches!(verdict, ResponseVerdict::Reject) {
-                        rm.record_rejected(peer);
-                        record_request_retry("app_rejected");
                     }
                 }
                 Err(e) => {
