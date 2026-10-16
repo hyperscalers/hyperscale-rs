@@ -186,6 +186,33 @@ async fn a_wanted_validator_is_dialed_from_its_signed_record() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_host_signs_its_records_again_only_when_its_addresses_change() {
+    let fixtures = TestFixtures::new(7, 2);
+    let host = HostSpec::new(&fixtures, &[0, 1]).bind().await;
+
+    let first = host.address_records();
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        host.address_records(),
+        first,
+        "the same addresses give the same records, so every copy dedups"
+    );
+
+    host.add_external_addr("203.0.113.7:9000".parse().unwrap())
+        .await;
+    assert!(
+        wait_for(BIND_BUDGET, || host.address_records() != first).await,
+        "new addresses are signed afresh"
+    );
+    let moved = host.address_records();
+    assert!(
+        moved
+            .iter()
+            .all(|record| record.sequence > first[0].sequence)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn hosts_that_dial_each_other_at_once_keep_one_connection() {
     let fixtures = TestFixtures::new(7, 2);
     let host0 = HostSpec::new(&fixtures, &[0]).bind().await;
