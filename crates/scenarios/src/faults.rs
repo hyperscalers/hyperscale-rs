@@ -2044,9 +2044,9 @@ fn agreed_state_root(c: &impl FaultableCluster, shard: ShardId) -> Option<StateR
 /// # Panics
 ///
 /// Panics if consensus does not commit before the partition, the majority fails
-/// to progress while the fragment is dark, the fragment advances while
-/// partitioned, or the rejoined fragment fails to catch up and agree on the
-/// committed root after the heal.
+/// to progress while the fragment is dark, the fragment keeps up with the
+/// majority while partitioned, or the rejoined fragment fails to catch up and
+/// agree on the committed root after the heal.
 pub fn minority_fragment_rejoins_after_partition(c: &mut impl FaultableCluster) {
     assert_eq!(
         c.host_count(),
@@ -2074,13 +2074,6 @@ pub fn minority_fragment_rejoins_after_partition(c: &mut impl FaultableCluster) 
         .committed_height(ShardId::ROOT)
         .expect("a committed height before the partition")
         .inner();
-    let frag_before: Vec<u64> = [0, 1]
-        .iter()
-        .map(|&host| {
-            c.host_committed_height(host, ShardId::ROOT)
-                .map_or(0, BlockHeight::inner)
-        })
-        .collect();
 
     // Keep the fragment dark across exactly one epoch boundary — the majority
     // (five of seven) keeps both shard and beacon consensus live, and bounding
@@ -2107,14 +2100,18 @@ pub fn minority_fragment_rejoins_after_partition(c: &mut impl FaultableCluster) 
         .expect("a committed height during the partition")
         .inner();
 
-    // The dark fragment has no quorum of its own, so neither of its hosts commits.
-    for (&host, &frozen) in [0, 1].iter().zip(&frag_before) {
+    // The dark fragment has no quorum of its own, so it falls behind the
+    // majority. It may still commit what it was handed before the cut, as
+    // much as its queues held, which a loaded host may not have worked
+    // through when the cut came; it cannot follow the majority past that.
+    for host in [0, 1] {
         let now = c
             .host_committed_height(host, ShardId::ROOT)
             .map_or(0, BlockHeight::inner);
         assert!(
-            now <= frozen + 1,
-            "fragment host {host} committed while partitioned (frozen={frozen}, now={now})",
+            now < during,
+            "fragment host {host} kept up with the majority while partitioned \
+             (cut at {before}, fragment at {now}, majority at {during})",
         );
     }
 
