@@ -118,6 +118,10 @@ impl ProdCluster {
         let _ = global_recorder();
         let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
+        // Every cluster's fault gates know the hosts from the start, so a
+        // scenario that installs a fault without `run_faultable` still
+        // installs one that can fire.
+        inner.fault_configure_all();
         Self {
             runtime,
             inner,
