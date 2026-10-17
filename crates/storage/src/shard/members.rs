@@ -2022,6 +2022,26 @@ impl MemberIndex {
         }
     }
 
+    /// Whether no row of the shard hears or may come to: none stands
+    /// shared in flight, stated or accepted. What a draining shard
+    /// asserts to the beacon, which cuts it only once it has: a stated row
+    /// leaves only by accepting or on a sibling's let go, and an accepted
+    /// one only once every sibling has read it, so a cut under a quiet
+    /// shard withdraws no yes and strands no accept.
+    #[must_use]
+    pub fn quiet(&self) -> bool {
+        !self.members.values().any(|row| {
+            row.state.hears()
+                || matches!(
+                    row.state,
+                    RowState::InFlight {
+                        settlement: Settlement::Shared,
+                        ..
+                    }
+                )
+        })
+    }
+
     /// The height of the oldest block that committed a member still held:
     /// where a replay of what this shard owes begins. An accepted row
     /// has settled and owes nothing.
@@ -2725,6 +2745,34 @@ mod tests {
         assert!(!row_of(&store, 1).unwrap().holds.is_empty());
         assert_eq!(reserved(&store, 9), 40);
         store
+    }
+
+    /// A shard is quiet while no row of it stands shared in flight,
+    /// stated or accepted: a pending row, or one in flight that a discard
+    /// releases or that its own certificate settles, has said nothing a
+    /// sibling reads.
+    #[test]
+    fn the_quiet_check_counts_shared_in_flight_stated_and_accepted_rows() {
+        let quiet = |store: &Entries| MemberIndex::load(store, LOCAL).quiet();
+        assert!(quiet(&Entries::default()), "no row");
+
+        let mut pending = Entries::default();
+        pending.fold(&committing(1, &[1]));
+        assert!(quiet(&pending), "a pending row");
+
+        for settlement in [Settlement::Alone, Settlement::Awaited] {
+            let store = two_in_flight_on_one_vault(settlement, settlement);
+            assert!(quiet(&store), "a {settlement:?} row in flight");
+        }
+        let shared = two_in_flight_on_one_vault(Settlement::Alone, Settlement::Shared);
+        assert!(!quiet(&shared), "a shared row in flight");
+
+        let mut store = stated_beside_peer();
+        assert!(!quiet(&store), "a stated row");
+        store.fold(&accepting(4, 2, &[1]));
+        assert!(!quiet(&store), "an accepted row");
+        store.fold(&ending(5, &[1]));
+        assert!(quiet(&store), "the accepted row ended");
     }
 
     /// A legs half accepting a stated member leaves its row standing

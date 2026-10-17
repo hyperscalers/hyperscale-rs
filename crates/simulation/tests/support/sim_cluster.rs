@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ use hyperscale_scenarios::query::{
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
-    ScenarioConfig, grow_and_hold, submission_shards,
+    MemberEdge, ScenarioConfig, grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -82,6 +82,15 @@ struct BuildArgs<'a> {
     processing: Option<ProcessingTimes>,
 }
 
+/// A [`FaultableCluster::drop_type_between_members`] rule: its edge, the
+/// handles of the host pairs it drops between now, and every handle it
+/// has installed, whose fires its handle sums.
+struct MemberRule {
+    edge: MemberEdge,
+    live: Vec<RuleHandle>,
+    installed: Arc<Mutex<Vec<RuleHandle>>>,
+}
+
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
 pub struct SimCluster {
     runner: SimulationRunner,
@@ -91,6 +100,10 @@ pub struct SimCluster {
     recorder: MemoryRecorder,
     /// The seed-drawn tuning this cluster runs under, if any.
     tuning: Option<SimTuning>,
+    /// The drop rules that follow shard membership. A host takes a seat
+    /// only at a topology step, so re-reading them after each one cuts
+    /// every send a joining host makes.
+    member_rules: Vec<MemberRule>,
 }
 
 impl Drop for SimCluster {
@@ -331,6 +344,7 @@ impl SimCluster {
             runner,
             recorder: MemoryRecorder::new(),
             tuning,
+            member_rules: Vec::new(),
         }
     }
 
@@ -506,9 +520,71 @@ impl SimCluster {
     /// single-threaded, so the thread-local scoped recorder captures every
     /// emission. Steady-state scenarios that read no metrics call the scenario
     /// directly instead.
+    ///
+    /// # Panics
+    ///
+    /// If any terminal of the run named a row that still heard: no cut
+    /// may fall under a yes.
     pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
         let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
-        with_scoped_recorder(recorder, || scenario(self))
+        let outcome = with_scoped_recorder(recorder, || scenario(self));
+        assert_eq!(
+            self.recorder.counter("terminal_fated_hearing_rows", None),
+            0,
+            "a terminal named a row that still heard",
+        );
+        outcome
+    }
+
+    /// Drop `type_id` between every pair of `from` and `to` hosts.
+    fn install_between(
+        &mut self,
+        from: &[usize],
+        to: &[usize],
+        type_id: &'static str,
+    ) -> Vec<RuleHandle> {
+        let mut handles = Vec::new();
+        for &src in from {
+            for &dst in to {
+                if src == dst {
+                    continue;
+                }
+                handles.push(
+                    self.runner
+                        .network_mut()
+                        .fault()
+                        .drop_type(type_id)
+                        .from(HostId(host_index(src)))
+                        .to(HostId(host_index(dst)))
+                        .install(),
+                );
+            }
+        }
+        handles
+    }
+
+    /// Advance the topology a step, then move each membership rule onto
+    /// the hosts that serve its shards after it.
+    fn topology_step(&mut self) {
+        self.runner.topology_step();
+        let mut rules = std::mem::take(&mut self.member_rules);
+        for rule in &mut rules {
+            let Some((from, to)) = rule.edge.moved(self) else {
+                continue;
+            };
+            for handle in rule.live.drain(..) {
+                assert!(
+                    self.runner.network_mut().fault().remove(&handle),
+                    "a membership rule's live pairs stay installed until it moves them",
+                );
+            }
+            rule.live = self.install_between(&from, &to, rule.edge.type_id());
+            rule.installed
+                .lock()
+                .expect("no holder of the rule's handles panics")
+                .extend(rule.live.iter().cloned());
+        }
+        self.member_rules = rules;
     }
 
     /// The duration `budget` epochs span on this harness's clock.
@@ -664,7 +740,7 @@ impl SimCluster {
     /// below its anchor.
     pub fn resync_host(&mut self, host: usize, shard: ShardId) {
         self.runner.bounce_host(host_index(host), &[shard]);
-        self.runner.topology_step();
+        self.topology_step();
     }
 
     /// Run `validator` on `host` from here on, if it holds no seat: its
@@ -759,7 +835,7 @@ impl Cluster for SimCluster {
         }
         let deadline = self.runner.now() + Self::span(budget);
         while self.runner.now() < deadline {
-            self.runner.topology_step();
+            self.topology_step();
             let next = (self.runner.now() + SLICE).min(deadline);
             self.runner.run_until(next);
             self.assert_beacon_cadence();
@@ -1181,6 +1257,7 @@ impl FaultableCluster for SimCluster {
     }
 
     fn clear_drops(&mut self) {
+        self.member_rules.clear();
         self.runner.network_mut().fault().clear();
     }
 
@@ -1190,24 +1267,36 @@ impl FaultableCluster for SimCluster {
         to: &[usize],
         type_id: &'static str,
     ) -> FaultHandle {
-        let mut handles = Vec::new();
-        for &src in from {
-            for &dst in to {
-                if src == dst {
-                    continue;
-                }
-                handles.push(
-                    self.runner
-                        .network_mut()
-                        .fault()
-                        .drop_type(type_id)
-                        .from(HostId(host_index(src)))
-                        .to(HostId(host_index(dst)))
-                        .install(),
-                );
-            }
-        }
+        let handles = self.install_between(from, to, type_id);
         FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn drop_type_between_members(
+        &mut self,
+        from: ShardId,
+        to: ShardId,
+        type_id: &'static str,
+    ) -> FaultHandle {
+        let mut edge = MemberEdge::new(from, to, type_id);
+        let live = edge
+            .moved(self)
+            .map_or_else(Vec::new, |(from_hosts, to_hosts)| {
+                self.install_between(&from_hosts, &to_hosts, type_id)
+            });
+        let installed = Arc::new(Mutex::new(live.clone()));
+        self.member_rules.push(MemberRule {
+            edge,
+            live,
+            installed: Arc::clone(&installed),
+        });
+        FaultHandle::new(move || {
+            installed
+                .lock()
+                .expect("no holder of the rule's handles panics")
+                .iter()
+                .map(RuleHandle::fired)
+                .sum()
+        })
     }
 
     fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle {

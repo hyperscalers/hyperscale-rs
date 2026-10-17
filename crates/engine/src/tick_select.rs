@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
+use hyperscale_metrics::record_terminal_fated_hearing_rows;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
     AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, Decision,
@@ -524,10 +525,10 @@ pub trait CommittedInputs {
     /// Whether a committed claim has read `key` live naming `tx`, at or
     /// after the block that committed `tx` here.
     fn arrived(&self, key: SubstateKey, tx: TxHash) -> bool;
-    /// Whether `tx`'s member here awaits a verdict across a shard that
-    /// leaves the trie at the end of the block's window, this one
-    /// included, or the window that says is not held.
-    fn terminating(&self, tx: TxHash) -> bool;
+    /// Whether `tx`'s member here awaits a verdict across a shard
+    /// reshaping at the block's anchor, this one included, or the windows
+    /// that say are not held.
+    fn reshaping(&self, tx: TxHash) -> bool;
 }
 
 /// Whether a member can join a tick at `anchor`, and on what terms.
@@ -582,9 +583,9 @@ pub struct CommittedSets {
     /// shards formed, for those whose record the window carries.
     pub formed: BTreeMap<ShardId, Formed>,
     /// Every waiting member whose settlement awaits a sibling, where this
-    /// shard or a sibling it awaits is terminating at the block's anchor
-    /// or the window that says is not held: none is named to run.
-    pub terminating: BTreeSet<TxHash>,
+    /// shard or a sibling it awaits is reshaping at the block's anchor or
+    /// the windows that say are not held: none is named to run.
+    pub reshaping: BTreeSet<TxHash>,
     /// What the schedule and the mirror say, at the block's anchor, of
     /// each shard a row that hears awaits.
     pub siblings: SiblingViews,
@@ -663,8 +664,8 @@ impl CommittedInputs for CommittedSets {
         self.arrived.contains(&(key, tx))
     }
 
-    fn terminating(&self, tx: TxHash) -> bool {
-        self.terminating.contains(&tx)
+    fn reshaping(&self, tx: TxHash) -> bool {
+        self.reshaping.contains(&tx)
     }
 }
 
@@ -689,8 +690,27 @@ pub enum ManifestKind {
 /// An accepted row is ended, which burns nothing and leaves its name
 /// for a sibling still deciding to read; every other row is fated,
 /// priced by what its row carries.
+///
+/// The beacon cuts a shard only once it has asserted no row of it hears,
+/// so a terminal meets a stated or accepted row only where a recovery
+/// lost a block a sibling read. Each one is reported loudly rather than
+/// refused: the cut is irrevocable, and refusing its terminal would stall
+/// the coast without returning the yes.
 #[must_use]
 pub fn terminal_fates(rows: &MemberIndex) -> Vec<TickLine> {
+    let hearing = rows
+        .members
+        .values()
+        .filter(|row| row.state.hears())
+        .count();
+    if hearing > 0 {
+        tracing::error!(
+            shard = ?rows.shard(),
+            hearing,
+            "A terminal names rows that still hear"
+        );
+        record_terminal_fated_hearing_rows(hearing);
+    }
     rows.members
         .values()
         .map(|row| match row.state {
@@ -1490,9 +1510,9 @@ impl Nameable<'_> {
 /// its aborts imply.
 ///
 /// A candidate whose settlement awaits a sibling is named to run by no
-/// line while this shard or a sibling it awaits is terminating: its
-/// sibling could not read it accepted before the cut. Its deadline abort
-/// still ends it.
+/// line while this shard or a sibling it awaits is reshaping: a row it
+/// stated would hold the reshape's cut. Its deadline abort still ends
+/// it.
 ///
 /// A candidate past its deadline at `anchor` is named `Aborted` and
 /// nothing else, whether or not it is ready: a member that awaits nobody
@@ -1561,7 +1581,7 @@ pub fn select_members<'a>(
         let Standing::Pending(judged) = standing else {
             continue;
         };
-        if judged.settlement == Settlement::Shared && inputs.terminating(tx) {
+        if judged.settlement == Settlement::Shared && inputs.reshaping(tx) {
             continue;
         }
         let Some(joins) = readiness(tx, &judged, deadline, anchor, inputs) else {
@@ -2107,7 +2127,7 @@ mod tests {
     struct Held {
         engaged: BTreeSet<(ShardId, TxHash)>,
         arrived: BTreeSet<(SubstateKey, TxHash)>,
-        terminating: BTreeSet<TxHash>,
+        reshaping: BTreeSet<TxHash>,
     }
 
     impl CommittedInputs for Held {
@@ -2119,8 +2139,8 @@ mod tests {
             self.arrived.contains(&(key, tx))
         }
 
-        fn terminating(&self, tx: TxHash) -> bool {
-            self.terminating.contains(&tx)
+        fn reshaping(&self, tx: TxHash) -> bool {
+            self.reshaping.contains(&tx)
         }
     }
 
@@ -5487,12 +5507,12 @@ mod tests {
     }
 
     /// A core member still waiting when this shard or a shard it awaits
-    /// reads as terminating is named to run by no line, and is aborted
+    /// reads as reshaping is named to run by no line, and is aborted
     /// from its deadline as any waiting member is; a member awaiting
     /// nobody runs beside it, and the same core member runs where nothing
-    /// it awaits is terminating.
+    /// it awaits is reshaping.
     #[test]
-    fn a_pending_core_member_is_not_run_in_the_final_epoch() {
+    fn a_pending_core_member_is_not_run_while_reshaping() {
         let core = leg(vec![], &[]);
         let solo = alone(vec![]);
         let passed = Deadline::of(ms(0));
@@ -5501,9 +5521,9 @@ mod tests {
         rows.members.insert(tx(2), stating(2, far(), &solo));
         rows.members.insert(tx(3), stating(3, passed, &core));
         let live = |_, _| Evidence::Live { terminating: false };
-        let named = |terminating: &[u8]| {
+        let named = |reshaping: &[u8]| {
             let inputs = Held {
-                terminating: terminating.iter().map(|&seed| tx(seed)).collect(),
+                reshaping: reshaping.iter().map(|&seed| tx(seed)).collect(),
                 ..Held::default()
             };
             lines_and_missing(&rows, ms(60_000), &inputs, &live, false, &BTreeSet::new()).0

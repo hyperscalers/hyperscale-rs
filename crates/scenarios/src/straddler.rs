@@ -36,7 +36,7 @@ use crate::support::wait::{
     await_beacon_epoch, await_crossings_end, await_merge_keeper_count, await_root_matches_anchor,
     await_serves, await_split_admitted, await_tx_terminal,
 };
-use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
+use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs, member_hosts};
 
 /// Cut every path by which `shard`'s committee obtains `peer_shard`'s execution
 /// certificates and finalizations.
@@ -48,20 +48,19 @@ use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 /// headers still flow, so `shard` still executes the tick and produces its own
 /// certificate; it just never receives `peer_shard`'s.
 ///
-/// Faithful only with disjoint committees — if the two shards share a host, its
-/// co-hosted vnodes hand the EC across in-process, which no network rule
-/// intercepts.
+/// The cut follows membership, so it holds across a rotation, a recovery
+/// and a cohort draw. It is faithful only while no host serves both shards:
+/// a host's co-hosted vnodes hand the EC across in-process, which no network
+/// rule intercepts.
 #[must_use]
 pub fn isolate_ec_intake(
     c: &mut impl FaultableCluster,
     shard: ShardId,
     peer_shard: ShardId,
 ) -> FaultHandle {
-    let shard_hosts = member_hosts(c, shard);
-    let peer_hosts = member_hosts(c, peer_shard);
     let handles = [
-        c.drop_type_between(&peer_hosts, &shard_hosts, "execution.cert.batch"),
-        c.drop_type_between(&shard_hosts, &peer_hosts, "finalization.request"),
+        c.drop_type_between_members(peer_shard, shard, "execution.cert.batch"),
+        c.drop_type_between_members(shard, peer_shard, "finalization.request"),
     ];
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
@@ -70,29 +69,29 @@ pub fn isolate_ec_intake(
 /// `consumer`'s committee: the producer's pushes (`crossing.readings`) and
 /// the consumer's own reads of its state (`state_proof.request`).
 ///
-/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+/// Follows membership, and is faithful only while no host serves both
+/// shards, as [`isolate_ec_intake`] is.
 #[must_use]
 pub fn isolate_crossing_intake(
     c: &mut impl FaultableCluster,
     consumer: ShardId,
     producer: ShardId,
 ) -> FaultHandle {
-    let consumer_hosts = member_hosts(c, consumer);
-    let producer_hosts = member_hosts(c, producer);
     let handles = [
-        c.drop_type_between(&producer_hosts, &consumer_hosts, "crossing.readings"),
-        c.drop_type_between(&consumer_hosts, &producer_hosts, "state_proof.request"),
+        c.drop_type_between_members(producer, consumer, "crossing.readings"),
+        c.drop_type_between_members(consumer, producer, "state_proof.request"),
     ];
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
 
 /// Cut every crossing reading between `shard`'s committee and every host
 /// outside it and outside the committees of `open`, both ways: what
-/// [`isolate_crossing_intake`] cuts between two committees, held as well
-/// against a host that joins another committee after the cut, which a
-/// cut keyed on that committee's hosts would let through.
+/// [`isolate_crossing_intake`] cuts between two committees, held against
+/// every host but those of `open`. Every host set is read once, at the
+/// cut.
 ///
-/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+/// Faithful only while no host serves `shard` and another committee, as
+/// [`isolate_ec_intake`] is.
 #[must_use]
 pub fn isolate_crossing_intake_but_from(
     c: &mut impl FaultableCluster,
@@ -145,18 +144,17 @@ pub fn isolate_crossing_intake_among(
 /// (`provisions.broadcast`) and the consumer's own fetches of them
 /// (`provision.request`).
 ///
-/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+/// Follows membership, and is faithful only while no host serves both
+/// shards, as [`isolate_ec_intake`] is.
 #[must_use]
 pub fn isolate_provision_intake(
     c: &mut impl FaultableCluster,
     consumer: ShardId,
     producer: ShardId,
 ) -> FaultHandle {
-    let consumer_hosts = member_hosts(c, consumer);
-    let producer_hosts = member_hosts(c, producer);
     let handles = [
-        c.drop_type_between(&producer_hosts, &consumer_hosts, "provisions.broadcast"),
-        c.drop_type_between(&consumer_hosts, &producer_hosts, "provision.request"),
+        c.drop_type_between_members(producer, consumer, "provisions.broadcast"),
+        c.drop_type_between_members(consumer, producer, "provision.request"),
     ];
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
@@ -166,16 +164,15 @@ pub fn isolate_provision_intake(
 /// its state open: what `consumer` learns of `producer`'s cells it then
 /// learns by asking.
 ///
-/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+/// Follows membership, and is faithful only while no host serves both
+/// shards, as [`isolate_ec_intake`] is.
 #[must_use]
 pub fn isolate_pushed_readings(
     c: &mut impl FaultableCluster,
     consumer: ShardId,
     producer: ShardId,
 ) -> FaultHandle {
-    let consumer_hosts = member_hosts(c, consumer);
-    let producer_hosts = member_hosts(c, producer);
-    c.drop_type_between(&producer_hosts, &consumer_hosts, "crossing.readings")
+    c.drop_type_between_members(producer, consumer, "crossing.readings")
 }
 
 /// Cut `consumer`'s committee off from reading `producer`'s state
@@ -183,35 +180,15 @@ pub fn isolate_pushed_readings(
 /// `consumer` learns of `producer`'s cells it then learns only from what
 /// `producer`'s blocks push.
 ///
-/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+/// Follows membership, and is faithful only while no host serves both
+/// shards, as [`isolate_ec_intake`] is.
 #[must_use]
 pub fn isolate_state_reads(
     c: &mut impl FaultableCluster,
     consumer: ShardId,
     producer: ShardId,
 ) -> FaultHandle {
-    let consumer_hosts = member_hosts(c, consumer);
-    let producer_hosts = member_hosts(c, producer);
-    c.drop_type_between(&consumer_hosts, &producer_hosts, "state_proof.request")
-}
-
-/// Every host that runs or is about to run a member of `shard`'s committee:
-/// the seated copies, and the hosts of the members the beacon names for this
-/// epoch and the next. A member the beacon has named joins once its host
-/// reads the shard's anchor, and a cut drawn from the seated copies alone
-/// would leave that member's channel open.
-fn member_hosts(c: &impl FaultableCluster, shard: ShardId) -> Vec<usize> {
-    let mut hosts: BTreeSet<usize> = c.committee_hosts(shard).into_iter().collect();
-    if let Some(state) = c.beacon_state() {
-        hosts.extend(
-            [&state.shard_committees, &state.next_shard_committees]
-                .into_iter()
-                .filter_map(|committees| committees.get(&shard))
-                .flat_map(|committee| &committee.members)
-                .filter_map(|member| c.host_of(*member)),
-        );
-    }
-    hosts.into_iter().collect()
+    c.drop_type_between_members(consumer, producer, "state_proof.request")
 }
 
 /// Epochs of lead the threshold vote carries beyond the fold budget, covering

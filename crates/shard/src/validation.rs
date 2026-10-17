@@ -650,14 +650,14 @@ pub mod tests {
         MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MemberTerms,
         MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
         ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
-        RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
-        StatedTerms, StoredReceipt, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
-        TimeoutCertificate, TimestampRange, TopologySchedule, Transaction, TransactionDecision,
-        TransactionEnvelope, TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo,
-        ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp, Window,
-        WitnessSources, claims_admit_block, receipt_hash_of, state_claims_admit_block, test_utils,
-        verdict_leaf,
+        RETENTION_HORIZON, Reshaping, Round, RoutePrefix, SectionRoots, SetRoot, Settlement,
+        ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
+        StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickId, TickManifest,
+        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, TopologySchedule,
+        Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, UnsettledTx,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount,
+        WeightedTimestamp, Window, WitnessSources, claims_admit_block, receipt_hash_of,
+        state_claims_admit_block, test_utils, verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
@@ -2297,7 +2297,27 @@ pub mod tests {
             .snapshot
             .clone()
             .with_scheduled_terminals(leaving.iter().map(|&shard| (shard, final_epoch)).collect());
-        let schedule = TopologySchedule::new(1_000, final_epoch, Arc::new(window));
+        anchored_in_the_fifth_window(plain, window)
+    }
+
+    /// [`among_four_shards`] anchored in its fifth window on a one-second
+    /// grid, in which each of `draining` is named draining under a
+    /// latched reshape, with no cut scheduled.
+    fn draining_in(draining: &[ShardId]) -> Against {
+        let (plain, ..) = among_four_shards();
+        let window = plain.snapshot.clone().with_draining(
+            draining
+                .iter()
+                .map(|&shard| (shard, Epoch::new(2)))
+                .collect(),
+        );
+        anchored_in_the_fifth_window(plain, window)
+    }
+
+    /// `plain`'s rows and shard anchored in its fifth window, governed by
+    /// `window`.
+    fn anchored_in_the_fifth_window(plain: Against, window: TopologySnapshot) -> Against {
+        let schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::new(window));
         let mut against = Against::schedule(plain.snapshot.clone(), schedule);
         against.local_shard = plain.local_shard;
         against.members = plain.members;
@@ -2306,39 +2326,278 @@ pub mod tests {
     }
 
     /// A core transaction is refused where a shard its member here awaits
-    /// leaves the trie at the end of the block's own window, and every
-    /// one is refused where this shard does, while a member awaiting
-    /// nobody is admitted beside them: the row it would write could not
-    /// be read accepted by a sibling before the cut.
+    /// is reshaping at the block's own anchor, draining under a latched
+    /// reshape or leaving the trie at the window's end, and every one is
+    /// refused where this shard is, while a member awaiting nobody is
+    /// admitted beside them: the row it would write would hold the
+    /// reshape's cut.
     #[test]
-    fn a_core_transaction_toward_a_terminating_shard_is_not_admitted() {
+    fn a_core_transaction_toward_a_reshaping_shard_is_not_admitted() {
         let (_, near, _) = among_four_shards();
         let (toward_near, toward_far) = (awaiting(0x10, 0x50), awaiting(0x12, 0x90));
         let alone = awaiting(0x13, 0x13);
 
-        let sibling_leaves = in_the_final_epoch_of(&[near]);
-        let verdicts = admit_in_order(&sibling_leaves, &[&toward_near, &toward_far, &alone]);
-        let err = verdicts[0]
-            .as_ref()
-            .expect_err("the near shard is terminating");
-        assert!(err.contains("terminating"), "{err}");
-        assert_eq!(verdicts[1], Ok(()), "the far shard runs on");
-        assert_eq!(verdicts[2], Ok(()), "a member awaiting nobody");
+        let reshapings: [fn(&[ShardId]) -> Against; 2] = [in_the_final_epoch_of, draining_in];
+        for reshaping in reshapings {
+            let sibling_reshapes = reshaping(&[near]);
+            let verdicts = admit_in_order(&sibling_reshapes, &[&toward_near, &toward_far, &alone]);
+            let err = verdicts[0]
+                .as_ref()
+                .expect_err("the near shard is reshaping");
+            assert!(err.contains("reshaping"), "{err}");
+            assert_eq!(verdicts[1], Ok(()), "the far shard runs on");
+            assert_eq!(verdicts[2], Ok(()), "a member awaiting nobody");
 
-        let local = sibling_leaves.local_shard;
-        let this_leaves = in_the_final_epoch_of(&[local]);
-        let verdicts = admit_in_order(&this_leaves, &[&toward_near, &toward_far, &alone]);
-        for refused in &verdicts[..2] {
-            let err = refused.as_ref().expect_err("this shard is terminating");
-            assert!(err.contains("terminating"), "{err}");
+            let local = sibling_reshapes.local_shard;
+            let this_reshapes = reshaping(&[local]);
+            let verdicts = admit_in_order(&this_reshapes, &[&toward_near, &toward_far, &alone]);
+            for refused in &verdicts[..2] {
+                let err = refused.as_ref().expect_err("this shard is reshaping");
+                assert!(err.contains("reshaping"), "{err}");
+            }
+            assert_eq!(verdicts[2], Ok(()), "a member awaiting nobody");
+
+            let nobody_reshapes = reshaping(&[]);
+            assert_eq!(
+                admit_in_order(&nobody_reshapes, &[&toward_near, &toward_far]),
+                vec![Ok(()), Ok(())],
+            );
         }
-        assert_eq!(verdicts[2], Ok(()), "a member awaiting nobody");
+    }
 
-        let nobody_leaves = in_the_final_epoch_of(&[]);
-        assert_eq!(
-            admit_in_order(&nobody_leaves, &[&toward_near, &toward_far]),
-            vec![Ok(()), Ok(())],
+    /// [`among_four_shards`] anchored in its fifth window, in which the
+    /// split of `syncing` is admitted and its cohort syncing: pending, its
+    /// drain not latched.
+    fn syncing_a_cohort_for(syncing: ShardId) -> Against {
+        let (plain, ..) = among_four_shards();
+        let window = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(Vec::new()),
+            plain
+                .snapshot
+                .shard_trie()
+                .leaves()
+                .map(|shard| (shard, Vec::new()))
+                .collect(),
+            HashMap::new(),
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([syncing]),
         );
+        assert!(window.split_pending(syncing) && !window.draining(syncing));
+        anchored_in_the_fifth_window(plain, window)
+    }
+
+    /// Intake stays open while a reshape's cohort syncs: with a split
+    /// admitted and its drain not yet latched, a core transaction toward
+    /// the splitting shard, or from it, is admitted, and only the latch
+    /// pauses it.
+    #[test]
+    fn intake_stays_open_through_cohort_sync() {
+        let (_, near, _) = among_four_shards();
+        let toward_near = awaiting(0x10, 0x50);
+        let local = in_the_final_epoch_of(&[]).local_shard;
+        for syncing in [near, local] {
+            assert_eq!(
+                admit_in_order(&syncing_a_cohort_for(syncing), &[&toward_near]),
+                vec![Ok(())],
+                "{syncing:?} syncing a cohort",
+            );
+            assert!(
+                admit_in_order(&draining_in(&[syncing]), &[&toward_near])[0].is_err(),
+                "{syncing:?} draining",
+            );
+        }
+    }
+
+    /// Where the window a block's anchor lies in is not held, every
+    /// shard reads as reshaping: the committed sets name every waiting
+    /// member that shares its verdict, and none that awaits nobody, and
+    /// the view a reader that cannot defer takes contains every shard.
+    #[test]
+    fn an_unheld_window_reads_as_reshaping_at_every_intake_site() {
+        use crate::tick_members::{Ancestry, OwnContent, committed_sets};
+        let (_, near, far) = among_four_shards();
+        let waiting = |seed: &[u8], settlement: Settlement, awaits: Option<ShardId>| {
+            let tx = TxHash::from(Hash::from_bytes(seed));
+            let row = MemberRow {
+                awaits: Capped::new(awaits.into_iter().collect()).expect("one shard at most"),
+                waiting: Some(Waiting {
+                    staged: 0,
+                    leg: false,
+                    settlement,
+                    declared: Capped::empty(),
+                    engages: Capped::empty(),
+                    waits: false,
+                }),
+                ..member_row(tx, RowState::Pending)
+            };
+            (tx, row)
+        };
+        let rows = [
+            waiting(b"toward near", Settlement::Shared, Some(near)),
+            waiting(b"toward far", Settlement::Shared, Some(far)),
+            waiting(b"alone", Settlement::Alone, None),
+        ];
+        let [toward_near, toward_far, _] = rows.each_ref().map(|(tx, _)| *tx);
+        let mut against = in_the_final_epoch_of(&[]);
+        for (tx, row) in &rows {
+            against.members.members.insert(*tx, row.clone());
+        }
+        let unheld = WeightedTimestamp::from_millis(7_500);
+        assert!(against.schedule.reshaping_at(unheld).is_none());
+
+        let sets = committed_sets(
+            &against.members,
+            &Ancestry::over(
+                &against.members,
+                std::iter::empty(),
+                against.schedule.windows(),
+            ),
+            &OwnContent::default(),
+            &against.dedup,
+            unheld,
+            &against.snapshot,
+            &against.schedule,
+        );
+        assert_eq!(sets.reshaping, BTreeSet::from([toward_near, toward_far]));
+        for shard in [near, far, against.local_shard] {
+            assert!(Reshaping::UNHELD.contains(shard));
+        }
+    }
+
+    /// A block that asserts its shard quiet names no shared member of its
+    /// own: the window its committee is drawn from names the shard
+    /// draining, so every later anchor, its own among them, reads the
+    /// shard reshaping, and its committed sets pause every waiting member
+    /// that shares its verdict.
+    #[test]
+    fn a_block_asserting_quiet_names_no_shared_member_itself() {
+        use hyperscale_types::{ReshapeKind, Settling, settling_in};
+
+        use crate::tick_members::{Ancestry, OwnContent, committed_sets};
+        let mut against = draining_in(&[]);
+        let local = against.local_shard;
+        let window = against
+            .snapshot
+            .clone()
+            .with_draining(BTreeMap::from([(local, Epoch::new(2))]));
+        let mut schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::new(window.clone()));
+        schedule.insert(Epoch::new(6), Arc::new(window.clone()));
+        against.schedule = schedule;
+        let own_anchor = WeightedTimestamp::from_millis(6_100);
+        assert_eq!(
+            settling_in(
+                &window,
+                local,
+                || Ok::<bool, ()>(false),
+                || Ok(against.members.quiet()),
+            ),
+            Ok(Some((
+                ReshapeKind::Merge,
+                Settling {
+                    admitted: Epoch::new(2),
+                    quiet: true,
+                },
+            ))),
+            "a draining shard no split names pending is a merge's child",
+        );
+
+        let tx = TxHash::from(Hash::from_bytes(b"shared"));
+        against.members.members.insert(
+            tx,
+            MemberRow {
+                waiting: Some(Waiting {
+                    staged: 0,
+                    leg: false,
+                    settlement: Settlement::Shared,
+                    declared: Capped::empty(),
+                    engages: Capped::empty(),
+                    waits: false,
+                }),
+                ..member_row(tx, RowState::Pending)
+            },
+        );
+        let sets = committed_sets(
+            &against.members,
+            &Ancestry::over(
+                &against.members,
+                std::iter::empty(),
+                against.schedule.windows(),
+            ),
+            &OwnContent::default(),
+            &against.dedup,
+            own_anchor,
+            &against.snapshot,
+            &against.schedule,
+        );
+        assert_eq!(sets.reshaping, BTreeSet::from([tx]));
+    }
+
+    /// Two siblings reshaping toward each other, each with a row stated
+    /// toward the other, both accept and both end: a draining sibling's
+    /// yes counts, so neither waits on the other's cut, and each shard is
+    /// quiet once its row has ended.
+    #[test]
+    fn two_reshaping_siblings_both_stated_accept_and_quiet() {
+        use hyperscale_types::{Decision, Heard, Hears, ReadMark, Said, Value, decide, value_of};
+
+        use crate::tick_members::sibling_view;
+
+        let (x, s) = ShardId::ROOT.children();
+        let window = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(Vec::new()),
+            )
+            .with_draining(BTreeMap::from([(x, Epoch::new(2)), (s, Epoch::new(2))])),
+        );
+        let mut schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::clone(&window));
+        schedule.insert_lookahead(Epoch::new(5), window);
+        let anchor = WeightedTimestamp::from_millis(5_500);
+        let committed = WeightedTimestamp::from_millis(5_100);
+        let reshaping = schedule.reshaping_at(anchor).expect("held");
+        assert!(reshaping.contains(x) && reshaping.contains(s));
+
+        for (here, sibling) in [(x, s), (s, x)] {
+            let (source, view) = sibling_view(&schedule, sibling, anchor);
+            assert_eq!(view.terminating, Some(false), "draining is not terminating");
+            let read = |said| Heard {
+                shard: sibling,
+                mark: ReadMark {
+                    epoch: Epoch::new(5),
+                    height: BlockHeight::new(9),
+                },
+                said: Some(said),
+            };
+            let yes = value_of(Some(&read(Said::Yes)), source, &view, committed);
+            assert_eq!(yes, Value::Y);
+            assert_eq!(decide(Hears::Stated, &[yes]), Decision::Accept);
+            let accepted = value_of(Some(&read(Said::Accepted)), source, &view, committed);
+            assert_eq!(decide(Hears::Accepted, &[accepted]), Decision::End);
+
+            let tx = TxHash::from(Hash::from_bytes(b"core"));
+            let mut rows = MemberIndex::empty(here);
+            rows.members.insert(
+                tx,
+                member_row(
+                    tx,
+                    RowState::Stated {
+                        tick: BlockHeight::new(2),
+                        receipt: GlobalReceiptHash::from_raw(Hash::from_bytes(b"yes")),
+                    },
+                ),
+            );
+            assert!(!rows.quiet(), "{here:?} stated");
+            rows.members.insert(tx, member_row(tx, RowState::Accepted));
+            assert!(!rows.quiet(), "{here:?} accepted");
+            rows.members.remove(&tx);
+            assert!(rows.quiet(), "{here:?} ended");
+        }
     }
 
     /// Past the cut the departed shard's id is out of the trie, and a
@@ -2416,7 +2675,7 @@ pub mod tests {
                 &against.snapshot,
                 &against.schedule,
             )
-            .terminating
+            .reshaping
         };
 
         assert_eq!(

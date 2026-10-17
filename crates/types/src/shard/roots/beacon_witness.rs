@@ -8,8 +8,8 @@ use crate::shard::roots::reveal_chain::next_reveal_chain;
 use crate::signing::shard_reveal_verify;
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Epoch, Hash,
-    ReadySignal, ReshapeThresholds, ReshapeTrigger, RevealChain, Round, ShardId,
-    ShardWitnessPayload, StoredReceipt, TopologySnapshot, ValidatorId, Verified, Verify,
+    ReadySignal, ReshapeKind, ReshapeThresholds, ReshapeTrigger, RevealChain, Round, Settling,
+    ShardId, ShardWitnessPayload, StoredReceipt, TopologySnapshot, ValidatorId, Verified, Verify,
     WitnessSources, compute_merkle_root, vrf_output_from_proof,
 };
 
@@ -72,7 +72,7 @@ pub struct BeaconWitnessRootContext<'a> {
     /// equivocator's registered key (two signature checks, so the QC attests
     /// the evidence is genuine and the beacon jails on it without
     /// re-verifying), the reshape assertion against the load predicate
-    /// recomputed from `substate_bytes` + `thresholds`, and the
+    /// recomputed from `settling`, `substate_bytes` and `thresholds`, and the
     /// randomness reveal as a valid VRF by the block's proposer over
     /// `(network, shard, height)` — an unverified proof would let the
     /// proposer choose its reveal output and grind the epoch seed.
@@ -86,6 +86,14 @@ pub struct BeaconWitnessRootContext<'a> {
     /// assertion is absent: a manifest claiming a trigger anyway is
     /// rejected.
     pub substate_bytes: Option<u64>,
+    /// What the block asserts of its latched reshape, resolved by the
+    /// caller: the kind and admission the block's committee window names
+    /// the shard draining under, and whether the rows at the block's
+    /// parent are quiet. `None` where that window names no draining for
+    /// the shard, or the parent sits in a recovery's suffix band. Read
+    /// before the byte total and without it, so a draining shard asserts
+    /// whatever its load and whatever the thresholds.
+    pub settling: Option<(ReshapeKind, Settling)>,
     /// The header's own claim about that total. Verification rejects a
     /// claim that differs from the resolved value, which is what lets the
     /// next block's resolution read this header's field instead of walking
@@ -198,11 +206,12 @@ pub fn missed_proposals_since_prev_commit(
 }
 
 /// Check the manifest's reshape assertion against the locally recomputed
-/// load predicate — including the once-per-epoch dedup, which scans the
-/// same trimmed window the root commits.
+/// one — including the once-per-epoch dedup, which scans the same
+/// trimmed window the root commits — on every block.
 ///
-/// A `None` byte total takes the predicate out of play and requires an
-/// absent assertion.
+/// A draining shard's assertion is its settling and needs no byte total.
+/// Otherwise a `None` byte total takes the load predicate out of play and
+/// requires an absent assertion.
 ///
 /// # Errors
 ///
@@ -213,16 +222,15 @@ fn verify_reshape_trigger(
     ctx: &BeaconWitnessRootContext<'_>,
     window: &[Hash],
 ) -> Result<(), BeaconWitnessRootVerifyError> {
-    let derived = ctx.substate_bytes.and_then(|bytes| {
-        derive_reshape_trigger(
-            ctx.shard,
-            bytes,
-            ctx.topology_snapshot.fullness_of(ctx.shard),
-            &ctx.thresholds,
-            window,
-            ctx.committee_anchor_epoch,
-        )
-    });
+    let derived = derive_reshape_trigger(
+        ctx.shard,
+        ctx.settling,
+        ctx.substate_bytes,
+        ctx.topology_snapshot.fullness_of(ctx.shard),
+        &ctx.thresholds,
+        window,
+        ctx.committee_anchor_epoch,
+    );
     if derived == ctx.witness_sources.reshape_trigger() {
         return Ok(());
     }
@@ -230,6 +238,7 @@ fn verify_reshape_trigger(
         claimed = ?ctx.witness_sources.reshape_trigger(),
         ?derived,
         substate_bytes = ?ctx.substate_bytes,
+        settling = ?ctx.settling,
         height = ctx.height.inner(),
         "Reshape trigger verification FAILED"
     );
@@ -239,14 +248,21 @@ fn verify_reshape_trigger(
     })
 }
 
-/// Evaluate the load predicate behind a block's reshape assertion.
+/// Evaluate a block's reshape assertion, in two arms.
 ///
-/// Fires `Split` when the committed substate byte total behind the block's
-/// parent state reaches the split threshold, `Merge` when it falls
-/// below the merge threshold — except when the would-be trigger's leaf
-/// already sits in `window_leaves`, which suppresses a second assertion
-/// of the same thing in the same `epoch`. A merge on the root shard
-/// never fires — there is no parent to merge under.
+/// A shard `settling` names draining asserts that reshape's kind with
+/// its settling, reading no byte total: the beacon's record keeps its
+/// trigger clock off these assertions whatever the shard's load, and
+/// schedules the cut off the quiet one. Otherwise the load predicate
+/// fires `Split` when the committed substate byte total behind the
+/// block's parent state reaches the split threshold, `Merge` when it
+/// falls below the merge threshold, and nothing where no total is known.
+///
+/// Either arm answers nothing where the would-be trigger's leaf already
+/// sits in `window_leaves`, which suppresses a second assertion of the
+/// same thing in the same `epoch`; a flip to quiet is another leaf, so it
+/// asserts again. A merge on the root shard never fires — there is no
+/// parent to merge under.
 ///
 /// The epoch is in the leaf, so the suppression cannot outlive the epoch
 /// that earned it. Deduping on the subject alone gives a shard one leaf
@@ -261,10 +277,75 @@ fn verify_reshape_trigger(
 #[must_use]
 pub fn derive_reshape_trigger(
     shard: ShardId,
-    substate_bytes: u64,
+    settling: Option<(ReshapeKind, Settling)>,
+    substate_bytes: Option<u64>,
     fullness: u32,
     thresholds: &ReshapeThresholds,
     window_leaves: &[Hash],
+    epoch: Epoch,
+) -> Option<ReshapeTrigger> {
+    let kind = match settling {
+        Some((kind, settling)) => ReshapeTrigger::of(kind, epoch, Some(settling)),
+        None => load_trigger(substate_bytes?, fullness, thresholds, epoch)?,
+    };
+    let leaf = kind.to_payload(shard)?.leaf_hash();
+    if window_leaves.contains(&leaf) {
+        return None;
+    }
+    Some(kind)
+}
+
+/// What a block on `shard` asserts of its latched reshape.
+///
+/// Read under `committee`, the window the block's committee is drawn
+/// from: the kind and admission it names the shard draining under, and
+/// `quiet`, whether no row at the block's parent hears.
+///
+/// `None` where the window names no draining for the shard, and `banded`
+/// and `quiet` are not read then; or where the parent lies in a
+/// recovery's suffix band (`banded`), whose rows are QC-attested history
+/// a replica may not have folded, and `quiet` is not read.
+///
+/// A latch shows in every window after the one it first shows in until
+/// its record clears, and a block's own anchor is never earlier than its
+/// committee's, so a block that asserts quiet under a latch has its own
+/// intake paused under it too. The one exception is a block anchored
+/// below a recovery's bridge, whose committee resolves the fresh
+/// committee's bridge window. A halt recovery never reaches it here,
+/// since a shard with a pending reshape is never counted halted; only a
+/// fork redraw of a draining shard does, and that needs more than `f`.
+///
+/// # Errors
+///
+/// Whatever `banded` or `quiet` fails with: the parent's anchor or its
+/// rows are not held.
+pub fn settling_in<E>(
+    committee: &TopologySnapshot,
+    shard: ShardId,
+    banded: impl FnOnce() -> Result<bool, E>,
+    quiet: impl FnOnce() -> Result<bool, E>,
+) -> Result<Option<(ReshapeKind, Settling)>, E> {
+    let Some((kind, admitted)) = committee.draining_admission(shard) else {
+        return Ok(None);
+    };
+    if banded()? {
+        return Ok(None);
+    }
+    Ok(Some((
+        kind,
+        Settling {
+            admitted,
+            quiet: quiet()?,
+        },
+    )))
+}
+
+/// The load predicate: a split when the shard holds or spends too much, a
+/// merge when it holds and spends little enough.
+const fn load_trigger(
+    substate_bytes: u64,
+    fullness: u32,
+    thresholds: &ReshapeThresholds,
     epoch: Epoch,
 ) -> Option<ReshapeTrigger> {
     // Two ways to be too big, and either asserts the same split: what
@@ -272,23 +353,23 @@ pub fn derive_reshape_trigger(
     // over its byte threshold is one committee serving too much state; a
     // shard over its fullness is one committee serving too much traffic,
     // which the network's own price cannot see.
-    let kind = if substate_bytes >= thresholds.split_bytes || fullness >= thresholds.split_fullness
-    {
-        ReshapeTrigger::Split { epoch }
+    if substate_bytes >= thresholds.split_bytes || fullness >= thresholds.split_fullness {
+        Some(ReshapeTrigger::Split {
+            epoch,
+            settling: None,
+        })
     } else if substate_bytes < thresholds.merge_bytes() && fullness < thresholds.merge_fullness() {
         // Both, because a merge answers to both: a shard small enough on
         // bytes and busy enough on traffic would fold into a parent that
         // starts idle, carries the sum of what its children carried, and
         // cannot assert a split back until its own mean catches up.
-        ReshapeTrigger::Merge { epoch }
+        Some(ReshapeTrigger::Merge {
+            epoch,
+            settling: None,
+        })
     } else {
-        return None;
-    };
-    let leaf = kind.to_payload(shard)?.leaf_hash();
-    if window_leaves.contains(&leaf) {
-        return None;
+        None
     }
-    Some(kind)
 }
 
 /// Canonical leaf-derivation rule used by both proposer and verifier.
@@ -727,6 +808,7 @@ mod tests {
             receipts: &[],
             witness_sources,
             substate_bytes: None,
+            settling: None,
             claimed_substate_bytes: None,
             thresholds: ReshapeThresholds::DISABLED,
             topology_snapshot,
@@ -746,40 +828,74 @@ mod tests {
         let child = ShardId::leaf(1, 0);
         let split = Some(ReshapeTrigger::Split {
             epoch: Epoch::GENESIS,
+            settling: None,
         });
 
         // Holding almost nothing — which on the byte arm alone asserts a
         // merge — but running at three quarters of its caps.
         assert_eq!(
-            derive_reshape_trigger(child, 0, 7_500, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(
+                child,
+                None,
+                Some(0),
+                7_500,
+                &thresholds,
+                &[],
+                Epoch::GENESIS
+            ),
             split,
         );
         assert_eq!(
-            derive_reshape_trigger(child, 50, 7_500, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(
+                child,
+                None,
+                Some(50),
+                7_500,
+                &thresholds,
+                &[],
+                Epoch::GENESIS
+            ),
             split,
         );
         // A hair under is the byte arm's verdict, unchanged.
         assert_eq!(
-            derive_reshape_trigger(child, 50, 7_499, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(
+                child,
+                None,
+                Some(50),
+                7_499,
+                &thresholds,
+                &[],
+                Epoch::GENESIS
+            ),
             None
         );
         // But a shard that busy does not merge either: a merge answers
         // to both dimensions, and one folding at three quarters of its
         // caps lands in a parent that starts idle and carries the sum.
         assert_eq!(
-            derive_reshape_trigger(child, 0, 7_499, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(
+                child,
+                None,
+                Some(0),
+                7_499,
+                &thresholds,
+                &[],
+                Epoch::GENESIS
+            ),
             None
         );
         // Quiet as well as small is what merges — under the split
         // threshold's eighth, the dampener the bytes answer to.
         assert_eq!(
-            derive_reshape_trigger(child, 0, 936, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, None, Some(0), 936, &thresholds, &[], Epoch::GENESIS),
             Some(ReshapeTrigger::Merge {
-                epoch: Epoch::GENESIS
+                epoch: Epoch::GENESIS,
+                settling: None,
             }),
         );
         assert_eq!(
-            derive_reshape_trigger(child, 0, 937, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, None, Some(0), 937, &thresholds, &[], Epoch::GENESIS),
             None,
             "and an eighth exactly is already too busy to fold"
         );
@@ -788,7 +904,8 @@ mod tests {
         assert_eq!(
             derive_reshape_trigger(
                 child,
-                50,
+                None,
+                Some(50),
                 u32::from(u16::MAX),
                 &ReshapeThresholds {
                     split_fullness: u32::MAX,
@@ -813,36 +930,47 @@ mod tests {
         let child = ShardId::leaf(1, 0);
 
         assert_eq!(
-            derive_reshape_trigger(child, 100, 0, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, None, Some(100), 0, &thresholds, &[], Epoch::GENESIS),
             Some(ReshapeTrigger::Split {
-                epoch: Epoch::GENESIS
+                epoch: Epoch::GENESIS,
+                settling: None,
             }),
         );
         // merge_bytes() == 12; the bound is strict.
         assert_eq!(
-            derive_reshape_trigger(child, 11, 0, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, None, Some(11), 0, &thresholds, &[], Epoch::GENESIS),
             Some(ReshapeTrigger::Merge {
-                epoch: Epoch::GENESIS
+                epoch: Epoch::GENESIS,
+                settling: None,
             }),
         );
         assert_eq!(
-            derive_reshape_trigger(child, 12, 0, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, None, Some(12), 0, &thresholds, &[], Epoch::GENESIS),
             None
         );
         assert_eq!(
-            derive_reshape_trigger(child, 50, 0, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(child, None, Some(50), 0, &thresholds, &[], Epoch::GENESIS),
             None
         );
         // The root shard has no parent to merge under.
         assert_eq!(
-            derive_reshape_trigger(ShardId::ROOT, 0, 0, &thresholds, &[], Epoch::GENESIS),
+            derive_reshape_trigger(
+                ShardId::ROOT,
+                None,
+                Some(0),
+                0,
+                &thresholds,
+                &[],
+                Epoch::GENESIS
+            ),
             None,
         );
         // Disabled thresholds never fire.
         assert_eq!(
             derive_reshape_trigger(
                 child,
-                u64::MAX - 1,
+                None,
+                Some(u64::MAX - 1),
                 0,
                 &ReshapeThresholds::DISABLED,
                 &[],
@@ -855,25 +983,36 @@ mod tests {
         // an unrelated leaf does not.
         let split_leaf = ReshapeTrigger::Split {
             epoch: Epoch::GENESIS,
+            settling: None,
         }
         .to_payload(child)
         .unwrap()
         .leaf_hash();
         assert_eq!(
-            derive_reshape_trigger(child, 100, 0, &thresholds, &[split_leaf], Epoch::GENESIS),
+            derive_reshape_trigger(
+                child,
+                None,
+                Some(100),
+                0,
+                &thresholds,
+                &[split_leaf],
+                Epoch::GENESIS
+            ),
             None,
         );
         assert_eq!(
             derive_reshape_trigger(
                 child,
-                100,
+                None,
+                Some(100),
                 0,
                 &thresholds,
                 &[Hash::from_bytes(b"other")],
                 Epoch::GENESIS,
             ),
             Some(ReshapeTrigger::Split {
-                epoch: Epoch::GENESIS
+                epoch: Epoch::GENESIS,
+                settling: None,
             }),
         );
     }
@@ -888,6 +1027,7 @@ mod tests {
             Capped::empty(),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
+                settling: None,
             }),
             signed_reveal(shard),
         );
@@ -897,7 +1037,8 @@ mod tests {
             BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
             BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
                 claimed: Some(ReshapeTrigger::Split {
-                    epoch: Epoch::GENESIS
+                    epoch: Epoch::GENESIS,
+                    settling: None,
                 }),
                 derived: None,
             }
@@ -923,9 +1064,288 @@ mod tests {
             BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
                 claimed: None,
                 derived: Some(ReshapeTrigger::Split {
-                    epoch: Epoch::GENESIS
+                    epoch: Epoch::GENESIS,
+                    settling: None,
                 }),
             }
+        );
+    }
+
+    /// The settling a block on a shard draining under a split admitted at
+    /// epoch 2 asserts, saying whether its parent's rows are `quiet`.
+    fn settling(quiet: bool) -> (ReshapeKind, Settling) {
+        (
+            ReshapeKind::Split,
+            Settling {
+                admitted: Epoch::new(2),
+                quiet,
+            },
+        )
+    }
+
+    /// A draining shard asserts its settling in every epoch, whatever its
+    /// load: one far over the split threshold, one under the merge
+    /// threshold, one in between, and one with no byte total at all all
+    /// assert the same settling, never a load trigger, and each epoch's
+    /// is a leaf of its own.
+    #[test]
+    fn a_draining_shard_asserts_settling_each_epoch_whatever_its_load() {
+        let shard = ShardId::leaf(1, 0);
+        let thresholds = ReshapeThresholds {
+            split_bytes: 100,
+            split_fullness: u32::MAX,
+        };
+        let mut window = Vec::new();
+        for epoch in [Epoch::new(3), Epoch::new(4)] {
+            let asserted = Some(ReshapeTrigger::Split {
+                epoch,
+                settling: Some(settling(false).1),
+            });
+            for bytes in [Some(1_000), Some(0), Some(50), None] {
+                assert_eq!(
+                    derive_reshape_trigger(
+                        shard,
+                        Some(settling(false)),
+                        bytes,
+                        0,
+                        &thresholds,
+                        &window,
+                        epoch
+                    ),
+                    asserted,
+                    "{bytes:?} bytes in {epoch:?}",
+                );
+            }
+            let leaf = asserted
+                .and_then(|trigger| trigger.to_payload(shard))
+                .expect("a split projects")
+                .leaf_hash();
+            assert_eq!(
+                derive_reshape_trigger(
+                    shard,
+                    Some(settling(false)),
+                    Some(1_000),
+                    0,
+                    &thresholds,
+                    &[leaf],
+                    epoch
+                ),
+                None,
+                "once asserted in {epoch:?}, the epoch's leaf is not asserted again",
+            );
+            window.push(leaf);
+        }
+    }
+
+    /// A block asserts settling only where the window its committee is
+    /// drawn from names its shard draining, and names the admission that
+    /// window names: a window naming another shard, or none, leaves the
+    /// load arm to answer, and neither the parent's anchor nor its rows
+    /// are read.
+    #[test]
+    fn settling_is_asserted_only_under_a_window_naming_the_latched_admission() {
+        let shard = ShardId::leaf(1, 0);
+        let other = ShardId::leaf(1, 1);
+        let held = || Ok::<bool, ()>(false);
+        let quiet = || Ok::<bool, ()>(true);
+        let unread = || -> Result<bool, ()> { panic!("nothing of the parent is read") };
+
+        let draining =
+            snapshot_with_base(shard, 0).with_draining(BTreeMap::from([(shard, Epoch::new(2))]));
+        assert_eq!(
+            settling_in(&draining, shard, held, quiet),
+            Ok(Some(settling(true))),
+        );
+        assert_eq!(settling_in(&draining, other, unread, unread), Ok(None));
+
+        let elsewhere =
+            snapshot_with_base(shard, 0).with_draining(BTreeMap::from([(other, Epoch::new(2))]));
+        assert_eq!(settling_in(&elsewhere, shard, unread, unread), Ok(None));
+        let plain = snapshot_with_base(shard, 0);
+        assert_eq!(settling_in(&plain, shard, unread, unread), Ok(None));
+
+        let missing = |what: &'static str| move || Err::<bool, &str>(what);
+        assert_eq!(
+            settling_in(&draining, shard, missing("no anchor"), quiet_unread()),
+            Err("no anchor"),
+            "a parent whose anchor is not held waits",
+        );
+        assert_eq!(
+            settling_in(&draining, shard, || Ok(false), missing("no rows")),
+            Err("no rows"),
+            "a parent whose rows are not held waits",
+        );
+    }
+
+    /// A reading of the parent no test expects to be taken.
+    fn quiet_unread<E>() -> impl FnOnce() -> Result<bool, E> {
+        || panic!("the rows are not read")
+    }
+
+    /// A draining shard's settling verifies with no byte total, reshaping
+    /// disabled included, and is required there: the same block with no
+    /// assertion is refused.
+    #[test]
+    fn a_settling_assertion_needs_no_byte_count() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+        let trigger = ReshapeTrigger::Split {
+            epoch: Epoch::GENESIS,
+            settling: Some(settling(true).1),
+        };
+        let leaf = trigger.to_payload(shard).unwrap().leaf_hash();
+        let expected_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&[leaf]));
+        let asserting = WitnessSources::new(Capped::empty(), Some(trigger), signed_reveal(shard));
+        for thresholds in [
+            ReshapeThresholds::DISABLED,
+            ReshapeThresholds {
+                split_bytes: 10,
+                split_fullness: u32::MAX,
+            },
+        ] {
+            let mut ctx = context_with(&topology_snapshot, &asserting, shard, 0, Vec::new(), 1);
+            ctx.thresholds = thresholds;
+            ctx.settling = Some(settling(true));
+            assert!(
+                expected_root.verify(&ctx).is_ok(),
+                "{thresholds:?}: {:?}",
+                expected_root.verify(&ctx)
+            );
+
+            let silent = empty_sources(shard);
+            let mut ctx = context_with(&topology_snapshot, &silent, shard, 0, Vec::new(), 0);
+            ctx.thresholds = thresholds;
+            ctx.settling = Some(settling(true));
+            assert_eq!(
+                BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
+                BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
+                    claimed: None,
+                    derived: Some(trigger),
+                },
+            );
+        }
+    }
+
+    /// A block saying its shard is quiet where the voter's rows at its
+    /// parent still hear is refused, and so is one saying it is not where
+    /// they do not.
+    #[test]
+    fn a_quiet_bit_the_parent_rows_contradict_is_refused() {
+        let shard = ShardId::ROOT;
+        let topology_snapshot = snapshot_with_base(shard, 0);
+        for claimed in [true, false] {
+            let trigger = ReshapeTrigger::Split {
+                epoch: Epoch::GENESIS,
+                settling: Some(settling(claimed).1),
+            };
+            let ws = WitnessSources::new(Capped::empty(), Some(trigger), signed_reveal(shard));
+            let mut ctx = context_with(&topology_snapshot, &ws, shard, 0, Vec::new(), 1);
+            ctx.settling = Some(settling(!claimed));
+            assert_eq!(
+                BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
+                BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
+                    claimed: Some(trigger),
+                    derived: Some(ReshapeTrigger::Split {
+                        epoch: Epoch::GENESIS,
+                        settling: Some(settling(!claimed).1),
+                    }),
+                },
+            );
+        }
+    }
+
+    /// A block whose parent sits in a recovery's suffix band asserts no
+    /// trigger, draining or not: its settling is not read, and its byte
+    /// total is out of play.
+    #[test]
+    fn a_suffix_band_block_asserts_no_trigger() {
+        let shard = ShardId::leaf(1, 0);
+        let draining =
+            snapshot_with_base(shard, 0).with_draining(BTreeMap::from([(shard, Epoch::new(2))]));
+        let unread = || -> Result<bool, ()> { panic!("a banded parent's rows are not read") };
+        let banded = settling_in(&draining, shard, || Ok(true), unread);
+        assert_eq!(banded, Ok(None));
+        assert_eq!(
+            derive_reshape_trigger(
+                shard,
+                None,
+                None,
+                u32::MAX,
+                &ReshapeThresholds {
+                    split_bytes: 0,
+                    split_fullness: 0,
+                },
+                &[],
+                Epoch::GENESIS,
+            ),
+            None,
+        );
+    }
+
+    /// A shard that turns quiet within an epoch asserts again in it: the
+    /// quiet settling is another leaf than the one the window carries.
+    #[test]
+    fn a_quiet_flip_within_an_epoch_asserts_again() {
+        let shard = ShardId::leaf(1, 0);
+        let epoch = Epoch::new(4);
+        let thresholds = ReshapeThresholds::DISABLED;
+        let leaf_of = |trigger: Option<ReshapeTrigger>| {
+            trigger
+                .and_then(|trigger| trigger.to_payload(shard))
+                .expect("a split projects")
+                .leaf_hash()
+        };
+        let unquiet = derive_reshape_trigger(
+            shard,
+            Some(settling(false)),
+            None,
+            0,
+            &thresholds,
+            &[],
+            epoch,
+        );
+        let window = [leaf_of(unquiet)];
+        assert_eq!(
+            derive_reshape_trigger(
+                shard,
+                Some(settling(false)),
+                None,
+                0,
+                &thresholds,
+                &window,
+                epoch
+            ),
+            None,
+            "the unquiet assertion is in the window",
+        );
+        let quiet = derive_reshape_trigger(
+            shard,
+            Some(settling(true)),
+            None,
+            0,
+            &thresholds,
+            &window,
+            epoch,
+        );
+        assert_eq!(
+            quiet,
+            Some(ReshapeTrigger::Split {
+                epoch,
+                settling: Some(settling(true).1),
+            }),
+        );
+        let both = [leaf_of(unquiet), leaf_of(quiet)];
+        assert_eq!(
+            derive_reshape_trigger(
+                shard,
+                Some(settling(true)),
+                None,
+                0,
+                &thresholds,
+                &both,
+                epoch
+            ),
+            None,
         );
     }
 
@@ -941,6 +1361,7 @@ mod tests {
             Capped::empty(),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
+                settling: None,
             }),
             signed_reveal(shard),
         );
@@ -955,7 +1376,8 @@ mod tests {
             BeaconWitnessRoot::ZERO.verify(&ctx).unwrap_err(),
             BeaconWitnessRootVerifyError::ReshapeTriggerMismatch {
                 claimed: Some(ReshapeTrigger::Split {
-                    epoch: Epoch::GENESIS
+                    epoch: Epoch::GENESIS,
+                    settling: None,
                 }),
                 derived: None,
             }
@@ -970,6 +1392,7 @@ mod tests {
         let topology_snapshot = snapshot_with_base(shard, 2);
         let trigger_leaf = ReshapeTrigger::Split {
             epoch: Epoch::GENESIS,
+            settling: None,
         }
         .to_payload(shard)
         .unwrap()
@@ -980,6 +1403,7 @@ mod tests {
             Capped::empty(),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
+                settling: None,
             }),
             signed_reveal(shard),
         );

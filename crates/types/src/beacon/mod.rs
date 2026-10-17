@@ -63,10 +63,10 @@ pub use constants::{
     EMISSION_WORK_WEIGHT, EMISSIONS_PER_EPOCH, EPOCHS_PER_YEAR, HALT_THRESHOLD_EPOCHS,
     IMPOUND_EPOCHS_DEFAULT, JAIL_COOLDOWN_EPOCHS, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
     MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS, POOL_BUFFER_TARGET,
-    PRODUCTION_BEACON_COMMITTEE_SIZE, RECOVERY_HISTORY_DEPTH, RESHAPE_HANDOFF_TTL_EPOCHS,
-    RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM,
-    SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, TERMINAL_EVIDENCE_EPOCHS, TOKENS_PER_YEAR_TARGET,
-    UNBONDING_WINDOW_EPOCHS, byzantine_threshold,
+    PRODUCTION_BEACON_COMMITTEE_SIZE, RECOVERY_HISTORY_DEPTH, RESHAPE_DRAIN_SPAN,
+    RESHAPE_HANDOFF_TTL_EPOCHS, RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS,
+    SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT,
+    TERMINAL_EVIDENCE_EPOCHS, TOKENS_PER_YEAR_TARGET, UNBONDING_WINDOW_EPOCHS, byzantine_threshold,
 };
 pub use genesis::{
     BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash,
@@ -108,7 +108,7 @@ pub use spc::{
 };
 pub use state::{
     Admission, BeaconState, CohortSeat, CommitteeTransition, JailReason, KeeperSeat, KeptSeat,
-    ObserverSeat, PendingReshape, PendingRotation, PendingWithdrawal, PoolConviction,
+    MergeHalf, ObserverSeat, PendingReshape, PendingRotation, PendingWithdrawal, PoolConviction,
     RecoveryBinding, RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery,
     SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };

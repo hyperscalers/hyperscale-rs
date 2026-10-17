@@ -620,6 +620,7 @@ mod tests {
             Capped::new(ready).expect("a list written out in a test"),
             Some(ReshapeTrigger::Split {
                 epoch: Epoch::GENESIS,
+                settling: None,
             }),
             VrfProof::ZERO,
         );

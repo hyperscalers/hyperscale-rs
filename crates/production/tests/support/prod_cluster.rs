@@ -2,12 +2,12 @@
 //!
 //! Wraps the real QUIC + `RocksDB` [`Harness`] driven on wall-clock. The harness
 //! observations are synchronous, so each [`Cluster`] method delegates directly;
-//! only [`Cluster::run_until`] needs the async bridge — it `block_on`s a poll
-//! loop on an owned multi-thread runtime, the same cadence the harness's own
-//! `await_*` helpers use. The runtime never leaks into a scenario body.
+//! only [`Cluster::run_until`] needs the async bridge — it polls at the same
+//! cadence the harness's own `await_*` helpers use, sleeping between polls on
+//! an owned multi-thread runtime. The runtime never leaks into a scenario body.
 
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hyperscale_engine::GenesisConfig;
@@ -18,8 +18,8 @@ use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::RanAs;
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    BlockServingCap, Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
-    submission_shards,
+    BlockServingCap, Budget, Cluster, FaultHandle, FaultableCluster, MemberEdge, ScenarioConfig,
+    grow_and_hold, submission_shards,
 };
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
@@ -29,7 +29,7 @@ use hyperscale_types::{
     ValidatorId, ValidatorSet,
 };
 use tokio::runtime::{Builder, Runtime};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::harness::{ClusterSpec, Harness, HostSpec};
@@ -51,6 +51,15 @@ struct StartArgs<'a> {
     staged_pool_extras: u32,
 }
 
+/// A [`FaultableCluster::drop_type_between_members`] rule: its edge, the
+/// per-host handles of each host pair it drops between now, and every
+/// handle it has installed, whose fires its handle sums.
+struct MemberRule {
+    edge: MemberEdge,
+    live: Vec<Vec<RuleHandle>>,
+    installed: Arc<Mutex<Vec<RuleHandle>>>,
+}
+
 /// The production adaptor: a [`Cluster`] over the real QUIC + `RocksDB` harness.
 pub struct ProdCluster {
     runtime: Runtime,
@@ -63,6 +72,8 @@ pub struct ProdCluster {
     withholding: Vec<Arc<WithholdingSigner>>,
     /// The ids of the pool extras beacon genesis left out.
     staged: Range<u32>,
+    /// The drop rules that follow shard membership, re-read at each poll.
+    member_rules: Vec<MemberRule>,
 }
 
 impl ProdCluster {
@@ -129,7 +140,54 @@ impl ProdCluster {
             started,
             withholding,
             staged,
+            member_rules: Vec::new(),
         }
+    }
+
+    /// Install `spec` between every pair of `from` and `to` hosts, one
+    /// list of per-host handles for each pair.
+    fn install_between(
+        &self,
+        from: &[usize],
+        to: &[usize],
+        type_id: &'static str,
+    ) -> Vec<Vec<RuleHandle>> {
+        let mut handles = Vec::new();
+        for &src in from {
+            for &dst in to {
+                if src == dst {
+                    continue;
+                }
+                let from = u32::try_from(src).expect("host index fits u32");
+                let to = u32::try_from(dst).expect("host index fits u32");
+                handles.push(self.inner.fault_install_drop(&DropSpec {
+                    type_id: Some(type_id),
+                    from: Some(HostId(from)),
+                    to: Some(HostId(to)),
+                    ..DropSpec::default()
+                }));
+            }
+        }
+        handles
+    }
+
+    /// Move each membership rule onto the hosts that serve its shards now.
+    fn follow_membership(&mut self) {
+        let mut rules = std::mem::take(&mut self.member_rules);
+        for rule in &mut rules {
+            let Some((from, to)) = rule.edge.moved(self) else {
+                continue;
+            };
+            for handles in rule.live.drain(..) {
+                self.inner.fault_remove_drop(&handles);
+            }
+            rule.live = self.install_between(&from, &to, rule.edge.type_id());
+            rule.installed
+                .lock()
+                .expect("no holder of the rule's handles panics")
+                .extend(rule.live.iter().flatten().cloned());
+        }
+        self.member_rules = rules;
     }
 
     /// Build a cluster grown to `config.num_shards` with `config.split_bytes`
@@ -322,16 +380,17 @@ impl Cluster for ProdCluster {
     }
 
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
-        let within = Duration::from_millis(self.epoch_ms) * budget.0;
-        self.runtime.block_on(async {
-            timeout(within, async {
-                while !cond(self) {
-                    sleep(POLL_INTERVAL).await;
-                }
-            })
-            .await
-            .is_ok()
-        })
+        let deadline = Instant::now() + Duration::from_millis(self.epoch_ms) * budget.0;
+        loop {
+            self.follow_membership();
+            if cond(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.runtime.block_on(async { sleep(POLL_INTERVAL).await });
+        }
     }
 
     fn now(&self) -> Duration {
@@ -514,7 +573,31 @@ impl FaultableCluster for ProdCluster {
     }
 
     fn clear_drops(&mut self) {
+        self.member_rules.clear();
         self.inner.fault_clear_all();
+    }
+
+    fn drop_type_between_members(
+        &mut self,
+        from: ShardId,
+        to: ShardId,
+        type_id: &'static str,
+    ) -> FaultHandle {
+        let installed = Arc::new(Mutex::new(Vec::new()));
+        self.member_rules.push(MemberRule {
+            edge: MemberEdge::new(from, to, type_id),
+            live: Vec::new(),
+            installed: Arc::clone(&installed),
+        });
+        self.follow_membership();
+        FaultHandle::new(move || {
+            installed
+                .lock()
+                .expect("no holder of the rule's handles panics")
+                .iter()
+                .map(RuleHandle::fired)
+                .sum()
+        })
     }
 
     fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle {
@@ -537,22 +620,11 @@ impl FaultableCluster for ProdCluster {
         to: &[usize],
         type_id: &'static str,
     ) -> FaultHandle {
-        let mut handles = Vec::new();
-        for &src in from {
-            for &dst in to {
-                if src == dst {
-                    continue;
-                }
-                let from = u32::try_from(src).expect("host index fits u32");
-                let to = u32::try_from(dst).expect("host index fits u32");
-                handles.extend(self.inner.fault_install_drop(&DropSpec {
-                    type_id: Some(type_id),
-                    from: Some(HostId(from)),
-                    to: Some(HostId(to)),
-                    ..DropSpec::default()
-                }));
-            }
-        }
+        let handles: Vec<RuleHandle> = self
+            .install_between(from, to, type_id)
+            .into_iter()
+            .flatten()
+            .collect();
         FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
     }
 

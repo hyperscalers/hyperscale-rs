@@ -103,6 +103,33 @@ impl Default for ReshapeThresholds {
     }
 }
 
+/// Which reshape a shard is part of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReshapeKind {
+    /// The shard splits into its two children.
+    Split,
+    /// The shard merges with its sibling under their parent.
+    Merge,
+}
+
+/// A draining shard's answer to its latched admission: which admission it
+/// answers, and whether no row of the shard hears.
+///
+/// Asserted under every window whose frozen projection names the shard
+/// draining, whatever its load, so the beacon's record keeps its trigger
+/// clock and can schedule the cut once the shard says it is quiet. The
+/// beacon folds it only against the admission it names, so an assertion
+/// from an anchor that predates a cancel sets nothing on the next
+/// admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct Settling {
+    /// The epoch the latched admission was made at.
+    pub admitted: Epoch,
+    /// Whether the shard's rows at the asserting block's parent hold no
+    /// shared row in flight and no stated or accepted row.
+    pub quiet: bool,
+}
+
 /// A block's reshape assertion, carried on the manifest.
 ///
 /// The subject never rides the wire — it is always the asserting shard
@@ -115,27 +142,44 @@ impl Default for ReshapeThresholds {
 /// assertion and reject anything but equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub enum ReshapeTrigger {
-    /// The shard's committed substate byte total reached the split threshold.
+    /// The shard's committed substate byte total reached the split
+    /// threshold, or the shard drains under a latched split.
     Split {
         /// The epoch the assertion was made in — see
         /// [`ShardWitnessPayload::ScheduleSplit`](crate::ShardWitnessPayload::ScheduleSplit).
         epoch: Epoch,
+        /// The shard's answer to its latched admission; `None` for an
+        /// assertion on load.
+        settling: Option<Settling>,
     },
     /// The shard's committed substate byte total fell below the merge
-    /// threshold; the assertion targets the shard's parent (merging the
-    /// shard with its sibling).
+    /// threshold, or the shard drains under a latched merge; the
+    /// assertion targets the shard's parent (merging the shard with its
+    /// sibling).
     Merge {
         /// The epoch the assertion was made in.
         epoch: Epoch,
+        /// The shard's answer to its latched admission; `None` for an
+        /// assertion on load.
+        settling: Option<Settling>,
     },
 }
 
 impl ReshapeTrigger {
+    /// An assertion of `kind` made in `epoch`.
+    #[must_use]
+    pub(crate) const fn of(kind: ReshapeKind, epoch: Epoch, settling: Option<Settling>) -> Self {
+        match kind {
+            ReshapeKind::Split => Self::Split { epoch, settling },
+            ReshapeKind::Merge => Self::Merge { epoch, settling },
+        }
+    }
+
     /// The epoch the assertion was made in.
     #[must_use]
     pub const fn epoch(self) -> Epoch {
         match self {
-            Self::Split { epoch } | Self::Merge { epoch } => epoch,
+            Self::Split { epoch, .. } | Self::Merge { epoch, .. } => epoch,
         }
     }
 
@@ -147,10 +191,20 @@ impl ReshapeTrigger {
     #[must_use]
     pub(crate) fn to_payload(self, shard: ShardId) -> Option<ShardWitnessPayload> {
         match self {
-            Self::Split { epoch } => Some(ShardWitnessPayload::ScheduleSplit { shard, epoch }),
-            Self::Merge { epoch } => shard
-                .parent()
-                .map(|parent| ShardWitnessPayload::ScheduleMerge { parent, epoch }),
+            Self::Split { epoch, settling } => Some(ShardWitnessPayload::ScheduleSplit {
+                shard,
+                epoch,
+                settling,
+            }),
+            Self::Merge { epoch, settling } => {
+                shard
+                    .parent()
+                    .map(|parent| ShardWitnessPayload::ScheduleMerge {
+                        parent,
+                        epoch,
+                        settling,
+                    })
+            }
         }
     }
 }
@@ -182,8 +236,16 @@ mod tests {
         let shard = ShardId::leaf(2, 0b10);
         let epoch = Epoch::new(4);
         assert_eq!(
-            ReshapeTrigger::Split { epoch }.to_payload(shard),
-            Some(ShardWitnessPayload::ScheduleSplit { shard, epoch }),
+            ReshapeTrigger::Split {
+                epoch,
+                settling: None
+            }
+            .to_payload(shard),
+            Some(ShardWitnessPayload::ScheduleSplit {
+                shard,
+                epoch,
+                settling: None
+            }),
         );
     }
 
@@ -192,14 +254,23 @@ mod tests {
         let shard = ShardId::leaf(2, 0b10);
         let epoch = Epoch::new(4);
         assert_eq!(
-            ReshapeTrigger::Merge { epoch }.to_payload(shard),
+            ReshapeTrigger::Merge {
+                epoch,
+                settling: None
+            }
+            .to_payload(shard),
             Some(ShardWitnessPayload::ScheduleMerge {
                 parent: shard.parent().unwrap(),
                 epoch,
+                settling: None,
             }),
         );
         assert_eq!(
-            ReshapeTrigger::Merge { epoch }.to_payload(ShardId::ROOT),
+            ReshapeTrigger::Merge {
+                epoch,
+                settling: None
+            }
+            .to_payload(ShardId::ROOT),
             None
         );
     }
@@ -210,6 +281,7 @@ mod tests {
         let at = |epoch: u64| {
             ReshapeTrigger::Split {
                 epoch: Epoch::new(epoch),
+                settling: None,
             }
             .to_payload(shard)
             .expect("a split always projects")
@@ -226,9 +298,21 @@ mod tests {
     #[test]
     fn reshape_trigger_hbor_round_trip() {
         let epoch = Epoch::new(4);
+        let settling = Some(Settling {
+            admitted: Epoch::new(2),
+            quiet: true,
+        });
         for t in [
-            ReshapeTrigger::Split { epoch },
-            ReshapeTrigger::Merge { epoch },
+            ReshapeTrigger::Split {
+                epoch,
+                settling: None,
+            },
+            ReshapeTrigger::Merge {
+                epoch,
+                settling: None,
+            },
+            ReshapeTrigger::Split { epoch, settling },
+            ReshapeTrigger::Merge { epoch, settling },
         ] {
             let bytes = hbor_to_vec(&t).unwrap();
             assert_eq!(hbor_from_slice::<ReshapeTrigger>(&bytes).unwrap(), t);

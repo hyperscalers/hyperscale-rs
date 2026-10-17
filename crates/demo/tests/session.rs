@@ -18,6 +18,45 @@ fn run(seed: u64, steps: usize) -> Vec<TraceEvent> {
     (0..steps).flat_map(|_| session.step(500)).collect()
 }
 
+/// The most half-second steps a two-shard session takes to land its root
+/// split: well past the trigger, admission, cohort draw, snap-sync,
+/// readiness gate, drain latch, quiet fold, cut and flip it runs through.
+const SPLIT_CEILING_STEPS: usize = 1_200;
+
+/// Step `session` in half-second steps until its root split lands, then
+/// `tail` steps more, returning every event observed.
+///
+/// # Panics
+///
+/// Panics if the split does not land within [`SPLIT_CEILING_STEPS`].
+fn step_past_split(session: &mut Session, tail: usize) -> Vec<TraceEvent> {
+    let mut events = Vec::new();
+    let mut steps = 0;
+    loop {
+        let step = session.step(500);
+        let split = step
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::TopologyChanged { .. }));
+        events.extend(step);
+        steps += 1;
+        if split {
+            break;
+        }
+        assert!(
+            steps < SPLIT_CEILING_STEPS,
+            "the root split must land within {SPLIT_CEILING_STEPS} steps",
+        );
+    }
+    for _ in 0..tail {
+        events.extend(session.step(500));
+    }
+    events
+}
+
+/// Half-second steps a test runs past the split for the children's chains
+/// to commit and the parent's terminal to be reported.
+const PAST_SPLIT_STEPS: usize = 160;
+
 #[test]
 fn a_session_commits_blocks_and_reports_them_in_weighted_time_order() {
     let events = run(42, 40);
@@ -141,12 +180,7 @@ fn the_root_shard_splits_while_the_session_is_being_watched() {
         "a session opens at genesis, on one shard",
     );
 
-    // The split lands about six epochs in — trigger, admission, cohort
-    // draw, snap-sync, readiness gate, flip — so give it headroom.
-    let mut events = Vec::new();
-    for _ in 0..600 {
-        events.extend(session.step(500));
-    }
+    let events = step_past_split(&mut session, PAST_SPLIT_STEPS);
 
     let splits: Vec<(Vec<String>, Vec<String>)> = events
         .iter()
@@ -212,16 +246,7 @@ fn transfers_reach_a_terminal_outcome_on_either_side_of_a_split() {
         42,
     );
 
-    let mut events = Vec::new();
-    for _ in 0..440 {
-        events.extend(session.step(500));
-    }
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.kind, TraceKind::TopologyChanged { .. })),
-        "the split must have happened before transactions are submitted",
-    );
+    let mut events = step_past_split(&mut session, 0);
 
     let mut submitted = 0;
     for i in 0..460 {
@@ -273,16 +298,7 @@ fn run_past_split(seed: u64, count: usize) -> Vec<TraceEvent> {
         },
         seed,
     );
-    let mut events = Vec::new();
-    for _ in 0..440 {
-        events.extend(session.step(500));
-    }
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e.kind, TraceKind::TopologyChanged { .. })),
-        "the split must land before transfers are submitted",
-    );
+    let mut events = step_past_split(&mut session, 0);
     for i in 0..(count * 20 + 100) {
         if i % 20 == 0 && i / 20 < count {
             session.submit_transfer();
@@ -477,10 +493,7 @@ fn a_split_parent_reports_one_terminal_that_closes_its_handoff_window() {
         },
         42,
     );
-    let mut events = Vec::new();
-    for _ in 0..600 {
-        events.extend(session.step(500));
-    }
+    let events = step_past_split(&mut session, PAST_SPLIT_STEPS);
 
     let terminals: Vec<(String, u64, Option<u64>)> = events
         .iter()
@@ -734,10 +747,7 @@ fn a_split_moves_hosts_out_of_the_pool_and_into_the_children() {
         "a session that can split opens with a free pool, saw {opening:?}",
     );
 
-    let mut events = Vec::new();
-    for _ in 0..600 {
-        events.extend(session.step(500));
-    }
+    let events = step_past_split(&mut session, PAST_SPLIT_STEPS);
 
     let rosters: Vec<&Vec<HostRole>> = events
         .iter()

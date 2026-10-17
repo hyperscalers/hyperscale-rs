@@ -148,6 +148,67 @@ impl Terminating<'_> {
     }
 }
 
+/// The shards an anchor's window says are reshaping.
+///
+/// Each one it names draining under a latched reshape, and each one whose
+/// cut falls at the window's end. Every scheduled cut belongs to a
+/// latched record, so this covers every cut.
+///
+/// Intake reads it: no core member toward or from a shard it contains is
+/// admitted or run, so a shard that has said it is quiet stays quiet
+/// until its cut. A record's latch shows in every window frozen after the
+/// fold that set it until the record clears, so once an anchor reads a
+/// shard reshaping, every later anchor does until the cut or the cancel.
+///
+/// The frozen window is read and not the projection of the one after
+/// it: a replica holds an anchor's frozen window before the window opens,
+/// while the projection after it lands only once the beacon has folded
+/// the window's own epoch, which every block anchored early in the window
+/// would otherwise wait on.
+#[derive(Debug, Clone, Copy)]
+pub struct Reshaping<'a> {
+    reading: ReshapingReading<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReshapingReading<'a> {
+    /// A schedule with no epoch boundaries, where nothing reshapes.
+    Nothing,
+    /// The anchor's window could not be read, and every shard counts.
+    Everything,
+    /// The anchor's frozen window, and what terminates at its end.
+    Window {
+        frozen: &'a TopologySnapshot,
+        terminating: Terminating<'a>,
+    },
+}
+
+impl Reshaping<'_> {
+    /// No shard reshapes: a schedule with no epoch boundaries.
+    pub const NONE: Self = Self {
+        reading: ReshapingReading::Nothing,
+    };
+
+    /// Every shard reads as reshaping: what a reader whose window is not
+    /// held takes, failing closed.
+    pub const UNHELD: Self = Self {
+        reading: ReshapingReading::Everything,
+    };
+
+    /// Whether `shard` is reshaping at the anchor.
+    #[must_use]
+    pub fn contains(self, shard: ShardId) -> bool {
+        match self.reading {
+            ReshapingReading::Nothing => false,
+            ReshapingReading::Everything => true,
+            ReshapingReading::Window {
+                frozen,
+                terminating,
+            } => frozen.draining(shard) || terminating.contains(shard),
+        }
+    }
+}
+
 /// What a window fixes network-wide, with no committee on it.
 ///
 /// Read off the snapshot governing an anchor: the shard trie content is
@@ -1343,6 +1404,27 @@ impl TopologySchedule {
         })
     }
 
+    /// The shards reshaping at a parent-anchor timestamp `wt`, read off
+    /// the one window [`terminating_at`](Self::terminating_at) reads, the
+    /// closing one for an anchor exactly on a boundary as a committee
+    /// resolves it: each it names draining, and each whose cut falls at
+    /// its end. `None` where the schedule does not hold that window; a
+    /// reader that cannot defer takes that as reshaping.
+    #[must_use]
+    pub fn reshaping_at(&self, wt: WeightedTimestamp) -> Option<Reshaping<'_>> {
+        if self.epoch_duration_ms == 0 {
+            return Some(Reshaping::NONE);
+        }
+        let terminating = self.terminating_at(wt)?;
+        let frozen = self.by_epoch.get(&self.anchor_epoch_for(wt))?;
+        Some(Reshaping {
+            reading: ReshapingReading::Window {
+                frozen,
+                terminating,
+            },
+        })
+    }
+
     /// Whether `shard` is scheduled to terminate — leave the trie via a split
     /// or merge — at or after `wt`, as far as the schedule can see.
     ///
@@ -2122,6 +2204,49 @@ mod tests {
         assert_eq!(
             sched.terminates_at_next_boundary(p, WeightedTimestamp::from_millis(6000)),
             Some(false)
+        );
+    }
+
+    /// An anchor exactly on a boundary reads its draining shards off the
+    /// closing window, the one its cut is read from, and an anchor past
+    /// it reads them off the window it opens.
+    #[test]
+    fn a_boundary_instant_anchor_reads_reshaping_off_the_closing_window() {
+        let p = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let mut sched = TopologySchedule::new(
+            1000,
+            Epoch::new(5),
+            reshape_snap(&[p, sibling], &[p], &[], &[]),
+        );
+        sched.insert(
+            Epoch::new(6),
+            Arc::new(
+                Arc::unwrap_or_clone(reshape_snap(&[p, sibling], &[p], &[], &[]))
+                    .with_draining(BTreeMap::from([(p, Epoch::new(4))])),
+            ),
+        );
+
+        let reshaping = |ms: u64| {
+            sched
+                .reshaping_at(WeightedTimestamp::from_millis(ms))
+                .expect("both windows are held")
+                .contains(p)
+        };
+        assert!(!reshaping(5_500), "window 5 shows no latch");
+        assert!(
+            !reshaping(6_000),
+            "an anchor on window 6's opening instant reads window 5",
+        );
+        assert!(
+            reshaping(6_001),
+            "an anchor inside window 6 reads its latch"
+        );
+        assert!(
+            !sched
+                .reshaping_at(WeightedTimestamp::from_millis(6_001))
+                .expect("window 6 is held")
+                .contains(sibling)
         );
     }
 

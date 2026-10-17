@@ -14,8 +14,8 @@
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
 use crate::{
-    BlockHeight, ConsensusPublicKey, ConsensusSignature, Epoch, Hash, ParamVote, Round, ShardId,
-    Stake, StakePoolId, ValidatorId,
+    BlockHeight, ConsensusPublicKey, ConsensusSignature, Epoch, Hash, ParamVote, Round, Settling,
+    ShardId, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -135,10 +135,12 @@ pub enum ShardWitnessPayload {
         round: Round,
     },
     /// The shard's committed substate byte total reached the split
-    /// threshold. Derived from the manifest's reshape assertion, which
-    /// replicas validate against their own count — so the witness
-    /// arrives committee-attested. The beacon admits it (pool gate,
-    /// `MAX_SHARDS`, active-leaf target) and schedules the split.
+    /// threshold, or the shard drains under a latched split. Derived from
+    /// the manifest's reshape assertion, which replicas validate against
+    /// their own count and rows — so the witness arrives
+    /// committee-attested. The beacon admits it (pool gate, `MAX_SHARDS`,
+    /// active-leaf target), and schedules the split once the shard has
+    /// said it is quiet.
     ScheduleSplit {
         /// Shard asserting the split — always the witness's source
         /// shard today; explicit so the payload stays valid if
@@ -154,10 +156,17 @@ pub enum ShardWitnessPayload {
         /// one after it. The window is trimmed at a base resolved from
         /// this same anchor, so the two move together.
         epoch: Epoch,
+        /// The shard's answer to its latched split, which the beacon
+        /// folds only against the admission it names; `None` for an
+        /// assertion on load. Part of the leaf, so a flip to quiet asserts
+        /// again within the epoch.
+        settling: Option<Settling>,
     },
     /// The shard's committed substate byte total fell below the merge
-    /// threshold. The beacon parks the assertion until the sibling's
-    /// matching half folds, then schedules the merge under `parent`.
+    /// threshold, or the shard drains under a latched merge. The beacon
+    /// parks the assertion until the sibling's matching half folds, and
+    /// schedules the merge under `parent` once both halves have said they
+    /// are quiet.
     ScheduleMerge {
         /// Parent the merged shard reforms under — always the source
         /// shard's own parent today; explicit for the same reason as
@@ -166,6 +175,9 @@ pub enum ShardWitnessPayload {
         /// The epoch the assertion was made in, for the reason
         /// [`Self::ScheduleSplit::epoch`] carries it.
         epoch: Epoch,
+        /// The child's answer to its latched merge, as
+        /// [`Self::ScheduleSplit::settling`] carries a split's.
+        settling: Option<Settling>,
     },
     /// A cohort observer finished syncing its assigned pending child
     /// of the source shard and is ready for the reshape to execute.
@@ -357,10 +369,15 @@ mod tests {
             ShardWitnessPayload::ScheduleSplit {
                 shard: ShardId::leaf(2, 0b01),
                 epoch: Epoch::new(9),
+                settling: None,
             },
             ShardWitnessPayload::ScheduleMerge {
                 parent: ShardId::leaf(1, 0b1),
                 epoch: Epoch::new(9),
+                settling: Some(Settling {
+                    admitted: Epoch::new(7),
+                    quiet: true,
+                }),
             },
             ShardWitnessPayload::ReshapeReady {
                 validator: ValidatorId::new(13),

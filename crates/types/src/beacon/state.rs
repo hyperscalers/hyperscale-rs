@@ -425,32 +425,52 @@ pub struct KeeperSeat {
     pub ready: bool,
 }
 
-/// When a reshape was admitted, and by when it must be ready.
+/// When a reshape was admitted, by when it must be ready, and by when
+/// its shard must quiet once it is.
 ///
-/// Two epochs with two roles. `at` is the epoch whose fold admitted the
-/// split or paired the merge: a fact nothing moves, and the floor of the
+/// Three epochs with three roles. `at` is the epoch whose fold admitted
+/// the split or paired the merge: a fact nothing moves, the floor of the
 /// terminating shard's settled-transaction window, since counterpart
-/// fences hold straddlers from that fold on. `ready_by` is the readiness
-/// deadline: only a Skip fold moves it, forward one epoch, so a beacon
-/// stall does not cost a reshape the epochs it could not ready in.
+/// fences hold straddlers from that fold on, and the name a quiet
+/// assertion carries for the admission it answers. `ready_by` is the
+/// readiness deadline, read until the drain latches. `drain_by` is the
+/// drain deadline, set once at the first fold whose readiness gate
+/// passes and cleared only with the record; from the window that shows
+/// it, intake toward the shard pauses. Only a Skip fold moves either
+/// deadline, forward one epoch, so a beacon stall does not cost a
+/// reshape the epochs it could not ready or drain in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub struct Admission {
     /// The epoch whose fold admitted the reshape.
     pub at: Epoch,
-    /// The epoch at which an unready reshape is abandoned.
+    /// The epoch at which an unlatched reshape is abandoned.
     pub ready_by: Epoch,
+    /// The epoch at which a latched reshape whose shard never asserted
+    /// quiet is abandoned; `None` until the readiness gate first passes.
+    pub drain_by: Option<Epoch>,
 }
 
 impl Admission {
     /// An admission at `epoch`, ready by
-    /// [`RESHAPE_READY_TTL_EPOCHS`] epochs later.
+    /// [`RESHAPE_READY_TTL_EPOCHS`] epochs later, not yet draining.
     #[must_use]
     pub const fn new(epoch: Epoch) -> Self {
         Self {
             at: epoch,
             ready_by: epoch.saturating_add(RESHAPE_READY_TTL_EPOCHS),
+            drain_by: None,
         }
     }
+}
+
+/// One child's half of a pending merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct MergeHalf {
+    /// Epoch of the child's most recent folded assertion.
+    pub last: Epoch,
+    /// Whether an assertion folded under the latched admission has said
+    /// no row of the child hears. Sticky: it clears only with the half.
+    pub quiet: bool,
 }
 
 /// An admitted, not-yet-executed shard reshape, keyed in
@@ -494,20 +514,26 @@ pub enum PendingReshape {
         /// identical selection and child assignment (given an unchanged
         /// free pool) — an observer's synced child never moves under it.
         cohort_seed: Randomness,
-        /// The cut this split will land on, stamped once the readiness
-        /// gate passes and never moved after. `None` while the split is
-        /// admitted but unscheduled.
+        /// The cut this split will land on, stamped once the drain has
+        /// latched, the readiness gate passes and the shard is quiet, and
+        /// never moved after. `None` while the split is admitted but
+        /// unscheduled.
         scheduled: Option<ScheduledSplit>,
+        /// Whether an assertion folded under the latched admission has
+        /// said no row of the shard hears. Sticky: it clears only with the
+        /// record.
+        quiet: bool,
     },
     /// The target parent's two children merge back under it. The merge
     /// is paired — keepers drawn, eligible for execution — once both
     /// children hold a live half.
     Merge {
-        /// Per-child epoch of the most recent folded assertion. Both
-        /// children must keep a live half; a half quiet for
+        /// Per-child half: the epoch of its most recent folded assertion
+        /// and its quiet bit. Both children must keep a live half; a half
+        /// silent for
         /// [`RESHAPE_TRIGGER_TTL_EPOCHS`](crate::RESHAPE_TRIGGER_TTL_EPOCHS)
         /// cancels the paired merge.
-        halves: BTreeMap<ShardId, Epoch>,
+        halves: BTreeMap<ShardId, MergeHalf>,
         /// Keeper committee drawn when both halves pair: half the merged
         /// committee from each child, each seat the child it runs and
         /// whether it has synced the sibling half. The execution gate
@@ -518,8 +544,9 @@ pub enum PendingReshape {
         /// When the merge paired and drew its keepers, and by when it
         /// must be ready. `None` until paired.
         admitted: Option<Admission>,
-        /// The children's final epoch window, stamped once the readiness
-        /// gate passes and never moved after — both children share it, so
+        /// The children's final epoch window, stamped once the drain has
+        /// latched, the readiness gate passes and both halves are quiet,
+        /// and never moved after — both children share it, so
         /// they leave the trie on the same cut. `None` while the merge is
         /// paired but unscheduled.
         scheduled_terminal: Option<Epoch>,
@@ -776,6 +803,13 @@ pub struct FrozenWindow {
     /// carry; the applying fold consumes the keepers mid-fold, under the
     /// same argument as the observer cohort.
     pub(crate) reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
+    /// Each shard a latched reshape drains, mapped to the epoch its
+    /// record was admitted at: a split's target, and both children of a
+    /// merge. Keyed from the record rather than its seats, so a child
+    /// whose keepers have all dropped still reads draining. Intake toward
+    /// a shard named here pauses, and the shard's trigger asserts whether
+    /// its rows hear under the admission named here.
+    pub(crate) draining: BTreeMap<ShardId, Epoch>,
     /// Each shard's fullest cap dimension as its mean stood at
     /// promotion, before this epoch's fold advances it.
     ///
@@ -1271,6 +1305,7 @@ struct WindowProjection {
     witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
     reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
     reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
+    draining: BTreeMap<ShardId, Epoch>,
     /// The live retained parent-half cohorts — not window-frozen like the
     /// fields above, since a parent half is discovered and seated entirely
     /// within the window the split executes in, so the head and lookahead
@@ -1803,6 +1838,7 @@ impl BeaconState {
                 witness_bases: self.window.witness_bases.clone(),
                 reshape_observers: self.window.reshape_observers.clone(),
                 reshape_keepers: self.window.reshape_keepers.clone(),
+                draining: self.window.draining.clone(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.window.split_pending.clone(),
                 scheduled_terminals: self.window.scheduled_terminals.clone(),
@@ -1833,6 +1869,7 @@ impl BeaconState {
                 witness_bases: live.witness_bases,
                 reshape_observers: live.reshape_observers,
                 reshape_keepers: live.reshape_keepers,
+                draining: live.draining,
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: live.split_pending,
                 scheduled_terminals: live.scheduled_terminals,
@@ -1903,6 +1940,7 @@ impl BeaconState {
             settled_window_floors: self.live_settled_window_floors(),
             reshape_observers: self.live_reshape_observers(),
             reshape_keepers: self.live_reshape_keepers(),
+            draining: self.live_draining(),
             fullness: self.fullness_peaks(),
         }
     }
@@ -1930,6 +1968,33 @@ impl BeaconState {
             .filter(|(_, r)| matches!(r, PendingReshape::Split { .. }))
             .map(|(target, _)| *target)
             .collect()
+    }
+
+    /// Each shard a latched reshape drains as `pending_reshapes` stand
+    /// right now, mapped to the epoch its record was admitted at — the
+    /// value the next promotion freezes into [`FrozenWindow::draining`],
+    /// and what the lookahead snapshot projects for the window it
+    /// describes.
+    #[must_use]
+    pub(crate) fn live_draining(&self) -> BTreeMap<ShardId, Epoch> {
+        let mut draining = BTreeMap::new();
+        for (target, reshape) in &self.pending_reshapes {
+            match reshape {
+                PendingReshape::Split { admitted, .. } if admitted.drain_by.is_some() => {
+                    draining.insert(*target, admitted.at);
+                }
+                PendingReshape::Merge {
+                    admitted: Some(admitted),
+                    ..
+                } if admitted.drain_by.is_some() => {
+                    for child in <[ShardId; 2]>::from(target.children()) {
+                        draining.insert(child, admitted.at);
+                    }
+                }
+                PendingReshape::Split { .. } | PendingReshape::Merge { .. } => {}
+            }
+        }
+        draining
     }
 
     /// Whether `shard`'s cut is scheduled but its reshape has not applied
@@ -2098,6 +2163,7 @@ impl BeaconState {
             witness_bases,
             reshape_observers,
             reshape_keepers,
+            draining,
             reshape_parent_halves,
             split_pending,
             scheduled_terminals,
@@ -2192,6 +2258,7 @@ impl BeaconState {
         .with_prices(prices)
         .with_fullness(fullness)
         .with_scheduled_terminals(scheduled_terminals)
+        .with_draining(draining)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
         .with_genesis_unanchored(genesis_unanchored)
@@ -2686,6 +2753,7 @@ mod tests {
                 cohort: BTreeMap::new(),
                 cohort_seed: Randomness::ZERO,
                 scheduled: None,
+                quiet: false,
             },
         );
 
@@ -3034,6 +3102,7 @@ mod tests {
                 )]),
                 cohort_seed: Randomness::ZERO,
                 scheduled: None,
+                quiet: false,
             },
         );
 

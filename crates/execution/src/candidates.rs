@@ -124,8 +124,8 @@ impl CommittedInputs for Absorbed<'_> {
             .is_some_and(|arrival| arrival.cell.tx == tx)
     }
 
-    /// A fixture's own block terminates no shard.
-    fn terminating(&self, _: TxHash) -> bool {
+    /// A fixture's own block reshapes no shard.
+    fn reshaping(&self, _: TxHash) -> bool {
         false
     }
 }

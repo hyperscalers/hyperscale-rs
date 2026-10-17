@@ -914,6 +914,7 @@ fn shuffle_skips_split_pending_shard() {
                     cohort: BTreeMap::new(),
                     cohort_seed: Randomness::new([0xaa; 32]),
                     scheduled: None,
+                    quiet: false,
                 },
             );
         } else {

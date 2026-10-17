@@ -21,9 +21,10 @@ use hyperscale_types::{
     Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
     EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateClaim, SubstateKey, Terminating, TickId, TxsInFlight, VerificationKind,
-    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
+    ReshapeKind, ReshapeThresholds, ReshapeTrigger, Reshaping, ScheduleLookup, Settling, ShardId,
+    SplitAtBoundary, StateClaim, StoredReceipt, SubstateClaim, SubstateKey, TickId, TxsInFlight,
+    VerificationKind, WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
+    settling_in,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -2260,7 +2261,7 @@ impl ShardCoordinator {
                 return None;
             }
         };
-        let terminating = topology_schedule.terminating_at(anchor)?;
+        let reshaping = topology_schedule.reshaping_at(anchor)?;
         let parent_settled_frontier = if parent_qc.is_genesis() {
             Some(BlockHeight::GENESIS)
         } else {
@@ -2278,7 +2279,7 @@ impl ShardCoordinator {
         Some(Committed {
             snapshot,
             window,
-            terminating,
+            reshaping,
             windows: topology_schedule.windows(),
             schedule: topology_schedule,
             local_shard: self.local_shard,
@@ -2301,7 +2302,7 @@ impl ShardCoordinator {
 
     /// What the seat building a block on `parent` asks its node with,
     /// every reading taken at `parent`: `committee`, which the block is
-    /// classified under, the shards `terminating` at the block's anchor,
+    /// classified under, the shards `reshaping` at the block's anchor,
     /// the rows of `members` standing toward each shard, the answers and
     /// owed crossings the chain stands holding there, the drain on the
     /// parent's header, the transactions `chain` carries, the engagements
@@ -2310,7 +2311,7 @@ impl ShardCoordinator {
     fn ask_at<'a>(
         &'a self,
         committee: &'a TopologySnapshot,
-        terminating: Terminating<'a>,
+        reshaping: Reshaping<'a>,
         parent: BlockHash,
         members: &MemberIndex,
         chain: &'a QcChainSets,
@@ -2319,7 +2320,7 @@ impl ShardCoordinator {
         ProposalAsk {
             intake: IntakeView {
                 trie: committee.shard_trie(),
-                terminating,
+                reshaping,
                 standing: standing_toward(members),
                 answers: self.standing_over(parent, members),
                 in_flight: self.chain_view().parent_in_flight(parent),
@@ -2339,18 +2340,73 @@ impl ShardCoordinator {
     /// committed rows advance on; `None` while a block of it is not held
     /// here.
     fn ancestry(&self, windows: EpochWindows, parent: BlockHash) -> Option<Ancestry> {
+        self.ancestry_or_blocker(windows, parent).ok()
+    }
+
+    /// [`Self::ancestry`], naming where it is not held the block whose
+    /// absence keeps it from being rebuilt here: the first block on the
+    /// way down from `parent` this node does not hold, or the first one
+    /// at or below the committed tip, which a fork past it never gets.
+    fn ancestry_or_blocker(
+        &self,
+        windows: EpochWindows,
+        parent: BlockHash,
+    ) -> Result<Ancestry, BlockHash> {
         let mut blocks = Vec::new();
         let mut current = parent;
         while current != self.committed_hash {
-            let block = self.chain_view().get_block(current)?.clone();
+            let block = self.chain_view().get_block(current).ok_or(current)?.clone();
             if block.height() <= self.committed_height {
-                return None;
+                return Err(current);
             }
             current = block.header().parent_block_hash();
             blocks.push(block);
         }
         blocks.reverse();
-        Some(Ancestry::over(&self.member_rows, &blocks, windows))
+        Ok(Ancestry::over(&self.member_rows, &blocks, windows))
+    }
+
+    /// What a block extending `parent` under a parent QC keyed at
+    /// `parent_qc_wt`, classified under `committee`, asserts of this
+    /// shard's latched reshape: the kind and admission the committee's
+    /// window names the shard draining under, and whether the rows at
+    /// `parent` are quiet. `None` where that window names no draining
+    /// here, or the parent sits in a recovery's suffix band, where the
+    /// rows are QC-attested history a replica may not have folded yet. The
+    /// proposer fills the assertion from it and every voter recomputes it,
+    /// outside the byte count, so a draining shard asserts whatever its
+    /// load and thresholds.
+    ///
+    /// # Errors
+    ///
+    /// Names the block whose absence keeps the parent's anchor or its
+    /// rows from being read here, which the caller waits on. A shard its
+    /// committee's window names no draining for reads neither.
+    fn settling_behind(
+        &self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        parent: BlockHash,
+        parent_qc_wt: WeightedTimestamp,
+    ) -> Result<Option<(ReshapeKind, Settling)>, BlockHash> {
+        settling_in(
+            committee,
+            self.local_shard,
+            || {
+                let committee_anchor = self.block_anchor(parent).ok_or(parent)?;
+                Ok(topology_schedule.recovery_suffix_band(
+                    self.local_shard,
+                    committee_anchor,
+                    parent_qc_wt,
+                ))
+            },
+            || {
+                Ok(self
+                    .ancestry_or_blocker(topology_schedule.windows(), parent)?
+                    .rows
+                    .quiet())
+            },
+        )
     }
 
     /// What the manifest of the block extending `parent` under a parent
@@ -3004,7 +3060,7 @@ impl ShardCoordinator {
             local_crossings,
         } = gather(&self.ask_at(
             committee,
-            ctx.terminating,
+            ctx.reshaping,
             parent_block_hash,
             &members,
             &chain,
@@ -3284,25 +3340,28 @@ impl ShardCoordinator {
             }))
     }
 
-    /// The reshape assertion for a proposal: the load predicate over the
-    /// resolved substate byte total, deduped against the same trimmed window
-    /// the witness root commits. A `None` count (predicate out of play)
-    /// yields no assertion. Every replica recomputes this in verification;
-    /// the count is resolved — or the build deferred — by
+    /// The reshape assertion for a proposal: a draining shard's settling,
+    /// or else the load predicate over the resolved substate byte total,
+    /// deduped against the same trimmed window the witness root commits. A
+    /// `None` count (predicate out of play) yields no load assertion, and
+    /// takes nothing from the settling. Every replica recomputes this in
+    /// verification; the settling and the count are resolved — or the
+    /// build deferred — by [`Self::settling_behind`] and
     /// [`Self::proposal_substate_bytes`] before the witness preview, so
     /// this never guesses an assertion the local walk can't justify.
     fn derive_proposal_reshape_trigger(
         &self,
         topology_snapshot: &TopologySnapshot,
+        settling: Option<(ReshapeKind, Settling)>,
         substate_bytes: Option<u64>,
         window: &[Hash],
         committee_anchor_epoch: Epoch,
     ) -> Option<ReshapeTrigger> {
-        let count = substate_bytes?;
         let thresholds = topology_snapshot.reshape_thresholds();
         derive_reshape_trigger(
             self.local_shard,
-            count,
+            settling,
+            substate_bytes,
             topology_snapshot.fullness_of(self.local_shard),
             &thresholds,
             window,
@@ -3324,6 +3383,9 @@ impl ShardCoordinator {
     /// [`prospective_parent_witness_leaves`], so previewing against the
     /// committed accumulator alone would omit those leaves and produce a
     /// root no validator accepts.
+    ///
+    /// `None`, draining nothing, where the shard drains and the rows at
+    /// the parent its assertion reads are not held: the build defers.
     #[allow(clippy::too_many_arguments)] // proposer-side witness preview: chain prefix + committee + reshape inputs
     fn preview_witness_commitment(
         &mut self,
@@ -3333,7 +3395,26 @@ impl ShardCoordinator {
         parent_block_hash: BlockHash,
         substate_bytes: Option<u64>,
         committee_anchor_epoch: Epoch,
-    ) -> WitnessCommitmentPreview {
+    ) -> Option<WitnessCommitmentPreview> {
+        // A draining shard's assertion reads the rows at the parent, and
+        // the build waits for them as its member lines do, before the
+        // ready-signal pool is drained.
+        let settling = match self.settling_behind(
+            topology_schedule,
+            topology_snapshot,
+            parent_block_hash,
+            proposal_wt,
+        ) {
+            Ok(settling) => settling,
+            Err(blocking) => {
+                trace!(
+                    validator = ?self.me,
+                    ?blocking,
+                    "The rows behind a draining shard's assertion are not held; deferring the build"
+                );
+                return None;
+            }
+        };
         let mut ready_signals = self.ready_signal_pool.drain_eligible(
             proposal_wt,
             self.now,
@@ -3392,6 +3473,7 @@ impl ShardCoordinator {
 
         let reshape_trigger = self.derive_proposal_reshape_trigger(
             topology_snapshot,
+            settling,
             substate_bytes,
             &parent_leaves,
             committee_anchor_epoch,
@@ -3401,12 +3483,12 @@ impl ShardCoordinator {
         // loop. The preview resolves only the inputs to that: the trimmed
         // parent window the new leaves append onto, the deduped ready signals,
         // the reshape assertion, and the window base.
-        WitnessCommitmentPreview {
+        Some(WitnessCommitmentPreview {
             ready_signals,
             reshape_trigger,
             parent_window: parent_leaves,
             base,
-        }
+        })
     }
 
     /// Unified proposal build + dispatch.
@@ -3591,14 +3673,16 @@ impl ShardCoordinator {
             Ok(claim) => claim,
             Err(blocking) => return self.defer_on_substate(blocking, height),
         };
-        let preview = self.preview_witness_commitment(
+        let Some(preview) = self.preview_witness_commitment(
             topology_schedule,
             committee,
             parent_qc.weighted_timestamp(),
             parent_block_hash,
             substate.bytes,
             committee_anchor_epoch,
-        );
+        ) else {
+            return vec![];
+        };
 
         // What the block's member lines are named over, off the chain up
         // to the parent; the builder names them once it has dropped what
@@ -4788,6 +4872,12 @@ impl ShardCoordinator {
                     return wanted;
                 }
             }
+            let settling = self.settling_behind(
+                topology_schedule,
+                committee,
+                block.header().parent_block_hash(),
+                block.header().parent_qc().weighted_timestamp(),
+            );
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
                 topology_schedule,
@@ -4800,6 +4890,7 @@ impl ShardCoordinator {
                 self.committed_committee_anchor_wt,
                 block_hash,
                 block,
+                settling,
                 SubstateCountSource {
                     thresholds: committee.reshape_thresholds(),
                     frontier: self.substate_bytes_frontier,
@@ -5673,9 +5764,16 @@ impl ShardCoordinator {
                 .park_beacon_witness_awaiting_committee(block_hash);
             return Vec::new();
         };
+        let settling = self.settling_behind(
+            topology_schedule,
+            committee,
+            block.header().parent_block_hash(),
+            block.header().parent_qc().weighted_timestamp(),
+        );
         self.verification.initiate_beacon_witness_root_verification(
             block_hash,
             &block,
+            settling,
             &self.pending_blocks,
             &self.beacon_witness_accumulator,
             self.committed_hash,
@@ -23130,6 +23228,72 @@ mod tests {
             carry(1_500, 1_000),
             Some(true),
             "the terminal after a block anchored on the cut"
+        );
+    }
+
+    /// The terminal settled set rides the terminal alone while its shard
+    /// reshapes: a window naming the shard draining carries it on no
+    /// block while no cut is scheduled, though every block there reads
+    /// the shard reshaping, and with the cut scheduled only the terminal
+    /// carries it.
+    #[test]
+    fn a_terminal_settled_set_is_carried_only_at_the_cut_while_reshaping() {
+        let at = WeightedTimestamp::from_millis;
+        let draining = BTreeMap::from([(ShardId::ROOT, Epoch::new(0))]);
+        let carry = |sched: &TopologySchedule, parent_qc_ms, grandparent_qc_ms| {
+            let state = coordinator_with_committed_anchor(grandparent_qc_ms);
+            state
+                .terminal_carry(sched, state.committed_hash, at(parent_qc_ms))
+                .map(|carry| carry.terminal_settled_txs)
+        };
+
+        let unscheduled = TopologySchedule::new(
+            1000,
+            Epoch::new(0),
+            Arc::new(
+                TopologySnapshot::new(NetworkDefinition::simulator(), 1, ValidatorSet::new(vec![]))
+                    .with_draining(draining.clone()),
+            ),
+        );
+        for (parent, grandparent) in [(500, 100), (900, 500), (999, 900)] {
+            assert!(
+                unscheduled
+                    .reshaping_at(at(parent))
+                    .is_some_and(|reshaping| reshaping.contains(ShardId::ROOT))
+            );
+            assert_eq!(carry(&unscheduled, parent, grandparent), Some(false));
+        }
+
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let mut scheduled = TopologySchedule::new(
+            1000,
+            Epoch::new(0),
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    1,
+                    ValidatorSet::new(validators.clone()),
+                )
+                .with_scheduled_terminals(BTreeMap::from([(ShardId::ROOT, Epoch::new(0))]))
+                .with_draining(draining),
+            ),
+        );
+        scheduled.insert(Epoch::new(1), root_departed_window(validators, None));
+        assert_eq!(
+            carry(&scheduled, 900, 500),
+            Some(false),
+            "a final-window block"
+        );
+        assert_eq!(carry(&scheduled, 1_500, 900), Some(true), "the terminal");
+        assert_eq!(
+            carry(&scheduled, 1_600, 1_500),
+            Some(false),
+            "a coast block"
         );
     }
 

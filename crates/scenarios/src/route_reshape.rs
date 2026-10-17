@@ -22,14 +22,17 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
+use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows,
-    MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, PrincipalAddr, ShardId, SubstateKey,
-    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp, Window,
+    Address, Admission, BeaconState, BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows,
+    HALT_THRESHOLD_EPOCHS, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, PendingReshape,
+    PrincipalAddr, RESHAPE_READY_TTL_EPOCHS, ShardId, SubstateKey, TimestampRange, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    Window,
 };
 use hyperscale_vm_effects::{Answered, ProtocolHasher, fee_hold_total_key};
 
+use crate::faults::{StagedHalt, await_halt_recovery, await_recovery_resume, freeze_shard};
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
 use crate::straddler::{
@@ -42,8 +45,7 @@ use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
     ChainMentions, anchor_seeded, answer_standing, beacon_epoch, clock, crossing_cells,
     declared_price, epoch_duration_ms, escrowed_into, held, held_at, merge_keeper_count, owed_at,
-    owning_shard, scheduled_terminal_epoch, shard_decisions, split_admitted, stands_at,
-    terminal_height,
+    owning_shard, scheduled_terminal_epoch, split_admitted, stands_at, terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -2553,6 +2555,45 @@ struct DepartingRoute {
 /// Panics if a quarter is unserved, if either venue misses its budget
 /// standing up, or if the split is not admitted, or admitted elsewhere.
 fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
+    let route = stand_up_departing_route(c);
+    // The departing venue's shard is leaving from here to the cut: its
+    // ballast alone crosses the voted threshold. The vote settles before
+    // any certificate channel is cut, since it crosses the same shards.
+    cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
+    assert_only_the_departing_venue_admitted(c, epochs(20));
+    route
+}
+
+/// Wait `budget` for the first venue's shard to admit its split, and
+/// hold that no other quarter admits one.
+///
+/// # Panics
+///
+/// Panics if the split is not admitted within `budget`, or another
+/// quarter admits one.
+fn assert_only_the_departing_venue_admitted<C: Cluster>(c: &mut C, budget: Budget) {
+    let departing = FIRST_VENUE_SHARD;
+    assert!(
+        await_split_admitted(c, departing, budget),
+        "only the over-threshold venue shard must admit a split",
+    );
+    assert!(
+        (0..4)
+            .map(|path| ShardId::leaf(2, path))
+            .filter(|&shard| shard != departing)
+            .all(|shard| !split_admitted(c, shard)),
+        "no other quarter may split",
+    );
+}
+
+/// [`departing_route`] short of its vote: both venues stocked and the
+/// trader ground, with no quarter over the threshold yet.
+///
+/// # Panics
+///
+/// Panics if a quarter is unserved, or if either venue misses its budget
+/// standing up.
+fn stand_up_departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
     let departing = FIRST_VENUE_SHARD;
     assert!(
         (0..4).all(|path| c.serves_shard(ShardId::leaf(2, path))),
@@ -2580,21 +2621,6 @@ fn departing_route<C: Cluster>(c: &mut C) -> DepartingRoute {
             reserve_cell(&leaving.meta, leaving.unit),
             reserve_cell(&staying.meta, staying.unit),
         ],
-    );
-    // The departing venue's shard is leaving from here to the cut: its
-    // ballast alone crosses the voted threshold. The vote settles before
-    // any certificate channel is cut, since it crosses the same shards.
-    cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
-    assert!(
-        await_split_admitted(c, departing, epochs(20)),
-        "only the over-threshold venue shard must admit a split",
-    );
-    assert!(
-        (0..4)
-            .map(|path| ShardId::leaf(2, path))
-            .filter(|&shard| shard != departing)
-            .all(|shard| !split_admitted(c, shard)),
-        "no other quarter may split",
     );
     DepartingRoute {
         leaving,
@@ -2879,51 +2905,28 @@ pub fn a_venue_sealed_on_a_fresh_split_child_runs<C: Cluster>(c: &mut C) {
     );
 }
 
-/// Both venues were genuinely held apart, and neither settled a route
-/// whose verdict the other never read.
-///
-/// The two halves of one claim: the channel carried something and was
-/// cut, so a run where the fault never fired proves nothing; and no
-/// venue reached an acceptance alone, which is what a core that never
-/// read its counterpart's verdict may never do.
-fn assert_neither_venue_settled<C: FaultableCluster>(
-    c: &C,
-    cut: &[FaultHandle],
-    hash: TxHash,
-    venues: [ShardId; 2],
-) {
-    assert!(
-        cut.iter().any(|handle| handle.fired() > 0),
-        "the channels between the venues must actually have been exercised and cut, or the \
-         venues were never held apart",
-    );
-    for shard in venues {
-        let fate = c.chain_fate(shard, hash).1.map(|(_, decision)| decision);
-        assert!(
-            fate != Some(TransactionDecision::Accept),
-            "a venue settled a route whose verdict it never read; {shard} reached {fate:?}",
-        );
-    }
-}
-
-/// A record naming a commit from before its departure was ever voted
-/// still resolves the window that priced it.
+/// A route committed before its departure was ever voted holds the
+/// departure until it settles on both venues.
 ///
 /// Every other reshape scenario takes its departure from the grow, which
-/// admits one before any scenario code runs — so the commit always falls
-/// inside the floor that admission pins, and the window the record names
-/// is always still retained. Here the grow's own split is allowed to run
-/// first, the route commits against quarters that survive it, and only
-/// then does a vote schedule the departure. The commit is left on the far
-/// side of every floor the schedule derives, while its entry lives on:
-/// nothing bounds how long a certified entry waits for a silent
-/// counterpart.
+/// admits one before any scenario code runs. Here the grow's own split
+/// is allowed to run first, the route commits against quarters that
+/// survive it, and only then does a vote schedule the departure: a merge
+/// of the departing venue's shard with its sibling. The venues are held
+/// apart, so the survivor never reads the departing venue's verdict and
+/// the departing venue's row hears a sibling that cannot read it back:
+/// the merge pairs and latches its drain, and no cut is scheduled. Once
+/// the venues read each other, the route accepts on both, the survivor's
+/// hold returns to its baseline, and the merge lands.
 ///
 /// # Panics
 ///
-/// Panics if the grown topology does not settle, if the late split is not
-/// admitted where it was voted, or if the survivor's hold or the trader's
-/// input does not come back.
+/// Panics if the grown topology does not settle, if either venue does
+/// not state its yes, if the late merge is not paired where it was voted,
+/// if its cut is scheduled while the venues cannot read each other, if the route does not accept on both
+/// venues once they can, if the merged parent is not served after it, if
+/// the survivor's hold does not return to its baseline, or if the world
+/// does not settle.
 pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: FaultableCluster>(
     c: &mut C,
 ) {
@@ -2936,9 +2939,7 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     let leaving = stand_up_venue(c, departing, &mut taken);
 
     // The grown threshold admits the merging parent's split. Let it run:
-    // the pair it forms is what the vote later collapses, and the floor
-    // its own admission pins expires before the route commits rather than
-    // after.
+    // the pair it forms is what the vote later collapses.
     let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
     assert!(
         await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
@@ -2955,8 +2956,8 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
 
     // A vote crosses both venue shards, so it has to be cast while they
     // can still hear each other — but it carries an activation far
-    // enough out that the departure it schedules lands well after the
-    // route has committed. That gap is the whole scenario.
+    // enough out that the departure it schedules comes after the route
+    // has committed.
     let activates_at = cast_late_threshold_vote(c, LATE_SPLIT_BYTES, LATE_VOTE_LEAD_EPOCHS);
 
     let cut = hold_late_venues_apart(c, LATE_TRADER_SHARD);
@@ -2973,8 +2974,6 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
         0,
         validity_around(c.now()),
     );
-    // A record the cut leaves standing is value the world still holds,
-    // counted rather than reported as a strand.
     protocol_resource.owing(crossing_records(
         &tx.try_derived(c.derivation().as_ref())
             .expect("a scenario route derives")
@@ -2986,56 +2985,213 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
             && c.chain_fate(departing, hash).0.is_some()),
         "both shards must commit the route while both are live",
     );
-    let engaged = c
-        .committed_txs_in_flight(survivor)
-        .expect("the survivor must serve a committed tip once it holds the route");
     assert!(
-        engaged > baseline,
-        "the route must engage a hold against the survivor's drain; baseline = {baseline:?}, \
-         engaged = {engaged:?}",
+        c.run_until(epochs(12), |c| stands_stated(c, survivor, hash)
+            && stands_stated(c, departing, hash)),
+        "both venues must state their yes",
     );
-    assert!(
-        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
-            < SWAPPER_FUNDING - ROUTE_INPUT),
-        "the trader's leg must pay before the core is asked anything",
-    );
-    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
 
-    await_late_departure(c, activates_at);
-    assert_fated_off(c, departing, hash, &[LATE_MERGED_PARENT]);
+    await_late_pairing(c, activates_at);
+    assert_no_cut_while_unread(c, departing, hash, epochs(12));
     assert!(
-        c.run_until(epochs(32), |c| c.committed_txs_in_flight(survivor)
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the channels between the venues must actually have been cut",
+    );
+    c.clear_drops();
+
+    let accepted = |c: &C, shard: ShardId| {
+        c.chain_fate(shard, hash).1.map(|(_, decision)| decision)
+            == Some(TransactionDecision::Accept)
+    };
+    assert!(
+        c.run_until(epochs(24), |c| accepted(c, departing)
+            && accepted(c, survivor)),
+        "the route must accept on both venues once they read each other; the departing venue \
+         reached {:?} and the survivor {:?}",
+        c.chain_fate(departing, hash).1,
+        c.chain_fate(survivor, hash).1,
+    );
+    assert!(
+        await_serves(c, LATE_MERGED_PARENT, epochs(40)),
+        "the merged parent must be served once the route has settled",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),
-        "the survivor's hold must return to its baseline once the departed venue's ended names \
-         have answered a commit from before the vote; holds {:?} against {baseline:?}",
+        "the survivor's hold must return to its baseline once the route settles; holds {:?} \
+         against {baseline:?}",
         c.committed_txs_in_flight(survivor),
     );
-    // And the crossing the trader's leg issued comes back to it. Which
-    // of the two settles it is the epoch length's to decide and not this
-    // scenario's: `CLAIM_WINDOW` is counted in epochs, so on a long one
-    // the leg entry is gone before the record the cut licenses lands and
-    // the record leaf is all that is left to compose from, while on a
-    // short one the entry is still standing and settles it itself. The
-    // value comes back either way, which is the whole of what is owed.
-    assert!(
-        c.run_until(epochs(12), |c| held(
-            c,
-            trader.address(),
-            *PROTOCOL_RESOURCE
-        ) == paid + ROUTE_INPUT),
-        "the trader must get the route's input back however late the cut lands; holds {} \
-         against {}",
-        held(c, trader.address(), *PROTOCOL_RESOURCE),
-        paid + ROUTE_INPUT,
-    );
-    assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
-    c.clear_drops();
-    // The trader holds its input again and neither venue settled, so no
-    // record stands and the reserves are untouched.
-    protocol_resource.assert_settled(
+    protocol_resource.assert_settles_within(
         c,
         &charges,
+        epochs(12),
         "a route committed before its departure was voted",
+    );
+}
+
+/// The merging child's pending merge: its admission, where it has paired.
+fn merge_admission<C: Cluster>(c: &C, child: ShardId) -> Option<Admission> {
+    c.beacon_state().and_then(
+        |state| match state.pending_reshapes.get(&child.parent()?)? {
+            PendingReshape::Merge { admitted, .. } => *admitted,
+            PendingReshape::Split { .. } => None,
+        },
+    )
+}
+
+/// Run a whole drain of the merge `departing` leaves under and past it,
+/// with the route `hash` between `departing` and `survivor` cut off from
+/// each other's readings, and hold that no cut of `departing` is
+/// scheduled, both rows of the route stand stated, and no admission is
+/// cancelled before its deadline.
+///
+/// # Panics
+///
+/// Panics if any of the three fails.
+fn assert_merge_holds_through_its_drain<C: Cluster>(
+    c: &mut C,
+    departing: ShardId,
+    survivor: ShardId,
+    hash: TxHash,
+) {
+    let both_stated = |c: &C| stands_stated(c, departing, hash) && stands_stated(c, survivor, hash);
+    let drain_epochs = c
+        .beacon_state()
+        .expect("a grown cluster has beacon state")
+        .chain_config
+        .reshape_drain_epochs();
+    let hold = u32::try_from(drain_epochs + 4).expect("a handful of epochs");
+    let early_cancel = Cell::new(None);
+    let seen = Cell::new(None::<Admission>);
+    let broke = c.run_until(epochs(hold), |c| {
+        let now = merge_admission(c, departing);
+        if let (Some(before), Some(drain_by)) = (seen.get(), seen.get().and_then(|a| a.drain_by))
+            && now.is_none_or(|now| now.at != before.at)
+            && beacon_epoch(c).is_some_and(|epoch| epoch < drain_by)
+        {
+            early_cancel.set(Some(before));
+        }
+        seen.set(now);
+        cut_scheduled(c, departing) || !both_stated(c) || early_cancel.get().is_some()
+    });
+    assert!(
+        !broke,
+        "while the readings are cut no cut of {departing:?} is scheduled, both rows stand, and \
+         no admission is cancelled before its deadline; scheduled {}, rows {:?}, cancelled \
+         early {:?}",
+        cut_scheduled(c, departing),
+        [departing, survivor].map(|shard| c
+            .member_rows(shard)
+            .and_then(|rows| rows.get(&hash).copied())),
+        early_cancel.get(),
+    );
+}
+
+/// A reading cut between a merging child and a venue it shares a route
+/// with tears nothing and cuts nothing: the merge waits it out.
+///
+/// The route runs between a venue on the child the late vote merges away
+/// and one on a quarter that outlives it, and every reading between the
+/// two is cut before it commits, held against hosts either committee
+/// gains: both venues state their yes, and the child's rows hear a
+/// sibling they cannot read. The vote pairs the merge and its keepers
+/// ready, but through a whole drain and past it no window schedules the
+/// child's terminal, both rows stand, and any admission that latched is
+/// cancelled only at its deadline. Once the cut lifts, the route accepts on both venues and the
+/// merge lands within its budget.
+///
+/// # Panics
+///
+/// Panics if the grown topology does not settle, if either venue does
+/// not state its yes, if the merge does not pair, if a cut of the child
+/// is scheduled while the readings are cut, if a row of the route stops
+/// standing then, if an admission is cancelled before its deadline, if
+/// the route does not accept on both venues once the cut lifts, if the
+/// merged parent is not served within budget, or if the world does not
+/// settle.
+pub fn a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
+    let mut taken = Vec::new();
+    let leaving = stand_up_venue(c, departing, &mut taken);
+    let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
+    assert!(
+        await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
+        "the grow's own split must have run before the route commits",
+    );
+    let staying = stand_up_venue(c, survivor, &mut taken);
+    let (key, trader) = grind_onto(LATE_TRADER_SHARD, &mut taken);
+    let reserves = [
+        reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE),
+        reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
+    ];
+    let mut protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
+    let activates_at = cast_late_threshold_vote(c, LATE_SPLIT_BYTES, LATE_VOTE_LEAD_EPOCHS);
+
+    let sibling = if grown_left == departing {
+        grown_right
+    } else {
+        grown_left
+    };
+    // Cut before the route, so neither venue holds a reading of the
+    // other's yes taken before it.
+    let cut = [
+        isolate_crossing_intake_but_from(c, departing, &[LATE_TRADER_SHARD, sibling]),
+        isolate_crossing_intake_but_from(c, survivor, &[LATE_TRADER_SHARD]),
+    ];
+
+    let mut charges = Charges::default();
+    let tx = build_route_tx(
+        &key,
+        trader,
+        (&leaving.meta, &staying.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    protocol_resource.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    ));
+    let hash = charges.submit(c, tx);
+    let both_stated = |c: &C| stands_stated(c, departing, hash) && stands_stated(c, survivor, hash);
+    assert!(
+        c.run_until(epochs(12), both_stated),
+        "both venues must state their yes",
+    );
+    await_late_pairing(c, activates_at);
+    assert_merge_holds_through_its_drain(c, departing, survivor, hash);
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "the readings between the venues must actually have been cut",
+    );
+    c.clear_drops();
+
+    let accepted = |c: &C, shard: ShardId| {
+        c.chain_fate(shard, hash).1.map(|(_, decision)| decision)
+            == Some(TransactionDecision::Accept)
+    };
+    assert!(
+        c.run_until(epochs(16), |c| accepted(c, departing)
+            && accepted(c, survivor)),
+        "the route must accept on both venues once the cut lifts; the departing venue reached \
+         {:?} and the survivor {:?}",
+        c.chain_fate(departing, hash).1,
+        c.chain_fate(survivor, hash).1,
+    );
+    assert!(
+        await_serves(c, LATE_MERGED_PARENT, epochs(40)),
+        "the merge must land within budget once the cut lifts",
+    );
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a reading cut through a merge",
     );
 }
 
@@ -3070,15 +3226,9 @@ fn cut_the_trader_once_stated<C: FaultableCluster>(
     cut: [FaultHandle; 3],
 ) -> Vec<FaultHandle> {
     let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
-    let stated = |c: &C, shard: ShardId| {
-        matches!(
-            c.member_rows(shard)
-                .and_then(|rows| rows.get(&hash).copied()),
-            Some(RowState::Stated { .. })
-        )
-    };
     assert!(
-        c.run_until(epochs(12), |c| stated(c, survivor) && stated(c, departing)),
+        c.run_until(epochs(12), |c| stands_stated(c, survivor, hash)
+            && stands_stated(c, departing, hash)),
         "both venues must state their success before the trader's shard is cut off too",
     );
     cut.into_iter()
@@ -3086,18 +3236,13 @@ fn cut_the_trader_once_stated<C: FaultableCluster>(
         .collect()
 }
 
-/// Drive the late vote through to the merged parent serving.
-///
-/// The activation carries the run past the floor the grow's own split
-/// pinned and past the horizon the commit's window would otherwise have
-/// been kept under, so the departure it schedules leaves the route's
-/// commit on the far side of every floor.
+/// Drive the late vote through to the departing pair pairing its
+/// keepers.
 ///
 /// # Panics
 ///
-/// Panics if the vote never activates, the pair never pairs its keepers,
-/// or the merged parent is unserved within budget.
-fn await_late_departure<C: Cluster>(c: &mut C, activates_at: Epoch) {
+/// Panics if the vote never activates or the pair never pairs.
+fn await_late_pairing<C: Cluster>(c: &mut C, activates_at: Epoch) {
     assert!(
         c.run_until(epochs(28), |c| c.beacon_state().is_some_and(|s| s
             .params
@@ -3110,20 +3255,18 @@ fn await_late_departure<C: Cluster>(c: &mut C, activates_at: Epoch) {
         await_merge_keeper_count(c, LATE_MERGED_PARENT, 3, epochs(28)),
         "the activated threshold must pair the departing venue's shard with its sibling",
     );
-    assert!(
-        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
-        "the merged parent must be served within budget",
-    );
 }
 
-/// Where the trader of [`a_merged_chain_declines_at_its_own_parent`]
+/// Where the trader of [`a_crossing_within_a_merging_pair_settles_before_the_merge_cuts`]
 /// sits: the departing venue's sibling, which the late vote collapses
 /// into one parent with it.
 const LATE_MERGING_TRADER_SHARD: ShardId = ShardId::leaf(3, 1);
 
-/// Genesis funding for [`a_merged_chain_declines_at_its_own_parent`]:
+/// Genesis funding for the crossing within a merging pair.
+///
 /// [`late_departing_route_genesis_accounts`] with the trader under the
-/// merging parent, on the half the departing venue is not.
+/// merging parent, on the half the departing venue is not, for
+/// [`a_crossing_within_a_merging_pair_settles_before_the_merge_cuts`].
 #[must_use]
 pub fn merging_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     let packages = GenesisPackages::with_fixtures();
@@ -3152,35 +3295,32 @@ pub fn merging_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     accounts
 }
 
-/// A chain a merge brought both ends of a crossing onto declines the
-/// record at its own parent, takes it back in a later block, and then
-/// lets the answer go.
+/// A crossing a merge would bring both ends of onto one chain settles
+/// before the merge cuts.
 ///
 /// [`a_route_committed_before_its_departure_was_voted_still_resolves`]
 /// with the trader on the departing venue's sibling. The trader's leg
 /// stages the route's input as a record under one half of the merging
-/// pair, for a venue under the other, and the core never combines. The
-/// late vote collapses the pair: both terminals fate what they hold, and
-/// the merged parent inherits the record and the venue's prefix
-/// together, with no member of the route and no answer.
-///
-/// No counterpart holds either end to be asked or pushed to, so the
-/// merged chain reads the crossing at its own parent: the record with
-/// its value and the route's member row absent, on which its fold
-/// writes the `Never`; then the `Never` present beside the record, on
-/// which the input is taken back; then the record absent, on which the
-/// `Never` is deleted.
+/// pair, for a venue under the other, and the venues are held apart once
+/// both have stated, the trader's shard cut off from the survivor too.
+/// The late vote pairs the merge, which latches its drain and schedules
+/// no cut while the departing venue's row hears a sibling it cannot read.
+/// Once the venues read each other the route accepts on both, the venue
+/// takes the record, and the merge lands with nothing of the crossing
+/// left for the merged chain to decline.
 ///
 /// # Panics
 ///
 /// Panics if the grown topology does not settle, if either venue does
-/// not state its success, if the late split is not admitted where it
-/// was voted, if the record and the venue's prefix do not come to the
-/// merged parent together, if the merged chain does not decline the
-/// record, if the decline is a refusal's or names another transaction,
-/// if the input does not come home, or if the answer outlives the
-/// record.
-pub fn a_merged_chain_declines_at_its_own_parent<C: FaultableCluster>(c: &mut C) {
+/// not state its success, if the record and its consumer do not sit on
+/// the two halves of the merging pair, if the merge's cut is scheduled
+/// while the venues cannot read each other, if the route does not accept
+/// on both venues once they can, if the merged parent is not served
+/// after it, if the record still stands or anything declined it, or if
+/// the world does not settle.
+pub fn a_crossing_within_a_merging_pair_settles_before_the_merge_cuts<C: FaultableCluster>(
+    c: &mut C,
+) {
     let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
     let mut taken = Vec::new();
     let leaving = stand_up_venue(c, departing, &mut taken);
@@ -3220,12 +3360,6 @@ pub fn a_merged_chain_declines_at_its_own_parent<C: FaultableCluster>(c: &mut C)
             && c.chain_fate(departing, hash).0.is_some()),
         "both venue shards must commit the route while both are live",
     );
-    assert!(
-        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
-            < SWAPPER_FUNDING - ROUTE_INPUT),
-        "the trader's leg must pay before the core is asked anything",
-    );
-    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
     let cut = cut_the_trader_once_stated(c, hash, cut);
     let (record, id) = escrowed_into(c, &charges.records(c), departing);
     let decline = id.answer_key(&ProtocolHasher, Answered::Never);
@@ -3238,49 +3372,44 @@ pub fn a_merged_chain_declines_at_its_own_parent<C: FaultableCluster>(c: &mut C)
         "the record and its consumer sit on the two halves of the merging pair",
     );
 
-    await_late_departure(c, activates_at);
-    assert_fated_off(c, departing, hash, &[LATE_MERGED_PARENT]);
-    assert_eq!(
-        (
-            owning_shard(c, record.owner),
-            owning_shard(c, decline.owner)
-        ),
-        (LATE_MERGED_PARENT, LATE_MERGED_PARENT),
-        "the merge must bring both ends of the crossing onto one chain",
+    await_late_pairing(c, activates_at);
+    assert_no_cut_while_unread(c, departing, hash, epochs(8));
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the channels between the venues must actually have been cut",
+    );
+    c.clear_drops();
+    let accepted = |c: &C, shard: ShardId| {
+        c.chain_fate(shard, hash).1.map(|(_, decision)| decision)
+            == Some(TransactionDecision::Accept)
+    };
+    assert!(
+        c.run_until(epochs(16), |c| accepted(c, departing)
+            && accepted(c, survivor)),
+        "the route must accept on both venues once they read each other; the departing venue \
+         reached {:?} and the survivor {:?}",
+        c.chain_fate(departing, hash).1,
+        c.chain_fate(survivor, hash).1,
     );
     assert!(
-        c.run_until(epochs(12), |c| answer_standing(c, decline).is_some()),
-        "the merged chain must decline the record at its own parent",
+        await_serves(c, LATE_MERGED_PARENT, epochs(28)),
+        "the merged parent must be served once the route has settled",
     );
-    let answer = answer_standing(c, decline).expect("the decline stands");
-    assert_eq!(
-        (answer.answered, answer.tx, answer.seen),
-        (Answered::Never, hash, true),
-        "the fold's decline names the route and is written seen",
+    assert!(
+        c.run_until(epochs(12), |c| !stands_at(c, record)
+            && answer_standing(c, decline).is_none()),
+        "the venue takes the record before the merge, and nothing declines it",
     );
     assert!(
         c.declined(departing, hash).is_empty() && c.declined(LATE_MERGED_PARENT, hash).is_empty(),
-        "no member of the route refused the input: the decline is the merged chain's fold's",
+        "nothing refused a record its consumer took",
     );
-    assert!(
-        c.run_until(epochs(12), |c| held(
-            c,
-            trader.address(),
-            *PROTOCOL_RESOURCE
-        ) == paid + ROUTE_INPUT),
-        "the trader must get the route's input back on the merged chain's decline; holds {} \
-         against {}",
-        held(c, trader.address(), *PROTOCOL_RESOURCE),
-        paid + ROUTE_INPUT,
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a crossing settled before its merge",
     );
-    assert!(
-        c.run_until(epochs(4), |c| !stands_at(c, record)
-            && answer_standing(c, decline).is_none()),
-        "the record is gone and its answer after it, read absent at the chain's own parent",
-    );
-    assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
-    c.clear_drops();
-    protocol_resource.assert_settled(c, &charges, "a record a merged chain declined");
 }
 
 /// A route the surviving venue accepted before its counterpart's split
@@ -3826,34 +3955,911 @@ pub fn a_route_only_the_departing_venue_heard_settles_on_both_venues_or_neither<
     a_route_heard_one_way_across_a_late_departure(c, LATE_SURVIVOR_VENUE);
 }
 
-/// A route through a departing venue releases the surviving venue's
-/// hold at the terminal and gives the trader its input back.
+/// Whether the beacon has scheduled `shard`'s cut: its boundary record
+/// carries the terminal a split or a merge stamps on its leaving leaves.
+fn cut_scheduled<C: Cluster>(c: &C, shard: ShardId) -> bool {
+    c.beacon_state().is_some_and(|state| {
+        state
+            .boundaries
+            .get(&shard)
+            .is_some_and(|boundary| boundary.terminal_epoch.is_some())
+    })
+}
+
+/// Whether the reshape `shard` leaves under has latched its drain: the
+/// split of `shard` itself, or the merge under its parent.
+fn drain_latched<C: Cluster>(c: &C, shard: ShardId) -> bool {
+    c.beacon_state().is_some_and(|state| {
+        let admitted = |reshape: &PendingReshape| match reshape {
+            PendingReshape::Split { admitted, .. } => Some(*admitted),
+            PendingReshape::Merge { admitted, .. } => *admitted,
+        };
+        [Some(shard), shard.parent()]
+            .into_iter()
+            .flatten()
+            .filter_map(|target| state.pending_reshapes.get(&target))
+            .filter_map(admitted)
+            .any(|admitted| admitted.drain_by.is_some())
+    })
+}
+
+/// Whether `shard`'s row of `hash` stands stated.
+fn stands_stated<C: Cluster>(c: &C, shard: ShardId, hash: TxHash) -> bool {
+    matches!(
+        c.member_rows(shard)
+            .and_then(|rows| rows.get(&hash).copied()),
+        Some(RowState::Stated { .. })
+    )
+}
+
+/// Run `budget` with `departing`'s row of `hash` hearing a sibling it
+/// cannot read, and hold that no cut of `departing` is scheduled under it,
+/// while its reshape latches its drain: the readiness gate passes and the
+/// quiet gate holds.
 ///
-/// A route's two venues are one core, each awaiting the other's
-/// verdict, so a route is the shape that still holds work across a
-/// shard's terminal: the trader's leg pays and settles alone, and the
-/// two venue rows wait. With each venue cut off from the other's state
-/// and certificates both ways, neither ever reads the other's yes: each
-/// states its own and stands, the departing venue's terminal fates its
-/// row, and the survivor's stated row stays engaged against its drain
-/// until it reads the departed sibling's ended names, which do not
-/// name the route. Then the survivor aborts the core member, the drain
-/// returns to its baseline, and the trader's crossing is reclaimed.
-/// Neither reserve moves.
+/// # Panics
+///
+/// Panics if the row does not hear when the wait starts, if it leaves
+/// its standing within `budget`, which only a reading the isolation
+/// should have withheld can cause, if the cut is scheduled within
+/// `budget`, or if the drain never latches.
+fn assert_no_cut_while_unread<C: Cluster>(
+    c: &mut C,
+    departing: ShardId,
+    hash: TxHash,
+    budget: Budget,
+) {
+    let row = |c: &C| {
+        c.member_rows(departing)
+            .and_then(|rows| rows.get(&hash).copied())
+    };
+    let standing = row(c);
+    assert!(
+        matches!(standing, Some(RowState::Stated { .. } | RowState::Accepted)),
+        "{departing:?}'s row must hear a sibling when the wait starts; it stands {standing:?}",
+    );
+    let latched = Cell::new(false);
+    let ended = c.run_until(budget, |c| {
+        latched.set(latched.get() || drain_latched(c, departing));
+        row(c) != standing || cut_scheduled(c, departing)
+    });
+    assert_eq!(
+        row(c),
+        standing,
+        "the isolation leaked: the row left its standing before the cut",
+    );
+    assert!(
+        !ended,
+        "no cut of {departing:?} may be scheduled while its row hears a sibling it cannot \
+         read; the row stands {standing:?}",
+    );
+    assert!(
+        latched.get(),
+        "{departing:?}'s reshape must latch its drain while it waits, or the readiness gate \
+         and not the quiet gate held the cut",
+    );
+}
+
+/// The pending split of `shard`'s admission.
+fn split_admission<C: Cluster>(c: &C, shard: ShardId) -> Option<Admission> {
+    c.beacon_state()
+        .and_then(|state| match state.pending_reshapes.get(&shard)? {
+            PendingReshape::Split { admitted, .. } => Some(*admitted),
+            PendingReshape::Merge { .. } => None,
+        })
+}
+
+/// How many routes [`a_split_under_steady_core_load_lands_without_a_cancel`]
+/// offers, one an epoch, before its target's drain must have latched.
+const STEADY_LOAD_ROUTES: usize = 24;
+
+/// A split under steady core load toward its target lands without a
+/// cancel.
+///
+/// The route topology's first venue shard is admitted to split, and a
+/// route through it is offered every epoch while its cohort syncs:
+/// intake stays open through the sync, so each commits on the splitting
+/// venue. Once the readiness gate passes, the drain latches, intake
+/// toward the target pauses from the next window, the routes it holds
+/// settle, and the target says it is quiet: the cut is scheduled before
+/// the latch's deadline, under the admission that latched it. Every
+/// route accepts, the target departs, and the world is conserved.
+///
+/// # Panics
+///
+/// Panics as [`departing_route`] does, and if the drain does not latch
+/// within [`STEADY_LOAD_ROUTES`] epochs of load, if a route offered
+/// before the latch's window does not commit on the splitting venue, if
+/// the record is cancelled or its cut is not scheduled before the latch's
+/// deadline, if a route does not accept, if the target does not depart,
+/// or if the world does not settle.
+pub fn a_split_under_steady_core_load_lands_without_a_cancel<C: Cluster>(c: &mut C) {
+    let departing = FIRST_VENUE_SHARD;
+    let mut route = departing_route(c);
+    let admitted = split_admission(c, departing).expect("the split is admitted");
+    let mut charges = Charges::default();
+    let mut routes = Vec::new();
+    while !drain_latched(c, departing) {
+        assert!(
+            routes.len() < STEADY_LOAD_ROUTES,
+            "the drain must latch within {STEADY_LOAD_ROUTES} epochs of load",
+        );
+        let tx = build_route_tx(
+            &route.key,
+            route.trader,
+            (&route.leaving.meta, &route.staying.meta),
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT,
+            0,
+            validity_around(c.now()),
+        );
+        route.protocol_resource.owing(crossing_records(
+            &tx.try_derived(c.derivation().as_ref())
+                .expect("a scenario route derives")
+                .legs,
+        ));
+        routes.push(charges.submit(c, tx));
+        c.run_until(epochs(1), |c| drain_latched(c, departing));
+    }
+    let latched = split_admission(c, departing).expect("the latched split stands");
+    assert_eq!(
+        latched.at, admitted.at,
+        "the drain latches the admission that synced"
+    );
+    let drain_by = latched.drain_by.expect("latched");
+
+    // Every route offered before the epoch that latched commits on the
+    // splitting venue: intake stays open until the latch's window.
+    let (offered_before, _) = routes.split_at(routes.len() - 1);
+    assert!(
+        c.run_until(epochs(4), |c| offered_before
+            .iter()
+            .all(|hash| c.chain_fate(departing, *hash).0.is_some())),
+        "intake toward the target must stay open through the cohort's sync",
+    );
+
+    assert!(
+        c.run_until(epochs(24), |c| cut_scheduled(c, departing)
+            || split_admission(c, departing)
+                .is_none_or(|now| now.at != admitted.at)),
+        "the cut must be scheduled",
+    );
+    assert!(
+        cut_scheduled(c, departing),
+        "the split must not be cancelled under steady load",
+    );
+    let scheduled_at = beacon_epoch(c).expect("a grown cluster has a beacon epoch");
+    assert!(
+        scheduled_at < drain_by,
+        "the cut must be scheduled before the latch's deadline: at {scheduled_at:?}, \
+         deadline {drain_by:?}",
+    );
+    assert!(
+        c.run_until(epochs(24), |c| routes.iter().all(|hash| c.tx_status(*hash)
+            == Some(TransactionStatus::Completed(TransactionDecision::Accept)))),
+        "every route must accept: {:?}",
+        routes
+            .iter()
+            .map(|hash| c.tx_status(*hash))
+            .collect::<Vec<_>>(),
+    );
+    await_departed(c);
+    route.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a split under steady core load",
+    );
+    route.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a split under steady core load",
+    );
+}
+
+/// A split beside a halted sibling returns its cohort for the recovery.
+///
+/// A route runs between a venue on a shard admitted to split and one on
+/// a sibling, the two cut off from each other's readings and
+/// certificates, and both state their yes. The sibling then halts. The
+/// splitting venue's row hears a sibling that cannot answer, so the
+/// split latches its drain but cannot say it is quiet: it is cancelled
+/// at its drain deadline and cuts nothing, returning its cohort to the
+/// pool. Where the sibling already stands in recovery demand at that
+/// fold, the recovery draws in it, ahead of the shuffle, from a pool the
+/// cohort's return funds, so it draws from the cohort. Where the cancel
+/// comes first, as it does at the production epoch length, the cohort
+/// reaches the recovery through the rotations it funds instead. Either
+/// way the recovery seats at the first fold after one that ended with
+/// the sibling in demand and a pool able to fund it. The sibling
+/// recovers keeping its stated row, the venues read each other again and
+/// accept, and the split, admitted again on load, lands with the route
+/// settled on both venues.
 ///
 /// # Panics
 ///
 /// Panics as [`departing_route`] and [`submit_departing_route`] do, and
-/// if the hold does not return to its baseline or the input to the
-/// trader after the terminal, if the route is not abandoned, if a
-/// reserve moves, or if either side of the pair is not conserved.
+/// if either venue does not state its yes, if the pool could fund the
+/// recovery without the cohort, if the split does not latch its drain,
+/// is cut while the sibling is halted or is not cancelled at its drain
+/// deadline, if the recovery seats later than the pool lets it or, drawn
+/// in the cancel fold, draws none of the cohort, if the halt or its
+/// recovery misses a budget, if the route does not accept on both
+/// venues, if the split does not land after it, or if the world does not
+/// settle.
+pub fn a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, sibling) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let mut route = departing_route(c);
+    let admitted = split_admission(c, departing).expect("the split is admitted");
+    let cut = hold_the_venues_apart(c);
+    let mut charges = Charges::default();
+    let (hash, _, _) = submit_departing_route(c, &mut route, &mut charges);
+    await_both_venues_stated(c, hash, &cut);
+    assert_the_cohort_holds_the_pool_short(c);
+
+    let halt = freeze_shard(c, sibling, TRADER_SHARD, |_| {});
+    let handoff = await_cohort_handoff(c, admitted);
+    if handoff.in_demand_at_cancel {
+        handoff.assert_drawn_from_the_cohort();
+    }
+    await_halt_recovery(c, &halt);
+    settle_beside_the_recovered_sibling(
+        c,
+        hash,
+        &route,
+        &charges,
+        "a split beside a halted sibling",
+    );
+}
+
+/// Epochs of lead the threshold vote of
+/// [`a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort`]
+/// carries: room to state the route before the freeze is due.
+const COUNTING_VOTE_LEAD_EPOCHS: u32 = 28;
+
+/// Epochs before the vote activates that the sibling is frozen: it has
+/// counted most of the way to its halt when the split is admitted, and
+/// crosses the halt threshold before the split can be cancelled.
+const COUNTING_FREEZE_LEAD_EPOCHS: u32 = 13;
+
+/// A split admitted while its sibling counts toward a halt hands the
+/// recovery its cohort in the fold that cancels it.
+///
+/// [`a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery`]
+/// with the order of the halt and the admission reversed. The route
+/// states on both venues, held apart, before the vote that admits the
+/// split activates, and the sibling is frozen so that it has counted
+/// most of its misses when the split is admitted. The admission is not
+/// held for a recovery the pool does not yet owe, so the cohort takes
+/// its seats, and the sibling crosses the halt threshold with the pool
+/// short of a committee. The split latches its drain, never says it is
+/// quiet, and is cancelled at its deadline; that fold returns the cohort
+/// and draws the recovery from it ahead of the shuffle, within the
+/// readiness and drain deadlines of the sibling's crossing.
+///
+/// # Panics
+///
+/// Panics as
+/// [`a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery`]
+/// does, and if the route does not state before the freeze is due, if
+/// the split is not admitted while the sibling counts toward its halt,
+/// if the sibling is not in recovery demand when the split is cancelled,
+/// or if the recovery is not seated in the cancel fold, draws none of
+/// the cohort, or seats later than the readiness and drain deadlines
+/// after the sibling's crossing.
+pub fn a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let split = admit_beside_a_counting_sibling(c);
+    let handoff = await_cohort_handoff(c, split.admitted);
+    handoff.assert_handed_over_in_the_cancel_fold(c);
+    await_halt_recovery(c, &split.halt);
+    settle_beside_the_recovered_sibling(
+        c,
+        split.hash,
+        &split.route,
+        &split.charges,
+        "a split admitted beside a counting sibling",
+    );
+}
+
+/// The quarter beside the route's venues and trader that
+/// [`a_split_on_load_beside_a_halted_sibling_takes_nothing_its_recovery_is_owed`]
+/// ballasts over the voted threshold beside the first venue's.
+const SECOND_SPLITTER: ShardId = ShardId::leaf(2, 3);
+
+/// Genesis funding for a second quarter splitting on load:
+/// [`departing_route_genesis_accounts`] with [`SECOND_SPLITTER`]
+/// ballasted as far over the voted threshold as the first venue's.
+#[must_use]
+pub fn second_splitter_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let packages = GenesisPackages::with_fixtures();
+    let mut accounts = departing_route_genesis_accounts();
+    accounts.extend(ballast_to(
+        SECOND_SPLITTER,
+        4,
+        departing_target(&packages),
+        &packages,
+    ));
+    accounts
+}
+
+/// A second shard asserting a split on load beside a halted sibling
+/// takes nothing the sibling's recovery is owed.
+///
+/// [`a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort`]
+/// with a second quarter over the voted threshold, asserting its split on
+/// load in every window from the vote's activation. The first venue's
+/// split takes the pool first, and the second is admitted at no fold
+/// from the sibling's crossing to its recovery's seating: the recovery
+/// still draws the cohort in the fold that cancels the first split. The
+/// route accepts once the sibling recovers, and once the pool can fund
+/// it, the second quarter is admitted on the load it asserted all along.
+///
+/// Requires [`second_splitter_genesis_accounts`] at genesis.
+///
+/// # Panics
+///
+/// Panics as
+/// [`a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort`]
+/// does, and if the second quarter is admitted while the sibling's
+/// recovery is owed, or is not admitted once the route has settled.
+pub fn a_split_on_load_beside_a_halted_sibling_takes_nothing_its_recovery_is_owed<
+    C: FaultableCluster,
+>(
+    c: &mut C,
+) {
+    let split = admit_beside_a_counting_sibling(c);
+    let handoff = await_cohort_handoff(c, split.admitted);
+    handoff.assert_handed_over_in_the_cancel_fold(c);
+    let contender =
+        c.beacon_state().and_then(
+            |state| match state.pending_reshapes.get(&SECOND_SPLITTER)? {
+                PendingReshape::Split { admitted, .. } => Some(admitted.at),
+                PendingReshape::Merge { .. } => None,
+            },
+        );
+    assert!(
+        contender.is_none_or(|at| at < handoff.demanded_at || at > handoff.seated_at),
+        "{SECOND_SPLITTER:?} must not be admitted from the sibling's crossing at {:?} to its \
+         recovery at {:?}; it was admitted at {contender:?}",
+        handoff.demanded_at,
+        handoff.seated_at,
+    );
+    await_halt_recovery(c, &split.halt);
+    await_accepted_beside_the_recovered_sibling(c, split.hash);
+    assert_the_route_conserved(
+        c,
+        &split.route,
+        &split.charges,
+        "a split on load beside a halted sibling",
+    );
+    let (left, _) = SECOND_SPLITTER.children();
+    assert!(
+        c.run_until(epochs(48), |c| split_admitted(c, SECOND_SPLITTER)
+            || c.serves_shard(left)),
+        "{SECOND_SPLITTER:?} must be admitted on its load once the pool can fund it",
+    );
+}
+
+/// A recovery that stalls beside a cancelled split is drawn again.
+///
+/// [`a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort`]
+/// up to the recovery the cancel funds. Its fresh committee is then held
+/// below a quorum from its draw, so the sibling never resumes and counts
+/// to the halt threshold again with its recovery pending. That puts it
+/// back in recovery demand: no reshape draw takes the pool below the
+/// reserve it owes, and the beacon draws a second committee over the
+/// pending recovery as soon as the pool funds one. The second committee
+/// resumes the sibling, and the route settles as before.
+///
+/// # Panics
+///
+/// Panics as
+/// [`a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort`]
+/// does, and if the stalled recovery is not drawn again within budget, or
+/// is drawn later than the pool lets it.
+pub fn a_recovery_stalled_beside_a_cancelled_split_is_drawn_again<C: FaultableCluster>(c: &mut C) {
+    let split = admit_beside_a_counting_sibling(c);
+    let handoff = await_cohort_handoff(c, split.admitted);
+    handoff.assert_handed_over_in_the_cancel_fold(c);
+
+    // The pair that froze the sibling is off it once the draw replaced
+    // it, and a later draw that seats one of them seats an honest member.
+    c.withhold(&split.withholders, Withheld::Nothing);
+    let stalled = &handoff.drawn[..2];
+    c.withhold(stalled, Withheld::Consensus);
+    let redrawn = await_recovery_seated(
+        c,
+        SECOND_VENUE_SHARD,
+        Some(handoff.seated_at),
+        "drawn again",
+    );
+    c.withhold(stalled, Withheld::Nothing);
+    await_recovery_resume(c, &split.halt, redrawn.seated_at);
+    settle_beside_the_recovered_sibling(
+        c,
+        split.hash,
+        &split.route,
+        &split.charges,
+        "a recovery stalled beside a cancelled split",
+    );
+}
+
+/// The choreography the counting-sibling scenarios share: the route
+/// stands up, the vote that admits the split is cast to activate
+/// [`COUNTING_VOTE_LEAD_EPOCHS`] out, the venues are held apart and both
+/// state, the sibling is frozen [`COUNTING_FREEZE_LEAD_EPOCHS`] before
+/// the activation, and the split is admitted while the sibling counts
+/// toward its halt, its cohort holding the pool short.
+///
+/// # Panics
+///
+/// Panics as [`stand_up_departing_route`] and [`submit_departing_route`]
+/// do, and if the route does not state before the freeze is due, if the
+/// split is not admitted, or is admitted elsewhere, within budget, if
+/// the sibling has crossed its halt threshold by then, or if the pool
+/// could fund a recovery while the cohort holds its seats.
+fn admit_beside_a_counting_sibling<C: FaultableCluster>(c: &mut C) -> CountingSplit {
+    let sibling = SECOND_VENUE_SHARD;
+    let mut route = stand_up_departing_route(c);
+    let activates_at = cast_late_threshold_vote(
+        c,
+        voted_split_bytes(&GenesisPackages::with_fixtures()),
+        u64::from(COUNTING_VOTE_LEAD_EPOCHS),
+    );
+    let cut = hold_the_venues_apart(c);
+    let mut charges = Charges::default();
+    let (hash, _, _) = submit_departing_route(c, &mut route, &mut charges);
+    await_both_venues_stated(c, hash, &cut);
+
+    let freeze_at = Epoch::new(activates_at.inner() - u64::from(COUNTING_FREEZE_LEAD_EPOCHS));
+    assert!(
+        beacon_epoch(c).is_some_and(|epoch| epoch < freeze_at),
+        "the route must state before the freeze is due at {freeze_at:?}",
+    );
+    assert!(
+        c.run_until(epochs(COUNTING_VOTE_LEAD_EPOCHS), |c| beacon_epoch(c)
+            .is_some_and(|epoch| epoch >= freeze_at)),
+        "the beacon must reach {freeze_at:?}",
+    );
+    // The two members `freeze_shard` silences: the first two of the
+    // sibling's consensus committee.
+    let withholders: Vec<ValidatorId> = c
+        .beacon_state()
+        .and_then(|state| state.shard_consensus_members.get(&sibling).cloned())
+        .expect("the sibling has a consensus committee")
+        .into_iter()
+        .take(2)
+        .collect();
+    let halt = freeze_shard(c, sibling, TRADER_SHARD, |_| {});
+    assert_only_the_departing_venue_admitted(c, epochs(COUNTING_FREEZE_LEAD_EPOCHS + 12));
+    let admitted = split_admission(c, FIRST_VENUE_SHARD).expect("the split is admitted");
+    let state = c.beacon_state().expect("a grown cluster has beacon state");
+    let misses = state
+        .boundaries
+        .get(&sibling)
+        .map_or(0, |boundary| boundary.consecutive_misses);
+    assert!(
+        !state.halted_shards().contains(&sibling) && misses > 0,
+        "the split must be admitted while the sibling counts toward its halt; it has missed \
+         {misses} folds",
+    );
+    assert_the_cohort_holds_the_pool_short(c);
+    CountingSplit {
+        route,
+        hash,
+        charges,
+        halt,
+        admitted,
+        withholders,
+    }
+}
+
+/// What [`admit_beside_a_counting_sibling`] leaves: the route, its hash
+/// and charges, the sibling's halt, the split's admission, and the two
+/// members that froze the sibling.
+struct CountingSplit {
+    route: DepartingRoute,
+    hash: TxHash,
+    charges: Charges,
+    halt: StagedHalt,
+    admitted: Admission,
+    withholders: Vec<ValidatorId>,
+}
+
+/// Cut the two venues off from each other's readings and certificates,
+/// both ways. Provisions and headers still flow, so each venue commits a
+/// route and runs its own core member.
+fn hold_the_venues_apart<C: FaultableCluster>(c: &mut C) -> [FaultHandle; 4] {
+    let (departing, sibling) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    [
+        isolate_ec_intake(c, departing, sibling),
+        isolate_ec_intake(c, sibling, departing),
+        isolate_crossing_intake(c, departing, sibling),
+        isolate_crossing_intake(c, sibling, departing),
+    ]
+}
+
+/// Wait for both venues to state their yes on `hash` with `cut` holding
+/// them apart.
+///
+/// # Panics
+///
+/// Panics if either venue does not state within budget, or `cut` never
+/// fired.
+fn await_both_venues_stated<C: Cluster>(c: &mut C, hash: TxHash, cut: &[FaultHandle]) {
+    assert!(
+        c.run_until(epochs(12), |c| stands_stated(c, FIRST_VENUE_SHARD, hash)
+            && stands_stated(c, SECOND_VENUE_SHARD, hash)),
+        "both venues must state their yes",
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the channels between the venues must actually have been cut",
+    );
+}
+
+/// Hold that the pool cannot fund a recovery while the admitted split's
+/// cohort holds its seats.
+///
+/// # Panics
+///
+/// Panics if the pool holds a committee's worth.
+fn assert_the_cohort_holds_the_pool_short<C: Cluster>(c: &C) {
+    let state = c.beacon_state().expect("a grown cluster has beacon state");
+    assert!(
+        state.pooled_validators().len() < state.chain_config.shard_size as usize,
+        "the pool must be unable to fund a recovery while the cohort holds its seats; it \
+         holds {:?}",
+        state.pooled_validators(),
+    );
+}
+
+/// Once the sibling has recovered, lift the cut and hold that the route
+/// accepts on both venues, the split lands after it, and the world
+/// settles.
+///
+/// # Panics
+///
+/// Panics if the route does not accept on both venues, the split does
+/// not land, or either side of the pair is not conserved.
+fn settle_beside_the_recovered_sibling<C: FaultableCluster>(
+    c: &mut C,
+    hash: TxHash,
+    route: &DepartingRoute,
+    charges: &Charges,
+    scenario: &str,
+) {
+    await_accepted_beside_the_recovered_sibling(c, hash);
+    await_departed(c);
+    assert_the_route_conserved(c, route, charges, scenario);
+}
+
+/// Once the sibling has recovered, lift the cut and hold that the route
+/// accepts on both venues.
+///
+/// # Panics
+///
+/// Panics if the route does not accept on both venues within budget.
+fn await_accepted_beside_the_recovered_sibling<C: FaultableCluster>(c: &mut C, hash: TxHash) {
+    let (departing, sibling) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    c.clear_drops();
+    let accepted = |c: &C, shard: ShardId| {
+        c.chain_fate(shard, hash).1.map(|(_, decision)| decision)
+            == Some(TransactionDecision::Accept)
+    };
+    assert!(
+        c.run_until(epochs(24), |c| accepted(c, departing)
+            && accepted(c, sibling)),
+        "the route must accept on both venues once the sibling recovers; the splitting venue \
+         reached {:?} and the sibling {:?}",
+        c.chain_fate(departing, hash).1,
+        c.chain_fate(sibling, hash).1,
+    );
+}
+
+/// Hold that both sides of the route's pair settle.
+///
+/// # Panics
+///
+/// Panics if either side is not conserved within budget.
+fn assert_the_route_conserved<C: Cluster>(
+    c: &mut C,
+    route: &DepartingRoute,
+    charges: &Charges,
+    scenario: &str,
+) {
+    route
+        .protocol_resource
+        .assert_settles_within(c, charges, epochs(8), scenario);
+    route
+        .units
+        .assert_settles_within(c, &Charges::default(), epochs(8), scenario);
+}
+
+/// What the beacon did with a split of the first venue's shard
+/// cancelled beside its halted sibling, and with the sibling's recovery.
+struct CohortHandoff {
+    /// The cancelled split's cohort.
+    cohort: BTreeSet<ValidatorId>,
+    /// The fold that cancelled the split.
+    cancelled_at: Epoch,
+    /// Whether the sibling stood in recovery demand at that fold.
+    in_demand_at_cancel: bool,
+    /// The first fold that ended with the sibling in recovery demand.
+    demanded_at: Epoch,
+    /// The fold that seated the sibling's recovery.
+    seated_at: Epoch,
+    /// The committee that fold drew.
+    drawn: Vec<ValidatorId>,
+}
+
+impl CohortHandoff {
+    /// Hold that the recovery drew from the cancelled split's cohort.
+    ///
+    /// # Panics
+    ///
+    /// Panics if it drew none of it.
+    fn assert_drawn_from_the_cohort(&self) {
+        assert!(
+            self.drawn.iter().any(|member| self.cohort.contains(member)),
+            "the recovery drawn in the cancel fold at {:?} must draw from the cancelled split's \
+             returned cohort; drew {:?} beside {:?}",
+            self.cancelled_at,
+            self.drawn,
+            self.cohort,
+        );
+    }
+
+    /// Hold that the cancel fold found the sibling in recovery demand and
+    /// drew its recovery in that fold from the cohort, within the
+    /// readiness and drain deadlines of the sibling's crossing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sibling was not in demand at the cancel, the
+    /// recovery was not seated in the cancel fold or drew none of the
+    /// cohort, or it seated past those deadlines.
+    fn assert_handed_over_in_the_cancel_fold<C: Cluster>(&self, c: &C) {
+        assert!(
+            self.in_demand_at_cancel,
+            "the sibling must stand in recovery demand when the split is cancelled at {:?}; it \
+             first stood in it at {:?}",
+            self.cancelled_at, self.demanded_at,
+        );
+        assert_eq!(
+            self.seated_at, self.cancelled_at,
+            "the fold that returns the cohort must seat the recovery the sibling waits on",
+        );
+        self.assert_drawn_from_the_cohort();
+        let drain = c
+            .beacon_state()
+            .expect("a grown cluster has beacon state")
+            .chain_config
+            .reshape_drain_epochs();
+        let bound = self
+            .demanded_at
+            .saturating_add(RESHAPE_READY_TTL_EPOCHS + drain);
+        assert!(
+            self.seated_at <= bound,
+            "the recovery must seat within the readiness and drain deadlines of the sibling's \
+             crossing at {:?}; it seated at {:?}",
+            self.demanded_at,
+            self.seated_at,
+        );
+    }
+}
+
+/// The cohort of `shard`'s pending split.
+fn split_cohort<C: Cluster>(c: &C, shard: ShardId) -> Option<BTreeSet<ValidatorId>> {
+    c.beacon_state()
+        .and_then(|state| match state.pending_reshapes.get(&shard)? {
+            PendingReshape::Split { cohort, .. } => Some(cohort.keys().copied().collect()),
+            PendingReshape::Merge { .. } => None,
+        })
+}
+
+/// Wait out the first venue's split, admitted at `admitted`, beside its
+/// halted sibling: it latches its drain, is cancelled at its drain
+/// deadline with no cut, and the sibling's recovery is seated.
+///
+/// # Panics
+///
+/// Panics if the split is cut, is not cancelled within budget, never
+/// latches its drain or is cancelled before its drain deadline, or if
+/// the recovery is not seated within budget or seats later than the
+/// pool lets it.
+fn await_cohort_handoff<C: Cluster>(c: &mut C, admitted: Admission) -> CohortHandoff {
+    let (departing, sibling) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let cohort = split_cohort(c, departing).expect("the admitted split holds its cohort");
+    let watch = RefCell::new(RecoveryWatch::after(None));
+    let drain_by = Cell::new(None);
+    let ended = c.run_until(epochs(40), |c| {
+        let Some(state) = c.beacon_state() else {
+            return false;
+        };
+        watch.borrow_mut().observe(&state, sibling);
+        match state.pending_reshapes.get(&departing) {
+            Some(PendingReshape::Split { admitted: now, .. }) if now.at == admitted.at => {
+                drain_by.set(drain_by.get().or(now.drain_by));
+                cut_scheduled(c, departing)
+            }
+            _ => true,
+        }
+    });
+    assert!(
+        ended && !cut_scheduled(c, departing),
+        "the split must be cancelled beside its halted sibling, and no cut of {departing:?} may \
+         fall while its row hears it",
+    );
+    let state = c.beacon_state().expect("a grown cluster has beacon state");
+    let cancelled_at = state.current_epoch;
+    let drain_by = drain_by.get().expect(
+        "the split must latch its drain before it is cancelled, or the readiness deadline and \
+         not the quiet gate held its cut",
+    );
+    assert!(
+        cancelled_at >= drain_by,
+        "a latched split is cancelled at its drain deadline {drain_by:?}, not at {cancelled_at:?}",
+    );
+    let in_demand_at_cancel = state
+        .pending_recoveries
+        .get(&sibling)
+        .is_some_and(|recovery| recovery.rotated_at == cancelled_at)
+        || state.recovery_demand(0).contains(&sibling);
+    let seated = await_watched_recovery(c, sibling, watch.into_inner(), "drawn");
+    CohortHandoff {
+        cohort,
+        cancelled_at,
+        in_demand_at_cancel,
+        demanded_at: seated.demanded_at,
+        seated_at: seated.seated_at,
+        drawn: seated.drawn,
+    }
+}
+
+/// A recovery the beacon seated, as a [`RecoveryWatch`] saw it.
+struct SeatedRecovery {
+    /// The first fold that ended with the shard in recovery demand, or
+    /// the seating fold where none was seen before it.
+    demanded_at: Epoch,
+    /// The fold that seated it.
+    seated_at: Epoch,
+    /// The committee that fold drew.
+    drawn: Vec<ValidatorId>,
+}
+
+/// What the committed beacon states show of one shard's recovery, read
+/// state by state.
+struct RecoveryWatch {
+    /// A recovery seated at or before this fold is an earlier one.
+    after: Option<Epoch>,
+    demanded_at: Option<Epoch>,
+    /// The fold after the first one that ended with the shard in demand
+    /// and a pool holding a committee: the recovery runs ahead of every
+    /// draw but the departure refill, so it seats by then.
+    due: Option<Epoch>,
+    seated: Option<(Epoch, Vec<ValidatorId>)>,
+}
+
+impl RecoveryWatch {
+    /// A watch for a recovery seated after `after`.
+    const fn after(after: Option<Epoch>) -> Self {
+        Self {
+            after,
+            demanded_at: None,
+            due: None,
+            seated: None,
+        }
+    }
+
+    /// Read one committed state of `shard`'s recovery.
+    fn observe(&mut self, state: &BeaconState, shard: ShardId) {
+        if self.seated.is_some() {
+            return;
+        }
+        if let Some(recovery) = state
+            .pending_recoveries
+            .get(&shard)
+            .filter(|recovery| self.after.is_none_or(|after| recovery.rotated_at > after))
+        {
+            let drawn = state
+                .next_shard_committees
+                .get(&shard)
+                .map_or_else(Vec::new, |committee| committee.members.clone());
+            self.seated = Some((recovery.rotated_at, drawn));
+            return;
+        }
+        if state.recovery_demand(0).contains(&shard) {
+            self.demanded_at.get_or_insert(state.current_epoch);
+            if state.pooled_validators().len() >= state.chain_config.shard_size as usize {
+                self.due
+                    .get_or_insert_with(|| state.current_epoch.saturating_add(1));
+            }
+        }
+    }
+}
+
+/// Wait for `shard`'s recovery seated after `after`, and hold that it
+/// seated no later than the pool let it.
+///
+/// # Panics
+///
+/// Panics if no recovery is seated within the halt threshold and budget,
+/// or one seats later than the fold after the first that ended with the
+/// shard in demand and a pool holding a committee.
+fn await_recovery_seated<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    after: Option<Epoch>,
+    what: &str,
+) -> SeatedRecovery {
+    await_watched_recovery(c, shard, RecoveryWatch::after(after), what)
+}
+
+/// [`await_recovery_seated`] from a watch already under way.
+fn await_watched_recovery<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    watch: RecoveryWatch,
+    what: &str,
+) -> SeatedRecovery {
+    let watch = RefCell::new(watch);
+    let threshold = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("threshold fits u32");
+    let seated = c.run_until(epochs(threshold + 40), |c| {
+        if let Some(state) = c.beacon_state() {
+            watch.borrow_mut().observe(&state, shard);
+        }
+        watch.borrow().seated.is_some()
+    });
+    let watch = watch.into_inner();
+    assert!(seated, "{shard:?}'s recovery must be {what} within budget");
+    let (seated_at, drawn) = watch.seated.expect("a seated recovery was seen");
+    if let Some(due) = watch.due {
+        assert!(
+            seated_at <= due,
+            "{shard:?}'s recovery must be {what} by {due:?}, the fold after the pool first \
+             held a committee with the shard in demand; it seated at {seated_at:?}",
+        );
+    }
+    SeatedRecovery {
+        demanded_at: watch.demanded_at.unwrap_or(seated_at),
+        seated_at,
+        drawn,
+    }
+}
+
+/// A route through a departing venue holds the venue's cut until it
+/// settles on both venues, and releases the surviving venue's hold as it
+/// does.
+///
+/// A route's two venues are one core, each awaiting the other's
+/// verdict. With each venue cut off from the other's state and
+/// certificates both ways, neither reads the other's yes: each states
+/// its own and stands, so the departing venue's rows hear a sibling it
+/// cannot read, and the beacon schedules no cut of it. Once the venues
+/// read each other again, both accept, the survivor's drain returns to
+/// its baseline, and only then, every row of the departing venue quiet,
+/// does its cut land. Both reserves move, and nothing is stranded.
+///
+/// # Panics
+///
+/// Panics as [`departing_route`] and [`submit_departing_route`] do, and
+/// if either venue does not state its yes, if the cut is scheduled while
+/// the venues cannot read each other, if the route does not accept on
+/// both venues once they can, if the departure does not land after it,
+/// if the hold does not return to its baseline, if a reserve does not
+/// move, or if either side of the pair is not conserved.
 pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCluster>(c: &mut C) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
     let mut route = departing_route(c);
     // Neither venue may read the other's verdict or hold its
     // certificate. Provisions and headers still flow, so each venue
-    // commits the route and runs its own core leg, which is the state
-    // under test.
+    // commits the route and runs its own core leg.
     let cut = [
         isolate_ec_intake(c, departing, survivor),
         isolate_ec_intake(c, survivor, departing),
@@ -3861,92 +4867,53 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         isolate_crossing_intake(c, survivor, departing),
     ];
     let mut charges = Charges::default();
-    let (hash, baseline, paid) = submit_departing_route(c, &mut route, &mut charges);
-
-    // The cut. The departing venue's cells land under a child, and its
-    // settled set reaches the survivor.
-    await_departed(c);
-    // The departing venue's core never heard its sibling, so its row
-    // stood stated at the terminal, which fates it; neither child reads
-    // its row as its own.
-    let (left, right) = departing.children();
+    let (hash, baseline, _) = submit_departing_route(c, &mut route, &mut charges);
     assert!(
-        await_anchor_seeded(c, left, epochs(6)),
-        "the beacon must compose the departed venue's children's anchor",
+        c.run_until(epochs(12), |c| stands_stated(c, departing, hash)
+            && stands_stated(c, survivor, hash)),
+        "both venues must state their yes",
     );
-    let terminal = terminal_height(c, departing);
-    assert_eq!(
-        Some(assert_fated_off(c, departing, hash, &[left, right])),
-        terminal,
-        "the departing venue's terminal must fate the route's core",
+
+    assert_no_cut_while_unread(c, departing, hash, epochs(12));
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the channels between the venues must actually have been cut",
     );
+    c.clear_drops();
+
+    let accepted = |c: &C, shard: ShardId| {
+        c.chain_fate(shard, hash).1.map(|(_, decision)| decision)
+            == Some(TransactionDecision::Accept)
+    };
+    assert!(
+        c.run_until(epochs(24), |c| accepted(c, departing)
+            && accepted(c, survivor)),
+        "the route must accept on both venues once they read each other; the departing venue \
+         reached {:?} and the survivor {:?}",
+        c.chain_fate(departing, hash).1,
+        c.chain_fate(survivor, hash).1,
+    );
+    await_departed(c);
     assert!(
         c.run_until(epochs(12), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),
-        "the survivor's hold must return to its baseline once the departed venue's ended \
-         names have answered; holds {:?} against {baseline:?}",
+        "the survivor's hold must return to its baseline once the route settles; holds {:?} \
+         against {baseline:?}",
         c.committed_txs_in_flight(survivor),
     );
-    // The trader's reclaim is licensed by whichever lands first: the
-    // abandonment record naming the route, or the `Never` the shard
-    // holding the departed venue's prefix writes for the record no
-    // member there took. Either reads the record cell the trader's leg
-    // wrote, whenever it lands, because a record is value and value is
-    // not swept on a clock. Neither licence is a probe, so no window
-    // bounds it: the input comes back however long the departure took,
-    // on either epoch clock.
-    assert!(
-        c.run_until(epochs(12), |c| held(
-            c,
-            route.trader.address(),
-            *PROTOCOL_RESOURCE
-        ) == paid + ROUTE_INPUT),
-        "the trader must get the route's input back once the departed venue's side is \
-         answered; holds {} against {}",
-        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-        paid + ROUTE_INPUT,
-    );
-    // The trader's own leg accepted and stays accepted; the core it
-    // fed is abandoned on both shards, never settled one-sided.
-    assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
-    // And nobody is told otherwise. Each venue stated a yes, which is
-    // not the route accepted: the core never combined, and the trader's
-    // chain reclaimed its input, which every replica of it reads as the
-    // abort — one that never held the leg's entry as well as one that
-    // did.
-    let decisions = shard_decisions(c, hash);
-    assert!(
-        decisions
-            .values()
-            .all(|decision| *decision != TransactionDecision::Accept),
-        "no shard may report accepted a route its chain reclaimed; reported {decisions:?}",
-    );
-    assert!(
-        decisions
-            .get(&TRADER_SHARD)
-            .is_none_or(|decision| *decision == TransactionDecision::Aborted),
-        "the trader's chain reclaimed the route's input, which is the abort; reported \
-         {decisions:?}",
-    );
     for (reserve, before) in route.reserves.into_iter().zip(route.stocked) {
-        assert_eq!(
+        assert_ne!(
             held_at(c, reserve),
             before,
-            "neither venue may have applied its side of a route whose verdict it never read",
+            "each venue applies its side of a route it accepted",
         );
     }
-    c.clear_drops();
-    // And conserved outright: nothing of the route is stranded, because
-    // nothing it issued was swept out from under its reclaim.
-    assert!(
-        c.run_until(epochs(8), |c| route
-            .protocol_resource
-            .settles(c, charges.burned(c))),
-        "a route through a departing venue: the world must settle against the burn alone",
+    route.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a route through a departing venue",
     );
-    route
-        .protocol_resource
-        .assert_settled(c, &charges, "a route through a departing venue");
     charges.assert_each_fits_a_full_block(c);
     route.units.assert_settles_within(
         c,
@@ -3956,26 +4923,26 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     );
 }
 
-/// A record whose consumer's shard departed with the record untaken is
-/// declined by the successor holding the consumer's prefix.
+/// A record whose consumer's shard is departing is taken by its consumer
+/// before the cut, and no successor is left a record to decline.
 ///
 /// [`a_route_into_a_departing_venue_releases_the_survivors_hold`], read
-/// at the crossing: the departing venue committed the route and its
-/// terminal fated the core, so no member of the route ever took the
-/// trader's input and no refusal of it was ever written. The record
-/// stands on the trader's shard and is pushed, past its transaction's
-/// validity end, to whichever shard holds the venue's prefix: after the
-/// cut, a child that never committed the route and holds no row of it.
-/// That child's fold writes the `Never`, seen and naming the route, and
-/// the trader's shard takes the input back on it.
+/// at the record: the trader's leg escrows the route's input into a
+/// record for the departing venue's member, and with the venues held
+/// apart the member states and waits. The departing venue's cut waits
+/// with it, so the record never outlives its consumer's shard. Once the
+/// venues read each other the route accepts on both, the member takes
+/// the record, and the departure lands with nothing of the route left
+/// for the successor holding the venue's prefix to answer.
 ///
 /// # Panics
 ///
 /// Panics as [`departing_route`] and [`submit_departing_route`] do, and
-/// if the departing venue's terminal does not fate the route's core, if
-/// no successor declines the record, if the decline is a refusal's or
-/// names another transaction, or if the input does not come home.
-pub fn a_record_whose_consumers_shard_departed_is_declined_by_its_successor<C: FaultableCluster>(
+/// if the cut is scheduled while the venues cannot read each other, if
+/// the route does not accept on both venues once they can, if the
+/// departure does not land after it, if the record still stands or any
+/// answer to it was written, or if the world does not settle.
+pub fn a_record_whose_consumers_shard_departs_is_taken_before_the_cut<C: FaultableCluster>(
     c: &mut C,
 ) {
     let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
@@ -3987,98 +4954,78 @@ pub fn a_record_whose_consumers_shard_departed_is_declined_by_its_successor<C: F
         isolate_crossing_intake(c, survivor, departing),
     ];
     let mut charges = Charges::default();
-    let (hash, _, paid) = submit_departing_route(c, &mut route, &mut charges);
+    let (hash, _, _) = submit_departing_route(c, &mut route, &mut charges);
     let (record, id) = escrowed_into(c, &charges.records(c), departing);
     let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+    assert!(
+        c.run_until(epochs(12), |c| stands_stated(c, departing, hash)),
+        "the departing venue must state its yes",
+    );
 
-    await_departed(c);
-    let (left, right) = departing.children();
-    assert!(
-        await_anchor_seeded(c, left, epochs(6)),
-        "the beacon must compose the departed venue's children's anchor",
-    );
-    assert_eq!(
-        Some(assert_fated_off(c, departing, hash, &[left, right])),
-        terminal_height(c, departing),
-        "the departing venue's terminal must fate the route's core",
-    );
-    assert!(
-        c.run_until(epochs(12), |c| answer_standing(c, decline).is_some()),
-        "the successor holding the venue's prefix must decline the record",
-    );
-    let successor = owning_shard(c, decline.owner);
-    assert!(
-        [left, right].contains(&successor),
-        "the decline stands under a child of the departed venue's shard, not {successor:?}",
-    );
-    let answer = answer_standing(c, decline).expect("the decline stands");
-    assert_eq!(
-        (answer.answered, answer.tx, answer.seen),
-        (Answered::Never, hash, true),
-        "the fold's decline names the route and is written seen",
-    );
-    assert!(
-        c.declined(departing, hash).is_empty() && c.declined(successor, hash).is_empty(),
-        "no member of the route refused the input: the decline is the successor's fold's",
-    );
-    assert!(
-        c.chain_fate(successor, hash).0.is_none(),
-        "the successor never committed the route",
-    );
+    assert_no_cut_while_unread(c, departing, hash, epochs(8));
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut",
+        "the channels between the venues must actually have been cut",
     );
-    assert!(
-        c.run_until(epochs(12), |c| held(
-            c,
-            route.trader.address(),
-            *PROTOCOL_RESOURCE
-        ) == paid + ROUTE_INPUT),
-        "the trader must get the route's input back on the successor's decline; holds {} \
-         against {}",
-        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
-        paid + ROUTE_INPUT,
-    );
-    assert!(!stands_at(c, record), "and the record is gone with it");
     c.clear_drops();
+    let accepted = |c: &C, shard: ShardId| {
+        c.chain_fate(shard, hash).1.map(|(_, decision)| decision)
+            == Some(TransactionDecision::Accept)
+    };
     assert!(
-        c.run_until(epochs(8), |c| route
-            .protocol_resource
-            .settles(c, charges.burned(c))),
-        "a record its consumer's successor declined: the world must settle against the burn",
+        c.run_until(epochs(16), |c| accepted(c, departing)
+            && accepted(c, survivor)),
+        "the route must accept on both venues once they read each other; the departing venue \
+         reached {:?} and the survivor {:?}",
+        c.chain_fate(departing, hash).1,
+        c.chain_fate(survivor, hash).1,
+    );
+    await_departed(c);
+    assert!(
+        c.run_until(epochs(12), |c| !stands_at(c, record)),
+        "the member must take the record before its shard departs",
+    );
+    assert!(
+        answer_standing(c, decline).is_none() && c.declined(departing, hash).is_empty(),
+        "nothing declines a record its consumer took",
+    );
+    route.protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a record its departing consumer took",
     );
     route.units.assert_settles_within(
         c,
         &Charges::default(),
         epochs(8),
-        "a record its consumer's successor declined",
+        "a record its departing consumer took",
     );
 }
 
 /// A route the departing venue settled is settled by the surviving venue
-/// too, from the names the departed chain's terminal ended.
+/// too, before the departure.
 ///
 /// The mirror of
 /// [`a_route_into_a_departing_venue_releases_the_survivors_hold`]: the
 /// cut takes only the survivor's intake, so the departing venue reads
 /// the survivor's yes and accepts, applying its half, while the
 /// survivor never reads the departing venue's verdict and stands
-/// stated. The departing venue's accepted row stands until its terminal
-/// ends it, and that `End` line is the one place the departed chain
-/// still says it accepted: once the departing venue leaves the trie,
-/// the survivor reads it in the terminal's lines, which name the route,
-/// and accepts. The cut lifts once the children seat, so what is
-/// measured is the departed sibling's reading and not a partition, and
-/// the route banks its output.
+/// stated. The departing venue's accepted row hears the survivor until
+/// the survivor reads the accept, so its reshape latches its drain and
+/// no cut of it is scheduled while the cut stands. Once the cut lifts,
+/// the survivor reads the accept and applies what the departing venue
+/// settled, the accepted row ends, the departure lands, and the route
+/// banks its output.
 ///
 /// # Panics
 ///
 /// Panics as [`departing_route`] and [`submit_departing_route`] do, and
-/// if the departing venue does not settle the route before it leaves,
-/// if the survivor never applies what the departed venue settled, if
-/// its hold does not return to its baseline, or if either side of the
-/// pair is not conserved.
+/// if the departing venue does not settle the route, if its cut is
+/// scheduled while the survivor cannot read it, if the survivor never
+/// applies what the departing venue settled, if the departure does not
+/// land after it, if the survivor's hold does not return to its
+/// baseline, or if either side of the pair is not conserved.
 pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: FaultableCluster>(
     c: &mut C,
 ) {
@@ -4095,18 +5042,18 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
             c.chain_fate(departing, hash).1,
             Some((_, TransactionDecision::Accept))
         )),
-        "the departing venue reads the survivor's yes and settles the route before it leaves",
+        "the departing venue reads the survivor's yes and settles the route",
     );
     assert!(
         c.chain_fate(survivor, hash).1.is_none(),
         "the survivor never read the departing venue's verdict and cannot apply yet",
     );
 
-    await_departed(c);
+    assert_no_cut_while_unread(c, departing, hash, epochs(12));
     assert!(
         cut.iter().all(|handle| handle.fired() > 0),
         "the survivor's intake must actually have been exercised and cut, or it read the \
-         departed venue's verdict all along",
+         departing venue's verdict all along",
     );
     c.clear_drops();
     assert!(
@@ -4114,9 +5061,9 @@ pub fn a_route_the_departing_venue_settled_is_settled_by_the_survivor<C: Faultab
             c.chain_fate(survivor, hash).1,
             Some((_, TransactionDecision::Accept))
         )),
-        "the survivor must read the departed venue's accept in its terminal's ended names and \
-         apply what it settled",
+        "the survivor must read the departing venue's accept and apply what it settled",
     );
+    await_departed(c);
     assert!(
         c.run_until(epochs(12), |c| c.committed_txs_in_flight(survivor)
             == Some(baseline)),

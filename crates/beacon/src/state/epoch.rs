@@ -1531,8 +1531,8 @@ mod tests {
     use super::*;
     use crate::rules::witness_chunk_bounds;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, fold_witness_chunk, genesis_boundary, live_boundary,
-        net, single_pool_state, single_pool_state_at_genesis, validator_record,
+        apply_next_epoch, apply_witness_chunk, assert_quiet, fold_witness_chunk, genesis_boundary,
+        live_boundary, net, single_pool_state, single_pool_state_at_genesis, validator_record,
     };
     use crate::state::witness::apply_shard_payload;
 
@@ -6013,6 +6013,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         assert_lookahead_becomes_the_active_entry(&mut state, "a split admission");
@@ -6038,6 +6039,15 @@ mod tests {
                 &ShardWitnessPayload::ReshapeReady { validator, child },
             );
         }
+        assert_lookahead_becomes_the_active_entry(&mut state, "the fold that latches the drain");
+        assert!(
+            !state.derive_topology_snapshot(net()).draining(p)
+                && state.derive_next_topology_snapshot(net()).draining(p),
+            "the gate must have latched the drain for this to cover the latching fold",
+        );
+
+        // The target says it is quiet, so the next fold schedules the cut.
+        assert_quiet(&mut state);
         assert_lookahead_becomes_the_active_entry(&mut state, "the fold that schedules the cut");
         assert!(
             state.pending_reshapes[&p].scheduled_terminal().is_some(),
@@ -6102,6 +6112,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let admitted = state.current_epoch;
@@ -6113,8 +6124,9 @@ mod tests {
             publish(&state, &mut schedule);
         }
 
-        // The observers ready; the next fold's gate schedules the cut, and
-        // the fold after applies it.
+        // The observers ready; the next fold's gate latches the drain, the
+        // fold after folds the target's quiet and schedules the cut, and
+        // the fold after that applies it.
         let seats: Vec<(ValidatorId, ShardId)> = match &state.pending_reshapes[&p] {
             PendingReshape::Split { cohort, .. } => {
                 cohort.iter().map(|(id, seat)| (*id, seat.child)).collect()
@@ -6130,6 +6142,9 @@ mod tests {
                 &ShardWitnessPayload::ReshapeReady { validator, child },
             );
         }
+        apply_next_epoch(&mut state, &[]);
+        publish(&state, &mut schedule);
+        assert_quiet(&mut state);
         apply_next_epoch(&mut state, &[]);
         let cut = state.pending_reshapes[&p]
             .scheduled_terminal()
@@ -6519,7 +6534,8 @@ mod tests {
         assert!(
             derive_reshape_trigger(
                 hot,
-                0,
+                None,
+                Some(0),
                 climbed,
                 &ReshapeThresholds {
                     split_bytes: u64::MAX,

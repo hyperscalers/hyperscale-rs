@@ -15,11 +15,11 @@ use hyperscale_core::{Action, ParentJudgement};
 use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    Demands, Finalization, FrontierInputs, LinkageError, QuorumCertificate, ReshapeThresholds,
-    RevealChain, SettledTxsRoot, ShardId, SharedTransactions, SplitChildRoots, StateClaim,
-    StateRoot, SubstateKey, SweepFrontier, TopologySchedule, TopologySnapshot, TxsInFlight,
-    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
-    WeightedTimestamp,
+    Demands, Finalization, FrontierInputs, LinkageError, QuorumCertificate, ReshapeKind,
+    ReshapeThresholds, RevealChain, SettledTxsRoot, Settling, ShardId, SharedTransactions,
+    SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule,
+    TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
+    VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -710,6 +710,7 @@ impl VerificationPipeline {
                             "deferred(witness_ancestor)"
                         }
                         Some((_, BeaconWitnessDefer::SubstateCount)) => "deferred(substate_count)",
+                        Some((_, BeaconWitnessDefer::ParentRows)) => "deferred(parent_rows)",
                         Some((_, BeaconWitnessDefer::ParentRevealChain)) => {
                             "deferred(parent_reveal_chain)"
                         }
@@ -977,6 +978,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
+        settling: Result<Option<(ReshapeKind, Settling)>, BlockHash>,
         pending_blocks: &PendingBlocks,
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
@@ -1030,6 +1032,13 @@ impl VerificationPipeline {
                 return Vec::new();
             }
         };
+        let settling = match settling {
+            Ok(settling) => settling,
+            Err(blocking_hash) => {
+                self.park_beacon_witness(blocking_hash, block_hash, BeaconWitnessDefer::ParentRows);
+                return Vec::new();
+            }
+        };
         let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
         debug!(
@@ -1078,6 +1087,7 @@ impl VerificationPipeline {
             witness_sources: Arc::clone(block.witness_sources()),
             substate_bytes,
             claimed_substate_bytes: header.load().substate_bytes,
+            settling,
             thresholds,
             finalizations,
             topology_snapshot: topology_snapshot.clone(),
@@ -1397,6 +1407,11 @@ enum BeaconWitnessDefer {
     /// held by neither cache, and is not the committed tip whose scalar
     /// would answer.
     ParentRevealChain,
+    /// The rows at the parent, which a draining shard's assertion says
+    /// are quiet or not, cannot be rebuilt: a block between the committed
+    /// tip and the parent is not held. Its arrival, or the commit past it,
+    /// re-drives the check.
+    ParentRows,
 }
 
 /// Inputs for resolving the substate byte total behind a block's parent —
@@ -1563,6 +1578,7 @@ impl VerificationPipeline {
         committed_committee_anchor_wt: WeightedTimestamp,
         block_hash: BlockHash,
         block: &Block,
+        settling: Result<Option<(ReshapeKind, Settling)>, BlockHash>,
         count_source: SubstateCountSource<'_>,
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
@@ -1618,6 +1634,7 @@ impl VerificationPipeline {
                         actions.extend(self.initiate_beacon_witness_root_verification(
                             block_hash,
                             block,
+                            settling,
                             pending_blocks,
                             accumulator,
                             committed_hash,
@@ -2896,6 +2913,7 @@ mod tests {
         let actions = vp.initiate_beacon_witness_root_verification(
             block_hash,
             &block,
+            Ok(None),
             &pending,
             &accumulator,
             BlockHash::ZERO,
@@ -2939,6 +2957,7 @@ mod tests {
             let _ = vp.initiate_beacon_witness_root_verification(
                 h,
                 b,
+                Ok(None),
                 &pending,
                 &accumulator,
                 BlockHash::ZERO,
@@ -2964,6 +2983,70 @@ mod tests {
         );
     }
 
+    /// A voter whose rows at the parent cannot be rebuilt parks the
+    /// beacon-witness check under the parent rows, on the block whose
+    /// absence keeps them, and emits nothing; once that block lands the
+    /// check re-drives and dispatches with the settling the rows give.
+    #[test]
+    fn a_voter_without_the_parents_rows_holds_and_redrives_the_quiet_check() {
+        use hyperscale_types::{Epoch, ReshapeKind, RevealChain, Settling};
+
+        use crate::beacon_witnesses::BeaconWitnessAccumulator;
+
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
+        let accumulator = BeaconWitnessAccumulator::new();
+        let pending = PendingBlocks::new();
+        let tip = bh(b"committed-tip");
+        let unheld = bh(b"unheld-ancestor");
+        let block = block_with(BlockHeight::new(5), tip, 0, vec![]);
+        let block_hash = block.hash();
+        let settling = Some((
+            ReshapeKind::Split,
+            Settling {
+                admitted: Epoch::new(2),
+                quiet: true,
+            },
+        ));
+        let initiate = |vp: &mut VerificationPipeline, rows| {
+            vp.initiate_beacon_witness_root_verification(
+                block_hash,
+                &block,
+                rows,
+                &pending,
+                &accumulator,
+                tip,
+                Some(RevealChain::ZERO),
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::ZERO,
+                ShardId::ROOT,
+                &topology_snapshot,
+                &dummy_schedule(&topology_snapshot),
+                disabled_count_source(),
+            )
+        };
+
+        assert!(initiate(&mut vp, Err(unheld)).is_empty());
+        assert_eq!(
+            vp.beacon_witness_defer(block_hash),
+            Some((unheld, BeaconWitnessDefer::ParentRows)),
+        );
+        assert!(!vp.is_root_in_flight(block_hash, VerificationKind::BeaconWitnessRoot));
+
+        assert_eq!(
+            vp.take_deferred_beacon_witness_children(unheld),
+            vec![block_hash]
+        );
+        let actions = initiate(&mut vp, Ok(settling));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::VerifyBeaconWitnessRoot { settling: carried, .. }] if *carried == settling
+            ),
+            "{actions:?}",
+        );
+    }
+
     /// A failed beacon-witness verification orphans any children that
     /// were parked on the failed block: the chain can't reconstruct
     /// matching leaves through a parent whose own root was wrong.
@@ -2982,6 +3065,7 @@ mod tests {
         let _ = vp.initiate_beacon_witness_root_verification(
             child_hash,
             &child,
+            Ok(None),
             &pending,
             &accumulator,
             BlockHash::ZERO,

@@ -58,8 +58,10 @@ use hyperscale_scenarios::{
     a_payer_spends_beside_its_routes_pending_core, a_priority_is_charged_over_the_table_price,
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
+    a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_recovered_venue_keeps_what_its_sibling_accepted,
+    a_recovery_stalled_beside_a_cancelled_split_is_drawn_again,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
@@ -76,6 +78,10 @@ use hyperscale_scenarios::{
     a_route_unstated_past_its_stating_window_aborts_on_both_venues,
     a_shard_halted_across_an_abandon_window_settles_again,
     a_silent_sibling_holds_no_more_than_a_quarter, a_spent_nullifier_is_swept_once_unreachable,
+    a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort,
+    a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery,
+    a_split_on_load_beside_a_halted_sibling_takes_nothing_its_recovery_is_owed,
+    a_split_under_steady_core_load_lands_without_a_cancel,
     a_sponsor_spends_its_balance_beside_its_held_cores_abort,
     a_stall_past_the_finalization_delay_states_every_member_of_its_tick,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
@@ -129,7 +135,7 @@ use hyperscale_scenarios::{
     route_genesis_accounts, routes_held_in_a_ring_wait_for_their_deadline,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     routes_seated_the_other_way_lose_the_later_to_the_cycle,
-    sealed_rounds_settle_on_the_seed_they_committed_to,
+    sealed_rounds_settle_on_the_seed_they_committed_to, second_splitter_genesis_accounts,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
@@ -144,8 +150,8 @@ use hyperscale_scenarios::{
 };
 #[cfg(feature = "production-epochs")]
 use hyperscale_scenarios::{
-    a_merged_chain_declines_at_its_own_parent,
-    a_record_whose_consumers_shard_departed_is_declined_by_its_successor,
+    a_crossing_within_a_merging_pair_settles_before_the_merge_cuts,
+    a_record_whose_consumers_shard_departs_is_taken_before_the_cut,
     a_route_whose_core_never_combines_holds_its_input,
     a_route_whose_held_core_keeps_its_sponsors_hold,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
@@ -2698,19 +2704,75 @@ fn a_swap_committed_after_the_venues_cut_is_disposed_once_sim() {
     cluster.run_faultable(a_swap_committed_after_the_venues_cut_is_disposed_once);
 }
 
+/// [`departing_route_cluster`] with one more pool spare: still short of
+/// a committee while the cohort holds its seats, and a committee's worth
+/// once it returns, with room for a withholder the halt jails.
+#[test]
+fn a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery_sim() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 19,
+            split_bytes: departing_venue_split_bytes(),
+            ..cross_shard_config()
+        },
+        42,
+        &departing_route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery);
+}
+
+#[test]
+fn a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort_sim() {
+    let mut cluster = departing_route_cluster();
+    cluster.run_faultable(a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort);
+}
+
+#[test]
+fn a_recovery_stalled_beside_a_cancelled_split_is_drawn_again_sim() {
+    let mut cluster = departing_route_cluster();
+    cluster.run_faultable(a_recovery_stalled_beside_a_cancelled_split_is_drawn_again);
+}
+
+#[test]
+fn a_split_on_load_beside_a_halted_sibling_takes_nothing_its_recovery_is_owed_sim() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 18,
+            split_bytes: departing_venue_split_bytes(),
+            ..cross_shard_config()
+        },
+        42,
+        &second_splitter_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster
+        .run_faultable(a_split_on_load_beside_a_halted_sibling_takes_nothing_its_recovery_is_owed);
+}
+
+/// Under both epoch lengths: the drain deadline is counted from the
+/// configured one.
+#[test]
+fn a_split_under_steady_core_load_lands_without_a_cancel_sim() {
+    let mut cluster = departing_route_cluster();
+    cluster.run_faultable(a_split_under_steady_core_load_lands_without_a_cancel);
+}
+
 #[test]
 fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
     let mut cluster = departing_route_cluster();
     cluster.run_faultable(a_route_into_a_departing_venue_releases_the_survivors_hold);
 }
 
-/// Under the production epoch length only, where the successor's
-/// decline is the one road the input comes home by.
+/// Under the production epoch length only, as the departure it is
+/// built on is measured.
 #[cfg(feature = "production-epochs")]
 #[test]
-fn a_record_whose_consumers_shard_departed_is_declined_by_its_successor_sim() {
+fn a_record_whose_consumers_shard_departs_is_taken_before_the_cut_sim() {
     let mut cluster = departing_route_cluster();
-    cluster.run_faultable(a_record_whose_consumers_shard_departed_is_declined_by_its_successor);
+    cluster.run_faultable(a_record_whose_consumers_shard_departs_is_taken_before_the_cut);
 }
 
 /// [`departing_route_cluster`] with the split threshold above every leaf
@@ -2739,6 +2801,12 @@ fn a_venue_sealed_on_a_fresh_split_child_runs_sim() {
 }
 
 #[test]
+fn a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing_sim() {
+    let mut cluster = late_departing_route_cluster();
+    cluster.run_faultable(a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing);
+}
+
+#[test]
 fn a_route_committed_before_its_departure_was_voted_still_resolves_sim() {
     let mut cluster = late_departing_route_cluster();
     cluster.run_faultable(a_route_committed_before_its_departure_was_voted_still_resolves);
@@ -2749,7 +2817,7 @@ fn a_route_committed_before_its_departure_was_voted_still_resolves_sim() {
 /// is built on is measured.
 #[cfg(feature = "production-epochs")]
 #[test]
-fn a_merged_chain_declines_at_its_own_parent_sim() {
+fn a_crossing_within_a_merging_pair_settles_before_the_merge_cuts_sim() {
     let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &ScenarioConfig {
             num_shards: 4,
@@ -2761,7 +2829,7 @@ fn a_merged_chain_declines_at_its_own_parent_sim() {
         &merging_route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     );
-    cluster.run_faultable(a_merged_chain_declines_at_its_own_parent);
+    cluster.run_faultable(a_crossing_within_a_merging_pair_settles_before_the_merge_cuts);
 }
 
 /// The pre-boundary hold in the settled-set fence cannot reach an accept

@@ -1969,7 +1969,7 @@ fn await_recovery_draw(c: &mut impl FaultableCluster, halt: &StagedHalt) -> Epoc
 /// Drive a drawn recovery through resume and record clear: the fresh
 /// committee seated at `seated_at` resumes the halted shard and its first
 /// crossing clears the record.
-fn await_recovery_resume(c: &mut impl FaultableCluster, halt: &StagedHalt, seated_at: Epoch) {
+pub fn await_recovery_resume(c: &mut impl FaultableCluster, halt: &StagedHalt, seated_at: Epoch) {
     let shard = halt.shard;
     // The fresh committee syncs the halted tip from the retained members,
     // bridges the halt gap, and resumes committing past the frozen height.
