@@ -514,7 +514,13 @@ impl ConsensusState {
             self.certificates
                 .insert(fw.receipt_hash(), encode_row(&fw.attestation()));
         }
-        self.insert_receipts(block.certificates().iter().flat_map(|fw| fw.receipts()));
+        self.insert_receipts(
+            &block
+                .certificates()
+                .iter()
+                .flat_map(|fw| fw.stored_receipts())
+                .collect::<Vec<_>>(),
+        );
     }
 
     fn record_transactions(&mut self, block: &Block) {

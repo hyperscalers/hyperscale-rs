@@ -16,9 +16,10 @@ use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat
 use hyperscale_types::{
     AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, Decision,
     DeclaredKey, DiscardCause, Evidence, Formed, Hears, Holds, Inclusion, Joins,
-    MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode, ModeKind, PriceTable, Reach, Reserves, Role,
-    Settlement, ShardId, ShardTrie, SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine,
-    TopologySnapshot, Transaction, TxHash, Value, WeightedTimestamp, Window, compatible, decide,
+    MAX_STAGED_RECEIPT_BYTES, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode,
+    ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView,
+    Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
+    Value, WeightedTimestamp, Window, compatible, decide, staged_yes_bound,
     tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
@@ -255,6 +256,8 @@ pub struct Judged<'a> {
     /// Whether it is the payer's leg, which waits for every shard it
     /// reaches to engage until its deadline.
     waits: bool,
+    /// What its yes receipt can cost staged.
+    staged: u64,
 }
 
 impl<'a> Judged<'a> {
@@ -270,6 +273,7 @@ impl<'a> Judged<'a> {
             engages: &terms.engages,
             crossings: &terms.crossings,
             waits: terms.waits,
+            staged: terms.staged,
         }
     }
 
@@ -295,6 +299,7 @@ impl<'a> Judged<'a> {
             engages: &waiting.engages,
             crossings: &row.crossings,
             waits: waiting.waits,
+            staged: waiting.staged,
         }
     }
 
@@ -450,7 +455,40 @@ pub fn terms_of_member(
         charge: AbortCharge::of(tx, prices),
         share: classified.local_price(tx, local, prices),
         reserves: local_reserves(tx, trie, local),
+        staged: staged_of(member, tx),
     }
+}
+
+/// What `member`'s yes receipt can cost staged on its shard.
+///
+/// [`staged_yes_bound`] of what `tx` declares there where a sibling's
+/// verdict can discard its effects, and zero where none can, since it
+/// then states no yes.
+#[must_use]
+fn staged_of(member: &Member, tx: &Transaction) -> u64 {
+    if member.abortable() {
+        staged_yes_bound(&member.classified().local_work(tx, member.local()))
+    } else {
+        0
+    }
+}
+
+/// The first shard `tx` reaches whose member could stage a yes past the
+/// receipt cap.
+///
+/// A member a sibling's verdict can discard, on a shard `tx` reaches
+/// under `trie`, whose staged bound passes [`MAX_STAGED_RECEIPT_BYTES`]
+/// could never state, so the transaction is refused at admission, free
+/// of charge. `None` where every member fits. `tx` must be routed.
+#[must_use]
+pub fn staged_past_cap(tx: &Transaction, trie: &ShardTrie) -> Option<ShardId> {
+    tx.routing()
+        .all_prefixes()
+        .into_iter()
+        .map(|prefix| trie.shard_for_prefix(prefix))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .find(|&shard| staged_of(&member_of(tx, trie, shard), tx) > MAX_STAGED_RECEIPT_BYTES)
 }
 
 /// `shards` without `local`, each once, ascending.
@@ -1332,13 +1370,14 @@ fn answerable(
     (!unknown).then_some(false)
 }
 
-/// What a manifest has spent of its byte budget, its line cap and its
-/// member cap.
+/// What a manifest has spent of its byte budget, its line cap, its
+/// member cap and its staged bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestBudget {
     spent: usize,
     lines: usize,
     members: usize,
+    staged: u64,
 }
 
 impl ManifestBudget {
@@ -1348,23 +1387,31 @@ impl ManifestBudget {
     }
 
     /// Take every one of `lines` if all of them fit what is left, and
-    /// none of them otherwise.
+    /// none of them otherwise. The staged bytes the member lines carry
+    /// between them stay within [`MAX_TICK_STAGED_BYTES`], so a stating
+    /// half of the block's tick fits the frame.
     fn take_all<'l>(&mut self, lines: impl IntoIterator<Item = &'l TickLine>) -> bool {
-        let (mut spent, mut count, mut members) = (self.spent, self.lines, self.members);
+        let (mut spent, mut count, mut members, mut staged) =
+            (self.spent, self.lines, self.members, self.staged);
         for line in lines {
             spent = spent.saturating_add(line.wire_weight());
             count += 1;
-            members += usize::from(matches!(line, TickLine::Member { .. }));
+            if let TickLine::Member { staged: line, .. } = line {
+                members += 1;
+                staged = staged.saturating_add(*line);
+            }
         }
         if !tick_manifest_admits_block(spent)
             || count > MAX_TICK_LINES_PER_BLOCK
             || !tick_manifest_admits_members(members)
+            || staged > MAX_TICK_STAGED_BYTES
         {
             return false;
         }
         self.spent = spent;
         self.lines = count;
         self.members = members;
+        self.staged = staged;
         true
     }
 }
@@ -1418,6 +1465,7 @@ impl Nameable<'_> {
             charge: self.charge,
             share: self.share,
             reserves: self.reserves.clone(),
+            staged: 0,
             deadline: self.deadline,
             crossings: if self.covered {
                 Capped::empty()
@@ -1536,6 +1584,7 @@ pub fn select_members<'a>(
             charge,
             share,
             reserves: reserves.clone(),
+            staged: judged.staged,
             deadline,
             crossings: if judged.settlement == Settlement::Shared {
                 crossings.clone()
@@ -1859,6 +1908,7 @@ mod tests {
 
     use hyperscale_effects_bridge::vault_key;
     use hyperscale_hbor::{Bytes, to_vec};
+    use hyperscale_storage::test_helpers::yes_receipt;
     use hyperscale_storage::{
         MemberInputs, SettledHalf, Substates, TickRow, Waiting, fate_writes, member_row_leaf,
         member_writes, reclaim_credits, reclaimed, unclaimed_declines,
@@ -2109,6 +2159,7 @@ mod tests {
             crossings: terms.crossings.clone(),
             owes: Owes::of(&terms.crossings),
             waiting: Some(Waiting {
+                staged: 0,
                 leg: terms.leg,
                 settlement: terms.settlement,
                 declared: terms.declared.clone(),
@@ -2137,6 +2188,7 @@ mod tests {
     /// The terms of a member reaching no other shard.
     fn alone(declared: Vec<(DeclaredKey, Mode)>) -> MemberTerms {
         MemberTerms {
+            staged: 0,
             leg: false,
             settlement: Settlement::Alone,
             declared: Capped::new(declared).expect("within the cap"),
@@ -2307,6 +2359,7 @@ mod tests {
         };
         assert!(to_vec(&entry).expect("an entry encodes").len() <= entry.terms.wire_weight());
         let line = TickLine::Member {
+            staged: 0,
             tx,
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
@@ -2339,6 +2392,7 @@ mod tests {
         let at = |height: u64| BlockHeight::new(height);
         let deadline = Deadline::of_transaction(&tx);
         let line = |joins| TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins,
             settlement: terms.settlement,
@@ -2414,6 +2468,7 @@ mod tests {
             ..MemberInputs::still(shard)
         });
         let in_flight = |seed: u8| TickLine::Member {
+            staged: 0,
             tx: tx(seed),
             joins: Joins::Executes,
             settlement: Settlement::Shared,
@@ -2607,6 +2662,58 @@ mod tests {
         );
     }
 
+    /// Each member line carries the staged bound its terms price, and a
+    /// tick's lines stage no more than [`MAX_TICK_STAGED_BYTES`] between
+    /// them: a run of small core members past it is named across blocks,
+    /// the rest waiting a block as for any other budget, and none is
+    /// refused.
+    #[test]
+    fn a_tick_of_small_core_members_past_the_staged_bound_splits_across_blocks_and_refuses_none() {
+        let small = MemberTerms {
+            staged: MAX_TICK_STAGED_BYTES / 32,
+            ..leg(vec![], &[])
+        };
+        let members: Vec<TxHash> = (0..40u8).map(tx).collect();
+        let named = |members: &[TxHash]| -> Vec<TxHash> {
+            select_members(
+                ms(0),
+                members.iter().map(|&member| pending(member, &small, far())),
+                &Held::default(),
+                &mut ProvisionalCells::default(),
+                &mut ManifestBudget::default(),
+            )
+            .iter()
+            .map(|line| match line {
+                TickLine::Member { tx, staged, .. } => {
+                    assert_eq!(*staged, small.staged, "the line carries its terms' figure");
+                    *tx
+                }
+                other @ (TickLine::Discard { .. }
+                | TickLine::Fate { .. }
+                | TickLine::End { .. }) => panic!("{other:?}"),
+            })
+            .collect()
+        };
+
+        let first = named(&members);
+        assert_eq!(
+            first.len(),
+            32,
+            "the tick stages up to its cap and no further"
+        );
+        let waiting: Vec<TxHash> = members
+            .iter()
+            .copied()
+            .filter(|member| !first.contains(member))
+            .collect();
+        let second = named(&waiting);
+        assert_eq!(
+            second.into_iter().collect::<BTreeSet<_>>(),
+            waiting.into_iter().collect::<BTreeSet<_>>(),
+            "the rest are named in the next block",
+        );
+    }
+
     /// The walk stops at the first line the budget refuses.
     #[test]
     fn the_walk_stops_at_the_budget() {
@@ -2709,6 +2816,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![TickLine::Member {
+                staged: 0,
                 tx: tx(1),
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
@@ -2747,6 +2855,7 @@ mod tests {
         assert_eq!(
             named(deadline.at()),
             vec![TickLine::Member {
+                staged: 0,
                 tx: tx(1),
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
@@ -2816,6 +2925,7 @@ mod tests {
             after,
             vec![
                 TickLine::Member {
+                    staged: 0,
                     tx: tx(1),
                     joins: Joins::Aborted,
                     settlement: Settlement::Awaited,
@@ -3004,6 +3114,7 @@ mod tests {
     fn aborted_in(seed: u8, deadline: Deadline, tick: u64) -> Vec<TickLine> {
         vec![
             TickLine::Member {
+                staged: 0,
                 tx: tx(seed),
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
@@ -3230,6 +3341,7 @@ mod tests {
     /// The line aborting `row`, answering `Never` for `crossings`.
     fn aborting(row: &MemberRow, crossings: Crossings) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: row.tx,
             joins: Joins::Aborted,
             settlement: if row.reach.is_empty() {
@@ -4203,6 +4315,7 @@ mod tests {
                     &mut rows,
                     2,
                     vec![TickLine::Member {
+                        staged: 0,
                         tx: tx(1),
                         joins: Joins::Executes,
                         settlement: Settlement::Shared,
@@ -4230,7 +4343,7 @@ mod tests {
                             tick: TickId::new(shard, at(2)),
                             half: TickHalf::Stated,
                             deleted: Vec::new(),
-                            stated: vec![(tx(1), GlobalReceiptHash::ZERO)],
+                            stated: vec![yes_receipt(tx(1), GlobalReceiptHash::ZERO)],
                             accepted: Vec::new(),
                         }],
                         ..MemberInputs::still(shard)
@@ -4854,6 +4967,7 @@ mod tests {
             held.engaged.insert((PEER, tx(seed)));
         }
         let named = TickLine::Member {
+            staged: 0,
             tx: tx(5),
             joins: Joins::Executes,
             settlement: Settlement::Shared,
@@ -4980,6 +5094,7 @@ mod tests {
         assert_eq!(
             lines(&family(1, 2), &[crossed(1, 2)]),
             vec![TickLine::Member {
+                staged: 0,
                 tx: tx(2),
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
@@ -6673,7 +6788,7 @@ mod tests {
             half,
             deleted: Vec::new(),
             stated: if stated {
-                vec![(tx(1), GlobalReceiptHash::ZERO)]
+                vec![yes_receipt(tx(1), GlobalReceiptHash::ZERO)]
             } else {
                 Vec::new()
             },
@@ -6684,6 +6799,7 @@ mod tests {
                 height: BlockHeight::new(2),
                 transactions: vec![(tx(1), far())],
                 manifest: Arc::new(Capped::from_array([TickLine::Member {
+                    staged: 0,
                     tx: tx(1),
                     joins: Joins::Executes,
                     settlement: Settlement::Shared,

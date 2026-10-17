@@ -643,6 +643,20 @@ pub enum ProtocolEvent {
         result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
     },
 
+    /// A legs half was built from the yes receipts staged at a committed
+    /// tip, answering `Action::BuildLegsHalf`.
+    ///
+    /// Routed to `ExecutionCoordinator::on_legs_half_built`, which records
+    /// the names it carries and offers it in place of the half held.
+    LegsHalfBuilt {
+        /// The tick it accepts members of.
+        tick: TickId,
+        /// The committed block it was built at.
+        tip: BlockHash,
+        /// The half, or `None` where no name's row stood stated there.
+        half: Option<Finalization>,
+    },
+
     /// An execution certificate was just admitted to the canonical EC store.
     ///
     /// Emitted by `ExecutionCoordinator::on_certificate_verified` only when

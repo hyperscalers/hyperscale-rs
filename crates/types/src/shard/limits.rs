@@ -9,15 +9,20 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
+use hyperscale_hbor::to_vec;
 use hyperscale_jmt::{MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES};
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_CROSSINGS_PER_TX, MAX_ENVELOPE_BYTES,
-    MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS,
-    VERIFY_WEIGHT,
+    AMOUNT_CELL_BYTES, DeclaredWork, EVENT_FRAME_BYTES, MAX_CALL_BYTES, MAX_CELL_VALUE_LEN,
+    MAX_CROSSINGS_PER_TX, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX, MAX_EVENTS_PER_TX,
+    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
+    WRITE_LEAF_BYTES,
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
-use crate::{Address, LocalKey, RoutePrefix, SectionRoots, TxsInFlight};
+use crate::{
+    Address, ConsensusReceipt, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX, RoutePrefix,
+    SectionRoots, TxsInFlight,
+};
 
 /// The largest message any transport carries, compressed.
 ///
@@ -416,6 +421,96 @@ const _: () = assert!(
         + MAX_CROSSINGS_PER_TX * TICK_CROSSING_BYTES
         <= MAX_TICK_MANIFEST_BYTES
 );
+
+/// What one write of a staged receipt costs beyond its value.
+///
+/// Its key, the presence tag in front of the value, the value's length,
+/// and a movement's resource and totals, which retention prices at an
+/// amount cell's width.
+const STAGED_ENTRY_OVERHEAD: u64 = 192;
+
+/// What one event of a staged receipt costs beyond the frame and payload
+/// the declared event bytes price.
+const STAGED_EVENT_OVERHEAD: u64 = 8;
+
+/// The widest one beacon witness event encodes.
+const BEACON_WITNESS_EVENT_BYTES: u64 = 192;
+
+/// What a staged receipt costs around its writes and events: its hash,
+/// its variant and the length of each list it carries.
+const RECEIPT_FRAME_BYTES: u64 = 64;
+
+/// What the leaf holding a staged receipt adds around the receipt: the
+/// collection, the order key and the value's length.
+const STAGED_LEAF_OVERHEAD: usize = 64;
+
+/// The largest yes receipt a stated row stages.
+///
+/// A staged receipt is one tree leaf, and snap-sync ships every leaf
+/// within [`MAX_CELL_VALUE_LEN`], so the receipt and the leaf around it
+/// fit that. A transaction with a member a sibling's verdict can discard
+/// on some shard whose [`staged_yes_bound`] there passes this is refused
+/// at admission: no such member could ever state.
+pub const MAX_STAGED_RECEIPT_BYTES: u64 = (MAX_CELL_VALUE_LEN - STAGED_LEAF_OVERHEAD) as u64;
+
+/// The yes receipt bytes one tick may state: what the member lines a
+/// block names may carry in `staged` between them, and what one batch's
+/// yes receipts may reach before the next one is refused.
+///
+/// A stating half carries every yes receipt of its tick, so this keeps
+/// one inside the frame beside its certificate and refusal receipts.
+pub const MAX_TICK_STAGED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A stating half at the staged cap leaves at least half the frame to
+/// its certificate and its refusal receipts.
+const _: () = assert!(2 * MAX_TICK_STAGED_BYTES <= MAX_WIRE_MESSAGE_BYTES as u64);
+
+/// A staged receipt at its cap fits the leaf that holds it.
+const _: () =
+    assert!(MAX_STAGED_RECEIPT_BYTES + STAGED_LEAF_OVERHEAD as u64 <= MAX_CELL_VALUE_LEN as u64);
+
+/// What `receipt` costs staged: its encoded length.
+///
+/// # Panics
+///
+/// Never: a receipt within its caps encodes.
+#[must_use]
+pub fn staged_yes_bytes(receipt: &ConsensusReceipt) -> u64 {
+    to_vec(receipt)
+        .expect("a receipt within its caps encodes")
+        .len() as u64
+}
+
+/// The most a yes receipt of a member declaring `work` on its shard can
+/// cost staged.
+///
+/// Retention prices every byte a receipt keeps: the values it writes,
+/// each event's frame and payload. The write dimension prices every leaf
+/// a receipt can write at no less than [`WRITE_LEAF_BYTES`]: each
+/// declared point, each entry a range may reach up to its cap, and each
+/// cell the kernel writes of its own accord. So its leaf count bounds
+/// the writes, each of which costs `STAGED_ENTRY_OVERHEAD` beside its
+/// value, and the retained bytes bound the events, each of which costs
+/// `STAGED_EVENT_OVERHEAD` beside its frame. The witness events, which
+/// are no declared slot, and the receipt's own frame are added at their
+/// widest.
+#[must_use]
+pub const fn staged_yes_bound(work: &DeclaredWork) -> u64 {
+    let writes = work.write_bytes / WRITE_LEAF_BYTES;
+    let events = {
+        let priced = work.retention.div_ceil(EVENT_FRAME_BYTES as u64);
+        if priced < MAX_EVENTS_PER_TX as u64 {
+            priced
+        } else {
+            MAX_EVENTS_PER_TX as u64
+        }
+    };
+    work.retention
+        .saturating_add(writes.saturating_mul(STAGED_ENTRY_OVERHEAD))
+        .saturating_add(events.saturating_mul(STAGED_EVENT_OVERHEAD))
+        .saturating_add(MAX_BEACON_WITNESS_EVENTS_PER_TX as u64 * BEACON_WITNESS_EVENT_BYTES)
+        .saturating_add(RECEIPT_FRAME_BYTES)
+}
 
 /// Byte budget a block's terms section spends.
 ///
@@ -933,11 +1028,25 @@ pub const MAX_ROUND_GAP: u64 = 100_000;
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_types::DeclaredWork;
+    use hyperscale_hbor::{Bytes, Capped, to_vec};
+    use hyperscale_vm_types::{
+        AMOUNT_CELL_BYTES, AddressClass, CollectionId, DeclaredWork, EVENT_FRAME_BYTES, EntryKey,
+        Event, MAX_EVENT_BYTES_PER_TX, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENTS_PER_TX, MAX_SLOT_WIDTH,
+        Movement, PriceBounds, PriceTable, ResourceAddr, StateWrites, SubstateKey,
+        entry_leaf_bytes, written_leaf,
+    };
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     use super::{
-        BLOCK_CAPS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_TXS, TX_CAPS, TxsInFlight,
-        budget_admits_block, caps_admit_transaction, drain_admits_block, sweep_admits_block,
+        BEACON_WITNESS_EVENT_BYTES, BLOCK_CAPS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_TXS,
+        TX_CAPS, TxsInFlight, budget_admits_block, caps_admit_transaction, drain_admits_block,
+        staged_yes_bound, staged_yes_bytes, sweep_admits_block,
+    };
+    use crate::{
+        Address, BeaconWitnessEvent, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+        Epoch, GlobalReceiptHash, Hash, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX, NetworkParams,
+        ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId, ValidatorId,
     };
 
     /// The bound bites on the level a block leaves: one carrying
@@ -995,6 +1104,170 @@ mod tests {
     #[test]
     fn a_block_adding_nothing_is_admitted_at_any_total() {
         assert!(drain_admits_block(TxsInFlight::new(u64::MAX), 0));
+    }
+
+    /// What `width` bytes cost written at a leaf, in the write and the
+    /// retention dimensions, as a derivation prices them.
+    const fn priced(leaf: u64) -> DeclaredWork {
+        DeclaredWork {
+            write_bytes: written_leaf(leaf),
+            retention: leaf,
+            ..DeclaredWork::ZERO
+        }
+    }
+
+    /// The widest of each beacon witness event, every field at its
+    /// widest encoding.
+    fn widest_witness_events() -> Vec<BeaconWitnessEvent> {
+        let pool_id = StakePoolId::new(u32::MAX);
+        let validator_id = ValidatorId::new(u64::MAX);
+        let table = PriceTable {
+            compute: u64::MAX,
+            read_bytes: u64::MAX,
+            write_bytes: u64::MAX,
+            footprint: u64::MAX,
+            retention: u64::MAX,
+        };
+        vec![
+            BeaconWitnessEvent::StakeDeposit {
+                pool_id,
+                amount: Stake::from_quanta(u128::MAX),
+            },
+            BeaconWitnessEvent::StakeWithdraw {
+                pool_id,
+                amount: Stake::from_quanta(u128::MAX),
+            },
+            BeaconWitnessEvent::RegisterValidator {
+                pool_id,
+                validator_id,
+                pubkey: ConsensusPublicKey::new([0xFF; 48]),
+                possession_proof: ConsensusSignature::new([0xFF; 96]),
+            },
+            BeaconWitnessEvent::DeactivateValidator {
+                pool_id,
+                validator_id,
+            },
+            BeaconWitnessEvent::Unjail {
+                pool_id,
+                id: validator_id,
+            },
+            BeaconWitnessEvent::ParamVote(ParamVote {
+                pool: pool_id,
+                proposal: Some(ParamProposal {
+                    params: NetworkParams {
+                        reshape_thresholds: ReshapeThresholds {
+                            split_bytes: u64::MAX,
+                            split_fullness: u32::MAX,
+                        },
+                        impound_epochs: u64::MAX,
+                        price_bounds: PriceBounds {
+                            floor: table,
+                            ceiling: table,
+                        },
+                    },
+                    activate_at: Epoch::new(u64::MAX),
+                }),
+            }),
+        ]
+    }
+
+    /// The witness term of the staged bound rests on one figure: every
+    /// beacon witness event, at its widest, encodes within it.
+    #[test]
+    fn a_beacon_witness_event_encodes_within_its_bound() {
+        for event in widest_witness_events() {
+            let bytes = to_vec(&event).expect("a witness event encodes").len() as u64;
+            assert!(
+                bytes <= BEACON_WITNESS_EVENT_BYTES,
+                "{event:?} encodes to {bytes}"
+            );
+        }
+    }
+
+    proptest! {
+        /// A yes receipt within its member's declaration never stages
+        /// more than the bound its declared work states: whatever cells
+        /// it writes, at whatever widths, among them the kernel's own
+        /// amount and entry cells, the most events its event bytes buy,
+        /// and the most witness events, each at its widest.
+        #[test]
+        fn staged_yes_bytes_never_exceeds_the_declared_bound(
+            points in vec(prop_oneof![0u32..=64, Just(MAX_SLOT_WIDTH)], 0..48),
+            amounts in 0usize..16,
+            entries in vec(0u32..=64, 0..48),
+            events in vec(prop_oneof![Just(0usize), 0usize..=MAX_EVENT_PAYLOAD_BYTES], 0..=MAX_EVENTS_PER_TX),
+            unused in 0u64..1_024,
+        ) {
+            let mut writes = StateWrites::default();
+            let mut work = DeclaredWork {
+                retention: unused,
+                ..DeclaredWork::ZERO
+            };
+            for (at, &width) in points.iter().enumerate() {
+                let local = (at as u128).to_be_bytes();
+                writes.cells.insert(
+                    SubstateKey {
+                        owner: Address::new([0xFF; 31], AddressClass::Component),
+                        local: LocalKey(local),
+                    },
+                    Some(vec![0xFF; width as usize]),
+                );
+                work = work.saturating_add(priced(u64::from(width)));
+            }
+            for at in 0..amounts {
+                writes.movements.insert(
+                    SubstateKey {
+                        owner: Address::new([0xFE; 31], AddressClass::Component),
+                        local: LocalKey((at as u128).to_be_bytes()),
+                    },
+                    Movement::unjudged(ResourceAddr::new([0xFF; 31]), u128::MAX),
+                );
+                work = work.saturating_add(priced(AMOUNT_CELL_BYTES as u64));
+            }
+            for (at, &width) in entries.iter().enumerate() {
+                writes.entries.insert(
+                    EntryKey {
+                        owner: Address::new([0xFD; 31], AddressClass::Component),
+                        collection: CollectionId([0xFF; 16]),
+                        order: u128::MAX - at as u128,
+                    },
+                    Some(vec![0xFF; width as usize]),
+                );
+                work = work.saturating_add(priced(entry_leaf_bytes(width)));
+            }
+            let mut emitted = Vec::new();
+            let mut event_bytes = 0u64;
+            for payload in events {
+                let frame = (EVENT_FRAME_BYTES + payload) as u64;
+                if event_bytes + frame > MAX_EVENT_BYTES_PER_TX as u64 {
+                    break;
+                }
+                event_bytes += frame;
+                emitted.push(Event {
+                    emitter: Address::new([0xFF; 31], AddressClass::Component),
+                    event_type: u32::MAX,
+                    payload: Bytes::new(vec![0xFF; payload]).expect("within the payload cap"),
+                });
+            }
+            work.retention = work.retention.saturating_add(event_bytes);
+            let widest = widest_witness_events()
+                .into_iter()
+                .max_by_key(|event| to_vec(event).expect("a witness event encodes").len())
+                .expect("a witness event");
+            let witnessed = vec![widest; MAX_BEACON_WITNESS_EVENTS_PER_TX];
+            let receipt = ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[0xFF; 32])),
+                writes,
+                beacon_witness_events: Capped::new(witnessed).expect("within the witness cap"),
+                events: Capped::new(emitted).expect("within the event cap"),
+            };
+            prop_assert!(
+                staged_yes_bytes(&receipt) <= staged_yes_bound(&work),
+                "{} staged past a bound of {}",
+                staged_yes_bytes(&receipt),
+                staged_yes_bound(&work),
+            );
+        }
     }
 
     /// The creation cap bites at the cell. That it is outrun by the

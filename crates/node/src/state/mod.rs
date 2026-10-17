@@ -494,7 +494,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
             | ProtocolEvent::ExecutionCertificateAdmitted { .. }
             | ProtocolEvent::FinalizationsReceived { .. }
-            | ProtocolEvent::FinalizationVerified { .. }) => {
+            | ProtocolEvent::FinalizationVerified { .. }
+            | ProtocolEvent::LegsHalfBuilt { .. }) => {
                 self.with_shard(move |s, sched| s.handle_execution(sched, evt))
             }
 

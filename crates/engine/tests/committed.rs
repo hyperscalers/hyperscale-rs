@@ -354,6 +354,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
         abandonment_records,
         state_claims,
         tick_manifest: Arc::new(Capped::from_array([TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,
@@ -507,6 +508,7 @@ fn a_follower_applies_its_half_of_the_terminal() {
         vec![funding(charge.vault)],
         std::slice::from_ref(&tx),
         Capped::from_array([TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,

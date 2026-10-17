@@ -483,7 +483,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let new_witness_leaves = derive_leaves(
         local_shard,
         topology_snapshot,
-        &receipts,
+        &settling,
         &missed,
         &witness_sources,
     );
@@ -872,7 +872,8 @@ fn commit_windows_for(
 fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
-        .flat_map(|fw| fw.consensus_receipts())
+        .flat_map(|fw| fw.settling_receipts())
+        .map(|receipt| receipt.consensus)
         .collect();
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
 }
@@ -1251,7 +1252,7 @@ where
             let start = Stopwatch::start();
             let receipts: Vec<StoredReceipt> = finalizations
                 .iter()
-                .flat_map(|fw| fw.receipts().iter().cloned())
+                .flat_map(|fw| fw.settling_receipts())
                 .collect();
             let bw_ctx = BeaconWitnessRootContext {
                 verifier: ctx.verifier,
@@ -1986,19 +1987,117 @@ pub fn committing_shards(
 #[cfg(test)]
 mod tests {
 
+    use std::sync::Mutex;
+
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, stub_abort_charge, stub_transaction, test_prefix,
-        test_principal,
+        TestCommittee, install_stub_protocol_statics, stating_half_on, stub_abort_charge,
+        stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        BeaconBlockHash, BeaconChainConfig, BeaconState, BodyRoot, BodyRootVerifyError,
-        CertifiedBeaconBlock, CommittedAt, Deadline, PriceTable, ProposerTimestamp, ShardCommittee,
-        Signer, TimestampRange,
+        Address, AddressClass, BeaconBlockHash, BeaconChainConfig, BeaconState, BeaconWitnessEvent,
+        BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CommittedAt, Deadline,
+        DerivationError, Derived, ExecutionOutcome, GlobalReceiptHash, LocalKey, PriceTable,
+        ProposerTimestamp, Role, ShardCommittee, Signer, Stake, StakePoolId, StateWrites, TickHalf,
+        TimestampRange, TransactionEnvelope, TxOutcome, receipt_hash_of,
     };
 
     use super::*;
+
+    /// A derivation recording every committed cell it is offered, and
+    /// deriving nothing.
+    #[derive(Default)]
+    struct Offered(Mutex<Vec<[u8; 16]>>);
+
+    impl Derivation for Offered {
+        fn derive(&self, _: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            Err(DerivationError::Refused("records offers only".into()))
+        }
+
+        fn absorb_committed_cell(&self, _: [u8; 32], local: [u8; 16], _: &[u8]) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(local);
+        }
+    }
+
+    /// A yes a stating half carries settles nothing where the half
+    /// commits: no witness leaf lifts its beacon facts, no committed cell
+    /// it writes is offered to the package cache, and none of its writes
+    /// is settled. The same receipt settled by a determined half does all
+    /// three.
+    #[test]
+    fn a_yes_receipt_emits_no_witness_absorbs_no_cell_and_writes_nothing_at_stating() {
+        install_stub_protocol_statics();
+        let mut writes = StateWrites::default();
+        writes.cells.insert(
+            SubstateKey {
+                owner: Address::new([0x42; 31], AddressClass::Component),
+                local: LocalKey([0x42; 16]),
+            },
+            Some(b"a package".to_vec()),
+        );
+        let witness = BeaconWitnessEvent::StakeDeposit {
+            pool_id: StakePoolId::new(1),
+            amount: Stake::from_quanta(5),
+        };
+        let unhashed = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: writes.clone(),
+            beacon_witness_events: Capped::from_array([witness.clone()]),
+            events: Capped::empty(),
+        };
+        let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
+        let tx = TxHash::from(Hash::from_bytes(b"a stated yes"));
+        let receipt = StoredReceipt::new(
+            tx,
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash,
+                writes,
+                beacon_witness_events: Capped::from_array([witness]),
+                events: Capped::empty(),
+            }),
+        );
+        let yes = TxOutcome::new(tx, ExecutionOutcome::Succeeded { receipt_hash })
+            .charging(1)
+            .awaiting([ShardId::leaf(1, 1)])
+            .as_role(Role::Core);
+        let stating = stating_half_on(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            vec![yes],
+            vec![receipt.clone()],
+        );
+        assert_eq!(stating.validate_against_certificates(), Ok(()));
+        let determined = Finalization::new(
+            *stating.tick_id(),
+            TickHalf::Determined,
+            stating.local_ec().cloned().map(Arc::new),
+            Capped::from_array([receipt]),
+        );
+
+        let snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
+        let sources = WitnessSources::new(Capped::empty(), None, VrfProof::ZERO);
+        let effects = |fw: &Finalization| {
+            let receipts = fw.settling_receipts();
+            let leaves = derive_leaves(ShardId::ROOT, &snapshot, &receipts, &[], &sources);
+            let offered = Offered::default();
+            absorb_finalized_cells(&[Arc::new(Verifiable::from(fw.clone()))], &offered);
+            let offered = offered
+                .0
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (leaves.len(), offered.len(), receipts.len())
+        };
+        assert_eq!(effects(&stating), (0, 0, 0), "the yes settles nothing");
+        assert_eq!(
+            effects(&determined),
+            (1, 1, 1),
+            "where its effects settle, they do"
+        );
+    }
 
     /// A beacon chain that answers for the epochs it was given and for
     /// nothing else — the reads `commit_windows_for` takes, without the

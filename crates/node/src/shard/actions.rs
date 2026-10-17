@@ -61,6 +61,7 @@ where
             | Action::VerifyAndAggregateExecutionVotes { .. }
             | Action::VerifyExecutionCertificateSignature { .. }
             | Action::VerifyFinalization { .. }
+            | Action::BuildLegsHalf { .. }
             | Action::BuildProposal { .. }
             | Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }

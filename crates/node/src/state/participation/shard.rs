@@ -435,7 +435,11 @@ impl ShardParticipation {
         let verdicts = self.shard_coordinator.verdict_questions(sched);
         actions.extend(self.execution_coordinator.ask_verdicts(&verdicts, sched));
         let accepting = self.shard_coordinator.accepting(sched);
-        actions.extend(self.execution_coordinator.offer_accepting(accepting));
+        actions.extend(self.execution_coordinator.offer_accepting(
+            self.shard_coordinator.committed_hash(),
+            self.shard_coordinator.committed_height(),
+            &accepting,
+        ));
         self.shard_coordinator.queue_ready_proposal();
         actions
     }

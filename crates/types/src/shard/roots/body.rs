@@ -246,17 +246,25 @@ mod tests {
     use super::*;
     use crate::test_utils::{make_live_block, rebound, stating_half_on};
     use crate::{
-        BlockHeight, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Role, ShardId,
-        StateWrites, TxOutcome, ValidatorId,
+        BlockHeight, ConsensusReceipt, ExecutionOutcome, Finalization, GlobalReceiptHash, Role,
+        ShardId, StateWrites, TxOutcome, ValidatorId, receipt_hash_of,
     };
 
-    /// A body carrying a stating half that states a yes is bound to its
-    /// header with no receipt for the yes, and is not bound where one
-    /// rides beside it: the yes settles nothing, so the half carries
-    /// nothing of it.
+    /// A body carrying a stating half is bound to its header with the
+    /// effects receipt of each yes it states, and the local receipts
+    /// root commits to it: a half missing the receipt is unbound. Sealed
+    /// into storage, where the attestation keeps the yes receipt inline
+    /// and the store keeps the refusal receipt beside it, the block
+    /// rebuilds to the same body root.
     #[test]
-    fn a_stating_half_holding_a_yes_is_bound() {
-        let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
+    fn a_sealed_stating_block_keeps_its_body_root() {
+        let unhashed = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        };
+        let effects = receipt_hash_of(&unhashed, true).expect("a projected success");
         let yes = TxOutcome::new(
             TxHash::from(Hash::from_bytes(b"yes")),
             ExecutionOutcome::Succeeded {
@@ -266,11 +274,38 @@ mod tests {
         .charging(3)
         .awaiting([ShardId::leaf(1, 1)])
         .as_role(Role::Core);
+        let refusal = GlobalReceiptHash::from_raw(Hash::from_bytes(b"refusal"));
+        let no = TxOutcome::with_refusal(
+            TxHash::from(Hash::from_bytes(b"no")),
+            ExecutionOutcome::Failed,
+            refusal,
+        )
+        .charging(4)
+        .awaiting([ShardId::leaf(1, 1)])
+        .as_role(Role::Core);
+        let yes_receipt = StoredReceipt::new(
+            yes.tx_hash(),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: effects,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
+        let refusal_receipt = StoredReceipt::new(
+            no.tx_hash(),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: refusal,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
         let carrying = |receipts: Vec<StoredReceipt>| {
             let half = stating_half_on(
                 ShardId::ROOT,
                 BlockHeight::new(1),
-                vec![yes.clone()],
+                vec![yes.clone(), no.clone()],
                 receipts,
             );
             rebound(make_live_block(
@@ -282,20 +317,38 @@ mod tests {
                 vec![Arc::new(Verifiable::from(half))],
             ))
         };
-        assert_eq!(carrying(Vec::new()).check_body_bound(), Ok(()));
-
-        let smuggled = StoredReceipt::new(
-            yes.tx_hash(),
-            Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: effects,
-                writes: StateWrites::default(),
-                beacon_witness_events: Capped::empty(),
-                events: Capped::empty(),
-            }),
-        );
+        let block = carrying(vec![yes_receipt, refusal_receipt.clone()]);
+        assert_eq!(block.check_body_bound(), Ok(()));
         assert_eq!(
-            carrying(vec![smuggled]).check_body_bound(),
+            carrying(vec![refusal_receipt.clone()]).check_body_bound(),
             Err(UnboundBody::ReceiptsVsCertificates),
+            "a yes without its receipt",
+        );
+
+        let half = block.certificates()[0].as_unverified();
+        let stored = half.stored_receipts();
+        assert_eq!(stored, vec![refusal_receipt]);
+        let rebuilt = Finalization::reconstruct(half.attestation(), |tx_hash, hash| {
+            stored
+                .iter()
+                .find(|receipt| {
+                    receipt.tx_hash == *tx_hash && receipt.consensus.receipt_hash() == *hash
+                })
+                .map(|receipt| Arc::clone(&receipt.consensus))
+        })
+        .expect("the store holds what the half settles");
+        assert_eq!(&rebuilt, half);
+        let resealed = rebound(make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(2),
+            0,
+            ValidatorId::new(0),
+            Vec::new(),
+            vec![Arc::new(Verifiable::from(rebuilt))],
+        ));
+        assert_eq!(
+            SectionRoots::of(&resealed).root(),
+            block.header().body_root(),
         );
     }
 }

@@ -424,6 +424,7 @@ mod tests {
 
     fn line(seed: u8, joins: Joins) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: tx(seed),
             joins,
             settlement: Settlement::Alone,

@@ -829,7 +829,7 @@ pub fn declines_naming(store: &impl CommittedChain, tx: TxHash) -> Vec<(BlockHei
     while height <= tip {
         if let Some(certified) = store.block(height) {
             for finalization in certified.block().certificates().iter() {
-                for receipt in finalization.as_unverified().receipts() {
+                for receipt in finalization.as_unverified().settling_receipts() {
                     let Some(writes) = receipt.consensus.writes() else {
                         continue;
                     };

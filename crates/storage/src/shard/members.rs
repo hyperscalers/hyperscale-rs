@@ -1,7 +1,7 @@
 //! Tick membership as committed state: which transactions this chain has
 //! committed and not resolved, and which tick holds each.
 //!
-//! Five ordered collections under the shard's own owner at the tick
+//! Six ordered collections under the shard's own owner at the tick
 //! member slot, told apart by their material, which also names the
 //! shard, as [`MemberCollection`] derives them. Member rows are keyed by
 //! the first 128 bits of the transaction hash and tick rows by height.
@@ -13,7 +13,11 @@
 //! while a row says yes or accepted: from this shard's own certificate
 //! succeeding for a member its counterparts share the verdict on, until
 //! the row is refused or, having accepted, is ended. Each is one cell a
-//! sibling can hash from what it holds of the transaction. Reserved
+//! sibling can hash from what it holds of the transaction. Staged
+//! receipts are keyed as member rows are too, and stand exactly while a
+//! row stands stated, holding the yes receipt its tick's stating half
+//! carried: what any replica holding the chain builds the member's legs
+//! half from, whether or not it ran the tick. Reserved
 //! totals are keyed by the
 //! first 128 bits of a vault's hashed key, each the sum of what the rows
 //! standing reserve of that vault: what admission weighs a new fee hold
@@ -44,14 +48,14 @@ use std::sync::Arc;
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Anchor, Block, BlockHeight, CollectionId, Crossings,
-    Deadline, DiscardCause, EntryKey, EntryLeaf, EpochWindows, ExecutionOutcome, Finalization,
-    GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins, MAX_PREFIXES_PER_TX,
-    MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection, MemberTerms, Movement, Owes,
-    Reach, ReadMark, Reserves, Said, SettledEntries, Settlement, ShardId, StateClaim, StateWrites,
-    StatedTerms, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
-    TxOutcome, VerdictQuestion, Verifiable, Verified, WeightedTimestamp, entry_leaf_key,
-    member_order, said_at, verdict_leaf,
+    AbandonmentRecord, AbortCharge, Address, Anchor, Block, BlockHeight, CollectionId,
+    ConsensusReceipt, Crossings, Deadline, DiscardCause, EntryKey, EntryLeaf, EpochWindows,
+    Finalization, GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins,
+    MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection,
+    MemberTerms, Movement, Owes, Reach, ReadMark, Reserves, Said, SettledEntries, Settlement,
+    ShardId, StateClaim, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId,
+    TickLine, TickManifest, Transaction, TxHash, TxOutcome, VerdictQuestion, Verifiable, Verified,
+    WeightedTimestamp, entry_leaf_key, member_order, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{ProtocolHasher, fee_hold_key, protocol_resource};
 
@@ -563,6 +567,9 @@ pub struct Waiting {
     /// Whether it is the payer's leg, which waits for every shard it
     /// reaches to engage.
     pub waits: bool,
+    /// What its yes receipt can cost staged, which a line running it
+    /// carries.
+    pub staged: u64,
 }
 
 /// One committed, unresolved member.
@@ -651,6 +658,7 @@ impl MemberRow {
                 declared: terms.declared.clone(),
                 engages: terms.engages.clone(),
                 waits: terms.waits,
+                staged: terms.staged,
             }),
             covered: false,
             executed: false,
@@ -662,6 +670,11 @@ impl MemberRow {
     #[must_use]
     pub fn until(&self) -> WeightedTimestamp {
         self.deadline.at().plus(MAX_VALIDITY_RANGE)
+    }
+
+    /// Whether the row stands stated, with a receipt staged beside it.
+    const fn stated(&self) -> bool {
+        matches!(self.state, RowState::Stated { .. })
     }
 
     /// The verdict leaf standing beside this row in `shard`'s family: a
@@ -737,10 +750,11 @@ pub struct SettledHalf {
     /// The members a legs half settles by their effects: stated rows it
     /// moves to accepted and does not delete. Empty for any other half.
     pub accepted: Vec<TxHash>,
-    /// The members a stating half states a yes for, each beside the
-    /// receipt hash its certificate attests: rows it moves and does not
-    /// delete. Empty for any other half.
-    pub stated: Vec<(TxHash, GlobalReceiptHash)>,
+    /// The members a stating half states a yes for, each by the effects
+    /// receipt it carries under the hash its certificate attests: rows it
+    /// moves and does not delete, staging the receipt beside each. Empty
+    /// for any other half.
+    pub stated: Vec<StoredReceipt>,
 }
 
 impl SettledHalf {
@@ -755,21 +769,12 @@ impl SettledHalf {
         let (accepted, deleted): (Vec<TxHash>, Vec<TxHash>) = fw
             .tx_hashes()
             .partition(|tx_hash| accepts.contains(tx_hash));
-        let stated = fw
-            .stated_outcomes()
-            .filter_map(|outcome| match outcome.outcome() {
-                ExecutionOutcome::Succeeded { receipt_hash } => {
-                    Some((outcome.tx_hash(), *receipt_hash))
-                }
-                ExecutionOutcome::Failed | ExecutionOutcome::Aborted => None,
-            })
-            .collect();
         Self {
             tick: *fw.tick_id(),
             half: fw.half(),
             deleted,
             accepted,
-            stated,
+            stated: fw.stated_receipts(),
         }
     }
 }
@@ -956,6 +961,28 @@ fn member_entry(shard: ShardId, tx: TxHash) -> EntryKey {
     MemberCollection::Members.entry(shard, tx)
 }
 
+/// The yes receipt `tx`'s row in `shard`'s family stages.
+///
+/// Present while the row stands stated, under the receipt hash the row
+/// states. `None` where no row of `tx`'s stands stated, or what is
+/// staged under its key is not that receipt.
+#[must_use]
+pub fn staged_yes(
+    state: &(impl Substates + ?Sized),
+    shard: ShardId,
+    tx: TxHash,
+) -> Option<ConsensusReceipt> {
+    let row: MemberRow = read_at(state, member_entry(shard, tx))?;
+    let RowState::Stated { receipt, .. } = row.state else {
+        return None;
+    };
+    if row.tx != tx {
+        return None;
+    }
+    read_at(state, MemberCollection::Staged.entry(shard, tx))
+        .filter(|staged: &ConsensusReceipt| staged.receipt_hash() == receipt)
+}
+
 /// The tree leaf of `tx`'s seat in `shard`'s family: present exactly
 /// while a tick of `shard`'s holds `tx`, in flight or stated, and a
 /// counterpart settles it against `shard`'s certificate.
@@ -1039,6 +1066,8 @@ struct Working<'s, S: ?Sized> {
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
     changed_ticks: BTreeSet<BlockHeight>,
+    /// The yes receipt each row the fold moves to `Stated` stages.
+    staged: BTreeMap<u128, Arc<ConsensusReceipt>>,
 }
 
 impl<'s, S: Substates + ?Sized> Working<'s, S> {
@@ -1051,6 +1080,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             ticks: BTreeMap::new(),
             changed_members: BTreeSet::new(),
             changed_ticks: BTreeSet::new(),
+            staged: BTreeMap::new(),
         }
     }
 
@@ -1203,10 +1233,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// stands awaiting it. A tick owing neither half goes.
     ///
     /// A stating half moves each member it states a yes for to `Stated`,
-    /// under the receipt hash its certificate attests, where the row
-    /// stands in flight in that tick on terms a counterpart shares, and
-    /// nowhere else: a row already stated, released or named again is
-    /// left as it stands. The row's share goes to zero, since the
+    /// under the receipt hash its certificate attests, staging the yes
+    /// receipt the half carries for it, where the row stands in flight in
+    /// that tick on terms a counterpart shares, and nowhere else: a row
+    /// already stated, released or named again is left as it stands. The row's share goes to zero, since the
     /// stating half is where it was counted, and an abort line later
     /// named for it attests nothing more. It stays awaited in its tick.
     ///
@@ -1232,7 +1262,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 self.set_member(tx, None);
             }
         }
-        for &(tx, receipt) in &settled.stated {
+        for yes in &settled.stated {
+            let tx = yes.tx_hash;
             let Some(mut row) = self.member(tx) else {
                 continue;
             };
@@ -1249,9 +1280,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             }
             row.state = RowState::Stated {
                 tick: height,
-                receipt,
+                receipt: yes.consensus.receipt_hash(),
             };
             row.share = 0;
+            self.staged
+                .insert(member_order(tx), Arc::clone(&yes.consensus));
             self.set_member(tx, Some(row));
         }
         if settled.half == TickHalf::Determined
@@ -1422,6 +1455,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     charge,
                     share,
                     reserves,
+                    staged: _,
                     deadline: _,
                     crossings: line_crossings,
                 } => {
@@ -1522,7 +1556,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     ///
     /// A row's verdict leaf is written wherever the leaf the row written
     /// gives differs from the one the row held gives, so the leaf goes
-    /// with its row whatever moves or deletes it.
+    /// with its row whatever moves or deletes it. Its staged receipt is
+    /// written where the row enters `Stated` and deleted where it leaves,
+    /// by whatever line or finalization moves or deletes it.
     ///
     /// [`MAX_UNSETTLED_TXS`]: hyperscale_types::MAX_UNSETTLED_TXS
     /// [`MAX_HOLDS_PER_MEMBER`]: hyperscale_types::MAX_HOLDS_PER_MEMBER
@@ -1531,6 +1567,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         let (owner, members) = MemberCollection::Members.of(self.shard);
         let (_, seats) = MemberCollection::Seats.of(self.shard);
         let (_, verdicts) = MemberCollection::Verdicts.of(self.shard);
+        let (_, staged) = MemberCollection::Staged.of(self.shard);
         let mut moved: BTreeMap<u128, (u128, u128)> = BTreeMap::new();
         for order in self.changed_members {
             let key = EntryKey {
@@ -1568,6 +1605,24 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         order,
                     },
                     says.map(|leaf| to_vec(&leaf).expect("a verdict leaf encodes")),
+                );
+            }
+            let was_stated = held.as_ref().is_some_and(MemberRow::stated);
+            if was_stated != row.is_some_and(MemberRow::stated) {
+                let receipt = (!was_stated).then(|| {
+                    let receipt = self
+                        .staged
+                        .get(&order)
+                        .expect("a row enters Stated only beside the yes receipt it stages");
+                    to_vec(&**receipt).expect("a receipt encodes")
+                });
+                writes.insert(
+                    EntryKey {
+                        owner,
+                        collection: staged,
+                        order,
+                    },
+                    receipt,
                 );
             }
             let was = held.is_some_and(|row| row.state.seated());
@@ -2184,7 +2239,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::test_helpers::with_state_claims;
+    use crate::test_helpers::{with_state_claims, yes_receipt};
 
     /// A store of entries alone, for the fold to read and write.
     #[derive(Default)]
@@ -2291,6 +2346,7 @@ mod tests {
     fn joining(seed: u8, joins: Joins) -> TickLine {
         let terms = stub_stated_terms(tx(seed), seed).terms;
         TickLine::Member {
+            staged: 0,
             tx: tx(seed),
             joins,
             settlement: terms.settlement,
@@ -2319,6 +2375,7 @@ mod tests {
 
     fn member(seed: u8, settlement: Settlement) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: tx(seed),
             joins: Joins::Executes,
             settlement,
@@ -2362,7 +2419,10 @@ mod tests {
                 tick: TickId::new(LOCAL, BlockHeight::new(tick)),
                 half: TickHalf::Stated,
                 deleted: refused.iter().map(|&seed| tx(seed)).collect(),
-                stated: yes.iter().map(|&seed| (tx(seed), effects(seed))).collect(),
+                stated: yes
+                    .iter()
+                    .map(|&seed| yes_receipt(tx(seed), effects(seed)))
+                    .collect(),
                 accepted: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
@@ -2375,6 +2435,7 @@ mod tests {
     /// `share`.
     fn sharing(seed: u8, share: u128) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: tx(seed),
             joins: Joins::Executes,
             settlement: Settlement::Shared,
@@ -2618,6 +2679,7 @@ mod tests {
         store.fold(&naming(
             2,
             vec![TickLine::Member {
+                staged: 0,
                 tx,
                 joins,
                 settlement,
@@ -2873,6 +2935,7 @@ mod tests {
 
         let mut values = vec![read(&store)];
         let abort = TickLine::Member {
+            staged: 0,
             tx: tx(1),
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
@@ -3001,6 +3064,7 @@ mod tests {
             ..naming(
                 5,
                 vec![TickLine::Member {
+                    staged: 0,
                     tx: twin,
                     joins,
                     settlement,
@@ -3101,6 +3165,7 @@ mod tests {
         assert_eq!(
             pending.waiting,
             Some(Waiting {
+                staged: 0,
                 leg: stated.leg,
                 settlement: stated.settlement,
                 declared: stated.declared,
@@ -4132,6 +4197,7 @@ mod tests {
         };
         let block = MemberInputs {
             manifest: Arc::new(Capped::from_array([TickLine::Member {
+                staged: 0,
                 tx: named,
                 joins,
                 settlement: Settlement::Shared,
@@ -4272,6 +4338,7 @@ mod tests {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(90_000));
         let lines: Vec<TickLine> = (0..MAX_TICK_LINES_PER_BLOCK)
             .map(|at| TickLine::Member {
+                staged: 0,
                 tx: hash(at),
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -4327,6 +4394,7 @@ mod tests {
     fn restating(store: &Entries, seed: u8, settlement: Settlement) -> TickLine {
         let row = row_of(store, seed).expect("a standing row");
         TickLine::Member {
+            staged: 0,
             tx: row.tx,
             joins: Joins::Executes,
             settlement,
@@ -5046,6 +5114,7 @@ mod tests {
         store.fold(&naming(
             2,
             vec![TickLine::Member {
+                staged: 0,
                 tx: tx(1),
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
@@ -5944,6 +6013,33 @@ mod tests {
         Accept(u8, Vec<u8>, Vec<u8>),
     }
 
+    /// The receipt hash of each yes `store` stages, by member order.
+    fn staged_in(store: &Entries) -> BTreeMap<u128, GlobalReceiptHash> {
+        let (owner, collection) = MemberCollection::Staged.of(LOCAL);
+        store
+            .0
+            .iter()
+            .filter(|(key, _)| key.owner == owner && key.collection == collection)
+            .map(|(key, bytes)| {
+                let receipt: ConsensusReceipt =
+                    from_slice(bytes).expect("a staged receipt decodes");
+                (key.order, receipt.receipt_hash())
+            })
+            .collect()
+    }
+
+    /// The receipt hash each stated row of `rows` states, by member
+    /// order.
+    fn stated_in(rows: &MemberIndex) -> BTreeMap<u128, GlobalReceiptHash> {
+        rows.members
+            .values()
+            .filter_map(|row| match row.state {
+                RowState::Stated { receipt, .. } => Some((member_order(row.tx), receipt)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn step() -> impl Strategy<Value = Step> {
         let seed = || 1u8..=8;
         let amount = || {
@@ -6047,6 +6143,7 @@ mod tests {
     /// it, on the terms the entry states.
     fn running(entry: &StatedTerms) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: entry.tx,
             joins: Joins::Executes,
             settlement: entry.terms.settlement,
@@ -6068,6 +6165,7 @@ mod tests {
         let settlement =
             [Settlement::Alone, Settlement::Shared, Settlement::Awaited][usize::from(shape % 3)];
         TickLine::Member {
+            staged: 0,
             tx: tx(seed),
             joins: [Joins::Executes, Joins::Aborted][usize::from(shape / 3)],
             settlement,
@@ -6203,7 +6301,7 @@ mod tests {
         let mut block = block_of(step, height, rows);
         block.heard = heard_of(hears);
         if *states {
-            let mut yes: BTreeMap<BlockHeight, Vec<(TxHash, GlobalReceiptHash)>> = BTreeMap::new();
+            let mut yes: BTreeMap<BlockHeight, Vec<StoredReceipt>> = BTreeMap::new();
             for row in rows.members.values() {
                 if let RowState::InFlight {
                     tick,
@@ -6213,7 +6311,7 @@ mod tests {
                 {
                     yes.entry(tick)
                         .or_default()
-                        .push((row.tx, GlobalReceiptHash::ZERO));
+                        .push(yes_receipt(row.tx, GlobalReceiptHash::ZERO));
                 }
             }
             block
@@ -6332,6 +6430,25 @@ mod tests {
             }
         }
 
+        /// Through any sequence of blocks, a staged entry stands exactly
+        /// beside each stated row, holding the yes receipt its stating
+        /// half carried under the hash the row states, and beside no
+        /// other: whatever moves a stated row out, an accept, an abort,
+        /// a fate or a recovery's release, deletes it.
+        #[test]
+        fn a_staged_entry_stands_exactly_while_its_row_is_stated(
+            steps in vec((step(), listens()), 1..24),
+        ) {
+            let mut store = Entries::default();
+            let mut rows = MemberIndex::empty(LOCAL);
+            for (at, (step, listens)) in steps.iter().enumerate() {
+                let block = carried(&listening_block(step, listens, at as u64 + 1, &rows));
+                store.fold(&block);
+                rows.advance(&block);
+                prop_assert_eq!(staged_in(&store), stated_in(&rows), "after {:?}", step);
+            }
+        }
+
         /// Through any sequence of blocks, a verdict leaf stands exactly
         /// beside each stated or accepted row, holding what the row
         /// gives, and beside no other.
@@ -6390,6 +6507,7 @@ mod tests {
                 once.fold(&carrying);
                 rows.advance(&carrying);
                 prop_assert_eq!(&twice.0, &once.0, "after {:?}", step);
+                prop_assert_eq!(staged_in(&twice), stated_in(&rows), "after {:?}", step);
                 prop_assert_eq!(
                     &MemberIndex::load(&twice, LOCAL).ticks,
                     &rows.ticks,

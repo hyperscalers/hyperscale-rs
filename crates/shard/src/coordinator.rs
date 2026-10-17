@@ -22,7 +22,7 @@ use hyperscale_types::{
     EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateClaim, SubstateKey, Terminating, TxsInFlight, VerificationKind,
+    StoredReceipt, SubstateClaim, SubstateKey, Terminating, TickId, TxsInFlight, VerificationKind,
     WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
@@ -2777,18 +2777,30 @@ impl ShardCoordinator {
     }
 
     /// The stated rows at the committed tip that accept on what their
-    /// siblings' state says at the tip's anchor: the members a legs half
-    /// may name. A proposer judges each name again at its own block's
-    /// anchor, over the readings its block carries.
+    /// siblings' state says at the tip's anchor, by the tick holding
+    /// each: the members each tick's legs half may name. A proposer
+    /// judges each name again at its own block's anchor, over the
+    /// readings its block carries.
     #[must_use]
-    pub fn accepting(&self, schedule: &TopologySchedule) -> BTreeSet<TxHash> {
+    pub fn accepting(&self, schedule: &TopologySchedule) -> BTreeMap<TickId, BTreeSet<TxHash>> {
         let views = sibling_views(
             hearing_rows(&self.member_rows),
             schedule,
             &self.mirror,
             self.committed_block_anchor_wt,
         );
-        accepting(&self.member_rows, &views)
+        let mut by_tick: BTreeMap<TickId, BTreeSet<TxHash>> = BTreeMap::new();
+        for tx in accepting(&self.member_rows, &views) {
+            if let Some(RowState::Stated { tick, .. }) =
+                self.member_rows.members.get(&tx).map(|row| row.state)
+            {
+                by_tick
+                    .entry(TickId::new(self.local_shard, tick))
+                    .or_default()
+                    .insert(tx);
+            }
+        }
+        by_tick
     }
 
     /// Try to build and broadcast a new block proposal.
@@ -6484,7 +6496,7 @@ impl ShardCoordinator {
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts().iter().cloned())
+            .flat_map(|fw| fw.settling_receipts())
             .collect();
         // The committed block's missed-proposal leaves resolve against the
         // committee that produced it — the certified binding of its anchor
@@ -9642,6 +9654,7 @@ mod tests {
     fn member(tx: &Transaction) -> TickLine {
         let terms = terms_of(tx, &fixture_committee(ShardId::ROOT), ShardId::ROOT);
         TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,
@@ -9763,6 +9776,7 @@ mod tests {
             )
         };
         let joining = |tx: &Transaction, joins| TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins,
             settlement: Settlement::Alone,
@@ -10233,6 +10247,7 @@ mod tests {
                 unreachable!("a member line")
             };
             TickLine::Member {
+                staged: 0,
                 tx: tx.hash(),
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
@@ -10281,10 +10296,15 @@ mod tests {
                     ShardId::ROOT,
                     BlockHeight::new(2),
                     txs.iter().map(yes).collect(),
-                    Vec::new(),
+                    txs.iter().map(effects_of).collect(),
                 )],
             ),
             None,
+        );
+        assert_eq!(
+            stating.check_body_bound(),
+            Ok(()),
+            "the proposer binds the yes receipts the stating half carries",
         );
         chain.push(stating);
         let (state, schedule) = committed_through(from, chain.clone());
@@ -12227,6 +12247,7 @@ mod tests {
             block_chained_on(BlockHeight::new(2), committing.hash(), 1_500),
             &[],
             vec![TickLine::Member {
+                staged: 0,
                 tx: held.hash(),
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
@@ -12771,6 +12792,7 @@ mod tests {
         assert_eq!(sealed.committed_height(), BlockHeight::new(1));
 
         let named = TickLine::Member {
+            staged: terms.staged,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: terms.settlement,
@@ -12830,6 +12852,67 @@ mod tests {
         );
     }
 
+    /// A line running a member a sibling's verdict can discard carries
+    /// the staged bound its terms price, and a voter holds it to that
+    /// figure as every other field of the line: a line stating less, or
+    /// more, is refused.
+    #[test]
+    fn a_block_whose_member_understates_its_staged_bound_is_refused() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let tx = remotely_paid(&committee, local);
+        let terms = terms_of(&tx, &committee, local);
+        assert_ne!(
+            terms.settlement,
+            Settlement::Alone,
+            "a sibling shares its verdict"
+        );
+        assert!(terms.staged > 0, "so its yes is staged");
+
+        let from = BlockHash::from_raw(Hash::from_bytes(b"staged bound tip"));
+        let engaging = with_bundle(
+            block_on_chained_on(local, BlockHeight::new(1), from, 1_000),
+            &[tx.hash()],
+        );
+        let parent = engaging.hash();
+        let voter = committed_on(left_of_two(), &schedule, from, [engaging]);
+        let naming = |staged: u64| {
+            carrying(
+                block_on_chained_on(local, BlockHeight::new(2), parent, 2_000),
+                std::slice::from_ref(&tx),
+                vec![TickLine::Member {
+                    staged,
+                    tx: tx.hash(),
+                    joins: Joins::Executes,
+                    settlement: terms.settlement,
+                    holds: terms.declared.clone(),
+                    reach: terms.reach.clone(),
+                    awaits: terms.awaits.clone(),
+                    charge: terms.charge,
+                    share: terms.share,
+                    reserves: terms.reserves.clone(),
+                    deadline: Deadline::of_transaction(&tx),
+                    crossings: Capped::empty(),
+                }],
+            )
+        };
+        assert!(
+            voter
+                .check_tick_manifest(&schedule, &committee, &naming(terms.staged))
+                .is_ok()
+        );
+        for staged in [0, terms.staged - 1, terms.staged + 1] {
+            assert!(
+                voter
+                    .check_tick_manifest(&schedule, &committee, &naming(staged))
+                    .is_err(),
+                "a line staging {staged} where its terms price {}",
+                terms.staged,
+            );
+        }
+    }
+
     /// A member committed and never ready is aborted by the first block
     /// past its deadline, and a block leaving the abort out is refused:
     /// no row outlives its deadline by more than a block. The abort's
@@ -12865,6 +12948,7 @@ mod tests {
             )
         };
         let aborted = TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
@@ -12975,6 +13059,7 @@ mod tests {
 
         let past = Deadline::of_transaction(&tx).at().as_millis() + 1;
         let aborted = TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
@@ -13260,6 +13345,7 @@ mod tests {
             height: BlockHeight::new(1),
             transactions: vec![(holder.hash(), Deadline::of_transaction(&holder))],
             manifest: Arc::new(Capped::from_array([TickLine::Member {
+                staged: 0,
                 tx: holder.hash(),
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -13609,6 +13695,7 @@ mod tests {
         let run_all: Vec<TickLine> = transactions
             .iter()
             .map(|tx| TickLine::Member {
+                staged: 0,
                 tx: tx.hash(),
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,

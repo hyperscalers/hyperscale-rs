@@ -30,10 +30,11 @@ use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
-    PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
-    install_protocol_statics, whole_work, witness_root, writes_root,
+    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
+    MAX_STAGED_RECEIPT_BYTES, MAX_TICK_STAGED_BYTES, Movement, PriceTable, PrincipalAddr,
+    ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry, Transaction,
+    TxHash, Verified, WeightedTimestamp, compute_merkle_root, install_protocol_statics,
+    staged_yes_bytes, whole_work, witness_root, writes_root,
 };
 use hyperscale_vm_effects::{
     Admitted, Answered, ChainRecords, CrossingId, Declaration, DeclaredAccess, IntentRecord,
@@ -1391,6 +1392,48 @@ fn assemble_executed_tx(
     executed
 }
 
+/// Refuse each yes of the batch past the staged caps.
+///
+/// Walks the batch's receipts in its fold order. A member `abortable`
+/// holds, one a sibling's verdict can discard, whose receipt succeeded
+/// is a yes its row will
+/// stage: one past [`MAX_STAGED_RECEIPT_BYTES`], or one that would take
+/// the batch's yes bytes past [`MAX_TICK_STAGED_BYTES`], fails instead,
+/// keeping the refusal receipt built beside it, so it settles exactly as
+/// a refused member does. Its batch-mates read its debits and never its
+/// credits, which is the view a sibling's refusal of it leaves too.
+///
+/// Under a sound [`staged_yes_bound`](hyperscale_types::staged_yes_bound) and a manifest within its staged
+/// budget, nothing is refused here.
+fn cap_staged_yes(folded: &mut BTreeMap<TxHash, ExecutedTx>, abortable: impl Fn(&TxHash) -> bool) {
+    let mut staged = 0u64;
+    for (vm_tx, executed) in folded.iter_mut() {
+        if !abortable(vm_tx) || !executed.is_success() {
+            continue;
+        }
+        let bytes = staged_yes_bytes(&executed.consensus);
+        let total = staged.saturating_add(bytes);
+        if bytes > MAX_STAGED_RECEIPT_BYTES || total > MAX_TICK_STAGED_BYTES {
+            tracing::error!(
+                tx = ?vm_tx,
+                bytes,
+                staged,
+                "a yes receipt passes the staged caps; refusing it"
+            );
+            executed.consensus = ConsensusReceipt::Failed;
+            executed.metadata = ExecutionMetadata::new(
+                executed.metadata.fee_summary.clone(),
+                Vec::new(),
+                Some(format!(
+                    "its yes receipt stages {bytes} bytes, past the staged caps"
+                )),
+            );
+            continue;
+        }
+        staged = total;
+    }
+}
+
 /// One member of a tick's batch: what its receipt is keyed by, and the
 /// body it runs over.
 struct BatchMember {
@@ -1818,6 +1861,12 @@ impl Executor {
             );
         }
 
+        cap_staged_yes(&mut folded, |vm_tx| {
+            shapes
+                .get(vm_tx)
+                .is_some_and(|input| input.member.abortable())
+        });
+
         // Reassemble in input order.
         Ok(members
             .iter()
@@ -1935,11 +1984,165 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_types::{AddressClass, LocalKey, Presence};
+    use hyperscale_types::{AddressClass, ExecutionOutcome, GlobalReceiptHash, LocalKey, Presence};
     use hyperscale_vm_types::{AbortReason, encode_amount};
 
     use super::*;
     use crate::genesis::vault_key;
+
+    /// A success writing one cell `width` bytes wide, beside the refusal
+    /// receipt its member settles if refused: its charge out of the
+    /// payer's vault and its `Never` for a crossing it consumed.
+    fn yes_of(seed: u8, width: usize) -> ExecutedTx {
+        let mut writes = StateWrites::default();
+        writes.cells.insert(
+            SubstateKey {
+                owner: Address::new([seed; 31], AddressClass::Component),
+                local: LocalKey([seed; 16]),
+            },
+            Some(vec![seed; width]),
+        );
+        let mut refusal = StateWrites::default();
+        refusal.movements.insert(
+            vault_key(
+                Address::new([0xAA; 31], AddressClass::Principal),
+                *PROTOCOL_RESOURCE,
+            ),
+            Movement::unjudged(*PROTOCOL_RESOURCE, 7),
+        );
+        refusal.cells.insert(
+            SubstateKey {
+                owner: Address::new([0xBB; 31], AddressClass::Component),
+                local: LocalKey([seed; 16]),
+            },
+            Some(b"never".to_vec()),
+        );
+        let mut executed = ExecutedTx::new(
+            TxHash::from(Hash::from_bytes(&[seed; 32])),
+            ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed, 1])),
+                writes,
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            },
+            vm_metadata(7, None),
+        );
+        executed.refusal_receipt = Some(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed, 2])),
+            writes: refusal,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        });
+        executed
+    }
+
+    fn batch(members: impl IntoIterator<Item = ExecutedTx>) -> BTreeMap<TxHash, ExecutedTx> {
+        members
+            .into_iter()
+            .map(|executed| (executed.tx_hash, executed))
+            .collect()
+    }
+
+    /// A core member whose yes receipt passes the receipt cap fails
+    /// instead of stating: it carries no effects, and the refusal
+    /// receipt built beside it stands. A member no sibling's verdict can
+    /// discard stages nothing, so the same receipt stands for it.
+    #[test]
+    fn an_oversized_core_receipt_is_refused_not_stated() {
+        let width = usize::try_from(MAX_STAGED_RECEIPT_BYTES).expect("a width");
+        let (core, alone) = (yes_of(1, width), yes_of(2, width));
+        let core_hash = core.tx_hash;
+        let mut folded = batch([core, alone.clone()]);
+        cap_staged_yes(&mut folded, |tx| *tx == core_hash);
+
+        let refused = &folded[&core_hash];
+        assert!(!refused.is_success(), "the oversized yes is refused");
+        assert!(matches!(
+            refused.outcome().outcome(),
+            ExecutionOutcome::Failed
+        ));
+        assert!(refused.refusal_receipt.is_some());
+        assert_eq!(
+            folded[&alone.tx_hash].consensus, alone.consensus,
+            "a determined member is left as it ran"
+        );
+    }
+
+    /// Yes receipts within the receipt cap state until the batch's yes
+    /// bytes would pass the tick cap: the yes that would take it past is
+    /// refused, and a later one that still fits states.
+    #[test]
+    fn a_tick_past_its_staged_bytes_refuses_its_later_yes() {
+        let width = usize::try_from(MAX_STAGED_RECEIPT_BYTES / 2).expect("a width");
+        let count =
+            u8::try_from(MAX_TICK_STAGED_BYTES / (MAX_STAGED_RECEIPT_BYTES / 2)).expect("few");
+        let mut members: Vec<ExecutedTx> = (1..=count).map(|seed| yes_of(seed, width)).collect();
+        members.push(yes_of(count + 1, 0));
+        let mut folded = batch(members);
+        cap_staged_yes(&mut folded, |_| true);
+
+        let staged: u64 = folded
+            .values()
+            .filter(|executed| executed.is_success())
+            .map(|executed| staged_yes_bytes(&executed.consensus))
+            .sum();
+        assert!(staged <= MAX_TICK_STAGED_BYTES);
+        let refused: Vec<&ExecutedTx> = folded
+            .values()
+            .filter(|executed| !executed.is_success())
+            .collect();
+        assert!(!refused.is_empty(), "the batch passes the tick cap");
+        assert!(
+            folded[&yes_of(count + 1, 0).tx_hash].is_success(),
+            "a small yes the cap still leaves room for states",
+        );
+        let first_refused = refused[0].tx_hash;
+        assert!(
+            folded
+                .range(..first_refused)
+                .all(|(_, executed)| executed.is_success()),
+            "every yes before the first refused one states",
+        );
+    }
+
+    /// A core member refused at the cap settles as a refused member
+    /// does: the refusal receipt it carries is the one built beside its
+    /// run, burning its charge out of its payer's vault and writing its
+    /// `Never`.
+    #[test]
+    fn an_over_cap_core_member_pays_its_charge_and_answers_never() {
+        let width = usize::try_from(MAX_STAGED_RECEIPT_BYTES).expect("a width");
+        let ran = yes_of(3, width);
+        let built = ran.refusal_receipt.clone();
+        let mut folded = batch([ran.clone()]);
+        cap_staged_yes(&mut folded, |_| true);
+
+        let refused = &folded[&ran.tx_hash];
+        assert_eq!(refused.consensus, ConsensusReceipt::Failed);
+        assert_eq!(
+            refused.refusal_receipt, built,
+            "the refusal receipt built beside it"
+        );
+        let refusal = refused
+            .refusal_receipt
+            .as_ref()
+            .and_then(ConsensusReceipt::writes)
+            .expect("a refusal receipt with writes");
+        assert!(
+            refusal
+                .movements
+                .values()
+                .any(|movement| movement == &Movement::unjudged(*PROTOCOL_RESOURCE, 7)),
+            "it burns the charge",
+        );
+        assert!(
+            refusal
+                .cells
+                .values()
+                .any(|value| value.as_deref() == Some(&b"never"[..])),
+            "and answers never",
+        );
+    }
 
     /// Every bound the preparation fixed reaches the entry the kernel
     /// runs. A bound left behind here is one the kernel never applies,

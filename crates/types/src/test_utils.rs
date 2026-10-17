@@ -520,6 +520,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
         named
             .into_iter()
             .map(|(tx, charge, share, deadline)| TickLine::Member {
+                staged: 0,
                 tx,
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -1323,6 +1324,7 @@ pub fn stub_stated_terms(tx: TxHash, seed: u8) -> StatedTerms {
     StatedTerms {
         tx,
         terms: MemberTerms {
+            staged: 0,
             leg: true,
             settlement: Settlement::Awaited,
             declared: Capped::from_array([(

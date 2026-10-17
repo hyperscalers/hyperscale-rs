@@ -17,7 +17,8 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
     make_finalization_leaving, make_finalization_settling, make_leg_finalization, proven_claim,
-    rebound, stating, stub_stated_terms, stub_sweepable_cell, test_key, test_transaction,
+    rebound, stating, stating_half_on, stub_stated_terms, stub_sweepable_cell, test_key,
+    test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
@@ -31,14 +32,15 @@ use hyperscale_types::{
     PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable, ProposerTimestamp,
     ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
     RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
-    Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
+    Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
     ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source,
     SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites,
     Stated, StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier,
     SyncHint, TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome,
     TxsInFlight, UnsettledTx, ValidatorId, Value, Verifiable, Verified, VotePosition,
     WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root, decide,
-    encode_amount, entry_leaf_key, read_amount, shard_prefix_path, value_of, verdict_leaf,
+    encode_amount, entry_leaf_key, read_amount, receipt_hash_of, shard_prefix_path, value_of,
+    verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -2520,6 +2522,7 @@ fn reserving_chain(first: u64) -> Reserving {
     let charge = stated.terms.charge;
     stated.terms.reserves = Capped::from_array([(vault, RESERVED_OF_VAULT)]);
     let named = TickLine::Member {
+        staged: 0,
         tx: tx.hash(),
         joins: Joins::Executes,
         settlement: Settlement::Shared,
@@ -6189,6 +6192,104 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     );
 }
 
+/// Shared chain-floor test: a stating block's yes receipts prune with it.
+///
+/// A stating half keeps its yes receipts in its stored attestation and
+/// nowhere else, so they go with its height, and the receipt a later
+/// legs half settles under the same transaction and hash is the legs
+/// block's own row, which the stating block's pruning leaves and its own
+/// takes.
+///
+/// # Panics
+///
+/// If the store keeps a yes receipt past its block, or loses the legs
+/// block's row with it.
+pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + TestStore>(
+    storage: &S,
+    collect: impl Fn(&S),
+) {
+    let tx = TxHash::from(Hash::from_bytes(b"a stated yes"));
+    let mut writes = StateWrites::default();
+    writes.cells.insert(state_key(0x51, 1), Some(vec![0x51]));
+    let unhashed = ConsensusReceipt::Succeeded {
+        receipt_hash: GlobalReceiptHash::ZERO,
+        writes: writes.clone(),
+        beacon_witness_events: Capped::empty(),
+        events: Capped::empty(),
+    };
+    let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
+    let receipt = StoredReceipt::new(
+        tx,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let stating = stating_half_on(
+        ShardId::ROOT,
+        BlockHeight::new(1),
+        vec![
+            TxOutcome::new(tx, ExecutionOutcome::Succeeded { receipt_hash })
+                .awaiting([ShardId::leaf(1, 1)])
+                .as_role(Role::Core),
+        ],
+        vec![receipt.clone()],
+    );
+    assert_eq!(stating.stated_receipts(), vec![receipt.clone()]);
+    let legs = Finalization::accepting(
+        TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+        Capped::from_array([receipt.clone()]),
+    );
+    let stated_at = stating.receipt_hash();
+    let chain = [
+        make_test_block(BlockHeight::new(1)),
+        push_certificate(
+            make_test_block(BlockHeight::new(2)),
+            Arc::new(stating.into()),
+        ),
+        push_certificate(make_test_block(BlockHeight::new(3)), Arc::new(legs.into())),
+        make_test_block(BlockHeight::new(4)),
+    ];
+    for block in chain {
+        commit_with_members(storage, &make_test_certified(block));
+    }
+    assert_eq!(
+        storage.get_consensus_receipts(&tx).len(),
+        1,
+        "the receipts store holds the legs block's row and nothing of the stating block's",
+    );
+    let stored = storage
+        .get_block(BlockHeight::new(2))
+        .expect("the stating block rebuilds");
+    assert_eq!(
+        stored.block().certificates()[0].stated_receipts(),
+        vec![receipt],
+        "with its yes receipt, from its attestation",
+    );
+
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(3));
+    collect(storage);
+    assert!(
+        storage.get_block(BlockHeight::new(2)).is_none()
+            && storage.get_certificates_batch(&[stated_at]).is_empty(),
+        "the yes receipt goes with the stating block's attestation",
+    );
+    assert_eq!(
+        storage.get_consensus_receipts(&tx).len(),
+        1,
+        "and the legs block's row stands",
+    );
+
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(4));
+    collect(storage);
+    assert!(
+        storage.get_consensus_receipts(&tx).is_empty(),
+        "which goes with its own block",
+    );
+}
+
 /// Shared chain-floor test: a standing member row keeps its rows beneath
 /// the floor on the store's own reading, with nothing told to it.
 ///
@@ -6328,6 +6429,7 @@ fn core_run_at_one(
         height: BlockHeight::new(1),
         transactions: vec![(tx, deadline)],
         manifest: Arc::new(Capped::from_array([TickLine::Member {
+            staged: 0,
             tx,
             joins: Joins::Executes,
             settlement: Settlement::Shared,
@@ -6347,6 +6449,21 @@ fn core_run_at_one(
     }
 }
 
+/// The yes receipt a stating half carries for `tx` under `hash`, writing
+/// nothing.
+#[must_use]
+pub fn yes_receipt(tx: TxHash, hash: GlobalReceiptHash) -> StoredReceipt {
+    StoredReceipt::new(
+        tx,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: hash,
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    )
+}
+
 /// A block of `shard` at `height` carrying `half` of its tick at height
 /// 1 for `tx`: a stating half stating its yes, any other deleting its
 /// row.
@@ -6359,7 +6476,7 @@ fn core_settled_of_one(shard: ShardId, height: u64, half: TickHalf, tx: TxHash) 
             half,
             deleted: if stated { Vec::new() } else { vec![tx] },
             stated: if stated {
-                vec![(tx, GlobalReceiptHash::ZERO)]
+                vec![yes_receipt(tx, GlobalReceiptHash::ZERO)]
             } else {
                 Vec::new()
             },
@@ -6585,6 +6702,7 @@ fn accepted_row_decides(row: &MemberRow, mark: ReadMark) -> (Vec<Option<Said>>, 
 /// awaiting nobody and answering no crossing.
 fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline) -> TickLine {
     TickLine::Member {
+        staged: 0,
         tx,
         joins: Joins::Aborted,
         settlement: Settlement::Awaited,

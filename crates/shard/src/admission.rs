@@ -23,18 +23,20 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_engine::tick_select::{awaited_core, crossings_consumed, member_of};
+use hyperscale_engine::tick_select::{
+    awaited_core, crossings_consumed, member_of, staged_past_cap,
+};
 use hyperscale_storage::{MemberIndex, MemberRow, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
     Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_OWED_TOWARD_SHARD,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, Settlement,
-    ShardId, StandingToward, StateClaim, SubstateKey, Terminating, TickHalf, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable, WeightedTimestamp, WindowView,
-    budget_admits_block, caps_admit_transaction, claims_admit_block, evidence_admits_block,
-    state_claims_admit_block, sweep_admits_block,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
+    Provisions, Settlement, ShardId, ShardTrie, StandingToward, StateClaim, SubstateKey,
+    Terminating, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
+    Verifiable, WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    claims_admit_block, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -316,6 +318,29 @@ pub(crate) fn standing_toward(rows: &MemberIndex) -> StandingToward {
     )
 }
 
+/// Whether what `tx` declares can be carried by the rows it would write.
+///
+/// The block that commits a transaction states what it declared, on its
+/// terms entry or on the line that runs it, and its row holds that: one
+/// declaring more than either carries is never carried. And a member a
+/// sibling's verdict can discard stages the yes it states beside its row:
+/// one whose staged bound passes the receipt cap could never state.
+fn carried(tx: &Transaction, trie: &ShardTrie) -> Result<(), String> {
+    let tx_hash = tx.hash();
+    if tx.routing().declared_modes.len() > MAX_HOLDS_PER_MEMBER {
+        return Err(format!(
+            "transaction {tx_hash} declares more accesses than a member's terms carry"
+        ));
+    }
+    if let Some(shard) = staged_past_cap(tx, trie) {
+        return Err(format!(
+            "transaction {tx_hash} could stage a yes on {shard:?} past \
+             {MAX_STAGED_RECEIPT_BYTES} bytes, so it could never state"
+        ));
+    }
+    Ok(())
+}
+
 impl<'p> Section for TransactionsSection<'p> {
     type Item = Transaction;
     type Fold = TransactionsFold<'p>;
@@ -345,6 +370,12 @@ impl<'p> Section for TransactionsSection<'p> {
     /// in the final epoch could still be stating at it. The transaction
     /// stays pooled until the cut, past which it is classified under the
     /// successors.
+    ///
+    /// **No yes past the staged cap.** A transaction with a member a
+    /// sibling's verdict can discard, on any shard it reaches, whose
+    /// staged bound there passes [`MAX_STAGED_RECEIPT_BYTES`] is refused:
+    /// its row could never stage the receipt its yes carries, so it
+    /// could never state. The refusal is free, since nothing ran.
     ///
     /// **The cap on rows standing toward one shard.** A core or whole
     /// member reaching beyond this shard stands, once it has stated,
@@ -390,15 +421,7 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} only delivers here, which its commit fold credits"
             ));
         }
-        // The block that commits a transaction states what it declared,
-        // on its terms entry or on the line that runs it, and its row
-        // holds that: one declaring more than either carries is never
-        // carried.
-        if tx.routing().declared_modes.len() > MAX_HOLDS_PER_MEMBER {
-            return Err(format!(
-                "transaction {tx_hash} declares more accesses than a member's terms carry"
-            ));
-        }
+        carried(tx, trie)?;
         let awaited = awaited_core(&member);
         if !awaited.is_empty()
             && let Some(shard) = member.reach().iter().copied().find(|&shard| {

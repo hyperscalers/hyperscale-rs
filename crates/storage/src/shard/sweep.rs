@@ -868,9 +868,9 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, BlockHeight, CollectionId, Deadline, ExecutionOutcome, GlobalReceiptHash,
-        Hash, Joins, Role, SWEEP_BUCKET_MS, SettledEntries, Settlement, StateClaim, StateRoot,
-        TickLine, TxOutcome, ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path,
-        verdict_leaf,
+        Hash, Joins, MemberCollection, Role, SWEEP_BUCKET_MS, SettledEntries, Settlement,
+        StateClaim, StateRoot, TickLine, TxOutcome, ValidatorId, Verifiable, entry_leaf_key,
+        shard_prefix_path, verdict_leaf,
     };
     use hyperscale_vm_effects::Answered;
     use proptest::prelude::*;
@@ -882,7 +882,7 @@ mod tests {
     use crate::shard::writes::{CreditBurns, settled_block_at, settled_writes_at};
     use crate::test_helpers::{
         CountedSweep, declining_block, replayed_sweep_reads_what_the_block_removed,
-        unclaimed_issuer, with_state_claims,
+        unclaimed_issuer, with_state_claims, yes_receipt,
     };
 
     fn owner(tag: u8) -> Address {
@@ -1141,17 +1141,24 @@ mod tests {
 
     impl SweepIndex for Rows {}
 
-    /// A followed block's stating half writes a verdict leaf only where
-    /// the follower holds the row it moves, and only under the prefix
-    /// the family sits in: the half of a split that does not hold the
-    /// rows reads them absent, folds no move and writes no leaf.
+    /// A followed block's stating half writes a verdict leaf and stages
+    /// its yes receipt only where the follower holds the row it moves,
+    /// and only under the prefix the family sits in: the half of a split
+    /// that does not hold the rows reads them absent, folds no move and
+    /// writes neither.
     #[test]
-    fn a_follower_of_the_half_without_the_rows_writes_no_leaf() {
+    fn a_follower_of_the_half_without_the_rows_writes_no_staged_entry() {
         install_stub_protocol_statics();
         let shard = ShardId::ROOT;
         let peer = ShardId::leaf(1, 1);
         let tx = TxHash::from(Hash::from_bytes(b"stated"));
         let leaf = verdict_leaf(shard, tx);
+        let staged = entry_leaf_key(&ProtocolHasher, MemberCollection::Staged.entry(shard, tx));
+        assert_eq!(
+            leaf.to_bytes()[0] >> 7,
+            staged.to_bytes()[0] >> 7,
+            "the family sits under one prefix",
+        );
         let (left, right) = shard.children();
         let (holding, other) = if leaf.to_bytes()[0] >> 7 == 0 {
             (left, right)
@@ -1165,6 +1172,7 @@ mod tests {
             height: BlockHeight::new(2),
             transactions: vec![(tx, deadline)],
             manifest: Arc::new(Capped::from_array([TickLine::Member {
+                staged: 0,
                 tx,
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
@@ -1190,7 +1198,12 @@ mod tests {
         .charging(1)
         .awaiting([peer])
         .as_role(Role::Core);
-        let half = stating_half_on(shard, BlockHeight::new(2), vec![yes], Vec::new());
+        let half = stating_half_on(
+            shard,
+            BlockHeight::new(2),
+            vec![yes],
+            vec![yes_receipt(tx, GlobalReceiptHash::ZERO)],
+        );
         let block = make_live_block(
             shard,
             BlockHeight::new(3),
@@ -1210,7 +1223,10 @@ mod tests {
             )
             .entries()
             .iter()
-            .filter(|(key, _)| entry_leaf_key(&ProtocolHasher, **key) == leaf)
+            .filter(|(key, _)| {
+                let at = entry_leaf_key(&ProtocolHasher, **key);
+                at == leaf || at == staged
+            })
             .map(|(_, change)| change.clone())
             .collect()
         };
@@ -1218,8 +1234,8 @@ mod tests {
 
         let written = leaves(&with_rows, holding);
         assert!(
-            matches!(&written[..], [Some(_)]),
-            "the half holding the row writes its leaf: {written:?}",
+            matches!(&written[..], [Some(_), Some(_)]),
+            "the half holding the row writes its leaf and stages its receipt: {written:?}",
         );
         assert!(leaves(&without, other).is_empty());
         assert!(leaves(&without, holding).is_empty());

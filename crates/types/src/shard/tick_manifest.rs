@@ -171,7 +171,10 @@ pub enum TickLine {
     /// floor an abort of the member burns, priced where the line is
     /// named: a fate ends the member off its row alone. `share` and
     /// `reserves` ride it for the member a line names in the block that
-    /// commits it, whose row the line alone writes. `deadline` and
+    /// commits it, whose row the line alone writes. So is `staged`, the
+    /// most its yes receipt can cost, which a block's lines are budgeted
+    /// in and a voter holding nothing of the transaction sums off the
+    /// lines alone. `deadline` and
     /// `crossings` ride it for an abort, which a replica holding nothing of
     /// the transaction seats and settles off the line alone; `crossings`
     /// ride a line running a member a sibling shares the verdict on too,
@@ -201,6 +204,9 @@ pub enum TickLine {
         /// What its declared reservations promise of this shard's fee
         /// vaults.
         reserves: Reserves,
+        /// What its yes receipt can cost staged: its terms' figure on a
+        /// line running it, and zero on an abort, which states no yes.
+        staged: u64,
         /// Its deadline, off its signed validity range.
         deadline: Deadline,
         /// On an abort, the crossings it answers `Never` for: every
@@ -307,6 +313,11 @@ pub struct MemberTerms {
     /// What its declared reservations promise of this shard's fee
     /// vaults.
     pub reserves: Reserves,
+    /// What its yes receipt can cost staged:
+    /// [`staged_yes_bound`](crate::staged_yes_bound) of what it declares
+    /// on this shard where a sibling's verdict can discard its effects,
+    /// and zero where none can, since it then states no yes.
+    pub staged: u64,
 }
 
 impl MemberTerms {
