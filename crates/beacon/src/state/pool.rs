@@ -126,14 +126,14 @@ pub(super) fn exit_placement(
             // A split that has frozen its carve names the members its
             // children seat, and a refill drawn after it would sit on a
             // parent about to end: the child that loses the member seats
-            // short, and `top_up_committees` backfills it as the split
-            // applies. Before the carve a refill is a parent member like
-            // any other. It seats `ready: false`, rides the carve to a
-            // child with that flag, and the split gate counts it toward
-            // no child's quorum until its `Ready` folds — so a jail on a
-            // splitting shard costs the shard a seat for no longer than
-            // any other shard, and the beacon a ready member for no
-            // longer than the refill takes to sync.
+            // short, and `top_up_committees` backfills it from the pool
+            // past the recovery reserve. Before the carve a refill is a
+            // parent member like any other. It seats `ready: false`, rides
+            // the carve to a child with that flag, and the split gate
+            // counts it toward no child's quorum until its `Ready` folds —
+            // so a jail on a splitting shard costs the shard a seat for no
+            // longer than any other shard, and the beacon a ready member
+            // for no longer than the refill takes to sync.
             let carved = matches!(
                 state.pending_reshapes.get(&shard),
                 Some(reshape @ PendingReshape::Split { .. })

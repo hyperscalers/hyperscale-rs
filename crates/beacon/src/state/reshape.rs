@@ -44,10 +44,10 @@ const DOMAIN_RESHAPE_KEEPER: &[u8] = b"hyperscale-reshape-keeper-v1";
 /// `target` from the free pool, assigning the first shuffled half to
 /// the left child and the rest to the right.
 ///
-/// The caller has already passed the pool gate (`pooled_validators() ≥
-/// shard_size`). Each drawn validator becomes `Observing { shard:
-/// target }` and joins the target's lookahead committee; the returned
-/// seats record the child assignments with `ready: false`.
+/// The caller has already passed the pool gate (`drawable_pool_len(1) ≥
+/// shard_size`). Each drawn validator becomes `Observing { shard: target }`
+/// and joins the target's lookahead committee; the returned seats record
+/// the child assignments with `ready: false`.
 ///
 /// `cohort_seed` is the split's frozen entropy — the same value the
 /// record carries for its whole life — so re-staffing a lapsed split
@@ -436,8 +436,9 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
         // the cohort half in id order. A half member jailed or withdrawn
         // since the carve was frozen is dropped here rather than moved —
         // the schedule cannot be retracted to re-gate around it, so the
-        // child seats short and `top_up_committees` backfills it this
-        // same fold.
+        // child seats short and `top_up_committees` backfills it from the
+        // pool past the recovery reserve, waiting while the reserve is at
+        // least the pool.
         let assigned: Vec<ValidatorId> = half
             .into_iter()
             .chain(
@@ -480,9 +481,11 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
                     placed_at_epoch: state.current_epoch,
                 },
                 // Jailed, withdrawn, or rotated away since the carve was
-                // frozen. The schedule cannot be retracted to re-gate
+                // frozen, or returned to the pool by a recovery of the
+                // target. The schedule cannot be retracted to re-gate
                 // around it, so the child seats short and
-                // `top_up_committees` backfills it this same fold.
+                // `top_up_committees` backfills it once the pool holds
+                // members past the recovery reserve.
                 _ => continue,
             };
             members.push(id);
@@ -640,7 +643,8 @@ fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
     // keeper jailed, withdrawn, or rotated off its child since the cut was
     // scheduled is dropped rather than moved — the schedule cannot be
     // retracted to re-gate around it, so the parent seats short and
-    // `top_up_committees` backfills it this same fold.
+    // `top_up_committees` backfills it once the pool holds members past
+    // the recovery reserve.
     let mut members: Vec<ValidatorId> = Vec::with_capacity(keepers.len());
     for (id, seat) in &keepers {
         let rec = state
@@ -726,16 +730,19 @@ fn shuffle(ids: &mut [ValidatorId], prng: &mut ChaCha20Rng) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::ops::Range;
     use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        Address, AddressClass, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence, Formed, Hash,
-        RecoveryBinding, SettledTxsRoot, ShardFullness, ShardWitnessPayload, SplitChildRoots,
-        Stake, StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
+        Address, AddressClass, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence, Formed,
+        HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding, RecoveryCause, SettledTxsRoot, ShardFullness,
+        ShardWitnessPayload, SplitChildRoots, Stake, StakePoolId, TERMINAL_EVIDENCE_EPOCHS,
+        TopologySchedule,
     };
 
     use super::*;
+    use crate::state::committee::{recover_committees, top_up_committees};
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, block_carrying, empty_state, fold_blocks, net,
         single_pool_state_at_genesis, validator_record,
@@ -3749,5 +3756,348 @@ mod tests {
         assert_eq!(state.boundaries[&parent].block_hash, first_hash);
         assert_eq!(state.boundaries[&parent].height, BlockHeight::new(38));
         assert!(state.advanced.contains(&parent));
+    }
+
+    // ─── recovery ahead of the reshape draws ────────────────────────────
+
+    /// A halt-threshold miss count, as the boundary record stores it.
+    fn halt_misses() -> u32 {
+        u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32")
+    }
+
+    /// Seat `leaf(1, 1)` beside the split target with four ready members
+    /// and a live record at `misses`, returning it.
+    fn seat_sibling(state: &mut BeaconState, misses: u32) -> ShardId {
+        let sibling = ShardId::leaf(1, 1);
+        let members: Vec<ValidatorId> = (2000u64..2004).map(ValidatorId::new).collect();
+        for id in &members {
+            state.validators.insert(
+                *id,
+                validator_record(
+                    id.inner(),
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard: sibling,
+                        ready: true,
+                        placed_at_epoch: Epoch::GENESIS,
+                    },
+                ),
+            );
+        }
+        let committee = ShardCommittee { members };
+        state
+            .next_shard_committees
+            .insert(sibling, committee.clone());
+        state.shard_committees.insert(sibling, committee);
+        state.boundaries.insert(
+            sibling,
+            ShardBoundary {
+                consecutive_misses: misses,
+                ..live_boundary()
+            },
+        );
+        sibling
+    }
+
+    fn add_pooled(state: &mut BeaconState, ids: Range<u64>) {
+        for id in ids {
+            state.validators.insert(
+                ValidatorId::new(id),
+                validator_record(id, 0, ValidatorStatus::Pooled),
+            );
+        }
+    }
+
+    fn assert_split(state: &mut BeaconState, target: ShardId) {
+        apply_shard_payload(
+            &BlsVerifier,
+            state,
+            &net(),
+            target,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: target,
+                epoch: Epoch::GENESIS,
+            },
+        );
+    }
+
+    /// `grow_state(pooled)` with the target on a live record, its split
+    /// admitted and both children's observers ready, then gated: the cut
+    /// stands scheduled for the window after the current one.
+    fn split_scheduled(pooled: u64) -> (BeaconState, ShardId) {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(pooled);
+        state.boundaries.insert(p, live_boundary());
+        assert_split(&mut state, p);
+        for child in <[ShardId; 2]>::from(p.children()) {
+            let observer = observer_for(&state, p, child);
+            mark_ready(&mut state, p, observer);
+        }
+        schedule_ready_splits(&mut state);
+        assert_eq!(
+            state
+                .pending_reshapes
+                .get(&p)
+                .and_then(PendingReshape::scheduled_terminal),
+            Some(state.current_epoch.next()),
+        );
+        (state, p)
+    }
+
+    /// A fork-flagged target whose cut applies at this fold is outside
+    /// recovery demand: the recovery leaves it to the apply, which carries
+    /// its committee into the children, and the flag drops with the seat.
+    #[test]
+    fn a_fork_flagged_shard_whose_cut_applies_this_fold_is_left_to_its_cut() {
+        let (mut state, p) = split_scheduled(8);
+        let parent: BTreeSet<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        assert!(advance_to_scheduled_cut(&mut state));
+        state.fork_flagged.insert(p, BlockHeight::new(3));
+
+        assert!(!state.recovery_demand(0).contains(&p));
+        recover_committees(&mut state);
+        assert!(!state.pending_recoveries.contains_key(&p));
+        assert!(state.fork_flagged.contains_key(&p));
+
+        apply_scheduled_splits(&mut state);
+        let seated: BTreeSet<ValidatorId> = <[ShardId; 2]>::from(p.children())
+            .iter()
+            .flat_map(|child| state.next_shard_committees[child].members.iter().copied())
+            .collect();
+        assert!(parent.is_subset(&seated), "the cut seats the committee");
+
+        apply_next_epoch(&mut state, &[]);
+        assert!(
+            !state.fork_flagged.contains_key(&p),
+            "the flag drops with the seat",
+        );
+    }
+
+    /// A fork-flagged target whose cut is a window out is in demand and is
+    /// re-drawn before its apply. The forked members return to the pool,
+    /// and the apply drops them from the frozen halves, so no forked
+    /// member is seated on a child.
+    #[test]
+    fn a_fork_flagged_target_scheduled_a_window_out_is_redrawn_before_its_apply() {
+        let (mut state, p) = split_scheduled(8);
+        let forked: BTreeSet<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        state.fork_flagged.insert(p, BlockHeight::new(3));
+
+        assert!(state.recovery_demand(0).contains(&p));
+        recover_committees(&mut state);
+        assert_eq!(state.pending_recoveries[&p].cause, RecoveryCause::Fork);
+        assert!(!state.fork_flagged.contains_key(&p));
+
+        assert!(advance_to_scheduled_cut(&mut state));
+        apply_scheduled_splits(&mut state);
+        for child in <[ShardId; 2]>::from(p.children()) {
+            assert!(
+                state.next_shard_committees[&child]
+                    .members
+                    .iter()
+                    .all(|id| !forked.contains(id)),
+                "a forked member is seated on {child:?}",
+            );
+        }
+    }
+
+    /// The witness fold runs before this fold's miss bump, so a sibling one
+    /// miss short of the halt threshold is reserved there: the split it
+    /// would starve is refused, and admitted once the pool funds both.
+    #[test]
+    fn a_shard_crossing_the_halt_threshold_this_fold_is_reserved_in_its_witness_fold() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(4);
+        let sibling = seat_sibling(&mut state, halt_misses());
+        assert!(state.halted_shards().is_empty());
+        assert!(state.recovery_demand(0).is_empty());
+        assert_eq!(state.recovery_demand(1), BTreeSet::from([sibling]));
+        assert_eq!(state.drawable_pool_len(1), 0);
+
+        assert_split(&mut state, p);
+        assert!(!state.pending_reshapes.contains_key(&p));
+        assert_eq!(state.pooled_validators().len(), 4);
+
+        add_pooled(&mut state, 2100..2104);
+        assert_split(&mut state, p);
+        assert!(state.pending_reshapes.contains_key(&p));
+        assert_eq!(state.pooled_validators().len(), 4, "the reserve stands");
+    }
+
+    /// Under a whole fold, the target's split contribution folds before the
+    /// miss bump that takes the silent sibling past the threshold: the
+    /// split is refused, and the same fold's recovery re-draws the sibling
+    /// from the pool the refusal kept.
+    #[test]
+    fn a_split_witnessed_in_the_fold_its_sibling_halts_is_refused_for_the_recovery() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(4);
+        let sibling = seat_sibling(&mut state, halt_misses());
+        assert!(state.halted_shards().is_empty());
+
+        apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            }],
+        );
+
+        assert!(!state.pending_reshapes.contains_key(&p));
+        assert_eq!(
+            state.pending_recoveries[&sibling].cause,
+            RecoveryCause::Halt
+        );
+    }
+
+    /// Split admission, cohort re-staff and top-up each leave a full
+    /// committee per unfunded recovery in the pool.
+    #[test]
+    fn reshape_draws_and_top_up_leave_the_recovery_reserve_in_the_pool() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(4);
+        state.boundaries.insert(p, live_boundary());
+        seat_sibling(&mut state, halt_misses() + 1);
+        assert_eq!(state.recovery_demand(0).len(), 1);
+
+        // Admission: the pool holds only the reserve.
+        assert_split(&mut state, p);
+        assert!(!state.pending_reshapes.contains_key(&p));
+
+        // Admission once the pool funds the cohort past the reserve.
+        add_pooled(&mut state, 2100..2104);
+        assert_split(&mut state, p);
+        assert_eq!(cohort_of(&state, p).len(), 4);
+        assert_eq!(state.pooled_validators().len(), 4);
+
+        // Re-staff: a lapse returns the cohort, and with one pooled
+        // validator gone the pool past the reserve no longer staffs it.
+        lapse_split(&mut state, p);
+        let pooled = state.pooled_validators()[0];
+        revoke(&mut state, pooled);
+        assert_split(&mut state, p);
+        assert!(cohort_of(&state, p).is_empty(), "the re-staff waits");
+        assert_eq!(state.pooled_validators().len(), 7);
+
+        // Top-up: a short committee is backfilled only from the pool past
+        // the reserve.
+        state.pending_reshapes.remove(&p);
+        let pooled = state.pooled_validators()[0];
+        revoke(&mut state, pooled);
+        shorten_by_two(&mut state, p);
+        assert_eq!(state.drawable_pool_len(0), 2);
+        top_up_committees(&mut state);
+        assert_eq!(state.next_shard_committees[&p].members.len(), 4);
+        assert_eq!(state.pooled_validators().len(), 4, "the reserve stands");
+
+        shorten_by_two(&mut state, p);
+        top_up_committees(&mut state);
+        assert_eq!(
+            state.next_shard_committees[&p].members.len(),
+            2,
+            "a pool at the reserve backfills nothing",
+        );
+        assert_eq!(state.pooled_validators().len(), 4);
+    }
+
+    fn revoke(state: &mut BeaconState, id: ValidatorId) {
+        state.validators.get_mut(&id).expect("registered").status = ValidatorStatus::Revoked {
+            at_epoch: state.current_epoch,
+        };
+    }
+
+    /// Revoke the last two members `shard` seats, leaving it short.
+    fn shorten_by_two(state: &mut BeaconState, shard: ShardId) {
+        let members = state.next_shard_committees[&shard].members.clone();
+        let (kept, dropped) = members.split_at(members.len() - 2);
+        for id in dropped {
+            revoke(state, *id);
+        }
+        state
+            .next_shard_committees
+            .get_mut(&shard)
+            .expect("seated")
+            .members = kept.to_vec();
+    }
+
+    /// The halted set reads the same on either side of the reshape folds:
+    /// a target due to apply is reshape-involved before the apply and
+    /// terminal after it, and the children's placeholders are exempt.
+    #[test]
+    fn the_halted_set_is_the_same_before_and_after_the_reshape_folds() {
+        let (mut state, p) = split_scheduled(4);
+        assert!(advance_to_scheduled_cut(&mut state));
+        state
+            .boundaries
+            .get_mut(&p)
+            .expect("live record")
+            .consecutive_misses = halt_misses() + 1;
+        let sibling = seat_sibling(&mut state, halt_misses() + 1);
+
+        let before = state.halted_shards();
+        apply_scheduled_splits(&mut state);
+        schedule_ready_splits(&mut state);
+        apply_scheduled_merges(&mut state);
+        schedule_ready_merges(&mut state);
+        let after = state.halted_shards();
+
+        assert!(
+            !state.next_shard_committees.contains_key(&p),
+            "the cut applied"
+        );
+        assert_eq!(before, BTreeSet::from([sibling]));
+        assert_eq!(after, before);
+    }
+
+    /// The merge half of the same claim: the children are reshape-involved
+    /// before the apply and terminal after it, and the parent's placeholder
+    /// is exempt as a never-produced successor.
+    #[test]
+    fn the_halted_set_is_the_same_before_and_after_a_merge_applies() {
+        let parent = ShardId::leaf(1, 0);
+        let children: [ShardId; 2] = parent.children().into();
+        let mut state = merge_grow_state(0);
+        let merge = merge_assertion(parent);
+        for child in children {
+            apply_shard_payload(&BlsVerifier, &mut state, &net(), child, &merge);
+        }
+        for (id, seat) in keepers_of(&state, parent) {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                seat.child,
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: id,
+                    child: seat.child,
+                },
+            );
+        }
+        schedule_ready_merges(&mut state);
+        assert!(advance_to_scheduled_cut(&mut state));
+        for child in children {
+            state
+                .boundaries
+                .get_mut(&child)
+                .expect("live record")
+                .consecutive_misses = halt_misses() + 1;
+        }
+        let sibling = seat_sibling(&mut state, halt_misses() + 1);
+
+        let before = (state.halted_shards(), state.recovery_demand(0));
+        apply_scheduled_splits(&mut state);
+        schedule_ready_splits(&mut state);
+        apply_scheduled_merges(&mut state);
+        schedule_ready_merges(&mut state);
+        let after = (state.halted_shards(), state.recovery_demand(0));
+
+        assert!(
+            state.next_shard_committees.contains_key(&parent),
+            "the cut applied"
+        );
+        assert_eq!(before.0, BTreeSet::from([sibling]));
+        assert_eq!(before.1, BTreeSet::from([sibling]));
+        assert_eq!(after, before);
     }
 }
