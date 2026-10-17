@@ -850,6 +850,8 @@ fn build_shard_io<S: ShardStorage>(
         .crossing_index
         .bind(Arc::new(ChainCrossings(Arc::clone(&pending_chain))));
     let tick_chain = Arc::new(TickChain::new(Arc::clone(&storage)));
+    // No run of this process stated the rows the store holds stated.
+    tick_chain.seed_stated(rep.state.shard_coordinator().member_rows());
     // Held from the first commit on: a restart replays from below the
     // tip, and the first commit dates a version before any persists.
     if let Some(executed) = inits

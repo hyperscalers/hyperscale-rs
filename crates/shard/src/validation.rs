@@ -4631,10 +4631,6 @@ pub mod tests {
             }],
         );
         rows.advance(&block_naming(9, anchor, lines));
-        assert!(
-            rows.ticks.is_empty(),
-            "the recovery discards the tick whole"
-        );
         rows
     }
 
@@ -4732,8 +4728,10 @@ pub mod tests {
 
     /// A core member a halt recovery released lands no take of the
     /// crossing it consumed before the frontier, whether its own tick
-    /// decided it or a sibling shares its verdict, and whether it stood
-    /// in flight or stated when the chain halted.
+    /// decided it or a sibling shares its verdict: it stood in flight
+    /// when the chain halted. One stated when the chain halted stands
+    /// across the recovery, its tick kept, and the legs half accepting it
+    /// still settles.
     ///
     /// Short of the recovery, the half its replaced committee certified
     /// is admitted over its row and settles its effects. Past the
@@ -4794,7 +4792,7 @@ pub mod tests {
             TxHash,
             Settlement,
             Vec<&Finalization>,
-        ); 3] = [
+        ); 2] = [
             (
                 &halted,
                 &taker_arrived,
@@ -4809,20 +4807,33 @@ pub mod tests {
                 Settlement::Shared,
                 vec![&yes, &accept],
             ),
-            (
-                &stated,
-                &sharer_arrived,
-                sharer,
-                Settlement::Shared,
-                vec![&yes, &accept],
-            ),
         ];
         for (before, arrived, tx, settlement, halves) in cases {
             for at in 0..anchors.len() {
                 let rows = recovered_at(before.clone(), arrived, anchors[at]);
                 assert_eq!(rows.members[&tx].state, RowState::Released { settlement });
+                assert!(rows.ticks.is_empty(), "the recovery discards the tick");
                 released_lands_nothing(&rows, arrived, tx, &anchors[at..], &halves);
             }
+        }
+
+        for at in anchors {
+            let rows = recovered_at(stated.clone(), &sharer_arrived, at);
+            assert_eq!(
+                rows.members[&sharer].state,
+                stated_in(2),
+                "the stated row stands"
+            );
+            assert_eq!(
+                rows.ticks[&BlockHeight::new(2)].members.as_slice(),
+                &[sharer],
+                "its tick is kept, awaiting its legs half",
+            );
+            assert_eq!(
+                settles(&over(&rows), &accept),
+                Ok(()),
+                "the legs half accepting it settles past the recovery",
+            );
         }
     }
 

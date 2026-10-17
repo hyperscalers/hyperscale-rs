@@ -20,13 +20,15 @@ use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes, staged_yes};
+use hyperscale_storage::{
+    ProvisionalTx, ShardStorage, TickOutput, declared_reservations, fold_state_writes, staged_yes,
+};
 use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVoteNotification,
 };
 use hyperscale_types::{
-    BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext, Mode,
+    BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
+    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext,
     StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, ValidatorId,
     Verifiable, Verified, shard_prefix_path, signed_bytes,
 };
@@ -168,24 +170,6 @@ fn granted_reservations(
         .iter()
         .find(|r| r.tx_hash == executed.tx_hash)
         .map_or_default(|r| declared_reservations(&r.transaction.routing().declared_modes))
-}
-
-/// What a leg declaring `declared` holds by cell once it completes.
-///
-/// A reservation targets an amount cell, which is a point, so an
-/// owner-granular declaration is never one. Cells this shard does not own
-/// ride along and are dropped where locality is known — a declaration
-/// spans every participating shard, and this one does not.
-pub(crate) fn declared_reservations(
-    declared: &[(DeclaredKey, Mode)],
-) -> BTreeMap<SubstateKey, u128> {
-    let mut reserved = BTreeMap::new();
-    for (key, mode) in declared {
-        if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode) {
-            *reserved.entry(*cell).or_default() += *amount;
-        }
-    }
-    reserved
 }
 
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator

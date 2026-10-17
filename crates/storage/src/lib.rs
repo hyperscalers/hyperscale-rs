@@ -88,6 +88,7 @@ pub use shard::sweep::{
 };
 pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
+    declared_reservations,
 };
 pub use shard::unresolved::{ReplayWindow, replay_cutoff, replay_window, unresolved_replay_floor};
 pub use shard::vote_registers::SafeVoteRegisterStore;

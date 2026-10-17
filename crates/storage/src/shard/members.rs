@@ -592,8 +592,8 @@ pub struct MemberRow {
     pub height: BlockHeight,
     /// Where it stands.
     pub state: RowState,
-    /// What it holds while in flight, as its line named them; empty in
-    /// every other state.
+    /// What it holds while in flight or stated, as its line named them;
+    /// empty in every other state.
     pub holds: Holds,
     /// The remote shards it reaches.
     pub reach: Reach,
@@ -959,6 +959,18 @@ pub fn member_row_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
 
 fn member_entry(shard: ShardId, tx: TxHash) -> EntryKey {
     MemberCollection::Members.entry(shard, tx)
+}
+
+/// Where `tx`'s row in `shard`'s family stands in `state`; `None` where
+/// no row of `tx`'s stands.
+pub(crate) fn row_state(
+    state: &(impl Substates + ?Sized),
+    shard: ShardId,
+    tx: TxHash,
+) -> Option<RowState> {
+    read_at::<MemberRow>(state, member_entry(shard, tx))
+        .filter(|row| row.tx == tx)
+        .map(|row| row.state)
 }
 
 /// The yes receipt `tx`'s row in `shard`'s family stages.
@@ -1327,11 +1339,13 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// A discard releases every member standing in the tick that shares
     /// no verdict with a counterpart, and the one it abandons whatever
-    /// that shares; a recovery discard releases the whole tick, stated
-    /// members included. What stays is owed its stating half or a legs
-    /// half, for each member kept. The member an `Unanswerable` discard
-    /// names is released as an abandoned one is, and the fate its block
-    /// names for it is what deletes its row.
+    /// that shares; a recovery discard releases every member in flight
+    /// and keeps every stated one, with its holds, reserves, hearing,
+    /// verdict leaf and staged yes: a yes is withdrawn by its siblings'
+    /// state alone. What stays is owed its stating half or a legs half,
+    /// for each member kept. The member an `Unanswerable` discard names
+    /// is released as an abandoned one is, and the fate its block names
+    /// for it is what deletes its row.
     fn discard(&mut self, tick: TickId, cause: DiscardCause) {
         if tick.shard_id() != self.shard {
             return;
@@ -1340,17 +1354,18 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         let Some(held) = self.tick(height) else {
             return;
         };
-        let abandoned = match cause {
-            DiscardCause::Abandoned(tx) | DiscardCause::Unanswerable(tx) => Some(tx),
-            DiscardCause::Recovery => None,
+        let keeps = |tx: TxHash, state: RowState| match cause {
+            DiscardCause::Abandoned(abandoned) | DiscardCause::Unanswerable(abandoned) => {
+                state.seated() && tx != abandoned
+            }
+            DiscardCause::Recovery => matches!(state, RowState::Stated { .. }),
         };
-        let whole = matches!(cause, DiscardCause::Recovery);
         let mut kept = Vec::new();
         for &tx in held.members.iter() {
             let Some(row) = self.member(tx).filter(|row| in_tick(row, height)) else {
                 continue;
             };
-            if row.state.seated() && !whole && Some(tx) != abandoned {
+            if keeps(tx, row.state) {
                 if !kept.contains(&tx) {
                     kept.push(tx);
                 }
@@ -1364,7 +1379,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             determined_unsettled: false,
             awaiting,
         });
-        self.set_tick(height, remains);
+        if remains.as_ref() != Some(&held) {
+            self.set_tick(height, remains);
+        }
     }
 
     /// Fates delete the rows they name, and every tick row they leave
@@ -2530,15 +2547,25 @@ mod tests {
 
         let mut recovered = stated();
         recovered.fold(&discarding(4, 2, DiscardCause::Recovery));
-        assert_eq!(
-            state_of(&recovered, 1),
-            Some(RowState::Released {
-                settlement: Settlement::Shared,
-            }),
-            "a recovery releases a stated member with the rest of its tick",
+        assert!(
+            matches!(state_of(&recovered, 1), Some(RowState::Stated { .. })),
+            "a recovery keeps a stated member",
         );
-        assert!(leaf_of(&recovered, 1).is_none() && !seated_in(&recovered, 1));
-        assert!(MemberIndex::load(&recovered, LOCAL).ticks.is_empty());
+        assert_eq!(
+            state_of(&recovered, 3),
+            Some(RowState::Released {
+                settlement: Settlement::Alone,
+            }),
+            "and releases the member its tick holds in flight",
+        );
+        assert_eq!(leaf_of(&recovered, 1), Some(to_vec(&ours).unwrap()));
+        assert!(seated_in(&recovered, 1));
+        assert_eq!(
+            MemberIndex::load(&recovered, LOCAL).ticks[&BlockHeight::new(2)]
+                .members
+                .as_slice(),
+            &[tx(1)],
+        );
 
         let mut kept = stated();
         kept.fold(&settling(4, 2, TickHalf::Determined, &[3]));
@@ -2775,56 +2802,29 @@ mod tests {
         );
     }
 
-    /// A recovery's crossing block releases a row its tick stated, a
-    /// shared member's yes standing beside a counterpart: the discard
-    /// lets go of the tick whole, so the row stands released, its yes
-    /// leaf and seat deleted, holding nothing, in no tick, and the tick
-    /// owes nothing more. Which tick the crossing discards is
-    /// whatever its parent's rows hold, a tick a kept block stated above
-    /// the recovery's frontier among them.
+    /// A recovery's crossing block releases the rows its ticks hold in
+    /// flight and keeps every stated one. The stated row keeps its holds,
+    /// its reservation, its yes leaf, its seat and its staged yes, and its
+    /// tick stays, listing it and awaiting its legs half; the row in
+    /// flight stands released, holding nothing, and its tick goes. A
+    /// second fold of the crossing block writes nothing, and the legs
+    /// half that follows accepts the kept row as it would have without
+    /// the recovery.
     #[test]
-    fn a_stated_row_above_the_frontier_is_released_and_its_leaf_deleted() {
+    fn a_recovery_releases_in_flight_rows_and_keeps_stated_ones() {
         let mut store = stated_beside_peer();
-        assert!(leaf_of(&store, 1).is_some(), "the stated yes stands");
-        store.fold(&discarding(4, 2, DiscardCause::Recovery));
+        store.fold(&committing(4, &[2]));
+        store.fold(&naming(5, vec![sharing(2, 7)]));
+        let row = row_of(&store, 1).expect("the stated row");
+        let leaf = leaf_of(&store, 1).expect("the stated yes stands");
+        let staged = staged_in(&store);
+        assert_eq!(staged.len(), 1, "the stated yes is staged");
+        assert!(matches!(
+            state_of(&store, 2),
+            Some(RowState::InFlight { .. })
+        ));
 
-        let row = row_of(&store, 1).expect("a released row stands");
-        assert_eq!(
-            row.state,
-            RowState::Released {
-                settlement: Settlement::Shared,
-            },
-        );
-        assert!(row.holds.is_empty(), "a released row holds nothing");
-        assert_eq!(
-            reserved(&store, 9),
-            40,
-            "its reservation stands until the line that ends the row",
-        );
-        assert!(
-            leaf_of(&store, 1).is_none() && !seated_in(&store, 1),
-            "its yes leaf is deleted with its seat",
-        );
-        assert!(
-            MemberIndex::load(&store, LOCAL).ticks.is_empty(),
-            "the tick is discarded whole",
-        );
-    }
-
-    /// A recovery deletes the yes leaf of every row stated in the ticks
-    /// its crossing block discards, whichever tick stated it: no leaf
-    /// outlives the row that said so, and each row stands released.
-    #[test]
-    fn a_recovery_deletes_a_stated_rows_leaf() {
-        let mut store = Entries::default();
-        store.fold(&committing(1, &[1, 2]));
-        store.fold(&naming(2, vec![sharing(1, 7)]));
-        store.fold(&naming(3, vec![sharing(2, 9)]));
-        store.fold(&stating(4, 2, &[], &[1]));
-        store.fold(&stating(5, 3, &[], &[2]));
-        assert!(leaf_of(&store, 1).is_some() && leaf_of(&store, 2).is_some());
-
-        store.fold(&naming(
+        let crossing = naming(
             6,
             vec![
                 TickLine::Discard {
@@ -2832,23 +2832,55 @@ mod tests {
                     cause: DiscardCause::Recovery,
                 },
                 TickLine::Discard {
-                    tick: TickId::new(LOCAL, BlockHeight::new(3)),
+                    tick: TickId::new(LOCAL, BlockHeight::new(5)),
                     cause: DiscardCause::Recovery,
                 },
             ],
-        ));
-        for seed in [1, 2] {
-            assert!(
-                leaf_of(&store, seed).is_none(),
-                "{seed}'s yes leaf is deleted"
-            );
-            assert_eq!(
-                state_of(&store, seed),
-                Some(RowState::Released {
-                    settlement: Settlement::Shared,
-                }),
-            );
-        }
+        );
+        store.fold(&crossing);
+
+        assert_eq!(
+            row_of(&store, 1),
+            Some(row),
+            "the stated row stands as it was"
+        );
+        assert_eq!(leaf_of(&store, 1), Some(leaf), "and so does its yes leaf");
+        assert!(seated_in(&store, 1), "and its seat");
+        assert_eq!(staged_in(&store), staged, "and its staged yes");
+        assert_eq!(reserved(&store, 9), 40, "and its reservation");
+        let ticks = MemberIndex::load(&store, LOCAL).ticks;
+        assert_eq!(
+            ticks.keys().copied().collect::<Vec<_>>(),
+            vec![BlockHeight::new(2)],
+            "the stated row's tick stays and the in-flight row's goes",
+        );
+        let kept = &ticks[&BlockHeight::new(2)];
+        assert_eq!(kept.members.as_slice(), &[tx(1)]);
+        assert_eq!(kept.awaiting, 1);
+        assert!(!kept.determined_unsettled);
+
+        let released = row_of(&store, 2).expect("a released row stands");
+        assert_eq!(
+            released.state,
+            RowState::Released {
+                settlement: Settlement::Shared,
+            },
+        );
+        assert!(released.holds.is_empty(), "a released row holds nothing");
+        assert!(leaf_of(&store, 2).is_none() && !seated_in(&store, 2));
+
+        assert!(
+            member_writes(&store, &crossing).is_empty(),
+            "a second fold of the crossing block writes nothing",
+        );
+
+        store.fold(&accepting(7, 2, &[1]));
+        assert_eq!(state_of(&store, 1), Some(RowState::Accepted));
+        assert!(
+            staged_in(&store).is_empty(),
+            "the accept deletes the staged yes"
+        );
+        assert_eq!(reserved(&store, 9), 0);
         assert!(MemberIndex::load(&store, LOCAL).ticks.is_empty());
     }
 
@@ -3341,13 +3373,13 @@ mod tests {
         ));
         assert!(
             !seated_in(&store, 7),
-            "a recovery releases the whole tick, seats included",
+            "a recovery releases every member in flight, seats included",
         );
     }
 
     /// A discard releases what shares no verdict with a counterpart and
     /// keeps what does, unless it abandons that member; a recovery
-    /// discard releases the whole tick.
+    /// discard releases every member in flight.
     #[test]
     fn a_discard_releases_what_shares_no_verdict() {
         let mut store = Entries::default();
@@ -5151,12 +5183,12 @@ mod tests {
     fn a_release_empties_the_hearing() {
         let [leaf, ..] = cells_of(PEER, 1);
         let yes = reading(at(7), &[(leaf, peers_yes(1))], &[1]);
-        let recovery = discarding(7, 2, DiscardCause::Recovery);
+        let abort = discarding(7, 2, DiscardCause::Abandoned(tx(1)));
 
         let mut store = listening();
         store.fold(&carrying(6, from_ref(&yes)));
         assert!(!heard_by(&store, 1).is_empty());
-        store.fold(&recovery);
+        store.fold(&abort);
         assert!(matches!(
             state_of(&store, 1),
             Some(RowState::Released { .. })
@@ -5166,7 +5198,7 @@ mod tests {
         let mut together = listening();
         together.fold(&MemberInputs {
             heard: carrying(6, from_ref(&yes)).heard,
-            ..recovery
+            ..abort
         });
         assert!(matches!(
             state_of(&together, 1),

@@ -79,3 +79,10 @@ pub fn member_order(tx: TxHash) -> u128 {
 pub fn verdict_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
     entry_leaf_key(&ProtocolHasher, MemberCollection::Verdicts.entry(shard, tx))
 }
+
+/// The tree leaf of the yes `tx`'s row in `shard`'s family stages:
+/// present exactly while the row stands stated.
+#[must_use]
+pub fn staged_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
+    entry_leaf_key(&ProtocolHasher, MemberCollection::Staged.entry(shard, tx))
+}

@@ -45,13 +45,14 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash, amount_cell,
-    read_amount,
+    BlockHeight, DeclaredKey, Mode, Movement, ProvisionalHolds, ShardId, StateWrites, SubstateKey,
+    TickId, TxHash, amount_cell, read_amount,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::shard::fee_holds::{FeeTerms, HeldByTx, StandingFeeHolds, release_of};
+use crate::shard::members::{MemberIndex, RowState, row_state};
 use crate::shard::writes::{entry_overlay_range, fold_state_writes, merge_entry_overlay};
 use crate::{Substates, VersionedStore};
 
@@ -79,6 +80,59 @@ pub struct ProvisionalTx {
     /// balance with the debit already in it while the hold still says the
     /// value is spoken for.
     pub reserved: BTreeMap<SubstateKey, u128>,
+}
+
+/// What a leg declaring `declared` holds by cell once it completes.
+///
+/// A reservation targets an amount cell, which is a point, so an
+/// owner-granular declaration is never one. Cells this shard does not own
+/// ride along and are dropped where locality is known — a declaration
+/// spans every participating shard, and this one does not.
+#[must_use]
+pub fn declared_reservations(declared: &[(DeclaredKey, Mode)]) -> BTreeMap<SubstateKey, u128> {
+    let mut reserved = BTreeMap::new();
+    for (key, mode) in declared {
+        if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode) {
+            *reserved.entry(*cell).or_default() += *amount;
+        }
+    }
+    reserved
+}
+
+/// The reservation of a stated row whose leg no entry holds: one the
+/// floor dropped, or one this replica never ran.
+///
+/// Whether it holds is read off the row in the base. It holds against a
+/// view at a height whose base holds the row stated in `tick`, and goes
+/// once the eviction floor reaches a height whose base holds the row in
+/// no tick of its own: the legs half or the abort that ends the row
+/// commits its writes, or their absence, into the base at that same
+/// height.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatedHold {
+    /// The tick holding the row.
+    tick: BlockHeight,
+    /// The shard whose family holds the row.
+    shard: ShardId,
+    /// What the row holds against each amount cell.
+    reserved: BTreeMap<SubstateKey, u128>,
+}
+
+impl StatedHold {
+    /// Whether `state` holds the row stated in its tick.
+    fn stated_in(&self, state: &(impl Substates + ?Sized), tx_hash: TxHash) -> bool {
+        matches!(
+            row_state(state, self.shard, tx_hash),
+            Some(RowState::Stated { tick, .. }) if tick == self.tick
+        )
+    }
+
+    /// Whether `state` holds the row in its tick, in flight or stated.
+    fn held_in(&self, state: &(impl Substates + ?Sized), tx_hash: TxHash) -> bool {
+        row_state(state, self.shard, tx_hash)
+            .and_then(RowState::held)
+            .is_some_and(|(tick, ..)| tick == self.tick)
+    }
 }
 
 /// The execution output of one tick.
@@ -532,6 +586,14 @@ impl TickEntry {
         }
     }
 
+    /// Whether this entry holds `tx_hash`'s leg, pending, retiring or
+    /// promoted.
+    fn holds_leg(&self, tx_hash: TxHash) -> bool {
+        self.pending.contains_key(&tx_hash)
+            || self.retiring.contains_key(&tx_hash)
+            || self.readable.contains_key(&tx_hash)
+    }
+
     /// Whether the settled base at `floor` already carries everything
     /// this entry holds, so no future read can still need it.
     fn covered_by(&self, floor: BlockHeight) -> bool {
@@ -561,6 +623,11 @@ pub struct TickChain<S> {
     /// parent height of a halt recovery's crossing block, at or below
     /// which every contribution is in the base or discarded.
     floor: RwLock<BlockHeight>,
+    /// The holds of stated rows whose legs no entry holds, by
+    /// transaction. A transaction's reservation is held by its entry's
+    /// pending leg, by that entry's `retiring`, or here, and never by two
+    /// of them. Taken after `entries` wherever both are.
+    stated: RwLock<BTreeMap<TxHash, StatedHold>>,
 }
 
 impl<S> TickChain<S>
@@ -579,7 +646,53 @@ where
             entries: RwLock::new(BTreeMap::new()),
             persisted: RwLock::new(persisted),
             floor: RwLock::new(BlockHeight::GENESIS),
+            stated: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// Hold the reservation of every stated row of `rows` whose leg no
+    /// entry holds: a replica resuming on a store, or seated over one it
+    /// imported, ran none of the ticks that stated them, and at a
+    /// recovery's crossing a replica may hold no run of a tick at or below
+    /// the floor that stated a row the crossing keeps.
+    ///
+    /// Rows read ahead of the chain's base are safe to seed from: a hold
+    /// counts only against a view whose base holds its row stated in its
+    /// tick.
+    ///
+    /// What a completed member holds is what it declared, so the row's
+    /// own holds state it exactly. A row already held here is left as it
+    /// is.
+    pub fn seed_stated(&self, rows: &MemberIndex) {
+        let shard = rows.shard();
+        let entries = write_or_recover(&self.entries);
+        let mut stated = write_or_recover(&self.stated);
+        for row in rows.members.values() {
+            let RowState::Stated { tick, .. } = row.state else {
+                continue;
+            };
+            if entries.values().any(|entry| entry.holds_leg(row.tx)) {
+                continue;
+            }
+            let reserved = declared_reservations(&row.holds);
+            if reserved.is_empty() {
+                continue;
+            }
+            stated.entry(row.tx).or_insert(StatedHold {
+                tick,
+                shard,
+                reserved,
+            });
+        }
+        drop(stated);
+        drop(entries);
+    }
+
+    /// Hand each stated hold of the tick at `height` whose leg `entry`
+    /// now holds over to it.
+    fn yield_stated_to(&self, height: BlockHeight, entry: &TickEntry) {
+        write_or_recover(&self.stated)
+            .retain(|tx_hash, hold| hold.tick != height || !entry.holds_leg(*tx_hash));
     }
 
     /// Append the output of the tick at `height`.
@@ -617,12 +730,13 @@ where
         for fate in fates {
             entry.resolve(height, fate);
         }
+        self.yield_stated_to(height, entry);
         drop(entries);
     }
 
     /// Withdraw every contribution at or below `floor` from the reads of
     /// every tick above it: the parent height of a halt recovery's
-    /// crossing block.
+    /// crossing block, a block of `shard`'s.
     ///
     /// Every entry at or below the floor goes whole, readable or pending,
     /// and nothing else: every contribution at or below it is in the base
@@ -630,9 +744,16 @@ where
     /// held at the floor, so the first tick past the crossing reads a
     /// baseline still there.
     ///
+    /// The holds of the pending legs it drops stay, as stated holds: the
+    /// crossing keeps each stated row, and a legs half above the floor
+    /// still settles it. A leg whose row the crossing releases holds
+    /// nothing against any view past the floor, since no base there holds
+    /// its row stated. A kept row whose leg no entry here held is
+    /// [`seed_stated`](Self::seed_stated)'s to hold.
+    ///
     /// A floor at or below the current one does nothing, so every vnode
     /// sharing the chain may raise it and it applies once.
-    pub fn raise_floor(&self, floor: BlockHeight) {
+    pub fn raise_floor(&self, floor: BlockHeight, shard: ShardId) {
         let mut entries = write_or_recover(&self.entries);
         {
             let mut current = write_or_recover(&self.floor);
@@ -645,7 +766,23 @@ where
             entries.range(floor.next()..).next().is_none(),
             "a run above the floor is under way at its first raise",
         );
-        entries.retain(|height, _| *height > floor);
+        let kept = entries.split_off(&floor.next());
+        let dropped = std::mem::replace(&mut *entries, kept);
+        {
+            let mut stated = write_or_recover(&self.stated);
+            for (tick, entry) in dropped {
+                for (tx_hash, leg) in entry.pending {
+                    if leg.reserved.is_empty() {
+                        continue;
+                    }
+                    stated.entry(tx_hash).or_insert(StatedHold {
+                        tick,
+                        shard,
+                        reserved: leg.reserved,
+                    });
+                }
+            }
+        }
         drop(entries);
         let persisted = *read_or_recover(&self.persisted);
         self.base.hold_retention_at(persisted.min(floor));
@@ -686,6 +823,9 @@ where
             }
         };
         entry.resolve(tick, resolution);
+        if matches!(resolution, TickResolution::RestoredLegs { .. }) {
+            self.yield_stated_to(tick, entry);
+        }
         drop(entries);
     }
 
@@ -716,6 +856,11 @@ where
     /// the retention horizon alone permits exactly that, because it is
     /// measured against a tip clock that a halt recovery moves by the
     /// whole halt.
+    ///
+    /// A stated hold drops at the same floor, once the base there holds
+    /// its row in no tick of its own: every view at or above the floor
+    /// reads the row's end through the base, and a tick still queued
+    /// below the end reads the hold.
     pub fn prune_persisted(&self, persisted: BlockHeight, executed: BlockHeight) {
         {
             let mut recorded = write_or_recover(&self.persisted);
@@ -723,7 +868,21 @@ where
         }
         let floor = persisted.min(executed);
         self.base.hold_retention_at(floor);
-        write_or_recover(&self.entries).retain(|_, entry| !entry.covered_by(floor));
+        let mut entries = write_or_recover(&self.entries);
+        entries.retain(|_, entry| !entry.covered_by(floor));
+        let mut stated = write_or_recover(&self.stated);
+        // Taken only for a hold at or below the floor: a floor below every
+        // hold's tick may sit under the store's retention.
+        let mut base = None;
+        stated.retain(|tx_hash, hold| {
+            floor < hold.tick
+                || hold.held_in(
+                    base.get_or_insert_with(|| self.base.snapshot_at(floor)),
+                    *tx_hash,
+                )
+        });
+        drop(stated);
+        drop(entries);
     }
 
     /// The highest height the settled base is known to carry: the
@@ -737,7 +896,10 @@ where
     /// chain; successors seed from settled state, never from tick
     /// outputs.
     pub fn clear(&self) {
-        write_or_recover(&self.entries).clear();
+        let mut entries = write_or_recover(&self.entries);
+        entries.clear();
+        write_or_recover(&self.stated).clear();
+        drop(entries);
     }
 
     /// Number of retained ticks (diagnostics).
@@ -847,6 +1009,21 @@ where
                 }
             }
         }
+        // A stated hold holds while the base at `tick` holds its row
+        // stated: from that height on the base carries the row's end. The
+        // stating half commits above its tick, so no base at or below the
+        // tick holds the row stated.
+        let stated = read_or_recover(&self.stated);
+        for (tx_hash, hold) in stated.iter().filter(|(_, hold)| hold.tick < tick) {
+            let base = base_at_tick.get_or_insert_with(|| self.base.snapshot_at(tick));
+            if !hold.stated_in(base, *tx_hash) {
+                continue;
+            }
+            for (cell, amount) in &hold.reserved {
+                *holds.entry(*cell).or_default().entry(*tx_hash).or_default() += *amount;
+            }
+        }
+        drop(stated);
         drop(entries);
         TickView {
             base: Arc::clone(&self.base),
@@ -1027,20 +1204,26 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use hyperscale_hbor::{Capped, to_vec};
     use hyperscale_types::{
-        Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, Movement, ResourceAddr,
-        ShardId, StateRoot, encode_amount,
+        AbortCharge, Address, AddressClass, Deadline, DeclaredRange, EntryKey, GlobalReceiptHash,
+        Hash, Joins, LocalKey, MemberCollection, Movement, Owes, ResourceAddr, Settlement,
+        StateRoot, WeightedTimestamp, encode_amount,
     };
     use hyperscale_vm_effects::{FeeHold, ProtocolHasher, fee_hold_total_key};
 
     use super::*;
     use crate::SubstateStore;
     use crate::shard::fee_holds::FeeHoldReading;
+    use crate::shard::members::MemberRow;
     use crate::shard::writes::settle_writes;
 
     /// What every cell these fixtures move holds.
     const RESOURCE: ResourceAddr = ResourceAddr::new([0xE1; 31]);
     use crate::lock_recover::lock_or_recover;
+
+    /// One height's entry writes, a `None` deleting its entry.
+    type EntryWrites = Vec<(EntryKey, Option<Vec<u8>>)>;
 
     /// A base built from settled write sets at heights, readable as of
     /// any anchor — the store's history without the JMT.
@@ -1053,6 +1236,8 @@ mod tests {
         /// Heights the chain held history at, so a test can pin the
         /// floor a pruning publishes.
         holds: Mutex<Vec<BlockHeight>>,
+        /// The entries each height writes.
+        entries: BTreeMap<BlockHeight, EntryWrites>,
     }
 
     impl StubStore {
@@ -1071,6 +1256,7 @@ mod tests {
                 tip: Self::WRITTEN,
                 anchors: Mutex::new(Vec::new()),
                 holds: Mutex::new(Vec::new()),
+                entries: BTreeMap::new(),
             }
         }
 
@@ -1088,6 +1274,7 @@ mod tests {
                 tip: height,
                 anchors: Mutex::new(Vec::new()),
                 holds: Mutex::new(Vec::new()),
+                entries: BTreeMap::new(),
             }
         }
 
@@ -1097,6 +1284,23 @@ mod tests {
                 cells.extend(settled.iter().map(|(k, v)| (*k, v.clone())));
             }
             cells
+        }
+
+        fn entries_at(&self, height: BlockHeight) -> BTreeMap<EntryKey, Vec<u8>> {
+            let mut entries = BTreeMap::new();
+            for (_, written) in self.entries.range(..=height) {
+                for (key, value) in written {
+                    match value {
+                        Some(bytes) => entries.insert(*key, bytes.clone()),
+                        None => entries.remove(key),
+                    };
+                }
+            }
+            entries
+        }
+
+        fn at(&self, height: BlockHeight) -> StubSnapshot {
+            StubSnapshot(self.cells_at(height), self.entries_at(height))
         }
     }
 
@@ -1117,7 +1321,7 @@ mod tests {
         }
     }
 
-    struct StubSnapshot(HashMap<SubstateKey, Vec<u8>>);
+    struct StubSnapshot(HashMap<SubstateKey, Vec<u8>>, BTreeMap<EntryKey, Vec<u8>>);
     use crate::Anchored;
 
     impl Anchored for StubSnapshot {
@@ -1133,13 +1337,22 @@ mod tests {
 
         fn entries_in_range(
             &self,
-            _owner: Address,
-            _collection: CollectionId,
-            _lo: u128,
-            _hi: u128,
-            _limit: usize,
+            owner: Address,
+            collection: CollectionId,
+            lo: u128,
+            hi: u128,
+            limit: usize,
         ) -> Vec<(u128, Vec<u8>)> {
-            Vec::new()
+            self.1
+                .iter()
+                .filter(|(key, _)| {
+                    key.owner == owner
+                        && key.collection == collection
+                        && (lo..=hi).contains(&key.order)
+                })
+                .take(limit)
+                .map(|(key, bytes)| (key.order, bytes.clone()))
+                .collect()
         }
     }
 
@@ -1154,7 +1367,7 @@ mod tests {
 
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             lock_or_recover(&self.anchors).push(height);
-            StubSnapshot(self.cells_at(height))
+            self.at(height)
         }
         fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
             None
@@ -1168,7 +1381,7 @@ mod tests {
     impl SubstateStore for StubStore {
         type Snapshot<'a> = StubSnapshot;
         fn snapshot(&self) -> Self::Snapshot<'_> {
-            StubSnapshot(self.cells_at(self.tip))
+            self.at(self.tip)
         }
         fn jmt_height(&self) -> BlockHeight {
             self.tip
@@ -1247,8 +1460,11 @@ mod tests {
         read_amount(cell).expect("an amount cell")
     }
 
+    /// The shard every fixture's ticks are of.
+    const SHARD: ShardId = ShardId::leaf(0, 0);
+
     fn tick(height: u64) -> TickId {
-        TickId::new(ShardId::leaf(0, 0), BlockHeight::new(height))
+        TickId::new(SHARD, BlockHeight::new(height))
     }
 
     fn tx(byte: u8) -> TxHash {
@@ -1491,6 +1707,7 @@ mod tests {
             tip: BlockHeight::new(9),
             anchors: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            entries: BTreeMap::new(),
         });
         let chain = TickChain::new(store);
         let w = tick(3);
@@ -1562,6 +1779,7 @@ mod tests {
             tip: BlockHeight::new(9),
             anchors: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            entries: BTreeMap::new(),
         });
         let chain = TickChain::new(store);
         chain.resolve(
@@ -1762,7 +1980,7 @@ mod tests {
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"two".to_vec()));
 
-        chain.raise_floor(BlockHeight::new(3));
+        chain.raise_floor(BlockHeight::new(3), SHARD);
         assert!(
             chain.is_empty(),
             "nothing at or below the floor is retained"
@@ -1790,7 +2008,7 @@ mod tests {
         assert_eq!(read_at(&chain, 6, key(1)), Some(b"coast".to_vec()));
 
         let crossing_parent = BlockHeight::new(6);
-        chain.raise_floor(crossing_parent);
+        chain.raise_floor(crossing_parent, SHARD);
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"in flight"))], 5),
@@ -1815,7 +2033,7 @@ mod tests {
     fn a_later_raise_keeps_every_entry_above_the_floor() {
         let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        chain.raise_floor(floor);
+        chain.raise_floor(floor, SHARD);
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
@@ -1828,8 +2046,8 @@ mod tests {
                 writes: vec![(tx(6), writes(&[(key(2), Some(b"six"))]))],
             },
         );
-        chain.raise_floor(floor);
-        chain.raise_floor(BlockHeight::new(2));
+        chain.raise_floor(floor, SHARD);
+        chain.raise_floor(BlockHeight::new(2), SHARD);
         assert_eq!(chain.len(), 2, "both entries stay");
         assert_eq!(read_at(&chain, 7, key(1)), Some(b"five".to_vec()));
         assert_eq!(read_at(&chain, 7, key(2)), Some(b"six".to_vec()));
@@ -1842,7 +2060,7 @@ mod tests {
     fn an_append_at_or_below_the_floor_lands_nothing() {
         let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        chain.raise_floor(floor);
+        chain.raise_floor(floor, SHARD);
         chain.append(
             BlockHeight::new(3),
             determined(&[(key(1), Some(b"three"))], 3),
@@ -1864,14 +2082,14 @@ mod tests {
     fn raising_the_floor_twice_is_one_raise() {
         let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        chain.raise_floor(floor);
+        chain.raise_floor(floor, SHARD);
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
             &[],
         );
-        chain.raise_floor(floor);
-        chain.raise_floor(BlockHeight::new(2));
+        chain.raise_floor(floor, SHARD);
+        chain.raise_floor(BlockHeight::new(2), SHARD);
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
     }
 
@@ -1882,7 +2100,7 @@ mod tests {
         let store = Arc::new(StubStore::with_cell(key(1), b"base"));
         let chain = TickChain::new(Arc::clone(&store));
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
-        chain.raise_floor(BlockHeight::new(3));
+        chain.raise_floor(BlockHeight::new(3), SHARD);
         assert_eq!(
             lock_or_recover(&store.holds).last().copied(),
             Some(BlockHeight::new(3)),
@@ -2355,6 +2573,7 @@ mod tests {
                 tip: BlockHeight::new(2),
                 anchors: Mutex::new(Vec::new()),
                 holds: Mutex::new(Vec::new()),
+                entries: BTreeMap::new(),
             });
             let chain = TickChain::new(store);
             let mut credit = StateWrites::default();
@@ -2438,6 +2657,7 @@ mod tests {
                 tip: BlockHeight::new(7),
                 anchors: Mutex::new(Vec::new()),
                 holds: Mutex::new(Vec::new()),
+                entries: BTreeMap::new(),
             });
             let chain = TickChain::new(store);
             if ran {
@@ -2559,6 +2779,7 @@ mod tests {
             tip: height,
             anchors: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            entries: BTreeMap::new(),
         }
     }
 
@@ -2591,6 +2812,7 @@ mod tests {
             tip: StubStore::WRITTEN,
             anchors: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            entries: BTreeMap::new(),
         };
         let chain = TickChain::new(Arc::new(store));
         chain.append(
@@ -2659,6 +2881,7 @@ mod tests {
             tip: StubStore::WRITTEN,
             anchors: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            entries: BTreeMap::new(),
         };
         let chain = TickChain::new(Arc::new(store));
         chain.append(
@@ -2685,6 +2908,7 @@ mod tests {
             tip: StubStore::WRITTEN,
             anchors: Mutex::new(Vec::new()),
             holds: Mutex::new(Vec::new()),
+            entries: BTreeMap::new(),
         };
         let chain = TickChain::new(Arc::new(store));
         chain.append(
@@ -2749,7 +2973,10 @@ mod tests {
     /// A view over `base` for `key(1)` with `layers` above it, bottom up.
     fn view_over(base: u128, layers: &[StateWrites]) -> TickViewSnapshot<StubSnapshot> {
         TickViewSnapshot {
-            base_snapshot: StubSnapshot(HashMap::from([(key(1), encode_amount(base).to_vec())])),
+            base_snapshot: StubSnapshot(
+                HashMap::from([(key(1), encode_amount(base).to_vec())]),
+                BTreeMap::new(),
+            ),
             overlays: Arc::new(layers.iter().cloned().map(Arc::new).collect()),
         }
     }
@@ -2781,7 +3008,10 @@ mod tests {
         for layer in layers {
             fold_state_writes(&mut block, layer);
         }
-        let prior = StubSnapshot(HashMap::from([(key(1), encode_amount(held).to_vec())]));
+        let prior = StubSnapshot(
+            HashMap::from([(key(1), encode_amount(held).to_vec())]),
+            BTreeMap::new(),
+        );
         settle_writes(&block, &prior)
             .cells()
             .get(&key(1))
@@ -2948,5 +3178,277 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What a stated row in these fixtures reserves of `key(1)`.
+    const RESERVED: u128 = 40;
+
+    /// `tx`'s row standing as `state`, declaring a reservation of
+    /// `RESERVED` against `key(1)`.
+    fn row(tx_hash: TxHash, state: RowState) -> MemberRow {
+        MemberRow {
+            tx: tx_hash,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(1_000_000)),
+            committed: WeightedTimestamp::ZERO,
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::from_array([(
+                DeclaredKey::Cell(key(1)),
+                Mode::Reserve { amount: RESERVED },
+            )]),
+            reach: Capped::from_array([ShardId::leaf(1, 1)]),
+            awaits: Capped::from_array([ShardId::leaf(1, 1)]),
+            charge: AbortCharge {
+                vault: key(9),
+                amount: 0,
+            },
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            owes: Owes::default(),
+            waiting: None,
+            covered: false,
+            executed: true,
+            hearing: Capped::empty(),
+        }
+    }
+
+    fn in_flight(tick: u64) -> RowState {
+        RowState::InFlight {
+            tick: BlockHeight::new(tick),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+        }
+    }
+
+    fn stated(tick: u64) -> RowState {
+        RowState::Stated {
+            tick: BlockHeight::new(tick),
+            receipt: GlobalReceiptHash::ZERO,
+        }
+    }
+
+    /// Write `tx`'s row at `height` in `store`'s history, standing as
+    /// `state`, or gone.
+    fn writing(store: &mut StubStore, height: u64, tx_hash: TxHash, state: Option<RowState>) {
+        store
+            .entries
+            .entry(BlockHeight::new(height))
+            .or_default()
+            .push((
+                MemberCollection::Members.entry(SHARD, tx_hash),
+                state.map(|state| to_vec(&row(tx_hash, state)).expect("a row encodes")),
+            ));
+    }
+
+    /// A base holding 100 at `key(1)` and `tx`'s row run in the tick
+    /// at 2 and stated at 3.
+    fn stated_at_three(tx_hash: TxHash) -> StubStore {
+        let mut store = StubStore::with_cell(key(1), &encode_amount(100));
+        writing(&mut store, 2, tx_hash, Some(in_flight(2)));
+        writing(&mut store, 3, tx_hash, Some(stated(2)));
+        store
+    }
+
+    /// The rows of `SHARD`'s family holding `tx` stated in the tick at 2.
+    fn rows_stating(tx_hash: TxHash) -> MemberIndex {
+        let mut rows = MemberIndex::empty(SHARD);
+        rows.members.insert(tx_hash, row(tx_hash, stated(2)));
+        rows
+    }
+
+    /// The tick output whose only member is `tx`'s leg, holding
+    /// `RESERVED` of `key(1)`.
+    fn leg(tx_hash: TxHash) -> TickOutput {
+        TickOutput {
+            determined: Vec::new(),
+            provisional: vec![ProvisionalTx {
+                tx_hash,
+                writes: Some(debit(key(1), RESERVED)),
+                reserve: None,
+                reserved: BTreeMap::from([(key(1), RESERVED)]),
+            }],
+        }
+    }
+
+    /// What the view at `tick` holds of `key(1)`, by transaction.
+    fn held<S: VersionedStore>(chain: &TickChain<S>, tick: u64) -> BTreeMap<TxHash, u128> {
+        chain
+            .view_at(BlockHeight::new(tick))
+            .holds()
+            .get(&key(1))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A stated row's reservation is held once whichever of its leg and
+    /// its row the chain takes first: a seed finding the leg in an entry
+    /// adds nothing, and an entry appended over a seeded hold takes it
+    /// over.
+    #[test]
+    fn a_stated_rows_reserve_is_held_once() {
+        let once = BTreeMap::from([(tx(1), RESERVED)]);
+
+        let ran = TickChain::new(Arc::new(stated_at_three(tx(1))));
+        ran.append(BlockHeight::new(2), leg(tx(1)), &[]);
+        ran.seed_stated(&rows_stating(tx(1)));
+        assert_eq!(
+            held(&ran, 3),
+            once,
+            "the leg holds it, and the seed adds nothing"
+        );
+
+        let seeded = TickChain::new(Arc::new(stated_at_three(tx(1))));
+        seeded.seed_stated(&rows_stating(tx(1)));
+        assert_eq!(held(&seeded, 3), once, "the seed holds it");
+        seeded.append(BlockHeight::new(2), leg(tx(1)), &[]);
+        assert_eq!(held(&seeded, 3), once, "and the leg takes it over");
+    }
+
+    /// The floor raise of a recovery's crossing keeps the reservation of
+    /// the stated row whose leg it drops, and lets go of the one whose
+    /// row the crossing releases in flight: the crossing tick's baseline
+    /// and every one past it hold the stated row's reservation and not
+    /// the other.
+    #[test]
+    fn a_stated_rows_reservation_holds_across_the_floor_raise() {
+        let mut store = stated_at_three(tx(1));
+        writing(&mut store, 3, tx(2), Some(in_flight(3)));
+        writing(
+            &mut store,
+            5,
+            tx(2),
+            Some(RowState::Released {
+                settlement: Settlement::Shared,
+            }),
+        );
+        let chain = TickChain::new(Arc::new(store));
+        chain.append(BlockHeight::new(2), leg(tx(1)), &[]);
+        chain.append(BlockHeight::new(3), leg(tx(2)), &[]);
+        assert_eq!(
+            held(&chain, 3),
+            BTreeMap::from([(tx(1), RESERVED), (tx(2), RESERVED)]),
+        );
+
+        chain.raise_floor(BlockHeight::new(4), SHARD);
+        assert!(chain.is_empty(), "every entry at or below the floor goes");
+        for tick in [4, 5, 8] {
+            assert_eq!(
+                held(&chain, tick),
+                BTreeMap::from([(tx(1), RESERVED)]),
+                "the view at {tick} holds the stated row's reservation alone",
+            );
+        }
+    }
+
+    /// A replica that ran none of the ticks its store's rows were stated
+    /// in holds each stated row's reservation from the row's own holds.
+    #[test]
+    fn a_fresh_replica_seats_a_stated_rows_reservation_from_its_row() {
+        let chain = TickChain::new(Arc::new(stated_at_three(tx(1))));
+        assert!(held(&chain, 3).is_empty());
+        chain.seed_stated(&rows_stating(tx(1)));
+        assert_eq!(held(&chain, 3), BTreeMap::from([(tx(1), RESERVED)]));
+    }
+
+    /// A stated hold holds for every view whose base holds the row stated
+    /// and none from the height the row leaves at: that base carries
+    /// what the row's end writes.
+    #[test]
+    fn a_stated_hold_is_not_read_at_or_above_its_release() {
+        let mut store = stated_at_three(tx(1));
+        writing(&mut store, 6, tx(1), Some(RowState::Accepted));
+        let chain = TickChain::new(Arc::new(store));
+        chain.seed_stated(&rows_stating(tx(1)));
+        for tick in [3, 5] {
+            assert_eq!(held(&chain, tick), BTreeMap::from([(tx(1), RESERVED)]));
+        }
+        for tick in [6, 7] {
+            assert!(held(&chain, tick).is_empty(), "released by {tick}");
+        }
+    }
+
+    /// A stated hold stays while the eviction floor is below the height
+    /// its row leaves at, a lagging executor holding it there though the
+    /// base has persisted past, and goes once the floor reaches it.
+    #[test]
+    fn a_stated_hold_drops_once_the_eviction_floor_passes_its_release() {
+        let mut store = stated_at_three(tx(1));
+        writing(&mut store, 6, tx(1), None);
+        let chain = TickChain::new(Arc::new(store));
+        chain.seed_stated(&rows_stating(tx(1)));
+
+        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(5));
+        assert_eq!(
+            held(&chain, 5),
+            BTreeMap::from([(tx(1), RESERVED)]),
+            "a tick still queued below the release reads the hold",
+        );
+
+        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(6));
+        assert!(
+            held(&chain, 5).is_empty(),
+            "the hold dropped once the eviction floor reached the release",
+        );
+    }
+
+    /// A legs half committed above the floor reaches every tick at or
+    /// above its height through the base: the view below it reads the
+    /// balance undebited with the stated row's reservation held, and the
+    /// view at it reads the debit and no hold.
+    #[test]
+    fn a_legs_half_above_the_floor_reaches_readers_through_the_base() {
+        let mut store = stated_at_three(tx(1));
+        store.history.insert(
+            BlockHeight::new(6),
+            HashMap::from([(key(1), encode_amount(100 - RESERVED).to_vec())]),
+        );
+        writing(&mut store, 6, tx(1), Some(RowState::Accepted));
+        let chain = TickChain::new(Arc::new(store));
+        chain.append(BlockHeight::new(2), leg(tx(1)), &[]);
+        chain.raise_floor(BlockHeight::new(4), SHARD);
+
+        let below = chain.view_at(BlockHeight::new(5));
+        let balance = |view: &TickView<StubStore>| {
+            amount(&view.snapshot().cell(key(1)).expect("the vault stands"))
+        };
+        assert_eq!(balance(&below), 100);
+        assert_eq!(held(&chain, 5), BTreeMap::from([(tx(1), RESERVED)]));
+        let at = chain.view_at(BlockHeight::new(6));
+        assert_eq!(balance(&at), 100 - RESERVED);
+        assert!(held(&chain, 6).is_empty());
+    }
+
+    /// A crossing seeds the reservation of a row it keeps stated where no
+    /// entry holds the leg: a replica that never ran the stating tick, or
+    /// whose run of it lands at or below the floor, holds the reservation
+    /// past the crossing as one that ran it does.
+    #[test]
+    fn a_stated_row_no_run_holds_is_seeded_at_the_crossing() {
+        let chain = TickChain::new(Arc::new(stated_at_three(tx(1))));
+        chain.raise_floor(BlockHeight::new(4), SHARD);
+        assert!(held(&chain, 4).is_empty(), "no run held the leg");
+        chain.seed_stated(&rows_stating(tx(1)));
+        chain.append(BlockHeight::new(2), leg(tx(1)), &[]);
+        assert!(chain.is_empty(), "the late run lands at or below the floor");
+        for tick in [4, 5] {
+            assert_eq!(held(&chain, tick), BTreeMap::from([(tx(1), RESERVED)]));
+        }
+    }
+
+    /// A prune whose eviction floor sits below every stated hold's tick
+    /// reads no base: a replica booting with nothing executed prunes at a
+    /// floor the store may no longer retain.
+    #[test]
+    fn a_prune_below_every_stated_hold_reads_no_base() {
+        let store = Arc::new(stated_at_three(tx(1)));
+        let chain = TickChain::new(Arc::clone(&store));
+        chain.seed_stated(&rows_stating(tx(1)));
+        chain.prune_persisted(BlockHeight::new(8), BlockHeight::GENESIS);
+        assert!(
+            lock_or_recover(&store.anchors).is_empty(),
+            "no base was read at the floor",
+        );
+        assert_eq!(held(&chain, 3), BTreeMap::from([(tx(1), RESERVED)]));
     }
 }

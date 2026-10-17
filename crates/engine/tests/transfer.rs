@@ -2136,7 +2136,7 @@ fn a_run_over_a_withdrawn_baseline_is_not_the_run_its_chain_made() {
         "the halted chain's own run declines the crossing: taken {taken}, never {never}",
     );
 
-    halted.chain.raise_floor(at);
+    halted.chain.raise_floor(at, halted.consumer);
     let (taken, never) = answers_settled(&halted.run_at(at), halted.crossing);
     assert!(
         taken && !never,
@@ -2176,7 +2176,7 @@ fn a_harvested_tick_lands_no_take_its_abandoned_tail_declined() {
     );
 
     let crossing_parent = tail.next();
-    halted.chain.raise_floor(crossing_parent);
+    halted.chain.raise_floor(crossing_parent, halted.consumer);
     halted
         .chain
         .prune_persisted(crossing_parent, BlockHeight::GENESIS);
