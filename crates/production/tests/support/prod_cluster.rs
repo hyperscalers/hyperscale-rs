@@ -10,8 +10,8 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use hyperscale_engine::GenesisConfig;
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_production::LocalValidator;
@@ -58,11 +58,6 @@ pub struct ProdCluster {
     epoch_ms: u64,
     /// Wall-clock instant captured at genesis, the origin `now` measures from.
     started: Instant,
-    /// A derivation over the same genesis the hosts run, for the routed
-    /// facts the harness reads off a transaction it built itself. The
-    /// hosts hold their own; this one answers alike for anything the
-    /// chain has not sealed since.
-    derivation: Arc<dyn Derivation>,
     /// Every validator's signer, by validator id, able to withhold its
     /// shard consensus when a scenario asks it to.
     withholding: Vec<Arc<WithholdingSigner>>,
@@ -123,13 +118,11 @@ impl ProdCluster {
         let _ = global_recorder();
         let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
-        let derivation = Executor::new(ExecutionMode::Serial).derivation();
         Self {
             runtime,
             inner,
             epoch_ms,
             started,
-            derivation,
             withholding,
             staged,
         }
@@ -277,7 +270,7 @@ impl ProdCluster {
     fn host_for_tx(&self, tx: &Transaction) -> Option<usize> {
         // The harness builds transactions outside every host, so nothing
         // has derived this one and routing is a derived fact.
-        tx.try_derived(self.derivation.as_ref()).ok()?;
+        tx.try_derived(self.inner.derivation().as_ref()).ok()?;
         let topology_snapshot = self
             .inner
             .beacon_state()?
@@ -304,7 +297,7 @@ impl Drop for ProdCluster {
 
 impl Cluster for ProdCluster {
     fn derivation(&self) -> Arc<dyn Derivation> {
-        Arc::clone(&self.derivation)
+        self.inner.derivation()
     }
 
     fn submit(&mut self, tx: Arc<Transaction>) {

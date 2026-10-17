@@ -34,9 +34,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, GenesisValidators, ShardId,
-    StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
+    BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, GenesisValidators,
+    ShardId, StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -159,6 +159,8 @@ struct Host {
     /// its terminal verdict here, the only place a counterpart abort (which
     /// never lands on-chain) is observable.
     tx_status: Arc<TxStatusCache>,
+    /// The host engine's derivation, which knows what its chains created.
+    derivation: Arc<dyn Derivation>,
     /// Every `RocksDbShardStorage` this host has opened, shared live with
     /// the runner for chain scans and byte-total reads.
     stores: StoreRegistry,
@@ -267,6 +269,12 @@ impl Harness {
         };
         harness.await_genesis_installed().await;
         harness
+    }
+
+    /// A derivation over everything the cluster's chains have created: the
+    /// first host's engine's, as a scenario asks of any host.
+    pub fn derivation(&self) -> Arc<dyn Derivation> {
+        Arc::clone(&self.hosts[0].derivation)
     }
 
     /// Wait until every host seated on the genesis ROOT committee holds a
@@ -827,6 +835,7 @@ fn spawn_host(mut bh: BuiltHost) -> Host {
         beacon_storage: bh.beacon_storage,
         tx_submission: bh.tx_submission,
         tx_status: bh.tx_status,
+        derivation: bh.derivation,
         stores: bh.stores,
         reconfigure,
         topology,
@@ -846,6 +855,8 @@ struct BuiltHost {
     beacon_storage: Arc<RocksDbBeaconStorage>,
     tx_submission: TxSubmissionSender,
     tx_status: Arc<TxStatusCache>,
+    /// The host engine's derivation, which knows what its chains created.
+    derivation: Arc<dyn Derivation>,
     stores: StoreRegistry,
 }
 
@@ -907,6 +918,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
     // Capture the submission + status hooks before `run()` consumes the host.
     let tx_submission = runner.tx_submission_sender();
     let tx_status = runner.tx_status_cache();
+    let derivation = runner.derivation();
 
     BuiltHost {
         validator_ids,
@@ -918,6 +930,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         beacon_storage,
         tx_submission,
         tx_status,
+        derivation,
         stores,
     }
 }

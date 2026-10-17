@@ -51,8 +51,8 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS, NetworkDefinition,
-    ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight, ValidatorId,
+    BeaconChainConfig, Derivation, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS,
+    NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight, ValidatorId,
 };
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
@@ -804,6 +804,22 @@ impl ProductionRunner {
     #[must_use]
     pub fn tx_status_cache(&self) -> Arc<TxStatusCache> {
         Arc::clone(&self.tx_status)
+    }
+
+    /// The derivation this host's vnodes resolve envelopes through, held
+    /// by its engine, which learns every instance and package its chains
+    /// commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `run()` has already consumed the host.
+    #[must_use]
+    pub fn derivation(&self) -> Arc<dyn Derivation> {
+        self.host
+            .as_ref()
+            .expect("host must exist for derivation")
+            .process()
+            .derivation()
     }
 
     /// Build a transaction-submission closure for RPC handlers.
