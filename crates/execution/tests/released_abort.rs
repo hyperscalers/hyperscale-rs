@@ -8,6 +8,10 @@
 //! the charge the line states and lands none of the effects the member's
 //! run produced. The abort ends the row on this shard, and a counterpart
 //! reads its exit off this shard's state.
+//!
+//! A shared member still in flight when its stating window closes is
+//! aborted the same way, and the discard of its tick releases it alone:
+//! the members the tick keeps still state off the tick's certificate.
 
 mod common;
 
@@ -18,10 +22,12 @@ use common::sim::{ExecutionSim, LEFT, Schedule, amount, cell_of, counter};
 use hyperscale_engine::tick_select::{CommittedSets, member_lines};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::RowState;
-use hyperscale_types::test_utils::{genesis_charge, test_prefix, test_transaction_with_prefixes};
+use hyperscale_types::test_utils::{
+    genesis_charge, stub_transaction_with_reads, test_prefix, test_transaction_with_prefixes,
+};
 use hyperscale_types::{
-    Deadline, Evidence, Joins, PriceTable, Role, Settlement, ShardId, TickHalf, TickLine,
-    Transaction, WeightedTimestamp,
+    Deadline, DiscardCause, Evidence, Joins, PriceTable, PrincipalAddr, Role, Settlement, ShardId,
+    TickHalf, TickLine, TimestampRange, Transaction, TxOutcome, WeightedTimestamp, Window,
 };
 
 /// The shard the crossing also reaches.
@@ -213,4 +219,99 @@ fn a_replica_holding_only_the_line_settles_the_abort_its_peers_settle() {
     assert_eq!(retained.0, fresh.0, "one root over one outcome");
     assert_eq!(retained.1, fresh.1);
     assert_eq!(fresh.1, FUNDED - genesis_charge(&tx).amount);
+}
+
+/// A crossing paid by `payer` from this shard, writing `local` here and
+/// `remote` on its sibling, valid until `until`.
+fn crossing_until(payer: u8, local: u8, remote: u8, until: WeightedTimestamp) -> Transaction {
+    let mut body = [0u8; 31];
+    body[1] = payer;
+    stub_transaction_with_reads(
+        PrincipalAddr::new(body),
+        &[],
+        &[test_prefix(local), test_prefix(remote)],
+        1_000,
+        TimestampRange::new(WeightedTimestamp::ZERO, until),
+    )
+}
+
+/// A tick whose members all share their verdict, one near its deadline
+/// among one valid far longer, runs both and forms its certificate, and
+/// no block carries its stating half before the near member's stating
+/// window closes. The block anchored there aborts the near member and
+/// discards it from the tick; the tick keeps the other, and its stating
+/// half, built again from the certificate over the member kept, states
+/// it. The abort settles in a tick of its own.
+#[test]
+fn a_released_all_shared_tick_states_its_kept_members_from_its_certificate() {
+    let near = crossing_until(0x11, LOCAL, 200, WeightedTimestamp::from_millis(10_000));
+    let far = crossing_until(0x22, LOCAL + 1, 201, WeightedTimestamp::from_millis(60_000));
+    let mut sim = ExecutionSim::with_shards(Schedule::Eager, 2, LEFT);
+    for tx in [&near, &far] {
+        sim.fund(tx.fee_vault(), FUNDED);
+    }
+    sim.commit(vec![near.clone(), far.clone()], Vec::new());
+    sim.engage(SIBLING, &[near.hash(), far.hash()]);
+    sim.drain();
+    let tick = sim
+        .tick_of(near.hash())
+        .expect("the crossings joined a tick");
+    assert_eq!(sim.tick_of(far.hash()), Some(tick), "one tick runs both");
+    let [half] = &sim.certify_votable()[..] else {
+        panic!("the tick offers one stating half");
+    };
+    assert_eq!(half.half(), TickHalf::Stated);
+    let certified = half
+        .local_ec()
+        .expect("a stating half carries its certificate")
+        .tx_outcomes()
+        .len();
+    assert_eq!(certified, 2, "the certificate covers both members");
+
+    let closed = Window::Stating.of(Deadline::of_transaction(&near)).end;
+    assert!(
+        closed < Window::Stating.of(Deadline::of_transaction(&far)).end,
+        "the far member is still inside its stating window",
+    );
+    let lines = lines_at(&sim, closed);
+    assert!(
+        matches!(
+            &lines[..],
+            [
+                TickLine::Member { tx, joins: Joins::Aborted, .. },
+                TickLine::Discard { tick: discarded, cause: DiscardCause::Abandoned(abandoned) },
+            ] if *tx == near.hash() && *discarded == tick && *abandoned == near.hash()
+        ),
+        "the near member is aborted and discarded from its tick: {lines:?}",
+    );
+    sim.commit_naming(lines);
+    assert!(matches!(
+        sim.member_rows().members[&far.hash()].state,
+        RowState::InFlight { .. }
+    ));
+
+    sim.commit(Vec::new(), Vec::new());
+    let mut offered = sim.offered();
+    offered.extend(sim.certify_votable());
+    let kept = offered
+        .iter()
+        .find(|half| *half.tick_id() == tick)
+        .expect("the tick owes its stating half again");
+    assert_eq!(kept.half(), TickHalf::Stated);
+    let stated: Vec<_> = kept.stated_outcomes().map(TxOutcome::tx_hash).collect();
+    assert_eq!(
+        stated,
+        [far.hash()],
+        "the rebuilt half states the kept member and leaves out the aborted one",
+    );
+    sim.commit(Vec::new(), offered);
+    let rows = sim.member_rows();
+    assert!(
+        matches!(rows.members[&far.hash()].state, RowState::Stated { .. }),
+        "the kept member states off the certificate",
+    );
+    assert!(
+        !rows.members.contains_key(&near.hash()),
+        "the abort settles in its own tick",
+    );
 }

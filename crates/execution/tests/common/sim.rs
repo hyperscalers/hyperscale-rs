@@ -943,6 +943,17 @@ impl ExecutionSim {
             .collect()
     }
 
+    /// The finalizations a proposal would carry, in the order it would
+    /// carry them.
+    #[must_use]
+    pub fn offered(&self) -> Vec<Finalization> {
+        self.coord
+            .get_finalizations()
+            .iter()
+            .map(|fw| fw.as_unverified().clone())
+            .collect()
+    }
+
     /// The receipts `tick_id`'s tick produced.
     #[must_use]
     pub fn receipts_for(&self, tick_id: &TickId) -> Vec<StoredReceipt> {

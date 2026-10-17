@@ -347,18 +347,18 @@ impl<'p> Section for TransactionsSection<'p> {
     /// successors.
     ///
     /// **The cap on rows standing toward one shard.** A core or whole
-    /// member reaching beyond this shard stands until every shard it
-    /// awaits answers, on no clock of its own, so a sibling that stops
-    /// answering pins every row awaiting it. Such a transaction is
-    /// refused where the rows at the parent awaiting one of its awaited
-    /// shards, with the ones this block has already admitted, number the
-    /// cap, or owe [`MAX_OWED_TOWARD_SHARD`] crossings between them, so
-    /// one silent sibling holds no more than a quarter of what the chain
-    /// may stand holding toward its producers. Counted off the parent's
-    /// rows and the block alone, so a
-    /// proposer and every voter count alike, and under the trie the
-    /// block's terms are derived under, so what is counted for an
-    /// admitted transaction is what its row records.
+    /// member reaching beyond this shard stands, once it has stated,
+    /// until every shard it awaits answers, on no clock of its own, so a
+    /// sibling that stops answering pins every row awaiting it. Such a
+    /// transaction is refused where the rows at the parent awaiting one
+    /// of its awaited shards, with the ones this block has already
+    /// admitted, number the cap, or owe [`MAX_OWED_TOWARD_SHARD`]
+    /// crossings between them, so one silent sibling holds no more than a
+    /// quarter of what the chain may stand holding toward its producers.
+    /// Counted off the parent's rows and the block alone, so a proposer
+    /// and every voter count alike, and under the trie the block's terms
+    /// are derived under, so what is counted for an admitted transaction
+    /// is what its row records.
     ///
     /// Nothing here asks about the code a transaction runs. A node that
     /// cannot resolve a package never derives the transaction at all, so

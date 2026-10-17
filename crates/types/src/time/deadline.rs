@@ -30,6 +30,16 @@ pub const CLAIM_WINDOW: Duration = Duration::from_secs(
     EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS - MAX_FINALIZATION_DELAY.as_secs(),
 );
 
+/// The span past the deadline a member whose verdict a sibling shares
+/// may still state, before an abort ends it.
+///
+/// The deadline's own [`MAX_FINALIZATION_DELAY`] term budgets a core
+/// block's commit and propagation, not the stating of what it ran; this
+/// covers a view change, a late provision and a stating backlog. A
+/// duration rather than a count of windows: what it waits on does not
+/// scale with epoch length.
+pub const STATING_GRACE: Duration = Duration::from_mins(5);
+
 /// How long a transaction's evidence outlives the moment it was
 /// committed: everything its shape reaches, ends by.
 ///
@@ -118,6 +128,11 @@ pub enum Window {
     /// presence, which answers at whatever anchor it was taken. What
     /// this sizes is how long the chain waits on a leg's records.
     LegEntry,
+    /// Where a member in flight whose verdict a sibling shares may still
+    /// state: from the deadline to one [`STATING_GRACE`] on. Past it the
+    /// member has said nothing a sibling could read, and an abort ends
+    /// it.
+    Stating,
 }
 
 impl Window {
@@ -128,6 +143,7 @@ impl Window {
         match self {
             Self::Core => at..at.plus(MAX_VALIDITY_RANGE * 2),
             Self::LegEntry => at..at.plus(CLAIM_WINDOW),
+            Self::Stating => at..at.plus(STATING_GRACE),
         }
     }
 }
@@ -150,7 +166,7 @@ mod tests {
 
     use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
-    use super::{CLAIM_WINDOW, Deadline, Window};
+    use super::{CLAIM_WINDOW, Deadline, STATING_GRACE, Window};
     use crate::{MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, WeightedTimestamp};
 
     fn ms(value: u64) -> WeightedTimestamp {
@@ -284,6 +300,11 @@ mod tests {
             Window::Core.of(deadline),
             deadline.at()..deadline.at().plus(MAX_VALIDITY_RANGE * 2),
             "a core's absence answers for one range to refuse in and one to read it",
+        );
+        assert_eq!(
+            Window::Stating.of(deadline),
+            deadline.at()..deadline.at().plus(STATING_GRACE),
+            "a shared member may state one grace past the deadline",
         );
     }
 

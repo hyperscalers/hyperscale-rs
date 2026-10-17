@@ -607,6 +607,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 pub mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::time::Duration;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{CommittedSets, awaited_core, member_lines, member_of};
@@ -2554,7 +2555,7 @@ pub mod tests {
             assert!(missing.is_empty());
             lines
         };
-        let short = deadline.at().minus(std::time::Duration::from_millis(1));
+        let short = deadline.at().minus(Duration::from_millis(1));
         assert_eq!(named(&ran, short).len(), MAX_STANDING_TOWARD_SHARD);
         ran.members.clear();
         assert!(named(&against.members, short).is_empty());
@@ -4553,18 +4554,20 @@ pub mod tests {
     }
 
     /// No line answers `Never` for a member a tick ran that no recovery
-    /// released and no sibling's state refuses, at any clock, under any
-    /// evidence, covered by a record or not: a member its own tick
-    /// decides is named by no line while that tick owes its determined
-    /// half, and one a sibling shares the verdict on is named only by an
-    /// abort a record covers, which answers nothing, or by a fate. So
-    /// until a recovery releases the member or a sibling refuses it, a
-    /// crossing it consumed is answered by its own tick and by nothing
-    /// else.
+    /// released, no sibling's state refuses and that did not reach its
+    /// stating window's end unstated, at any clock, under any evidence,
+    /// covered by a record or not. A member its own tick decides is named
+    /// by no line while that tick owes its determined half. One a sibling
+    /// shares the verdict on is named by an abort a record covers, which
+    /// answers nothing, by a fate, or, once its stating window closes
+    /// with no record covering it, by an abort answering `Never` for what
+    /// it consumed: it never stated, so its effects apply nowhere. A
+    /// stated one is named by none of these.
     #[test]
-    fn no_line_answers_never_for_a_member_a_tick_ran() {
+    fn a_ran_member_answers_never_only_once_its_stating_window_closes_unstated() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
         let lapse = Window::LegEntry.of(deadline).end;
+        let unstated_from = Window::Stating.of(deadline).end;
         let (taker, sharer) = (
             TxHash::from(Hash::from_bytes(b"alone core")),
             TxHash::from(Hash::from_bytes(b"shared core")),
@@ -4592,6 +4595,8 @@ pub mod tests {
                 for anchor in [
                     WeightedTimestamp::from_millis(3_000),
                     deadline.at(),
+                    unstated_from.minus(Duration::from_millis(1)),
+                    unstated_from,
                     lapse,
                     lapse.plus(RETENTION_HORIZON),
                 ] {
@@ -4611,6 +4616,10 @@ pub mod tests {
                             &BTreeSet::new(),
                             &BTreeMap::new(),
                         );
+                        let unstated = rows.members[&tx].state == in_flight(2, Settlement::Shared)
+                            && !rows.members[&tx].covered
+                            && anchor >= unstated_from;
+                        let mut answered = false;
                         for line in &lines {
                             let TickLine::Member {
                                 joins, crossings, ..
@@ -4619,9 +4628,13 @@ pub mod tests {
                                 continue;
                             };
                             assert!(
-                                *joins == Joins::Aborted && crossings.is_empty(),
+                                *joins == Joins::Aborted && crossings.is_empty() != unstated,
                                 "under {said:?} at {anchor:?}: {line:?}",
                             );
+                            answered |= !crossings.is_empty();
+                        }
+                        if unstated && matches!(said, Evidence::Live { .. } | Evidence::Readable) {
+                            assert!(answered, "under {said:?} at {anchor:?}: {lines:?}");
                         }
                         if rows.members[&tx].state == in_flight(2, Settlement::Alone) {
                             assert_eq!(lines, vec![], "under {said:?} at {anchor:?}");
@@ -4658,7 +4671,7 @@ pub mod tests {
         let anchors = [
             WeightedTimestamp::from_millis(3_000),
             deadline.at(),
-            lapse.minus(std::time::Duration::from_millis(1)),
+            lapse.minus(Duration::from_millis(1)),
             lapse,
             lapse.plus(RETENTION_HORIZON),
         ];
@@ -5353,7 +5366,7 @@ pub mod tests {
         };
 
         let deadline = anchor.plus(RETENTION_HORIZON);
-        let inside = deadline.minus(std::time::Duration::from_millis(1));
+        let inside = deadline.minus(Duration::from_millis(1));
         assert!(admit(&with_entry(&topo, inside), &bare).is_ok());
         let err = admit(&with_entry(&topo, deadline), &bare).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
