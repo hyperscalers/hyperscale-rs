@@ -293,7 +293,8 @@ where
     // executed: both read it out of the same block content.
     let receipts: Vec<Arc<ConsensusReceipt>> = finalizations
         .iter()
-        .flat_map(|fw| fw.consensus_receipts())
+        .flat_map(|fw| fw.settling_receipts())
+        .map(|receipt| receipt.consensus)
         .collect();
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
     let parent_block_hash = block.header().parent_block_hash();

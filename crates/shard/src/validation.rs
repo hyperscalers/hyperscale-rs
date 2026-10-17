@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
-    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad, TickLine,
-    TopologySnapshot, Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
-    tick_manifest_admits_members, tick_terms_admit_block,
+    MAX_TICK_STAGED_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId,
+    ShardLoad, TickLine, TopologySnapshot, Transaction, Verifiable, VoteCount,
+    tick_manifest_admits_block, tick_manifest_admits_members, tick_terms_admit_block,
 };
 
 use crate::admission::{
@@ -434,8 +434,9 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     Ok(transactions.budget)
 }
 
-/// The tick manifest fits its byte budget, and names no more members
-/// than a tick's manifest may.
+/// The tick manifest fits its byte budget, names no more members than a
+/// tick's manifest may, and its member lines carry no more than
+/// [`MAX_TICK_STAGED_BYTES`] staged between them.
 pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
     let weight: usize = block
         .tick_manifest()
@@ -456,6 +457,17 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
         return Err(format!(
             "tick manifest names {members} members, over its cap"
         ));
+    }
+    let staged = block
+        .tick_manifest()
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::Member { staged, .. } => Some(*staged),
+            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+        })
+        .fold(0u64, u64::saturating_add);
+    if staged > MAX_TICK_STAGED_BYTES {
+        return Err(format!("tick manifest stages {staged} bytes, over its cap"));
     }
     Ok(())
 }
@@ -610,9 +622,13 @@ pub mod tests {
     use std::time::Duration;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_engine::tick_select::{CommittedSets, awaited_core, member_lines, member_of};
+    use hyperscale_engine::tick_select::{
+        CommittedSets, awaited_core, member_lines, member_of, staged_past_cap,
+    };
     use hyperscale_hbor::{Capped, from_slice, to_vec};
-    use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
+    use hyperscale_storage::test_helpers::{
+        commit_settled_at, make_state_writes, state_key, yes_receipt,
+    };
     use hyperscale_storage::{
         MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, Substates, TickRow, Waiting,
     };
@@ -624,22 +640,24 @@ pub mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
-        BodyRootContext, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline, DiscardCause,
-        Engagement, EngagementRoot, Epoch, Evidence, ExecutionOutcome, Finalization,
-        GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES,
-        MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS, MAX_NAMED_MEMBERS_PER_TICK,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
-        MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
-        MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
-        MemberTerms, MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
+        BodyRootContext, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline, Derivation,
+        DerivationError, Derived, DiscardCause, Engagement, EngagementRoot, Epoch, Evidence,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot,
+        LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
+        MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES,
+        MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
+        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MemberTerms,
+        MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
         ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
         RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId,
         ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
         StatedTerms, StoredReceipt, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
         TimeoutCertificate, TimestampRange, TopologySchedule, Transaction, TransactionDecision,
-        TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, Verify, VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
-        receipt_hash_of, state_claims_admit_block, test_utils, verdict_leaf,
+        TransactionEnvelope, TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp, Window,
+        WitnessSources, claims_admit_block, receipt_hash_of, state_claims_admit_block, test_utils,
+        verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
@@ -863,11 +881,21 @@ pub mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
+        let receipts: Vec<StoredReceipt> = certificate
+            .tx_outcomes()
+            .iter()
+            .filter_map(|outcome| match outcome.outcome() {
+                ExecutionOutcome::Succeeded { receipt_hash } => {
+                    Some(yes_receipt(outcome.tx_hash(), *receipt_hash))
+                }
+                ExecutionOutcome::Failed | ExecutionOutcome::Aborted => None,
+            })
+            .collect();
         Finalization::new(
             tick_id,
             TickHalf::Stated,
             Some(Arc::new(certificate)),
-            Capped::empty(),
+            Capped::new(receipts).expect("a list written out in a test"),
         )
     }
 
@@ -2140,6 +2168,60 @@ pub mod tests {
             .collect()
     }
 
+    /// The stub derivation, retaining `self.0` bytes on every shard:
+    /// what a publish of an artifact that wide declares.
+    struct Retaining(u64);
+
+    impl Derivation for Retaining {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            let mut derived = test_utils::StubVmStatics.derive(vm)?;
+            derived.work.retention = self.0;
+            derived.everywhere.retention = self.0;
+            Ok(derived)
+        }
+    }
+
+    /// [`awaiting`]'s transaction, derived as retaining `retention`.
+    fn retaining(payer: u8, other: u8, retention: u64) -> Transaction {
+        let tx = Transaction::new(awaiting(payer, other).body().clone());
+        tx.try_derived(&Retaining(retention))
+            .expect("the stub derivation routes it");
+        tx
+    }
+
+    /// A transaction with a member a sibling's verdict can discard whose
+    /// staged bound passes the receipt cap is refused at admission, free
+    /// of charge: its row could never stage the yes it would state. The
+    /// same declaration on a member no sibling's verdict can discard is
+    /// admitted, since it states no yes, and so is a shared member whose
+    /// bound fits.
+    #[test]
+    fn an_abortable_member_whose_bound_passes_the_receipt_cap_is_refused_at_admission() {
+        let (against, _, _) = among_four_shards();
+        let trie = against.snapshot.shard_trie();
+        let near_the_cell_limit = MAX_STAGED_RECEIPT_BYTES;
+        let shared = retaining(0x10, 0x50, near_the_cell_limit);
+        let alone = retaining(0x13, 0x13, near_the_cell_limit);
+        let fitting = retaining(0x11, 0x51, near_the_cell_limit / 2);
+        assert!(member_of(&shared, trie, against.local_shard).abortable());
+        assert!(!member_of(&alone, trie, against.local_shard).abortable());
+        assert!(staged_past_cap(&shared, trie).is_some());
+        assert_eq!(staged_past_cap(&alone, trie), None);
+        assert_eq!(staged_past_cap(&fitting, trie), None);
+
+        let verdicts = admit_in_order(&against, &[&shared, &alone, &fitting]);
+        let err = verdicts[0]
+            .as_ref()
+            .expect_err("a yes it could never stage");
+        assert!(err.contains("could never state"), "{err}");
+        assert_eq!(
+            verdicts[1],
+            Ok(()),
+            "a member no sibling shares states no yes"
+        );
+        assert_eq!(verdicts[2], Ok(()), "a bound within the cap");
+    }
+
     /// A core transaction is refused where the cap's worth of rows
     /// already stand toward a shard it awaits, counting the ones its own
     /// block admitted ahead of it, while one awaiting another shard and
@@ -2299,6 +2381,7 @@ pub mod tests {
             let row = MemberRow {
                 awaits: Capped::new(awaits.into_iter().collect()).expect("one shard at most"),
                 waiting: Some(Waiting {
+                    staged: 0,
                     leg: false,
                     settlement,
                     declared: Capped::empty(),
@@ -2485,6 +2568,7 @@ pub mod tests {
         let aborted = MemberInputs {
             height: BlockHeight::new(3),
             manifest: Arc::new(Capped::from_array([TickLine::Member {
+                staged: 0,
                 tx: standing[0],
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
@@ -4469,6 +4553,7 @@ pub mod tests {
             terms: vec![StatedTerms {
                 tx,
                 terms: MemberTerms {
+                    staged: 0,
                     leg: false,
                     settlement,
                     declared: Capped::empty(),
@@ -5637,6 +5722,7 @@ pub mod tests {
     /// A line naming `tx` on `joins`.
     fn joining(tx: TxHash, joins: Joins) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx,
             joins,
             settlement: Settlement::Alone,
@@ -5853,6 +5939,42 @@ pub mod tests {
                 .expect_err("a line a coast block does not carry");
             assert!(err.contains("tick lines"), "{err}");
         }
+    }
+
+    /// A block's member lines stage no more than
+    /// [`MAX_TICK_STAGED_BYTES`] between them: lines summing to the cap
+    /// are within the budget, and one byte past it is refused, off the
+    /// lines alone.
+    #[test]
+    fn a_block_whose_lines_pass_the_staged_bound_is_refused() {
+        let staging = |staged: &[u64]| {
+            naming_lines(
+                block_with_transactions(BlockHeight::new(1), Vec::new()),
+                staged
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &bytes)| {
+                        let mut line = joining(
+                            TxHash::from(Hash::from_bytes(&at.to_be_bytes())),
+                            Joins::Executes,
+                        );
+                        if let TickLine::Member { staged, .. } = &mut line {
+                            *staged = bytes;
+                        }
+                        line
+                    })
+                    .collect(),
+            )
+        };
+        let half = MAX_TICK_STAGED_BYTES / 2;
+        assert_eq!(
+            validate_tick_manifest_budget(&staging(&[half, MAX_TICK_STAGED_BYTES - half])),
+            Ok(())
+        );
+        let err =
+            validate_tick_manifest_budget(&staging(&[half, MAX_TICK_STAGED_BYTES - half + 1]))
+                .expect_err("a byte past the cap");
+        assert!(err.contains("stages"), "{err}");
     }
 
     /// An end line names no member and runs nothing: a manifest of them

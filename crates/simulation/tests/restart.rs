@@ -34,11 +34,12 @@ use hyperscale_scenarios::{
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
-    BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader, Substates,
+    BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader, Substates, staged_yes,
 };
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, GlobalReceiptRoot, HALT_THRESHOLD_EPOCHS, PrincipalAddr,
-    ShardId, TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
+    BlockHeight, ConsensusReceipt, EPOCH_DURATION, Ed25519PrivateKey, GlobalReceiptRoot,
+    HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId, TERMINAL_EVIDENCE_EPOCHS,
+    TRANSACTION_EVIDENCE_HORIZON, TickHalf, TickId, TransactionDecision, TransactionStatus, TxHash,
     verdict_leaf,
 };
 use support::{SimCluster, committee_member_host, seeded};
@@ -1565,6 +1566,248 @@ fn a_snap_synced_store_holds_the_leaves_its_peers_do() {
         "the row and its leaf go together on every replica: joiner {:?}, peer {:?}",
         stated_on(&cluster, joiner, shard, tx),
         stated_on(&cluster, peer, shard, tx),
+    );
+}
+
+/// The sponsored swap of [`a_snap_synced_store_holds_the_leaves_its_peers_do`]
+/// in a venue world whose sponsor's shard certifies nothing: the cluster,
+/// the venue's committee hosts, and the swap, which the venue's shard
+/// has stated and which waits on its sibling.
+fn stated_beside_a_silent_sponsor() -> (SimCluster, Vec<usize>, TxHash) {
+    const RESERVED: u128 = 120_000_000;
+
+    let shard = VENUE_SHARD;
+    let (accounts, (caller_key, caller), _) = venue_caller_accounts();
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
+    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let hosts = cluster.committee_hosts(shard);
+    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
+
+    let _votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
+    let swap = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        RESERVED,
+        0,
+        validity_around(cluster.now()),
+    );
+    let tx = swap.hash();
+    cluster.submit(Arc::new(swap));
+    assert!(
+        cluster.run_until(epochs(8), |c| matches!(
+            stated_on(c, hosts[1], shard, tx).0,
+            Some(RowState::Stated { .. })
+        )),
+        "the venue's shard must state the caller's member; its row stands {:?}",
+        stated_on(&cluster, hosts[1], shard, tx).0,
+    );
+    (cluster, hosts, tx)
+}
+
+/// The yes `host`'s store for `shard` stages for `tx`.
+fn staged_on(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> Option<ConsensusReceipt> {
+    c.runner()
+        .hosts_shard(u32::try_from(host).expect("a host index"), shard)
+        .and_then(|storage| staged_yes(storage, shard, tx))
+}
+
+/// Whether `host` offers a legs half accepting `tx` on `shard`.
+fn offers_legs(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool {
+    c.runner()
+        .vnode_state_in(u32::try_from(host).expect("a host index"), shard)
+        .is_some_and(|state| {
+            state
+                .execution_coordinator()
+                .get_finalizations()
+                .iter()
+                .any(|fw| fw.half() == TickHalf::Legs && fw.contains_tx(&tx))
+        })
+}
+
+/// Let the sponsor's shard certify, and run until `host` offers the legs
+/// half accepting `tx` on `shard`, stepping finely enough to see the
+/// offer between the tip that builds it and the block that settles it.
+fn await_legs_offered(c: &mut SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool {
+    const STEP: Duration = Duration::from_millis(10);
+    c.clear_drops();
+    let deadline = c.now() + Duration::from_millis(EPOCH_MS * 8);
+    while c.now() < deadline {
+        if offers_legs(c, host, shard, tx) {
+            return true;
+        }
+        c.runner_mut().topology_step();
+        let next = c.now() + STEP;
+        c.runner_mut().run_until(next);
+    }
+    false
+}
+
+/// A replica that snap-syncs past the block stating a member's yes, and
+/// so never ran the tick, holds the yes receipt its row stages and builds
+/// the member's legs half from it once the row accepts.
+#[test]
+fn a_snap_synced_joiner_builds_the_legs_half_of_a_row_it_never_ran() {
+    let shard = VENUE_SHARD;
+    let (mut cluster, hosts, tx) = stated_beside_a_silent_sponsor();
+    let (joiner, peer) = (hosts[0], hosts[1]);
+    let tick = match stated_on(&cluster, peer, shard, tx).0 {
+        Some(RowState::Stated { tick, .. }) => tick,
+        other => panic!("stated above: {other:?}"),
+    };
+    let joiner_index = u32::try_from(joiner).expect("a host index");
+    assert!(
+        cluster.run_until(epochs(4), |c| attested(c, joiner_index, shard).is_some_and(
+            |height| height > tick && staged_on(c, peer, shard, tx).is_some()
+        )),
+        "the beacon must attest a venue boundary above the stating of tick {tick:?}",
+    );
+    let anchor = attested(&cluster, joiner_index, shard).expect("just attested");
+
+    snap_sync_past(&mut cluster, joiner, shard, anchor);
+    let staged = staged_on(&cluster, joiner, shard, tx);
+    assert!(staged.is_some(), "the joiner stages the yes it never ran");
+    assert_eq!(staged, staged_on(&cluster, peer, shard, tx));
+    assert!(
+        cluster
+            .runner()
+            .vnode_state_in(joiner_index, shard)
+            .is_some_and(|state| state
+                .execution_coordinator()
+                .voted_receipt_root(&TickId::new(shard, tick))
+                .is_none()),
+        "and holds no run of its tick",
+    );
+
+    assert!(
+        await_legs_offered(&mut cluster, joiner, shard, tx),
+        "the joiner builds the legs half once the row accepts",
+    );
+    let status = await_tx_terminal(&mut cluster, tx, epochs(8));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the swap is accepted on both venues; status = {status:?}",
+    );
+    assert!(
+        cluster.run_until(epochs(8), |c| [joiner, peer]
+            .iter()
+            .all(|&host| staged_on(c, host, shard, tx).is_none())),
+        "and its staged receipt goes with its row on every replica",
+    );
+}
+
+/// A replica restarted while a member stands stated, its tick past what a
+/// restart replays, accepts the row once its sibling's yes is read: the
+/// yes it accepts on is staged in its committed state, not held by a run
+/// it would have to repeat.
+///
+/// The sponsored swap runs whole on the venue's shard and the sponsor's,
+/// and both state their yes. Neither reads the other's while the reads
+/// between the two committees are dropped, so both rows stand stated, on
+/// no clock of their own, past the reach of a restart's replay.
+#[test]
+fn a_replica_restarted_past_replay_reach_accepts_a_stated_row() {
+    const RESERVED: u128 = 120_000_000;
+
+    let shard = VENUE_SHARD;
+    let (accounts, (caller_key, caller), _) = venue_caller_accounts();
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
+    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let hosts = cluster.committee_hosts(shard);
+    let (restarted, peer) = (hosts[0], hosts[1]);
+    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
+
+    for kind in ["state_proof.request", "crossing.readings"] {
+        let _unread = cluster.drop_type_between(&hosts, &sponsors, kind);
+        let _unheard = cluster.drop_type_between(&sponsors, &hosts, kind);
+    }
+    let swap = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        RESERVED,
+        0,
+        validity_around(cluster.now()),
+    );
+    let tx = swap.hash();
+    cluster.submit(Arc::new(swap));
+    let stated = |c: &SimCluster| match stated_on(c, peer, shard, tx).0 {
+        Some(RowState::Stated { tick, .. }) => Some(tick),
+        _ => None,
+    };
+    assert!(
+        cluster.run_until(epochs(8), |c| stated(c).is_some()),
+        "the venue's shard must state the caller's member; its row stands {:?}",
+        stated_on(&cluster, peer, shard, tx).0,
+    );
+    let tick = stated(&cluster).expect("just seen");
+
+    let record_window = Duration::from_secs(EPOCH_DURATION.as_secs() * TERMINAL_EVIDENCE_EPOCHS);
+    let reach = TRANSACTION_EVIDENCE_HORIZON.max(record_window);
+    let aged = cluster.runner().now() + reach + Duration::from_secs(60);
+    cluster.runner_mut().run_until(aged);
+    assert_eq!(
+        stated(&cluster),
+        Some(tick),
+        "a stated row unread by its sibling stands on no clock of its own",
+    );
+
+    cluster.restart_host(restarted);
+    assert!(
+        cluster.run_until(epochs(4), |c| at_the_tip(c, shard, restarted, peer)),
+        "the restarted replica rejoins the tip",
+    );
+    assert!(
+        cluster
+            .runner()
+            .vnode_state_in(u32::try_from(restarted).expect("a host index"), shard)
+            .is_some_and(|state| state
+                .execution_coordinator()
+                .voted_receipt_root(&TickId::new(shard, tick))
+                .is_none()),
+        "the restart replays nothing of the stated tick",
+    );
+    let restaged = staged_on(&cluster, restarted, shard, tx);
+    assert!(restaged.is_some(), "the restarted replica stages the yes");
+    assert_eq!(restaged, staged_on(&cluster, peer, shard, tx));
+
+    assert!(
+        await_legs_offered(&mut cluster, restarted, shard, tx),
+        "the restarted replica builds the legs half once the row accepts",
+    );
+    let status = await_tx_terminal(&mut cluster, tx, epochs(8));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the swap is accepted on both venues; status = {status:?}",
+    );
+    assert!(
+        cluster.run_until(epochs(8), |c| [restarted, peer]
+            .iter()
+            .all(|&host| stated_on(c, host, shard, tx) == (None, None)
+                && staged_on(c, host, shard, tx).is_none())),
+        "the row, its leaf and its staged receipt go together on every replica",
     );
 }
 

@@ -145,11 +145,12 @@ fn committed_members(
         .collect()
 }
 
-/// What each member a finalization's receipts name left, as the receipts
-/// state it.
+/// What each member a finalization settles left, as the receipts it
+/// settles state it: never a yes a stating half carries, whose writes
+/// land only through its legs half.
 fn receipt_writes(fw: &Finalization) -> Vec<(TxHash, StateWrites)> {
-    fw.receipts()
-        .iter()
+    fw.settling_receipts()
+        .into_iter()
         .filter_map(|receipt| Some((receipt.tx_hash, receipt.consensus.writes()?.clone())))
         .collect()
 }
@@ -654,10 +655,16 @@ pub struct ExecutionCoordinator {
     parked: ParkedArtifacts,
     /// Pushed claims waiting on their anchor's proof.
     parked_claims: ParkedClaims,
-    /// The stated members whose rows at the committed tip accept on what
-    /// their siblings' state says, as the shard coordinator last handed
-    /// them over: the members a legs half may name.
-    accepting: BTreeSet<TxHash>,
+    /// The members the legs half held for each tick names, as the build
+    /// that answered last carried them. A tick's half is asked for again
+    /// only where the members its rows accept differ from these.
+    legs_offered: BTreeMap<TickId, BTreeSet<TxHash>>,
+    /// The committed tip of the one legs half build out for each tick. No
+    /// later tip asks for another while it is out, however many settle
+    /// before it answers, so a build queued behind execution is never
+    /// superseded by its own successors. An answer to a build no longer
+    /// out, one a release or a withdrawal dropped, is dropped.
+    legs_asked: BTreeMap<TickId, BlockHash>,
     /// The records the last live block wrote, by the shard owning each
     /// consumer, kept one commit for the next block's proposer to push
     /// beside the header that proves them.
@@ -797,7 +804,8 @@ impl ExecutionCoordinator {
             pending_verifications: HashSet::new(),
             parked: ParkedArtifacts::default(),
             parked_claims: ParkedClaims::new(),
-            accepting: BTreeSet::new(),
+            legs_offered: BTreeMap::new(),
+            legs_asked: BTreeMap::new(),
             pending_push: None,
             me,
             local_shard,
@@ -1203,6 +1211,7 @@ impl ExecutionCoordinator {
                 charge: entry.charge,
                 share: entry.charged,
                 reserves: Capped::empty(),
+                staged: 0,
                 deadline: entry.deadline,
                 crossings: Capped::new(crossings).expect("a star's edges are capped"),
             });
@@ -3162,7 +3171,7 @@ impl ExecutionCoordinator {
         actions.extend(self.revote_stalled_ticks(topology_schedule));
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
-        actions.extend(self.offer_legs());
+        actions.extend(self.offer_stating());
 
         // Re-broadcast outbound ECs that haven't been ACKed via tick
         // finalization. Driven from the commit cadence so the schedule is
@@ -3588,10 +3597,10 @@ impl ExecutionCoordinator {
     /// late voter for a verdict this shard has retracted.
     ///
     /// Something kept: the tick stays and so does its certificate, which
-    /// its stating half is built from. Its legs half is composed again on
-    /// the kept legs that have their verdict — one taken before may name
-    /// a released member, which every voter would refuse, so it is
-    /// evicted — and its determined half is untouched, emitted or
+    /// its stating half is built from. Its legs half is built again at
+    /// the next settled tip over the kept members whose rows accept — one
+    /// held before may name a released member, which every voter would
+    /// refuse, so it is evicted — and its determined half is untouched, emitted or
     /// pending: it releases no claim, and its writes are readable from
     /// the append. A stating half handed off and not committed states
     /// the member the release took, which the tick no longer holds: the
@@ -3608,6 +3617,8 @@ impl ExecutionCoordinator {
             .map_or_else(|| (Vec::new(), Vec::new()), |tick| tick.release(abandoned));
         let counts = self.ticks.release_tick(&tick_id, &kept);
         self.release_chain_holds(tick_id, &released, kept.is_empty());
+        self.legs_offered.remove(&tick_id);
+        self.legs_asked.remove(&tick_id);
         if kept.is_empty() {
             self.finalized.remove_tick(&tick_id);
             self.exec_certs.evict(&tick_id);
@@ -4179,18 +4190,15 @@ impl ExecutionCoordinator {
         })]
     }
 
-    /// Offer the legs half of every tick whose stated members that can
-    /// accept are not the ones its last half names: a block settled one
-    /// of them, a release let one go, or the committed tip's rows now
-    /// accept another. And the stating half of every tick that owes one
-    /// it can build: a release took a member the half it had handed off
-    /// stated, so that half was withdrawn, or the vote scan fixed this
-    /// validator's own outcomes after the tick's certificate had landed.
-    fn offer_legs(&mut self) -> Vec<Action> {
+    /// Offer the stating half of every tick that owes one it can build: a
+    /// release took a member the half it had handed off stated, so that
+    /// half was withdrawn, or the vote scan fixed this validator's own
+    /// outcomes after the tick's certificate had landed.
+    fn offer_stating(&mut self) -> Vec<Action> {
         let due: Vec<TickId> = self
             .ticks
             .ticks_iter()
-            .filter(|(_, tick)| tick.legs_ready(&self.accepting) || tick.stating_ready())
+            .filter(|(_, tick)| tick.stating_ready())
             .map(|(tick_id, _)| *tick_id)
             .collect();
         let mut actions = Vec::new();
@@ -4200,30 +4208,96 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Take `accepting` as the stated members whose rows at the committed
-    /// tip accept on what their siblings' state says, and offer the legs
-    /// half of every tick whose members that can accept changed.
+    /// Take `accepting` as the stated members, by tick, whose rows at the
+    /// committed tip `tip` accept on what their siblings' state says, and
+    /// ask for the legs half of every tick whose accepting members are not
+    /// the ones its half held names, unless a build of it is already out.
+    /// A tick no member of which accepts any more has its half withdrawn
+    /// and any build of it dropped.
     ///
     /// Execution holds no rows: the shard coordinator reads them and
-    /// hands the answer here at each settled tip. A proposer judges each
-    /// name again at its own block's anchor and cuts what no longer
-    /// stands.
-    pub fn offer_accepting(&mut self, accepting: BTreeSet<TxHash>) -> Vec<Action> {
-        if accepting == self.accepting {
+    /// hands the answer here at each settled tip, and the half is built
+    /// from the yes receipts those rows stage, so any replica holding the
+    /// chain builds it. A proposer judges each name again at its own
+    /// block's anchor and cuts what no longer stands.
+    pub fn offer_accepting(
+        &mut self,
+        tip: BlockHash,
+        tip_height: BlockHeight,
+        accepting: &BTreeMap<TickId, BTreeSet<TxHash>>,
+    ) -> Vec<Action> {
+        let gone: Vec<TickId> = self
+            .legs_offered
+            .keys()
+            .filter(|tick| !accepting.contains_key(tick))
+            .copied()
+            .collect();
+        for tick in gone {
+            self.legs_offered.remove(&tick);
+            self.finalized.remove_half(&tick, TickHalf::Legs);
+        }
+        self.legs_asked
+            .retain(|tick, _| accepting.contains_key(tick));
+        let mut actions = Vec::new();
+        for (tick, names) in accepting {
+            if self.legs_offered.get(tick) == Some(names) || self.legs_asked.contains_key(tick) {
+                continue;
+            }
+            self.legs_asked.insert(*tick, tip);
+            actions.push(Action::BuildLegsHalf {
+                tick: *tick,
+                names: names.clone(),
+                tip,
+                tip_height,
+            });
+        }
+        actions
+    }
+
+    /// Take `half`, the legs half of `tick` built at the committed tip
+    /// `tip`, and hand it off in place of the one held, recording the
+    /// names it carries; the next tip asks again where the rows accept
+    /// others. A half built at a tip older than the newest settled one is
+    /// taken as it is: a proposer judges each name again at its own
+    /// block's anchor. An answer to a build no longer out is dropped.
+    pub fn on_legs_half_built(
+        &mut self,
+        tick: TickId,
+        tip: BlockHash,
+        half: Option<Finalization>,
+    ) -> Vec<Action> {
+        if self.legs_asked.get(&tick) != Some(&tip) {
             return Vec::new();
         }
-        self.accepting = accepting;
-        self.offer_legs()
+        self.legs_asked.remove(&tick);
+        let names: BTreeSet<TxHash> = half
+            .as_ref()
+            .map_or_else(BTreeSet::new, |half| half.tx_hashes().collect());
+        if self.legs_offered.get(&tick) == Some(&names) {
+            return Vec::new();
+        }
+        // The half held names other members, and a block carrying both
+        // would name a member twice.
+        self.finalized.remove_half(&tick, TickHalf::Legs);
+        let Some(half) = half else {
+            self.legs_offered.remove(&tick);
+            return Vec::new();
+        };
+        self.legs_offered.insert(tick, names);
+        let half: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(half).into());
+        self.finalized.insert(tick, Arc::clone(&half));
+        vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+            finalizations: vec![half],
+        })]
     }
 
     /// Finalize a tick: build the [`Finalization`] of each half that can
-    /// settle, and hand it off.
+    /// settle on its certificate, and hand it off.
     ///
     /// Called when the tick's local EC is present. The determined half
     /// settles on it alone; the stating half says what it reached for
-    /// every member awaiting another shard; the legs half names the
-    /// stated members whose rows accept, and is built again, in place of
-    /// the one held, each time those members change.
+    /// every member awaiting another shard.
     fn finalize(&mut self, tick_id: &TickId) -> Vec<Action> {
         let Some(tick) = self.ticks.get_tick_mut(tick_id) else {
             return vec![];
@@ -4233,9 +4307,6 @@ impl ExecutionCoordinator {
         // states an absolute computed on top of the first.
         let determined = tick.take_determined_finalization();
         let stating = tick.take_stating_finalization();
-        let legs = tick
-            .legs_ready(&self.accepting)
-            .then(|| tick.legs_half(&self.accepting));
 
         // Local-finalization gate produces `Verified<Finalization>`; lift
         // into the `Block::Live.certificates` transport shape once so the
@@ -4245,9 +4316,6 @@ impl ExecutionCoordinator {
         for half in determined.into_iter().chain(stating) {
             let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
             actions.extend(self.emit_finalized(finalized_arc));
-        }
-        if let Some(half) = legs {
-            actions.extend(self.offer_legs_half(tick_id, half));
         }
 
         if self
@@ -4264,35 +4332,6 @@ impl ExecutionCoordinator {
             self.outbound_certs.on_tick_finalized(tick_id);
         }
         actions
-    }
-
-    /// Hand off `half`, the legs half naming every stated member of
-    /// `tick_id` that can accept now, or none where it is `None`; it
-    /// replaces the legs half the store holds for the tick wherever its
-    /// names differ.
-    fn offer_legs_half(&mut self, tick_id: &TickId, half: Option<Finalization>) -> Vec<Action> {
-        let names: Vec<TxHash> = half
-            .as_ref()
-            .map_or_else(Vec::new, |half| half.tx_hashes().collect());
-        let replaces = self
-            .ticks
-            .get_tick_mut(tick_id)
-            .is_some_and(|tick| tick.offer_legs(names));
-        if !replaces {
-            return Vec::new();
-        }
-        // The half held names other members, and a block carrying both
-        // would name a member twice.
-        self.finalized.remove_half(tick_id, TickHalf::Legs);
-        let Some(half) = half else {
-            return Vec::new();
-        };
-        let half: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(half).into());
-        self.finalized.insert(*tick_id, Arc::clone(&half));
-        vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![half],
-        })]
     }
 
     /// Record a freshly built finalization and emit its admission event,
@@ -4330,7 +4369,7 @@ impl ExecutionCoordinator {
         self.counterparts.on_settled(shard, settled);
         self.parked_claims.drop_shard(shard);
         let mut actions = self.release(topology_schedule, Wake::SettledSet(shard));
-        actions.extend(self.offer_legs());
+        actions.extend(self.offer_stating());
         actions
     }
 
@@ -4568,6 +4607,14 @@ impl ExecutionCoordinator {
                 self.finalized.remove(&copy.receipt_hash());
             }
         }
+        // Every legs half held for the tick goes with its record, one
+        // sharing no member with this one included, so none outlives the
+        // rows it names; the next settled tip asks for it again over what
+        // still accepts.
+        if fw.half() == TickHalf::Legs {
+            self.finalized.remove_half(tick_id, TickHalf::Legs);
+            self.legs_offered.remove(tick_id);
+        }
 
         // A tick settles its determined half once and its legs by
         // member, so one finalization committing says nothing about the
@@ -4716,8 +4763,11 @@ impl ExecutionCoordinator {
                     },
                     |tick| {
                         let determined = tick.determined_ready();
-                        let legs = tick.legs_ready(&self.accepting);
-                        format!("tick={tick_id}, determined_ready={determined}, legs_ready={legs}")
+                        let stating = tick.stating_ready();
+                        format!(
+                            "tick={tick_id}, determined_ready={determined}, \
+                             stating_ready={stating}"
+                        )
                     },
                 )
             },
@@ -4845,7 +4895,8 @@ mod tests {
         RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor,
         ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
         SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Verify, Window, compute_global_receipt_root, signed_bytes,
+        ValidatorInfo, ValidatorSet, Verify, Window, compute_global_receipt_root, receipt_hash_of,
+        signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -9622,6 +9673,7 @@ mod tests {
             vec![Arc::new(named_tx.clone()), Arc::new(unnamed_tx.clone())],
         );
         let lines = vec![TickLine::Member {
+            staged: 0,
             tx: named_tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,
@@ -9690,6 +9742,7 @@ mod tests {
             &naming(
                 &test_certify(sealed, 2_000),
                 vec![TickLine::Member {
+                    staged: 0,
                     tx: tx.hash(),
                     joins: Joins::Executes,
                     settlement: Settlement::Alone,
@@ -9738,6 +9791,7 @@ mod tests {
         let schedule = make_test_topology();
         let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
         let member = |tx: &Transaction| TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,
@@ -9922,6 +9976,7 @@ mod tests {
     /// certificate.
     fn alone(tx: &Transaction) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,
@@ -9939,6 +9994,7 @@ mod tests {
     /// The line naming `tx` abandoned, reaching `reach`.
     fn abandoning(tx: &Transaction, reach: &[ShardId]) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Aborted,
             settlement: if reach.is_empty() {
@@ -10294,6 +10350,33 @@ mod tests {
             .as_role(Role::Core)
     }
 
+    /// A success whose effects receipt, [`yes_of`], recomputes to the
+    /// hash it attests: a yes a stating half carries.
+    fn yes_outcome() -> ExecutionOutcome {
+        ExecutionOutcome::Succeeded {
+            receipt_hash: yes_of(TxHash::ZERO).consensus.receipt_hash(),
+        }
+    }
+
+    /// `tx_hash`'s effects receipt under [`yes_outcome`]'s hash.
+    fn yes_of(tx_hash: TxHash) -> StoredReceipt {
+        let unhashed = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        };
+        StoredReceipt::new(
+            tx_hash,
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: receipt_hash_of(&unhashed, true).expect("a projected success"),
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        )
+    }
+
     /// The stating half of tick 2 at `ROOT` over `outcomes`, carrying
     /// `receipts`, as a block may carry it.
     fn stating_of(
@@ -10343,12 +10426,12 @@ mod tests {
         let stating = stating_of(
             vec![
                 core_outcome(refused, ExecutionOutcome::Failed),
-                core_outcome(accepted, succeeded()),
+                core_outcome(accepted, yes_outcome()),
             ],
-            vec![StoredReceipt::new(
-                refused,
-                Arc::new(ConsensusReceipt::Failed),
-            )],
+            vec![
+                StoredReceipt::new(refused, Arc::new(ConsensusReceipt::Failed)),
+                yes_of(accepted),
+            ],
         );
         let effects =
             state.commit_block_carrying(&schedule, &settling(5, stating), Naming::Manifest);
@@ -10418,10 +10501,10 @@ mod tests {
 
         let stating = stating_of(
             vec![
-                core_outcome(first, succeeded()),
-                core_outcome(second, succeeded()),
+                core_outcome(first, yes_outcome()),
+                core_outcome(second, yes_outcome()),
             ],
-            Vec::new(),
+            vec![yes_of(first), yes_of(second)],
         );
         let effects =
             state.commit_block_carrying(&schedule, &settling(5, stating), Naming::Manifest);
@@ -10653,6 +10736,7 @@ mod tests {
         pair.sort_by_key(Transaction::hash);
         let [abandoned, mate] = pair;
         let line = |tx: &Transaction, joins| TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins,
             settlement: Settlement::Alone,
@@ -10758,6 +10842,7 @@ mod tests {
         );
         let resumed = make_live_block(BlockHeight::new(3), resumed_ms, ValidatorId::new(0), vec![]);
         let aborting = TickLine::Member {
+            staged: 0,
             tx: tx.hash(),
             joins: Joins::Aborted,
             settlement: Settlement::Alone,
@@ -10927,6 +11012,7 @@ mod tests {
         let committing = Verified::<CertifiedBlock>::from_persisted(naming(
             &test_certify(committing, 2_000),
             vec![TickLine::Member {
+                staged: 0,
                 tx: held_hash,
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -15104,7 +15190,6 @@ mod tests {
     /// half: no block admits one stating a member its tick no longer
     /// holds. The tick owes it again, the copy held for a proposer goes,
     /// and the next commit builds it over the members the discard kept.
-    /// No legs half is offered meanwhile, whatever is covered.
     #[test]
     fn a_stating_half_is_built_again_over_the_members_a_discard_kept() {
         let (mut state, tick_id, near, far) = state_holding_two_legs();
@@ -15114,14 +15199,8 @@ mod tests {
         assert_eq!(first[0].half(), TickHalf::Stated);
         assert_eq!(held_stating(&state).len(), 1);
         assert!(
-            announced(&state.offer_legs()).is_empty(),
+            announced(&state.offer_stating()).is_empty(),
             "a half handed off is not built again while the tick stands as it stated",
-        );
-
-        row_accepts(&mut state, near);
-        assert!(
-            announced(&state.finalize(&tick_id)).is_empty(),
-            "a covered member's legs half waits for the stating half to commit",
         );
 
         state.release_tick(tick_id, Some(far));
@@ -15136,7 +15215,7 @@ mod tests {
                 .is_some_and(|tick| tick.stating_owed() && !tick.has_spoken()),
         );
 
-        let again = announced(&state.offer_legs());
+        let again = announced(&state.offer_stating());
         assert_eq!(
             stated_by(&again),
             vec![vec![near]],
@@ -15150,20 +15229,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![again[0].receipt_hash()],
         );
-        assert!(announced(&state.offer_legs()).is_empty());
+        assert!(announced(&state.offer_stating()).is_empty());
 
         state.remove_finalization(again[0].as_unverified());
         assert!(held_stating(&state).is_empty());
-        assert_eq!(
-            names_of(&announced(&state.offer_legs())),
-            vec![vec![near]],
-            "the commit of the stating half is what lets the covered leg settle",
-        );
     }
 
     /// A discard after a tick's stating half committed builds no second
     /// one: the tick states once, the members the discard kept stand
-    /// stated, and their legs half follows as their coverage lands.
+    /// stated, and their legs half follows as their rows accept.
     #[test]
     fn a_discard_after_the_stating_half_committed_builds_no_second_one() {
         let (mut state, tick_id, near, far) = state_holding_two_legs();
@@ -15178,12 +15252,11 @@ mod tests {
                 .is_some_and(|tick| !tick.stating_owed() && !tick.stating_ready()),
             "a committed stating half is not owed again",
         );
-        assert!(announced(&state.offer_legs()).is_empty());
+        assert!(announced(&state.offer_stating()).is_empty());
         assert!(announced(&state.finalize(&tick_id)).is_empty());
         assert!(state.get_finalizations().is_empty());
 
-        row_accepts(&mut state, near);
-        let legs = announced(&state.offer_legs());
+        let legs = build_legs(&mut state, tick_id, &[near], tip(1));
         assert_eq!(names_of(&legs), vec![vec![near]]);
         assert_eq!(legs[0].half(), TickHalf::Legs);
         state.remove_finalization(legs[0].as_unverified());
@@ -15196,34 +15269,31 @@ mod tests {
     /// A replica that ran a tick and receives its own shard's
     /// certificate only after a block committed the tick's stating half
     /// hands off no stating half of its own: the chain has stated the
-    /// tick. Its legs half follows once the certificate and the
-    /// counterpart's coverage are in hand.
+    /// tick. Its legs half needs no certificate: it is built from the
+    /// rows the chain stages, as the rows accept.
     #[test]
-    fn a_replica_whose_certificate_lands_after_the_stating_commit_offers_legs_and_no_stating_half()
-    {
+    fn a_replica_whose_certificate_lands_after_the_stating_commit_offers_no_stating_half() {
         let (mut ahead, tick_id, near, far) = state_holding_two_legs();
         let stating = commit_stating(&mut ahead, tick_id);
 
         let (mut late, _, _, _) = state_running_two_legs();
         assert!(announced(&late.finalize(&tick_id)).is_empty());
         late.remove_finalization(stating.as_unverified());
-        row_accepts(&mut late, near);
-        assert!(
-            announced(&late.offer_legs()).is_empty(),
-            "nothing is built without the tick's own certificate",
+        let built = build_legs(&mut late, tick_id, &[near], tip(1));
+        assert_eq!(
+            names_of(&built),
+            vec![vec![near]],
+            "the legs half is built without the tick's own certificate",
         );
 
         late.ticks
             .get_tick_mut(&tick_id)
             .expect("the tick stands for its stated members")
             .add_execution_certificate(own_certificate(tick_id, 1_000, near, far));
-        let built = announced(&late.finalize(&tick_id));
         assert!(
-            built.iter().all(|fw| fw.half() == TickHalf::Legs),
-            "no second stating half: {:?}",
-            built.iter().map(|fw| fw.half()).collect::<Vec<_>>(),
+            announced(&late.finalize(&tick_id)).is_empty(),
+            "no second stating half",
         );
-        assert_eq!(names_of(&built), vec![vec![near]]);
         assert!(held_stating(&late).is_empty());
     }
 
@@ -15509,13 +15579,44 @@ mod tests {
                 .get_tick(&tick_id)
                 .is_some_and(|tick| !tick.stating_owed() && !tick.stating_ready()),
         );
-        assert!(announced(&state.offer_legs()).is_empty());
+        assert!(announced(&state.offer_stating()).is_empty());
     }
 
-    /// The committed tip's rows accept `member`, as the shard
-    /// coordinator hands them over.
-    fn row_accepts(state: &mut ExecutionCoordinator, member: TxHash) {
-        state.accepting.insert(member);
+    /// A committed tip of height `height`.
+    fn tip(height: u64) -> (BlockHash, BlockHeight) {
+        (
+            BlockHash::from_raw(Hash::from_bytes(&height.to_be_bytes())),
+            BlockHeight::new(height),
+        )
+    }
+
+    /// The committed tip `at`'s rows accept `names` of `tick_id`, as the
+    /// shard coordinator hands them over: answer each build it asks for
+    /// with the legs half the staged receipts of its names yield, as the
+    /// action handler does. Returns what the answers announce.
+    fn build_legs(
+        state: &mut ExecutionCoordinator,
+        tick_id: TickId,
+        names: &[TxHash],
+        (hash, height): (BlockHash, BlockHeight),
+    ) -> Vec<Arc<Verifiable<Finalization>>> {
+        let accepting = BTreeMap::from([(tick_id, names.iter().copied().collect())]);
+        let mut built = Vec::new();
+        for action in state.offer_accepting(hash, height, &accepting) {
+            let Action::BuildLegsHalf {
+                tick, names, tip, ..
+            } = action
+            else {
+                continue;
+            };
+            let receipts: Vec<StoredReceipt> = names.into_iter().map(succeeded_receipt).collect();
+            let half = Finalization::accepting(
+                tick,
+                Capped::new(receipts).expect("a list written out in a test"),
+            );
+            built.extend(announced(&state.on_legs_half_built(tick, tip, Some(half))));
+        }
+        built
     }
 
     /// The members each finalization `actions` announce names, in order.
@@ -15548,15 +15649,15 @@ mod tests {
         let (mut state, tick_id, near, far) = state_holding_two_legs();
 
         commit_stating(&mut state, tick_id);
-        let mut built = Vec::new();
-        for member in [near, far] {
-            row_accepts(&mut state, member);
-            built.extend(announced(&state.finalize(&tick_id)));
-        }
+        let mut built = build_legs(&mut state, tick_id, &[near], tip(1));
+        built.extend(build_legs(&mut state, tick_id, &[near, far], tip(2)));
 
         assert_eq!(
             names_of(&built),
-            vec![vec![near], vec![near, far]],
+            vec![
+                vec![near],
+                BTreeSet::from([near, far]).into_iter().collect::<Vec<_>>()
+            ],
             "each entry is announced as it is built",
         );
         assert_eq!(
@@ -15574,6 +15675,94 @@ mod tests {
         );
     }
 
+    /// One legs half build is out for a tick at a time: no later tip asks
+    /// for another while it is out, and its answer is taken however many
+    /// tips settled meanwhile. A build that answers with nothing, or is
+    /// lost to its tick leaving the accepting set, whose answer is then
+    /// dropped, is asked for again at the next settled tip. Once an answer
+    /// carries the names the rows accept, no tip asks again until those
+    /// change, and a tick none of whose rows accept any more has its half
+    /// withdrawn.
+    #[test]
+    fn a_lost_legs_half_build_is_redriven_at_the_next_tip() {
+        let (mut state, tick_id, near, _) = state_holding_two_legs();
+        commit_stating(&mut state, tick_id);
+        let accepting = BTreeMap::from([(tick_id, BTreeSet::from([near]))]);
+        let asks = |actions: &[Action]| -> Vec<(TickId, BlockHash)> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::BuildLegsHalf { tick, tip, .. } => Some((*tick, *tip)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let half =
+            || Finalization::accepting(tick_id, Capped::from_array([succeeded_receipt(near)]));
+
+        let (first, first_height) = tip(1);
+        assert_eq!(
+            asks(&state.offer_accepting(first, first_height, &accepting)),
+            vec![(tick_id, first)],
+        );
+        let (second, second_height) = tip(2);
+        assert!(
+            asks(&state.offer_accepting(second, second_height, &accepting)).is_empty(),
+            "one build out per tick, whatever tip settles next",
+        );
+        assert!(
+            state.on_legs_half_built(tick_id, first, None).is_empty(),
+            "a build that found nothing staged offers nothing",
+        );
+        assert!(state.get_finalizations().is_empty());
+
+        let (third, third_height) = tip(3);
+        assert_eq!(
+            asks(&state.offer_accepting(third, third_height, &accepting)),
+            vec![(tick_id, third)],
+            "and is asked again",
+        );
+        assert!(
+            asks(&state.offer_accepting(third, third_height, &BTreeMap::new())).is_empty(),
+            "a tick that accepts nothing asks for nothing",
+        );
+        assert!(
+            announced(&state.on_legs_half_built(tick_id, third, Some(half()))).is_empty(),
+            "an answer to a build its tick's withdrawal dropped is dropped",
+        );
+
+        let (fourth, fourth_height) = tip(4);
+        assert_eq!(
+            asks(&state.offer_accepting(fourth, fourth_height, &accepting)),
+            vec![(tick_id, fourth)],
+            "the lost build is asked for again at the next tip",
+        );
+        for later in 5..=7 {
+            let (later, later_height) = tip(later);
+            assert!(asks(&state.offer_accepting(later, later_height, &accepting)).is_empty());
+        }
+        assert_eq!(
+            names_of(&announced(&state.on_legs_half_built(
+                tick_id,
+                fourth,
+                Some(half())
+            ))),
+            vec![vec![near]],
+            "a build answering behind later tips is taken",
+        );
+
+        let (eighth, eighth_height) = tip(8);
+        assert!(
+            asks(&state.offer_accepting(eighth, eighth_height, &accepting)).is_empty(),
+            "the half held names what the rows accept",
+        );
+        assert!(
+            asks(&state.offer_accepting(eighth, eighth_height, &BTreeMap::new())).is_empty()
+                && state.get_finalizations().is_empty(),
+            "and goes once they accept nothing",
+        );
+    }
+
     /// A stated member accepts on its row however long after its tick
     /// the row says so: no certificate of its counterpart is ever asked
     /// for, so none lapses. The clock runs a retention horizon past the
@@ -15584,9 +15773,9 @@ mod tests {
         let (mut state, tick_id, near, _) = state_holding_two_legs();
         commit_stating(&mut state, tick_id);
         state.committed_ts = WeightedTimestamp::from_millis(past_the_horizon() + 1_000);
-        assert!(announced(&state.offer_legs()).is_empty());
+        assert!(announced(&state.offer_stating()).is_empty());
 
-        let built = announced(&state.offer_accepting(BTreeSet::from([near])));
+        let built = build_legs(&mut state, tick_id, &[near], tip(1));
         assert_eq!(names_of(&built), vec![vec![near]]);
         assert!(
             built
@@ -15620,14 +15809,14 @@ mod tests {
             vec![t],
             "the stating half states T and nothing released",
         );
-        tick.stating_committed();
-        let legs = tick
-            .legs_half(&BTreeSet::from([t]))
-            .expect("T's row accepts");
         assert_eq!(
-            legs.tx_hashes().collect::<Vec<_>>(),
+            stating
+                .stated_receipts()
+                .iter()
+                .map(|receipt| receipt.tx_hash)
+                .collect::<Vec<_>>(),
             vec![t],
-            "the legs half names T and nothing released",
+            "and carries the yes receipt T's row stages, for its legs half",
         );
         assert!(
             state
@@ -15683,6 +15872,7 @@ mod tests {
             .clone();
         let named = [
             TickLine::Member {
+                staged: 0,
                 tx: x,
                 joins: Joins::Aborted,
                 settlement: Settlement::Alone,
@@ -15725,6 +15915,7 @@ mod tests {
         crossings: Crossings,
     ) -> TickLine {
         TickLine::Member {
+            staged: 0,
             tx: transaction.hash(),
             joins: Joins::Aborted,
             settlement: if reach.is_empty() {
@@ -16560,9 +16751,18 @@ mod tests {
                 ),
             ))),
         );
+        assert_eq!(
+            names_of(&build_legs(&mut state, tick_id, &[t], tip(1))),
+            vec![vec![t]],
+        );
 
         state.release_tick(tick_id, Some(x));
 
+        assert_eq!(
+            names_of(&build_legs(&mut state, tick_id, &[t], tip(2))),
+            vec![vec![t]],
+            "the release evicts the legs half, which the next tip builds again",
+        );
         assert_eq!(
             state.ticked[&tick_id]
                 .legs
@@ -16586,7 +16786,10 @@ mod tests {
             "the released leg's holds are let go of",
         );
         assert!(
-            !state.finalized.contains(&tick_id),
+            state
+                .get_finalizations()
+                .iter()
+                .all(|fw| fw.half() == TickHalf::Legs && fw.local_ec().is_none()),
             "the legs finalization taken before the release is gone",
         );
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);

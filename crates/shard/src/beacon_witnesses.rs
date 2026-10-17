@@ -239,7 +239,7 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts().iter().cloned())
+            .flat_map(|fw| fw.settling_receipts())
             .collect();
         let missed = missed_proposals_since_prev_commit(
             local_shard,

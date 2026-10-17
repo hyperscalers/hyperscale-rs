@@ -52,6 +52,7 @@ fn crossing() -> Transaction {
 /// the sibling, awaiting nobody and answering no crossing.
 fn aborting(tx: &Transaction) -> TickLine {
     TickLine::Member {
+        staged: 0,
         tx: tx.hash(),
         joins: Joins::Aborted,
         settlement: Settlement::Awaited,

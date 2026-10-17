@@ -52,8 +52,8 @@ mod tests {
         ReceiptValidationError, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf,
         TickId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet,
         Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
-        compute_global_receipt_root_with_proof, compute_merkle_root, tick_leader, tx_outcome_leaf,
-        verify_merkle_inclusion,
+        compute_global_receipt_root_with_proof, compute_merkle_root, receipt_hash_of, tick_leader,
+        tx_outcome_leaf, verify_merkle_inclusion,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.
@@ -401,11 +401,33 @@ mod tests {
                     "{half:?} refused: {err:?}",
                 );
             }
+            let effects = ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            };
+            let receipt_hash = receipt_hash_of(&effects, true).expect("a projected success");
+            let tx_hash = TxHash::from(Hash::from_bytes(&[1; 4]));
             let own = Finalization::new(
                 tick_id,
                 half,
-                Some(make_local_ec(&tick_id, vec![make_outcome(1)])),
-                Capped::from_array([]),
+                Some(make_local_ec(
+                    &tick_id,
+                    vec![TxOutcome::new(
+                        tx_hash,
+                        ExecutionOutcome::Succeeded { receipt_hash },
+                    )],
+                )),
+                Capped::from_array([StoredReceipt::new(
+                    tx_hash,
+                    Arc::new(ConsensusReceipt::Succeeded {
+                        receipt_hash,
+                        writes: StateWrites::default(),
+                        beacon_witness_events: Capped::empty(),
+                        events: Capped::empty(),
+                    }),
+                )]),
             );
             assert_eq!(
                 hbor_from_slice::<Finalization>(&hbor_to_vec(&own).unwrap()).unwrap(),

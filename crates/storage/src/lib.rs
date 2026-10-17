@@ -66,8 +66,8 @@ pub use shard::genesis::GenesisCommit;
 pub use shard::members::{
     HeardCells, MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, SettledHalf,
     StandingQuestions, TickRow, VerdictAsks, VerdictChange, Waiting, colliding_member_row,
-    fate_writes, member_row_leaf, member_writes, reserved_total, seat_leaf, verdict_changes,
-    without_colliding_member_rows,
+    fate_writes, member_row_leaf, member_writes, reserved_total, seat_leaf, staged_yes,
+    verdict_changes, without_colliding_member_rows,
 };
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{

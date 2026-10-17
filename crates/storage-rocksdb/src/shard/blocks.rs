@@ -25,7 +25,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
     CertifiedBlock, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash, Hash,
-    ProvisionHash, QuorumCertificate, ShardId, Transaction, TxHash, Verified,
+    ProvisionHash, QuorumCertificate, ShardId, StoredReceipt, Transaction, TxHash, Verified,
 };
 use rocksdb::{ColumnFamily, DB, WriteBatch};
 
@@ -254,11 +254,12 @@ impl RocksDbShardStorage {
         // writes them: reading the block back rebuilds each finalization
         // from its attestation and these rows, and a block missing one
         // does not rebuild at all.
-        add_receipts_to_batch(
-            batch,
-            ConsensusReceiptsCf::handle(&cf),
-            block.certificates().iter().flat_map(|fw| fw.receipts()),
-        );
+        let receipts: Vec<StoredReceipt> = block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.stored_receipts())
+            .collect();
+        add_receipts_to_batch(batch, ConsensusReceiptsCf::handle(&cf), &receipts);
     }
 
     /// Fold a block's provision bodies into the same batch, and drop

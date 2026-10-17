@@ -80,6 +80,9 @@ impl ShardParticipation {
             ProtocolEvent::FinalizationVerified { result } => {
                 self.execution_coordinator.on_finalization_verified(result)
             }
+            ProtocolEvent::LegsHalfBuilt { tick, tip, half } => self
+                .execution_coordinator
+                .on_legs_half_built(tick, tip, half),
             ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
                 .execution_coordinator
                 .on_certificate_verified(topology_schedule, result),

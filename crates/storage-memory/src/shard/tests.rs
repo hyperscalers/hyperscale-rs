@@ -1009,6 +1009,12 @@ fn the_chain_floor_prunes_beneath_it() {
 }
 
 #[test]
+fn a_stating_blocks_yes_receipts_prune_with_it() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_stating_blocks_yes_receipts_prune_with_it(&storage, |_| {});
+}
+
+#[test]
 fn a_standing_member_row_keeps_its_rows() {
     test_helpers::test_a_standing_member_row_keeps_its_rows(
         SimShardStorage::default(),

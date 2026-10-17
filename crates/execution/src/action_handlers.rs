@@ -20,15 +20,15 @@ use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes};
+use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes, staged_yes};
 use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVoteNotification,
 };
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificatesSenderMessage, ExecutionVote, FinalizationContext, Mode, StateWrites,
-    Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, shard_prefix_path, signed_bytes,
+    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext, Mode,
+    StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, shard_prefix_path, signed_bytes,
 };
 
 // ============================================================================
@@ -266,6 +266,28 @@ where
                 .map(Arc::new)
                 .map_err(|(raw, err)| (Arc::new(raw), err));
             ctx.notify_protocol(ProtocolEvent::FinalizationVerified { result });
+        }
+        Action::BuildLegsHalf {
+            tick,
+            names,
+            tip,
+            tip_height,
+        } => {
+            let view = ctx.pending_chain.view_at(tip, tip_height);
+            let receipts: Vec<StoredReceipt> = names
+                .into_iter()
+                .filter_map(|tx_hash| {
+                    staged_yes(&*view, ctx.shard, tx_hash)
+                        .map(|receipt| StoredReceipt::new(tx_hash, Arc::new(receipt)))
+                })
+                .collect();
+            let half = (!receipts.is_empty()).then(|| {
+                Finalization::accepting(
+                    tick,
+                    Capped::new(receipts).expect("a tick's members are within the receipts' cap"),
+                )
+            });
+            ctx.notify_protocol(ProtocolEvent::LegsHalfBuilt { tick, tip, half });
         }
         Action::ExecuteTransactions {
             tick,

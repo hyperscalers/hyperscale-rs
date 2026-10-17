@@ -25,6 +25,8 @@ pub enum MemberCollection {
     Reserved,
     /// The verdict leaves, by member.
     Verdicts,
+    /// The yes receipts of the stated rows, by member.
+    Staged,
 }
 
 impl MemberCollection {
@@ -35,6 +37,7 @@ impl MemberCollection {
             Self::Seats => 2,
             Self::Reserved => 3,
             Self::Verdicts => 4,
+            Self::Staged => 5,
         }
     }
 

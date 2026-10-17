@@ -17,7 +17,8 @@ use hyperscale_storage::test_helpers::{
     test_a_replayed_sweep_reads_what_its_block_removed, test_a_settled_tick_pulls_the_replay_down,
     test_a_settling_claim_folds_its_removals, test_a_standing_member_row_keeps_its_rows,
     test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives,
-    test_a_stored_block_keeps_its_terms, test_a_successor_keeps_its_predecessors_terminal,
+    test_a_stating_blocks_yes_receipts_prune_with_it, test_a_stored_block_keeps_its_terms,
+    test_a_successor_keeps_its_predecessors_terminal,
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
@@ -1513,6 +1514,13 @@ fn the_chain_floor_prunes_beneath_it() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_chain_floor_prunes_beneath_it(&storage, collect_chain);
+}
+
+#[test]
+fn a_stating_blocks_yes_receipts_prune_with_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_stating_blocks_yes_receipts_prune_with_it(&storage, collect_chain);
 }
 
 /// A backlog longer than one write batch goes in one collection, held

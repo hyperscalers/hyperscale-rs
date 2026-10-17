@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1092,6 +1092,23 @@ pub enum Action {
         standing_answers: Option<StandingAnswers>,
     },
 
+    /// Build the legs half of `tick` accepting `names` from the yes
+    /// receipts the stated rows stage in the committed state at `tip`.
+    ///
+    /// Any replica holding the chain builds it, whether or not it ran the
+    /// tick. A name whose row no longer stands stated there is left out.
+    /// Returns `ProtocolEvent::LegsHalfBuilt` when complete.
+    BuildLegsHalf {
+        /// The tick whose stated members accept.
+        tick: TickId,
+        /// The members whose rows accept at `tip`.
+        names: BTreeSet<TxHash>,
+        /// The committed block the names were read at.
+        tip: BlockHash,
+        /// Its height.
+        tip_height: BlockHeight,
+    },
+
     /// Execute one tick's whole batch: the committing block's
     /// local-only tick beside every cross-shard tick whose provisions
     /// completed at that commit, as one executor batch.
@@ -1826,6 +1843,7 @@ impl Action {
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
             | Self::VerifyFinalization { .. }
+            | Self::BuildLegsHalf { .. }
             | Self::VerifyQcSignature { .. }
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
@@ -1939,6 +1957,7 @@ impl Action {
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
             | Self::VerifyFinalization { .. }
+            | Self::BuildLegsHalf { .. }
             | Self::ExecuteTransactions { .. }
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,

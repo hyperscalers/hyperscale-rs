@@ -432,6 +432,7 @@ mod tests {
 
         let (admitted, in_hand) = candidates.take_named(
             &[TickLine::Member {
+                staged: 0,
                 tx: hash,
                 joins: Joins::ExecutesAborted,
                 settlement: Settlement::Alone,
@@ -468,6 +469,7 @@ mod tests {
         let waiting = local_only(&mut candidates, tx(2));
         let (admitted, in_hand) = candidates.take_named(
             &[TickLine::Member {
+                staged: 0,
                 tx: tx(3).hash(),
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -514,6 +516,7 @@ mod tests {
         );
         let (admitted, _) = candidates.take_named(
             &[TickLine::Member {
+                staged: 0,
                 tx: hash,
                 joins: Joins::Executes,
                 settlement: Settlement::Awaited,
@@ -588,6 +591,7 @@ mod tests {
             );
             let (admitted, _) = candidates.take_named(
                 &[TickLine::Member {
+                    staged: 0,
                     tx: hash,
                     joins: Joins::ExecutesAborted,
                     settlement: Settlement::Awaited,

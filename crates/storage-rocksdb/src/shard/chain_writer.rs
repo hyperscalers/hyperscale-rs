@@ -43,11 +43,11 @@ impl ShardChainWriter for RocksDbShardStorage {
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
-        // Everything the ticks carried, for storage; only what they
-        // decided reaches state.
-        let receipts: Vec<&StoredReceipt> = finalizations
+        // What the ticks carried beside their attestations, for storage;
+        // only what they decided reaches state.
+        let receipts: Vec<StoredReceipt> = finalizations
             .iter()
-            .flat_map(|fw| fw.receipts().iter())
+            .flat_map(|fw| fw.stored_receipts())
             .collect();
         // The chain's own protocol families: the read frontier and tick
         // membership, each read off the parent state it advances.
@@ -131,7 +131,11 @@ impl ShardChainWriter for RocksDbShardStorage {
         );
 
         let cf = self.cf();
-        add_receipts_to_batch(&mut write_batch, ConsensusReceiptsCf::handle(&cf), receipts);
+        add_receipts_to_batch(
+            &mut write_batch,
+            ConsensusReceiptsCf::handle(&cf),
+            &receipts,
+        );
 
         let prepared = build_prepared_commit(
             Arc::clone(self),

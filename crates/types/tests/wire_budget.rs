@@ -23,27 +23,30 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
-    BlockHeight, CollectionId, CommittedAt, Crossings, Deadline, DeclaredKey, DeclaredRange,
-    DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement, Finalization,
-    FinalizationHash, Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
-    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_BYTES,
+    BlockHeight, CollectionId, CommittedAt, ConsensusReceipt, Crossings, Deadline, DeclaredKey,
+    DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement,
+    ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash,
+    Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK,
+    MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
+    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES, MAX_TICK_LINES_PER_BLOCK,
-    MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof,
-    ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
-    Reserves, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, SectionRoots, Settlement, ShardId,
-    SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES,
+    MAX_TICK_MANIFEST_BYTES, MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
+    MerkleInclusionProof, Movement, ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate,
+    ROUTE_PREFIX_BYTES, Reach, Reserves, Role, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM,
+    SchemeId, SectionRoots, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot,
+    StateWrites, Stated, StatedTerms, StoredReceipt, SubstateKey, TICK_CROSSING_BYTES,
     TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
-    TerminalLines, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash,
-    UNSETTLED_TX_BYTES, UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources,
-    evidence_admits_block, shard_prefix_path, state_claims_admit_block, tick_manifest_admits_block,
+    TerminalLines, TickHalf, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope,
+    TxHash, TxOutcome, UNSETTLED_TX_BYTES, UnsettledTx, Verifiable, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, evidence_admits_block, receipt_hash_of,
+    shard_prefix_path, staged_yes_bytes, state_claims_admit_block, tick_manifest_admits_block,
     tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
-use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves};
+use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves, ResourceAddr};
 
 type Jmt = Tree<Blake3Hasher, 1>;
 
@@ -553,6 +556,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         ] {
             for crossings in [0usize, 1, MAX_CROSSINGS_PER_TX] {
                 let line = TickLine::Member {
+                    staged: 0,
                     tx: widest_tx,
                     joins: Joins::ExecutesAborted,
                     settlement: Settlement::Awaited,
@@ -605,6 +609,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
     );
     assert_eq!(fate.wire_weight(), TICK_LINE_BYTES);
     let one = TickLine::Member {
+        staged: 0,
         tx: widest_tx,
         joins: Joins::Executes,
         settlement: Settlement::Alone,
@@ -673,6 +678,7 @@ fn an_end_line_round_trips_within_the_bare_line_weight() {
 #[test]
 fn a_line_at_the_crossings_cap_fits_an_empty_manifest() {
     let line = TickLine::Member {
+        staged: 0,
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
         joins: Joins::Aborted,
         settlement: Settlement::Awaited,
@@ -723,6 +729,7 @@ fn widest_terms(declared: usize, shards: usize, crossings: usize, reserves: usiz
     StatedTerms {
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
         terms: MemberTerms {
+            staged: 0,
             leg: true,
             settlement: Settlement::Awaited,
             declared: Capped::new(
@@ -919,6 +926,7 @@ fn full_verdict_claims() -> Vec<StateClaim> {
 /// admits.
 fn full_manifest() -> Vec<TickLine> {
     let line = TickLine::Member {
+        staged: 0,
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
         joins: Joins::ExecutesAborted,
         settlement: Settlement::Awaited,
@@ -1109,4 +1117,148 @@ fn a_terminal_lines_response_over_a_full_manifest_fits_the_frame() {
     const {
         assert!(MAX_TERMINAL_LINES_RESPONSE_BYTES < MAX_WIRE_MESSAGE_BYTES);
     }
+}
+
+/// `seed`'s effects receipt, writing one cell `width` bytes wide and
+/// stating the hash its content recomputes to.
+fn effects(seed: u32, width: usize) -> StoredReceipt {
+    let mut writes = StateWrites::default();
+    writes.cells.insert(
+        SubstateKey {
+            owner: Address::new([0xAB; 31], AddressClass::Component),
+            local: LocalKey(
+                Hash::from_bytes(&seed.to_be_bytes()).as_bytes()[..16]
+                    .try_into()
+                    .expect("16 bytes"),
+            ),
+        },
+        Some(vec![0xCD; width]),
+    );
+    let unhashed = ConsensusReceipt::Succeeded {
+        receipt_hash: GlobalReceiptHash::ZERO,
+        writes,
+        beacon_witness_events: Capped::empty(),
+        events: Capped::empty(),
+    };
+    let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
+    let ConsensusReceipt::Succeeded { writes, .. } = unhashed else {
+        unreachable!("built a success")
+    };
+    StoredReceipt::new(
+        TxHash::from(Hash::from_bytes(&seed.to_be_bytes())),
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    )
+}
+
+/// A refused member's outcome beside its refusal receipt, a charge at its
+/// widest.
+fn refused(seed: usize, sibling: ShardId) -> (TxOutcome, StoredReceipt) {
+    let tx_hash = TxHash::from(Hash::from_bytes(&(seed as u64 | 1 << 63).to_be_bytes()));
+    let mut writes = StateWrites::default();
+    writes.movements.insert(
+        SubstateKey {
+            owner: Address::new([0xEE; 31], AddressClass::Component),
+            local: LocalKey([0xEE; 16]),
+        },
+        Movement::unjudged(ResourceAddr::new([0xFE; 31]), u128::MAX),
+    );
+    let refusal = StoredReceipt::new(
+        tx_hash,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(tx_hash.as_bytes())),
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let outcome = TxOutcome::with_refusal(
+        tx_hash,
+        ExecutionOutcome::Failed,
+        refusal.consensus.receipt_hash(),
+    )
+    .charging(u128::MAX)
+    .awaiting([sibling])
+    .as_role(Role::Core);
+    (outcome, refusal)
+}
+
+/// A stating half of a full tick encodes within the frame: yes receipts
+/// staging [`MAX_TICK_STAGED_BYTES`] between them, each at the receipt
+/// cap, beside a refused member for every other transaction a block may
+/// carry, each with its charge, and the certificate over all of them.
+#[test]
+fn a_stating_half_of_a_full_tick_encodes_within_the_frame() {
+    let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+    let sibling = ShardId::leaf(1, 1);
+    // The value's length prefix widens with it, so the width is the
+    // widest at which the receipt still meets the cap.
+    let width = (0..=usize::try_from(MAX_STAGED_RECEIPT_BYTES).expect("a cell width"))
+        .rev()
+        .find(|&width| staged_yes_bytes(&effects(0, width).consensus) <= MAX_STAGED_RECEIPT_BYTES)
+        .expect("an empty receipt meets the cap");
+    let yes_count = u32::try_from(MAX_TICK_STAGED_BYTES / MAX_STAGED_RECEIPT_BYTES).expect("few");
+    let yeses: Vec<StoredReceipt> = (0..yes_count).map(|seed| effects(seed, width)).collect();
+    let staged: u64 = yeses
+        .iter()
+        .map(|receipt| staged_yes_bytes(&receipt.consensus))
+        .sum();
+    assert!(staged <= MAX_TICK_STAGED_BYTES);
+    assert!(staged + MAX_STAGED_RECEIPT_BYTES > MAX_TICK_STAGED_BYTES);
+
+    let mut outcomes = Vec::new();
+    let mut receipts = Vec::new();
+    for receipt in &yeses {
+        outcomes.push(
+            TxOutcome::new(
+                receipt.tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: receipt.consensus.receipt_hash(),
+                },
+            )
+            .charging(u128::MAX)
+            .awaiting([sibling])
+            .as_role(Role::Core),
+        );
+        receipts.push(receipt.clone());
+    }
+    let refusing = MAX_TXS_PER_BLOCK - yeses.len();
+    for seed in 0..refusing {
+        let (outcome, refusal) = refused(seed, sibling);
+        outcomes.push(outcome);
+        receipts.push(refusal);
+    }
+    let certificate = ExecutionCertificate::new(
+        tick_id,
+        WeightedTimestamp::from_millis(u64::MAX),
+        compute_global_receipt_root(&outcomes),
+        Capped::new(outcomes).expect("a full tick's outcomes"),
+        AggregateSignature::ZERO,
+        SignerBitfield::new(1024),
+    );
+    let half = Finalization::new(
+        tick_id,
+        TickHalf::Stated,
+        Some(Arc::new(certificate)),
+        Capped::new(receipts).expect("a receipt per outcome"),
+    );
+    assert_eq!(half.validate_against_certificates(), Ok(()));
+    let bytes = hbor_to_vec(&half).expect("a stating half encodes");
+    println!(
+        "a stating half of a full tick: {} bytes in a frame of {MAX_WIRE_MESSAGE_BYTES}",
+        bytes.len(),
+    );
+    assert!(
+        bytes.len() <= MAX_WIRE_MESSAGE_BYTES,
+        "a stating half of a full tick encodes to {} bytes, past the frame",
+        bytes.len(),
+    );
+    assert_eq!(
+        hbor_from_slice::<Finalization>(&bytes).expect("and decodes"),
+        half
+    );
 }

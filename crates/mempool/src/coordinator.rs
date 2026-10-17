@@ -53,7 +53,9 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_engine::legs::Classified;
-use hyperscale_engine::tick_select::{awaited_core, crossings_consumed, member_of};
+use hyperscale_engine::tick_select::{
+    awaited_core, crossings_consumed, member_of, staged_past_cap,
+};
 use hyperscale_metrics::{
     record_expected_tx_dropped, record_transaction_aborted, record_transaction_rejected,
 };
@@ -495,6 +497,18 @@ impl MempoolCoordinator {
                 tx_hash = ?hash,
                 work = ?tx.work(),
                 "Rejecting transaction declaring more than the protocol admits of one"
+            );
+            return None;
+        }
+
+        // A member a sibling's verdict can discard must be able to stage
+        // the yes it would state; one that never could is refused at
+        // every shard's admission, so it is not pooled.
+        if let Some(shard) = staged_past_cap(tx, topology_snapshot.shard_trie()) {
+            tracing::debug!(
+                tx_hash = ?hash,
+                ?shard,
+                "Rejecting transaction whose yes could not be staged"
             );
             return None;
         }
