@@ -7,11 +7,13 @@
 //! child it will sync, and carries them on the splitting shard's
 //! lookahead committee as `Observing` members — visible to serving and
 //! gossip, never to the consensus subset, so the shard's quorum stays
-//! at target size for the whole grow. The trie mutates at the first
-//! fold where each child's ready membership — its parent half,
-//! computed at that fold, plus its ready cohort — reaches quorum; the
-//! reshaped trie rides that fold's lookahead, so the children's
-//! committees are known a full epoch before their window opens.
+//! at target size for the whole grow. The cut is scheduled at the first
+//! fold where each child's ready membership — its parent half, computed
+//! at that fold, plus its ready cohort — reaches quorum and the shard
+//! has said no row of it hears, which it can say only once an earlier
+//! such fold has latched its drain; the reshaped trie rides the lookahead
+//! of the fold at the cut, so the children's committees are known a full
+//! epoch before their window opens.
 
 use std::collections::BTreeMap;
 
@@ -210,9 +212,11 @@ pub(super) fn lapse_split(state: &mut BeaconState, target: ShardId) {
 /// no dangling assignments to repair), and the gate asks that each
 /// child's ready membership — its parent half, ready by construction,
 /// plus its ready cohort seats — reach `2f+1` of the committee target.
-/// On the first fold where both children pass, the carve and the cut are
-/// frozen onto the record and the parent's boundary takes its terminal
-/// mark; [`apply_scheduled_splits`] does the rest a window later.
+/// The first fold where both children pass latches the drain and
+/// schedules nothing; on a later fold where both pass and the target has
+/// said it is quiet, the carve and the cut are frozen onto the record and
+/// the parent's boundary takes its terminal mark; [`apply_scheduled_splits`]
+/// does the rest a window later.
 ///
 /// The cut is the *next* window, never this one. A proposer decides
 /// whether to stamp its boundary verdicts from its own window's frozen
@@ -380,6 +384,10 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     {
         return;
     }
+    let halves = BTreeMap::from([(left, left_half.to_vec()), (right, right_half.to_vec())]);
+    if !drained(state, target) {
+        return;
+    }
     let terminal = state.current_epoch.next();
     tracing::info!(
         shard = ?target,
@@ -387,7 +395,6 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
         "Shard split readiness gate met; scheduling the cut"
     );
 
-    let halves = BTreeMap::from([(left, left_half.to_vec()), (right, right_half.to_vec())]);
     let Some(PendingReshape::Split {
         scheduled,
         admitted,
@@ -411,6 +418,47 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
         .expect("a shard asserts its split in a crossing folded under its record");
     boundary.terminal_epoch = Some(terminal);
     boundary.reshape_admitted_epoch = Some(admitted_at);
+}
+
+/// Whether the pending reshape of `target`, whose readiness gate passed
+/// in this fold, may schedule its cut: its drain has latched and its
+/// shard, or both of a merge's children, asserted quiet under it.
+///
+/// The first fold whose gate passes latches the drain instead, setting
+/// the deadline [`reshape_drain_epochs`] out, and schedules nothing: the
+/// windows that show the latch pause intake toward the shard, and only
+/// an assertion made under one of them may say it is quiet. A latched
+/// record whose gate stops passing waits, and cancels at its deadline.
+///
+/// [`reshape_drain_epochs`]: hyperscale_types::BeaconChainConfig::reshape_drain_epochs
+fn drained(state: &mut BeaconState, target: ShardId) -> bool {
+    let drain_by = state
+        .current_epoch
+        .saturating_add(state.chain_config.reshape_drain_epochs());
+    let (admitted, quiet) = match state.pending_reshapes.get_mut(&target) {
+        Some(PendingReshape::Split {
+            admitted, quiet, ..
+        }) => (admitted, *quiet),
+        Some(PendingReshape::Merge {
+            admitted: Some(admitted),
+            halves,
+            ..
+        }) => (
+            admitted,
+            halves.len() == 2 && halves.values().all(|half| half.quiet),
+        ),
+        Some(PendingReshape::Merge { admitted: None, .. }) | None => return false,
+    };
+    if admitted.drain_by.is_none() {
+        admitted.drain_by = Some(drain_by);
+        tracing::info!(
+            ?target,
+            drain_by = drain_by.inner(),
+            "Reshape readiness gate met; draining until its shard asserts quiet"
+        );
+        return false;
+    }
+    quiet
 }
 
 fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
@@ -510,7 +558,8 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
 /// Symmetric to [`schedule_ready_splits`], inverted: a merge keeps no
 /// committee-liveness half — every keeper must sync the sibling half — so
 /// the gate is simply the merged committee's ready keepers reaching
-/// `2f+1` of the target. On the first fold that passes, both children's
+/// `2f+1` of the target. The first fold that passes latches the drain;
+/// on a later fold that passes with both children quiet, both children's
 /// boundaries take the same terminal mark, so they leave the trie on one
 /// cut; [`apply_scheduled_merges`] does the rest a window later.
 ///
@@ -572,7 +621,7 @@ fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
         "a merge was admitted onto a parent id whose terminal record stands",
     );
     let quorum = 2 * byzantine_threshold(state.chain_config.shard_size as usize) + 1;
-    if keepers.values().filter(|seat| seat.ready).count() < quorum {
+    if keepers.values().filter(|seat| seat.ready).count() < quorum || !drained(state, parent) {
         return;
     }
     let terminal = state.current_epoch.next();
@@ -735,17 +784,17 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        Address, AddressClass, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence, Formed,
-        HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding, RecoveryCause, SettledTxsRoot, ShardFullness,
-        ShardWitnessPayload, SplitChildRoots, Stake, StakePoolId, TERMINAL_EVIDENCE_EPOCHS,
-        TopologySchedule,
+        Address, AddressClass, Admission, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence,
+        Formed, HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding, RecoveryCause, ReshapeKind,
+        SettledTxsRoot, Settling, ShardFullness, ShardWitnessPayload, SplitChildRoots, Stake,
+        StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
     };
 
     use super::*;
     use crate::state::committee::{recover_committees, top_up_committees};
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, block_carrying, empty_state, fold_blocks, net,
-        single_pool_state_at_genesis, validator_record,
+        apply_next_epoch, apply_witness_chunk, assert_quiet, block_carrying, empty_state,
+        fold_blocks, net, quiet_assertions, single_pool_state_at_genesis, validator_record,
     };
     use crate::state::witness::{apply_shard_payload, defer_reshape_ttls, prune_stale_reshapes};
 
@@ -789,7 +838,7 @@ mod tests {
     /// `apply_epoch`, so a gate that holds simply leaves the record
     /// untouched and a gate that passes lands its reshape here.
     fn fold_split(state: &mut BeaconState) {
-        schedule_ready_splits(state);
+        schedule_quiet_splits(state);
         if advance_to_scheduled_cut(state) {
             apply_scheduled_splits(state);
         }
@@ -797,10 +846,26 @@ mod tests {
 
     /// The merge counterpart of [`fold_split`].
     fn fold_merge(state: &mut BeaconState) {
-        schedule_ready_merges(state);
+        schedule_quiet_merges(state);
         if advance_to_scheduled_cut(state) {
             apply_scheduled_merges(state);
         }
+    }
+
+    /// The split schedulers a cut takes once its gate passes: the one
+    /// that latches the drain, and, once the target has said it is quiet,
+    /// the one that schedules the cut.
+    fn schedule_quiet_splits(state: &mut BeaconState) {
+        schedule_ready_splits(state);
+        assert_quiet(state);
+        schedule_ready_splits(state);
+    }
+
+    /// The merge counterpart of [`schedule_quiet_splits`].
+    fn schedule_quiet_merges(state: &mut BeaconState) {
+        schedule_ready_merges(state);
+        assert_quiet(state);
+        schedule_ready_merges(state);
     }
 
     /// Step to the cut a reshape just scheduled, reporting whether there
@@ -852,6 +917,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let parent_members: BTreeSet<ValidatorId> = (0..4).map(ValidatorId::new).collect();
@@ -954,6 +1020,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let gate_epoch = state.current_epoch;
@@ -964,7 +1031,7 @@ mod tests {
         mark_ready(&mut state, p, left_observer);
         let right_observer = observer_for(&state, p, right);
         mark_ready(&mut state, p, right_observer);
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         let terminal = state
             .pending_reshapes
             .get(&p)
@@ -1037,6 +1104,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let admitted = state.current_epoch;
@@ -1123,6 +1191,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let admitted = state.current_epoch;
@@ -1138,7 +1207,7 @@ mod tests {
         mark_ready(&mut state, p, left_observer);
         let right_observer = observer_for(&state, p, right);
         mark_ready(&mut state, p, right_observer);
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         assert!(
             state.pending_reshapes[&p].scheduled_terminal().is_some(),
             "the gate schedules the cut",
@@ -1197,6 +1266,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
@@ -1236,6 +1306,7 @@ mod tests {
                 &ShardWitnessPayload::ScheduleSplit {
                     shard: p,
                     epoch: Epoch::GENESIS,
+                    settling: None,
                 },
             );
             let observers: Vec<ValidatorId> = cohort_of(state, p).keys().copied().collect();
@@ -1261,6 +1332,7 @@ mod tests {
         let split = ShardWitnessPayload::ScheduleSplit {
             shard: p,
             epoch: Epoch::GENESIS,
+            settling: None,
         };
 
         // Admission: the draw surfaces with assignments.
@@ -1319,9 +1391,13 @@ mod tests {
             })
             .collect();
         let effects = apply_witness_chunk(&mut state, 0, ready_leaves);
+        assert!(drain_latched(&state, p), "the gate must fire");
+        assert!(effects.observers_released.is_empty());
+        let quiet = quiet_payloads(&state);
+        let effects = apply_witness_chunk(&mut state, 0, quiet);
         assert!(
             state.pending_reshapes[&p].scheduled_terminal().is_some(),
-            "the gate must fire"
+            "the quiet target must be scheduled"
         );
         assert!(effects.observers_released.is_empty());
 
@@ -1381,14 +1457,16 @@ mod tests {
             vec![ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             }],
         );
         assert!(state.pending_reshapes.contains_key(&p));
         let consensus_during_grow = state.shard_consensus_members.clone();
 
         // The next epoch folds every observer's ReshapeReady; the gate
-        // fires inside that apply and schedules the cut a window out.
-        // The fold at the cut is the one whose lookahead carries the
+        // fires inside that apply and latches the drain, and the one
+        // after folds the target's quiet and schedules the cut a window
+        // out. The fold at the cut is the one whose lookahead carries the
         // children.
         let ready_leaves: Vec<ShardWitnessPayload> = cohort_of(&state, p)
             .iter()
@@ -1398,6 +1476,9 @@ mod tests {
             })
             .collect();
         apply_witness_chunk(&mut state, 0, ready_leaves);
+        assert!(drain_latched(&state, p));
+        let quiet = quiet_payloads(&state);
+        apply_witness_chunk(&mut state, 0, quiet);
         assert!(state.pending_reshapes[&p].scheduled_terminal().is_some());
         apply_witness_chunk(&mut state, 0, Vec::new());
         assert!(state.pending_reshapes.is_empty());
@@ -1873,6 +1954,7 @@ mod tests {
             let merge = ShardWitnessPayload::ScheduleMerge {
                 parent,
                 epoch: Epoch::GENESIS,
+                settling: None,
             };
             apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
             apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
@@ -1982,6 +2064,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         // Collected first: marking readiness borrows the state mutably.
@@ -1989,7 +2072,7 @@ mod tests {
         for observer in observers {
             mark_ready(&mut state, p, observer);
         }
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         let scheduled = state.pending_reshapes[&p]
             .scheduled_terminal()
             .expect("the gate fires");
@@ -2043,7 +2126,7 @@ mod tests {
                 },
             );
         }
-        schedule_ready_merges(&mut state);
+        schedule_quiet_merges(&mut state);
         let scheduled = state.pending_reshapes[&parent]
             .scheduled_terminal()
             .expect("the gate fires");
@@ -2120,13 +2203,14 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
         for observer in observers {
             mark_ready(&mut state, p, observer);
         }
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         let cut = state.pending_reshapes[&p]
             .scheduled_terminal()
             .expect("the gate fires");
@@ -2148,6 +2232,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
 
@@ -2184,7 +2269,7 @@ mod tests {
                 },
             );
         }
-        schedule_ready_merges(&mut state);
+        schedule_quiet_merges(&mut state);
         let cut = state.pending_reshapes[&parent]
             .scheduled_terminal()
             .expect("the gate fires");
@@ -2220,13 +2305,14 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
         for observer in &observers {
             mark_ready(&mut state, p, *observer);
         }
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         assert!(state.pending_reshapes[&p].scheduled_terminal().is_some());
         let approved = cohort_of(&state, p).clone();
 
@@ -2246,6 +2332,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
 
@@ -2302,6 +2389,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         for child in [left, right] {
@@ -2449,6 +2537,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         assert_eq!(state.pooled_validators().len(), 2);
@@ -2515,6 +2604,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         // Two parent members leave; their refills seat unready, so two of
@@ -2534,7 +2624,7 @@ mod tests {
             let observer = observer_for(&state, p, child);
             mark_ready(&mut state, p, observer);
         }
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         let scheduled = state
             .pending_reshapes
             .get(&p)
@@ -2732,6 +2822,7 @@ mod tests {
         ShardWitnessPayload::ScheduleMerge {
             parent,
             epoch: Epoch::GENESIS,
+            settling: None,
         }
     }
 
@@ -2919,6 +3010,27 @@ mod tests {
     /// their load holds.
     type Triggers = Vec<(ShardId, ShardWitnessPayload)>;
 
+    /// The quiet assertions of every latched reshape, for a chunk from the
+    /// one shard the fixture contributes for.
+    fn quiet_payloads(state: &BeaconState) -> Vec<ShardWitnessPayload> {
+        quiet_assertions(state)
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect()
+    }
+
+    /// Whether `target`'s pending reshape has latched its drain and is
+    /// not yet scheduled.
+    fn drain_latched(state: &BeaconState, target: ShardId) -> bool {
+        let reshape = &state.pending_reshapes[&target];
+        let admitted = match reshape {
+            PendingReshape::Split { admitted, .. } => Some(*admitted),
+            PendingReshape::Merge { admitted, .. } => *admitted,
+        };
+        reshape.scheduled_terminal().is_none()
+            && admitted.is_some_and(|admitted| admitted.drain_by.is_some())
+    }
+
     /// Fold each of `triggers` from its source.
     fn assert_triggers(state: &mut BeaconState, triggers: &[(ShardId, ShardWitnessPayload)]) {
         for (source, trigger) in triggers {
@@ -2962,6 +3074,7 @@ mod tests {
     /// records the fold before left standing.
     fn fold_asserting(state: &mut BeaconState, triggers: &[(ShardId, ShardWitnessPayload)]) {
         assert_triggers(state, triggers);
+        assert_quiet(state);
         ready_every_seat(state);
         apply_next_epoch(state, &[]);
     }
@@ -3010,6 +3123,7 @@ mod tests {
             ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         )];
         (state, p, triggers)
@@ -3117,9 +3231,11 @@ mod tests {
         assert_eq!(*scheduled_terminal, None);
 
         fold_asserting(&mut state, &triggers);
+        assert!(drain_latched(&state, parent));
+        fold_asserting(&mut state, &triggers);
         assert_eq!(
             state.pending_reshapes[&parent].scheduled_terminal(),
-            Some(drops.next().next()),
+            Some(drops.next().next().next()),
         );
 
         fold_asserting(&mut state, &triggers);
@@ -3172,9 +3288,11 @@ mod tests {
             assert!(state.pooled_validators().is_empty());
 
             fold_asserting(&mut state, &triggers);
+            assert!(drain_latched(&state, p));
+            fold_asserting(&mut state, &triggers);
             assert_eq!(
                 state.pending_reshapes[&p].scheduled_terminal(),
-                Some(drops.next().next()),
+                Some(drops.next().next().next()),
             );
 
             fold_asserting(&mut state, &triggers);
@@ -3188,8 +3306,9 @@ mod tests {
     }
 
     /// A merge whose parent id carries no record, and a split whose
-    /// child ids carry none, are admitted by the first assertion and
-    /// scheduled by the fold that finds them ready.
+    /// child ids carry none, are admitted by the first assertion, latch
+    /// their drain at the fold that finds them ready, and are scheduled
+    /// by the fold after it, which folds their shards' quiet.
     #[test]
     fn a_reshape_onto_ids_carrying_no_record_is_admitted_at_once() {
         let (mut state, parent, triggers) = merge_asserted();
@@ -3197,9 +3316,11 @@ mod tests {
         assert_triggers(&mut state, &triggers);
         assert_eq!(keepers_of(&state, parent).len(), 4);
         fold_asserting(&mut state, &triggers);
+        assert!(drain_latched(&state, parent));
+        fold_asserting(&mut state, &triggers);
         assert_eq!(
             state.pending_reshapes[&parent].scheduled_terminal(),
-            Some(asserted_at.next().next()),
+            Some(asserted_at.next().next().next()),
         );
 
         let (mut state, p, triggers) = split_asserted();
@@ -3207,9 +3328,11 @@ mod tests {
         assert_triggers(&mut state, &triggers);
         assert_eq!(cohort_of(&state, p).len(), 4);
         fold_asserting(&mut state, &triggers);
+        assert!(drain_latched(&state, p));
+        fold_asserting(&mut state, &triggers);
         assert_eq!(
             state.pending_reshapes[&p].scheduled_terminal(),
-            Some(asserted_at.next().next()),
+            Some(asserted_at.next().next().next()),
         );
     }
 
@@ -3306,11 +3429,12 @@ mod tests {
 
     /// What [`evidence_until_live`] reads of an id whose terminal record
     /// is stamped in `stamp` and which the first fold allowed takes up
-    /// again, its cohort ready in the fold that admits it: readable to
-    /// the opening instant of the window its evidence expires at,
-    /// unreadable from there through the three whole windows after, and
-    /// live in the next. Each further fold a cohort takes to sync adds a
-    /// whole unreadable window.
+    /// again, its cohort ready in the fold that admits it and its shards
+    /// quiet in the fold after the one that latches its drain: readable
+    /// to the opening instant of the window its evidence expires at,
+    /// unreadable from there through the four whole windows after, and
+    /// live in the next. Each further fold a cohort takes to sync, or a
+    /// shard to quiet, adds a whole unreadable window.
     fn readable_then_unreadable_then_live(stamp: Epoch) -> Vec<(Epoch, Evidence, Evidence)> {
         let expires_at = stamp.inner() + TERMINAL_EVIDENCE_EPOCHS + 1;
         let live = Evidence::Live { terminating: false };
@@ -3321,7 +3445,8 @@ mod tests {
                 (expires_at + 1, Evidence::Unreadable, Evidence::Unreadable),
                 (expires_at + 2, Evidence::Unreadable, Evidence::Unreadable),
                 (expires_at + 3, Evidence::Unreadable, Evidence::Unreadable),
-                (expires_at + 4, live, live),
+                (expires_at + 4, Evidence::Unreadable, Evidence::Unreadable),
+                (expires_at + 5, live, live),
             ])
             .map(|(window, opening, last)| (Epoch::new(window), opening, last))
             .collect()
@@ -3817,6 +3942,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: target,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
     }
@@ -3833,7 +3959,7 @@ mod tests {
             let observer = observer_for(&state, p, child);
             mark_ready(&mut state, p, observer);
         }
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         assert_eq!(
             state
                 .pending_reshapes
@@ -3941,6 +4067,7 @@ mod tests {
             vec![ShardWitnessPayload::ScheduleSplit {
                 shard: p,
                 epoch: Epoch::GENESIS,
+                settling: None,
             }],
         );
 
@@ -4037,9 +4164,9 @@ mod tests {
 
         let before = state.halted_shards();
         apply_scheduled_splits(&mut state);
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         apply_scheduled_merges(&mut state);
-        schedule_ready_merges(&mut state);
+        schedule_quiet_merges(&mut state);
         let after = state.halted_shards();
 
         assert!(
@@ -4074,7 +4201,7 @@ mod tests {
                 },
             );
         }
-        schedule_ready_merges(&mut state);
+        schedule_quiet_merges(&mut state);
         assert!(advance_to_scheduled_cut(&mut state));
         for child in children {
             state
@@ -4087,9 +4214,9 @@ mod tests {
 
         let before = (state.halted_shards(), state.recovery_demand(0));
         apply_scheduled_splits(&mut state);
-        schedule_ready_splits(&mut state);
+        schedule_quiet_splits(&mut state);
         apply_scheduled_merges(&mut state);
-        schedule_ready_merges(&mut state);
+        schedule_quiet_merges(&mut state);
         let after = (state.halted_shards(), state.recovery_demand(0));
 
         assert!(
@@ -4099,5 +4226,423 @@ mod tests {
         assert_eq!(before.0, BTreeSet::from([sibling]));
         assert_eq!(before.1, BTreeSet::from([sibling]));
         assert_eq!(after, before);
+    }
+
+    // ─── the quiet gate ─────────────────────────────────────────────────
+
+    /// [`grow_state`] with `leaf(1, 0)`'s split admitted at epoch 5 and
+    /// every observer ready, so the readiness gate passes at every fold.
+    fn split_ready() -> (BeaconState, ShardId) {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(4);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+                settling: None,
+            },
+        );
+        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        for observer in observers {
+            mark_ready(&mut state, p, observer);
+        }
+        (state, p)
+    }
+
+    /// `target`'s pending admission.
+    fn admission_of(state: &BeaconState, target: ShardId) -> Admission {
+        match &state.pending_reshapes[&target] {
+            PendingReshape::Split { admitted, .. } => *admitted,
+            PendingReshape::Merge { admitted, .. } => admitted.expect("a paired merge"),
+        }
+    }
+
+    /// Whether `target`'s pending split carries its quiet bit.
+    fn split_quiet(state: &BeaconState, target: ShardId) -> bool {
+        matches!(
+            state.pending_reshapes.get(&target),
+            Some(PendingReshape::Split { quiet: true, .. })
+        )
+    }
+
+    /// Fold `target`'s split settling, naming the admission at `admitted`.
+    fn settle_split(state: &mut BeaconState, target: ShardId, admitted: Epoch, quiet: bool) {
+        apply_shard_payload(
+            &BlsVerifier,
+            state,
+            &net(),
+            target,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: target,
+                epoch: state.current_epoch,
+                settling: Some(Settling { admitted, quiet }),
+            },
+        );
+    }
+
+    /// Fold `child`'s settling of the merge under `parent`, naming the
+    /// admission at `admitted`.
+    fn settle_half(
+        state: &mut BeaconState,
+        parent: ShardId,
+        child: ShardId,
+        admitted: Epoch,
+        quiet: bool,
+    ) {
+        apply_shard_payload(
+            &BlsVerifier,
+            state,
+            &net(),
+            child,
+            &ShardWitnessPayload::ScheduleMerge {
+                parent,
+                epoch: state.current_epoch,
+                settling: Some(Settling { admitted, quiet }),
+            },
+        );
+    }
+
+    /// The fold's reshape steps in its order: the witnesses already
+    /// applied, the prune, then the schedulers.
+    fn prune_and_schedule(state: &mut BeaconState) {
+        prune_stale_reshapes(state);
+        schedule_ready_splits(state);
+        schedule_ready_merges(state);
+    }
+
+    /// The first fold whose readiness gate passes latches the drain, a
+    /// deadline the configured drain span out, and schedules nothing: no
+    /// terminal is stamped, and the next window shows the target draining
+    /// under its admission. A further fold without a quiet bit schedules
+    /// nothing and leaves the deadline where it was.
+    #[test]
+    fn a_passing_gate_latches_the_drain_and_schedules_nothing_that_fold() {
+        let (mut state, p) = split_ready();
+        assert!(!state.derive_next_topology_snapshot(net()).draining(p));
+
+        schedule_ready_splits(&mut state);
+        let admitted = admission_of(&state, p);
+        let drain_by = state
+            .current_epoch
+            .saturating_add(state.chain_config.reshape_drain_epochs());
+        assert_eq!(admitted.drain_by, Some(drain_by));
+        assert_eq!(state.pending_reshapes[&p].scheduled_terminal(), None);
+        assert_eq!(state.boundaries[&p].terminal_epoch, None);
+        assert_eq!(
+            state
+                .derive_next_topology_snapshot(net())
+                .draining_admission(p),
+            Some((ReshapeKind::Split, admitted.at)),
+        );
+
+        schedule_ready_splits(&mut state);
+        assert_eq!(state.pending_reshapes[&p].scheduled_terminal(), None);
+        assert_eq!(admission_of(&state, p).drain_by, Some(drain_by));
+    }
+
+    /// A latched split whose gate passes waits for its quiet bit: an
+    /// unquiet settling refreshes it and schedules nothing, and the quiet
+    /// one schedules the cut in the same fold.
+    #[test]
+    fn a_split_whose_gate_passes_waits_for_its_quiet_bit() {
+        let (mut state, p) = split_ready();
+        schedule_ready_splits(&mut state);
+        let at = admission_of(&state, p).at;
+
+        settle_split(&mut state, p, at, false);
+        prune_and_schedule(&mut state);
+        assert!(!split_quiet(&state, p));
+        assert_eq!(state.pending_reshapes[&p].scheduled_terminal(), None);
+
+        settle_split(&mut state, p, at, true);
+        prune_and_schedule(&mut state);
+        assert_eq!(
+            state.pending_reshapes[&p].scheduled_terminal(),
+            Some(state.current_epoch.next()),
+        );
+    }
+
+    /// A latched record is cancelled at its drain deadline, its cohort
+    /// back in the pool, and not at its readiness deadline: on a chain of
+    /// short epochs the drain deadline lies past it.
+    #[test]
+    fn a_latched_record_cancels_at_drain_by() {
+        let (mut state, p) = split_ready();
+        state.chain_config.epoch_duration_ms = 30_000;
+        let pooled = state.pooled_validators().len();
+        schedule_ready_splits(&mut state);
+        let admitted = admission_of(&state, p);
+        let drain_by = admitted.drain_by.expect("latched");
+        assert!(drain_by > admitted.ready_by);
+
+        let at = admitted.at;
+        for epoch in admitted.ready_by.inner()..drain_by.inner() {
+            state.current_epoch = Epoch::new(epoch);
+            settle_split(&mut state, p, at, false);
+            prune_and_schedule(&mut state);
+            assert!(state.pending_reshapes.contains_key(&p), "kept at {epoch}");
+        }
+        state.current_epoch = drain_by;
+        settle_split(&mut state, p, at, false);
+        prune_and_schedule(&mut state);
+        assert!(!state.pending_reshapes.contains_key(&p));
+        assert_eq!(state.pooled_validators().len(), pooled + 4);
+    }
+
+    /// A quiet leaf folded the fold before the drain deadline schedules
+    /// the cut.
+    #[test]
+    fn a_quiet_leaf_folded_the_fold_before_drain_by_schedules_the_cut() {
+        let (mut state, p) = split_ready();
+        schedule_ready_splits(&mut state);
+        let admitted = admission_of(&state, p);
+        let drain_by = admitted.drain_by.expect("latched");
+
+        state.current_epoch = Epoch::new(drain_by.inner() - 1);
+        settle_split(&mut state, p, admitted.at, true);
+        prune_and_schedule(&mut state);
+        assert_eq!(
+            state.pending_reshapes[&p].scheduled_terminal(),
+            Some(drain_by)
+        );
+    }
+
+    /// A quiet leaf folded at the drain deadline schedules nothing: the
+    /// prune cancels the record before the schedulers read the fold.
+    #[test]
+    fn a_quiet_leaf_folded_at_drain_by_schedules_nothing() {
+        let (mut state, p) = split_ready();
+        schedule_ready_splits(&mut state);
+        let admitted = admission_of(&state, p);
+
+        state.current_epoch = admitted.drain_by.expect("latched");
+        settle_split(&mut state, p, admitted.at, true);
+        assert!(split_quiet(&state, p), "the leaf folds");
+        prune_and_schedule(&mut state);
+        assert!(!state.pending_reshapes.contains_key(&p));
+        assert_eq!(state.boundaries[&p].terminal_epoch, None);
+    }
+
+    /// A latched split whose trigger goes silent lapses its cohort as any
+    /// split does, and keeps its drain deadline: the next window still
+    /// shows the target draining.
+    #[test]
+    fn the_drain_latch_survives_a_cohort_lapse() {
+        use hyperscale_types::RESHAPE_TRIGGER_TTL_EPOCHS;
+
+        let (mut state, p) = split_ready();
+        state.chain_config.epoch_duration_ms = 30_000;
+        schedule_ready_splits(&mut state);
+        let admitted = admission_of(&state, p);
+
+        state.current_epoch = state
+            .current_epoch
+            .saturating_add(RESHAPE_TRIGGER_TTL_EPOCHS);
+        prune_and_schedule(&mut state);
+        assert!(cohort_of(&state, p).is_empty(), "the cohort lapses");
+        assert_eq!(admission_of(&state, p), admitted, "the latch stands");
+        assert!(state.derive_next_topology_snapshot(net()).draining(p));
+        assert_eq!(state.pending_reshapes[&p].scheduled_terminal(), None);
+    }
+
+    /// A settling assertion re-staffs a lapsed, latched split from its
+    /// frozen seed, as an assertion on load does, and raises its quiet
+    /// bit beside.
+    #[test]
+    fn a_lapsed_cohort_is_restaffed_by_a_settling_assertion() {
+        use hyperscale_types::RESHAPE_TRIGGER_TTL_EPOCHS;
+
+        let (mut state, p) = split_ready();
+        state.chain_config.epoch_duration_ms = 30_000;
+        let drawn: BTreeSet<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        schedule_ready_splits(&mut state);
+        let at = admission_of(&state, p).at;
+        state.current_epoch = state
+            .current_epoch
+            .saturating_add(RESHAPE_TRIGGER_TTL_EPOCHS);
+        prune_and_schedule(&mut state);
+        assert!(cohort_of(&state, p).is_empty());
+
+        settle_split(&mut state, p, at, true);
+        assert_eq!(
+            cohort_of(&state, p)
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            drawn,
+            "the same cohort, drawn again from the seed",
+        );
+        assert!(split_quiet(&state, p));
+    }
+
+    /// A settling assertion on a record that has not latched its drain
+    /// sets nothing: neither the quiet bit nor the trigger clock.
+    #[test]
+    fn a_settling_assertion_on_an_unlatched_record_sets_nothing() {
+        let (mut state, p) = split_ready();
+        let before = state.pending_reshapes[&p].clone();
+        state.current_epoch = state.current_epoch.next();
+        let at = admission_of(&state, p).at;
+        settle_split(&mut state, p, at, true);
+        assert_eq!(state.pending_reshapes[&p], before);
+    }
+
+    /// A settling assertion folded after its record was cancelled admits
+    /// nothing: no record, and no cohort leaves the pool.
+    #[test]
+    fn a_settling_assertion_after_cancellation_admits_nothing() {
+        let (mut state, p) = split_ready();
+        schedule_ready_splits(&mut state);
+        let admitted = admission_of(&state, p);
+        state.current_epoch = admitted.drain_by.expect("latched");
+        prune_and_schedule(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+        let pooled = state.pooled_validators();
+
+        settle_split(&mut state, p, admitted.at, true);
+        assert!(state.pending_reshapes.is_empty());
+        assert_eq!(state.pooled_validators(), pooled);
+    }
+
+    /// An assertion from an anchor that predates a cancel names the
+    /// cancelled admission. Folded against the re-admission that followed
+    /// it, past whose own latch the fold epoch lies, it sets nothing.
+    #[test]
+    fn a_settling_assertion_naming_a_cancelled_admission_sets_nothing() {
+        let (mut state, p) = split_ready();
+        schedule_ready_splits(&mut state);
+        let first = admission_of(&state, p);
+        state.current_epoch = first.drain_by.expect("latched");
+        prune_and_schedule(&mut state);
+        assert!(state.pending_reshapes.is_empty());
+
+        state.current_epoch = state.current_epoch.next();
+        let epoch = state.current_epoch;
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch,
+                settling: None,
+            },
+        );
+        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        for observer in observers {
+            mark_ready(&mut state, p, observer);
+        }
+        schedule_ready_splits(&mut state);
+        let second = admission_of(&state, p);
+        assert!(second.at > first.at && second.drain_by.is_some());
+        state.current_epoch = state.current_epoch.next();
+        let before = state.pending_reshapes[&p].clone();
+
+        settle_split(&mut state, p, first.at, true);
+        assert_eq!(state.pending_reshapes[&p], before);
+        prune_and_schedule(&mut state);
+        assert_eq!(state.pending_reshapes[&p].scheduled_terminal(), None);
+    }
+
+    /// A quiet bit is sticky: an unquiet leaf folded after it, as a stale
+    /// replica's might be, leaves it standing, for a split and for a
+    /// merge's half.
+    #[test]
+    fn a_later_unquiet_leaf_does_not_clear_the_quiet_bit() {
+        let (mut state, p) = split_ready();
+        schedule_ready_splits(&mut state);
+        let at = admission_of(&state, p).at;
+        settle_split(&mut state, p, at, true);
+        settle_split(&mut state, p, at, false);
+        assert!(split_quiet(&state, p));
+
+        let (mut state, parent) = merge_ready();
+        schedule_ready_merges(&mut state);
+        let at = admission_of(&state, parent).at;
+        let (left, _) = parent.children();
+        settle_half(&mut state, parent, left, at, true);
+        settle_half(&mut state, parent, left, at, false);
+        let Some(PendingReshape::Merge { halves, .. }) = state.pending_reshapes.get(&parent) else {
+            panic!("the merge stands");
+        };
+        assert!(halves[&left].quiet);
+    }
+
+    /// [`merge_grow_state`] with the merge under `leaf(1, 0)` paired and
+    /// every keeper ready, so the readiness gate passes at every fold.
+    fn merge_ready() -> (BeaconState, ShardId) {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = merge_assertion(parent);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+        for (keeper, seat) in keepers_of(&state, parent) {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                seat.child,
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: keeper,
+                    child: seat.child,
+                },
+            );
+        }
+        (state, parent)
+    }
+
+    /// A latched merge waits for both children to say they are quiet:
+    /// one quiet half schedules nothing, and the second schedules the
+    /// cut.
+    #[test]
+    fn a_merge_waits_for_both_children_quiet() {
+        let (mut state, parent) = merge_ready();
+        let (left, right) = parent.children();
+        schedule_ready_merges(&mut state);
+        let at = admission_of(&state, parent).at;
+        assert_eq!(state.pending_reshapes[&parent].scheduled_terminal(), None);
+
+        settle_half(&mut state, parent, left, at, true);
+        settle_half(&mut state, parent, right, at, false);
+        prune_and_schedule(&mut state);
+        assert_eq!(state.pending_reshapes[&parent].scheduled_terminal(), None);
+
+        settle_half(&mut state, parent, right, at, true);
+        prune_and_schedule(&mut state);
+        assert_eq!(
+            state.pending_reshapes[&parent].scheduled_terminal(),
+            Some(state.current_epoch.next()),
+        );
+    }
+
+    /// The draining view is keyed from the record, not its seats: a
+    /// child every keeper of which has dropped still reads draining under
+    /// the merge's admission.
+    #[test]
+    fn a_merge_whose_keepers_on_one_child_dropped_still_reads_that_child_draining() {
+        let (mut state, parent) = merge_ready();
+        let (left, right) = parent.children();
+        schedule_ready_merges(&mut state);
+        let at = admission_of(&state, parent).at;
+        let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.get_mut(&parent)
+        else {
+            panic!("the merge stands");
+        };
+        keepers.retain(|_, seat| seat.child != left);
+
+        let lookahead = state.derive_next_topology_snapshot(net());
+        for child in [left, right] {
+            assert_eq!(
+                lookahead.draining_admission(child),
+                Some((ReshapeKind::Merge, at)),
+                "{child:?}",
+            );
+        }
     }
 }

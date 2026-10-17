@@ -38,7 +38,7 @@ pub mod transaction;
 
 pub use beacon_witness::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, commit_witness_window, derive_leaves,
-    derive_reshape_trigger, missed_proposals_since_prev_commit, ready_leaf_payload,
+    derive_reshape_trigger, missed_proposals_since_prev_commit, ready_leaf_payload, settling_in,
 };
 pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots, UnboundBody};
 pub use leaf::{LeafRoot, SetRoot};

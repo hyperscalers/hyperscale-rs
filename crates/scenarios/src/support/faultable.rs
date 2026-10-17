@@ -9,6 +9,7 @@
 //!
 //! [`drop_type`]: FaultableCluster::drop_type
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +19,8 @@ use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    BlockHeight, MAX_CLAIMS_BYTES, MAX_STATE_CLAIMS_BYTES, ShardId, StateRoot, ValidatorId,
+    BlockHeight, MAX_CLAIMS_BYTES, MAX_STATE_CLAIMS_BYTES, PendingReshape, ShardId, StateRoot,
+    ValidatorId,
 };
 
 use super::{Budget, Cluster};
@@ -85,6 +87,23 @@ pub trait FaultableCluster: Cluster {
         &mut self,
         from: &[usize],
         to: &[usize],
+        type_id: &'static str,
+    ) -> FaultHandle;
+
+    /// Drop deliveries of `type_id` sent by a host that serves `from` to a
+    /// host that serves `to`, as [`member_hosts`] reads both sides, that
+    /// direction only. Unlike [`drop_type_between`](Self::drop_type_between)
+    /// the rule follows membership: the harness re-reads both sides as the
+    /// run advances, so a host that joins either shard after the rule is
+    /// installed is cut too. A host stays cut once it has served a side,
+    /// since it keeps the store it served it from, and a host named for a
+    /// seat counts before it takes it, which covers the gap between two
+    /// reads. The same response-leg and gossip caveats apply. The handle
+    /// sums fires over every host pair the rule has covered.
+    fn drop_type_between_members(
+        &mut self,
+        from: ShardId,
+        to: ShardId,
         type_id: &'static str,
     ) -> FaultHandle;
 
@@ -187,6 +206,78 @@ pub trait FaultableCluster: Cluster {
 
     /// Read how many observations a cluster-wide histogram holds.
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
+}
+
+/// Every host that runs or is about to run a member of `shard`: the
+/// seated copies, the hosts of the members the beacon names for this
+/// epoch and the next, and the hosts of the cohort syncing `shard`
+/// toward its split. A member the beacon has named joins once its host
+/// reads the shard's anchor, and a cohort member serves the shard's state
+/// while it syncs, so a cut drawn from the seated copies alone would leave
+/// their channels open.
+pub fn member_hosts(c: &impl FaultableCluster, shard: ShardId) -> Vec<usize> {
+    let mut hosts: BTreeSet<usize> = c.committee_hosts(shard).into_iter().collect();
+    if let Some(state) = c.beacon_state() {
+        let named = [&state.shard_committees, &state.next_shard_committees]
+            .into_iter()
+            .filter_map(|committees| committees.get(&shard))
+            .flat_map(|committee| committee.members.iter().copied());
+        let cohort = match state.pending_reshapes.get(&shard) {
+            Some(PendingReshape::Split { cohort, .. }) => cohort.keys().copied().collect(),
+            _ => Vec::new(),
+        };
+        hosts.extend(named.chain(cohort).filter_map(|member| c.host_of(member)));
+    }
+    hosts.into_iter().collect()
+}
+
+/// The two sides of a [`FaultableCluster::drop_type_between_members`]
+/// rule, and every host each side has counted since it was installed.
+pub struct MemberEdge {
+    from: ShardId,
+    to: ShardId,
+    type_id: &'static str,
+    covered: (BTreeSet<usize>, BTreeSet<usize>),
+}
+
+impl MemberEdge {
+    /// An edge from `from`'s hosts to `to`'s for `type_id`, covering no
+    /// host until it is first read.
+    #[must_use]
+    pub const fn new(from: ShardId, to: ShardId, type_id: &'static str) -> Self {
+        Self {
+            from,
+            to,
+            type_id,
+            covered: (BTreeSet::new(), BTreeSet::new()),
+        }
+    }
+
+    /// The message type the edge drops.
+    #[must_use]
+    pub const fn type_id(&self) -> &'static str {
+        self.type_id
+    }
+
+    /// The `(from, to)` host sets the edge covers now, when a host has
+    /// joined either side since it was last read. A side never drops a
+    /// host: one that leaves a shard keeps the store it served it from.
+    pub fn moved(&mut self, c: &impl FaultableCluster) -> Option<(Vec<usize>, Vec<usize>)> {
+        let joined = member_hosts(c, self.from)
+            .into_iter()
+            .filter(|host| self.covered.0.insert(*host))
+            .count()
+            + member_hosts(c, self.to)
+                .into_iter()
+                .filter(|host| self.covered.1.insert(*host))
+                .count();
+        (joined > 0).then(|| {
+            (
+                self.covered.0.iter().copied().collect(),
+                self.covered.1.iter().copied().collect(),
+            )
+        })
+    }
 }
 
 /// What a host under [`FaultableCluster::cap_block_serving`] answers a

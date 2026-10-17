@@ -52,30 +52,31 @@ pub use beacon::{
     MAX_FORK_PROOFS_PER_PROPOSER, MAX_PREFIX_SIGS, MAX_RANGE_PROOF_NODES,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_SHARDS, MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH,
     MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_SHARD, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
-    MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS, NetworkParams, ObserverSeat,
-    PC_VALUE_ELEMENT_BYTES, POOL_BUFFER_TARGET, PRODUCTION_BEACON_COMMITTEE_SIZE, ParamBoundsError,
-    ParamProposal, ParamVote, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2,
-    PcQc2VerifyError, PcQc3, PcQc3VerifyError, PcSignerLengths, PcValueElement, PcVector, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    PcVoteEquivocation, PcVoteEquivocationContext, PcVoteEquivocationVerifyError, PcVoteRound,
-    PcVoteVerifyContext, PcXpProof, PendingReshape, PendingRotation, PendingWithdrawal,
-    PoolConviction, RECOVERY_HISTORY_DEPTH, RESHAPE_HANDOFF_TTL_EPOCHS, RESHAPE_READY_TTL_EPOCHS,
-    RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert, RatifyCertVerifyError, RatifyPhase, RatifyPolka,
-    RatifyVerifyContext, RatifyVote, RatifyVoteRecord, RatifyVoteVerifyError, ReadySignal,
-    RecoveryBinding, RecoveryCause, SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG,
-    SHUFFLE_SYNC_HEADROOM, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ScheduledSplit, ShardBoundary,
-    ShardCommittee, ShardEpochContribution, ShardRecovery, ShardWitnessPayload, SkipReport,
-    SlotEffects, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
-    SpcHighTriple, SpcHighTripleVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcVerifyContext, StakePool,
-    TERMINAL_EVIDENCE_EPOCHS, TOKENS_PER_YEAR_TARGET, TransitionCause, UNBONDING_WINDOW_EPOCHS,
-    ValidatorRecord, ValidatorStatus, build_indirect_cert, build_qc1, build_qc2, build_qc3,
-    build_ratify_cert, byzantine_threshold, genesis_config_hash, hash_high_value, mce, mcp,
-    qc1_certify, ratify_quorum, ready_signal_window, sign_empty_view_msg, sign_ratify_vote,
-    sign_vote1, sign_vote2, sign_vote3, skip_target, verify_block_cert, verify_block_equivocations,
-    verify_cert, verify_certified, verify_empty_view_msg, verify_proposal_object, verify_qc1,
-    verify_qc2, verify_qc3, verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation,
-    verify_vote1, verify_vote2, verify_vote3,
+    MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS, MergeHalf, NetworkParams,
+    ObserverSeat, PC_VALUE_ELEMENT_BYTES, POOL_BUFFER_TARGET, PRODUCTION_BEACON_COMMITTEE_SIZE,
+    ParamBoundsError, ParamProposal, ParamVote, PcCompactVote, PcDivergingProof, PcQc1,
+    PcQc1VerifyError, PcQc2, PcQc2VerifyError, PcQc3, PcQc3VerifyError, PcSignerLengths,
+    PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
+    PcVoteEquivocationVerifyError, PcVoteRound, PcVoteVerifyContext, PcXpProof, PendingReshape,
+    PendingRotation, PendingWithdrawal, PoolConviction, RECOVERY_HISTORY_DEPTH, RESHAPE_DRAIN_SPAN,
+    RESHAPE_HANDOFF_TTL_EPOCHS, RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert,
+    RatifyCertVerifyError, RatifyPhase, RatifyPolka, RatifyVerifyContext, RatifyVote,
+    RatifyVoteRecord, RatifyVoteVerifyError, ReadySignal, RecoveryBinding, RecoveryCause,
+    SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG, SHUFFLE_SYNC_HEADROOM, SPC_INPUT_DWELL,
+    SPC_VIEW_TIMEOUT, ScheduledSplit, ShardBoundary, ShardCommittee, ShardEpochContribution,
+    ShardRecovery, ShardWitnessPayload, SkipReport, SlotEffects, SpcCert, SpcCertVerifyError,
+    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcHighTriple, SpcHighTripleVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcVerifyContext, StakePool, TERMINAL_EVIDENCE_EPOCHS, TOKENS_PER_YEAR_TARGET, TransitionCause,
+    UNBONDING_WINDOW_EPOCHS, ValidatorRecord, ValidatorStatus, build_indirect_cert, build_qc1,
+    build_qc2, build_qc3, build_ratify_cert, byzantine_threshold, genesis_config_hash,
+    hash_high_value, mce, mcp, qc1_certify, ratify_quorum, ready_signal_window,
+    sign_empty_view_msg, sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, skip_target,
+    verify_block_cert, verify_block_equivocations, verify_cert, verify_certified,
+    verify_empty_view_msg, verify_proposal_object, verify_qc1, verify_qc2, verify_qc3,
+    verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation, verify_vote1, verify_vote2,
+    verify_vote3,
 };
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
@@ -206,7 +207,7 @@ pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate}
 pub use shard::read_frontier::{
     FrontierInputs, FrontierRefusal, ReadFence, ReadFrontier, ReadMark, Reading, Refused,
 };
-pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
+pub use shard::reshape::{ReshapeKind, ReshapeThresholds, ReshapeTrigger, Settling};
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
     CommittingShards, LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap,
@@ -214,7 +215,7 @@ pub use shard::roots::{
     StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
-    settled_txs_root_from_hashes,
+    settled_txs_root_from_hashes, settling_in,
 };
 pub use shard::state_claim::{
     BoundaryOffer, CarriedClaims, Issuer, Recarried, StateClaim, Stated, answer_hashes,
@@ -252,7 +253,7 @@ pub use signing::{
 };
 pub use state_holds::ProvisionalHolds;
 pub use time::deadline::{
-    CLAIM_WINDOW, Deadline, TRANSACTION_EVIDENCE_HORIZON, Window, admissible_until,
+    CLAIM_WINDOW, Deadline, STATING_GRACE, TRANSACTION_EVIDENCE_HORIZON, Window, admissible_until,
 };
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
@@ -268,8 +269,8 @@ pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, Wei
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    BoundaryAttestation, Formed, RoutingCommittees, ScheduleLookup, SplitAtBoundary, Terminating,
-    TopologySchedule, Unpublished, WindowLookup, WindowView,
+    BoundaryAttestation, Formed, Reshaping, RoutingCommittees, ScheduleLookup, SplitAtBoundary,
+    Terminating, TopologySchedule, Unpublished, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
     Evidence, SettledTxSet, TerminalEvidence, TerminalLines, UnboundLines, partner_evidence,

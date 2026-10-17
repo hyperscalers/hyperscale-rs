@@ -669,8 +669,12 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
         c.run_until(epochs(8), ring_holds),
         "each venue must seat the route arriving from the venue before it, and hold it",
     );
+    // The bundle a venue's successor sends back goes out once the
+    // successor holds the route, which may be after the ring first reads
+    // held.
     assert!(
-        cut.iter().all(|handle| handle.fired() > 0),
+        c.run_until(epochs(2), |c| ring_holds(c)
+            && cut.iter().all(|handle| handle.fired() > 0)),
         "each venue must actually have been cut off from its successor's bundles",
     );
 

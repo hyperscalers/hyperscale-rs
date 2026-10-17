@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use crate::Stake;
+use crate::{MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, STATING_GRACE, Stake};
 
 // ─── Consensus timeouts ────────────────────────────────────────────────────
 
@@ -240,6 +240,18 @@ pub const RESHAPE_TRIGGER_TTL_EPOCHS: u64 = 4;
 /// after admission. Re-emission retries while the load condition
 /// holds.
 pub const RESHAPE_READY_TTL_EPOCHS: u64 = 8;
+
+/// How long a reshape that has passed its readiness gate waits, from the
+/// first window that shows it draining, for the last shared row toward
+/// its shard to state or end.
+///
+/// Intake toward the shard pauses from that window, so the rows still in
+/// flight are those committed before it: each ends by its stating
+/// window's end, which lies at most a validity range plus the
+/// finalization delay plus the stating grace past the window's opening.
+pub const RESHAPE_DRAIN_SPAN: Duration = MAX_VALIDITY_RANGE
+    .saturating_add(MAX_FINALIZATION_DELAY)
+    .saturating_add(STATING_GRACE);
 
 /// How long a reshape's successors may take to go live after the reshape
 /// executes before the handoff is flagged as stalled.

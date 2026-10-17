@@ -130,19 +130,26 @@ pub use route::{
 pub use route_reshape::{
     LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,
     a_crossing_a_merge_converges_finishes_on_the_successor,
+    a_crossing_within_a_merging_pair_settles_before_the_merge_cuts,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
-    a_leg_issued_on_a_merging_shard_reaches_its_venue, a_merged_chain_declines_at_its_own_parent,
+    a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_merged_pair_returns_a_crossing_its_consumer_never_took,
-    a_record_whose_consumers_shard_departed_is_declined_by_its_successor,
+    a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
+    a_record_whose_consumers_shard_departs_is_taken_before_the_cut,
+    a_recovery_stalled_beside_a_cancelled_split_is_drawn_again,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
     a_route_only_the_departing_venue_heard_settles_on_both_venues_or_neither,
     a_route_only_the_survivor_heard_settles_on_both_venues_or_neither,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
+    a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort,
+    a_split_beside_a_halted_sibling_returns_its_cohort_for_the_recovery,
+    a_split_on_load_beside_a_halted_sibling_takes_nothing_its_recovery_is_owed,
+    a_split_under_steady_core_load_lands_without_a_cancel,
     a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
@@ -151,7 +158,8 @@ pub use route_reshape::{
     departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
     late_departing_route_genesis_accounts, merge_train_genesis_accounts,
     merged_pair_genesis_accounts, merging_caller_genesis_accounts, merging_route_genesis_accounts,
-    saturated_reshape_genesis_accounts, split_train_genesis_accounts,
+    saturated_reshape_genesis_accounts, second_splitter_genesis_accounts,
+    split_train_genesis_accounts,
 };
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,
@@ -164,9 +172,9 @@ pub use straddler::{
 };
 pub use support::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle,
-    FaultableCluster, Nemesis, ScenarioConfig, assume, committees_on_separate_hosts, conservation,
-    discard, epochs, grow_and_hold, grow_to, query, submission_shards, tx, vote_reshape_threshold,
-    wait,
+    FaultableCluster, MemberEdge, Nemesis, ScenarioConfig, assume, committees_on_separate_hosts,
+    conservation, discard, epochs, grow_and_hold, grow_to, query, submission_shards, tx,
+    vote_reshape_threshold, wait,
 };
 pub use swarm::{SWARM_ACCOUNTS, transfers_survive_a_nemesis};
 pub use transactions::livelock_resolves_promptly;

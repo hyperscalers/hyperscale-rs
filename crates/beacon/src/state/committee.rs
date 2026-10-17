@@ -663,15 +663,16 @@ mod tests {
         Admission, BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash,
         BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason,
         MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, PendingReshape, RESHAPE_READY_TTL_EPOCHS,
-        Randomness, RecoveryCause, ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload,
-        Stake, StakePool, StakePoolId, StateRoot, TransitionCause, ValidatorId, ValidatorStatus,
-        WeightedTimestamp, byzantine_threshold,
+        Randomness, RecoveryCause, Settling, ShardBoundary, ShardCommittee, ShardId,
+        ShardWitnessPayload, Stake, StakePool, StakePoolId, StateRoot, TransitionCause,
+        ValidatorId, ValidatorStatus, WeightedTimestamp, byzantine_threshold,
     };
 
     use super::{
         recover_committee, recover_committees, resample_beacon_committee,
         resolve_pending_rotations, run_shuffle_step,
     };
+    use crate::state::reshape::schedule_ready_splits;
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, live_boundary, net, possession_proof,
         single_pool_state, validator_record,
@@ -892,6 +893,7 @@ mod tests {
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
                 scheduled: None,
+                quiet: false,
             },
         );
 
@@ -1550,6 +1552,7 @@ mod tests {
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
                 scheduled: None,
+                quiet: false,
             },
         );
         let before = state.next_shard_committees[&splitting].members.clone();
@@ -2741,6 +2744,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleSplit {
                 shard: target,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get(&target) else {
@@ -2769,6 +2773,87 @@ mod tests {
             state.next_shard_committees[&target]
                 .members
                 .contains(&entrant)
+        );
+    }
+
+    /// A split whose target never says it is quiet is cancelled at its
+    /// drain deadline, and the same fold's recovery draws the returned
+    /// cohort for the halted sibling the target's rows wait on.
+    #[test]
+    fn an_unquiet_split_is_cancelled_and_its_cohort_drawn_by_the_recovery() {
+        let (halted, target) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut state = multi_shard_state(2, 4, 5);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.shard_committees = state.next_shard_committees.clone();
+        add_eligible_slack(&mut state);
+        for shard in [halted, target] {
+            state.boundaries.insert(shard, live_boundary(0));
+        }
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            target,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: target,
+                epoch: Epoch::GENESIS,
+                settling: None,
+            },
+        );
+        let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get(&target) else {
+            panic!("the split is admitted");
+        };
+        let seats: Vec<(ValidatorId, ShardId)> =
+            cohort.iter().map(|(id, seat)| (*id, seat.child)).collect();
+        let mut returned: BTreeSet<ValidatorId> = seats.iter().map(|(id, _)| *id).collect();
+        returned.extend(state.pooled_validators());
+        for (validator, child) in seats {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                target,
+                &ShardWitnessPayload::ReshapeReady { validator, child },
+            );
+        }
+        schedule_ready_splits(&mut state);
+        let Some(PendingReshape::Split { admitted, .. }) = state.pending_reshapes.get(&target)
+        else {
+            panic!("the split stands");
+        };
+        let (at, drain_by) = (admitted.at, admitted.drain_by.expect("the gate latched"));
+
+        halt(&mut state, halted);
+        state.current_epoch = Epoch::new(drain_by.inner() - 1);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            target,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: target,
+                epoch: Epoch::new(drain_by.inner() - 1),
+                settling: Some(Settling {
+                    admitted: at,
+                    quiet: false,
+                }),
+            },
+        );
+        apply_next_epoch(&mut state, &[]);
+
+        assert_eq!(state.current_epoch, drain_by);
+        assert!(!state.pending_reshapes.contains_key(&target), "cancelled");
+        assert_eq!(
+            state.boundaries[&target].terminal_epoch, None,
+            "nothing cut"
+        );
+        assert_eq!(state.pending_recoveries[&halted].rotated_at, drain_by);
+        assert!(
+            state.next_shard_committees[&halted]
+                .members
+                .iter()
+                .all(|id| returned.contains(id)),
+            "the fresh committee is drawn from the returned cohort",
         );
     }
 

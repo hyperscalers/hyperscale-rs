@@ -156,6 +156,9 @@ pub struct Metrics {
     pub batches_unavailable: Counter,
     pub hold_contentions: Counter,
     pub hold_inversions_proven: Counter,
+    /// Stated or accepted rows a chain's terminal named; any count is a
+    /// cut the quiet gate should have held.
+    pub terminal_fated_hearing_rows: Counter,
     /// The bytes a committed block's state claims that are not verdict
     /// claims weigh, proofs included.
     pub state_claims_weight: Histogram,
@@ -779,6 +782,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            terminal_fated_hearing_rows: register_counter!(
+                "hyperscale_terminal_fated_hearing_rows_total",
+                "Stated or accepted rows a terminal manifest named, per derivation"
+            )
+            .unwrap(),
+
             verdict_cells_named: register_counter!(
                 "hyperscale_verdict_cells_named_total",
                 "Cells of the claims naming a member that committed blocks carried"
@@ -1275,6 +1284,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_hold_inversions_proven(&self, victims: usize) {
         self.metrics.hold_inversions_proven.inc_by(victims as f64);
+    }
+
+    fn record_terminal_fated_hearing_rows(&self, rows: usize) {
+        self.metrics.terminal_fated_hearing_rows.inc_by(rows as f64);
     }
 
     fn record_state_claims_weight(&self, bytes: usize, verdict_bytes: usize) {

@@ -601,7 +601,7 @@ pub struct ParentReads {
 /// admission charges it.
 ///
 /// The verdict claims are taken in the order offered, those naming a row
-/// stated at the parent first where this shard is terminating at the
+/// stated at the parent first where this shard is reshaping at the
 /// block's anchor, each cut first to
 /// what a row at the parent would hear once the block's `finalizations`
 /// have settled, by [`heard_at_the_parent`], and carried only where it
@@ -746,14 +746,14 @@ pub fn select_claims(
 }
 
 /// `verdict_claims` in the order a block spends on them: on a
-/// terminating shard, the readings a stated row awaits ride ahead of the
-/// rest, since its stated rows must read their siblings' accepts before
-/// the cut. Stable, so each part keeps the order it was offered in.
+/// reshaping shard, the readings a stated row awaits ride ahead of the
+/// rest, since its cut waits until every row of it has stopped
+/// hearing. Stable, so each part keeps the order it was offered in.
 fn stated_readings_first(
     ctx: &Committed<'_>,
     mut verdict_claims: Vec<StateClaim>,
 ) -> Vec<StateClaim> {
-    if ctx.terminating.contains(ctx.local_shard) {
+    if ctx.reshaping.contains(ctx.local_shard) {
         verdict_claims.sort_by_key(|claim| {
             !claim.verdicts.iter().any(|tx| {
                 ctx.members

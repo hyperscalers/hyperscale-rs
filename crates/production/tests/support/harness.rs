@@ -744,6 +744,14 @@ impl Harness {
             .collect()
     }
 
+    /// Remove a rule [`Self::fault_install_drop`] installed, given the
+    /// handles it answered, one per host in host order.
+    pub fn fault_remove_drop(&self, handles: &[RuleHandle]) {
+        for (host, handle) in self.hosts.iter().zip(handles) {
+            host.adapter.fault_gate().remove_fault(handle);
+        }
+    }
+
     /// Install `rewrite` over the answers host `host` serves for requests of
     /// `type_id`.
     pub fn fault_install_response_rewrite(

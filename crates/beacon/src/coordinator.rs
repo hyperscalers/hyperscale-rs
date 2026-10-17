@@ -6756,6 +6756,7 @@ mod tests {
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
                 scheduled: None,
+                quiet: false,
             },
         );
         for _ in 0..2 {

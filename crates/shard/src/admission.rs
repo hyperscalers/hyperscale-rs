@@ -33,10 +33,10 @@ use hyperscale_types::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_OWED_TOWARD_SHARD,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, Settlement, ShardId, ShardTrie, StandingToward, StateClaim, SubstateKey,
-    Terminating, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
-    Verifiable, WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
-    claims_admit_block, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    Provisions, Reshaping, Settlement, ShardId, ShardTrie, StandingToward, StateClaim, SubstateKey,
+    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
+    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
+    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -131,10 +131,10 @@ pub(crate) struct Committed<'a> {
     /// The window at the block's own anchor, whose boundary records say
     /// which shards have departed and where each chain ended.
     pub(crate) window: WindowView<'a>,
-    /// The shards leaving the trie at the end of the window the block's
-    /// anchor resolves: no core member awaiting one of them, or written
-    /// on one of them, is admitted.
-    pub(crate) terminating: Terminating<'a>,
+    /// The shards reshaping at the block's anchor, every one where the
+    /// windows that say are not held: no core member awaiting one of
+    /// them, or written on one of them, is admitted.
+    pub(crate) reshaping: Reshaping<'a>,
     /// The epoch grid the windows sit on.
     pub(crate) windows: EpochWindows,
     /// The schedule, read only for the window a state claim's own anchor
@@ -363,13 +363,14 @@ impl<'p> Section for TransactionsSection<'p> {
     /// straddle a cut can meet it, and the transaction is classified
     /// afresh under the next block's committee.
     ///
-    /// **No core member across a terminating shard.** A member awaiting
-    /// another shard is refused where this shard or a shard it awaits
-    /// leaves the trie at the end of the block's own window: a sibling
-    /// must read this shard's accept before its cut, and a row committed
-    /// in the final epoch could still be stating at it. The transaction
-    /// stays pooled until the cut, past which it is classified under the
-    /// successors.
+    /// **No core member across a reshaping shard.** A member awaiting
+    /// another shard is refused where this shard or a shard it awaits is
+    /// reshaping at the block's own anchor: the beacon cuts a shard only
+    /// once no row of it hears, and from the first window that shows its
+    /// drain no row toward it is added, so a shard that has said it is
+    /// quiet stays quiet. The transaction stays pooled until the cut,
+    /// past which it is classified under the successors, or until the
+    /// reshape is cancelled.
     ///
     /// **No yes past the staged cap.** A transaction with a member a
     /// sibling's verdict can discard, on any shard it reaches, whose
@@ -436,10 +437,10 @@ impl<'p> Section for TransactionsSection<'p> {
         if !awaited.is_empty()
             && let Some(shard) = std::iter::once(ctx.local_shard)
                 .chain(awaited.iter().copied())
-                .find(|&shard| ctx.terminating.contains(shard))
+                .find(|&shard| ctx.reshaping.contains(shard))
         {
             return Err(format!(
-                "transaction {tx_hash} awaits a verdict across {shard:?}, which is terminating \
+                "transaction {tx_hash} awaits a verdict across {shard:?}, which is reshaping \
                  at the block's anchor"
             ));
         }
@@ -1041,7 +1042,7 @@ pub fn admit_finalization_over(
     let ctx = Committed {
         snapshot,
         window,
-        terminating: Terminating::NONE,
+        reshaping: Reshaping::NONE,
         windows: schedule.windows(),
         schedule: &schedule,
         local_shard: local,
@@ -1763,9 +1764,9 @@ pub(crate) mod fixtures {
             Committed {
                 snapshot: &self.snapshot,
                 window,
-                terminating: self
+                reshaping: self
                     .schedule
-                    .terminating_at(self.anchor)
+                    .reshaping_at(self.anchor)
                     .expect("a fixture anchors inside its own schedule"),
                 windows: self.schedule.windows(),
                 schedule: &self.schedule,

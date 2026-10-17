@@ -4,12 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    Admission, BASIS_POINTS, BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS,
-    JailReason, MAX_SHARDS, MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS,
-    NetworkDefinition, PendingReshape, PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId,
-    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
-    byzantine_threshold, validator_possession_proof_verify, verify_shard_vote_equivocation,
-    verify_vote_equivocation,
+    Admission, BASIS_POINTS, BeaconProposal, BeaconState, BlockHeader, Epoch, Hash,
+    JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MISSED_PROPOSAL_JAIL_FLOOR,
+    MISSED_PROPOSAL_JAIL_SHARE_BPS, MergeHalf, NetworkDefinition, PendingReshape,
+    PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake,
+    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
+    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -568,7 +568,11 @@ pub(super) fn apply_shard_payload(
         // The asserted epoch separates one assertion from the next on
         // the shard's own window; what dates a pending record here is
         // the beacon's own clock, so the fold reads the subject only.
-        ShardWitnessPayload::ScheduleSplit { shard, epoch: _ } => {
+        ShardWitnessPayload::ScheduleSplit {
+            shard,
+            epoch: _,
+            settling,
+        } => {
             // Source pinning: only the shard itself asserts its split.
             if source_shard != *shard {
                 return None;
@@ -588,22 +592,40 @@ pub(super) fn apply_shard_payload(
             // seat unready. A scheduled record's cohort cannot empty today
             // (the TTL lapse skips it), so this is the same property stated
             // where it would be violated rather than two files away.
+            //
+            // A settling assertion takes this branch and no other, and only
+            // against the latched admission it names: one made under a
+            // window that predates a cancel names the cancelled admission,
+            // and sets nothing on the next. Its quiet bit is sticky, since
+            // intake toward the shard has paused since the window it was
+            // asserted under, so a quiet shard stays quiet until its cut.
             let existing = match state.pending_reshapes.get(shard) {
                 Some(PendingReshape::Split {
                     cohort,
                     cohort_seed,
                     scheduled,
+                    admitted,
                     ..
-                }) => Some((cohort.is_empty() && scheduled.is_none(), *cohort_seed)),
+                }) => Some((
+                    cohort.is_empty() && scheduled.is_none(),
+                    *cohort_seed,
+                    *admitted,
+                )),
                 _ => None,
             };
-            if let Some((restaffable, seed)) = existing {
+            if let Some(settling) = settling
+                && !existing.is_some_and(|(_, _, admitted)| answers(admitted, *settling))
+            {
+                return None;
+            }
+            if let Some((restaffable, seed, _)) = existing {
                 let restaffed = (restaffable
                     && state.drawable_pool_len(1) >= state.chain_config.shard_size as usize)
                     .then(|| draw_split_cohort(state, *shard, &seed));
                 if let Some(PendingReshape::Split {
                     cohort,
                     last_asserted,
+                    quiet,
                     ..
                 }) = state.pending_reshapes.get_mut(shard)
                 {
@@ -611,6 +633,7 @@ pub(super) fn apply_shard_payload(
                         *cohort = restaffed;
                     }
                     *last_asserted = state.current_epoch;
+                    *quiet |= settling.is_some_and(|settling| settling.quiet);
                 }
                 return None;
             }
@@ -663,11 +686,16 @@ pub(super) fn apply_shard_payload(
                     cohort,
                     cohort_seed,
                     scheduled: None,
+                    quiet: false,
                 },
             );
             None
         }
-        ShardWitnessPayload::ScheduleMerge { parent, epoch: _ } => {
+        ShardWitnessPayload::ScheduleMerge {
+            parent,
+            epoch: _,
+            settling,
+        } => {
             // Source pinning: only a child asserts the merge under its
             // parent.
             if source_shard.parent() != Some(*parent) {
@@ -687,6 +715,26 @@ pub(super) fn apply_shard_payload(
             {
                 return None;
             }
+            // A settling assertion refreshes this child's half of the
+            // latched admission it names, and nothing else, under the
+            // split's rule above; its quiet bit clears only with the half.
+            if let Some(settling) = settling {
+                if let Some(PendingReshape::Merge {
+                    halves,
+                    admitted: Some(admitted),
+                    ..
+                }) = state.pending_reshapes.get_mut(parent)
+                    && answers(*admitted, *settling)
+                {
+                    let half = halves.entry(source_shard).or_insert(MergeHalf {
+                        last: state.current_epoch,
+                        quiet: false,
+                    });
+                    half.last = state.current_epoch;
+                    half.quiet |= settling.quiet;
+                }
+                return None;
+            }
             // Record or refresh this child's half. The merge pairs —
             // draws its keepers, becomes executable — once both children
             // hold a live half; a lone half expires via the staleness
@@ -695,7 +743,13 @@ pub(super) fn apply_shard_payload(
                 halves, admitted, ..
             }) = state.pending_reshapes.get_mut(parent)
             {
-                halves.insert(source_shard, state.current_epoch);
+                halves
+                    .entry(source_shard)
+                    .and_modify(|half| half.last = state.current_epoch)
+                    .or_insert(MergeHalf {
+                        last: state.current_epoch,
+                        quiet: false,
+                    });
                 Some(halves.len() == 2 && admitted.is_none())
             } else {
                 None
@@ -747,7 +801,13 @@ pub(super) fn apply_shard_payload(
             state.pending_reshapes.insert(
                 *parent,
                 PendingReshape::Merge {
-                    halves: BTreeMap::from([(source_shard, state.current_epoch)]),
+                    halves: BTreeMap::from([(
+                        source_shard,
+                        MergeHalf {
+                            last: state.current_epoch,
+                            quiet: false,
+                        },
+                    )]),
                     keepers: BTreeMap::new(),
                     admitted: None,
                     scheduled_terminal: None,
@@ -789,16 +849,18 @@ pub(super) fn apply_shard_payload(
     }
 }
 
-/// Lapse or cancel pending reshapes whose triggers went quiet or whose
-/// readiness gate never fired.
+/// Lapse or cancel pending reshapes whose triggers went quiet, whose
+/// readiness gate never fired, or whose shard never quieted.
 ///
 /// Triggers re-derive once per witness window while the load condition
-/// holds, so every live assertion refreshes each epoch. The readiness
-/// TTL is checked first and unconditionally: a split (or paired merge)
-/// still ungated [`RESHAPE_READY_TTL_EPOCHS`] after admission is removed
-/// outright — a stalled grow must not park a committee indefinitely, and
-/// this is what bounds how long a lapsed split (and its frozen seed)
-/// survives. Below that deadline, a split whose trigger has gone quiet
+/// holds or the shard drains, so every live assertion refreshes each
+/// epoch. The deadline is checked first and unconditionally: a split (or
+/// paired merge) still ungated [`RESHAPE_READY_TTL_EPOCHS`] after
+/// admission, or latched and still unscheduled at its `drain_by`, is
+/// removed outright — a stalled grow, or a shard whose rows still hear,
+/// must not park a committee indefinitely, and this is what bounds how
+/// long a lapsed split (and its frozen seed) survives. A cancel cuts
+/// nothing. Below that deadline, a split whose trigger has gone quiet
 /// for [`RESHAPE_TRIGGER_TTL_EPOCHS`] *lapses*: its cohort returns to the
 /// pool but the record is kept, so a re-assertion re-staffs the same
 /// cohort. A merge whose half goes quiet for the trigger TTL cancels
@@ -814,8 +876,8 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
         // schedule frozen into their topology snapshot and stamp their
         // boundary verdicts from it, so retracting it here would leave
         // them carrying a verdict for a cut that never lands while the
-        // shard stays in the trie. The readiness TTL governs
-        // admission-to-scheduling and stops there.
+        // shard stays in the trie. The readiness and drain deadlines
+        // govern admission-to-scheduling and stop there.
         if reshape.scheduled_terminal().is_some() {
             continue;
         }
@@ -826,8 +888,8 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
                 cohort,
                 ..
             } => {
-                if current >= admitted.ready_by.inner() {
-                    removed.push((*target, "readiness TTL elapsed"));
+                if let Some(cause) = deadline_passed(admitted, current) {
+                    removed.push((*target, cause));
                 } else if !cohort.is_empty()
                     && current.saturating_sub(last_asserted.inner()) >= RESHAPE_TRIGGER_TTL_EPOCHS
                 {
@@ -837,8 +899,8 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
             PendingReshape::Merge {
                 halves, admitted, ..
             } => {
-                halves.retain(|_, last| {
-                    current.saturating_sub(last.inner()) < RESHAPE_TRIGGER_TTL_EPOCHS
+                halves.retain(|_, half| {
+                    current.saturating_sub(half.last.inner()) < RESHAPE_TRIGGER_TTL_EPOCHS
                 });
                 // A lone half waits for its sibling, but once the merge
                 // paired both halves must keep asserting — either going
@@ -847,8 +909,10 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
                 let required = if admitted.is_some() { 2 } else { 1 };
                 if halves.len() < required {
                     removed.push((*target, "trigger went quiet"));
-                } else if admitted.is_some_and(|admitted| current >= admitted.ready_by.inner()) {
-                    removed.push((*target, "readiness TTL elapsed"));
+                } else if let Some(cause) =
+                    admitted.and_then(|admitted| deadline_passed(&admitted, current))
+                {
+                    removed.push((*target, cause));
                 }
             }
         }
@@ -871,8 +935,26 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
     }
 }
 
-/// Carry every pending reshape's staleness anchors and readiness deadline
-/// forward one epoch.
+/// Whether a pending reshape's deadline has passed at the `current`
+/// epoch, and which: the drain deadline once the drain has latched, the
+/// readiness TTL before.
+fn deadline_passed(admitted: &Admission, current: u64) -> Option<&'static str> {
+    let (deadline, cause) = admitted
+        .drain_by
+        .map_or((admitted.ready_by, "readiness TTL elapsed"), |drain_by| {
+            (drain_by, "drain deadline elapsed")
+        });
+    (current >= deadline.inner()).then_some(cause)
+}
+
+/// Whether a settling assertion answers `admitted`: the record has
+/// latched its drain, and the assertion names the admission it latched.
+fn answers(admitted: Admission, settling: Settling) -> bool {
+    admitted.drain_by.is_some() && admitted.at == settling.admitted
+}
+
+/// Carry every pending reshape's staleness anchors and deadlines forward
+/// one epoch.
 ///
 /// The trigger and readiness TTLs measure how many epochs a reshape has
 /// gone without asserting or readying, against `current_epoch`. A skip
@@ -895,20 +977,26 @@ pub(super) fn defer_reshape_ttls(state: &mut BeaconState) {
                 ..
             } => {
                 *last_asserted = last_asserted.next();
-                admitted.ready_by = admitted.ready_by.next();
+                defer_deadlines(admitted);
             }
             PendingReshape::Merge {
                 halves, admitted, ..
             } => {
-                for last in halves.values_mut() {
-                    *last = last.next();
+                for half in halves.values_mut() {
+                    half.last = half.last.next();
                 }
                 if let Some(admitted) = admitted {
-                    admitted.ready_by = admitted.ready_by.next();
+                    defer_deadlines(admitted);
                 }
             }
         }
     }
+}
+
+/// Move an admission's readiness and drain deadlines forward one epoch.
+fn defer_deadlines(admitted: &mut Admission) {
+    admitted.ready_by = admitted.ready_by.next();
+    admitted.drain_by = admitted.drain_by.map(Epoch::next);
 }
 
 #[cfg(test)]
@@ -2748,6 +2836,7 @@ mod tests {
         ShardWitnessPayload::ScheduleSplit {
             shard,
             epoch: Epoch::GENESIS,
+            settling: None,
         }
     }
 
@@ -2966,6 +3055,7 @@ mod tests {
             &ShardWitnessPayload::ScheduleMerge {
                 parent: ShardId::ROOT,
                 epoch: Epoch::GENESIS,
+                settling: None,
             },
         );
         assert!(state.pending_reshapes.is_empty());
@@ -3150,6 +3240,7 @@ mod tests {
         let payload = ShardWitnessPayload::ScheduleMerge {
             parent: ShardId::ROOT,
             epoch: Epoch::GENESIS,
+            settling: None,
         };
         apply_shard_payload(&BlsVerifier, &mut merged, &net(), left, &payload);
         apply_shard_payload(&BlsVerifier, &mut merged, &net(), right, &payload);
@@ -3181,6 +3272,7 @@ mod tests {
         let payload = ShardWitnessPayload::ScheduleMerge {
             parent: ShardId::ROOT,
             epoch: Epoch::GENESIS,
+            settling: None,
         };
 
         apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &payload);
@@ -3219,6 +3311,7 @@ mod tests {
         let merge = ShardWitnessPayload::ScheduleMerge {
             parent: ShardId::ROOT,
             epoch: Epoch::GENESIS,
+            settling: None,
         };
 
         // Only one child active: merge dropped.

@@ -14,9 +14,9 @@ use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
 use crate::{
     BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash, Hash,
-    IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
-    ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat,
-    ValidatorId,
+    IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE,
+    RESHAPE_DRAIN_SPAN, Randomness, ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM,
+    Stake, StakePoolId, StakePoolSeat, ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -90,6 +90,28 @@ impl BeaconChainConfig {
     #[must_use]
     pub const fn epoch_duration(&self) -> Duration {
         Duration::from_millis(self.epoch_duration_ms)
+    }
+
+    /// Epochs from the fold that latches a reshape's drain to the fold
+    /// that cancels it if its shard never asserts quiet:
+    /// `3 + ⌈RESHAPE_DRAIN_SPAN / epoch_duration⌉`.
+    ///
+    /// One window for the latch to publish, the drain itself, one fold for
+    /// the quiet leaf to ride a crossing and fold, and one because the
+    /// prune cancels at the deadline before that fold's schedulers read
+    /// it. A quiet leaf therefore folds by the fold before the deadline at
+    /// any epoch length. Counted from the configured length rather than
+    /// fixed, since a fixed count is shorter than the drain on a chain of
+    /// short epochs.
+    #[must_use]
+    pub const fn reshape_drain_epochs(&self) -> u64 {
+        let epoch_ms = if self.epoch_duration_ms == 0 {
+            1
+        } else {
+            self.epoch_duration_ms
+        };
+        let span_ms = RESHAPE_DRAIN_SPAN.as_secs().saturating_mul(1000);
+        3 + span_ms.div_ceil(epoch_ms)
     }
 
     /// The chain's epoch-window grid — the single home for every
@@ -309,6 +331,24 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_principal;
+
+    #[test]
+    fn the_drain_deadline_covers_the_drain_span_at_30_s_and_300_s_epochs() {
+        for (epoch_secs, expected) in [(300_u64, 5_u64), (30, 18)] {
+            let config = BeaconChainConfig {
+                epoch_duration_ms: epoch_secs * 1000,
+                ..BeaconChainConfig::default()
+            };
+            let epochs = config.reshape_drain_epochs();
+            assert_eq!(epochs, expected, "{epoch_secs} s epochs");
+            // The drain itself fits the epochs left after the latch's
+            // publication, the quiet leaf's fold and the prune's lead.
+            let drain = config
+                .epoch_duration()
+                .saturating_mul(u32::try_from(epochs - 3).expect("a handful of epochs"));
+            assert!(drain >= RESHAPE_DRAIN_SPAN, "{epoch_secs} s epochs");
+        }
+    }
 
     fn sample_config() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);

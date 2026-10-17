@@ -14,9 +14,9 @@ use hyperscale_vm_types::PriceTable;
 use crate::{
     Address, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey,
     DeclaredKey, Epoch, EpochWindows, NetworkDefinition, NetworkParams, QuorumCertificate,
-    RecoveryBinding, RecoveryCause, ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId,
-    ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount,
-    WeightedTimestamp,
+    RecoveryBinding, RecoveryCause, ReshapeKind, ReshapeThresholds, Round, SeedRing,
+    SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
+    ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -195,6 +195,12 @@ pub struct TopologySnapshot {
     /// the affirmative half of the same question: `split_pending` rules a
     /// boundary out, this rules one in.
     scheduled_terminals: BTreeMap<ShardId, Epoch>,
+    /// Each shard a latched reshape drains as of this window's committee
+    /// freeze, mapped to the epoch its record was admitted at: a split's
+    /// target and both children of a merge. Frozen with the same
+    /// discipline as `split_pending`, which also tells which reshape a
+    /// draining shard belongs to.
+    draining: BTreeMap<ShardId, Epoch>,
     /// Each terminating leaf's settled-transaction window floor as of this
     /// window's committee freeze — pending split targets, paired merge
     /// children, and shards coasting to their terminal block, each mapped
@@ -296,6 +302,7 @@ impl TopologySnapshot {
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
             scheduled_terminals: BTreeMap::new(),
+            draining: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
@@ -349,6 +356,7 @@ impl TopologySnapshot {
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
             scheduled_terminals: BTreeMap::new(),
+            draining: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
@@ -411,6 +419,7 @@ impl TopologySnapshot {
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
             scheduled_terminals: BTreeMap::new(),
+            draining: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
@@ -505,6 +514,7 @@ impl TopologySnapshot {
             reshape_parent_halves,
             split_pending,
             scheduled_terminals: BTreeMap::new(),
+            draining: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
@@ -653,6 +663,17 @@ impl TopologySnapshot {
         scheduled_terminals: BTreeMap<ShardId, Epoch>,
     ) -> Self {
         self.scheduled_terminals = scheduled_terminals;
+        self
+    }
+
+    /// Set each draining shard's admission epoch (see
+    /// [`Self::draining_admission`]). Defaults empty; the beacon
+    /// projection supplies the frozen (active) or live (lookahead) value.
+    /// Builder-set under the [`Self::with_settled_window_floors`]
+    /// rationale.
+    #[must_use]
+    pub fn with_draining(mut self, draining: BTreeMap<ShardId, Epoch>) -> Self {
+        self.draining = draining;
         self
     }
 
@@ -819,6 +840,30 @@ impl TopologySnapshot {
     #[must_use]
     pub fn scheduled_terminal(&self, shard: ShardId) -> Option<Epoch> {
         self.scheduled_terminals.get(&shard).copied()
+    }
+
+    /// The reshape `shard` drains under as of this window's committee
+    /// freeze, and the epoch that reshape was admitted at, or `None` when
+    /// no latched reshape names it.
+    ///
+    /// Read from the record rather than its seats: a merge child whose
+    /// keepers have all dropped still answers here.
+    #[must_use]
+    pub fn draining_admission(&self, shard: ShardId) -> Option<(ReshapeKind, Epoch)> {
+        let admitted = *self.draining.get(&shard)?;
+        let kind = if self.split_pending(shard) {
+            ReshapeKind::Split
+        } else {
+            ReshapeKind::Merge
+        };
+        Some((kind, admitted))
+    }
+
+    /// Whether `shard` names a latched reshape as of this window's
+    /// committee freeze.
+    #[must_use]
+    pub fn draining(&self, shard: ShardId) -> bool {
+        self.draining.contains_key(&shard)
     }
 
     /// Whether `shard` is a constituent of an admitted, paired merge as of

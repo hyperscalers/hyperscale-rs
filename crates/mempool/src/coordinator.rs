@@ -1180,7 +1180,7 @@ impl MempoolCoordinator {
     /// offered anyway it would take its place from a transaction that can
     /// go in every block until the shard answers. So is a transaction
     /// whose member here awaits another shard, where this shard or one it
-    /// awaits is among the intake's terminating shards. Its carried set is the
+    /// awaits is among the intake's reshaping shards. Its carried set is the
     /// transactions of the blocks between the committed tip and the
     /// parent, which stay pending here until their block commits and
     /// which admission refuses a second time: one is never a candidate,
@@ -1288,7 +1288,7 @@ impl MempoolCoordinator {
             if !member.awaited.is_empty()
                 && std::iter::once(self.local_shard)
                     .chain(member.awaited.iter().copied())
-                    .any(|shard| intake.terminating.contains(shard))
+                    .any(|shard| intake.reshaping.contains(shard))
             {
                 continue;
             }
@@ -3713,13 +3713,14 @@ mod tests {
         assert_eq!(offered(&IntakeView::idle(trie), 100).len(), 21);
     }
 
-    /// A shard terminating at the end of the block's window takes none of
-    /// the ready set: every transaction whose member here would await it
-    /// is passed over and the places go to the rest, and where this shard
-    /// itself is terminating every core transaction is passed over and
-    /// one awaiting nobody is still offered.
+    /// A shard reshaping at the block's anchor, draining under a latched
+    /// reshape or terminating at the end of the window, takes none of the
+    /// ready set: every transaction whose member here would await it is
+    /// passed over and the places go to the rest, and where this shard
+    /// itself is reshaping every core transaction is passed over and one
+    /// awaiting nobody is still offered.
     #[test]
-    fn the_ready_set_passes_over_a_terminating_shard() {
+    fn the_ready_set_passes_over_a_reshaping_shard() {
         let topology = TestCommittee::new(16, 42).topology_snapshot(4);
         let trie = topology.shard_trie();
         let mut homes: BTreeMap<ShardId, Vec<PrincipalAddr>> = BTreeMap::new();
@@ -3770,11 +3771,22 @@ mod tests {
                 ),
             )
         };
+        let draining = |shard: ShardId| {
+            TopologySchedule::new(
+                1_000,
+                Epoch::new(5),
+                Arc::new(
+                    topology
+                        .clone()
+                        .with_draining(BTreeMap::from([(shard, Epoch::new(2))])),
+                ),
+            )
+        };
         let now = LocalTimestamp::from_millis(1_000);
         let offered = |schedule: &TopologySchedule| -> BTreeSet<TxHash> {
             let intake = IntakeView {
-                terminating: schedule
-                    .terminating_at(WeightedTimestamp::from_millis(5_500))
+                reshaping: schedule
+                    .reshaping_at(WeightedTimestamp::from_millis(5_500))
                     .expect("held"),
                 ..IntakeView::idle(trie)
             };
@@ -3785,12 +3797,18 @@ mod tests {
                 .collect()
         };
 
-        let sibling_leaves = offered(&ending(leaving));
-        assert!(sibling_leaves.is_disjoint(&toward_it), "{sibling_leaves:?}");
-        assert!(sibling_leaves.is_superset(&core));
-        assert!(sibling_leaves.is_superset(&alone));
+        let reshapings: [&dyn Fn(ShardId) -> TopologySchedule; 2] = [&ending, &draining];
+        for reshaping in reshapings {
+            let sibling_reshapes = offered(&reshaping(leaving));
+            assert!(
+                sibling_reshapes.is_disjoint(&toward_it),
+                "{sibling_reshapes:?}"
+            );
+            assert!(sibling_reshapes.is_superset(&core));
+            assert!(sibling_reshapes.is_superset(&alone));
 
-        assert_eq!(offered(&ending(local)), alone);
+            assert_eq!(offered(&reshaping(local)), alone);
+        }
     }
 
     /// A share read again under the placement it was last read under is

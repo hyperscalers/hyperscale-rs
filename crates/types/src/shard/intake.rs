@@ -13,7 +13,7 @@ use hyperscale_vm_types::MAX_CROSSINGS_PER_TX;
 
 use crate::{
     MAX_OWED_TOWARD_SHARD, MAX_STANDING_ANSWERS, MAX_STANDING_ANSWERS_FROM_SHARD,
-    MAX_STANDING_TOWARD_SHARD, Owes, RoutePrefix, ShardId, ShardTrie, Terminating, TxHash,
+    MAX_STANDING_TOWARD_SHARD, Owes, Reshaping, RoutePrefix, ShardId, ShardTrie, TxHash,
     TxsInFlight,
 };
 
@@ -325,9 +325,9 @@ impl AnswerAdditions {
 pub struct IntakeView<'t> {
     /// The trie the block's committee places owners by.
     pub trie: &'t ShardTrie,
-    /// The shards leaving the trie at the end of the window the block's
-    /// anchor resolves, across which no core member is admitted.
-    pub terminating: Terminating<'t>,
+    /// The shards reshaping at the block's anchor, toward and from which
+    /// no core member is admitted.
+    pub reshaping: Reshaping<'t>,
     /// The rows standing toward each shard at the block's parent.
     pub standing: StandingToward,
     /// The answers and owed crossings the chain stands holding at the
@@ -349,12 +349,12 @@ static NOTHING_CARRIED: LazyLock<HashSet<TxHash>> = LazyLock::new(HashSet::new);
 #[cfg(any(test, feature = "test-utils"))]
 impl<'t> IntakeView<'t> {
     /// Intake under `trie` on a parent with no row standing, nothing in
-    /// flight, no shard terminating and no uncommitted chain behind it.
+    /// flight, no shard reshaping and no uncommitted chain behind it.
     #[must_use]
     pub fn idle(trie: &'t ShardTrie) -> Self {
         Self {
             trie,
-            terminating: Terminating::NONE,
+            reshaping: Reshaping::NONE,
             standing: StandingToward::default(),
             answers: Some(StandingAnswers::default()),
             in_flight: TxsInFlight::ZERO,

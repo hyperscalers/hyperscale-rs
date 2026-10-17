@@ -14,16 +14,18 @@ pub use hyperscale_crypto_bls::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusSignature,
-    DeclaredWork, Epoch, Hash, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
-    PendingWithdrawal, QuorumCertificate, Round, ShardBoundary, ShardCommittee,
-    ShardEpochContribution, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
-    SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot, ValidatorId,
-    ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp, beacon_reveal_sign,
-    compute_merkle_root, compute_range_proof, validator_possession_proof_sign,
+    Admission, AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts,
+    BlockHeight, ConsensusSignature, DeclaredWork, Epoch, Hash, MIN_STAKE_FLOOR, NetworkDefinition,
+    PcVoteEquivocation, PendingReshape, PendingWithdrawal, QuorumCertificate, Round, Settling,
+    ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool,
+    StakePoolId, StateRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof,
+    WeightedTimestamp, beacon_reveal_sign, compute_merkle_root, compute_range_proof,
+    validator_possession_proof_sign,
 };
 
+use crate::state::witness::apply_shard_payload;
 use crate::state::{ApplyEpochInput, apply_epoch};
 
 pub fn net() -> NetworkDefinition {
@@ -581,4 +583,56 @@ pub fn state_with_pending_withdrawal(
         .insert(shard, ShardCommittee { members });
     state.committee = (0..n_actives).map(ValidatorId::new).collect();
     state
+}
+
+/// The quiet assertion each shard a latched reshape drains makes once no
+/// row of it hears, naming its record's admission: a split's target, and
+/// both children of a merge, each from its own chain.
+pub fn quiet_assertions(state: &BeaconState) -> Vec<(ShardId, ShardWitnessPayload)> {
+    let settling = |admitted: Admission| {
+        admitted.drain_by.map(|_| Settling {
+            admitted: admitted.at,
+            quiet: true,
+        })
+    };
+    let mut assertions = Vec::new();
+    for (target, reshape) in &state.pending_reshapes {
+        match reshape {
+            PendingReshape::Split { admitted, .. } => {
+                if let Some(settling) = settling(*admitted) {
+                    assertions.push((
+                        *target,
+                        ShardWitnessPayload::ScheduleSplit {
+                            shard: *target,
+                            epoch: state.current_epoch,
+                            settling: Some(settling),
+                        },
+                    ));
+                }
+            }
+            PendingReshape::Merge { admitted, .. } => {
+                if let Some(settling) = admitted.and_then(settling) {
+                    for child in <[ShardId; 2]>::from(target.children()) {
+                        assertions.push((
+                            child,
+                            ShardWitnessPayload::ScheduleMerge {
+                                parent: *target,
+                                epoch: state.current_epoch,
+                                settling: Some(settling),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assertions
+}
+
+/// Fold [`quiet_assertions`]: every latched reshape's shards say they are
+/// quiet.
+pub fn assert_quiet(state: &mut BeaconState) {
+    for (source, payload) in quiet_assertions(state) {
+        apply_shard_payload(&BlsVerifier, state, &net(), source, &payload);
+    }
 }

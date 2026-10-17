@@ -232,6 +232,12 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// of a hold cycle.
     fn record_hold_inversions_proven(&self, victims: usize) {}
 
+    /// Stated or accepted rows a terminal's manifest fated or ended, one
+    /// count per row at each derivation of that manifest: the proposer's,
+    /// each voter's and each re-proposal's, so a nonzero total scales with
+    /// the committee. Any count is a cut the quiet gate should have held.
+    fn record_terminal_fated_hearing_rows(&self, rows: usize) {}
+
     /// The bytes a committed block's state claims weigh between them,
     /// proofs included, by kind: every claim but the verdict claims
     /// (`bytes`), against their budget, and the verdict claims
@@ -836,6 +842,12 @@ pub fn record_hold_contentions(pairs: usize) {
 #[inline]
 pub fn record_hold_inversions_proven(victims: usize) {
     recorder().record_hold_inversions_proven(victims);
+}
+
+/// Record the hearing rows one derivation of a terminal's manifest named.
+#[inline]
+pub fn record_terminal_fated_hearing_rows(rows: usize) {
+    recorder().record_terminal_fated_hearing_rows(rows);
 }
 
 /// Record the bytes a committed block's state claims weigh: its

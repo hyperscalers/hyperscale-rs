@@ -17,14 +17,14 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
     HeaderFetchCount, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
     PriceTable, ProposerTimestamp, ProvisionTxRootsMap, Provisions, QuorumCertificate, RatifyPhase,
-    RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ResolvedCommittee, RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
-    ShardVoteEquivocation, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg,
-    SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StandingAnswers,
-    StateClaim, StateRoot, SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId,
-    Timeout, TimeoutCertificate, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified,
-    VoteCount, VotePosition, WeightedTimestamp,
+    RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeKind, ReshapeThresholds,
+    ReshapeTrigger, ResolvedCommittee, RevealChain, Round, SettledTxsRoot, Settling,
+    ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedTransactions,
+    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, SplitChildRoots, StandingAnswers, StateClaim, StateRoot, SubstateClaim, SubstateEntry,
+    SubstateKey, SweepFrontier, TickId, Timeout, TimeoutCertificate, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId,
+    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -867,6 +867,12 @@ pub enum Action {
         substate_bytes: Option<u64>,
         /// The header's own claim about that total, checked against it.
         claimed_substate_bytes: Option<u64>,
+        /// What the block must assert of its shard's latched reshape: the
+        /// kind and admission its committee window names the shard
+        /// draining under, and whether the rows at its parent are quiet.
+        /// `None` where no draining is named, or the parent lies in a
+        /// recovery's suffix band.
+        settling: Option<(ReshapeKind, Settling)>,
         /// Reshape thresholds in force for this network.
         thresholds: ReshapeThresholds,
         /// Finalizations whose receipts contribute receipt-sourced
