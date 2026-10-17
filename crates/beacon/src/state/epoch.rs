@@ -420,6 +420,24 @@ pub fn apply_epoch(
         .collect();
     let rewards_credited = distribute_epoch_rewards(state, &shard_fees);
     let timeout_readied = auto_ready_timeout(state);
+    // Recovery draws before the shuffle and the reshape folds, so a
+    // cohort the prune above returned reaches a halted or forked shard
+    // ahead of any rotation entrant or top-up backfill. The halted set reads
+    // the same here as after the reshape folds: a target due to apply is
+    // reshape-involved before the apply and terminal after it, and the
+    // placeholders the apply seats are exempt as never-produced
+    // successors. Recovery also runs before the top-up and the beacon
+    // resample, so replaced members return to the pool in time to backfill
+    // other short committees and the resample reads post-recovery
+    // placements.
+    let halted_shards = state.halted_shards();
+    for shard in &halted_shards {
+        tracing::error!(
+            ?shard,
+            "shard halted: no boundary crossing within the halt threshold"
+        );
+    }
+    recover_committees(state);
     run_shuffle_step(state);
     // Close resolvable rotations after the shuffle, never before it. The
     // ready timeout backstops an entrant a whole sync window after it
@@ -458,20 +476,6 @@ pub fn apply_epoch(
             .all(|terminal| *terminal > epoch),
         "a fold scheduled a terminal for the window it opens",
     );
-    // Halt detection reads the settled reshape state: a shard whose reshape
-    // executed this epoch is already terminal-marked or placeholder-fresh,
-    // so it reads as legitimately quiet. Recovery runs before the top-up
-    // and the beacon resample, so replaced members return to the pool in
-    // time to backfill other short committees and the resample reads
-    // post-recovery placements.
-    let halted_shards = state.halted_shards();
-    for shard in &halted_shards {
-        tracing::error!(
-            ?shard,
-            "shard halted: no boundary crossing within the halt threshold"
-        );
-    }
-    recover_committees(state, &halted_shards);
     // Grow any committee a short cohort draw left under `shard_size` back to
     // full strength, now that dissolved predecessors have freed their members.
     top_up_committees(state);
@@ -2483,8 +2487,13 @@ mod tests {
         }
         fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
         fold_alone(&mut state, shard, 3, older_crossing(shard, 7), 1_500);
+        state
+            .boundaries
+            .get_mut(&shard)
+            .expect("the crossings seeded the record")
+            .consecutive_misses = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
 
-        recover_committees(&mut state, &std::iter::once(shard).collect());
+        recover_committees(&mut state);
 
         let recovery = state
             .pending_recoveries

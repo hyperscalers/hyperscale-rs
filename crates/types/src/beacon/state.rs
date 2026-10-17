@@ -976,11 +976,12 @@ pub struct BeaconState {
     /// each fold — so a fork that folds while the free pool is short of a
     /// full committee retries until the re-draw is actually stamped.
     /// Cleared when the shard's fork-caused recovery enters
-    /// [`Self::pending_recoveries`], or when the shard leaves
-    /// [`Self::next_shard_committees`]: only a shard the lookahead seats
-    /// is flagged. While a shard is flagged, the
-    /// boundary fold fences its crossings, so the forked committee can
-    /// neither advance the boundary nor accumulate halt misses.
+    /// [`Self::pending_recoveries`]. A flag on a shard the lookahead no
+    /// longer seats, such as a target whose cut applied this fold, drops
+    /// at the next fold's fork-proof ingest, so every fold reads only
+    /// seated flags. While a shard is flagged, the boundary fold fences
+    /// its crossings, so the forked committee can neither advance the
+    /// boundary nor accumulate halt misses.
     pub fork_flagged: BTreeMap<ShardId, BlockHeight>,
     /// In-flight shard recoveries, keyed by the recovered shard.
     /// Written when the fold re-draws a failed committee; an entry
@@ -1487,6 +1488,12 @@ impl BeaconState {
     /// set at the identical fold.
     #[must_use]
     pub fn halted_shards(&self) -> BTreeSet<ShardId> {
+        self.halted_within(0)
+    }
+
+    /// The shards [`Self::halted_shards`] flags once `lead` more folds
+    /// miss: its filter with `lead` added to each miss count.
+    fn halted_within(&self, lead: u32) -> BTreeSet<ShardId> {
         let reshape_involved = self.reshape_involved_shards();
         self.boundaries
             .iter()
@@ -1494,10 +1501,57 @@ impl BeaconState {
                 b.terminal_epoch.is_none()
                     && !(b.block_hash == BlockHash::ZERO && b.last_live_epoch > Epoch::GENESIS)
                     && !reshape_involved.contains(*shard)
-                    && u64::from(b.consecutive_misses) > HALT_THRESHOLD_EPOCHS
+                    && u64::from(b.consecutive_misses) + u64::from(lead) > HALT_THRESHOLD_EPOCHS
             })
             .map(|(shard, _)| *shard)
             .collect()
+    }
+
+    /// The shards whose committee the recovery would re-draw at this fold
+    /// if the pool allowed, reading each miss count `lead` folds ahead.
+    ///
+    /// Every fork-flagged shard and every shard
+    /// [`Self::halted_shards`] would flag `lead` folds on, among those
+    /// the lookahead seats. Left out:
+    /// - a shard whose boundary still carries the ZERO genesis hash. It
+    ///   never produced, so a fresh committee has no attested anchor to
+    ///   seat against; it needs an operator, and counting it would reserve
+    ///   a committee for every fold.
+    /// - a shard whose scheduled cut is at or before the current epoch.
+    ///   The apply that follows the recovery unseats it, and its flag drops
+    ///   with the seat.
+    ///
+    /// A shard both halted and pending a recovery is one whose recovery
+    /// stalled: the recovery reset its misses, so only a full threshold of
+    /// further misses puts it back here.
+    #[must_use]
+    pub fn recovery_demand(&self, lead: u32) -> BTreeSet<ShardId> {
+        let terminals = self.live_scheduled_terminals();
+        self.fork_flagged
+            .keys()
+            .copied()
+            .chain(self.halted_within(lead))
+            .filter(|shard| self.next_shard_committees.contains_key(shard))
+            .filter(|shard| {
+                self.boundaries
+                    .get(shard)
+                    .is_none_or(|b| b.block_hash != BlockHash::ZERO)
+            })
+            .filter(|shard| {
+                terminals
+                    .get(shard)
+                    .is_none_or(|terminal| *terminal > self.current_epoch)
+            })
+            .collect()
+    }
+
+    /// The free pool left once a full committee is set aside for each
+    /// shard of [`Self::recovery_demand`] at `lead`: what a draw that must
+    /// not starve a recovery may take.
+    #[must_use]
+    pub fn drawable_pool_len(&self, lead: u32) -> usize {
+        let reserve = self.chain_config.shard_size as usize * self.recovery_demand(lead).len();
+        self.pooled_validators().len().saturating_sub(reserve)
     }
 
     /// Every shard a pending reshape involves — [`Self::reshape_involves`]

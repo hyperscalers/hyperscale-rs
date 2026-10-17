@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, MIN_BEACON_COMMITTEE_SIZE,
+    BeaconState, BlockHeight, CommitteeTransition, Epoch, MIN_BEACON_COMMITTEE_SIZE,
     PendingReshape, PendingRotation, RecoveryCause, ShardCommittee, ShardId, ShardRecovery,
     TransitionCause, ValidatorId, ValidatorStatus, byzantine_threshold,
 };
@@ -275,7 +275,8 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     }
 }
 
-/// Re-draw the entire committee of every halted shard from the free
+/// Re-draw the entire committee of every shard in
+/// [`BeaconState::recovery_demand`], fork-flagged or halted, from the free
 /// pool — the f+1 liveness recovery.
 ///
 /// A shard marches to a halt only by concentrating corrupt members; a
@@ -298,71 +299,41 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
 /// still `OnShard` when the pool derives), and is retained in the
 /// shard's routing view via [`ShardRecovery`] so the incomers can fetch
 /// the halted tip from nodes that hold it.
-pub(super) fn recover_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
-    // Fork-flagged shards re-draw under `Fork` provenance; a shard that
-    // both forked and halted recovers once, as a fork. The flag is the
-    // durable trigger: a re-draw that stamps a pending recovery clears
-    // it, so a fold that declines (short pool) retries on every later
-    // fold, Skip epochs included.
-    //
-    // A flagged shard the lookahead does not seat has left the trie. Its
-    // flag is dropped: there is no committee to re-draw, and a chain
-    // later seated under the id is not the one that forked.
-    let forked: BTreeSet<ShardId> = state.fork_flagged.keys().copied().collect();
-    for &shard in &forked {
-        if !state.next_shard_committees.contains_key(&shard)
-            || recover_committee(state, shard, RecoveryCause::Fork)
-        {
+pub(super) fn recover_committees(state: &mut BeaconState) {
+    // Fork-flagged shards re-draw first, under `Fork` provenance; a shard
+    // that both forked and halted recovers once, as a fork. The flag is
+    // the durable trigger: a re-draw that stamps a pending recovery
+    // clears it, so a fold that declines (short pool) retries on every
+    // later fold, Skip epochs included.
+    let (forked, halted): (Vec<ShardId>, Vec<ShardId>) = state
+        .recovery_demand(0)
+        .into_iter()
+        .partition(|shard| state.fork_flagged.contains_key(shard));
+    for shard in forked {
+        if recover_committee(state, shard, RecoveryCause::Fork) {
             state.fork_flagged.remove(&shard);
         }
     }
-    for &shard in halted {
-        if forked.contains(&shard) {
-            continue;
-        }
+    for shard in halted {
         recover_committee(state, shard, RecoveryCause::Halt);
     }
 }
 
-/// Whether the re-draw stamped a pending recovery for `shard`. `false`
-/// when it declined: no attested anchor or a free pool short of a full
-/// committee, in which case the caller's trigger stays armed, or a shard
-/// the lookahead does not seat, whose trigger the caller drops.
+/// Whether the re-draw stamped a pending recovery for `shard`, a member
+/// of [`BeaconState::recovery_demand`]. `false` when the free pool is
+/// short of a full committee, in which case the caller's trigger stays
+/// armed.
 fn recover_committee(
     state: &mut BeaconState,
     shard: ShardId,
     requested_cause: RecoveryCause,
 ) -> bool {
     let size = state.chain_config.shard_size as usize;
-    // A recovery replaces the committee the lookahead seats. A shard it
-    // does not seat has left the trie, and the leaves that took its range
-    // are seated in its place: a committee drawn for it would publish a
-    // trie holding the shard beside the leaves that cover it.
-    if !state.next_shard_committees.contains_key(&shard) {
-        return false;
-    }
-    // A genesis-born shard that never produced still carries its ZERO
-    // placeholder, which the topology snapshot omits — so a fresh committee
-    // would have no attested anchor to seat against and the chain would
-    // stay dead. Skip the redraw: it could only churn the pool. The halt
-    // flag keeps standing, and a shard that never launched needs an
-    // operator, not a rotation.
-    if state
-        .boundaries
-        .get(&shard)
-        .is_some_and(|b| b.block_hash == BlockHash::ZERO)
-    {
-        tracing::warn!(
-            ?shard,
-            "halted shard never produced: no attested anchor to recover against, redraw skipped"
-        );
-        return false;
-    }
     // The beacon-authenticated frontier: the last boundary height folded
     // for the shard. A halted shard folds no new crossing, so this is
     // fixed for the halt's duration and equal across a stalled recovery's
-    // successors. A shard reaching recovery always has a boundary record
-    // (detection reads it); the default only guards a logically dead path.
+    // successors. A halted shard always has a boundary record; a
+    // fork-flagged shard without one falls back to the genesis frontier.
     let attested_frontier = state
         .boundaries
         .get(&shard)
@@ -459,18 +430,22 @@ fn recover_committee(
     true
 }
 
-/// Fill any live shard committee below `shard_size` from the pool.
+/// Fill any live shard committee below `shard_size` from the pool, short of
+/// the recovery reserve.
 ///
 /// [`run_shuffle_step`] maintains a committee's size — rotate one out, draw one
 /// in — but never grows it. A committee drawn short — a split cohort drawn
 /// against a pool the predecessors' make-before-break coast had momentarily
-/// depleted — would otherwise stay under `shard_size` for life, tightening its
-/// quorum toward all-of-N and missing the full-strength target a grow must
-/// reach. Once those predecessors dissolve and return their members to the
-/// pool, top each short committee back up; a member placed here syncs in via
-/// the normal `Ready` path like any pool refill. Skips a shard mid-reshape — a
-/// splitting parent's members carry to its children, a merge target's are its
-/// keepers — matching the shuffle's guards.
+/// depleted, or a split child whose half member was jailed or withdrawn since
+/// the carve — would otherwise stay under `shard_size` for life, tightening
+/// its quorum toward all-of-N and missing the full-strength target a grow must
+/// reach. Once the pool holds members past the reserve
+/// ([`BeaconState::drawable_pool_len`]), top each short committee back up; a
+/// member placed here syncs in via the normal `Ready` path like any pool
+/// refill. A recovery the pool cannot fund yet outranks a short committee, so
+/// while the reserve is at least the pool, the backfill waits. Skips a shard
+/// mid-reshape — a splitting parent's members carry to its children, a merge
+/// target's are its keepers — matching the shuffle's guards.
 pub(super) fn top_up_committees(state: &mut BeaconState) {
     // Only a split can seat a committee short — its cohort drawn against a pool
     // the make-before-break coast had depleted — and a split always leaves the
@@ -493,7 +468,7 @@ pub(super) fn top_up_committees(state: &mut BeaconState) {
             .get(&shard)
             .is_some_and(|committee| committee.members.len() < shard_size)
         {
-            if pool_draw(state, shard).is_none() {
+            if state.drawable_pool_len(0) == 0 || pool_draw(state, shard).is_none() {
                 break;
             }
         }
@@ -683,13 +658,14 @@ pub(super) fn diff_shard_committees(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
         Admission, BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash,
         BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason,
-        MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, PendingReshape, Randomness, RecoveryCause,
-        ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
-        StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
-        byzantine_threshold,
+        MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, PendingReshape, RESHAPE_READY_TTL_EPOCHS,
+        Randomness, RecoveryCause, ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload,
+        Stake, StakePool, StakePoolId, StateRoot, TransitionCause, ValidatorId, ValidatorStatus,
+        WeightedTimestamp, byzantine_threshold,
     };
 
     use super::{
@@ -701,6 +677,7 @@ mod tests {
         single_pool_state, validator_record,
     };
     use crate::state::vrf::jail_validator;
+    use crate::state::witness::apply_shard_payload;
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
 
     /// The shuffle interval the fixture states derive — all of them run
@@ -2187,6 +2164,16 @@ mod tests {
         u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1
     }
 
+    /// Put `shard` past the halt threshold, seeding a live record where
+    /// it has none.
+    fn halt(state: &mut BeaconState, shard: ShardId) {
+        state
+            .boundaries
+            .entry(shard)
+            .or_insert_with(|| live_boundary(0))
+            .consecutive_misses = over_threshold();
+    }
+
     /// A genesis-born placeholder the fold has never observed producing.
     fn never_produced_boundary(misses: u32) -> ShardBoundary {
         ShardBoundary {
@@ -2392,7 +2379,8 @@ mod tests {
             .copied()
             .collect();
 
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        halt(&mut state, s0);
+        recover_committees(&mut state);
         let fresh1: BTreeSet<ValidatorId> = state.next_shard_committees[&s0]
             .members
             .iter()
@@ -2401,7 +2389,8 @@ mod tests {
         assert!(fresh1.is_disjoint(&old));
 
         state.current_epoch = Epoch::new(40);
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        halt(&mut state, s0);
+        recover_committees(&mut state);
         let recovery = &state.pending_recoveries[&s0];
         assert_eq!(recovery.rotated_at, Epoch::new(40));
         assert_eq!(
@@ -2486,7 +2475,7 @@ mod tests {
         state.boundaries.insert(s0, live_boundary(0));
         state.fork_flagged.insert(s0, BlockHeight::new(6));
 
-        recover_committees(&mut state, &BTreeSet::new());
+        recover_committees(&mut state);
         assert!(
             state.pending_recoveries.is_empty(),
             "a short pool defers the re-draw",
@@ -2504,7 +2493,7 @@ mod tests {
             );
         }
         state.current_epoch = Epoch::new(11);
-        recover_committees(&mut state, &BTreeSet::new());
+        recover_committees(&mut state);
         assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
         assert!(!state.fork_flagged.contains_key(&s0));
     }
@@ -2527,7 +2516,7 @@ mod tests {
             .collect();
 
         state.fork_flagged.insert(s0, BlockHeight::new(6));
-        recover_committees(&mut state, &BTreeSet::new());
+        recover_committees(&mut state);
 
         assert!(
             !state.fork_flagged.contains_key(&s0),
@@ -2566,7 +2555,8 @@ mod tests {
             .collect();
 
         state.fork_flagged.insert(s0, BlockHeight::new(6));
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        halt(&mut state, s0);
+        recover_committees(&mut state);
 
         assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
         // A single re-draw: retention holds exactly the one replaced committee.
@@ -2592,7 +2582,7 @@ mod tests {
         state.boundaries.insert(s0, live_boundary(0));
 
         state.fork_flagged.insert(s0, BlockHeight::new(6));
-        recover_committees(&mut state, &BTreeSet::new());
+        recover_committees(&mut state);
         assert_eq!(state.pending_recoveries[&s0].cause, RecoveryCause::Fork);
 
         // Refill the pool so the stalled recovery can re-draw again.
@@ -2603,7 +2593,8 @@ mod tests {
             );
         }
         state.current_epoch = Epoch::new(20);
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        halt(&mut state, s0);
+        recover_committees(&mut state);
         assert_eq!(
             state.pending_recoveries[&s0].cause,
             RecoveryCause::Fork,
@@ -2670,16 +2661,158 @@ mod tests {
         assert!(published.shard_trie().contains(ShardId::leaf(1, 0)));
     }
 
-    /// The re-draw itself declines a shard the lookahead does not seat,
-    /// whichever trigger names it.
+    // ─── recovery demand ───────────────────────────────────────────────
+
+    /// A recovery that stalled past a further halt threshold is in demand
+    /// beside its pending record: the record is the stalled recovery, not
+    /// a reason to stop reserving for it.
     #[test]
-    fn a_recovery_declines_a_shard_the_lookahead_does_not_seat() {
-        for cause in [RecoveryCause::Fork, RecoveryCause::Halt] {
-            let (mut state, departed) = beside_departed_children();
-            let before = state.clone();
-            assert!(!recover_committee(&mut state, departed, cause));
-            assert_eq!(state, before);
+    fn a_restalled_recovery_is_in_demand() {
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 8);
+        state.current_epoch = Epoch::new(10);
+        halt(&mut state, s0);
+        recover_committees(&mut state);
+        assert!(state.pending_recoveries.contains_key(&s0));
+        assert!(state.recovery_demand(0).is_empty());
+
+        halt(&mut state, s0);
+        assert_eq!(state.recovery_demand(0), BTreeSet::from([s0]));
+        assert_eq!(
+            state.drawable_pool_len(0),
+            state.pooled_validators().len() - 4
+        );
+    }
+
+    /// A seated fork-flagged shard is in demand though the fork fence
+    /// keeps it out of the halted set.
+    #[test]
+    fn a_fork_flagged_sibling_is_in_demand() {
+        let (s0, s1) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut state = multi_shard_state(2, 4, 4);
+        for shard in [s0, s1] {
+            state.boundaries.insert(shard, live_boundary(0));
         }
+        state.fork_flagged.insert(s1, BlockHeight::new(3));
+
+        assert!(state.halted_shards().is_empty());
+        assert_eq!(state.recovery_demand(0), BTreeSet::from([s1]));
+        assert_eq!(state.drawable_pool_len(0), 0);
+    }
+
+    /// A genesis shard that never produced is halted but not in demand: no
+    /// recovery can seat against it, so it reserves nothing from the pool.
+    #[test]
+    fn a_never_produced_genesis_shard_reserves_nothing() {
+        let (s0, s1) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut state = multi_shard_state(2, 4, 4);
+        state
+            .boundaries
+            .insert(s0, never_produced_boundary(over_threshold()));
+        state.boundaries.insert(s1, live_boundary(0));
+
+        assert_eq!(state.halted_shards(), BTreeSet::from([s0]));
+        assert!(state.recovery_demand(1).is_empty());
+        assert_eq!(state.drawable_pool_len(1), 4);
+    }
+
+    /// A split cancelled at its readiness deadline returns its cohort in
+    /// the prune, and the recovery draws it ahead of the shuffle: the
+    /// halted sibling is re-drawn from the returned cohort, and the
+    /// shuffle still opens its rotation from what the recovery returned.
+    #[test]
+    fn a_cancelled_cohort_reaches_the_recovery_before_the_shuffle() {
+        let (halted, target) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut state = multi_shard_state(2, 4, 5);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.shard_committees = state.next_shard_committees.clone();
+        add_eligible_slack(&mut state);
+        for shard in [halted, target] {
+            state.boundaries.insert(shard, live_boundary(0));
+        }
+        let interval = shuffle_interval();
+        let fold = interval * (RESHAPE_READY_TTL_EPOCHS / interval + 1);
+        state.current_epoch = Epoch::new(fold - RESHAPE_READY_TTL_EPOCHS);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            target,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: target,
+                epoch: Epoch::GENESIS,
+            },
+        );
+        let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get(&target) else {
+            panic!("the split is admitted");
+        };
+        let mut returned: BTreeSet<ValidatorId> = cohort.keys().copied().collect();
+        returned.extend(state.pooled_validators());
+        assert_eq!(state.pooled_validators().len(), 1);
+
+        halt(&mut state, halted);
+        state.current_epoch = Epoch::new(fold - 1);
+        apply_next_epoch(&mut state, &[]);
+
+        assert!(!state.pending_reshapes.contains_key(&target), "cancelled");
+        let recovery = &state.pending_recoveries[&halted];
+        assert_eq!(recovery.rotated_at, Epoch::new(fold));
+        assert!(
+            state.next_shard_committees[&halted]
+                .members
+                .iter()
+                .all(|id| returned.contains(id)),
+            "the fresh committee is drawn from the returned cohort",
+        );
+        let (_, entrant) = sole_rotation(&state, target);
+        assert!(
+            state.next_shard_committees[&target]
+                .members
+                .contains(&entrant)
+        );
+    }
+
+    /// A halted shard the pool cannot fund leaves rotation running on its
+    /// siblings: the shuffle's entrant is not gated on the reserve.
+    #[test]
+    fn a_halted_shard_the_pool_cannot_fund_does_not_stop_rotation() {
+        let (halted, live) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut state = multi_shard_state(2, 4, 2);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state
+            .boundaries
+            .insert(halted, live_boundary(over_threshold()));
+        state.boundaries.insert(live, live_boundary(0));
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
+
+        apply_next_epoch(&mut state, &[]);
+
+        assert!(state.recovery_demand(0).contains(&halted));
+        assert!(!state.pending_recoveries.contains_key(&halted));
+        let (_, entrant) = sole_rotation(&state, live);
+        assert!(
+            state.next_shard_committees[&live]
+                .members
+                .contains(&entrant)
+        );
+    }
+
+    /// A shard the lookahead does not seat is never in recovery demand,
+    /// whichever trigger names it, so the recovery draws nothing for it.
+    #[test]
+    fn a_shard_the_lookahead_does_not_seat_is_not_in_demand() {
+        let (mut state, departed) = beside_departed_children();
+        state.fork_flagged.insert(departed, BlockHeight::new(6));
+        halt(&mut state, departed);
+        state
+            .boundaries
+            .get_mut(&departed)
+            .expect("seeded")
+            .terminal_epoch = None;
+        assert!(!state.recovery_demand(0).contains(&departed));
+        let before = state.clone();
+        recover_committees(&mut state);
+        assert_eq!(state, before);
     }
 
     /// A recovery that stalls and is re-drawn keeps its binding beside its
@@ -2692,9 +2825,11 @@ mod tests {
         let mut state = multi_shard_state(1, 4, 8);
         state.current_epoch = Epoch::new(10);
         state.boundaries.insert(s0, live_boundary(0));
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        halt(&mut state, s0);
+        recover_committees(&mut state);
         state.current_epoch = Epoch::new(20);
-        recover_committees(&mut state, &BTreeSet::from([s0]));
+        halt(&mut state, s0);
+        recover_committees(&mut state);
 
         let history: Vec<_> = state.recoveries[&s0]
             .iter()

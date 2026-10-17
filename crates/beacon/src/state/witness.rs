@@ -576,7 +576,10 @@ pub(super) fn apply_shard_payload(
             // An existing split's re-assertion refreshes its trigger
             // clock. If a lapse emptied the cohort, the re-assertion also
             // re-staffs it from the frozen seed over the now-refilled
-            // pool, re-deriving the identical selection and assignment.
+            // pool, re-deriving the identical selection and assignment,
+            // once the pool past the recovery reserve staffs it. The
+            // reserve reads a fold ahead, because this fold's miss bump
+            // has yet to run.
             //
             // Never once the cut is scheduled. The gate approved one
             // specific cohort and froze the carve beside it, and there is
@@ -596,7 +599,7 @@ pub(super) fn apply_shard_payload(
             };
             if let Some((restaffable, seed)) = existing {
                 let restaffed = (restaffable
-                    && state.pooled_validators().len() >= state.chain_config.shard_size as usize)
+                    && state.drawable_pool_len(1) >= state.chain_config.shard_size as usize)
                     .then(|| draw_split_cohort(state, *shard, &seed));
                 if let Some(PendingReshape::Split {
                     cohort,
@@ -638,10 +641,12 @@ pub(super) fn apply_shard_payload(
                 return None;
             }
             // Pool gate: the grow phase draws a full committee's worth
-            // of observers; refuse what the pool can't staff. Rejection
-            // isn't an error — the shard re-asserts next window and
-            // admission resumes when the pool allows.
-            if state.pooled_validators().len() < state.chain_config.shard_size as usize {
+            // of observers; refuse what the pool past the recovery
+            // reserve can't staff, the reserve read a fold ahead as the
+            // re-staff above reads it. Rejection isn't an error — the
+            // shard re-asserts next window and admission resumes when the
+            // pool allows.
+            if state.drawable_pool_len(1) < state.chain_config.shard_size as usize {
                 return None;
             }
             tracing::info!(?shard, "Shard split admitted; reshape pending");
