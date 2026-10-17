@@ -67,6 +67,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a stopped host's handed-off store work may hold a store open.
 const STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the cluster's seated hosts have to install the network genesis
+/// once their runners start.
+const GENESIS_INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How often a restart rechecks for stores still open.
 const STORE_CLOSE_POLL: Duration = Duration::from_millis(50);
 
@@ -251,7 +255,7 @@ impl Harness {
         // Spawn every runner now that all adapters are peering.
         let running = built.into_iter().map(spawn_host).collect();
 
-        Self {
+        let harness = Self {
             hosts: running,
             temp_dirs,
             build: ClusterBuild {
@@ -260,7 +264,38 @@ impl Harness {
                 genesis_config,
                 simulated_outbound_latency,
             },
-        }
+        };
+        harness.await_genesis_installed().await;
+        harness
+    }
+
+    /// Wait until every host seated on the genesis ROOT committee holds a
+    /// ROOT store that installed the network genesis. A runner opens and
+    /// installs its stores only once it runs, so until then a scenario
+    /// reading the cluster's state would find nothing there at all.
+    async fn await_genesis_installed(&self) {
+        let committee = &self.build.genesis.committee;
+        let seated: Vec<usize> = (0..self.hosts.len())
+            .filter(|&host| {
+                self.hosts[host]
+                    .validator_ids
+                    .iter()
+                    .any(|validator| committee.contains(validator))
+            })
+            .collect();
+        let installed = || {
+            seated.iter().all(|&host| {
+                self.host_store(host, ShardId::ROOT)
+                    .is_some_and(|store| store.installed_genesis().is_some())
+            })
+        };
+        timeout(GENESIS_INSTALL_TIMEOUT, async {
+            while !installed() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("every seated host installs the network genesis");
     }
 
     /// Restart host `host` with its stores for `shards` wiped: shut the
