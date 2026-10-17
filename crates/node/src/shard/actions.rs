@@ -122,7 +122,15 @@ where
                 self.io.tick_chain.clear();
             }
             Action::RaiseTickFloor { floor } => {
-                self.io.tick_chain.raise_floor(floor);
+                self.io.tick_chain.raise_floor(floor, self.shard);
+                // A row the crossing keeps may be stated by a tick this
+                // replica never ran, or whose run lands at or below the floor.
+                self.io.tick_chain.seed_stated(
+                    self.vnodes[vnode_idx]
+                        .state
+                        .shard_coordinator()
+                        .member_rows(),
+                );
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────

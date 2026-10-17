@@ -64,7 +64,9 @@ use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
     record_unresolvable_tx,
 };
-use hyperscale_storage::{FeeTerms, ProvisionalTx, RecoveredState, TickResolution};
+use hyperscale_storage::{
+    FeeTerms, ProvisionalTx, RecoveredState, TickResolution, declared_reservations,
+};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CarriedClaims, CertifiedBlock,
@@ -80,7 +82,6 @@ use hyperscale_types::{
 };
 use tracing::instrument;
 
-use crate::action_handlers::declared_reservations;
 use crate::candidates::{Admitted, TickCandidates};
 use crate::counterparts::{Counterparts, CrossingIndexSlot, Offers};
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
@@ -3551,10 +3552,12 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Discard a tick a halt recovery lets go of at its crossing block,
-    /// whole: every member goes to the deadline path, a `Shared` one
-    /// included, since no committee the shard keeps certifies a tick
-    /// anchored below the bridge.
+    /// Discard a tick a halt recovery lets go of at its crossing block:
+    /// no committee the shard keeps certifies a tick anchored below the
+    /// bridge, so every member in flight goes to the deadline path. A
+    /// stated member's row stands, and its legs half is built from the
+    /// yes its row stages, so the half held for the tick is built again
+    /// at the next settled tip.
     fn discard_recovered(&mut self, tick_id: TickId) {
         // What the tally saw is the whole diagnosis: split roots are
         // replicas that executed the tick differently, and power under
@@ -3574,6 +3577,8 @@ impl ExecutionCoordinator {
         // on it.
         self.ticked.remove(&tick_id);
         self.finalized.remove_tick(&tick_id);
+        self.legs_offered.remove(&tick_id);
+        self.legs_asked.remove(&tick_id);
         self.exec_certs.evict(&tick_id);
         let height = tick_id.block_height();
         self.pending_ticks
@@ -3848,11 +3853,12 @@ impl ExecutionCoordinator {
     /// row or not: the registry drops each whole, with its queue
     /// entries, buffered resolutions, votes, finalizations and
     /// certificates. Every contribution at or below the parent is then
-    /// in the base or discarded, so the floor withdraws every chain entry
-    /// there and nothing else, and the first tick past the crossing reads
-    /// the base alone. A batch in flight now is of a tick the registry no
-    /// longer holds: its completion records nothing, and its append lands
-    /// at or below the floor, so the chain drops it.
+    /// in the base, discarded, or a stated member's leg its legs half
+    /// settles through the base, so the floor withdraws every chain entry
+    /// there and nothing else, keeping only the holds of stated members.
+    /// A batch in flight now is of a tick the registry no longer holds:
+    /// its completion records nothing, and its append lands at or below
+    /// the floor, so the chain drops it.
     ///
     /// Asks the shard's own question of the shard's own inputs
     /// ([`TopologySchedule::crossing_block`] at the block's committee

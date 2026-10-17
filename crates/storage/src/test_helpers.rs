@@ -6675,9 +6675,13 @@ pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore 
 }
 
 /// What each sibling `row` awaits last said of it, beside what the row
-/// may do as an accepted one where every sibling still runs, records no
+/// may do as one that `hears` where every sibling still runs, records no
 /// recovery and is judged in the epoch of `mark`.
-fn accepted_row_decides(row: &MemberRow, mark: ReadMark) -> (Vec<Option<Said>>, Decision) {
+fn hearing_row_decides(
+    row: &MemberRow,
+    hears: Hears,
+    mark: ReadMark,
+) -> (Vec<Option<Said>>, Decision) {
     let view = SiblingView {
         epoch: mark.epoch,
         terminating: Some(false),
@@ -6695,11 +6699,12 @@ fn accepted_row_decides(row: &MemberRow, mark: ReadMark) -> (Vec<Option<Said>>, 
         })
         .collect();
     let said = row.hearing.iter().map(|heard| heard.said).collect();
-    (said, decide(Hears::Accepted, &values))
+    (said, decide(hears, &values))
 }
 
-/// The line aborting `tx`, a released member reaching `counterpart`:
-/// awaiting nobody and answering no crossing.
+/// The line aborting `tx`, a member released in flight reaching
+/// `counterpart`: awaiting nobody, answering no crossing, and attesting
+/// the share no half of its tick settled.
 fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline) -> TickLine {
     TickLine::Member {
         staged: 0,
@@ -6713,7 +6718,7 @@ fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline)
             vault: state_key(0x77, 1),
             amount: 0,
         },
-        share: 0,
+        share: 1,
         reserves: Capped::empty(),
         deadline,
         crossings: Capped::empty(),
@@ -6739,19 +6744,19 @@ fn abort_settled_of_one(shard: ShardId, tick: u64, height: u64, tx: TxHash) -> M
 /// Shared verdict test: a sibling reads a row a recovery released as
 /// having stated nothing, and the row's abort as an exit.
 ///
-/// One shard runs a member a counterpart shares the verdict on and
-/// states its yes; the counterpart hears the yes and accepts. A
-/// recovery's discard of the tick releases the row and deletes its leaf,
-/// and a claim at that root reads the verdict cell absent beside the
-/// row: nothing is stated, so the counterpart's accepted row waits.
-/// `named` is the lines a block names over the rows the store holds at
-/// an anchor: the row ran, so the first block after its release names
-/// its abort, short of its deadline. The reading is the same while the abort's
-/// tick holds the row. Once that tick's stating half deletes it, a claim
-/// reads the cell and the row absent beside the committed marker, the
-/// counterpart hears that the shard has left, and its accepted row ends.
-/// That reading is the one way the counterpart learns of the exit: the
-/// abort's certificate tells it nothing.
+/// One shard runs a member a counterpart shares the verdict on, and the
+/// counterpart states its own yes. A recovery's discard of the tick
+/// releases the row while it is still in flight, and a claim at that
+/// root reads the verdict cell absent beside the row: nothing is stated,
+/// so the counterpart's stated row waits. `named` is the lines a block
+/// names over the rows the store holds at an anchor: the row ran, so the
+/// first block after its release names its abort, short of its deadline.
+/// The reading is the same while the abort's tick holds the row. Once
+/// that tick's stating half deletes it, a claim reads the cell and the
+/// row absent beside the committed marker, the counterpart hears that
+/// the shard has left, and its stated row is refused. That reading is
+/// the one way the counterpart learns of the exit: the abort's
+/// certificate tells it nothing.
 ///
 /// # Panics
 ///
@@ -6785,11 +6790,6 @@ pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + Tree
         &committed_tx_cells(writer, [&transaction]),
         &core_run_at_one(writer, reader, tx, deadline),
     );
-    let stated_root = commit(
-        2,
-        &[],
-        &core_settled_of_one(writer, 2, TickHalf::Stated, tx),
-    );
 
     let leaf = verdict_leaf(writer, tx);
     let mut keys = vec![
@@ -6811,18 +6811,18 @@ pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + Tree
             heard: AnchorReadings::among(from_ref(claim), windows),
             ..MemberInputs::still(reader)
         });
-        accepted_row_decides(&rows.members[&tx], ReadMark::of(&claim.anchor, windows))
+        hearing_row_decides(
+            &rows.members[&tx],
+            Hears::Stated,
+            ReadMark::of(&claim.anchor, windows),
+        )
     };
-
-    hear(&mut rows, &claim_at(2, stated_root));
-    rows.advance(&core_accepted_of_one(reader, 3, tx));
-    assert_eq!(rows.members[&tx].state, RowState::Accepted);
 
     let discard = TickLine::Discard {
         tick: TickId::new(writer, BlockHeight::new(1)),
         cause: DiscardCause::Recovery,
     };
-    let released = claim_at(3, commit(3, &[], &naming(3, vec![discard])));
+    let released = claim_at(2, commit(2, &[], &naming(2, vec![discard])));
     assert_eq!(released.reading(leaf), Some(Inclusion::Absent));
     assert_eq!(
         hear(&mut rows, &released),
@@ -6839,18 +6839,18 @@ pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + Tree
     );
     let abort = named(&standing, deadline.at().minus(Duration::from_millis(1)));
     assert_eq!(abort, vec![abort_of_a_released_row(tx, reader, deadline)]);
-    let aborting = claim_at(4, commit(4, &[], &naming(4, abort)));
+    let aborting = claim_at(3, commit(3, &[], &naming(3, abort)));
     assert_eq!(
         hear(&mut rows, &aborting),
         (vec![None], Decision::Wait),
         "the row stands until the abort's tick settles it",
     );
 
-    let left = claim_at(5, commit(5, &[], &abort_settled_of_one(writer, 4, 5, tx)));
+    let left = claim_at(4, commit(4, &[], &abort_settled_of_one(writer, 3, 4, tx)));
     assert_eq!(
         hear(&mut rows, &left),
-        (vec![Some(Said::Left)], Decision::End),
-        "the row gone beside the committed marker is an exit, and the accepted row ends",
+        (vec![Some(Said::Left)], Decision::Refuse),
+        "the row gone beside the committed marker is an exit, and the stated row is refused",
     );
 }
 

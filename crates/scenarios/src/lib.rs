@@ -104,10 +104,8 @@ pub use reshape::{
 };
 pub use route::{
     Certificates, CoreLoad, FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport,
-    SECOND_VENUE_SHARD, TRADER_SHARD,
-    a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released,
-    a_crossing_the_consumer_refuses_is_declined,
-    a_recovered_venue_aborts_what_its_sibling_accepted,
+    SECOND_VENUE_SHARD, TRADER_SHARD, a_core_stated_at_a_halt_is_accepted_on_both_venues,
+    a_crossing_the_consumer_refuses_is_declined, a_recovered_venue_keeps_what_its_sibling_accepted,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,

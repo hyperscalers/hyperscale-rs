@@ -1082,9 +1082,11 @@ impl<'a> Standing<'a> {
 /// it, defers.
 ///
 /// On a recovery's crossing block (`recovery`) every tick the rows hold
-/// is discarded whole: each was anchored below the bridge, so no
-/// committee the shard keeps can certify it, and no other line names
-/// its members in that block.
+/// is discarded: each was anchored below the bridge, so no committee the
+/// shard keeps can certify it, and no other line names its members in
+/// that block. The discard releases each member in flight and keeps each
+/// stated one, which owes nothing a certificate gives and leaves only on
+/// what its siblings' state says.
 ///
 /// The lines are listed as the budget is charged: a recovery's
 /// discards; the fates in transaction order, each after the
@@ -1217,17 +1219,15 @@ impl<'a> Exit<'a> {
     ///   its deadline otherwise; it is fated once nobody can answer for
     ///   it. Only a recovery's discard leaves such a row standing past
     ///   the block that released it, and the abort ends it on this shard
-    ///   alone, where nothing else can. A sibling that has not accepted
-    ///   reads the abort and refuses, and one that accepted on the yes
-    ///   the discard dropped keeps its accept and ends its row on the
-    ///   abort;
+    ///   alone, where nothing else can. It never stated, so no sibling
+    ///   accepted on it, and a sibling reads the abort and refuses;
     /// - one let go of out of an abort is aborted again at its deadline,
     ///   whether or not it ran;
     /// - one that has stated leaves only on what its siblings' state
     ///   says, in `verdicts`: aborted where a sibling left without
     ///   accepting, fated where one can never be read and none refused,
-    ///   each after its tick's determined half; no clock, record or
-    ///   evidence ends it, and a recovery's discard releases it;
+    ///   each after its tick's determined half; no clock, record,
+    ///   evidence or recovery ends it;
     /// - one that has accepted stands whatever the clock or the evidence
     ///   says: it has settled, and only an `End` line ends it.
     ///
@@ -1285,10 +1285,11 @@ impl<'a> Exit<'a> {
                 settlement,
             } => held(tick, joins, settlement),
             RowState::Stated { tick, .. } => {
-                // A stated row's tick is let go of by a recovery's own
-                // discard alone, and by an exit of the row only once its
-                // determined half has settled: the determined
-                // contribution it ran beside is readable.
+                // A recovery's crossing block names nothing for a stated
+                // row beside its tick's discard, which keeps it, and an
+                // exit of the row waits for its determined half to
+                // settle: the determined contribution it ran beside is
+                // readable.
                 if recovered.contains(&tick)
                     || rows
                         .ticks
@@ -4217,12 +4218,13 @@ mod tests {
     }
 
     /// A recovery's crossing block discards every tick row standing at
-    /// its parent, whatever its height, and the next block aborts every
-    /// member a sibling shares the verdict on that ran in one of them,
-    /// stated or still in flight, short of its deadline: each answers the
-    /// crossings its run consumed and never applied.
+    /// its parent, whatever its height, and aborts no stated row: the
+    /// discard keeps each stated member standing in its tick, and the
+    /// next block aborts only the shared member that ran and was still
+    /// in flight, short of its deadline, answering the crossings its run
+    /// consumed and never applied.
     #[test]
-    fn a_recovery_aborts_every_shared_member_that_ran() {
+    fn the_crossing_block_aborts_no_stated_row() {
         let deadline = far();
         let at = BlockHeight::new;
         let consumed = consuming().crossings;
@@ -4275,26 +4277,27 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         naming(&mut rows, 6, crossing);
+        for (seed, tick) in [(1, 2), (2, 3)] {
+            assert!(
+                matches!(
+                    rows.members[&tx(seed)].state,
+                    RowState::Stated { tick: held, .. } if held == at(tick)
+                ),
+                "{seed} stands stated",
+            );
+            assert_eq!(rows.ticks[&at(tick)].members.as_slice(), &[tx(seed)]);
+        }
+        assert!(!rows.ticks.contains_key(&at(4)));
         let next = lines_at(&rows, ms(60_001), live, false).0;
-        let mut aborts: Vec<TickLine> = [1, 2, 3]
-            .into_iter()
-            .map(|seed| aborting(&rows.members[&tx(seed)], consumed.clone()))
-            .collect();
-        aborts.sort_by_key(|line| match line {
-            TickLine::Member { tx, .. } => *tx,
-            _ => unreachable!("an abort is a member line"),
-        });
-        assert_eq!(next, aborts);
+        assert_eq!(next, vec![aborting(&rows.members[&tx(3)], consumed)]);
     }
 
     /// A member that ran and that a recovery released, a counterpart
     /// settling against it, is aborted at once answering every
     /// crossing it consumes unless a record covers it: the line that ran
     /// it stated them and left them on its row, and its effects, which
-    /// would have answered them, never applied. Stated before its
-    /// release, it attests no share, which its stating half counted, and
-    /// burns the charge its row carries; released in flight, it attests
-    /// the share no half of its tick settled.
+    /// would have answered them, never applied. Released in flight, it
+    /// attests the share no half of its tick settled.
     #[test]
     fn a_released_shared_row_that_ran_answers_its_crossings() {
         let deadline = Deadline::of(ms(10_000));
@@ -4308,89 +4311,70 @@ mod tests {
         let at = BlockHeight::new;
         let live = Evidence::Live { terminating: false };
         for covered in [false, true] {
-            for stated in [false, true] {
-                let mut rows = rows_of([stating(1, deadline, &core)]);
-                assert_eq!(rows.members[&tx(1)].crossings, core.crossings);
-                naming(
-                    &mut rows,
-                    2,
-                    vec![TickLine::Member {
-                        staged: 0,
-                        tx: tx(1),
-                        joins: Joins::Executes,
+            let mut rows = rows_of([stating(1, deadline, &core)]);
+            assert_eq!(rows.members[&tx(1)].crossings, core.crossings);
+            naming(
+                &mut rows,
+                2,
+                vec![TickLine::Member {
+                    staged: 0,
+                    tx: tx(1),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Shared,
+                    holds: Capped::empty(),
+                    reach: core.reach.clone(),
+                    awaits: core.awaits.clone(),
+                    charge: core.charge,
+                    share: core.share,
+                    reserves: core.reserves.clone(),
+                    deadline,
+                    crossings: core.crossings.clone(),
+                }],
+            );
+            let named = &rows.members[&tx(1)];
+            assert_eq!(
+                (&named.crossings, &named.owes),
+                (&core.crossings, &owed),
+                "the line that runs a shared member leaves its crossings on its row, \
+                 which owes them until its writes land",
+            );
+            let discard = lines_at(&rows, ms(5_000), live, true).0;
+            naming(&mut rows, 4, discard);
+            rows.advance(&MemberInputs {
+                height: at(5),
+                covered: if covered { vec![tx(1)] } else { Vec::new() },
+                ..MemberInputs::still(shard)
+            });
+            let released = rows.members[&tx(1)].clone();
+            assert_eq!(
+                (released.state, released.executed, released.covered),
+                (
+                    RowState::Released {
                         settlement: Settlement::Shared,
-                        holds: Capped::empty(),
-                        reach: core.reach.clone(),
-                        awaits: core.awaits.clone(),
-                        charge: core.charge,
-                        share: core.share,
-                        reserves: core.reserves.clone(),
-                        deadline,
-                        crossings: core.crossings.clone(),
-                    }],
-                );
-                let named = &rows.members[&tx(1)];
-                assert_eq!(
-                    (&named.crossings, &named.owes),
-                    (&core.crossings, &owed),
-                    "the line that runs a shared member leaves its crossings on its row, \
-                     which owes them until its writes land",
-                );
-                if stated {
-                    rows.advance(&MemberInputs {
-                        height: at(3),
-                        settled: vec![SettledHalf {
-                            tick: TickId::new(shard, at(2)),
-                            half: TickHalf::Stated,
-                            deleted: Vec::new(),
-                            stated: vec![yes_receipt(tx(1), GlobalReceiptHash::ZERO)],
-                            accepted: Vec::new(),
-                        }],
-                        ..MemberInputs::still(shard)
-                    });
-                    assert!(matches!(
-                        rows.members[&tx(1)].state,
-                        RowState::Stated { .. }
-                    ));
-                }
-                let discard = lines_at(&rows, ms(5_000), live, true).0;
-                naming(&mut rows, 4, discard);
-                rows.advance(&MemberInputs {
-                    height: at(5),
-                    covered: if covered { vec![tx(1)] } else { Vec::new() },
-                    ..MemberInputs::still(shard)
-                });
-                let released = rows.members[&tx(1)].clone();
-                assert_eq!(
-                    (released.state, released.executed, released.covered),
-                    (
-                        RowState::Released {
-                            settlement: Settlement::Shared,
-                        },
-                        true,
-                        covered,
-                    ),
-                );
-                assert_eq!(
-                    (&released.crossings, &released.owes),
-                    (&core.crossings, &owed)
-                );
-                assert_eq!(released.share, if stated { 0 } else { 9 });
+                    },
+                    true,
+                    covered,
+                ),
+            );
+            assert_eq!(
+                (&released.crossings, &released.owes),
+                (&core.crossings, &owed)
+            );
+            assert_eq!(released.share, 9);
 
-                let answered = if covered {
-                    Capped::empty()
-                } else {
-                    core.crossings.clone()
-                };
-                let (lines, missing) = lines_at(&rows, deadline.at().minus(MS), live, false);
-                assert!(missing.is_empty());
-                assert_eq!(
-                    lines,
-                    vec![aborting(&released, answered.clone())],
-                    "covered {covered}, stated {stated}",
-                );
-                assert_eq!(abort_of(&lines, 1), (deadline, answered));
-            }
+            let answered = if covered {
+                Capped::empty()
+            } else {
+                core.crossings.clone()
+            };
+            let (lines, missing) = lines_at(&rows, deadline.at().minus(MS), live, false);
+            assert!(missing.is_empty());
+            assert_eq!(
+                lines,
+                vec![aborting(&released, answered.clone())],
+                "covered {covered}",
+            );
+            assert_eq!(abort_of(&lines, 1), (deadline, answered));
         }
     }
 
@@ -4863,8 +4847,9 @@ mod tests {
                 vec![],
             ),
         );
-        // A halt recovery's crossing block discards it whole, owed half
-        // and all, and names nothing else of its rows.
+        // A halt recovery's crossing block discards it, owed half and
+        // all, releasing its member in flight, and names nothing else of
+        // its rows.
         assert_eq!(
             lines_and_missing(
                 &rows,

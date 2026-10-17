@@ -666,7 +666,10 @@ impl ExecutionSim {
                     }
                 }
                 Action::ClearTickChain => self.chain.clear(),
-                Action::RaiseTickFloor { floor } => self.chain.raise_floor(floor),
+                Action::RaiseTickFloor { floor } => {
+                    self.chain.raise_floor(floor, self.local_shard);
+                    self.chain.seed_stated(&self.member_rows());
+                }
                 _ => {}
             }
         }

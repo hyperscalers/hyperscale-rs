@@ -641,16 +641,17 @@ impl Section for FinalizationsSection {
     ///
     /// A certificate anchored below a bridge of this shard's recovery
     /// settles nothing in a block anchored at or past it. The recovery's
-    /// crossing block discards every tick below the bridge, so no row
-    /// stands for it; and the committee that certified it is one the
-    /// recovery replaced, or a fresh one whose members sign no tick
-    /// below the bridge. Read off the bindings the block's own snapshot
-    /// records, so every voter reads one history.
+    /// crossing block discards every tick below the bridge, so no row in
+    /// flight stands for it, and a tick it keeps holds only stated rows,
+    /// which await a legs half and no certificate; and the committee that
+    /// certified it is one the recovery replaced, or a fresh one whose
+    /// members sign no tick below the bridge. Read off the bindings the
+    /// block's own snapshot records, so every voter reads one history.
     ///
     /// The order its tick settles in is [`settles_in_order`]'s.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
         // A legs half carries no certificate: its names are held to rows
-        // stated on this chain, which a recovery's discard releases.
+        // stated on this chain, which a recovery's discard keeps.
         if let Some(local) = fw.local_ec() {
             let vote_anchor = local.vote_anchor_ts();
             if vote_anchor < ctx.chain_origin {

@@ -24,7 +24,7 @@ use hyperscale_types::{
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr, REATTESTATION_STEP,
     ResourceAddr, ShardId, ShardTrie, SubstateKey, TimestampRange, Transaction,
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
-    verdict_leaf,
+    staged_leaf, verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -1333,41 +1333,31 @@ fn route_held_by_a_silent_sibling<C: FaultableCluster>(c: &mut C, payer: FeePaye
     }
 }
 
-/// A route's core held through a halt of its first venue's shard is
-/// aborted on both venues past the recovery, and the trader's escrowed
-/// input is released.
+/// A route's core stated on both venues through a halt of its first
+/// venue's shard is accepted on both past the recovery, and the trader's
+/// escrowed input is spent on the route.
 ///
 /// The core is held on both venues, each cut off from the other's state
-/// and certificates, and stands stated on the first venue's shard
-/// through a halt and its committee redraw. The recovery's crossing
-/// block releases the row, and the recovered shard aborts it at once:
-/// the row goes and the chain reads the route `Aborted`.
-///
-/// Once the cut lifts the surviving venue's shard reads the recovered
-/// shard's exit, the row gone beside its committed marker, and refuses:
-/// its stated core ends `Aborted` as well. The trader's escrowed input
-/// is then answered, and both resources settle.
+/// and certificates, and stands stated on both through a halt of the
+/// first venue's shard and its committee redraw. The recovery's crossing
+/// block keeps the stated row and the yes it staged, so neither venue
+/// withdraws its yes. Once the venues read each other, both accept, both
+/// rows end, and both resources settle.
 ///
 /// # Panics
 ///
-/// Panics if the core is never held on both venues, the halt or its
-/// recovery misses a budget, either venue's shard does not end the core
-/// by an abort, the trader's input stays locked, or either resource
+/// Panics if the core never stands stated on both venues, the halt or
+/// its recovery misses a budget, either venue's shard does not accept
+/// the core, a row, leaf or staged yes of it stands, or either resource
 /// does not settle.
-pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
-    C: FaultableCluster,
->(
-    c: &mut C,
-) {
+pub fn a_core_stated_at_a_halt_is_accepted_on_both_venues<C: FaultableCluster>(c: &mut C) {
     let (halted, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let venues = [halted, survivor];
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
     let sponsor = sponsor(&mut taken);
     let (key, trader) = &traders[0];
-    let row = |c: &C, shard: ShardId, tx: TxHash| {
-        c.member_rows(shard).and_then(|rows| rows.get(&tx).copied())
-    };
     let cut = [
         isolate_ec_intake(c, halted, survivor),
         isolate_ec_intake(c, survivor, halted),
@@ -1387,20 +1377,17 @@ pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
         validity_around(c.now()),
     );
     let hash = charges.submit(c, route);
-    let held_on = |c: &C, shard: ShardId| {
-        matches!(
-            row(c, shard, hash),
-            Some(RowState::InFlight { .. } | RowState::Stated { .. })
-        )
-    };
+    let stated_on =
+        |c: &C, shard: ShardId| matches!(row_on(c, shard, hash), Some(RowState::Stated { .. }));
     assert!(
-        c.run_until(epochs(8), |c| held_on(c, halted) && held_on(c, survivor)),
-        "the route's core must be held on both venues: {:?} {:?}",
-        row(c, halted, hash),
-        row(c, survivor, hash),
+        c.run_until(epochs(8), |c| stated_on(c, halted)
+            && stated_on(c, survivor)),
+        "the route's core must stand stated on both venues: {:?} {:?}",
+        row_on(c, halted, hash),
+        row_on(c, survivor, hash),
     );
     // The recovery's frontier is the last boundary the beacon attested,
-    // so the tick holding the core has to stand through one.
+    // so the block stating the core has to stand through one.
     c.run_until(epochs(2), |_| false);
 
     let halt = freeze_shard(c, halted, survivor, |_| {});
@@ -1409,44 +1396,32 @@ pub fn a_core_held_at_a_halt_is_aborted_on_both_venues_and_its_input_released<
         "the channels between the venues must actually have been exercised and cut",
     );
     await_halt_recovery(c, &halt);
-
-    let aborted_on = |c: &C, shard: ShardId| {
-        row(c, shard, hash).is_none()
-            && matches!(
-                c.chain_fate(shard, hash).1,
-                Some((_, TransactionDecision::Aborted))
-            )
-    };
-    assert!(
-        c.run_until(epochs(6), |c| aborted_on(c, halted)),
-        "the recovered shard ends the route's core by an abort: {:?} {:?}",
-        row(c, halted, hash),
-        c.chain_fate(halted, hash),
-    );
     c.clear_drops();
     assert!(
-        c.run_until(epochs(6), |c| aborted_on(c, survivor)),
-        "the survivor reads the recovered shard's exit and ends its core by an abort: {:?} {:?}",
-        row(c, survivor, hash),
-        c.chain_fate(survivor, hash),
+        c.run_until(epochs(RECOVERED_ROW_EPOCHS), |c| venues.iter().all(
+            |venue| accepted_on(c, *venue, hash) && row_on(c, *venue, hash).is_none()
+        )),
+        "both venues accept the route's core and both rows end: {:?} {:?}",
+        venues.map(|venue| c.chain_fate(venue, hash).1),
+        venues.map(|venue| row_on(c, venue, hash)),
     );
-    assert!(
-        c.run_until(epochs(6), |c| protocol_resource
-            .locked(c, &charges)
-            .is_empty()),
-        "the trader's escrowed input is released: {:?}",
-        protocol_resource.locked(c, &charges),
-    );
+    for venue in venues {
+        assert!(
+            !leaf_stands(c, venue, hash) && !staged_stands(c, venue, hash),
+            "{venue:?} keeps no leaf or staged yes of the route",
+        );
+    }
     protocol_resource.assert_settles_within(
         c,
         &charges,
         epochs(8),
-        "a core aborted on both venues past a halt",
+        "a core stated on both venues through a halt",
     );
-    units.assert_settled(
+    units.assert_settles_within(
         c,
         &Charges::default(),
-        "a core aborted on both venues past a halt",
+        epochs(8),
+        "a core stated on both venues through a halt",
     );
 }
 
@@ -2946,9 +2921,9 @@ fn isolate_execution_votes_among<C: FaultableCluster>(c: &mut C, open: &[ShardId
     c.drop_type_between(&cut, &cut, "execution.vote")
 }
 
-/// Epochs a recovered venue gets to end the row its recovery released,
-/// and its sibling the accepted row it holds beside it, once every
-/// channel is open again.
+/// Epochs a recovered venue gets to accept and end the stated row its
+/// recovery kept, and its sibling the accepted row it holds beside it,
+/// once every channel is open again.
 const RECOVERED_ROW_EPOCHS: u32 = 6;
 
 /// Whether `shard`'s chain accepted `tx`.
@@ -2962,6 +2937,12 @@ fn accepted_on<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
 /// Whether a verdict leaf of `tx` stands on `shard`.
 fn leaf_stands<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
     let leaf = verdict_leaf(shard, tx);
+    c.substate(shard, leaf.owner, leaf.local.0).is_some()
+}
+
+/// Whether a staged yes of `tx` stands on `shard`.
+fn staged_stands<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
+    let leaf = staged_leaf(shard, tx);
     c.substate(shard, leaf.owner, leaf.local.0).is_some()
 }
 
@@ -3052,34 +3033,33 @@ pub fn a_route_a_halting_venue_could_read_is_settled_before_the_halt<C: Faultabl
 }
 
 /// A route one venue accepted while its sibling could not read it is
-/// aborted by the sibling's recovery, and the accepted row ends on that
-/// abort.
-///
-/// The tear a recovery leaves is an outcome both chains record.
+/// kept by the sibling's recovery, and settles on both venues.
 ///
 /// The first venue is cut off from the second's certificate and state,
 /// so it states its yes and stands, while the second reads that yes and
 /// accepts. The first venue's shard then halts and a fresh committee
-/// resumes it: the recovery releases the stated row, and the recovered
-/// shard aborts it at once. The cuts lift, the second venue reads the
-/// first's exit, the row gone beside its committed marker, and ends its
-/// accepted row. The route is torn, the residual a recovery carries: the
-/// second venue applied and the first did not. Nothing of it stands on
-/// either venue.
+/// resumes it, its harvest keeping the block that stated the yes: the
+/// recovery keeps the stated row and the yes it staged. Once it reads
+/// the second venue's accept, the recovered chain accepts in turn,
+/// applying that yes, and both rows end. Nothing tears: both venues
+/// apply, and nothing of the route stands on either.
 ///
 /// # Panics
 ///
 /// Panics if either venue misses its budget standing up, if the second
 /// venue does not accept while the first stands stated, if the cut
 /// never fires, if the halt or its recovery misses a budget, if the
-/// recovered venue does not end its row by an abort, if the second
-/// venue's accepted row does not end, or if a leaf of the route stands.
-pub fn a_recovered_venue_aborts_what_its_sibling_accepted<C: FaultableCluster>(c: &mut C) {
+/// recovered chain does not accept the route past the halt, if a row,
+/// leaf or staged yes of the route stands, or if either resource does
+/// not settle.
+pub fn a_recovered_venue_keeps_what_its_sibling_accepted<C: FaultableCluster>(c: &mut C) {
     let (halted, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let venues = [halted, survivor];
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
     let (key, trader) = &traders[0];
+    let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
     let cut = [
         isolate_ec_intake(c, halted, survivor),
         isolate_crossing_intake(c, halted, survivor),
@@ -3095,9 +3075,10 @@ pub fn a_recovered_venue_aborts_what_its_sibling_accepted<C: FaultableCluster>(c
         validity_around(c.now()),
     );
     let hash = charges.submit(c, route);
+    let stated_on_halted = |c: &C| matches!(row_on(c, halted, hash), Some(RowState::Stated { .. }));
     assert!(
         c.run_until(epochs(8), |c| accepted_on(c, survivor, hash)
-            && matches!(row_on(c, halted, hash), Some(RowState::Stated { .. }))),
+            && stated_on_halted(c)),
         "{survivor:?} must accept the route while {halted:?} stands stated: {:?} {:?}",
         c.chain_fate(survivor, hash).1,
         row_on(c, halted, hash),
@@ -3107,33 +3088,46 @@ pub fn a_recovered_venue_aborts_what_its_sibling_accepted<C: FaultableCluster>(c
         "the halting venue must actually have been cut off from its sibling",
     );
 
+    let frozen = c.committed_height(halted);
     let halt = freeze_shard(c, halted, survivor, |_| {});
     await_halt_recovery(c, &halt);
     c.clear_drops();
     assert!(
-        c.run_until(epochs(RECOVERED_ROW_EPOCHS), |c| row_on(c, halted, hash)
-            .is_none()
-            && matches!(
-                c.chain_fate(halted, hash).1,
-                Some((_, TransactionDecision::Aborted))
-            )),
-        "the recovered venue ends the route's row by an abort: {:?} {:?}",
-        row_on(c, halted, hash),
+        c.run_until(epochs(RECOVERED_ROW_EPOCHS), |c| accepted_on(
+            c, halted, hash
+        ) && venues
+            .iter()
+            .all(|venue| row_on(c, *venue, hash).is_none())),
+        "the recovered venue accepts the route and both rows end: {:?} {:?}, heard {:?}",
         c.chain_fate(halted, hash).1,
+        venues.map(|venue| row_on(c, venue, hash)),
+        c.heard(halted, hash),
     );
+    let accepted_at = verdict_on(c, halted, hash).map(|(height, _)| height);
     assert!(
-        c.run_until(epochs(RECOVERED_ROW_EPOCHS), |c| row_on(c, survivor, hash)
-            .is_none()),
-        "{survivor:?}'s accepted row ends on reading the abort: {:?}, heard {:?}",
-        row_on(c, survivor, hash),
-        c.heard(survivor, hash),
+        accepted_at > frozen,
+        "the recovered chain accepts the row it kept, at {accepted_at:?}, past the halt at \
+         {frozen:?}",
     );
-    assert!(
-        accepted_on(c, survivor, hash)
-            && [halted, survivor]
-                .iter()
-                .all(|venue| !leaf_stands(c, *venue, hash)),
-        "the survivor's accept stands, and no leaf of the route does",
+    for venue in venues {
+        assert!(
+            accepted_on(c, venue, hash)
+                && !leaf_stands(c, venue, hash)
+                && !staged_stands(c, venue, hash),
+            "{venue:?} accepts the route and keeps no leaf or staged yes of it",
+        );
+    }
+    protocol_resource.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a route its venue's recovery kept",
+    );
+    units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a route its venue's recovery kept",
     );
 }
 
