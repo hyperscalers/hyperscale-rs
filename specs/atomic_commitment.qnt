@@ -37,8 +37,8 @@
 //     state at the instant it is taken; an older reading delivered late
 //     loses to the newest, so delivery delay adds no behaviour a read at
 //     the earlier instant does not have.
-//   - No recovery, no departure: the tear a recovery leaves and a departed
-//     sibling's terminal lines are shard_recovery.qnt's and
+//   - No recovery, no departure: the tear a recovery leaves and the quiet
+//     gate a departing sibling's cut waits on are shard_recovery.qnt's and
 //     straddler_settlement.qnt's.
 //
 // Run:

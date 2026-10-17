@@ -956,13 +956,19 @@ module recovery_bridge_honest_old {
 // successor.
 //
 // The recovered shard's crossing block, its first anchored at or past the
-// bridge, discards every tick its parent's rows hold, and with them every
-// tick above the halted tip. A core member the discard releases that ran
-// is aborted at once, stated or not: the recovered shard ends its row
-// with a recorded outcome. A sibling that reads that exit and has not
-// accepted refuses; one that accepted on the yes the discard dropped
-// keeps its accept, the tear of a recovery (residual 1), and ends its
-// accepted row on the exit.
+// bridge, discards every tick its parent's rows hold, and the discard
+// releases only rows in flight. A recovery keeps stated rows: a member
+// stated in a block the recovered chain keeps stands stated, and the
+// fresh committee completes it from the receipt staged under its row. A
+// member the recovered chain never saw stated, because its stating block
+// lies above what the chain keeps, is in flight there; the discard
+// releases it and it is aborted at once, the recovered shard ending its
+// row with a recorded outcome. A sibling that reads that exit and has not
+// accepted refuses; one that accepted on a yes in the lost block keeps
+// its accept, the tear of a recovery, and ends its accepted row on the
+// exit. The lost block is one above the halted tip, forged by the
+// retained committee, or one at or below it that the harvest settled
+// short of.
 //
 // What bounds the tear is the reading rule, not the fence. A sibling's
 // row counts no reading marked below the bridge of the newest recovery
@@ -1006,11 +1012,15 @@ module recovery_bridge_honest_old {
 //   - The discard and the abort: `member_lines` (crates/engine/src/
 //     tick_select.rs) names a `Recovery` discard for every tick row the
 //     parent holds on the crossing block (`TopologySchedule::crossing_block`),
-//     the fold releases each member of it (`release`, crates/storage/src/
-//     shard/members.rs), and `Exit::of` aborts a released shared member
-//     that ran at once.
+//     the fold releases each member of it in flight and keeps each stated
+//     one (`Working::discard`, crates/storage/src/shard/members.rs), and
+//     `Exit::of` aborts a released shared member that ran at once.
+//   - The kept yes: the stated row's staged receipt (`MemberCollection::
+//     Staged`) and its reservation (`TickChain.stated`, crates/storage/
+//     src/shard/tick_chain.rs) let a replica that never ran the tick
+//     accept it.
 //
-// Properties (INV-SEC-8, cross-shard half; INV-EXEC-1 residual 1):
+// Properties (INV-SEC-8, cross-shard half; INV-EXEC-1's recovery residual):
 //   invFenceHolds — once an honest sibling has folded the recovery, it
 //                      never admits a claim on an old-committee header
 //                      above the frontier attested at fold time: the fence
@@ -1021,10 +1031,15 @@ module recovery_bridge_honest_old {
 //                      tear is decided by arrival order relative to the
 //                      fold, at or below the frontier and above it alike,
 //                      and nothing read before the bridge decides anything
-//                      after. Bounded by the standing-row cap toward one
-//                      shard, which this model does not count. The
-//                      `pre_bridge_reading` twin counts a reading below the
-//                      bridge and violates it.
+//                      after. The `pre_bridge_reading` twin counts a
+//                      reading below the bridge and violates it.
+//   invKeptYesStands — the crossing aborts only members stated above the
+//                      height the recovered chain keeps, which lies between
+//                      the attested frontier and the halted tip: no yes in
+//                      a kept block is withdrawn. The `release_stated` twin
+//                      releases stated rows below it too, and a sibling
+//                      that accepted on a yes the recovered chain still
+//                      holds is torn.
 //   invOneOutcome — the sibling ends a member one way: never both accepted
 //                      and refused.
 //   invEndsOnExit — an accepted row the sibling ended is one the
@@ -1055,10 +1070,12 @@ module recovery_bridge_honest_old {
 //     recovery being published at the sibling's anchor.
 //   - A reading's age rule (a yes no older than the epoch before the
 //     anchor's) only narrows what counts; it is left out.
-//   - Which ticks the crossing block discards is the environment's: any
-//     set holding every height above the halted tip. A member the
-//     crossing keeps is still stated and accepts on the sibling's accept
-//     as in Model C.
+//   - How far the recovered chain reaches is the environment's: any
+//     height at or above the frontier attested before the window and at
+//     or below the halted tip, wherever the harvest settles. A member
+//     stated at or below it is still stated past the crossing and accepts
+//     on the sibling's accept as in Model C; every member above it is
+//     released and aborted.
 //   - One honest sibling; the source's beyond-f committee is an oracle
 //     that certifies any header (its signatures always verify against the
 //     old committee at a stale anchor — the claim path has no timestamp
@@ -1079,6 +1096,11 @@ module recovery_bridge_honest_old {
 //      it, and the crossing aborts the member)
 //   quint verify --main=cross_shard_pre_bridge_reading --invariant=invResidualBounded --max-steps=8 specs/shard_recovery.qnt
 //     (same tear, found by search)
+//   quint test --main=cross_shard_release_stated --match=keptYesTorn specs/shard_recovery.qnt
+//     (scripted witness: the sibling accepts on a yes at the frontier, and
+//      the crossing releases and aborts that stated row anyway)
+//   quint verify --main=cross_shard_release_stated --invariant=invKeptYesStands --max-steps=8 specs/shard_recovery.qnt
+//     (same release, found by search)
 
 module cross_shard_freeze {
   // The true halted tip H_t (unknown to any sibling). An old-committee
@@ -1099,6 +1121,10 @@ module cross_shard_freeze {
   // Broken twin: a reading marked below the bridge still counts once the
   // recovery is folded. True is the shipped reading rule.
   const BRIDGE_RULE: bool
+  // Broken twin: the crossing's discard releases stated rows too, so it
+  // may abort a member stated in a block the recovered chain keeps.
+  // False is the shipped discard.
+  const RELEASE_STATED: bool
 
   var now: int
   // The beacon has folded the recovery (a committed fact).
@@ -1154,6 +1180,12 @@ module cross_shard_freeze {
   // recovered shard aborted at its crossing.
   val torn: Set[int] = accepted.intersect(discarded)
 
+  // `lost` is every height above one the recovered chain keeps, which
+  // lies between the frontier attested before the window and the halted
+  // tip.
+  def keepsPrefix(lost: Set[int]): bool =
+    ATTESTED_0.to(HALT_TIP).exists(kept => lost == 1.to(MAX_HEIGHT).filter(h => h > kept))
+
   // The sibling admits a claim on an old-committee header at `srcHeight`
   // and records the yes it reads there.
   action readOld(srcHeight: int): bool = all {
@@ -1206,13 +1238,15 @@ module cross_shard_freeze {
     freshAdvanced' = freshAdvanced,
   }
 
-  // The recovered shard commits its crossing block, discarding `lost`:
-  // every tick above the halted tip, and whichever of the rest no kept
-  // block settled. Every member it releases is aborted there.
+  // The recovered shard commits its crossing block. `lost` holds the
+  // members stated above the height its chain keeps: they are in flight
+  // there, and the discard releases and aborts each. A member stated at
+  // or below it stands.
   action crossBridge(lost: Set[int]): bool = all {
     beaconFrozen,
     not(crossed),
     1.to(MAX_HEIGHT).filter(h => h > HALT_TIP).subseteq(lost),
+    RELEASE_STATED or keepsPrefix(lost),
     crossed' = true,
     discarded' = lost,
     freshAdvanced' = true,
@@ -1395,6 +1429,10 @@ module cross_shard_freeze {
   val invResidualBounded =
     torn.subseteq(acceptedPreFold) and refused.intersect(sourceAccepted) == Set()
 
+  // The crossing aborts no member stated in a block the recovered chain
+  // keeps.
+  val invKeptYesStands = crossed implies keepsPrefix(discarded)
+
   // The sibling ends a member one way: never both accepted and refused.
   val invOneOutcome = accepted.intersect(refused) == Set()
 
@@ -1412,6 +1450,7 @@ module cross_shard_freeze {
   val invAll = and {
     invFenceHolds,
     invResidualBounded,
+    invKeptYesStands,
     invOneOutcome,
     invEndsOnExit,
     invObservable,
@@ -1421,7 +1460,7 @@ module cross_shard_freeze {
 
   // Legit history is read and accepted up to the tip, the halt is
   // detected and the beacon stamps the recovery, the sibling folds it,
-  // the crossing keeps that member and aborts the tick above it, and the
+  // the crossing keeps that member and aborts the one above it, and the
   // sibling refuses the aborted member on the exit and ends its accept on
   // the recovered shard's, while the fence stays intact. (A folded
   // sibling admitting an above-frontier old claim is disabled under the
@@ -1445,9 +1484,9 @@ module cross_shard_freeze {
       .expect(freshAdvanced and not(breached) and torn == Set()
         and refused == Set(3) and ended == Set(2))
 
-  // The tear: the sibling accepts on a yes read before it folds, and the
-  // crossing aborts that member. Its accepted row ends on the exit, and
-  // nothing stands.
+  // The tear: the sibling accepts on a yes read before it folds, the
+  // harvest settles short of that yes's block, and the crossing aborts
+  // the member. Its accepted row ends on the exit, and nothing stands.
   run tearAcceptedBeforeFoldTest =
     init
       .then(readOld(2))
@@ -1463,7 +1502,8 @@ module cross_shard_freeze {
 
   // A yes read before the fold and not yet accepted on decides nothing
   // after it, at or below the frontier: the row waits for the fresh
-  // chain, which says the abort.
+  // chain, which keeps the stated row and still says yes. Both sides
+  // accept, and nothing tears.
   run readBeforeFoldDecidesNothingTest =
     init
       .then(readOld(1))
@@ -1471,9 +1511,11 @@ module cross_shard_freeze {
       .then(tick)
       .then(tick)
       .then(siblingFold)
-      .then(crossBridge(Set(1, 3, 4)))
+      .then(crossBridge(Set(3, 4)))
       .then(readFresh(1))
-      .expect(refused == Set(1) and torn == Set() and invAll)
+      .then(sourceAccept(1))
+      .then(endOnAccept(1))
+      .expect(accepted == Set(1) and ended == Set(1) and torn == Set() and invAll)
 
   // A pre-fold orphan (above the true tip) poisons the attested frontier —
   // irreversible, the detection-latency window — but once the recovery is
@@ -1496,7 +1538,7 @@ module cross_shard_freeze {
 module cross_shard_freeze_ok {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
-    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = true
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = true, RELEASE_STATED = false
   ).*
 }
 
@@ -1508,7 +1550,7 @@ module cross_shard_freeze_ok {
 module cross_shard_no_freeze {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
-    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = false, BRIDGE_RULE = true
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = false, BRIDGE_RULE = true, RELEASE_STATED = false
   ).*
 }
 
@@ -1520,21 +1562,45 @@ module cross_shard_no_freeze {
 module cross_shard_pre_bridge_reading {
   import cross_shard_freeze(
     HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
-    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = false
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = false, RELEASE_STATED = false
   ).*
 
   // The scripted twin witness: a yes read before the fold is accepted on
   // after it, and the crossing aborts the member.
   run postFoldTear =
     init
-      .then(readOld(1))
+      .then(readOld(2))
       .then(tick)
       .then(tick)
       .then(tick)
       .then(siblingFold)
-      .then(acceptOld(1))
-      .then(crossBridge(Set(1, 3, 4)))
+      .then(acceptOld(2))
+      .then(crossBridge(Set(2, 3, 4)))
       .expect(not(invResidualBounded))
+}
+
+// Broken twin: the crossing's discard releases stated rows. A sibling
+// that accepted on a yes in a block the recovered chain keeps meets an
+// abort of it — invKeptYesStands fails, on a tear no lost block explains.
+module cross_shard_release_stated {
+  import cross_shard_freeze(
+    HALT_TIP = 2, ATTESTED_0 = 1, FREEZE_EPOCH = 3,
+    MAX_HEIGHT = 4, MAX_TIME = 5, FREEZE_FENCE = true, BRIDGE_RULE = true,
+    RELEASE_STATED = true
+  ).*
+
+  // The scripted twin witness: the sibling accepts on a yes at the
+  // frontier, and the crossing releases and aborts that stated row.
+  run keptYesTorn =
+    init
+      .then(readOld(1))
+      .then(acceptOld(1))
+      .then(tick)
+      .then(tick)
+      .then(tick)
+      .then(siblingFold)
+      .then(crossBridge(Set(1, 3, 4)))
+      .expect(not(invKeptYesStands) and torn == Set(1))
 }
 
 // Active-fork detection and the commit-proof consumption gate — the

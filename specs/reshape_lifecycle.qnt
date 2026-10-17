@@ -1,7 +1,8 @@
 // Model F (register: specs/README.md) — the reshape lifecycle and its
 // staffing. INV-RESHAPE-1 (seating gate), INV-RESHAPE-7 (staffing
 // stability), INV-RESHAPE-8 (bounded lifecycle, staffing half),
-// INV-RESHAPE-9/10 (the terminal lead and its irrevocability), and the
+// INV-RESHAPE-9/10 (the terminal lead and its irrevocability), the beacon
+// half of INV-RESHAPE-5 (the drain latch and the quiet gate), and the
 // reshape clauses of INV-SEC-2.
 //
 // Two modules, mirroring the implementation's own split between the
@@ -21,9 +22,13 @@
 //   `reshape_lifecycle` — the pure beacon fold for a split: trigger
 //   admission under the pool gate, the frozen-seed cohort draw and its
 //   child assignment, the sticky ready fold, TTL lapse/re-staff and
-//   abandonment, and the 2f+1-per-child seating gate. The gate and the
-//   trie mutation are two folds, a window apart: the gate fires once and
-//   stamps a cut for a *later* window (INV-RESHAPE-9, so a proposer can
+//   abandonment, the 2f+1-per-child seating gate, and the drain it opens.
+//   The first fold whose gate passes latches the drain and schedules
+//   nothing; the cut is stamped only at a later fold, on a record whose
+//   shard has asserted quiet under the latch, and before the drain
+//   deadline, at which a latched record cancels as an unlatched one does
+//   at its readiness TTL. The gate and the trie mutation are two folds, a
+//   window apart: the gate fires once and stamps a cut for a *later* window (INV-RESHAPE-9, so a proposer can
 //   read its own window's frozen projection and stamp the boundary
 //   verdicts its header owes), freezing the approved carve with it; the
 //   fold at the cut consumes the record and seats from that carve
@@ -51,7 +56,8 @@
 //   - Fold + draw: crates/beacon/src/state/witness.rs (admission, re-staff,
 //     `ReshapeReady` fold, `prune_stale_reshapes`) and
 //     crates/beacon/src/state/reshape.rs (`draw_split_cohort`,
-//     `try_execute_split`); classification is
+//     `try_schedule_split`, and `drained`, which latches `drain_by` and
+//     gates the cut on the quiet bit); classification is
 //     crates/types/src/shard/roots/beacon_witness.rs `ready_leaf_payload`
 //     (by the emitter's current seat, not the signal's content).
 //
@@ -86,6 +92,13 @@
 //   invSeatingGate       — if the split executed, each child seats a quorum
 //                          of genuinely honest-synced members (INV-RESHAPE-1
 //                          at its semantic floor, not seat count).
+//   invCutOnQuiet        — a cut is stamped only on a record whose drain
+//                          latched at an earlier fold and whose quiet bit is
+//                          up, before its drain deadline; for a merge, both
+//                          children's bits (INV-RESHAPE-5, beacon half).
+//                          Whether the rows are quiet is Model D's subject.
+//                          The `reshape_ungated_cut` twin stamps the cut on
+//                          the readiness gate alone and violates it.
 //
 // Modeling assumptions:
 //   - Ticks are unit and deterministic. The dwell rule concerns re-admission,
@@ -119,7 +132,9 @@
 //   quint test   --main=ready_signal_reset --match=dwellStarvesUnderReemit specs/reshape_lifecycle.qnt
 //   quint verify --main=reshape_split_ok     --invariant=invAll --max-steps=10 specs/reshape_lifecycle.qnt
 //     (the healthy split: staffing soundness holds through admit, lapse/
-//      re-staff, and the seating gate)
+//      re-staff, the latch, the quiet assertion and the seating gate; the
+//      fold at the cut lies past this depth and is covered by
+//      `quint run --main=reshape_split_ok --invariant=invAll --max-steps=25`)
 //   quint verify --main=reshape_split_churn  --invariant=invSeatStability --max-steps=8 specs/reshape_lifecycle.qnt
 //     (pool churn drifts a frozen-seed re-staff off an observer's first
 //      assignment; expect a counterexample — the INV-RESHAPE-7 over-claim)
@@ -128,14 +143,17 @@
 //   quint verify --main=reshape_unbound_ready --invariant=invNoHonestFalseReady --max-steps=10 specs/reshape_lifecycle.qnt
 //     (the finding: an unbound signal from the observer's prior seat folds
 //      for its churned-to seat; expect a counterexample)
-//   quint verify --main=reshape_retractable_schedule --invariant=invSeatingGate --max-steps=13 specs/reshape_lifecycle.qnt
+//   quint verify --main=reshape_retractable_schedule --invariant=invSeatingGate --max-steps=16 specs/reshape_lifecycle.qnt
 //     (the lapse arm on a scheduled record: the cohort the frozen carve
 //      names drains, and the applying fold seats the child below the
 //      quorum its own gate approved; expect a counterexample)
-//   quint verify --main=reshape_retractable_abandon --invariant=invScheduleIrrevocable --max-steps=12 specs/reshape_lifecycle.qnt
-//     (the abandon arm, on a short readiness TTL so it lands inside a
+//   quint verify --main=reshape_retractable_abandon --invariant=invScheduleIrrevocable --max-steps=14 specs/reshape_lifecycle.qnt
+//     (the cancel arm, on a short drain deadline so it lands inside a
 //      practical depth: the record is dropped while its cut is already
 //      published; expect a counterexample)
+//   quint verify --main=reshape_ungated_cut --invariant=invCutOnQuiet --max-steps=6 specs/reshape_lifecycle.qnt
+//     (the cut stamped on the readiness gate alone, with no latch and no
+//      quiet bit; expect a counterexample)
 
 module ready_signal_admission {
   // Ticks a signal must rest in the pool before it is drain-eligible.
@@ -322,10 +340,16 @@ module reshape_lifecycle {
   // the validator ready for whatever seat it currently holds. False is the
   // child-bound signal the fix would carry.
   const UNBOUND_READY: bool
+  // Epochs from the latch to the drain deadline (`reshape_drain_epochs`).
+  const DRAIN: int
   // Broken twin: the TTL arms still fire on a record that already
   // carries a scheduled cut. False is the shipped guard, where
-  // `prune_stale_reshapes` skips a scheduled record on both arms.
+  // `prune_stale_reshapes` skips a scheduled record on every arm.
   const RETRACTABLE: bool
+  // Broken twin: the scheduler stamps the cut on the readiness gate
+  // alone, ignoring the latch and the quiet bit. False is the shipped
+  // `drained` gate.
+  const UNGATED_CUT: bool
 
   pure val QUORUM = 2 * F + 1
   // The observer identities: a full cohort's worth plus one benched spare.
@@ -379,6 +403,13 @@ module reshape_lifecycle {
   // Trigger and admission clocks (epochs).
   var lastAsserted: int
   var admittedAt: int
+  // The epoch the readiness gate first passed and the drain latched
+  // (-1 = not latched). Set once; it clears only with the record.
+  var latchedAt: int
+  // The record's quiet bit: raised by the shard's quiet assertion under
+  // the latch, cleared only with the record. Whether the shard's rows are
+  // quiet is Model D's subject; here the assertion is the environment's.
+  var quiet: bool
   // The split has executed; the model is terminal (only the clock advances).
   var executed: bool
   // The cut has been stamped. From here the readiness gate is not
@@ -411,6 +442,8 @@ module reshape_lifecycle {
     everAssignedR' = Set(),
     lastAsserted' = 0,
     admittedAt' = 0,
+    latchedAt' = -1,
+    quiet' = false,
     executed' = false,
     scheduled' = false,
     scheduledAt' = 0,
@@ -448,6 +481,8 @@ module reshape_lifecycle {
       everAssignedR' = everAssignedR.union(newR.exclude(everAssignedL.union(everAssignedR))),
       lastAsserted' = epoch,
       admittedAt' = epoch,
+      latchedAt' = -1,
+      quiet' = false,
       executed' = false,
       scheduled' = scheduled,
       scheduledAt' = scheduledAt,
@@ -489,6 +524,8 @@ module reshape_lifecycle {
       everAssignedR' = everAssignedR.union(newR.exclude(everAssignedL.union(everAssignedR))),
       lastAsserted' = epoch,
       admittedAt' = admittedAt,
+      latchedAt' = latchedAt,
+      quiet' = quiet,
       executed' = false,
       scheduled' = scheduled,
       scheduledAt' = scheduledAt,
@@ -520,6 +557,8 @@ module reshape_lifecycle {
       everAssignedR' = everAssignedR,
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
+      latchedAt' = latchedAt,
+      quiet' = quiet,
       executed' = false,
       scheduled' = scheduled,
       scheduledAt' = scheduledAt,
@@ -553,6 +592,8 @@ module reshape_lifecycle {
       everAssignedR' = everAssignedR,
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
+      latchedAt' = latchedAt,
+      quiet' = quiet,
       executed' = false,
       scheduled' = scheduled,
       scheduledAt' = scheduledAt,
@@ -587,6 +628,8 @@ module reshape_lifecycle {
       everAssignedR' = everAssignedR,
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
+      latchedAt' = latchedAt,
+      quiet' = quiet,
       executed' = false,
       scheduled' = scheduled,
       scheduledAt' = scheduledAt,
@@ -623,6 +666,8 @@ module reshape_lifecycle {
       everAssignedR' = everAssignedR,
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
+      latchedAt' = latchedAt,
+      quiet' = quiet,
       executed' = false,
       scheduled' = scheduled,
       scheduledAt' = scheduledAt,
@@ -631,15 +676,22 @@ module reshape_lifecycle {
     }
   }
 
-  // Trigger quiet for TRIGGER_TTL but still inside the readiness TTL: the
-  // cohort returns to the pool, the record and seed are retained.
+  // Whether the record's own deadline has passed: the readiness TTL
+  // before the latch, the drain deadline after it.
+  def expired: bool =
+    if (latchedAt < 0) epoch - admittedAt >= READY_TTL
+    else epoch - latchedAt >= DRAIN
+
+  // Trigger quiet for TRIGGER_TTL but still inside the record's deadline:
+  // the cohort returns to the pool, the record and seed are retained, and
+  // so is a latched drain.
   action lapse = all {
     not(executed),
     pendingPresent,
     RETRACTABLE or not(scheduled),
     cohortL.union(cohortR) != Set(),
     epoch - lastAsserted >= TRIGGER_TTL,
-    epoch - admittedAt < READY_TTL,
+    not(expired),
     epoch' = epoch,
     pool' = pool.union(cohortL).union(cohortR),
     benched' = benched,
@@ -656,6 +708,8 @@ module reshape_lifecycle {
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
+    latchedAt' = latchedAt,
+    quiet' = quiet,
     executed' = false,
     scheduled' = scheduled,
     scheduledAt' = scheduledAt,
@@ -663,13 +717,15 @@ module reshape_lifecycle {
     carveR' = carveR,
   }
 
-  // Ungated for READY_TTL after admission: abandon, returning the cohort to
-  // the pool and clearing the reshape's identity and any held signals.
+  // Ungated for READY_TTL after admission, or latched and unscheduled at
+  // its drain deadline: abandon, returning the cohort to the pool and
+  // clearing the reshape's identity and any held signals. A cancel cuts
+  // nothing.
   action abandon = all {
     not(executed),
     pendingPresent,
     RETRACTABLE or not(scheduled),
-    epoch - admittedAt >= READY_TTL,
+    expired,
     epoch' = epoch,
     pool' = pool.union(cohortL).union(cohortR),
     benched' = benched,
@@ -686,6 +742,8 @@ module reshape_lifecycle {
     everAssignedR' = Set(),
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
+    latchedAt' = -1,
+    quiet' = false,
     executed' = false,
     scheduled' = scheduled,
     scheduledAt' = scheduledAt,
@@ -694,16 +752,67 @@ module reshape_lifecycle {
   }
 
   // The seating gate: parent halves plus ready cohort seats reach 2f+1
-  // for both children. The code counts ready seats, synced or not. The
-  // gate fires once and stamps the cut — it does not reshape anything —
-  // freezing the carve with it, since no second gate will approve a
-  // different one (`try_schedule_split`).
+  // for both children. The code counts ready seats, synced or not.
+  def gatePasses: bool = and {
+    PARENT_HALF_L + readyL.size() >= QUORUM,
+    PARENT_HALF_R + readyR.size() >= QUORUM,
+  }
+
+  // The first fold whose gate passes latches the drain and schedules
+  // nothing (`drained`, crates/beacon/src/state/reshape.rs).
+  action latch = all {
+    not(executed),
+    not(scheduled),
+    pendingPresent,
+    latchedAt < 0,
+    gatePasses,
+    latchedAt' = epoch,
+    quiet' = quiet,
+    epoch' = epoch, pool' = pool, benched' = benched,
+    pendingPresent' = pendingPresent, seed' = seed,
+    cohortL' = cohortL, cohortR' = cohortR, readyL' = readyL, readyR' = readyR,
+    syncedL' = syncedL, syncedR' = syncedR, liveSig' = liveSig,
+    everAssignedL' = everAssignedL, everAssignedR' = everAssignedR,
+    lastAsserted' = lastAsserted, admittedAt' = admittedAt,
+    executed' = executed, scheduled' = scheduled, scheduledAt' = scheduledAt,
+    carveL' = carveL, carveR' = carveR,
+  }
+
+  // The shard's quiet assertion folds under the latch and raises the
+  // sticky bit. It also refreshes the trigger, as any assertion does.
+  action assertQuiet = all {
+    not(executed),
+    pendingPresent,
+    latchedAt >= 0,
+    quiet' = true,
+    lastAsserted' = epoch,
+    latchedAt' = latchedAt,
+    epoch' = epoch, pool' = pool, benched' = benched,
+    pendingPresent' = pendingPresent, seed' = seed,
+    cohortL' = cohortL, cohortR' = cohortR, readyL' = readyL, readyR' = readyR,
+    syncedL' = syncedL, syncedR' = syncedR, liveSig' = liveSig,
+    everAssignedL' = everAssignedL, everAssignedR' = everAssignedR,
+    admittedAt' = admittedAt,
+    executed' = executed, scheduled' = scheduled, scheduledAt' = scheduledAt,
+    carveL' = carveL, carveR' = carveR,
+  }
+
+  // The gate fires on a latched, quiet record, at a fold after the latch
+  // and before the drain deadline (the cancel runs ahead of the
+  // schedulers at the deadline), and stamps the cut — it does not reshape
+  // anything — freezing the carve with it, since no second gate will
+  // approve a different one (`try_schedule_split`).
   action schedule = all {
     not(executed),
     not(scheduled),
     pendingPresent,
-    PARENT_HALF_L + readyL.size() >= QUORUM,
-    PARENT_HALF_R + readyR.size() >= QUORUM,
+    gatePasses,
+    UNGATED_CUT or and {
+      latchedAt >= 0,
+      epoch > latchedAt,
+      epoch - latchedAt < DRAIN,
+      quiet,
+    },
     scheduled' = true,
     scheduledAt' = epoch,
     carveL' = cohortL,
@@ -725,6 +834,8 @@ module reshape_lifecycle {
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
+    latchedAt' = latchedAt,
+    quiet' = quiet,
   }
 
   // The fold at the cut consumes the record and seats the children from
@@ -756,6 +867,8 @@ module reshape_lifecycle {
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
+    latchedAt' = latchedAt,
+    quiet' = quiet,
   }
 
   action tick = all {
@@ -775,6 +888,8 @@ module reshape_lifecycle {
     everAssignedR' = everAssignedR,
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
+    latchedAt' = latchedAt,
+    quiet' = quiet,
     executed' = executed,
     scheduled' = scheduled,
     scheduledAt' = scheduledAt,
@@ -783,8 +898,8 @@ module reshape_lifecycle {
   }
 
   action step = any {
-    admit, reassert, syncStep, expireSig, foldReady, churn, lapse, abandon, schedule, apply,
-    tick,
+    admit, reassert, syncStep, expireSig, foldReady, churn, lapse, abandon, latch,
+    assertQuiet, schedule, apply, tick,
   }
 
   // Honest-synced members a child actually has: its parent half (trusted
@@ -842,12 +957,24 @@ module reshape_lifecycle {
   val invScheduleIrrevocable =
     scheduled implies (pendingPresent or executed)
 
+  // INV-RESHAPE-5, beacon half: a cut is stamped only on a record whose
+  // drain latched at an earlier fold and whose quiet bit is up, before its
+  // drain deadline.
+  val invCutOnQuiet =
+    scheduled implies and {
+      latchedAt >= 0,
+      quiet,
+      scheduledAt > latchedAt,
+      scheduledAt - latchedAt < DRAIN,
+    }
+
   val invAll = and {
     invConservation,
     invSeatStability,
     invNoHonestFalseReady,
     invSeatingGate,
     invScheduleIrrevocable,
+    invCutOnQuiet,
   }
 }
 
@@ -859,7 +986,9 @@ module reshape_split_ok {
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
     UNBOUND_READY = false,
-    RETRACTABLE = false
+    DRAIN = 3,
+    RETRACTABLE = false,
+    UNGATED_CUT = false
   ).*
 }
 
@@ -873,7 +1002,9 @@ module reshape_split_churn {
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = true,
     UNBOUND_READY = false,
-    RETRACTABLE = false
+    DRAIN = 3,
+    RETRACTABLE = false,
+    UNGATED_CUT = false
   ).*
 }
 
@@ -887,7 +1018,9 @@ module reshape_unbound_ready {
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = true,
     UNBOUND_READY = true,
-    RETRACTABLE = false
+    DRAIN = 3,
+    RETRACTABLE = false,
+    UNGATED_CUT = false
   ).*
 }
 
@@ -902,7 +1035,9 @@ module reshape_epoch_seeded {
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = true, POOL_CHURN = false,
     UNBOUND_READY = false,
-    RETRACTABLE = false
+    DRAIN = 3,
+    RETRACTABLE = false,
+    UNGATED_CUT = false
   ).*
 }
 
@@ -919,11 +1054,13 @@ module reshape_retractable_schedule {
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
     UNBOUND_READY = false,
-    RETRACTABLE = true
+    DRAIN = 3,
+    RETRACTABLE = true,
+    UNGATED_CUT = false
   ).*
 }
 
-// The same twin with a short readiness TTL, so the `abandon` arm is
+// The same twin with a short drain deadline, so the `abandon` arm is
 // reachable inside a practical depth: the record is dropped outright
 // while its cut is already published.
 module reshape_retractable_abandon {
@@ -932,7 +1069,23 @@ module reshape_retractable_abandon {
     TRIGGER_TTL = 2, READY_TTL = 2, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
     UNBOUND_READY = false,
-    RETRACTABLE = true
+    DRAIN = 2,
+    RETRACTABLE = true,
+    UNGATED_CUT = false
+  ).*
+}
+
+// Broken twin: the cut is stamped on the readiness gate alone, so a
+// shard that never asserted quiet is scheduled for its cut.
+module reshape_ungated_cut {
+  import reshape_lifecycle(
+    SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
+    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
+    UNBOUND_READY = false,
+    DRAIN = 3,
+    RETRACTABLE = false,
+    UNGATED_CUT = true
   ).*
 }
 
@@ -954,16 +1107,24 @@ module reshape_retractable_abandon {
 // `merge_seats_full_keeper_committee` regression (a single-shard merge is not
 // top-up-eligible, so an under-sized committee never heals).
 //
+// The merge drains as a split does: the keeper gate first passing latches
+// the drain, each child asserts quiet into its own half, and the merge
+// executes only on both bits before the drain deadline, cancelling at it
+// otherwise.
+//
 // Code anchors: crates/beacon/src/state/reshape.rs `draw_merge_keepers`
-// (ready-preferring draw with backfill), `try_execute_merge` (2f+1 ready
-// gate); crates/beacon/src/state/witness.rs (pairing, per-child cancel);
+// (ready-preferring draw with backfill), `try_schedule_merge` (2f+1 ready
+// gate), `drained` (the latch and both halves' quiet bits);
+// crates/beacon/src/state/witness.rs (pairing, per-child cancel, the
+// settling fold into a half);
 // crates/beacon/src/state/committee.rs (the shuffle pins keepers).
 //
 // Run:
 //   quint verify --main=reshape_epoch_seeded --invariant=invSeatStability --max-steps=10 specs/reshape_lifecycle.qnt
 //     (epoch-seeded re-staff drifts the assignment; expect a counterexample)
-//   quint verify --main=reshape_merge_ok    --invariant=invAll --max-steps=8 specs/reshape_lifecycle.qnt
-//     (backfilled draw: the merged committee seats at target with a ready quorum)
+//   quint verify --main=reshape_merge_ok    --invariant=invAll --max-steps=11 specs/reshape_lifecycle.qnt
+//     (backfilled draw: the merged committee seats at target with a ready
+//      quorum, once both children asserted quiet under the latch)
 //   quint verify --main=reshape_merge_short --invariant=invKeeperSized --max-steps=8 specs/reshape_lifecycle.qnt
 //     (ready-only draw: a child short on ready seats below target; expect a counterexample)
 module reshape_merge {
@@ -973,6 +1134,8 @@ module reshape_merge {
   const F: int
   // A merge half goes quiet for this many epochs → the merge cancels.
   const TRIGGER_TTL: int
+  // Epochs from the latch to the drain deadline (`reshape_drain_epochs`).
+  const DRAIN: int
   // The fixed Byzantine keeper set. Honest = complement.
   const BYZ: Set[int]
   // Broken twin: draw only ready members, no backfill, so a child short on
@@ -1000,6 +1163,11 @@ module reshape_merge {
   var readyC2: Set[int]
   // Keepers that have assembled the merged store (synced the sibling).
   var keeperSynced: Set[int]
+  // The epoch the keeper gate first passed and the drain latched (-1 =
+  // not latched), and each child's sticky quiet bit under it.
+  var latchedAt: int
+  var quiet1: bool
+  var quiet2: bool
   // The merge has executed; the model is terminal.
   var executed: bool
 
@@ -1013,6 +1181,7 @@ module reshape_merge {
     readyC2' = Set(),
     keeperSynced' = Set(),
     executed' = false,
+    latchedAt' = -1, quiet1' = false, quiet2' = false,
   }
 
   // A child asserts (or refreshes) its merge trigger.
@@ -1022,6 +1191,7 @@ module reshape_merge {
     epoch' = epoch, assert2' = assert2, paired' = paired, keepers' = keepers,
     readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
     executed' = false,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
   }
 
   action assertHalf2 = all {
@@ -1030,6 +1200,7 @@ module reshape_merge {
     epoch' = epoch, assert1' = assert1, paired' = paired, keepers' = keepers,
     readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
     executed' = false,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
   }
 
   // A member finishes syncing its own child (grows the readiness the draw
@@ -1043,6 +1214,7 @@ module reshape_merge {
       readyC2' = if (C2.contains(v)) readyC2.union(Set(v)) else readyC2,
       epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
       keepers' = keepers, keeperSynced' = keeperSynced, executed' = false,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
     }
   }
 
@@ -1058,6 +1230,7 @@ module reshape_merge {
     epoch' = epoch, assert1' = assert1, assert2' = assert2,
     readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
     executed' = false,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
   }
 
   // A keeper assembles the merged store (syncs the sibling child).
@@ -1071,29 +1244,83 @@ module reshape_merge {
       epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
       keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
       executed' = false,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
     }
   }
 
-  // A half goes quiet past the trigger TTL: the merge cancels clean —
-  // keepers are released (they never left their child), halves must reassert.
+  // A half goes quiet past the trigger TTL, or the latched drain reaches
+  // its deadline unexecuted: the merge cancels clean — keepers are released
+  // (they never left their child), halves must reassert.
   action cancel = all {
     not(executed),
     paired,
-    epoch - assert1 >= TRIGGER_TTL or epoch - assert2 >= TRIGGER_TTL,
+    or {
+      epoch - assert1 >= TRIGGER_TTL,
+      epoch - assert2 >= TRIGGER_TTL,
+      latchedAt >= 0 and epoch - latchedAt >= DRAIN,
+    },
     paired' = false,
     keepers' = Set(),
     keeperSynced' = Set(),
     assert1' = -1,
     assert2' = -1,
     epoch' = epoch, readyC1' = readyC1, readyC2' = readyC2, executed' = false,
+    latchedAt' = -1, quiet1' = false, quiet2' = false,
   }
 
-  // The gate: a 2f+1 quorum of keepers has assembled the merged store.
+  // The keeper gate first passing latches the drain and executes nothing.
+  action latch = all {
+    not(executed),
+    paired,
+    latchedAt < 0,
+    keeperSynced.size() >= QUORUM,
+    latchedAt' = epoch,
+    quiet1' = quiet1, quiet2' = quiet2,
+    epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
+    keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
+    keeperSynced' = keeperSynced, executed' = executed,
+  }
+
+  // A child's quiet assertion folds into its own half under the latch,
+  // refreshing that half's trigger.
+  action assertQuiet1 = all {
+    not(executed),
+    paired,
+    latchedAt >= 0,
+    quiet1' = true,
+    assert1' = epoch,
+    latchedAt' = latchedAt, quiet2' = quiet2,
+    epoch' = epoch, assert2' = assert2, paired' = paired,
+    keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
+    keeperSynced' = keeperSynced, executed' = executed,
+  }
+
+  action assertQuiet2 = all {
+    not(executed),
+    paired,
+    latchedAt >= 0,
+    quiet2' = true,
+    assert2' = epoch,
+    latchedAt' = latchedAt, quiet1' = quiet1,
+    epoch' = epoch, assert1' = assert1, paired' = paired,
+    keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
+    keeperSynced' = keeperSynced, executed' = executed,
+  }
+
+  // The gate: a 2f+1 quorum of keepers has assembled the merged store,
+  // the drain latched at an earlier fold, and both children asserted
+  // quiet before its deadline.
   action execute = all {
     not(executed),
     paired,
     keeperSynced.size() >= QUORUM,
+    latchedAt >= 0,
+    epoch > latchedAt,
+    epoch - latchedAt < DRAIN,
+    quiet1,
+    quiet2,
     executed' = true,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
     epoch' = epoch, assert1' = assert1, assert2' = assert2, paired' = paired,
     keepers' = keepers, readyC1' = readyC1, readyC2' = readyC2,
     keeperSynced' = keeperSynced,
@@ -1104,10 +1331,12 @@ module reshape_merge {
     assert1' = assert1, assert2' = assert2, paired' = paired, keepers' = keepers,
     readyC1' = readyC1, readyC2' = readyC2, keeperSynced' = keeperSynced,
     executed' = executed,
+    latchedAt' = latchedAt, quiet1' = quiet1, quiet2' = quiet2,
   }
 
   action step = any {
-    assertHalf1, assertHalf2, readyStep, pair, keeperSyncStep, cancel, execute, tick,
+    assertHalf1, assertHalf2, readyStep, pair, keeperSyncStep, cancel, latch,
+    assertQuiet1, assertQuiet2, execute, tick,
   }
 
   // Keepers are drawn from the two children only, and only synced keepers
@@ -1129,18 +1358,24 @@ module reshape_merge {
   val invKeeperGate =
     executed implies keeperSynced.exclude(BYZ).size() >= QUORUM
 
-  val invAll = and { invConservation, invKeeperSized, invKeeperGate }
+  // INV-RESHAPE-5, beacon half: a merge executes only once both children
+  // asserted quiet under its latched drain. The deadline and the fold
+  // after the latch are the guards of `execute`; the model keeps no
+  // execution epoch to judge them by.
+  val invCutOnQuiet = executed implies (latchedAt >= 0 and quiet1 and quiet2)
+
+  val invAll = and { invConservation, invKeeperSized, invKeeperGate, invCutOnQuiet }
 }
 
 // Healthy merge: ready-preferring draw with backfill. The merged committee
 // seats at target size and executes on a 2f+1 ready keeper quorum.
 module reshape_merge_ok {
-  import reshape_merge(SHARD_SIZE = 4, F = 1, TRIGGER_TTL = 2, BYZ = Set(), SHORT_DRAW = false).*
+  import reshape_merge(SHARD_SIZE = 4, F = 1, TRIGGER_TTL = 2, DRAIN = 3, BYZ = Set(), SHORT_DRAW = false).*
 }
 
 // Broken twin: ready-only draw. A child short on ready at pairing seats the
 // merged committee below target size — the `merge_seats_full_keeper_committee`
 // regression, which a single-shard merge cannot top up.
 module reshape_merge_short {
-  import reshape_merge(SHARD_SIZE = 4, F = 1, TRIGGER_TTL = 2, BYZ = Set(), SHORT_DRAW = true).*
+  import reshape_merge(SHARD_SIZE = 4, F = 1, TRIGGER_TTL = 2, DRAIN = 3, BYZ = Set(), SHORT_DRAW = true).*
 }
