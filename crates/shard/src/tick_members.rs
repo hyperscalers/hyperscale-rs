@@ -6,7 +6,7 @@
 //! the chain up to the parent as the committed tier plus each pending
 //! ancestor's content, and so read one input.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{
@@ -15,10 +15,10 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, record_arrivals};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CounterpartMirror, Engagement, EpochWindows, Finalization,
-    MemberTerms, Reshaping, Settlement, ShardId, SiblingView, Source, StatedTerms, SubstateKey,
-    TickHalf, TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable,
-    WeightedTimestamp, partner_evidence, source_of,
+    Block, BlockHeight, Engagement, EpochWindows, Finalization, MemberTerms, Reshaping, Settlement,
+    ShardId, SiblingView, Source, StatedTerms, SubstateKey, TickHalf, TickLine, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp, partner_evidence,
+    source_of,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -142,10 +142,7 @@ impl OwnContent {
 
 /// Where `sibling`'s verdict is read from and what the schedule says of
 /// it at `anchor`: the source off the trie of the anchor's window, the
-/// recovery, the evidence and the formation off that window as it was
-/// first published.
-/// Whether a departed sibling's terminal ended a transaction is the
-/// mirror's to add, per transaction.
+/// recovery and the formation off that window as it was first published.
 pub fn sibling_view(
     schedule: &TopologySchedule,
     sibling: ShardId,
@@ -155,11 +152,8 @@ pub fn sibling_view(
         source_of(schedule.at(anchor), sibling),
         SiblingView {
             epoch: schedule.epoch_for(anchor),
-            terminating: schedule.terminates_at_next_boundary(sibling, anchor),
             recovery: schedule.recovery_as_published(sibling, anchor),
-            evidence: schedule.evidence_as_published(sibling, anchor),
             formed: schedule.formed_as_published(sibling, anchor),
-            ended: None,
         },
     )
 }
@@ -180,8 +174,7 @@ pub fn hearing_rows(rows: &MemberIndex) -> impl Iterator<Item = &MemberRow> {
 /// # Errors
 ///
 /// Refused for a line no replica licenses; deferred where this one
-/// lacks the block's window as it was published or a departed
-/// sibling's ended names, which a line turns on.
+/// lacks the block's window as it was published, which a line turns on.
 pub fn ends_licensed(
     ended: &[TickLine],
     rows: &MemberIndex,
@@ -297,38 +290,20 @@ pub fn heard_named(parent: &MemberIndex, pending: &MemberInputs, names: &[TxHash
     rows
 }
 
-/// What the schedule and `mirror` say at `anchor` of each shard one of
-/// `rows` awaits. A departed sibling's ended names are the ones held for
-/// the terminal the anchor's published window records for it, so every
-/// replica asks the mirror about one terminal.
+/// What the schedule says at `anchor` of each shard one of `rows`
+/// awaits.
 pub fn sibling_views<'r>(
     rows: impl IntoIterator<Item = &'r MemberRow>,
     schedule: &TopologySchedule,
-    mirror: &CounterpartMirror,
     anchor: WeightedTimestamp,
 ) -> SiblingViews {
     let mut views = SiblingViews::default();
-    let mut terminals: BTreeMap<ShardId, Option<BlockHash>> = BTreeMap::new();
     for row in rows {
         for &sibling in row.awaits.iter() {
-            let (source, _) = *views
+            views
                 .shards
                 .entry(sibling)
                 .or_insert_with(|| sibling_view(schedule, sibling, anchor));
-            if source != Some(Source::Gone) {
-                continue;
-            }
-            let terminal = *terminals.entry(sibling).or_insert_with(|| {
-                schedule
-                    .terminal_as_published(sibling, anchor)
-                    .ok()
-                    .flatten()
-            });
-            if let Some(ended) =
-                terminal.and_then(|terminal| mirror.ended(sibling, terminal, row.tx))
-            {
-                views.ended.insert((sibling, row.tx), ended);
-            }
         }
     }
     views

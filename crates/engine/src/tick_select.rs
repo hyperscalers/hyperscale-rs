@@ -586,25 +586,18 @@ pub struct CommittedSets {
     /// shard or a sibling it awaits is reshaping at the block's anchor or
     /// the windows that say are not held: none is named to run.
     pub reshaping: BTreeSet<TxHash>,
-    /// What the schedule and the mirror say, at the block's anchor, of
-    /// each shard a row that hears awaits.
+    /// What the schedule says, at the block's anchor, of each shard a row
+    /// that hears awaits.
     pub siblings: SiblingViews,
 }
 
 /// What each sibling of the rows that hear, stated or accepted, counts
-/// by at a block's anchor.
-///
-/// Where its verdict is read from and what the schedule says of it, and
-/// for a departed one whose terminal's ended names this replica holds,
-/// whether they name each such row.
+/// by at a block's anchor: where its verdict is read from and what the
+/// schedule says of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SiblingViews {
     /// The source and the schedule's view of each sibling.
     pub shards: BTreeMap<ShardId, (Option<Source>, SiblingView)>,
-    /// For each departed sibling whose ended names are held and each row
-    /// that hears awaiting it, whether the names hold the row's
-    /// transaction.
-    pub ended: BTreeMap<(ShardId, TxHash), bool>,
 }
 
 impl SiblingViews {
@@ -616,15 +609,11 @@ impl SiblingViews {
         row.awaits
             .iter()
             .map(|sibling| {
-                let Some(&(source, view)) = self.shards.get(sibling) else {
+                let Some((source, view)) = self.shards.get(sibling) else {
                     return Value::N;
                 };
-                let view = SiblingView {
-                    ended: self.ended.get(&(*sibling, row.tx)).copied(),
-                    ..view
-                };
                 let entry = row.hearing.iter().find(|heard| heard.shard == *sibling);
-                value_of(entry, source, &view, row.committed)
+                value_of(entry, *source, view, row.committed)
             })
             .collect()
     }
@@ -687,9 +676,9 @@ pub enum ManifestKind {
 /// The lines a chain's terminal names: one per member row, in
 /// transaction order.
 ///
-/// An accepted row is ended, which burns nothing and leaves its name
-/// for a sibling still deciding to read; every other row is fated,
-/// priced by what its row carries.
+/// An accepted row is ended, which burns nothing, since a fate would
+/// leave an accepted row standing; every other row is fated, priced by
+/// what its row carries.
 ///
 /// The beacon cuts a shard only once it has asserted no row of it hears,
 /// so a terminal meets a stated or accepted row only where a recovery
@@ -772,7 +761,7 @@ pub enum Unlicensed {
     /// No replica licenses the lines.
     Refused(String),
     /// This replica cannot say whether the row is ended: it lacks the
-    /// published window or a departed sibling's ended names.
+    /// published window.
     Lacking(TxHash),
 }
 
@@ -811,7 +800,7 @@ pub fn ends_stand(
         match decisions.get(&tx) {
             Some(Decision::End) => {}
             Some(Decision::Lacking) => lacking = lacking.or(Some(tx)),
-            Some(Decision::Wait | Decision::Accept | Decision::Refuse | Decision::LetGo) => {
+            Some(Decision::Wait | Decision::Accept | Decision::Refuse) => {
                 return Err(Unlicensed::Refused(format!(
                     "an end line names {tx:?}, whose row still waits on a sibling"
                 )));
@@ -832,8 +821,8 @@ pub fn ends_stand(
 }
 
 /// What [`decide`] says under `views` of every row of `rows` standing
-/// stated: whether it accepts, is refused, is let go, waits, or is one
-/// this replica cannot judge.
+/// stated: whether it accepts, is refused, waits, or is one this replica
+/// cannot judge.
 #[must_use]
 pub fn stated_decisions(rows: &MemberIndex, views: &SiblingViews) -> BTreeMap<TxHash, Decision> {
     rows.members
@@ -884,7 +873,7 @@ pub fn legs_stand(
         match decide(Hears::Stated, &views.values(row)) {
             Decision::Accept => {}
             Decision::Lacking => lacking = lacking.or(Some(tx)),
-            Decision::Refuse | Decision::Wait | Decision::LetGo | Decision::End => {
+            Decision::Refuse | Decision::Wait | Decision::End => {
                 return Err(Unlicensed::Refused(format!(
                     "a legs half names {tx:?}, whose siblings' state does not accept it"
                 )));
@@ -895,8 +884,8 @@ pub fn legs_stand(
 }
 
 /// The member lines a proposer names over `rows`: [`member_lines`] acting
-/// on every refusal and every letting go [`decide`] licenses under
-/// `views` that the block has room for.
+/// on every refusal [`decide`] licenses under `views` that the block has
+/// room for.
 ///
 /// The lines are named once over every licensed exit and again over the
 /// ones the first naming kept, which is what a voter reading the block
@@ -916,7 +905,7 @@ pub fn licensed_lines(
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
     let licensed: BTreeMap<TxHash, Decision> = stated_decisions(rows, views)
         .into_iter()
-        .filter(|(_, decision)| matches!(decision, Decision::Refuse | Decision::LetGo))
+        .filter(|(_, decision)| *decision == Decision::Refuse)
         .collect();
     if licensed.is_empty() {
         return member_lines(rows, anchor, inputs, evidence, recovery, wounded, &licensed);
@@ -944,16 +933,16 @@ const fn exits(line: &TickLine) -> Option<TxHash> {
 
 /// The decisions on stated rows `lines`, a block's member lines, act on.
 ///
-/// An abort for each refused row they abort and a letting go for each one
-/// they fate. Each is licensed where [`decide`] under `views` reaches it
-/// over `rows`, the rows the lines were named over; none is owed.
+/// A refusal for each stated row they abort, licensed where [`decide`]
+/// under `views` refuses it over `rows`, the rows the lines were named
+/// over; none is owed. No fate of a stated row is licensed: a stated row
+/// leaves only on what its siblings' state says.
 ///
 /// # Errors
 ///
-/// [`Unlicensed::Refused`] for a line ending a stated row that `decide`
-/// does not refuse or let go as the line has it, and
-/// [`Unlicensed::Lacking`], where no line is refused, for the first one
-/// this replica cannot judge.
+/// [`Unlicensed::Refused`] for a line fating a stated row, or aborting
+/// one that `decide` does not refuse, and [`Unlicensed::Lacking`], where
+/// no line is refused, for the first abort this replica cannot judge.
 pub fn carried_verdicts(
     lines: &[TickLine],
     rows: &MemberIndex,
@@ -972,15 +961,15 @@ pub fn carried_verdicts(
         else {
             continue;
         };
-        let licensed = if matches!(line, TickLine::Fate { .. }) {
-            Decision::LetGo
-        } else {
-            Decision::Refuse
-        };
+        if matches!(line, TickLine::Fate { .. }) {
+            return Err(Unlicensed::Refused(format!(
+                "a line fates the stated row of {tx:?}, which only its siblings' state ends"
+            )));
+        }
         match decide(Hears::Stated, &views.values(row)) {
             Decision::Lacking => lacking = lacking.or(Some(tx)),
-            decision if decision == licensed => {
-                carried.insert(tx, decision);
+            Decision::Refuse => {
+                carried.insert(tx, Decision::Refuse);
             }
             decision => {
                 return Err(Unlicensed::Refused(format!(
@@ -1084,11 +1073,11 @@ impl<'a> Standing<'a> {
 /// short of its deadline.
 ///
 /// A stated row takes the exit `verdicts` gives it, the decisions over
-/// its siblings' state the block acts on: an abort where it is refused
-/// and a fate where it is let go, each after its tick's determined half
-/// has settled. A row `verdicts` does not name stands. Every such line
-/// is optional: [`licensed_lines`] names the ones a proposer's view
-/// licenses, and [`carried_verdicts`] reads the ones a block carries.
+/// its siblings' state the block acts on: an abort where it is refused,
+/// after its tick's determined half has settled. A row `verdicts` does
+/// not name stands. Every such line is optional: [`licensed_lines`]
+/// names the ones a proposer's view licenses, and [`carried_verdicts`]
+/// reads the ones a block carries.
 ///
 /// A fate ends a row no certificate of this shard's is owed for: a
 /// member a counterpart settles against, in flight or released, at any
@@ -1245,8 +1234,7 @@ impl<'a> Exit<'a> {
     ///   whether or not it ran;
     /// - one that has stated leaves only on what its siblings' state
     ///   says, in `verdicts`: aborted where a sibling left without
-    ///   accepting, fated where one can never be read and none refused,
-    ///   each after its tick's determined half; no clock, record,
+    ///   accepting, after its tick's determined half; no clock, record,
     ///   evidence or recovery ends it;
     /// - one that has accepted stands whatever the clock or the evidence
     ///   says: it has settled, and only an `End` line ends it.
@@ -1324,7 +1312,6 @@ impl<'a> Exit<'a> {
                         tick,
                         reach: &row.reach,
                     }),
-                    Some(Decision::LetGo) => Self::Fated(Some(tick)),
                     Some(Decision::Accept | Decision::Wait | Decision::Lacking | Decision::End)
                     | None => Self::None,
                 }
@@ -1931,10 +1918,8 @@ mod tests {
     use hyperscale_hbor::{Bytes, to_vec};
     use hyperscale_storage::test_helpers::yes_receipt;
     use hyperscale_storage::{
-        MemberInputs, SettledHalf, Substates, TickRow, Waiting, fate_writes, member_row_leaf,
-        member_writes, reclaim_credits, reclaimed, unclaimed_declines,
+        MemberInputs, SettledHalf, TickRow, Waiting, fate_writes, member_row_leaf, member_writes,
     };
-    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         StubTree, proven_claim, stub_abort_charge, stub_stated_terms,
     };
@@ -1942,13 +1927,12 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
         Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK,
-        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof,
-        NetworkId, Owes, PrincipalAddr, ProtocolHasher, RETENTION_HORIZON, ReadMark, ResourceAddr,
-        Routing, Said, StateRoot, StateWrites, Stated, StatedTerms, TICK_LINE_BYTES,
+        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkId, Owes,
+        PrincipalAddr, ProtocolHasher, ReadMark, Routing, Said, StatedTerms, TICK_LINE_BYTES,
         TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
-        Unpublished, encode_amount, entry_leaf_key, said_at, tick_manifest_admits_members,
+        Unpublished, entry_leaf_key, said_at, tick_manifest_admits_members,
     };
-    use hyperscale_vm_effects::{Answered, Hash32, IntentHash, Terms as CrossingTerms};
+    use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
 
     use super::*;
@@ -5689,8 +5673,8 @@ mod tests {
 
     /// What a block anchored in epoch 5 reads of [`PEER`], read from
     /// `source` in a published window that is held and records no
-    /// recovery, under `evidence`.
-    fn peer_read_from(source: Source, evidence: Evidence) -> SiblingViews {
+    /// recovery.
+    fn peer_read_from(source: Source) -> SiblingViews {
         SiblingViews {
             shards: BTreeMap::from([(
                 PEER,
@@ -5698,20 +5682,16 @@ mod tests {
                     Some(source),
                     SiblingView {
                         epoch: Epoch::new(5),
-                        terminating: Some(false),
                         recovery: Ok(None),
-                        evidence: Ok(evidence),
                         formed: Ok(None),
-                        ended: None,
                     },
                 ),
             )]),
-            ended: BTreeMap::new(),
         }
     }
 
     fn peer_running() -> SiblingViews {
-        peer_read_from(Source::Live, Evidence::Live { terminating: false })
+        peer_read_from(Source::Live)
     }
 
     /// A row stated in the tick at 2 beside [`PEER`], consuming one
@@ -5808,10 +5788,10 @@ mod tests {
         }
     }
 
-    /// A letting go the budget cuts frees the room it would have taken:
-    /// the proposer's lines name what fits after it, and a voter naming
-    /// lines over the exits those lines carry derives them exactly,
-    /// budget included.
+    /// A refusal the budget cuts frees the room it would have taken: the
+    /// proposer's lines name what fits after it, and a voter naming lines
+    /// over the exits those lines carry derives them exactly, budget
+    /// included.
     #[test]
     fn lines_over_the_exits_they_carry_are_the_lines_a_budget_cut() {
         let hash = |at: usize| {
@@ -5820,9 +5800,9 @@ mod tests {
             TxHash::from(Hash::from_hash_bytes(&bytes))
         };
         let anchor = ms(u64::MAX / 4);
-        let mut rows = stated_beside(1, None, false);
+        let mut rows = stated_beside(1, Some((5, Said::Left)), false);
         // Fated lines ahead of the stated row's, leaving one line of room:
-        // too little for its discard and fate, enough for a member.
+        // too little for its abort and discard, enough for a member.
         let room = MAX_TICK_LINES_PER_BLOCK - 1;
         for at in 0..room / 2 {
             let row = MemberRow {
@@ -5859,11 +5839,11 @@ mod tests {
             ..stating(0, far(), &alone(vec![]))
         };
         rows.members.insert(ready.tx, ready.clone());
-        let views = peer_read_from(Source::Gone, Evidence::Unreadable);
+        let views = peer_running();
         let evidence = |_, _| Evidence::Unreadable;
         assert_eq!(
             stated_decisions(&rows, &views),
-            BTreeMap::from([(tx(1), Decision::LetGo)]),
+            BTreeMap::from([(tx(1), Decision::Refuse)]),
         );
 
         let (lines, missing, budget) = licensed_lines(
@@ -5879,7 +5859,7 @@ mod tests {
         assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK);
         assert!(
             lines.iter().all(|line| exits(line) != Some(tx(1))),
-            "the budget cuts the letting go",
+            "the budget cuts the refusal",
         );
         assert!(
             matches!(lines.last(), Some(TickLine::Member { tx, .. }) if *tx == ready.tx),
@@ -5902,221 +5882,107 @@ mod tests {
         );
     }
 
-    /// A stated row's tick owing its determined half lets the row go by
-    /// no line, whatever its siblings' state licenses: a refusal waits,
-    /// and so does a letting go, until the determined half has settled.
+    /// A stated row's tick owing its determined half ends the row by no
+    /// line, whatever its siblings' state licenses: a refusal waits until
+    /// the determined half has settled.
     #[test]
     fn a_refusal_waits_for_its_ticks_determined_half() {
-        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
-        let unreadable = peer_read_from(Source::Gone, Evidence::Unreadable);
         for determined in [true, false] {
             let refused = stated_beside(1, Some((5, Said::Left)), determined);
-            let let_go = stated_beside(1, None, determined);
-            assert_eq!(
-                stated_decisions(&let_go, &unreadable),
-                BTreeMap::from([(tx(1), Decision::LetGo)]),
-            );
-            let (refusing, letting_go) = (
-                licensed_over(&refused, &peer_running()),
-                licensed_over(&let_go, &unreadable),
-            );
+            let refusing = licensed_over(&refused, &peer_running());
             if determined {
-                assert!(refusing.is_empty() && letting_go.is_empty());
+                assert!(refusing.is_empty());
                 continue;
             }
             assert_eq!(refusing.len(), 2, "an abort and its discard: {refusing:?}");
-            assert_eq!(
-                letting_go,
-                vec![
-                    TickLine::Discard {
-                        tick,
-                        cause: DiscardCause::Unanswerable(tx(1)),
-                    },
-                    fate_of(1),
-                ],
-            );
         }
     }
 
-    /// Two cores leaving at one cut read each other as terminating
-    /// through their final epoch and count no yes of the other's: a row
-    /// of either beside the two of them follows the third core, which
-    /// runs on. Its accept decides alone, its leaving refuses, and its
-    /// yes waits on the terminating one's.
+    /// A survivor's stated row beside a departed sibling reads it off the
+    /// row alone: accepted on an accepted entry, and refused otherwise,
+    /// a yes included, on every replica holding the row. No fate of the
+    /// row is licensed.
     #[test]
-    fn three_cores_two_leaving_at_one_cut_follow_the_third() {
-        let (third, leaving) = (ShardId::leaf(2, 2), ShardId::leaf(2, 3));
-        let view = |terminating| SiblingView {
-            epoch: Epoch::new(5),
-            terminating: Some(terminating),
-            recovery: Ok(None),
-            evidence: Ok(Evidence::Live { terminating }),
-            formed: Ok(None),
-            ended: None,
-        };
-        let views = SiblingViews {
-            shards: BTreeMap::from([
-                (third, (Some(Source::Live), view(false))),
-                (leaving, (Some(Source::Live), view(true))),
-            ]),
-            ended: BTreeMap::new(),
-        };
-        let row = |of_third: Said, of_leaving: Said| {
-            let heard = |shard, said| Heard {
-                shard,
-                mark: ReadMark {
-                    epoch: Epoch::new(5),
-                    height: BlockHeight::new(7),
-                },
-                said: Some(said),
-            };
-            let mut hearing = vec![heard(third, of_third), heard(leaving, of_leaving)];
-            hearing.sort_by_key(|heard| heard.shard);
-            rows_of([MemberRow {
-                state: RowState::Stated {
-                    tick: BlockHeight::new(2),
-                    receipt: GlobalReceiptHash::ZERO,
-                },
-                awaits: Capped::new(vec![third, leaving]).expect("two siblings"),
-                hearing: Capped::new(hearing).expect("two siblings"),
-                ..standing(1, far(), RowState::Accepted, false)
-            }])
-        };
-        for (of_third, decision) in [
-            (Said::Accepted, Decision::Accept),
-            (Said::Left, Decision::Refuse),
-            (Said::Yes, Decision::Wait),
-        ] {
+    fn a_survivor_reads_a_departed_sibling_off_its_row() {
+        let gone = peer_read_from(Source::Gone);
+        let accepted = stated_beside(1, Some((5, Said::Accepted)), false);
+        assert_eq!(accepting(&accepted, &gone), BTreeSet::from([tx(1)]));
+        assert_eq!(legs_stand([tx(1)], &accepted, &gone), Ok(()));
+        for heard in [None, Some((5, Said::Yes)), Some((5, Said::Left))] {
+            let rows = stated_beside(1, heard, false);
             assert_eq!(
-                stated_decisions(&row(of_third, Said::Yes), &views),
-                BTreeMap::from([(tx(1), decision)]),
-                "{of_third:?} of the third",
+                stated_decisions(&rows, &gone),
+                BTreeMap::from([(tx(1), Decision::Refuse)]),
+                "{heard:?}",
             );
+            let refusing = licensed_over(&rows, &gone);
+            assert_eq!(refusing.len(), 2, "an abort and its discard: {refusing:?}");
+            assert_eq!(
+                carried_verdicts(&refusing, &rows, &gone),
+                Ok(BTreeMap::from([(tx(1), Decision::Refuse)])),
+            );
+            assert!(matches!(
+                legs_stand([tx(1)], &rows, &gone),
+                Err(Unlicensed::Refused(_))
+            ));
         }
     }
 
-    /// A survivor's stated row beside a departed sibling follows the
-    /// names its terminal ended: accepted where they hold the
-    /// transaction, refused where they do not, and lacking where this
-    /// replica holds none, which no proposer acts on and a voter defers.
+    /// A line fating a stated row is refused, whatever its siblings'
+    /// state says and whether or not this replica can judge it: a stated
+    /// row leaves only by accepting or by an abort on a sibling's
+    /// leaving.
     #[test]
-    fn a_survivor_follows_a_departed_siblings_ended_names() {
-        let gone = peer_read_from(Source::Gone, Evidence::Readable);
-        let rows = stated_beside(1, None, false);
-        let with_names = |holds: bool| SiblingViews {
-            ended: BTreeMap::from([((PEER, tx(1)), holds)]),
-            ..gone.clone()
-        };
-        assert_eq!(accepting(&rows, &with_names(true)), BTreeSet::from([tx(1)]));
-        assert_eq!(
-            legs_stand([tx(1)], &rows, &with_names(true)),
-            Ok(()),
-            "a legs half naming it stands",
-        );
-        assert_eq!(
-            stated_decisions(&rows, &with_names(false)),
-            BTreeMap::from([(tx(1), Decision::Refuse)]),
-        );
-        assert_eq!(
-            stated_decisions(&rows, &gone),
-            BTreeMap::from([(tx(1), Decision::Lacking)]),
-        );
-        assert!(licensed_over(&rows, &gone).is_empty());
-        let refusing = licensed_over(&rows, &with_names(false));
-        assert_eq!(
-            carried_verdicts(&refusing, &rows, &gone),
-            Err(Unlicensed::Lacking(tx(1))),
-            "a voter without the names defers the abort",
-        );
-        assert_eq!(
-            legs_stand([tx(1)], &rows, &gone),
-            Err(Unlicensed::Lacking(tx(1))),
-        );
-    }
-
-    /// A voter lacking a departed sibling's ended names, beside a live
-    /// sibling that waits or has left, defers what a proposer holding
-    /// the names licenses: the names may hold an accept, which decides
-    /// alone. A proposer lacking them names neither an accept nor an
-    /// abort.
-    #[test]
-    fn a_voter_lacking_names_beside_a_waiting_sibling_defers() {
-        let (gone, live) = (ShardId::leaf(2, 2), ShardId::leaf(2, 3));
-        let view = |evidence| SiblingView {
-            epoch: Epoch::new(5),
-            terminating: Some(false),
-            recovery: Ok(None),
-            evidence: Ok(evidence),
-            formed: Ok(None),
-            ended: None,
-        };
-        let voter = SiblingViews {
-            shards: BTreeMap::from([
-                (gone, (Some(Source::Gone), view(Evidence::Readable))),
+    fn a_fate_of_a_stated_row_is_never_licensed() {
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let fating = vec![
+            TickLine::Discard {
+                tick,
+                cause: DiscardCause::Unanswerable(tx(1)),
+            },
+            fate_of(1),
+        ];
+        let (source, view) = peer_running().shards[&PEER];
+        let unpublished = SiblingViews {
+            shards: BTreeMap::from([(
+                PEER,
                 (
-                    live,
-                    (
-                        Some(Source::Live),
-                        view(Evidence::Live { terminating: false }),
-                    ),
+                    source,
+                    SiblingView {
+                        recovery: Err(Unpublished),
+                        ..view
+                    },
                 ),
-            ]),
-            ended: BTreeMap::new(),
+            )]),
         };
-        let holding = |names: bool| SiblingViews {
-            ended: BTreeMap::from([((gone, tx(1)), names)]),
-            ..voter.clone()
-        };
-        let row = |of_live: Option<Said>| {
-            let mut rows = stated_beside(1, None, false);
-            let row = rows.members.get_mut(&tx(1)).expect("the stated row");
-            row.awaits = Capped::new(vec![gone, live]).expect("two siblings");
-            row.hearing = Capped::new(
-                of_live
-                    .map(|said| Heard {
-                        shard: live,
-                        mark: ReadMark {
-                            epoch: Epoch::new(5),
-                            height: BlockHeight::new(7),
-                        },
-                        said: Some(said),
-                    })
-                    .into_iter()
-                    .collect(),
-            )
-            .expect("one sibling heard");
-            rows
-        };
-        for of_live in [None, Some(Said::Left)] {
-            let rows = row(of_live);
-            assert_eq!(
-                accepting(&rows, &holding(true)),
-                BTreeSet::from([tx(1)]),
-                "{of_live:?}: the proposer holding the names accepts",
-            );
-            assert_eq!(
-                legs_stand([tx(1)], &rows, &voter),
-                Err(Unlicensed::Lacking(tx(1))),
-                "{of_live:?}: a voter lacking the names defers the legs half",
-            );
-            assert_eq!(
-                stated_decisions(&rows, &voter),
-                BTreeMap::from([(tx(1), Decision::Lacking)]),
-                "{of_live:?}",
-            );
-            assert!(
-                licensed_over(&rows, &voter).is_empty(),
-                "{of_live:?}: a proposer lacking the names aborts nothing",
-            );
+        for views in [
+            peer_running(),
+            peer_read_from(Source::Gone),
+            unpublished,
+            SiblingViews::default(),
+        ] {
+            for heard in [
+                None,
+                Some((5, Said::Yes)),
+                Some((5, Said::Left)),
+                Some((5, Said::Accepted)),
+            ] {
+                let rows = stated_beside(1, heard, false);
+                assert!(
+                    licensed_over(&rows, &views)
+                        .iter()
+                        .all(|line| !matches!(line, TickLine::Fate { .. })),
+                    "{heard:?}",
+                );
+                assert!(
+                    matches!(
+                        carried_verdicts(&fating, &rows, &views),
+                        Err(Unlicensed::Refused(_))
+                    ),
+                    "{heard:?} under {views:?}",
+                );
+            }
         }
-        let rows = row(None);
-        let refusing = licensed_over(&rows, &holding(false));
-        assert!(refusing.iter().any(|line| exits(line) == Some(tx(1))));
-        assert_eq!(
-            carried_verdicts(&refusing, &rows, &voter),
-            Err(Unlicensed::Lacking(tx(1))),
-            "a voter lacking the names defers the abort",
-        );
     }
 
     /// A sibling that never committed the transaction reads absent, its
@@ -6153,11 +6019,10 @@ mod tests {
     }
 
     /// An accepted row ends once every sibling has accepted or left, and
-    /// the end deletes it: nothing then stands for anyone to ask about,
-    /// so its sibling's terminal names no accept of it and no question
-    /// of it is put.
+    /// the end deletes it: nothing then stands for a terminal to fate or
+    /// for anyone to ask about.
     #[test]
-    fn an_accept_let_go_before_the_terminal_is_asked_by_nobody() {
+    fn an_ended_accept_leaves_nothing_for_the_terminal() {
         let mut rows = rows_of([accepted(1, Some((5, Said::Accepted)))]);
         let parent = rows.clone();
         let ended = end_lines(&rows, &parent, &peer_running(), ManifestBudget::default());
@@ -6263,7 +6128,7 @@ mod tests {
             )
             .0
         };
-        let gone = || peer_read_from(Source::Gone, Evidence::Unreadable);
+        let gone = || peer_read_from(Source::Gone);
         assert_eq!(
             lines(Evidence::Unreadable, peer_running()),
             vec![unanswerable(2, 1), fate_of(1)],
@@ -6307,15 +6172,11 @@ mod tests {
                     Some(Source::Live),
                     SiblingView {
                         epoch: Epoch::new(9),
-                        terminating: Some(false),
                         recovery: Ok(None),
-                        evidence: Ok(Evidence::Live { terminating: false }),
                         formed: Ok(sets.formed.get(&PEER).copied()),
-                        ended: None,
                     },
                 ),
             )]),
-            ended: BTreeMap::new(),
         };
         let (lines, missing, _) = licensed_lines(
             rows,
@@ -6360,18 +6221,31 @@ mod tests {
 
     /// A row committed before the chain its counterpart's id runs at the
     /// anchor formed reaches an earlier chain, which can no longer answer
-    /// for it however the later one reads: in flight or stated it is
-    /// discarded from its tick and fated, and released it is fated.
+    /// for it however the later one reads: in flight it is discarded from
+    /// its tick and fated, and released it is fated. Stated, it reads
+    /// the earlier chain left without accepting, and is refused.
     #[test]
-    fn a_shared_row_reaching_only_a_later_life_is_fated() {
+    fn a_shared_row_reaching_only_a_later_life_is_fated_or_refused() {
         let sets = peer_formed_in(3);
         let [in_flight, stated, released] = shared_rows_committed_at(ms(1_500));
-        for rows in [in_flight, stated] {
-            assert_eq!(
-                lines_under(&rows, &sets),
-                (vec![unanswerable(2, 1), fate_of(1)], vec![]),
-            );
-        }
+        assert_eq!(
+            lines_under(&in_flight, &sets),
+            (vec![unanswerable(2, 1), fate_of(1)], vec![]),
+        );
+        let row = &stated.members[&tx(1)];
+        assert_eq!(
+            lines_under(&stated, &sets),
+            (
+                vec![
+                    aborting(row, row.crossings.clone()),
+                    TickLine::Discard {
+                        tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                        cause: DiscardCause::Abandoned(tx(1)),
+                    },
+                ],
+                vec![]
+            ),
+        );
         assert_eq!(lines_under(&released, &sets), (vec![fate_of(1)], vec![]));
     }
 
@@ -6410,157 +6284,6 @@ mod tests {
         }
     }
 
-    /// A store of cells alone.
-    struct Cells(BTreeMap<SubstateKey, Vec<u8>>);
-
-    impl Substates for Cells {
-        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-            self.0.get(&key).cloned()
-        }
-
-        fn entries_in_range(
-            &self,
-            _owner: Address,
-            _collection: CollectionId,
-            _lo: u128,
-            _hi: u128,
-            _limit: usize,
-        ) -> Vec<(u128, Vec<u8>)> {
-            Vec::new()
-        }
-    }
-
-    /// A claim of `shard`'s state at `ts`, reading `cells` and naming
-    /// each of `named` for its crossing.
-    fn claim_of(
-        shard: ShardId,
-        ts: WeightedTimestamp,
-        cells: Vec<(SubstateKey, Stated)>,
-        named: Vec<(SubstateKey, CrossingId)>,
-    ) -> StateClaim {
-        StateClaim::new(
-            Anchor {
-                shard,
-                height: BlockHeight::new(4),
-                state_root: StateRoot::ZERO,
-                ts,
-            },
-            cells,
-            MerkleInclusionProof::dummy(),
-        )
-        .naming(named)
-    }
-
-    /// A stated row whose counterpart's id runs a later chain is let go
-    /// with nothing taken, and the value its producer escrowed for it
-    /// comes home: the fate deletes the row, the consumer's chain past
-    /// the record's validity end reads its own row absent and declines
-    /// the record, and the producer's chain, reading that decline at a
-    /// boundary, takes the record back to the cell it left.
-    #[test]
-    fn a_let_go_rows_escrow_is_declined_and_returned() {
-        const VALIDITY_END_MS: u64 = 8_000;
-        const AMOUNT: u128 = 250;
-        let member = tx(1);
-        let id = CrossingId {
-            producer: Address::new([0x91; 31], AddressClass::Component),
-            consumer: Address::new([0x11; 31], AddressClass::Component),
-            intent: IntentHash(Hash32([0x31; 32])),
-            local: 0,
-            output: 0,
-        };
-        assert!(ShardTrie::shard_owns_prefix(PEER, id.producer));
-        let credit = SubstateKey {
-            owner: id.producer,
-            local: LocalKey([0x77; 16]),
-        };
-        let resource = ResourceAddr::new([0xE1; 31]);
-        let record = id.record_key(&ProtocolHasher);
-        let cell = id.cell(
-            member,
-            resource,
-            AMOUNT,
-            VALIDITY_END_MS,
-            CrossingTerms::Escrowed { credit },
-        );
-        let record_bytes = cell.to_bytes();
-        let held_at = |shard| {
-            claim_of(
-                shard,
-                ms(9_000),
-                vec![(
-                    record,
-                    Stated::Held(Bytes::new(record_bytes.clone()).expect("a record fits")),
-                )],
-                vec![(record, id)],
-            )
-        };
-        let row_read = |reading: Inclusion| {
-            claim_of(
-                ShardId::ROOT,
-                ms(9_400),
-                vec![(member_row_leaf(ShardId::ROOT, member), reading.into())],
-                vec![],
-            )
-        };
-        let nothing = Cells(BTreeMap::new());
-        let declines = |reading| {
-            unclaimed_declines(
-                &[held_at(PEER), row_read(reading)],
-                ShardId::ROOT,
-                IN_A_LATER_LIFE,
-                &nothing,
-            )
-        };
-        assert!(IN_A_LATER_LIFE >= ms(VALIDITY_END_MS));
-
-        let [_, mut rows, _] = shared_rows_committed_at(ms(1_500));
-        assert_eq!(
-            declines(Inclusion::Present([2; 32])),
-            StateWrites::default(),
-            "a standing row may still take",
-        );
-        let (lines, missing) = lines_under(&rows, &peer_formed_in(3));
-        assert!(missing.is_empty());
-        naming(&mut rows, 9, lines);
-        assert!(!rows.members.contains_key(&member), "the fate ends the row");
-
-        let never = id.answer_key(&ProtocolHasher, Answered::Never);
-        let decline = id
-            .answer(member, Answered::Never, VALIDITY_END_MS)
-            .to_bytes();
-        assert_eq!(
-            declines(Inclusion::Absent).cells,
-            BTreeMap::from([(never, Some(decline.clone()))]),
-        );
-
-        let read_back = claim_of(
-            ShardId::ROOT,
-            ms(9_500),
-            vec![(never, Inclusion::Present(jmt_value_hash(&decline)).into())],
-            vec![(never, id)],
-        );
-        let producer_anchor = ms(9_500)
-            .plus(RETENTION_HORIZON)
-            .plus(Duration::from_millis(1));
-        let claims = [held_at(PEER), read_back];
-        let taken_back = reclaimed(&claims, PEER, producer_anchor);
-        assert_eq!(taken_back, vec![(record, cell)]);
-        let producer = Cells(BTreeMap::from([
-            (record, record_bytes.clone()),
-            (credit, encode_amount(40).to_vec()),
-        ]));
-        let returned = reclaim_credits(&taken_back, PEER, &StateWrites::default(), &producer);
-        assert_eq!(returned.cells, BTreeMap::from([(record, None)]));
-        assert_eq!(
-            returned
-                .movements
-                .get(&credit)
-                .map(|movement| movement.credit),
-            Some(AMOUNT),
-        );
-    }
-
     /// A proposer ends every row accepted at the parent that no sibling
     /// can still ask about, in transaction order, and no other: a row
     /// whose sibling still says yes or has not answered waits, one this
@@ -6595,17 +6318,10 @@ mod tests {
             "nothing gathered of a sibling is this replica's lack",
         );
 
-        // A departed sibling: an accepted entry counts, and past it the
-        // names its terminal ended, held or not.
-        let departed = peer_read_from(Source::Gone, Evidence::Readable);
-        assert_eq!(named(&departed), ends_of(&[1]));
-        let unreadable = peer_read_from(Source::Gone, Evidence::Unreadable);
-        assert_eq!(named(&unreadable), ends_of(&[1, 2, 3, 4, 6]));
-        let named_by_terminal = SiblingViews {
-            ended: BTreeMap::from([((PEER, tx(2)), true), ((PEER, tx(3)), false)]),
-            ..departed
-        };
-        assert_eq!(named(&named_by_terminal), ends_of(&[1, 2, 3]));
+        // A departed sibling has accepted or left: every row accepted at
+        // the parent ends, an entry it does not count included.
+        let departed = peer_read_from(Source::Gone);
+        assert_eq!(named(&departed), ends_of(&[1, 2, 3, 4, 6]));
     }
 
     /// The end lines take what the other lines left of the manifest's
@@ -6709,9 +6425,8 @@ mod tests {
     }
 
     /// A voter that cannot judge a line, for want of the published
-    /// window or of a departed sibling's names, answers that it lacks
-    /// them, so the vote is deferred; a line no replica licenses is
-    /// refused whatever else this one lacks.
+    /// window, answers that it lacks it, so the vote is deferred; a line
+    /// no replica licenses is refused whatever else this one lacks.
     #[test]
     fn an_end_line_a_voter_cannot_judge_is_lacking_and_not_refused() {
         let rows = rows_of([accepted(1, None), accepted(2, Some((5, Said::Yes)))]);
@@ -6720,8 +6435,8 @@ mod tests {
             let ended: Vec<TxHash> = ended.iter().map(|&seed| tx(seed)).collect();
             ends_stand(&ended, &rows, &rows, views, ManifestBudget::default())
         };
-        let departed = peer_read_from(Source::Gone, Evidence::Readable);
-        assert_eq!(judged(&[1], &departed), Err(Unlicensed::Lacking(tx(1))));
+        let departed = peer_read_from(Source::Gone);
+        assert_eq!(judged(&[1], &departed), Ok(()));
         let (source, view) = departed.shards[&PEER];
         let unpublished = SiblingViews {
             shards: BTreeMap::from([(
@@ -6734,25 +6449,37 @@ mod tests {
                     },
                 ),
             )]),
-            ended: BTreeMap::new(),
         };
         assert_eq!(judged(&[1], &unpublished), Err(Unlicensed::Lacking(tx(1))));
-        for held in [true, false] {
-            let named = SiblingViews {
-                ended: BTreeMap::from([((PEER, tx(1)), held)]),
-                ..departed.clone()
-            };
-            assert_eq!(judged(&[1], &named), Ok(()), "named {held}");
-        }
-
-        // A sibling that runs and still says yes is a wait every replica
-        // computes alike, beside a row this one cannot judge.
-        let mixed = SiblingViews {
-            shards: BTreeMap::from([(PEER, peer_running().shards[&PEER])]),
-            ended: BTreeMap::new(),
-        };
         assert!(matches!(
-            judged(&[1, 2], &mixed),
+            judged(&[2, 1], &unpublished),
+            Err(Unlicensed::Refused(_))
+        ));
+
+        let other = ShardId::leaf(1, 0);
+        let waiting = MemberRow {
+            awaits: Capped::from_array([other]),
+            hearing: Capped::from_array([Heard {
+                shard: other,
+                mark: ReadMark {
+                    epoch: Epoch::new(5),
+                    height: BlockHeight::new(7),
+                },
+                said: Some(Said::Yes),
+            }]),
+            ..accepted(2, None)
+        };
+        let mixed = rows_of([accepted(1, None), waiting]);
+        let mut views = unpublished;
+        views.shards.insert(other, peer_running().shards[&PEER]);
+        let ended = [tx(1), tx(2)];
+        let budget = ManifestBudget::default;
+        assert_eq!(
+            ends_stand(&ended[..1], &mixed, &mixed, &views, budget()),
+            Err(Unlicensed::Lacking(tx(1))),
+        );
+        assert!(matches!(
+            ends_stand(&ended, &mixed, &mixed, &views, budget()),
             Err(Unlicensed::Refused(_))
         ));
     }

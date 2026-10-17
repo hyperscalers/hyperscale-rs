@@ -787,7 +787,7 @@ mod tests {
         Address, AddressClass, Admission, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence,
         Formed, HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding, RecoveryCause, ReshapeKind,
         SettledTxsRoot, Settling, ShardFullness, ShardWitnessPayload, SplitChildRoots, Stake,
-        StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
+        StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule, partner_evidence,
     };
 
     use super::*;
@@ -3179,8 +3179,8 @@ mod tests {
                     && !published.split_pending(*leaf)
                     && published.settled_window_floor(*leaf).is_none()
                     && !schedule.termination_scheduled(*leaf, opening)
-                    && schedule.evidence_as_published(*leaf, opening)
-                        == Ok(Evidence::Live { terminating: false })
+                    && partner_evidence(&schedule, *leaf, opening)
+                        == Evidence::Live { terminating: false }
             })
     }
 
@@ -3412,14 +3412,10 @@ mod tests {
             );
             fold_asserting(&mut state, triggers);
             let window = state.current_epoch.next();
-            schedule.insert_lookahead(window, Arc::new(state.derive_next_topology_snapshot(net())));
+            schedule.insert(window, Arc::new(state.derive_next_topology_snapshot(net())));
             let span = windows.window_of(window);
             let last = WeightedTimestamp::from_millis(span.end.as_millis() - 1);
-            let at = |anchor| {
-                schedule
-                    .evidence_as_published(shard, anchor)
-                    .expect("published above")
-            };
+            let at = |anchor| partner_evidence(&schedule, shard, anchor);
             read.push((window, at(span.start), at(last)));
             if matches!(at(last), Evidence::Live { .. }) {
                 return read;

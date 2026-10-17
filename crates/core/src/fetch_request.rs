@@ -106,24 +106,6 @@ pub enum FetchRequest {
         /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
-    /// A departed shard's terminal manifest, checked against the block
-    /// hash this node's own beacon fold records for the terminal. Routed
-    /// as [`Self::SettledTxs`] is.
-    ///
-    /// Carries the whole wanted set, re-derived on every beacon fold and
-    /// diffed by the node as the settled sets' is, so a terminal whose
-    /// names are held or whose evidence window has closed releases its
-    /// slot by dropping out. An empty set releases and asks no peer
-    /// anything.
-    TerminalLines {
-        /// Every terminal whose ended names are still wanted.
-        wanted: Vec<TerminalEvidence>,
-        /// Always `None` for this variant; every member holds the
-        /// terminal block.
-        preferred: Option<ValidatorId>,
-        /// Optional class override; see enum-level doc.
-        class: Option<MessageClass>,
-    },
     /// The code a committed tick waits on at the dispatch head. The node
     /// takes each package from a store it serves where one holds it, and
     /// asks the committee its content address names otherwise, so no

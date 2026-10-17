@@ -17,7 +17,6 @@ mod settled_txs;
 mod state_proof;
 mod state_range;
 mod sync;
-mod terminal_lines;
 mod transaction;
 mod witness_history;
 
@@ -34,6 +33,5 @@ pub use settled_txs::GetSettledTxsRequest;
 pub use state_proof::GetStateProofRequest;
 pub use state_range::GetStateRangeRequest;
 pub use sync::SyncCompleteAnnouncement;
-pub use terminal_lines::GetTerminalLinesRequest;
 pub use transaction::GetTransactionsRequest;
 pub use witness_history::GetWitnessHistoryRequest;

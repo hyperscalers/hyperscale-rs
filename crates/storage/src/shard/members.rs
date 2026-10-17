@@ -2024,10 +2024,11 @@ impl MemberIndex {
 
     /// Whether no row of the shard hears or may come to: none stands
     /// shared in flight, stated or accepted. What a draining shard
-    /// asserts to the beacon, which cuts it only once it has: a stated row
-    /// leaves only by accepting or on a sibling's let go, and an accepted
-    /// one only once every sibling has read it, so a cut under a quiet
-    /// shard withdraws no yes and strands no accept.
+    /// asserts to the beacon, which cuts it only once it has: a stated
+    /// row leaves only by accepting or by an abort on a sibling's
+    /// leaving, and an accepted one only once every sibling has read it,
+    /// so a cut under a quiet shard withdraws no yes and strands no
+    /// accept.
     #[must_use]
     pub fn quiet(&self) -> bool {
         !self.members.values().any(|row| {
@@ -2265,10 +2266,10 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, ConsensusReceipt, Decision, Declared, Derivation, DerivationError, Derived,
-        Epoch, Evidence, LocalKey, MAX_CLAIMS_PER_BLOCK, MAX_DECLARED_RESERVE,
-        MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
-        MerkleInclusionProof, RoutePrefix, SiblingView, Source, StateRoot, StoredReceipt,
-        TransactionEnvelope, ValidatorId, Value, decide, shard_prefix_path, value_of,
+        Epoch, LocalKey, MAX_CLAIMS_PER_BLOCK, MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY,
+        MAX_STATE_CLAIMS_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, RoutePrefix,
+        SiblingView, Source, StateRoot, StoredReceipt, TransactionEnvelope, ValidatorId, Value,
+        decide, shard_prefix_path, value_of,
     };
     use hyperscale_vm_effects::CrossingId;
     use proptest::collection::vec;
@@ -2984,11 +2985,8 @@ mod tests {
         let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &awaited);
         let live = SiblingView {
             epoch: Epoch::new(0),
-            terminating: Some(false),
             recovery: Ok(None),
-            evidence: Ok(Evidence::Live { terminating: false }),
             formed: Ok(None),
-            ended: None,
         };
         let read = |store: &Entries| {
             let leaf = leaf_of(store, 1).map_or(Inclusion::Absent, |bytes| {
@@ -3664,6 +3662,72 @@ mod tests {
             Movement::unjudged(protocol_resource(&ProtocolHasher), 26),
             "two fates on one vault burn both charges",
         );
+    }
+
+    /// A terminal's manifest leaves no row standing, whatever each row
+    /// stood as: an end deletes an accepted row and a fate every other,
+    /// a stated row's verdict leaf, seat and staged entry beside it, and
+    /// no tick row is left holding what it named. The beacon cuts a shard
+    /// only once it is quiet, so a terminal meets a stated or accepted
+    /// row only where a recovery lost a block a sibling read; even then
+    /// nothing stands under an owner the shard's successor reuses.
+    #[test]
+    fn a_terminal_leaves_no_row_standing_even_an_accepted_one() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3, 4, 5, 6]));
+        store.fold(&naming(
+            2,
+            vec![sharing(3, 7), sharing(4, 9), sharing(5, 11)],
+        ));
+        store.fold(&stating(3, 2, &[], &[4, 5]));
+        store.fold(&naming(4, vec![member(2, Settlement::Alone)]));
+        store.fold(&naming(5, vec![member(6, Settlement::Alone)]));
+        store.fold(&discarding(6, 5, DiscardCause::Recovery));
+        store.fold(&accepting(7, 2, &[5]));
+        assert_eq!(state_of(&store, 1), Some(RowState::Pending));
+        assert!(matches!(
+            (state_of(&store, 2), state_of(&store, 3)),
+            (
+                Some(RowState::InFlight {
+                    settlement: Settlement::Alone,
+                    ..
+                }),
+                Some(RowState::InFlight {
+                    settlement: Settlement::Shared,
+                    ..
+                }),
+            )
+        ));
+        assert!(matches!(state_of(&store, 4), Some(RowState::Stated { .. })));
+        assert_eq!(state_of(&store, 5), Some(RowState::Accepted));
+        assert!(matches!(
+            state_of(&store, 6),
+            Some(RowState::Released { .. })
+        ));
+        assert!(leaf_of(&store, 4).is_some() && !staged_in(&store).is_empty());
+
+        let terminal: Vec<TickLine> = MemberIndex::load(&store, LOCAL)
+            .members
+            .values()
+            .map(|row| match row.state {
+                RowState::Accepted => TickLine::End { tx: row.tx },
+                _ => TickLine::Fate {
+                    tx: row.tx,
+                    charge: row.charge,
+                },
+            })
+            .collect();
+        assert!(terminal.contains(&TickLine::End { tx: tx(5) }));
+        store.fold(&naming(8, terminal));
+        let index = MemberIndex::load(&store, LOCAL);
+        assert!(
+            index.members.is_empty() && index.ticks.is_empty(),
+            "{index:?}"
+        );
+        for seed in 1..=6 {
+            assert!(leaf_of(&store, seed).is_none() && !seated_in(&store, seed));
+        }
+        assert!(staged_in(&store).is_empty());
     }
 
     /// An end line moves no row a line does not end: one naming a row

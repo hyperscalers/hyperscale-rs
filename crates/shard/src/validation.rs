@@ -2565,7 +2565,6 @@ pub mod tests {
 
         for (here, sibling) in [(x, s), (s, x)] {
             let (source, view) = sibling_view(&schedule, sibling, anchor);
-            assert_eq!(view.terminating, Some(false), "draining is not terminating");
             let read = |said| Heard {
                 shard: sibling,
                 mark: ReadMark {

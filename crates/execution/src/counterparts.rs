@@ -31,7 +31,7 @@ use hyperscale_types::network::response::ServedValue;
 #[cfg(test)]
 use hyperscale_types::shard_prefix_path;
 use hyperscale_types::{
-    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Address, Anchor, Block, BlockHash, BlockHeight,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Address, Anchor, Block, BlockHeight,
     BoundaryAttestation, BoundaryOffer, CarriedClaims, CounterpartMirror, Deadline, EpochWindows,
     ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey, MAX_CLAIMS_PER_BLOCK,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_BYTES,
@@ -2063,12 +2063,6 @@ impl Counterparts {
         self.mirror.record_settled(shard, settled);
     }
 
-    /// Record the transactions a departed shard's terminal block
-    /// `terminal` ended, beside its settled set.
-    pub(crate) fn on_ended(&self, shard: ShardId, terminal: BlockHash, names: BTreeSet<TxHash>) {
-        self.mirror.record_ended(shard, terminal, names);
-    }
-
     /// The departed shards whose settled sets the fence will need and
     /// this validator does not hold: every shard the schedule still
     /// routes to whose boundary record attests a settled root, until the
@@ -2082,42 +2076,12 @@ impl Counterparts {
         topology_schedule: &TopologySchedule,
         now: WeightedTimestamp,
     ) -> Vec<TerminalEvidence> {
-        self.departures_lacking(topology_schedule, now, |shard| {
-            self.mirror.with_settled(|sets| sets.contains_key(&shard))
-        })
-    }
-
-    /// The departed shards whose terminal lines this validator does not
-    /// hold: the same shards under the same evidence window as
-    /// [`Self::wanted_settled_sets`], each wanted until the names ended
-    /// by the terminal its evidence names are held.
-    #[must_use]
-    pub(crate) fn wanted_terminal_lines(
-        &self,
-        topology_schedule: &TopologySchedule,
-        now: WeightedTimestamp,
-    ) -> Vec<TerminalEvidence> {
-        let mut wanted = self.departures_lacking(topology_schedule, now, |_| false);
-        wanted.retain(|evidence| !self.mirror.holds_ended(evidence.shard, evidence.block_hash));
-        wanted
-    }
-
-    /// The terminal evidence of every departed shard `answered` is false
-    /// of: each shard the schedule still routes to whose
-    /// boundary record attests a settled root, until the
-    /// handoff-anchored evidence window has closed at `now`.
-    fn departures_lacking(
-        &self,
-        topology_schedule: &TopologySchedule,
-        now: WeightedTimestamp,
-        answered: impl Fn(ShardId) -> bool,
-    ) -> Vec<TerminalEvidence> {
         let head = topology_schedule.head();
         topology_schedule
             .routable_shards()
             .into_iter()
             .filter(|&shard| shard != self.ledger.local())
-            .filter(|&shard| !answered(shard))
+            .filter(|&shard| !self.mirror.with_settled(|sets| sets.contains_key(&shard)))
             .filter(|&shard| {
                 topology_schedule
                     .handoff_evidence_expiry(shard)
@@ -4193,9 +4157,9 @@ impl Counterparts {
         })
     }
 
-    /// Drop settled sets and ended names past their evidence window.
-    /// Past it the gate rejects any outcome naming the shard regardless
-    /// of the set, so retaining either only leaks memory.
+    /// Drop settled sets past their evidence window. Past it the gate
+    /// rejects any outcome naming the shard regardless of the set, so
+    /// retaining one only leaks memory.
     fn gc_settled_sets(&self, topology_schedule: &TopologySchedule, now: WeightedTimestamp) {
         self.mirror
             .retain_departures(&|shard| topology_schedule.terminal_evidence_readable(shard, now));
@@ -4212,8 +4176,8 @@ mod tests {
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{proven_claim, state_and_proof, state_and_proof_holding};
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, BeaconWitnessLeafCount, BlockHeight, CollectionId,
-        CommittedAt, Deadline, Epoch, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
+        AbortCharge, Address, AddressClass, BeaconWitnessLeafCount, BlockHash, BlockHeight,
+        CollectionId, CommittedAt, Deadline, Epoch, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_PROOFS_PER_QUERY, MAX_VALIDITY_RANGE, NetworkDefinition, ResourceAddr, RoutePrefix,
         Said, SettledTxsRoot, ShardAnchor, StateRoot, StateWrites, TopologySnapshot, ValidatorSet,
         encode_amount, evidence_admits_block,

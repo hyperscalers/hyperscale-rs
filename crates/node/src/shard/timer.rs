@@ -17,7 +17,7 @@ use crate::fetch::FetchInput;
 use crate::shard::ShardLoop;
 use crate::shard::cross_shard::{
     FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
-    StateProofBinding, TerminalLinesBinding, VerdictProofBinding,
+    StateProofBinding, VerdictProofBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -47,7 +47,6 @@ where
         self.drive_fetch::<StateProofBinding>(FetchInput::Tick);
         self.drive_fetch::<VerdictProofBinding>(FetchInput::Tick);
         self.drive_fetch::<SettledTxsBinding>(FetchInput::Tick);
-        self.drive_fetch::<TerminalLinesBinding>(FetchInput::Tick);
         self.drive_fetch::<ShardWitnessBinding>(FetchInput::Tick);
         self.drive_fetch::<BeaconProposalBinding>(FetchInput::Tick);
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
