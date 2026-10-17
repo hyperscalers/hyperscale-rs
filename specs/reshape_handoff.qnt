@@ -175,6 +175,13 @@
 //     import verification is INV-STATE-3's; straddler settlement across
 //     the same cut is Model D's. Members here adopt whenever the record
 //     is fetchable — adoption order and timing are free.
+//   - The cut is one the beacon stamped after the drain latch, on a quiet
+//     bit (Model F's `invCutOnQuiet`), so the terminating chain holds no
+//     row that hears when its terminal commits (Model D). The handoff
+//     therefore carries state and no verdict: no successor or survivor
+//     reads a row's outcome from the terminal's lines, and nothing here
+//     models them. A drain that cancels cuts nothing and never reaches
+//     this model.
 //   - The retention clock collapses window ends onto epoch indices and
 //     the horizon onto whole epochs; the GC may fire on any fold once
 //     its guard passes, over-approximating the per-fold sweep.
