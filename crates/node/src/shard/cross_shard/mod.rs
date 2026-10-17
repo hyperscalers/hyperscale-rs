@@ -19,17 +19,13 @@ mod remote_header_serve;
 mod remote_header_sync;
 mod settled_txs_serve;
 mod state_proof_serve;
-#[cfg(test)]
-mod terminal_fixture;
-mod terminal_lines_serve;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use fetch::{
     FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
     ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
-    StateProofFetch, TerminalLinesBinding, TerminalLinesFetch, VerdictProofBinding,
-    VerdictProofFetch,
+    StateProofFetch, VerdictProofBinding, VerdictProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
@@ -41,7 +37,6 @@ use remote_header::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
 pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
 pub use state_proof_serve::{serve_cells_request, serve_state_proof_request};
-pub use terminal_lines_serve::{TerminalLinesCache, serve_terminal_lines_request};
 
 use crate::config::NodeConfig;
 use crate::fetch::FetchConfig;
@@ -70,15 +65,10 @@ pub struct CrossShardState {
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
-    /// Fetch of departed shards' terminal manifests (rotates through
-    /// the terminal committee).
-    pub(crate) terminal_lines: TerminalLinesFetch,
     /// The pre-cut proofs each seat last named, by terminal.
     pub(crate) precut_wants: SeatWants<(Anchor, SubstateKey)>,
     /// The settled sets each seat last named.
     pub(crate) settled_wants: SeatWants<TerminalEvidence>,
-    /// The terminals whose lines each seat last named.
-    pub(crate) lines_wants: SeatWants<TerminalEvidence>,
 }
 
 /// What each seat last named of a fetch whose consumer re-derives its
@@ -128,11 +118,6 @@ impl<Id: Ord + Clone> SeatWants<Id> {
     /// `seat` left the loop.
     pub(crate) fn forget(&mut self, seat: ValidatorId) {
         self.by_seat.remove(&seat);
-    }
-
-    /// Every id any seat names.
-    pub(crate) fn named(&self) -> BTreeSet<Id> {
-        self.by_seat.values().flatten().cloned().collect()
     }
 }
 
@@ -199,17 +184,8 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            terminal_lines: TerminalLinesFetch::new(
-                "terminal_lines",
-                FetchConfig {
-                    max_in_flight: 8,
-                    max_ids_per_request: 8,
-                    parallel_chunks_per_tick: 2,
-                },
-            ),
             precut_wants: SeatWants::default(),
             settled_wants: SeatWants::default(),
-            lines_wants: SeatWants::default(),
         }
     }
 
@@ -226,7 +202,6 @@ impl CrossShardState {
             || self.state_proof.has_pending()
             || self.verdict_proof.has_pending()
             || self.settled_txs.has_pending()
-            || self.terminal_lines.has_pending()
     }
 
     /// Drive the remote-header-sync FSM's periodic tick. Returns range

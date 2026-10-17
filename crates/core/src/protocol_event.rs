@@ -867,22 +867,6 @@ pub enum ProtocolEvent {
         terminal_wt: WeightedTimestamp,
     },
 
-    /// A terminal-lines fetch verified a past-terminal shard's terminal
-    /// manifest against the block hash the beacon records for it. The
-    /// execution coordinator records the transactions its end lines
-    /// name beside the shard's settled set.
-    TerminalLinesVerified {
-        /// The terminated shard whose terminal this is.
-        shard: ShardId,
-        /// The terminal block the manifest was verified against: the
-        /// names are that block's, whatever terminal the beacon records
-        /// for the shard by the time they arrive.
-        terminal: BlockHash,
-        /// Transactions that shard's terminal block ended: every row it
-        /// had accepted and still held.
-        ended: BTreeSet<TxHash>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════

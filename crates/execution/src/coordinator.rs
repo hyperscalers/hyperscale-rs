@@ -4351,14 +4351,6 @@ impl ExecutionCoordinator {
         })]
     }
 
-    /// Record the transactions a past-terminal shard's terminal block
-    /// `terminal` ended, held beside its settled set for whoever reads
-    /// the rows the departed shard had accepted. Nothing waits on them
-    /// here.
-    pub fn record_ended_names(&self, shard: ShardId, terminal: BlockHash, names: BTreeSet<TxHash>) {
-        self.counterparts.on_ended(shard, terminal, names);
-    }
-
     /// Record a past-terminal shard's settled-transaction set for the finalize
     /// gate (mirrors the shard coordinator's fence feed), and release
     /// what waited on it: the finalizations the gate held while the set
@@ -4458,15 +4450,6 @@ impl ExecutionCoordinator {
                 wanted: self
                     .counterparts
                     .wanted_settled_sets(topology_schedule, self.committed_ts),
-                preferred: None,
-                class: None,
-            }));
-        effects
-            .actions
-            .push(Action::Fetch(FetchRequest::TerminalLines {
-                wanted: self
-                    .counterparts
-                    .wanted_terminal_lines(topology_schedule, self.committed_ts),
                 preferred: None,
                 class: None,
             }));
@@ -14358,15 +14341,6 @@ mod tests {
         wanted.iter().map(|evidence| evidence.shard).collect()
     }
 
-    /// The terminals whose lines `state` asks for under `sched`.
-    fn lines_wanted(state: &ExecutionCoordinator, sched: &TopologySchedule) -> Vec<ShardId> {
-        shards_of(
-            &state
-                .counterparts
-                .wanted_terminal_lines(sched, state.committed_ts),
-        )
-    }
-
     /// The terminals whose settled sets `state` asks for under `sched`.
     fn sets_wanted(state: &ExecutionCoordinator, sched: &TopologySchedule) -> Vec<ShardId> {
         shards_of(
@@ -14383,136 +14357,65 @@ mod tests {
         }
     }
 
-    /// A departed shard's lines are wanted, under the terminal its
-    /// boundary record names, while the names its terminal ended are not
-    /// held; recording them, an empty list included, ends the want. The
-    /// settled set is wanted and acquired on its own: neither answer
-    /// stands in for the other.
+    /// A departed shard's settled set is wanted, under the terminal its
+    /// boundary record names, until it is held.
     #[test]
-    fn terminal_lines_are_wanted_until_the_names_are_held() {
+    fn a_settled_set_is_wanted_until_it_is_held() {
         let (mut state, sched) = state_beside_an_attested_departure(None);
         let wanted = state
             .counterparts
-            .wanted_terminal_lines(&sched, state.committed_ts);
+            .wanted_settled_sets(&sched, state.committed_ts);
         let [evidence] = wanted.as_slice() else {
             panic!("one departure, one terminal: {wanted:?}");
         };
         assert_eq!(evidence.shard, PEER);
         assert_eq!(evidence.height, BlockHeight::new(9));
         assert_eq!(evidence.block_hash, peer_terminal());
-        assert_eq!(sets_wanted(&state, &sched), vec![PEER]);
 
-        // The set arriving leaves the lines wanted.
         let _ = state.record_settled_txs(&sched, PEER, empty_settled_set());
         assert!(sets_wanted(&state, &sched).is_empty());
-        assert_eq!(lines_wanted(&state, &sched), vec![PEER]);
-
-        let accepted = TxHash::from(Hash::from_bytes(b"accepted"));
-        state.record_ended_names(PEER, peer_terminal(), BTreeSet::from([accepted]));
-        assert!(lines_wanted(&state, &sched).is_empty());
-        let mirror = &state.counterparts.mirror;
-        assert_eq!(mirror.ended(PEER, peer_terminal(), accepted), Some(true));
-        assert_eq!(
-            mirror.ended(
-                PEER,
-                peer_terminal(),
-                TxHash::from(Hash::from_bytes(b"left"))
-            ),
-            Some(false),
-        );
     }
 
-    /// The names arriving first leave the settled set wanted, and a
-    /// terminal that ended nothing is still an answer.
+    /// The settled set stops being wanted once the handoff-anchored
+    /// evidence window has closed.
     #[test]
-    fn the_names_arriving_leave_the_settled_set_wanted() {
-        let (state, sched) = state_beside_an_attested_departure(None);
-
-        state.record_ended_names(PEER, peer_terminal(), BTreeSet::new());
-
-        assert!(lines_wanted(&state, &sched).is_empty());
-        assert_eq!(sets_wanted(&state, &sched), vec![PEER]);
-        assert!(
-            state
-                .counterparts
-                .mirror
-                .with_settled(|sets| !sets.contains_key(&PEER)),
-        );
-    }
-
-    /// The lines stop being wanted where the settled set does: once the
-    /// handoff-anchored evidence window has closed.
-    #[test]
-    fn terminal_lines_are_not_wanted_past_the_evidence_window() {
+    fn a_settled_set_is_not_wanted_past_the_evidence_window() {
         let (mut state, sched) = state_beside_an_attested_departure(Some(Epoch::new(0)));
         let expiry = sched
             .handoff_evidence_expiry(PEER)
             .expect("the head carries the stamp");
 
         state.committed_ts = expiry;
-        assert_eq!(lines_wanted(&state, &sched), vec![PEER]);
         assert_eq!(sets_wanted(&state, &sched), vec![PEER]);
 
         state.committed_ts = expiry.plus(Duration::from_millis(1));
-        assert!(lines_wanted(&state, &sched).is_empty());
         assert!(sets_wanted(&state, &sched).is_empty());
     }
 
-    /// Names verified against a terminal the boundary record does not
-    /// name are not the current terminal's: the want stands until the
-    /// names of the terminal the evidence names arrive.
+    /// Every beacon fold names the settled sets wanted, and names none
+    /// once they are held, which is what the node's diff releases on.
     #[test]
-    fn names_of_another_terminal_leave_the_lines_wanted() {
-        let (state, sched) = state_beside_an_attested_departure(None);
-        let accepted = TxHash::from(Hash::from_bytes(b"accepted"));
-        let superseded = BlockHash::from_raw(Hash::from_bytes(b"superseded"));
-
-        state.record_ended_names(PEER, superseded, BTreeSet::from([accepted]));
-        assert_eq!(lines_wanted(&state, &sched), vec![PEER]);
-        let mirror = &state.counterparts.mirror;
-        assert_eq!(mirror.ended(PEER, peer_terminal(), accepted), None);
-
-        state.record_ended_names(PEER, peer_terminal(), BTreeSet::new());
-        assert!(lines_wanted(&state, &sched).is_empty());
-        let mirror = &state.counterparts.mirror;
-        assert_eq!(mirror.ended(PEER, peer_terminal(), accepted), Some(false));
-    }
-
-    /// Every beacon fold names the terminals whose lines are wanted on
-    /// their own fetch, beside the settled sets', and names none once
-    /// the names are held, which is what the node's diff releases on.
-    #[test]
-    fn a_beacon_fold_asks_for_the_lines_on_their_own_fetch() {
+    fn a_beacon_fold_asks_for_the_settled_sets_wanted() {
         let (mut state, sched) = state_beside_an_attested_departure(None);
         let asked = |state: &mut ExecutionCoordinator| {
             let actions = state.on_beacon_block_persisted(&sched).actions;
-            let lines = actions.iter().find_map(|action| match action {
-                Action::Fetch(FetchRequest::TerminalLines { wanted, .. }) => {
-                    Some(shards_of(wanted))
-                }
-                _ => None,
-            });
-            let sets = actions.iter().find_map(|action| match action {
+            actions.iter().find_map(|action| match action {
                 Action::Fetch(FetchRequest::SettledTxs { wanted, .. }) => Some(shards_of(wanted)),
                 _ => None,
-            });
-            (lines, sets)
+            })
         };
 
-        assert_eq!(asked(&mut state), (Some(vec![PEER]), Some(vec![PEER])));
-
-        state.record_ended_names(PEER, peer_terminal(), BTreeSet::new());
-        assert_eq!(asked(&mut state), (Some(vec![]), Some(vec![PEER])));
+        assert_eq!(asked(&mut state), Some(vec![PEER]));
+        let _ = state.record_settled_txs(&sched, PEER, empty_settled_set());
+        assert_eq!(asked(&mut state), Some(vec![]));
     }
 
-    /// The names leave the mirror with the set, at the commit that finds
-    /// the schedule no longer reading the departure's evidence.
+    /// A settled set leaves the mirror at the commit that finds the
+    /// schedule no longer reading the departure's evidence.
     #[test]
-    fn the_ended_names_retire_with_the_settled_set() {
+    fn a_settled_set_retires_past_its_evidence_window() {
         let (mut state, open) = state_beside_an_attested_departure(None);
-        let accepted = TxHash::from(Hash::from_bytes(b"accepted"));
         let _ = state.record_settled_txs(&open, PEER, empty_settled_set());
-        state.record_ended_names(PEER, peer_terminal(), BTreeSet::from([accepted]));
 
         let block = make_live_block(BlockHeight::new(1), 6_001, ValidatorId::new(0), vec![]);
         let now = WeightedTimestamp::from_millis(6_001);
@@ -14520,19 +14423,16 @@ mod tests {
             .counterparts
             .on_commit(open.head().shard_trie(), &open, &block, now, &[]);
         let mirror = &state.counterparts.mirror;
-        assert_eq!(
-            mirror.ended(PEER, peer_terminal(), accepted),
-            Some(true),
-            "an unstamped window holds the names"
+        assert!(
+            mirror.with_settled(|sets| sets.contains_key(&PEER)),
+            "an unstamped window holds the set"
         );
-        assert!(mirror.with_settled(|sets| sets.contains_key(&PEER)));
 
         let (_, closed) = state_beside_an_attested_departure(Some(Epoch::new(0)));
         let _ = state
             .counterparts
             .on_commit(closed.head().shard_trie(), &closed, &block, now, &[]);
         let mirror = &state.counterparts.mirror;
-        assert_eq!(mirror.ended(PEER, peer_terminal(), accepted), None);
         assert!(mirror.with_settled(|sets| !sets.contains_key(&PEER)));
     }
 

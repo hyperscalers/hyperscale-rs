@@ -35,7 +35,8 @@ use hyperscale_simulation::{
     ArchivedChain, CrashKind, EPOCH_MS, ExecutionMode, ProcessingTimes, SimConfig, SimulationRunner,
 };
 use hyperscale_storage::{
-    BoundaryStore, MemberIndex, RowState, ShardChainReader, SubstateStore, Substates, answer_route,
+    BoundaryStore, MemberIndex, RowState, ShardChainReader, SubstateStore, Substates,
+    VersionedStore, answer_route,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::Withheld;
@@ -1040,28 +1041,13 @@ impl Cluster for SimCluster {
             .map_or_else(Vec::new, |row| row.hearing.to_vec())
     }
 
-    fn ended_names_read(
-        &self,
-        survivor: ShardId,
-        departed: ShardId,
-        tx: TxHash,
-    ) -> Option<Vec<(bool, Option<bool>)>> {
-        Some(
-            (0..self.runner.num_hosts())
-                .filter_map(|host| self.runner.vnode_state_in(host, survivor))
-                .map(|node| {
-                    let shard = node.shard_coordinator();
-                    let schedule = node.beacon_coordinator().topology_schedule();
-                    let readable = schedule
-                        .terminal_evidence_readable(departed, shard.committed_clock().now());
-                    let names = schedule
-                        .head()
-                        .boundary(departed)
-                        .and_then(|anchor| shard.mirror().ended(departed, anchor.block_hash, tx));
-                    (readable, names)
-                })
-                .collect(),
-        )
+    fn quiet_at(&self, shard: ShardId, height: BlockHeight) -> Option<bool> {
+        let snapshot = self
+            .tallest_store(shard)
+            .unwrap_or_else(|| panic!("no host holds a store of {shard:?}"))
+            .snapshot_held_at(height)
+            .unwrap_or_else(|| panic!("{shard:?} no longer retains its state at {height:?}"));
+        Some(MemberIndex::load(&snapshot, shard).quiet())
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {

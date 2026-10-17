@@ -43,9 +43,6 @@ pub enum FetchIds {
     /// Departed shards' settled sets, by the terminal each is checked
     /// against.
     SettledTxs(Vec<TerminalEvidence>),
-    /// Departed shards' terminal manifests, by the terminal each is
-    /// checked against.
-    TerminalLines(Vec<TerminalEvidence>),
     /// Block proposals a committee member's vote named and this replica
     /// never received, by block hash.
     Proposals(Vec<BlockHash>),

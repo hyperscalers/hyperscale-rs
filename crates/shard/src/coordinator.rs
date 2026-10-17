@@ -2548,12 +2548,7 @@ impl ShardCoordinator {
         // A legs half is judged over the parent's rows advanced by the
         // block's claims alone, before any finalization of the block
         // settles: its names accept on what the siblings' state says.
-        let views = sibling_views(
-            hearing_rows(&ancestry.rows),
-            topology_schedule,
-            &self.mirror,
-            anchor,
-        );
+        let views = sibling_views(hearing_rows(&ancestry.rows), topology_schedule, anchor);
         legs_licensed(&ancestry.rows, &pending, block.certificates(), &views)?;
         let mut rows = ancestry.rows.clone();
         rows.advance(&pending);
@@ -2577,7 +2572,6 @@ impl ShardCoordinator {
         let views = sibling_views(
             hearing_rows(&ancestry.rows).chain(hearing_rows(&rows)),
             topology_schedule,
-            &self.mirror,
             anchor,
         );
         let (expected, left) = if kind == ManifestKind::Fates {
@@ -2734,7 +2728,6 @@ impl ShardCoordinator {
         held.siblings = sibling_views(
             hearing_rows(&ancestry.rows).chain(hearing_rows(&rows)),
             topology_schedule,
-            &self.mirror,
             anchor,
         );
         let recovery =
@@ -2842,7 +2835,6 @@ impl ShardCoordinator {
         let views = sibling_views(
             hearing_rows(&self.member_rows),
             schedule,
-            &self.mirror,
             self.committed_block_anchor_wt,
         );
         let mut by_tick: BTreeMap<TickId, BTreeSet<TxHash>> = BTreeMap::new();
@@ -3110,12 +3102,7 @@ impl ShardCoordinator {
             finalizations,
             &members,
             &MemberInputs::hearing(self.local_shard, &state_claims, topology_schedule.windows()),
-            &sibling_views(
-                hearing_rows(&members),
-                topology_schedule,
-                &self.mirror,
-                ctx.anchor,
-            ),
+            &sibling_views(hearing_rows(&members), topology_schedule, ctx.anchor),
         );
         let fence = read_fence(&state_claims, topology_schedule.windows());
         let transactions = select_transactions(
@@ -9146,9 +9133,9 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, ChainOrigin, CollectionId,
-        CommittedAt, ConsensusReceipt, ConsensusSignature, CounterpartMirror, Deadline, Decision,
-        Declared, DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause,
-        Epoch, Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
+        CommittedAt, ConsensusReceipt, ConsensusSignature, Deadline, Decision, Declared,
+        DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
+        Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER,
         MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_TICK_MANIFEST_BYTES,
         MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
@@ -10614,23 +10601,47 @@ mod tests {
     }
 
     /// [`stated_beside_a_sibling`] for every one of `txs`, the sibling
-    /// since departed, and this replica holding the names its terminal
-    /// ended: `ended`.
+    /// since departed, and the row of each of `accepted` holding the
+    /// sibling's accept, read in a block committed before it left.
     fn stated_beside_a_departed_sibling(
         txs: &[Transaction],
-        ended: &[&Transaction],
+        accepted: &[&Transaction],
     ) -> (
         ShardCoordinator,
         TopologySchedule,
         SimShardStorage,
         Vec<Block>,
     ) {
-        let (state, schedule, storage, chain) = all_stated_beside_a_sibling(txs);
-        state.mirror().record_ended(
-            HEARD_SIBLING,
-            sibling_terminal(),
-            ended.iter().map(|tx| tx.hash()).collect(),
-        );
+        let (mut state, schedule, storage, mut chain) = all_stated_beside_a_sibling(txs);
+        if !accepted.is_empty() {
+            let running = publishing(&schedule, true, BTreeMap::new());
+            let state_claims = accepted
+                .iter()
+                .map(|tx| naming_an_accept(&mut state, &running, tx))
+                .collect();
+            chain.push(proposed_on_tip(
+                &state,
+                &running,
+                &storage,
+                2_500,
+                &ProposalPayload {
+                    state_claims,
+                    ..payload_of(&[], Vec::new())
+                },
+                None,
+            ));
+            let from = BlockHash::from_raw(Hash::from_bytes(b"heard tip"));
+            (state, _) = committed_through(from, chain.clone());
+            for tx in accepted {
+                assert_eq!(
+                    state.member_rows().members[&tx.hash()]
+                        .hearing
+                        .first()
+                        .and_then(|heard| heard.said),
+                    Some(Said::Accepted),
+                );
+            }
+        }
         (state, sibling_departed(&schedule), storage, chain)
     }
 
@@ -10654,8 +10665,8 @@ mod tests {
 
     /// A voter refuses a legs half naming a stated row its sibling's
     /// state does not accept: a running sibling not yet read leaves the
-    /// row waiting, and a departed one whose terminal did not end the
-    /// transaction refuses it.
+    /// row waiting, and a departed one it never read accepting refuses
+    /// it.
     #[test]
     fn a_legs_half_naming_a_row_that_waits_is_refused() {
         let tx = test_transaction(1);
@@ -10690,31 +10701,23 @@ mod tests {
         let block = legs_on_tip(&state, &departed, &storage, std::slice::from_ref(&tx));
         let rows = state
             .rows_voted_over(&departed, &committee, &block)
-            .expect("the departed sibling's names accept the row")
+            .expect("the departed sibling's accept accepts the row")
             .expect("a block of member lines");
         assert_eq!(rows.members[&tx.hash()].state, RowState::Accepted);
     }
 
-    /// A voter that cannot judge a legs half's name defers the block and
-    /// refuses nothing: it lacks the window as published, or the names a
-    /// departed sibling's terminal ended.
+    /// A voter that cannot judge a legs half's name, lacking the window
+    /// as published, defers the block and refuses nothing.
     #[test]
-    fn a_voter_without_the_names_or_the_window_defers_and_does_not_refuse() {
+    fn a_voter_without_the_window_defers_and_does_not_refuse() {
         let tx = test_transaction(1);
-        for departed in [false, true] {
-            let (state, schedule, storage, _) = stated_beside_a_sibling(&tx);
-            let committee = Arc::clone(schedule.head());
-            let judged = if departed {
-                sibling_departed(&schedule)
-            } else {
-                schedule
-            };
-            let block = legs_on_tip(&state, &judged, &storage, std::slice::from_ref(&tx));
-            assert!(matches!(
-                state.rows_voted_over(&judged, &committee, &block),
-                Err(Withheld::Deferred { .. })
-            ));
-        }
+        let (state, schedule, storage, _) = stated_beside_a_sibling(&tx);
+        let committee = Arc::clone(schedule.head());
+        let block = legs_on_tip(&state, &schedule, &storage, std::slice::from_ref(&tx));
+        assert!(matches!(
+            state.rows_voted_over(&schedule, &committee, &block),
+            Err(Withheld::Deferred { .. })
+        ));
     }
 
     /// A stated row its departed sibling did not accept is refused, and
@@ -10752,10 +10755,9 @@ mod tests {
         assert!(state.rows_voted_over(&departed, &committee, &named).is_ok());
     }
 
-    /// No stated row that waits defers a block: a sibling not yet read,
-    /// departed with its names not held here, or judged without the
-    /// window as published holds back no vote on a block naming nothing
-    /// of it.
+    /// No stated row defers a block naming nothing of it: a sibling not
+    /// yet read, departed, or judged without the window as published
+    /// holds back no vote, since no exit of a stated row is owed.
     #[test]
     fn a_row_that_waits_defers_no_block() {
         let tx = test_transaction(1);
@@ -10776,7 +10778,7 @@ mod tests {
 
     /// A proposer cuts a legs half to the names that stand at its block's
     /// anchor, and hands the cut half to its node to serve: the member
-    /// its departed sibling's terminal ended rides, and the one it did
+    /// its departed sibling was read accepting rides, and the one it was
     /// not is left out.
     #[test]
     fn a_proposer_cuts_a_legs_half_to_the_names_that_stand() {
@@ -10959,8 +10961,7 @@ mod tests {
 
     /// [`publishing`] a window [`HEARD_SIBLING`] has departed whose
     /// record still names [`sibling_terminal`], its handoff stamp aged
-    /// past the evidence window: the evidence reads unreadable, and the
-    /// terminal the ended names are keyed by is still the window's.
+    /// past the evidence window: the evidence reads unreadable.
     fn sibling_past_its_evidence(schedule: &TopologySchedule) -> TopologySchedule {
         publishing(
             schedule,
@@ -11293,17 +11294,13 @@ mod tests {
             .map(|tx| TickLine::End { tx: tx.hash() })
             .collect();
         let (state, schedule, storage, _) = all_accepted_beside_a_sibling(&pair);
-        // A window carrying no record of the sibling reads it unreadable,
-        // so each row ends on no reading and no names.
-        let unreadable = publishing(&schedule, false, BTreeMap::new());
+        // A window that no longer runs the sibling reads it left, so each
+        // accepted row ends on no reading.
+        let departed = publishing(&schedule, false, BTreeMap::new());
         let committee = Arc::clone(schedule.head());
         assert!(
             state
-                .check_tick_manifest(
-                    &unreadable,
-                    &committee,
-                    &naming_on_tip(&state, ends.clone())
-                )
+                .check_tick_manifest(&departed, &committee, &naming_on_tip(&state, ends.clone()))
                 .is_ok(),
             "with the manifest to themselves both rows end",
         );
@@ -11338,7 +11335,7 @@ mod tests {
 
         let block = proposed_on_tip(
             &state,
-            &unreadable,
+            &departed,
             &storage,
             3_000,
             &payload_of(&heavy, Vec::new()),
@@ -11363,7 +11360,7 @@ mod tests {
         );
         assert!(
             state
-                .check_tick_manifest(&unreadable, &committee, &block)
+                .check_tick_manifest(&departed, &committee, &block)
                 .is_ok(),
             "the voter admits the end line the budget takes",
         );
@@ -11373,7 +11370,7 @@ mod tests {
             &heavy,
             members.iter().chain(&ends).cloned().collect(),
         );
-        match state.check_tick_manifest(&unreadable, &committee, &both) {
+        match state.check_tick_manifest(&departed, &committee, &both) {
             Err(Withheld::Refused(why)) => assert!(
                 why.contains("past the manifest's budget"),
                 "refused for the budget, not for: {why}",
@@ -11382,153 +11379,53 @@ mod tests {
         }
     }
 
-    /// An end line that turns on a departed sibling's ended names is
-    /// licensed where the names are held, whether or not they name the
-    /// row, and deferred where they are not: by the voter, and by the
-    /// proposer, which names no line it cannot judge. Names held for
-    /// another terminal of the sibling are not the ones the block's
-    /// window records. A sibling whose evidence can no longer be read
-    /// ends the row with no names at all.
+    /// A survivor's accepted row beside a sibling that has departed
+    /// ends on no reading at all: whatever the sibling's record says,
+    /// the proposer names the end line, the block's commit deletes the
+    /// row and its leaf and burns nothing, and every voter votes the
+    /// block. A stated row beside it is refused.
     #[test]
-    fn an_ended_line_is_licensed_and_deferred_without_the_names() {
+    fn a_survivors_accepted_row_ends_beside_a_departed_sibling() {
         let tx = test_transaction(1);
-        let end = TickLine::End { tx: tx.hash() };
-        let (state, schedule, _, _) = accepted_beside_a_sibling(&tx);
-        let departed = sibling_departed(&schedule);
-        let committee = Arc::clone(schedule.head());
-        let judged = |state: &ShardCoordinator, schedule: &TopologySchedule| {
-            state.check_tick_manifest(
-                schedule,
-                &committee,
-                &naming_on_tip(state, vec![end.clone()]),
-            )
+        let gone = |schedule: &TopologySchedule| {
+            [
+                sibling_departed(schedule),
+                sibling_past_its_evidence(schedule),
+                publishing(schedule, false, BTreeMap::new()),
+            ]
         };
-        let built = |state: &ShardCoordinator| {
-            state
-                .manifest_inputs(
-                    &departed,
-                    &committee,
-                    state.committed_hash,
-                    state.committed_height.next(),
-                    WeightedTimestamp::from_millis(3_000),
-                    None,
-                )
-                .expect("the tip is held")
-                .committed
-                .siblings
-        };
-
-        assert!(matches!(
-            judged(&state, &departed),
-            Err(Withheld::Deferred { .. })
-        ));
-        assert!(built(&state).ended.is_empty());
-
-        state.mirror().record_ended(
-            HEARD_SIBLING,
-            BlockHash::from_raw(Hash::from_bytes(b"another terminal")),
-            BTreeSet::from([tx.hash()]),
-        );
-        assert!(
-            matches!(judged(&state, &departed), Err(Withheld::Deferred { .. })),
-            "names of a terminal the window does not record",
-        );
-
-        for names in [BTreeSet::from([tx.hash()]), BTreeSet::new()] {
-            let held = names.contains(&tx.hash());
-            state
-                .mirror()
-                .record_ended(HEARD_SIBLING, sibling_terminal(), names);
-            assert!(judged(&state, &departed).is_ok(), "named {held}");
+        let (stated, schedule, _, _) = stated_beside_a_sibling(&tx);
+        for departed in gone(&schedule) {
             assert_eq!(
-                built(&state).ended,
-                BTreeMap::from([((HEARD_SIBLING, tx.hash()), held)]),
+                decided_here(&stated, &departed, &tx, Hears::Stated),
+                (vec![Value::L], Decision::Refuse),
             );
         }
-
-        let (bare, schedule, _, _) = accepted_beside_a_sibling(&tx);
-        assert!(
-            judged(&bare, &publishing(&schedule, false, BTreeMap::new())).is_ok(),
-            "a window carrying no record of the sibling reads it unreadable",
-        );
-    }
-
-    /// A survivor's accepted row beside a sibling that has departed ends
-    /// on the names the sibling's terminal ended, whether they hold its
-    /// transaction or not: the proposer names the end line once it holds
-    /// them, the block's commit deletes the row and its leaf and burns
-    /// nothing, and a voter holding them votes the block.
-    #[test]
-    fn a_survivors_accepted_row_ends_on_a_departed_siblings_names() {
-        let tx = test_transaction(1);
-        for named in [true, false] {
-            let (state, schedule, storage, _) = accepted_beside_a_sibling(&tx);
-            let departed = sibling_departed(&schedule);
+        let (_, schedule, _, _) = accepted_beside_a_sibling(&tx);
+        for departed in gone(&schedule) {
+            let (state, _, storage, _) = accepted_beside_a_sibling(&tx);
             let committee = Arc::clone(schedule.head());
-            let payload = payload_of(&[], Vec::new());
-            let names: BTreeSet<TxHash> = named.then_some(tx.hash()).into_iter().collect();
-            state
-                .mirror()
-                .record_ended(HEARD_SIBLING, sibling_terminal(), names.clone());
-            let block = proposed_on_tip(&state, &departed, &storage, 3_000, &payload, None);
             assert_eq!(
-                block.tick_manifest()[..],
-                [TickLine::End { tx: tx.hash() }],
-                "named {named}",
+                decided_here(&state, &departed, &tx, Hears::Accepted),
+                (vec![Value::L], Decision::End),
             );
+            let payload = payload_of(&[], Vec::new());
+            let block = proposed_on_tip(&state, &departed, &storage, 3_000, &payload, None);
+            assert_eq!(block.tick_manifest()[..], [TickLine::End { tx: tx.hash() }]);
             assert_eq!(fate_writes(block.tick_manifest()), StateWrites::default());
             let stored = MemberIndex::load(&storage.snapshot(), ShardId::ROOT);
             assert!(stored.members.is_empty() && stored.ticks.is_empty());
             assert_eq!(storage.state_root(), block.header().state_root());
 
             let (voter, _, _, _) = accepted_beside_a_sibling(&tx);
-            assert!(matches!(
-                voter.rows_voted_over(&departed, &committee, &block),
-                Err(Withheld::Deferred { .. })
-            ));
-            voter
-                .mirror()
-                .record_ended(HEARD_SIBLING, sibling_terminal(), names);
             assert_eq!(
                 voter
                     .rows_voted_over(&departed, &committee, &block)
-                    .expect("a voter holding the names admits the line")
+                    .expect("every voter admits the line")
                     .as_ref(),
                 Some(&stored),
             );
         }
-    }
-
-    /// A vote deferred for want of a departed sibling's ended names is
-    /// driven again when they arrive: recording them advances what the
-    /// pending votes are re-driven on, and the block then stands.
-    #[test]
-    fn a_vote_deferred_on_names_is_driven_again_when_they_arrive() {
-        let tx = test_transaction(1);
-        let (mut state, schedule, _, _) = accepted_beside_a_sibling(&tx);
-        let departed = sibling_departed(&schedule);
-        let committee = Arc::clone(schedule.head());
-        let block = naming_on_tip(&state, vec![TickLine::End { tx: tx.hash() }]);
-
-        assert!(matches!(
-            state.check_tick_manifest(&departed, &committee, &block),
-            Err(Withheld::Deferred { .. })
-        ));
-        let _ = state.take_fence_evidence_advanced();
-        assert!(!state.take_fence_evidence_advanced());
-
-        state
-            .mirror()
-            .record_ended(HEARD_SIBLING, sibling_terminal(), BTreeSet::new());
-        assert!(
-            state.take_fence_evidence_advanced(),
-            "the names' arrival re-drives the pending votes",
-        );
-        assert!(
-            state
-                .check_tick_manifest(&departed, &committee, &block)
-                .is_ok()
-        );
     }
 
     /// The anchor the blocks below are judged at.
@@ -11544,150 +11441,9 @@ mod tests {
         hears: Hears,
     ) -> (Vec<Value>, Decision) {
         let row = &state.member_rows().members[&tx.hash()];
-        let values = sibling_views([row], schedule, state.mirror(), JUDGED_AT).values(row);
+        let values = sibling_views([row], schedule, JUDGED_AT).values(row);
         let decision = decide(hears, &values);
         (values, decision)
-    }
-
-    /// The three replicas a departed sibling's names divide a committee
-    /// into: one holding names that hold the transaction, one holding
-    /// names that do not, and one holding none.
-    fn held_names(tx: &Transaction) -> [Option<BTreeSet<TxHash>>; 3] {
-        [
-            Some(BTreeSet::from([tx.hash()])),
-            Some(BTreeSet::new()),
-            None,
-        ]
-    }
-
-    /// Past a departed sibling's evidence window, in a window that still
-    /// carries its record, a replica holding its ended names and one
-    /// holding none both count it unreadable, which ends an accepted
-    /// row: each replica names the same end line and votes the block of
-    /// either of the others.
-    #[test]
-    fn a_voter_holding_names_and_one_without_license_the_same_line_past_the_window_for_an_accepted_row()
-     {
-        let tx = test_transaction(1);
-        let end = TickLine::End { tx: tx.hash() };
-        let replica = |names: &Option<BTreeSet<TxHash>>| {
-            let (state, schedule, storage, _) = accepted_beside_a_sibling(&tx);
-            if let Some(names) = names {
-                state
-                    .mirror()
-                    .record_ended(HEARD_SIBLING, sibling_terminal(), names.clone());
-            }
-            (state, sibling_past_its_evidence(&schedule), storage)
-        };
-
-        let mut counted = Vec::new();
-        for proposing in &held_names(&tx) {
-            let (proposer, past, storage) = replica(proposing);
-            assert_eq!(
-                past.evidence_as_published(HEARD_SIBLING, JUDGED_AT),
-                Ok(Evidence::Unreadable),
-            );
-            assert_eq!(
-                past.terminal_as_published(HEARD_SIBLING, JUDGED_AT),
-                Ok(Some(sibling_terminal())),
-            );
-            let (values, decision) = decided_here(&proposer, &past, &tx, Hears::Accepted);
-            assert_eq!(decision, Decision::End);
-            counted.extend(values);
-
-            let payload = payload_of(&[], Vec::new());
-            let block = proposed_on_tip(&proposer, &past, &storage, 3_000, &payload, None);
-            assert_eq!(block.tick_manifest()[..], *std::slice::from_ref(&end));
-            for voting in &held_names(&tx) {
-                let (voter, past, _) = replica(voting);
-                let committee = Arc::clone(past.head());
-                assert!(
-                    voter.check_tick_manifest(&past, &committee, &block).is_ok(),
-                    "a voter holding {voting:?} votes the end line of a proposer holding \
-                     {proposing:?}",
-                );
-            }
-        }
-        assert_eq!(
-            counted,
-            [Value::U; 3],
-            "the three replicas count the sibling one way",
-        );
-    }
-
-    /// Past a departed sibling's evidence window, in a window that still
-    /// carries its record, a replica holding the sibling's ended names
-    /// and one holding none decide one exit for a stated row, so the
-    /// line or legs half either proposes is one the other licenses.
-    #[test]
-    fn a_voter_holding_names_and_one_without_license_the_same_line_past_the_window_for_a_stated_row()
-     {
-        let tx = test_transaction(1);
-        let decided = |names: &Option<BTreeSet<TxHash>>| {
-            let (state, schedule, _, _) = stated_beside_a_sibling(&tx);
-            if let Some(names) = names {
-                state
-                    .mirror()
-                    .record_ended(HEARD_SIBLING, sibling_terminal(), names.clone());
-            }
-            decided_here(
-                &state,
-                &sibling_past_its_evidence(&schedule),
-                &tx,
-                Hears::Stated,
-            )
-        };
-        let [named, unnamed, none] = held_names(&tx);
-        let (without_values, without) = decided(&none);
-        assert_eq!(without_values, [Value::U]);
-
-        let apart: Vec<_> = [named, unnamed]
-            .iter()
-            .map(decided)
-            .filter(|(_, holding)| *holding != without)
-            .map(|(values, holding)| (values, holding, without))
-            .collect();
-        assert!(
-            apart.is_empty(),
-            "a holder of the names and a replica without them decide apart, as \
-             (the holder's values, its decision, the other's decision): {apart:?}",
-        );
-    }
-
-    /// Once the published window carries no record of a departed
-    /// sibling, its ended names are keyed by no terminal: a replica
-    /// holding them and one holding none both count the sibling
-    /// unreadable, and decide one exit for a stated row and for an
-    /// accepted one.
-    #[test]
-    fn a_voter_holding_names_and_one_without_license_the_same_line_once_the_record_drops() {
-        let tx = test_transaction(1);
-        for (hears, exit) in [
-            (Hears::Stated, Decision::LetGo),
-            (Hears::Accepted, Decision::End),
-        ] {
-            for names in &held_names(&tx) {
-                let (state, schedule, _, _) = match hears {
-                    Hears::Stated => stated_beside_a_sibling(&tx),
-                    Hears::Accepted => accepted_beside_a_sibling(&tx),
-                };
-                if let Some(names) = names {
-                    state
-                        .mirror()
-                        .record_ended(HEARD_SIBLING, sibling_terminal(), names.clone());
-                }
-                let dropped = publishing(&schedule, false, BTreeMap::new());
-                assert_eq!(
-                    dropped.terminal_as_published(HEARD_SIBLING, JUDGED_AT),
-                    Ok(None),
-                );
-                assert_eq!(
-                    decided_here(&state, &dropped, &tx, hears),
-                    (vec![Value::U], exit),
-                    "holding {names:?}",
-                );
-            }
-        }
     }
 
     /// The epoch [`HEARD_SIBLING`] leaves the trie at the end of.
@@ -11812,17 +11568,12 @@ mod tests {
     }
 
     /// What `row`, standing as `hears`, may do at an anchor in `epoch`
-    /// of [`reclaiming_the_sibling`], judged with `mirror`; and whether
-    /// it then asks the sibling.
-    fn decided_in(
-        row: &MemberRow,
-        hears: Hears,
-        mirror: &CounterpartMirror,
-        epoch: u64,
-    ) -> (Vec<Value>, Decision, bool) {
+    /// of [`reclaiming_the_sibling`]; and whether it then asks the
+    /// sibling.
+    fn decided_in(row: &MemberRow, hears: Hears, epoch: u64) -> (Vec<Value>, Decision, bool) {
         let schedule = reclaiming_the_sibling();
         let anchor = WeightedTimestamp::from_millis(epoch * 1_000 + 500);
-        let values = sibling_views([row], &schedule, mirror, anchor).values(row);
+        let values = sibling_views([row], &schedule, anchor).values(row);
         let (source, view) = sibling_view(&schedule, HEARD_SIBLING, anchor);
         let asked = asks(row.hearing.first(), source, &view, row.committed);
         (values.clone(), decide(hears, &values), asked)
@@ -11858,69 +11609,60 @@ mod tests {
     }
 
     /// A row that still awaits a shard whose id departed and is live
-    /// again awaited the departed chain, which nothing the later chain
-    /// says can answer for: from [`LIVE_AGAIN`] on, whether the later
-    /// chain runs or has itself departed, a row holding no entry, the
-    /// departed chain's yes or its left reads the sibling unreadable and
-    /// asks nothing, so a stated row is let go and an accepted one ends.
-    /// The later chain reads the member left, and a row holding that
-    /// reading is let go all the same rather than refused. A row holding
-    /// the departed chain's accept counts it.
+    /// again awaited the departed chain, which had gone before the later
+    /// one formed: from [`LIVE_AGAIN`] on, whether the later chain runs
+    /// or has itself departed, a row holding no entry, the departed
+    /// chain's yes or its left, or the later chain's left, reads the
+    /// sibling left and asks nothing, so a stated row is refused and an
+    /// accepted one ends. A row holding the departed chain's accept
+    /// counts it. In its last epoch the departing chain's yes counts as
+    /// any other, and once it is gone the yes reads left.
     #[test]
-    fn a_row_outliving_a_reclaimed_id_is_let_go() {
+    fn a_row_outliving_a_reclaimed_id_reads_it_left() {
         let tx = test_transaction(1);
         let (stated, _, _, _) = stated_beside_a_sibling(&tx);
         let (accepted, _, _, _) = accepted_beside_a_sibling(&tx);
         let stated_row = &stated.member_rows().members[&tx.hash()];
         let accepted_row = &accepted.member_rows().members[&tx.hash()];
-        let unheld = CounterpartMirror::default();
-        let unnamed = CounterpartMirror::default();
-        unnamed.record_ended(HEARD_SIBLING, sibling_terminal(), BTreeSet::new());
 
         // The yes of the departed chain, read in its last epoch.
         let yes = having_heard(stated_row, DEPARTS, Said::Yes);
         assert_eq!(
-            decided_in(&yes, Hears::Stated, &unheld, DEPARTS),
-            (vec![Value::W], Decision::Wait, true),
-            "a terminating sibling's yes waits",
+            decided_in(&yes, Hears::Stated, DEPARTS),
+            (vec![Value::Y], Decision::Accept, true),
+            "a reshaping sibling's yes counts",
         );
         assert_eq!(
-            decided_in(&yes, Hears::Stated, &unheld, DEPARTS + 1),
-            (vec![Value::N], Decision::Lacking, false),
-        );
-        assert_eq!(
-            decided_in(&yes, Hears::Stated, &unnamed, DEPARTS + 1),
+            decided_in(&yes, Hears::Stated, DEPARTS + 1),
             (vec![Value::L], Decision::Refuse, false),
-            "gone, its terminal's names refuse the row",
+            "gone, a sibling it never read accepting left",
         );
 
         assert!(reads_left_afresh(&yes), "the later chain reads it left");
         for window in LIVE_AGAIN..=LAST_WINDOW {
-            for mirror in [&unheld, &unnamed] {
-                for (row, hears, exit) in [
-                    (stated_row, Hears::Stated, Decision::LetGo),
-                    (accepted_row, Hears::Accepted, Decision::End),
+            for (row, hears, exit) in [
+                (stated_row, Hears::Stated, Decision::Refuse),
+                (accepted_row, Hears::Accepted, Decision::End),
+            ] {
+                for heard in [
+                    row.clone(),
+                    having_heard(row, DEPARTS, Said::Yes),
+                    having_heard(row, DEPARTS, Said::Left),
+                    having_heard(row, window, Said::Left),
                 ] {
-                    for heard in [
-                        row.clone(),
-                        having_heard(row, DEPARTS, Said::Yes),
-                        having_heard(row, DEPARTS, Said::Left),
-                        having_heard(row, window, Said::Left),
-                    ] {
-                        assert_eq!(
-                            decided_in(&heard, hears, mirror, window),
-                            (vec![Value::U], exit, false),
-                            "window {window}, {:?}",
-                            heard.hearing,
-                        );
-                    }
-                    let earlier = having_heard(row, DEPARTS, Said::Accepted);
                     assert_eq!(
-                        decided_in(&earlier, hears, mirror, window).0,
-                        vec![Value::A],
-                        "window {window}",
+                        decided_in(&heard, hears, window),
+                        (vec![Value::L], exit, false),
+                        "window {window}, {:?}",
+                        heard.hearing,
                     );
                 }
+                let earlier = having_heard(row, DEPARTS, Said::Accepted);
+                assert_eq!(
+                    decided_in(&earlier, hears, window).0,
+                    vec![Value::A],
+                    "window {window}",
+                );
             }
         }
     }
@@ -12008,40 +11750,20 @@ mod tests {
         assert!(asked(&mut stated), "the row reaches the later chain");
     }
 
-    /// A row awaiting a shard that has departed counts it by the names
-    /// its terminal ended only while its evidence reads. From the window
-    /// the evidence stops reading in, through the windows before the id
-    /// runs again and on through the later chain the row predates, its
-    /// life and its own departure, every replica counts it unreadable
-    /// whatever names it holds and whatever the row read of the departed
-    /// chain short of an accept: a stated row is let go and an accepted
-    /// row ends, neither asking. So no window in which a row reads the
-    /// shard now holding the id follows one in which it read the departed
-    /// chain's names.
-    ///
-    /// A row holding the departed chain's accept counts it in every
-    /// window, the id's next life included.
+    /// A row awaiting a shard that has departed reads it off the row
+    /// alone, in every window from the cut on: through the evidence
+    /// window, past it, through the windows before the id runs again and
+    /// on through the later chain the row predates, its life and its own
+    /// departure. Short of an accept the sibling reads left, so a stated
+    /// row is refused and an accepted row ends, neither asking; a row
+    /// holding the departed chain's accept counts it in every window.
     #[test]
-    fn a_row_awaiting_a_departed_id_is_let_go_before_the_id_runs_again() {
+    fn a_row_awaiting_a_departed_id_reads_it_off_the_row() {
         let tx = test_transaction(1);
         let (stated, _, _, _) = stated_beside_a_sibling(&tx);
         let (accepted, _, _, _) = accepted_beside_a_sibling(&tx);
         let stated_row = &stated.member_rows().members[&tx.hash()];
         let accepted_row = &accepted.member_rows().members[&tx.hash()];
-        let unheld = CounterpartMirror::default();
-        let unnamed = CounterpartMirror::default();
-        unnamed.record_ended(HEARD_SIBLING, sibling_terminal(), BTreeSet::new());
-        let named = CounterpartMirror::default();
-        named.record_ended(
-            HEARD_SIBLING,
-            sibling_terminal(),
-            BTreeSet::from([tx.hash()]),
-        );
-        let by_names = [
-            (&unheld, Value::N, Decision::Lacking, Decision::Lacking),
-            (&unnamed, Value::L, Decision::Refuse, Decision::End),
-            (&named, Value::A, Decision::Accept, Decision::End),
-        ];
         let short_of_an_accept = |row: &MemberRow| {
             [
                 row.clone(),
@@ -12050,59 +11772,33 @@ mod tests {
             ]
         };
 
-        for window in DEPARTS + 1..UNREADABLE_FROM {
-            for (mirror, value, stated_does, accepted_does) in by_names {
-                for row in short_of_an_accept(stated_row) {
-                    assert_eq!(
-                        decided_in(&row, Hears::Stated, mirror, window),
-                        (vec![value], stated_does, false),
-                        "window {window}",
-                    );
-                }
-                for row in short_of_an_accept(accepted_row) {
-                    assert_eq!(
-                        decided_in(&row, Hears::Accepted, mirror, window),
-                        (vec![value], accepted_does, false),
-                        "window {window}",
-                    );
-                }
-            }
-        }
-
-        for window in UNREADABLE_FROM..=LAST_WINDOW {
-            for (mirror, ..) in by_names {
-                for row in short_of_an_accept(stated_row) {
-                    assert_eq!(
-                        decided_in(&row, Hears::Stated, mirror, window),
-                        (vec![Value::U], Decision::LetGo, false),
-                        "window {window}",
-                    );
-                }
-                for row in short_of_an_accept(accepted_row) {
-                    assert_eq!(
-                        decided_in(&row, Hears::Accepted, mirror, window),
-                        (vec![Value::U], Decision::End, false),
-                        "window {window}",
-                    );
-                }
-            }
-        }
-
         for window in DEPARTS + 1..=LAST_WINDOW {
-            for (mirror, ..) in by_names {
-                let heard = having_heard(stated_row, DEPARTS, Said::Accepted);
+            for row in short_of_an_accept(stated_row) {
                 assert_eq!(
-                    decided_in(&heard, Hears::Stated, mirror, window),
-                    (vec![Value::A], Decision::Accept, false),
-                    "window {window}",
-                );
-                let heard = having_heard(accepted_row, DEPARTS, Said::Accepted);
-                assert_eq!(
-                    decided_in(&heard, Hears::Accepted, mirror, window),
-                    (vec![Value::A], Decision::End, false),
+                    decided_in(&row, Hears::Stated, window),
+                    (vec![Value::L], Decision::Refuse, false),
                     "window {window}",
                 );
             }
+            for row in short_of_an_accept(accepted_row) {
+                assert_eq!(
+                    decided_in(&row, Hears::Accepted, window),
+                    (vec![Value::L], Decision::End, false),
+                    "window {window}",
+                );
+            }
+            let heard = having_heard(stated_row, DEPARTS, Said::Accepted);
+            assert_eq!(
+                decided_in(&heard, Hears::Stated, window),
+                (vec![Value::A], Decision::Accept, false),
+                "window {window}",
+            );
+            let heard = having_heard(accepted_row, DEPARTS, Said::Accepted);
+            assert_eq!(
+                decided_in(&heard, Hears::Accepted, window),
+                (vec![Value::A], Decision::End, false),
+                "window {window}",
+            );
         }
     }
 

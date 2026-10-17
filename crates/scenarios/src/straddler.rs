@@ -226,77 +226,42 @@ pub fn straddler_split_bytes() -> u64 {
 /// the split the survivor must reach a terminal verdict on every straddler,
 /// consistent with what the splitter settled: never applying one the splitter
 /// never settled, never contradicting one it did, and aborting (not hanging) the
-/// rest. The survivor's hosts also take the names the splitter's terminal
-/// ended, as soon as the beacon records that terminal. Requires the
-/// [`split_straddler_setup`] genesis funding.
+/// rest. The splitter is quiet at its terminal: no row of it heard when
+/// the cut fell. Requires the [`split_straddler_setup`] genesis funding.
 ///
 /// # Panics
 ///
 /// Panics if the grow or split misses its budget, the settled-transaction fence is
 /// breached (a one-sided application, a mismatch, or a hung straddler), or the
-/// survivor's hosts are left without the terminal's ended names.
+/// splitter's terminal fell under a row that heard.
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
     let run = split_straddler_run(
         c,
         |_| {},
         |_, _| {},
-        |c, probes| assert_terminal_lines_read(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER, probes),
+        |c, _| assert_quiet_at_terminal(c, STRADDLER_SPLITTER),
     );
     assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
     run.assert_conserved(c);
 }
 
-/// Most hosts seating `survivor` come to hold the names `departed`'s
-/// terminal ended while their own schedules read its evidence, and every
-/// one that does reads each of `probes` as left: a terminal ends no row
-/// by a line, so the list a survivor verifies against the terminal's
-/// hash is empty and names none of them.
+/// `departed` stood quiet at its terminal: the rows its terminal was
+/// named over held none that heard or could come to, so the cut fell
+/// under no yes and a survivor reads each straddler off its own row.
 ///
-/// Called once the beacon records the terminal. A host's names retire at
-/// the commit that finds its schedule no longer reading the departure's
-/// evidence, so they are read while that window is opening and not after
-/// waits that can outlast it.
-///
-/// A cluster that cannot read a node's own view asserts nothing.
-fn assert_terminal_lines_read<C: Cluster>(
-    c: &mut C,
-    survivor: ShardId,
-    departed: ShardId,
-    probes: &[TxHash],
-) {
-    let Some(&first) = probes.first() else {
-        return;
-    };
-    if c.ended_names_read(survivor, departed, first).is_none() {
-        return;
-    }
-    assert!(
-        c.run_until(epochs(2), |c| {
-            c.ended_names_read(survivor, departed, first)
-                .is_some_and(|hosts| {
-                    let holding = hosts
-                        .iter()
-                        .filter(|(readable, names)| *readable && names.is_some())
-                        .count();
-                    2 * holding > hosts.len()
-                })
-        }),
-        "most hosts of {survivor:?} must take the names {departed:?}'s terminal ended while \
-         its evidence is readable: {:?}",
-        c.ended_names_read(survivor, departed, first),
+/// Called once the beacon records the terminal, while the departed
+/// chain's state at the terminal's parent is still retained. A cluster
+/// that cannot read state entries asserts nothing.
+fn assert_quiet_at_terminal<C: Cluster>(c: &C, departed: ShardId) {
+    let terminal = terminal_height(c, departed).expect("the beacon records the terminal");
+    let parent = terminal
+        .prev()
+        .expect("a terminal stands above its chain's genesis");
+    assert_ne!(
+        c.quiet_at(departed, parent),
+        Some(false),
+        "{departed:?} must be quiet at its terminal at {terminal:?}",
     );
-    for &probe in probes {
-        let read = c
-            .ended_names_read(survivor, departed, probe)
-            .unwrap_or_default();
-        assert!(
-            read.iter()
-                .filter_map(|(_, names)| *names)
-                .all(|ended| !ended),
-            "{departed:?}'s terminal carries no end line, so {probe:?} reads as left on \
-             every host of {survivor:?} holding its names: {read:?}",
-        );
-    }
 }
 
 /// A split whose beacon stalls between admission and the gate keeps every
@@ -1138,7 +1103,8 @@ pub fn surviving_sibling_split_seats_full_committees(c: &mut impl Cluster) {
 ///
 /// # Panics
 ///
-/// Panics if the merge misses its budget, the merged parent never seats, or the
+/// Panics if the merge misses its budget, the merged parent never seats, either
+/// merging child's terminal fell under a row that heard, or the
 /// settled-transaction fence is breached (a one-sided application, a mismatch, or a
 /// hung straddler).
 pub fn merge_straddler_atomic(c: &mut impl Cluster) {
@@ -1230,8 +1196,14 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         .and_then(BlockHeight::prev)
         .expect("the merged seeded genesis pins the merging child's terminal block");
 
-    assert_terminal_lines_read(c, survivor, merge_left, &probes);
-    assert_terminal_lines_read(c, survivor, merge_right, &probes);
+    assert!(
+        c.run_until(epochs(6), |c| {
+            terminal_height(c, merge_left).is_some() && terminal_height(c, merge_right).is_some()
+        }),
+        "the beacon must record both merging children's terminal crossings",
+    );
+    assert_quiet_at_terminal(c, merge_left);
+    assert_quiet_at_terminal(c, merge_right);
 
     // Every straddler must reach a terminal verdict on the survivor.
     for hash in &probes {

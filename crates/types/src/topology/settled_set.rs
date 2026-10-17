@@ -17,12 +17,8 @@
 
 use std::collections::BTreeSet;
 
-use hyperscale_hbor::Hbor;
-use thiserror::Error;
-
 use crate::{
-    Block, BlockHash, BlockHeader, BlockHeight, LeafRoot, SectionRoots, SettledTxsRoot, ShardId,
-    TickLine, TickManifest, TickManifestRoot, TopologySchedule, TxHash, WeightedTimestamp,
+    BlockHash, BlockHeight, SettledTxsRoot, ShardId, TopologySchedule, TxHash, WeightedTimestamp,
     WindowLookup,
 };
 
@@ -51,103 +47,6 @@ pub struct TerminalEvidence {
     /// The beacon-attested `settled_txs_root` a fetched list must
     /// recompute to.
     pub attested_root: SettledTxsRoot,
-}
-
-/// A departed shard's terminal block as far as its tick manifest: the
-/// header, the root of each body section, and the manifest's lines.
-///
-/// The header binds the lines through its body root, so a holder of the
-/// terminal's block hash checks the three against each other and needs
-/// no other section of the block. A terminal ends every accepted row it
-/// still holds by a [`TickLine::End`] line, so the lines name every
-/// transaction the departed shard had accepted and a sibling can still
-/// ask about, and a transaction they do not name is one it left.
-#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-pub struct TerminalLines {
-    /// Carried whole because the boundary record names the terminal by
-    /// its block hash alone, and the body root is read out of the header
-    /// that hashes to it.
-    pub header: BlockHeader,
-    /// All nine, though only the manifest's is recomputed: the body root
-    /// is one hash over them together, so none can be left out.
-    pub roots: SectionRoots,
-    /// Every line and in block order, since the root is over the lines
-    /// as the block lists them; the end lines alone would not recompute
-    /// it.
-    pub manifest: TickManifest,
-}
-
-/// Why a served [`TerminalLines`] is not the terminal its evidence
-/// names.
-#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-pub enum UnboundLines {
-    /// The header is not the terminal block's.
-    #[error("the header does not hash to the terminal block")]
-    Header,
-    /// The section roots are not the ones the header commits.
-    #[error("the section roots do not combine to the header's body root")]
-    Roots,
-    /// The lines are not the manifest the section roots commit.
-    #[error("the lines do not recompute the manifest root")]
-    Manifest,
-}
-
-impl UnboundLines {
-    /// Metrics label for the failure.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Header => "terminal_header_mismatch",
-            Self::Roots => "terminal_body_root_mismatch",
-            Self::Manifest => "terminal_manifest_root_mismatch",
-        }
-    }
-}
-
-impl TerminalLines {
-    /// The lines of `block` with what binds them to its header.
-    #[must_use]
-    pub fn of(block: &Block) -> Self {
-        Self {
-            header: block.header().clone(),
-            roots: SectionRoots::of(block),
-            manifest: block.tick_manifest().clone(),
-        }
-    }
-
-    /// The transactions the terminal `evidence` names ended, taken only
-    /// where the lines are that terminal's own: the header hashes to the
-    /// evidence's block, the section roots combine to the header's body
-    /// root, and the lines recompute the manifest root among them.
-    ///
-    /// The manifest root commits every line in order, so a server can
-    /// neither drop an end line nor add one.
-    ///
-    /// # Errors
-    ///
-    /// The first [`UnboundLines`] link that does not hold.
-    pub fn ended_under(
-        &self,
-        evidence: &TerminalEvidence,
-    ) -> Result<BTreeSet<TxHash>, UnboundLines> {
-        if self.header.hash() != evidence.block_hash {
-            return Err(UnboundLines::Header);
-        }
-        if self.roots.root() != self.header.body_root() {
-            return Err(UnboundLines::Roots);
-        }
-        if TickManifestRoot::over(&self.manifest) != self.roots.tick_manifest {
-            return Err(UnboundLines::Manifest);
-        }
-        Ok(self
-            .manifest
-            .iter()
-            .filter_map(|line| match line {
-                TickLine::End { tx } => Some(*tx),
-                _ => None,
-            })
-            .collect())
-    }
 }
 
 /// A terminated shard's settled-transaction set.
