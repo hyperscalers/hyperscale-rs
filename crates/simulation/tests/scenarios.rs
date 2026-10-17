@@ -73,9 +73,11 @@ use hyperscale_scenarios::{
     a_route_settles_on_a_certificate_formed_past_its_life,
     a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
+    a_route_unstated_past_its_stating_window_aborts_on_both_venues,
     a_shard_halted_across_an_abandon_window_settles_again,
     a_silent_sibling_holds_no_more_than_a_quarter, a_spent_nullifier_is_swept_once_unreachable,
     a_sponsor_spends_its_balance_beside_its_held_cores_abort,
+    a_stall_past_the_finalization_delay_states_every_member_of_its_tick,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
@@ -1563,6 +1565,24 @@ fn a_route_settles_on_a_certificate_delivered_past_its_life_sim() {
 fn a_route_settles_on_a_certificate_formed_past_its_life_sim() {
     let mut cluster = dedicated_route_cluster(&late_certificate_genesis_accounts());
     cluster.run_faultable(a_route_settles_on_a_certificate_formed_past_its_life);
+}
+
+/// Nothing cut between the venues: one venue's committee is cut off from
+/// its own execution votes past its member's stating window, so it
+/// aborts the member and both venues abort the route. Sim-only, as its
+/// sibling.
+#[test]
+fn a_route_unstated_past_its_stating_window_aborts_on_both_venues_sim() {
+    let mut cluster = dedicated_route_cluster(&late_certificate_genesis_accounts());
+    cluster.run_faultable(a_route_unstated_past_its_stating_window_aborts_on_both_venues);
+}
+
+/// A venue's committee stalled past one member's deadline while it
+/// cannot certify: the vote cut and the stall are keyed on its hosts.
+#[test]
+fn a_stall_past_the_finalization_delay_states_every_member_of_its_tick_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_stall_past_the_finalization_delay_states_every_member_of_its_tick);
 }
 
 fn a_route_a_halting_venue_could_read_is_settled_before_the_halt_at_seed(seed: u64) {

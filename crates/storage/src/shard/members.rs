@@ -2172,10 +2172,11 @@ mod tests {
         StubTree, make_live_block, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
     };
     use hyperscale_types::{
-        AddressClass, ConsensusReceipt, Declared, Derivation, DerivationError, Derived, Epoch,
-        LocalKey, MAX_CLAIMS_PER_BLOCK, MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY,
-        MAX_STATE_CLAIMS_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, RoutePrefix,
-        StateRoot, StoredReceipt, TransactionEnvelope, ValidatorId, shard_prefix_path,
+        AddressClass, ConsensusReceipt, Decision, Declared, Derivation, DerivationError, Derived,
+        Epoch, Evidence, LocalKey, MAX_CLAIMS_PER_BLOCK, MAX_DECLARED_RESERVE,
+        MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
+        MerkleInclusionProof, RoutePrefix, SiblingView, Source, StateRoot, StoredReceipt,
+        TransactionEnvelope, ValidatorId, Value, decide, shard_prefix_path, value_of,
     };
     use hyperscale_vm_effects::CrossingId;
     use proptest::collection::vec;
@@ -2818,6 +2819,110 @@ mod tests {
         let after: Vec<Option<MemberRow>> = (2..=5).map(|seed| row_of(&store, seed)).collect();
         assert_eq!(after, before);
         assert!(member_writes(&store, &block).is_empty());
+    }
+
+    /// A shared row aborted in flight never wrote a yes. A sibling
+    /// awaiting this shard reads it waiting while the row stands in
+    /// flight, waiting again while the abort stands in flight in its own
+    /// tick, and left once the abort's stating half deletes the row. A
+    /// stated sibling therefore never accepts on it, and is refused at
+    /// the end. The abort's discard keeps the tick-mate, which its own
+    /// tick still states.
+    #[test]
+    fn an_aborted_in_flight_row_reads_waiting_then_left_and_no_sibling_accepts() {
+        use hyperscale_types::Hears;
+
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(90_000));
+        let end = deadline.validity_end();
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2]));
+        store.fold(&naming(2, vec![sharing(1, 7), sharing(2, 9)]));
+
+        let awaited = shared_among(&Capped::from_array([LOCAL]), PEER);
+        let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &awaited);
+        let live = SiblingView {
+            epoch: Epoch::new(0),
+            terminating: Some(false),
+            recovery: Ok(None),
+            evidence: Ok(Evidence::Live { terminating: false }),
+            formed: Ok(None),
+            ended: None,
+        };
+        let read = |store: &Entries| {
+            let leaf = leaf_of(store, 1).map_or(Inclusion::Absent, |bytes| {
+                Inclusion::Present(verdict_hash(
+                    LOCAL,
+                    tx(1),
+                    &from_slice::<VerdictLeaf>(&bytes).expect("a verdict leaf decodes"),
+                ))
+            });
+            let row = if row_of(store, 1).is_some() {
+                PRESENT
+            } else {
+                Inclusion::Absent
+            };
+            let said = said_at(leaf, Some((row, PRESENT)), end, end, yes, accepted)
+                .expect("the row and marker are read beside the leaf");
+            let heard = Heard {
+                shard: LOCAL,
+                mark: mark(0, 7),
+                said,
+            };
+            value_of(Some(&heard), Some(Source::Live), &live, end)
+        };
+
+        let mut values = vec![read(&store)];
+        let abort = TickLine::Member {
+            tx: tx(1),
+            joins: Joins::Aborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            reach: Capped::from_array([PEER]),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(1),
+            share: 7,
+            reserves: Capped::empty(),
+            deadline,
+            crossings: Capped::empty(),
+        };
+        store.fold(&naming(
+            3,
+            vec![
+                abort,
+                TickLine::Discard {
+                    tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                    cause: DiscardCause::Abandoned(tx(1)),
+                },
+            ],
+        ));
+        assert_eq!(
+            state_of(&store, 1),
+            Some(RowState::InFlight {
+                tick: BlockHeight::new(3),
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+            }),
+        );
+        values.push(read(&store));
+        store.fold(&stating(4, 3, &[1], &[]));
+        assert!(row_of(&store, 1).is_none() && leaf_of(&store, 1).is_none());
+        values.push(read(&store));
+
+        assert_eq!(values, [Value::W, Value::W, Value::L]);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| decide(Hears::Stated, from_ref(value)))
+                .collect::<Vec<_>>(),
+            [Decision::Wait, Decision::Wait, Decision::Refuse],
+        );
+
+        assert!(matches!(
+            state_of(&store, 2),
+            Some(RowState::InFlight { tick, .. }) if tick == BlockHeight::new(2)
+        ));
+        store.fold(&stating(5, 2, &[], &[2]));
+        assert!(matches!(state_of(&store, 2), Some(RowState::Stated { .. })));
     }
 
     /// While a row stands accepted its leaf holds the hash a sibling

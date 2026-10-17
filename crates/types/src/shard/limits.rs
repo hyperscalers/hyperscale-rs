@@ -730,14 +730,19 @@ const _: () = assert!(MAX_TERMINAL_LINES_RESPONSE_BYTES < MAX_WIRE_MESSAGE_BYTES
 /// The total is the member rows standing after the block: it advances
 /// with each row a block writes, one per transaction it commits, and
 /// retreats with each row it deletes, whichever verdict the deletion
-/// carries. A transaction still unresolved at its own deadline is
-/// certified aborted at the price its block took — unless a certificate
-/// of the shard's own already covers it, in which case a counterpart
-/// could have settled against that certificate, and only that
-/// counterpart's departure makes the abort admissible. A straddler
-/// waiting on a counterpart that never leaves keeps its row for as long
-/// as it waits. A leg that never ran keeps its row past its deadline,
-/// to the close of its leg entry window, where a fate deletes it.
+/// carries. A transaction no tick has named by its own deadline is
+/// certified aborted at the price its block took. One a tick holds whose
+/// verdict a sibling shares is aborted once its stating window closes,
+/// one [`STATING_GRACE`](crate::time::deadline::STATING_GRACE) past the
+/// deadline, unless it has stated by then; a stated one leaves on what
+/// its siblings' state says, so a sibling that stops answering keeps it
+/// standing, which [`MAX_STANDING_TOWARD_SHARD`] bounds. Any row a tick
+/// holds is also aborted past its deadline where an abandonment record
+/// covers it. An abort in flight stands until its own stating half
+/// settles it, and a tick still owing its determined half keeps its rows
+/// until that half settles. A leg that never ran keeps its row past its
+/// deadline, to the close of its leg entry window, where a fate deletes
+/// it.
 pub const MAX_UNSETTLED_TXS: u64 = MAX_UNSETTLED_PER_BLOCK as u64;
 
 /// Hard cap on the member rows standing toward one shard: the rows a

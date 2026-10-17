@@ -1148,9 +1148,11 @@ impl<'a> Exit<'a> {
     /// at `anchor`, where `recovered` are the ticks the block discards
     /// whole.
     ///
-    /// A row a tick holds leaves by a clock only where no counterpart can
-    /// still settle against a certificate of this shard's for it; a row
-    /// let go of always has a clock, since no half settles it:
+    /// A row a tick holds that shares its verdict with a sibling leaves
+    /// by a clock until it states, unless its tick still owes its
+    /// determined half: in flight it has said nothing a sibling could
+    /// read. Any row a tick holds that a record covers leaves by a clock
+    /// too. A row let go of always has a clock, since no half settles it:
     ///
     /// - one no tick has named is aborted at its deadline, or wounded
     ///   short of it, having certified nothing; a leg is never aborted,
@@ -1159,8 +1161,12 @@ impl<'a> Exit<'a> {
     ///   `Never`;
     /// - one a tick holds leaves by its tick, and otherwise only where a
     ///   counterpart's verdict can discard it: fated once nobody can
-    ///   answer for it, or aborted past its deadline under a covering
-    ///   record; a stated row is the shared member in flight it was;
+    ///   answer for it, or aborted once its stating window has closed, or
+    ///   past its deadline under a covering record; the abort discards
+    ///   its tick, and its sibling reads it waiting until the abort
+    ///   settles and left after. A tick still owing its determined half
+    ///   holds it with no clock. A stated row is the shared member in
+    ///   flight it was;
     /// - one let go of that reaches no other shard is aborted at its
     ///   deadline;
     /// - one let go of that is settled on this shard's word alone and
@@ -1188,7 +1194,8 @@ impl<'a> Exit<'a> {
     ///   says: it has settled, and only an `End` line ends it.
     ///
     /// The reading that nobody can answer is taken first, so it wins
-    /// over the abort a covering record or a deadline would license.
+    /// over the abort a covering record, a stating window or a deadline
+    /// would license.
     fn of(
         row: &'a MemberRow,
         rows: &MemberIndex,
@@ -1200,6 +1207,7 @@ impl<'a> Exit<'a> {
     ) -> Self {
         let passed = row.deadline.passed(anchor);
         let lapsed = anchor >= Window::LegEntry.of(row.deadline).end;
+        let unstated = anchor >= Window::Stating.of(row.deadline).end;
         let held = |tick: BlockHeight, joins: Joins, settlement: Settlement| {
             // A tick still owing its determined half is let go of by
             // nothing but a recovery: a determined contribution that
@@ -1220,10 +1228,15 @@ impl<'a> Exit<'a> {
             match answerable(&row.reach, row.committed, evidence) {
                 Some(false) => Self::Fated(Some(tick)),
                 None => Self::Unread,
-                Some(true) if passed && row.covered => Self::Candidate(Standing::Held {
-                    tick,
-                    reach: &row.reach,
-                }),
+                Some(true)
+                    if (settlement == Settlement::Shared && unstated)
+                        || (passed && row.covered) =>
+                {
+                    Self::Candidate(Standing::Held {
+                        tick,
+                        reach: &row.reach,
+                    })
+                }
                 Some(true) => Self::None,
             }
         };
@@ -1857,12 +1870,12 @@ mod tests {
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
-        Heard, LocalKey, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkId, Owes,
-        PrincipalAddr, ProtocolHasher, RETENTION_HORIZON, ReadMark, ResourceAddr, Routing, Said,
-        StateRoot, StateWrites, Stated, StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON,
-        Terms, TickHalf, TimestampRange, TransactionEnvelope, Unpublished, encode_amount,
-        entry_leaf_key, said_at, tick_manifest_admits_members,
+        Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK,
+        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof,
+        NetworkId, Owes, PrincipalAddr, ProtocolHasher, RETENTION_HORIZON, ReadMark, ResourceAddr,
+        Routing, Said, StateRoot, StateWrites, Stated, StatedTerms, TICK_LINE_BYTES,
+        TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
+        Unpublished, encode_amount, entry_leaf_key, said_at, tick_manifest_admits_members,
     };
     use hyperscale_vm_effects::{Answered, Hash32, IntentHash, Terms as CrossingTerms};
     use hyperscale_vm_types::Moves;
@@ -2886,7 +2899,8 @@ mod tests {
     /// its row carries. That reading wins over the abort a covering
     /// record licenses past the deadline. One whose evidence is not yet
     /// folded holds the voter back, and one a shard can still answer for
-    /// stands until a record covers it past its deadline.
+    /// stands until a record covers it past its deadline or its stating
+    /// window closes.
     #[test]
     fn a_member_in_flight_nobody_can_answer_for_is_discarded_and_fated() {
         let deadline = Deadline::of(ms(10_000));
@@ -2979,6 +2993,144 @@ mod tests {
                     lines_over(&row, deadline.at(), evidence),
                     (vec![], vec![]),
                     "{joins:?}, {settlement:?}, {evidence:?}",
+                );
+            }
+        }
+    }
+
+    /// The abort of `seed`'s row held in the tick at `tick`, reaching
+    /// `PEER` and carrying what `standing` gives it, and that tick's
+    /// `Abandoned` discard.
+    fn aborted_in(seed: u8, deadline: Deadline, tick: u64) -> Vec<TickLine> {
+        vec![
+            TickLine::Member {
+                tx: tx(seed),
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                holds: Capped::empty(),
+                reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
+                charge: stub_abort_charge(seed),
+                share: 0,
+                reserves: Capped::empty(),
+                deadline,
+                crossings: Capped::empty(),
+            },
+            TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
+                cause: DiscardCause::Abandoned(tx(seed)),
+            },
+        ]
+    }
+
+    /// A shared member in flight that no record covers is aborted once
+    /// its stating window closes, beside the `Abandoned` discard of its
+    /// tick, whether or not it ran: it never stated, so no sibling read a
+    /// yes of it. A shard it reaches that can no longer answer still has
+    /// it fated, and one not yet folded still holds the voter back.
+    #[test]
+    fn a_shared_member_in_flight_is_aborted_at_its_stating_window_end_without_a_record() {
+        let deadline = Deadline::of(ms(10_000));
+        let end = Window::Stating.of(deadline).end;
+        for joins in [Joins::Executes, Joins::ExecutesAborted] {
+            let row = held_in(1, deadline, 2, joins, Settlement::Shared);
+            for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
+                assert_eq!(
+                    lines_over(&row, end.minus(Duration::from_millis(1)), answered),
+                    (vec![], vec![]),
+                    "{joins:?} under {answered:?} stands inside its stating window",
+                );
+                for anchor in [end, end.plus(Duration::from_hours(1))] {
+                    assert_eq!(
+                        lines_over(&row, anchor, answered),
+                        (aborted_in(1, deadline, 2), vec![]),
+                        "{joins:?} under {answered:?} at {anchor:?}",
+                    );
+                }
+            }
+            assert_eq!(
+                lines_over(&row, end, Evidence::Unreadable),
+                (vec![unanswerable(2, 1), fate_of(1)], vec![]),
+            );
+            assert_eq!(
+                lines_over(&row, end, Evidence::Unknown),
+                (vec![], vec![tx(1)])
+            );
+        }
+    }
+
+    /// Past its deadline and short of its stating window's end, a shared
+    /// member in flight that no record covers stands: its tick may still
+    /// state it. One a record covers is aborted from its deadline.
+    #[test]
+    fn a_shared_member_past_its_deadline_inside_its_stating_window_stands() {
+        let deadline = Deadline::of(ms(10_000));
+        let last = Window::Stating
+            .of(deadline)
+            .end
+            .minus(Duration::from_millis(1));
+        let uncovered = held_in(1, deadline, 2, Joins::Executes, Settlement::Shared);
+        let covered = MemberRow {
+            covered: true,
+            ..uncovered.clone()
+        };
+        for anchor in [
+            deadline.at(),
+            deadline.at().plus(MAX_FINALIZATION_DELAY),
+            last,
+        ] {
+            assert_eq!(
+                lines_over(&uncovered, anchor, Evidence::Readable),
+                (vec![], vec![]),
+                "at {anchor:?}",
+            );
+            assert_eq!(
+                lines_over(&covered, anchor, Evidence::Readable),
+                (aborted_in(1, deadline, 2), vec![]),
+                "at {anchor:?}",
+            );
+        }
+    }
+
+    /// A member in flight whose settlement awaits its counterparts has no
+    /// stating window: one a record covers is aborted from its deadline,
+    /// and one no record covers stands whatever the clock. An abort in
+    /// flight is never aborted again, covered or not.
+    #[test]
+    fn an_awaited_member_keeps_its_covered_rule() {
+        let deadline = Deadline::of(ms(10_000));
+        let late = Window::Stating
+            .of(deadline)
+            .end
+            .plus(Duration::from_hours(1));
+        let awaiting = held_in(1, deadline, 2, Joins::Executes, Settlement::Awaited);
+        for anchor in [deadline.at(), late] {
+            assert_eq!(
+                lines_over(&awaiting, anchor, Evidence::Readable),
+                (vec![], vec![]),
+                "at {anchor:?}",
+            );
+            assert_eq!(
+                lines_over(
+                    &MemberRow {
+                        covered: true,
+                        ..awaiting.clone()
+                    },
+                    anchor,
+                    Evidence::Readable,
+                ),
+                (aborted_in(1, deadline, 2), vec![]),
+                "at {anchor:?}",
+            );
+            for covered in [false, true] {
+                let abort = MemberRow {
+                    covered,
+                    ..held_in(1, deadline, 2, Joins::Aborted, Settlement::Awaited)
+                };
+                assert_eq!(
+                    lines_over(&abort, anchor, Evidence::Readable),
+                    (vec![], vec![]),
+                    "covered {covered} at {anchor:?}",
                 );
             }
         }
@@ -4615,6 +4767,38 @@ mod tests {
                 cause: DiscardCause::Recovery,
             }],
         );
+    }
+
+    /// A shared member in flight in a tick still owing its determined
+    /// half has no stating window: it stands past it, covered or not,
+    /// and is aborted at it once that half has settled.
+    #[test]
+    fn a_tick_owing_its_determined_half_is_not_aborted() {
+        let deadline = Deadline::of(ms(10_000));
+        let end = Window::Stating.of(deadline).end;
+        for covered in [false, true] {
+            let row = MemberRow {
+                covered,
+                ..held_in(1, deadline, 2, Joins::Executes, Settlement::Shared)
+            };
+            let mut rows = rows_of([row]);
+            rows.ticks
+                .insert(BlockHeight::new(2), tick_holding(&[1], true));
+            for anchor in [end, end.plus(Duration::from_hours(1))] {
+                assert_eq!(
+                    lines_at(&rows, anchor, Evidence::Readable, false),
+                    (vec![], vec![]),
+                    "covered {covered} at {anchor:?}",
+                );
+            }
+            rows.ticks
+                .insert(BlockHeight::new(2), tick_holding(&[1], false));
+            assert_eq!(
+                lines_at(&rows, end, Evidence::Readable, false),
+                (aborted_in(1, deadline, 2), vec![]),
+                "covered {covered}",
+            );
+        }
     }
 
     /// A ready core member left out pairs with every core holder that
