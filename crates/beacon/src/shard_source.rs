@@ -15,6 +15,7 @@
 //!   was fetched against).
 
 use std::collections::BTreeMap;
+use std::iter;
 use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
@@ -52,10 +53,18 @@ const MAX_RETAINED_HEADERS_PER_SHARD: usize = 8;
 /// crossing, and `canonical_qc` is the certificate the block held above
 /// `C` embeds over it: a proof that `C` was certified, read from a block
 /// whose own commit an observer need never be shown.
+///
+/// `boundary_parent` is the boundary block's parent, where the window
+/// held it when the crossing was read. A block's committee anchors on its
+/// parent, so it names the committee that signed `canonical_qc`; kept
+/// beside the crossing, it spares every member that read the crossing
+/// live a commit-proof ask for it, which a member's own shard never
+/// answers.
 #[derive(Debug, Clone)]
 pub struct ObservedCrossing {
     boundary_header: Arc<Verified<CertifiedBlockHeader>>,
     canonical_qc: QuorumCertificate,
+    boundary_parent: Option<Arc<Verified<CertifiedBlockHeader>>>,
 }
 
 impl ObservedCrossing {
@@ -155,12 +164,16 @@ impl ShardSourceTracker {
     }
 
     /// Insert a verified source-shard header. Called by the coordinator
-    /// from `on_verified_source_header` for every active shard (on- or
-    /// off-committee) — remote shards via the remote-header path, the
-    /// local shard from its own commit stream. The shard's window keeps
-    /// only its most recent [`MAX_RETAINED_HEADERS_PER_SHARD`] heights;
-    /// a boundary block needed past the window is retained on its
-    /// [`ObservedCrossing`].
+    /// for every active shard (on- or off-committee) — remote shards via
+    /// the remote-header path, the local shard from its own certified
+    /// blocks and commit stream. The shard's window keeps only its most
+    /// recent [`MAX_RETAINED_HEADERS_PER_SHARD`] heights; a boundary block
+    /// needed past the window is retained on its [`ObservedCrossing`].
+    ///
+    /// A header is certified, not committed, so a sibling that lost its
+    /// round can arrive for a height already held. A chain commits one
+    /// block per height: a held block whose commit the window proves
+    /// keeps its slot, and any other block at that height is the loser.
     pub fn on_verified_source_header(
         &mut self,
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
@@ -169,6 +182,12 @@ impl ShardSourceTracker {
         let shard = header.shard_id();
         let height = header.height();
         let headers = self.shard_headers.entry(shard).or_default();
+        if headers.get(&height).is_some_and(|held| {
+            held.block_hash() != certified_header.block_hash()
+                && window_commits(headers, held.header())
+        }) {
+            return;
+        }
         headers.insert(height, certified_header);
         while headers.len() > MAX_RETAINED_HEADERS_PER_SHARD {
             headers.pop_first();
@@ -209,7 +228,10 @@ impl ShardSourceTracker {
                 self.boundary_crossings.get(&shard).and_then(|per_shard| {
                     per_shard
                         .values()
-                        .map(|crossing| &crossing.boundary_header)
+                        .flat_map(|crossing| {
+                            iter::once(&crossing.boundary_header)
+                                .chain(crossing.boundary_parent.as_ref())
+                        })
                         .find(|held| held.block_hash() == parent_hash)
                 })
             })
@@ -482,14 +504,32 @@ impl ShardSourceTracker {
                 .filter_map(|(height, b)| {
                     let c = headers.get(&height.next())?;
                     let d = headers.get(&height.next().next());
-                    let crossing = detect_crossing(b, c, d, windows)?;
-                    self.commit_established(shard, c.header())
-                        .then_some(crossing)
+                    let (epoch, mut crossing) = detect_crossing(b, c, d, windows)?;
+                    if !self.commit_established(shard, c.header()) {
+                        return None;
+                    }
+                    let boundary = crossing.boundary_header.header();
+                    crossing.boundary_parent = boundary
+                        .height()
+                        .prev()
+                        .and_then(|parent_height| headers.get(&parent_height))
+                        .filter(|parent| parent.block_hash() == boundary.parent_block_hash())
+                        .cloned();
+                    Some((epoch, crossing))
                 })
                 .collect()
         };
-        for (epoch, crossing) in found {
+        for (epoch, mut crossing) in found {
             let per_shard = self.boundary_crossings.entry(shard).or_default();
+            // A re-read after the parent left the window keeps the parent
+            // the first read held.
+            if crossing.boundary_parent.is_none()
+                && let Some(held) = per_shard.get(&epoch).filter(|held| {
+                    held.boundary_header.block_hash() == crossing.boundary_header.block_hash()
+                })
+            {
+                crossing.boundary_parent.clone_from(&held.boundary_parent);
+            }
             per_shard.insert(epoch, crossing);
             while per_shard.len() > MAX_RETAINED_CROSSINGS_PER_SHARD {
                 let Some(oldest) = per_shard.keys().next().copied() else {
@@ -700,6 +740,7 @@ fn detect_crossing(
             ObservedCrossing {
                 boundary_header: Arc::clone(b),
                 canonical_qc: dating_qc.clone(),
+                boundary_parent: None,
             },
         ));
     }
@@ -709,6 +750,7 @@ fn detect_crossing(
         ObservedCrossing {
             boundary_header: Arc::clone(c),
             canonical_qc: terminal_qc.clone(),
+            boundary_parent: None,
         },
     ))
 }
@@ -966,6 +1008,67 @@ mod tests {
         );
         assert!(t.is_pending_fetch(shard(0), anchor(2), 3, 5));
         assert!(!t.is_pending_fetch(shard(0), anchor(1), 0, 2));
+    }
+
+    /// A certified header can be a sibling that lost its round. One that
+    /// arrives for a height whose held block the window proves committed
+    /// leaves that block in its slot; one beside a held block whose commit
+    /// is not yet proven takes the slot.
+    #[test]
+    fn a_losing_sibling_never_displaces_a_committed_block() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let c = linked_header(shard(0), 3, 2, b.block_hash(), 1_000, 7);
+        let sibling = linked_header(shard(0), 2, 4, BlockHash::ZERO, 950, 7);
+        assert_ne!(sibling.block_hash(), b.block_hash());
+
+        t.on_verified_source_header(Arc::clone(&sibling));
+        t.on_verified_source_header(Arc::clone(&b));
+        assert_eq!(
+            t.header(shard(0), BlockHeight::new(2))
+                .map(|held| held.block_hash()),
+            Some(b.block_hash()),
+            "an unproven block yields its slot",
+        );
+
+        t.on_verified_source_header(Arc::clone(&c));
+        t.on_verified_source_header(Arc::clone(&sibling));
+        assert_eq!(
+            t.header(shard(0), BlockHeight::new(2))
+                .map(|held| held.block_hash()),
+            Some(b.block_hash()),
+            "a committed block keeps its slot",
+        );
+        assert!(t.commit_established(shard(0), b.header()));
+    }
+
+    /// The boundary block's parent names the committee that signed it.
+    /// A crossing read while the window held that parent keeps it, so the
+    /// committee still resolves once the chain has moved the window past
+    /// both: no member that read the crossing live has to ask the shard
+    /// for it, and a member's own shard answers no such ask.
+    #[test]
+    fn a_crossing_keeps_the_parent_that_names_its_committee() {
+        let mut t = ShardSourceTracker::new();
+        let a = linked_header(shard(0), 1, 0, BlockHash::ZERO, 800, 7);
+        let b = linked_header(shard(0), 2, 1, a.block_hash(), 900, 7);
+        let c = linked_header(shard(0), 3, 2, b.block_hash(), 1_500, 7);
+        let mut tip = linked_header(shard(0), 4, 3, c.block_hash(), 1_600, 7);
+        for header in [&a, &b, &c, &tip] {
+            note(&mut t, header, 1_000);
+        }
+        let crossing = t.latest_crossing(shard(0)).expect("crossing observed");
+        assert_eq!(crossing.boundary_header().hash(), b.block_hash());
+
+        for height in 5..20 {
+            tip = linked_header(shard(0), height, height - 1, tip.block_hash(), 1_700, 7);
+            note(&mut t, &tip, 1_000);
+        }
+        assert!(t.header(shard(0), BlockHeight::new(1)).is_none());
+        assert_eq!(
+            t.parent_header(b.header()).map(BlockHeader::hash),
+            Some(a.block_hash()),
+        );
     }
 
     /// A `(B, C)` parent/child pair straddling an epoch boundary records a

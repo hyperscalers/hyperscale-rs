@@ -2231,6 +2231,9 @@ impl ShardCoordinatorSim {
                         self.detected_vote_equivocations
                             .push((emitter_idx, *evidence));
                     }
+                    // Feeds the node's beacon, which this harness does not
+                    // run.
+                    ProtocolEvent::LocalBlockCertified { .. } => {}
                     other => panic!(
                         "ShardCoordinatorSim: unmodelled Continuation event {}",
                         other.type_name()

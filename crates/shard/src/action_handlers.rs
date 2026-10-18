@@ -1016,8 +1016,6 @@ where
             sender,
             committee_public_keys,
             quorum_threshold,
-            shard,
-            height,
         } => {
             let start = Stopwatch::start();
             let qc_ctx = QcContext {
@@ -1060,8 +1058,7 @@ where
                 },
             );
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
-                shard,
-                height,
+                certified_header,
                 sender,
                 result,
             });

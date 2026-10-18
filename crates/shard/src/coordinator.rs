@@ -726,6 +726,20 @@ fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<B
     (pending_blocks, recovered_blocks)
 }
 
+/// What a certified handle for a local block sets moving, ahead of the
+/// block's commit: block sync serves the certified block to a peer that
+/// missed its body (a tip commits only once a child certifies at the next
+/// round, and a peer wedged below it may be the vote that child needs),
+/// and the beacon reads the shard's own chain from its header as early as
+/// a remote observer could.
+fn certified_block_landed(certified: Arc<Verified<CertifiedBlock>>) -> Vec<Action> {
+    let certified_header = Arc::new(certified.certified_header());
+    vec![
+        Action::AttachCertifiedUncommitted { certified },
+        Action::Continuation(ProtocolEvent::LocalBlockCertified { certified_header }),
+    ]
+}
+
 /// The QC a restarted validator resumes on: the higher of the committed
 /// tip's and the one its safe-vote registers justify.
 ///
@@ -5617,10 +5631,9 @@ impl ShardCoordinator {
     /// dropped and the height synced, since sync serves the certified
     /// header with the body it commits.
     ///
-    /// Emits [`Action::AttachCertifiedUncommitted`] for the handle it
-    /// lands, making the certified block servable to block sync ahead of
-    /// its commit. Nothing is emitted when no complete block is pending
-    /// under `qc`'s hash or neither path could establish the linkage.
+    /// Emits [`certified_block_landed`] for the handle it lands. Nothing
+    /// is emitted when no complete block is pending under `qc`'s hash or
+    /// neither path could establish the linkage.
     fn populate_certified_for(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
         let block_hash = qc.block_hash();
         let Some(block) = self.pending_blocks.get_block(block_hash).map(Arc::clone) else {
@@ -5644,7 +5657,7 @@ impl ShardCoordinator {
         }
         self.verification.track_pending_assembly(Arc::clone(&block));
         if let Some(Ok(certified)) = self.verification.record_qc_assembly(block_hash, qc.clone()) {
-            return vec![Action::AttachCertifiedUncommitted { certified }];
+            return certified_block_landed(certified);
         }
         // Local assembly yielded no handle — synthesize via the
         // BFT-transitive trust gate. SAFETY: `qc` is verified and certifies
@@ -5658,7 +5671,7 @@ impl ShardCoordinator {
                 let certified = Arc::new(certified);
                 self.verification
                     .insert_verified_certified_block(block_hash, Arc::clone(&certified));
-                vec![Action::AttachCertifiedUncommitted { certified }]
+                certified_block_landed(certified)
             }
             Err(e) => {
                 warn!(
@@ -7355,12 +7368,8 @@ impl ShardCoordinator {
         // prepared: a halted shard's recovery committee may be able to
         // fetch the certified tip it must extend only from hosts that
         // synced it.
-        let mut actions = vec![
-            Action::SyncBlockApplied { height },
-            Action::AttachCertifiedUncommitted {
-                certified: Arc::clone(&certified),
-            },
-        ];
+        let mut actions = vec![Action::SyncBlockApplied { height }];
+        actions.extend(certified_block_landed(Arc::clone(&certified)));
         let own = certified.qc_verified();
         let mut commits = self.try_two_chain_commit(own, CommitSource::Sync);
         // A QC held above this block's own is a child's, adopted when the

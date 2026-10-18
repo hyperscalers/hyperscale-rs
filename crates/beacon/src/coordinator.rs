@@ -2249,11 +2249,13 @@ impl BeaconCoordinator {
     /// Record a verified source-shard header — a remote shard's via the
     /// remote-header path, or the local shard's from its own commit
     /// stream — and note any epoch-boundary crossing it makes visible.
-    /// Local-shard intake is what makes the shard's own boundary QCs
-    /// verifiable at proposal admission (and reportable by local
-    /// proposers): `boundary_qc_admissible` resolves headers from this
-    /// view, and a validator is never on the remote path for its own
-    /// shard. Off-committee vnodes retain the header (a vnode drawn onto
+    /// The local shard's headers reach this view first at certification,
+    /// through [`Self::on_certified_local_header`], which is what makes
+    /// the shard's own boundary QCs verifiable at proposal admission (and
+    /// reportable by local proposers): `boundary_qc_admissible` resolves
+    /// headers from this view, and a validator is never on the remote
+    /// path for its own shard. The commit stream feeds them again here,
+    /// where the witness chunk is fetched. Off-committee vnodes retain the header (a vnode drawn onto
     /// the committee admits boundary QCs against the history it already
     /// holds, rather than abstaining until fresh headers arrive) and emit
     /// nothing. On-committee vnodes additionally fetch the witness chunk of
@@ -2263,25 +2265,53 @@ impl BeaconCoordinator {
     /// the boundary block. `chunk_bounds` caps that range at the fold's
     /// per-epoch budget, so a large producer/consumer gap can't make one
     /// header do unbounded work. They also release the proposals the
-    /// header completes ([`Self::release_awaited_proposals`]): a member's
-    /// own shard answers no commit-proof ask, so the header its chain
-    /// commits is the only thing that arrives for it.
+    /// header completes ([`Self::release_awaited_proposals`]).
     pub fn on_verified_source_header(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
-        self.shard_source
-            .on_verified_source_header(Arc::clone(certified_header));
-        self.shard_source.observe_crossing(
-            certified_header.header().shard_id(),
-            self.state.chain_config.epoch_duration_ms,
-        );
+        self.record_source_header(certified_header);
         if !self.is_on_committee() {
             return Vec::new();
         }
         let mut actions = self.fetch_witness_chunk(certified_header.header().shard_id());
         actions.extend(self.release_awaited_proposals());
         actions
+    }
+
+    /// Record a local block's header the moment it certifies, ahead of
+    /// its commit, and release the proposals it completes. A member's own
+    /// shard answers no commit-proof ask, so the headers its chain
+    /// certifies are the only thing that arrives for it, and they arrive
+    /// no later than a remote observer's: a remote shard learns a header
+    /// from its proposer's commit, which follows the certification of the
+    /// block above it.
+    ///
+    /// The witness chunk is not fetched here. The local shard's chunk is
+    /// served from this host's own store with no round trip, the store
+    /// holds a block only once it commits, and an empty answer re-drives
+    /// the fetch at once; [`Self::on_verified_source_header`] fetches it
+    /// from the commit stream.
+    pub fn on_certified_local_header(
+        &mut self,
+        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+    ) -> Vec<Action> {
+        self.record_source_header(certified_header);
+        if !self.is_on_committee() {
+            return Vec::new();
+        }
+        self.release_awaited_proposals()
+    }
+
+    /// Hold `certified_header` in the shard's window and note any
+    /// epoch-boundary crossing it makes visible.
+    fn record_source_header(&mut self, certified_header: &Arc<Verified<CertifiedBlockHeader>>) {
+        self.shard_source
+            .on_verified_source_header(Arc::clone(certified_header));
+        self.shard_source.observe_crossing(
+            certified_header.header().shard_id(),
+            self.state.chain_config.epoch_duration_ms,
+        );
     }
 
     /// Fetch `shard`'s current witness chunk, anchored to its latest
@@ -4538,6 +4568,117 @@ mod tests {
             NetworkDefinition::simulator(),
             config_hash,
         )
+    }
+
+    /// A proposal naming the member's own shard boundary awaits that
+    /// shard's certified headers, which are the only thing that arrives
+    /// for it. Certified headers up to the boundary's child leave it
+    /// awaiting while the child's commit is unproven; the block that
+    /// commits the child releases it into the pool. None of it fetches a
+    /// witness chunk, which the local store serves only once a block
+    /// commits.
+    #[test]
+    fn certified_local_headers_release_a_proposal_naming_the_own_shard_boundary() {
+        use hyperscale_types::test_utils::TestCommittee;
+        use hyperscale_types::{BlockVote, ProposerTimestamp};
+
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = coord_seating([0, 1, 2, 3].map(|seat| *committee.public_key(seat)));
+        let shard = ShardId::ROOT;
+        let cut = coord.state.chain_config.epoch_duration_ms;
+        let network = NetworkDefinition::simulator();
+
+        let header = |height: u64, parent_qc: &QuorumCertificate| {
+            BlockHeader::new(BlockHeaderParts {
+                shard_id: shard,
+                height: BlockHeight::new(height),
+                parent_block_hash: parent_qc.block_hash(),
+                parent_qc: parent_qc.clone().into(),
+                round: Round::new(height),
+                beacon_witness_root: BeaconWitnessRoot::from_raw(Hash::from_bytes(b"bw")),
+                beacon_witness_leaf_count: BeaconWitnessLeafCount::new(3),
+                ..Default::default()
+            })
+        };
+        let qc_over = |header: &BlockHeader, wt: u64| {
+            let votes: Vec<(usize, Verified<BlockVote>)> = (0..3)
+                .map(|seat| {
+                    let vote = BlockVote::new(
+                        &network,
+                        header.hash(),
+                        header.parent_block_hash(),
+                        shard,
+                        header.height(),
+                        header.round(),
+                        ValidatorId::new(seat as u64),
+                        committee.signer(seat).as_ref(),
+                        ProposerTimestamp::from_millis(wt),
+                    )
+                    .expect("vote signs");
+                    (seat, Verified::new_unchecked_for_test(vote))
+                })
+                .collect();
+            Verified::<QuorumCertificate>::from_verified_votes(
+                &BlsVerifier,
+                header.hash(),
+                shard,
+                header.height(),
+                header.round(),
+                header.parent_block_hash(),
+                header.parent_qc().weighted_timestamp(),
+                &votes,
+            )
+            .expect("aggregates over a quorum")
+            .into_inner()
+        };
+        let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
+            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+                header.clone(),
+                qc.clone(),
+            )))
+        };
+
+        // `B` anchors short of the cut and is certified past it; `C`
+        // embeds that certificate and `D` commits `C`.
+        let below = qc_naming(BlockHash::ZERO, shard, 3, cut - 2);
+        let a = header(4, &below);
+        let a_qc = qc_over(&a, cut - 1);
+        let b = header(5, &a_qc);
+        let b_qc = qc_over(&b, cut + 1);
+        let c = header(6, &b_qc);
+        let c_qc = qc_over(&c, cut + 2);
+        let d = header(7, &c_qc);
+        let d_qc = qc_over(&d, cut + 3);
+
+        let from = ValidatorId::new(1);
+        let proposal = Arc::new(Verified::new_unchecked_for_test(proposal_with_boundary(
+            shard,
+            b_qc.clone(),
+        )));
+        let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
+        actions.extend(coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal));
+        actions.extend(coord.on_certified_local_header(&certified(&b, &b_qc)));
+        actions.extend(coord.on_certified_local_header(&certified(&c, &c_qc)));
+        assert!(
+            coord.awaiting_boundaries.contains_key(&from) && !coord.proposal_pool.contains(from),
+            "a boundary whose dating child is only certified leaves the proposal awaiting",
+        );
+
+        actions.extend(coord.on_certified_local_header(&certified(&d, &d_qc)));
+        assert!(
+            coord.awaiting_boundaries.is_empty() && coord.proposal_pool.contains(from),
+            "the block that commits the dating child releases the proposal into the pool",
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::ShardWitnesses(_),
+                    ..
+                })
+            )),
+            "certification fetches no witness chunk: {actions:?}",
+        );
     }
 
     /// A genuine fork proof against a shard the lookahead no longer
