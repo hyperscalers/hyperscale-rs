@@ -233,6 +233,21 @@ pub enum ProtocolEvent {
         source: CommitSource,
     },
 
+    /// A local block's QC verified against its held body: the block is
+    /// certified, and its commit is not yet known. Emitted by shard
+    /// consensus for every block it can hold a certified handle for, on
+    /// every path that lands one (an aggregated QC, a child's parent QC,
+    /// a synced block).
+    ///
+    /// The beacon reads the shard's own chain from these headers the way
+    /// it reads a remote shard's from `RemoteHeaderAdmitted`: commit is
+    /// established structurally from the round-contiguous two-chain the
+    /// headers carry, never from the event itself.
+    LocalBlockCertified {
+        /// The certified block's header and its certifying QC.
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+
     /// A block has been committed by consensus (QC formed, 2f+1 agreement).
     ///
     /// Fired immediately when the `CommitBlock` action arrives — before
@@ -302,10 +317,10 @@ pub enum ProtocolEvent {
 
     /// Remote header QC verification completed.
     RemoteHeaderQcVerified {
-        /// Remote shard that produced the header.
-        shard: ShardId,
-        /// Remote block height (for correlation).
-        height: BlockHeight,
+        /// The header whose QC was checked. A failed header is parked
+        /// from this copy, which outlives the pending entry it was
+        /// dispatched from.
+        certified_header: Arc<CertifiedBlockHeader>,
         /// Sender of the candidate header — needed by the coordinator to
         /// remove the failed candidate from its pending map on error.
         sender: ValidatorId,

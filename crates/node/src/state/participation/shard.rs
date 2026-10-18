@@ -108,13 +108,17 @@ impl ShardParticipation {
                 .shard_coordinator
                 .on_qc_signature_verified(topology_schedule, subject, result),
             ProtocolEvent::RemoteHeaderQcVerified {
-                shard,
-                height,
+                certified_header,
                 sender,
                 result,
             } => self
                 .remote_headers_coordinator
-                .on_remote_header_qc_verified(topology_schedule, shard, height, sender, *result),
+                .on_remote_header_qc_verified(
+                    topology_schedule,
+                    &certified_header,
+                    sender,
+                    *result,
+                ),
             ProtocolEvent::BlockCheckCompleted {
                 block_hash,
                 kind,
@@ -956,6 +960,64 @@ mod tests {
         assert_eq!(
             pending_blocks, 1,
             "header within cap must reach shard consensus exactly once — pending_blocks should be 1",
+        );
+    }
+
+    /// A local block's QC hands the block's certified header to the beacon
+    /// the moment it verifies, with no commit behind it. A member's own
+    /// shard answers none of its commit-proof asks, so this is how the
+    /// beacon judges a proposal naming its own shard's boundary no later
+    /// than a remote observer, which learns the header from its
+    /// proposer's commit.
+    #[test]
+    fn a_certified_local_block_reaches_the_beacon_before_it_commits() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let certified = certify(
+            make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                /* timestamp_ms */ 1_000,
+                ValidatorId::new(0),
+                vec![],
+                vec![],
+            ),
+            /* weighted_timestamp_ms */ 1_000,
+        );
+        let block_hash = certified.block().hash();
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockHeaderReceived {
+                header: Arc::new(certified.block().header().clone()),
+                manifest: BlockManifest::default(),
+            },
+        );
+        let qc = certified.qc().clone();
+
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::QuorumCertificateResult {
+                block_hash,
+                qc: Some(Verified::new_unchecked_for_test(qc)),
+                verified_votes: vec![],
+            },
+        );
+
+        let certified_header = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Continuation(ProtocolEvent::LocalBlockCertified { certified_header }) => {
+                    Some(Arc::clone(certified_header))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the certified block reaches the beacon: {actions:?}"));
+        assert_eq!(certified_header.block_hash(), block_hash);
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::CommitBlock { .. } | Action::CommitBlockByQcOnly { .. }
+            )),
+            "the block is certified, not committed: {actions:?}",
         );
     }
 

@@ -672,10 +672,6 @@ pub enum Action {
         committee_public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the remote shard.
         quorum_threshold: VoteCount,
-        /// Remote shard ID (for correlation in callback).
-        shard: ShardId,
-        /// Remote block height (for correlation in callback).
-        height: BlockHeight,
     },
 
     /// Verify an assembled shard fork proof off the state-machine thread.

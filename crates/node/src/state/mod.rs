@@ -379,6 +379,9 @@ impl StateMachine for NodeStateMachine {
                 certified,
                 committee_anchor,
             } => self.on_block_committed(&certified, committee_anchor),
+            ProtocolEvent::LocalBlockCertified { certified_header } => self
+                .beacon_coordinator
+                .on_certified_local_header(&certified_header),
             ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
                 self.on_remote_header_admitted(&certified_header)
             }
