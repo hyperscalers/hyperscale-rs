@@ -1468,42 +1468,14 @@ fn stated_on(
 /// it stands stated holds the row and the verdict leaf its peers hold,
 /// and lets both go with them when the member settles.
 ///
-/// The sponsored swap of
-/// [`a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved`]:
-/// the venue's shard certifies its tick and states the caller's member,
-/// while the sponsor's shard certifies nothing, so the yes stands across
-/// the boundary the joiner snap-syncs at.
+/// The sponsored swap of [`stated_beside_a_silent_sponsor`]: both shards
+/// state their members, while neither reads the other's, so the yes
+/// stands across the boundary the joiner snap-syncs at.
 #[test]
 fn a_snap_synced_store_holds_the_leaves_its_peers_do() {
-    const RESERVED: u128 = 120_000_000;
-
     let shard = VENUE_SHARD;
-    let (accounts, (caller_key, caller), _) = venue_caller_accounts();
-    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
-        &venue_config(),
-        42,
-        &accounts,
-        GenesisPackages::with_fixtures(),
-    );
-    let mut taken = Vec::new();
-    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
-    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
-    let hosts = cluster.committee_hosts(shard);
+    let (mut cluster, hosts, tx) = stated_beside_a_silent_sponsor();
     let (joiner, peer) = (hosts[0], hosts[1]);
-    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
-
-    let _votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
-    let swap = build_sponsored_swap_tx(
-        &sponsor_key,
-        &caller_key,
-        caller,
-        &venue.meta,
-        RESERVED,
-        0,
-        validity_around(cluster.now()),
-    );
-    let tx = swap.hash();
-    cluster.submit(Arc::new(swap));
 
     let stated = |c: &SimCluster, host: usize| {
         let (row, leaf) = stated_on(c, host, shard, tx);
@@ -1512,12 +1484,7 @@ fn a_snap_synced_store_holds_the_leaves_its_peers_do() {
             _ => None,
         }
     };
-    assert!(
-        cluster.run_until(epochs(8), |c| stated(c, peer).is_some()),
-        "the venue's shard must state the caller's member; its row stands {:?}",
-        stated_on(&cluster, peer, shard, tx).0,
-    );
-    let (tick, leaf) = stated(&cluster, peer).expect("just seen");
+    let (tick, leaf) = stated(&cluster, peer).expect("stated above");
     assert!(
         leaf.is_some(),
         "a stated row stands beside its verdict leaf"
@@ -1555,7 +1522,7 @@ fn a_snap_synced_store_holds_the_leaves_its_peers_do() {
     let status = await_tx_terminal(&mut cluster, tx, epochs(8));
     assert!(
         matches!(status, Some(TransactionStatus::Completed(_))),
-        "the swap must reach an outcome once the votes flow; status = {status:?}",
+        "the swap must reach an outcome once the shards read each other; status = {status:?}",
     );
     assert!(
         cluster.run_until(epochs(8), |c| [joiner, peer].iter().all(|&host| stated_on(
@@ -1569,10 +1536,10 @@ fn a_snap_synced_store_holds_the_leaves_its_peers_do() {
     );
 }
 
-/// The sponsored swap of [`a_snap_synced_store_holds_the_leaves_its_peers_do`]
-/// in a venue world whose sponsor's shard certifies nothing: the cluster,
-/// the venue's committee hosts, and the swap, which the venue's shard
-/// has stated and which waits on its sibling.
+/// A sponsored swap in a venue world whose venue and sponsor shards
+/// never read each other's state or readings: the cluster, the venue's
+/// committee hosts, and the swap, which the venue's shard has stated and
+/// which waits on its sibling.
 fn stated_beside_a_silent_sponsor() -> (SimCluster, Vec<usize>, TxHash) {
     const RESERVED: u128 = 120_000_000;
 
@@ -1590,7 +1557,10 @@ fn stated_beside_a_silent_sponsor() -> (SimCluster, Vec<usize>, TxHash) {
     let hosts = cluster.committee_hosts(shard);
     let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
 
-    let _votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
+    for kind in ["state_proof.request", "crossing.readings"] {
+        let _unread = cluster.drop_type_between(&hosts, &sponsors, kind);
+        let _unheard = cluster.drop_type_between(&sponsors, &hosts, kind);
+    }
     let swap = build_sponsored_swap_tx(
         &sponsor_key,
         &caller_key,
@@ -1633,7 +1603,7 @@ fn offers_legs(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool 
         })
 }
 
-/// Let the sponsor's shard certify, and run until `host` offers the legs
+/// Let the shards read each other, and run until `host` offers the legs
 /// half accepting `tx` on `shard`, stepping finely enough to see the
 /// offer between the tip that builds it and the block that settles it.
 fn await_legs_offered(c: &mut SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool {
@@ -1962,15 +1932,15 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
     );
 }
 
-/// A record naming a transaction committed further back than a restart
+/// An abort settling a transaction committed further back than a restart
 /// replays.
 ///
-/// Under the production epoch length only: the reshape that composes the
-/// record is counted in epochs and the reach a restart replays in
-/// seconds, and at the short epoch the record lands long before the
-/// commit it names leaves that reach.
+/// Under the production epoch length only: the reshape that departs the
+/// sibling is counted in epochs and the reach a restart replays in
+/// seconds, and at the short epoch the departure lands long before the
+/// commit leaves that reach.
 #[cfg(feature = "production-epochs")]
-mod a_record_past_the_replay {
+mod a_commit_past_the_replay {
     use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR, voted_split_bytes};
     use hyperscale_scenarios::{
         cast_threshold_vote, departing_caller_ballast, departing_venue_split_bytes,
@@ -2110,8 +2080,8 @@ mod a_record_past_the_replay {
         );
         let peer = c.committee_hosts(HOME)[0];
         assert!(
-            legs_owed(c, peer, HOME, hash).is_some() && c.named_unsettled(HOME, hash).is_empty(),
-            "the swap must still be owed its legs half, and unrecorded, with the floor past it",
+            legs_owed(c, peer, HOME, hash).is_some() && c.chain_fate(HOME, hash).1.is_none(),
+            "the swap must still be owed its legs half, and undecided, with the floor past it",
         );
         // A member seated since by snap-sync began above the commit and
         // never held it.
@@ -2146,8 +2116,8 @@ mod a_record_past_the_replay {
             "each restarted replica must move its floor again",
         );
         assert!(
-            c.named_unsettled(HOME, hash).is_empty(),
-            "the record must not land before the restarted replicas have collected",
+            c.chain_fate(HOME, hash).1.is_none(),
+            "the swap must not be decided before the restarted replicas have collected",
         );
         for &host in &holders[2..] {
             assert!(
@@ -2159,7 +2129,7 @@ mod a_record_past_the_replay {
     }
 
     /// A counterpart silent for longer than a restart replays, then
-    /// gone: the block carrying the record of what it left certifies on a
+    /// gone: the block aborting the swap it never stated certifies on a
     /// home committee most of which restarted in between.
     ///
     /// The venue's shard runs a swap whose fee a sponsor on the other
@@ -2167,11 +2137,10 @@ mod a_record_past_the_replay {
     /// nothing from then on, so the swap's row stands on the venue's
     /// shard, owed its legs half, while the chain floor passes the block
     /// that committed it. Two of the venue's four replicas restart there,
-    /// past the reach of their replay. The sponsor's shard then splits,
-    /// and the venue's shard records the swap as what the departed shard
-    /// left unsettled: a block each replica checks against the swap's
-    /// body and the header of its commit, which a restarted replica reads
-    /// off its store or not at all.
+    /// past the reach of their replay. The sponsor's shard then splits;
+    /// the venue's shard reads the departed shard's unstated row as left
+    /// and aborts the swap, with no record of what the departed shard
+    /// left unsettled.
     #[test]
     fn certifies_on_a_committee_restarted_past_it() {
         let mut accounts = departing_caller_ballast();
@@ -2196,39 +2165,34 @@ mod a_record_past_the_replay {
                 );
             }
 
-            // The counterpart splits, and the home chain records the swap
-            // as what it left unsettled.
+            // The counterpart splits, and the home chain, reading the
+            // departed shard's rows as left, aborts the swap.
             assert!(
-                run_cut_until(c, 12, |c| !c.named_unsettled(HOME, hash).is_empty()),
-                "a record naming the swap must commit on the venue's shard; the counterpart's \
-                 reshape stands at {:?} and the venue's replicas at {:?}",
-                c.beacon_state()
-                    .and_then(|state| state.pending_reshapes.get(&COUNTERPART).cloned()),
-                heights(c, HOME),
+                run_cut_until(c, 12, |c| matches!(
+                    c.chain_fate(HOME, hash).1,
+                    Some((_, TransactionDecision::Aborted))
+                )),
+                "the swap must abort on the venue's shard; its fate is {:?}",
+                c.chain_fate(HOME, hash),
             );
-            let (recorded, departed) = c.named_unsettled(HOME, hash)[0];
-            assert_eq!(departed, COUNTERPART);
+            let (aborted, _) = c.chain_fate(HOME, hash).1.expect("just seen");
             // Two of four signatures are not a quorum, so the block's
             // certificate carries a restarted replica's.
             let seated = c.committee_hosts(HOME);
             assert!(
                 seated.len() == 4 && restarted.iter().all(|host| seated.contains(host)),
                 "both restarted replicas must sit on the committee of four that certified \
-                 the record at {recorded:?}; it is {seated:?}",
+                 the abort at {aborted:?}; it is {seated:?}",
             );
             for host in restarted {
                 assert!(
-                    c.host_block(host, HOME, recorded).is_some(),
-                    "restarted host {host} must commit the block carrying the record",
+                    c.host_block(host, HOME, aborted).is_some(),
+                    "restarted host {host} must commit the block carrying the abort",
                 );
             }
             assert!(
-                run_cut_until(c, 2, |c| matches!(
-                    c.chain_fate(HOME, hash).1,
-                    Some((_, TransactionDecision::Aborted))
-                )),
-                "the recorded swap must abort on the venue's shard; its fate is {:?}",
-                c.chain_fate(HOME, hash),
+                c.named_unsettled(HOME, hash).is_empty(),
+                "the departure leaves no record of a swap its abort settles",
             );
         });
     }
