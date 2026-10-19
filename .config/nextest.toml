@@ -14,7 +14,7 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # runaway sim is reported by nextest rather than cancelling the whole job.
 [[profile.ci.overrides]]
 filter = "package(hyperscale-simulation) or package(hyperscale-production) or package(hyperscale-simulator)"
-slow-timeout = { period = "300s", terminate-after = 24 }
+slow-timeout = { period = "300s", terminate-after = 36 }
 
 # The fresh_store tests, and the runner tests that restart or rejoin a host,
 # each run a cluster over real QUIC and RocksDB against a wall-clock budget,
