@@ -1929,9 +1929,10 @@ pub fn a_crossing_the_consumer_refuses_is_declined<C: FaultableCluster>(c: &mut 
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
     let (key, trader) = &traders[0];
-    // The venue's own committee certifies its refusal; what is cut is
-    // the road that verdict takes to the shard holding the record, so
-    // the producer has nothing to reclaim off while the cut stands.
+    // The venue's own committee certifies its refusal, and that
+    // certificate is cut from the shard holding the record. It decides
+    // nothing there: the producer reclaims off the `Never` it reads from
+    // the venue's state.
     let cut = isolate_ec_intake(c, TRADER_SHARD, FIRST_VENUE_SHARD);
     let (protocol_resource, units) = route_worlds(c, &first, &second, accounts(&traders));
 
@@ -2355,9 +2356,9 @@ pub enum Certificates {
     /// does, which is as long as the sibling's own member takes to run:
     /// on committees that share no host, most of a finalization delay.
     Flow,
-    /// Each venue shard is cut off from the other's until the offering
-    /// ends, so every row that states stands stated, and what it learns
-    /// of its sibling it learns from a verdict reading. Requires the
+    /// Each venue shard is cut off from the other's certificates until
+    /// the offering ends, and what it learns of its sibling it learns
+    /// from a verdict reading, as it does with them. Requires the
     /// venue shards' committees on hosts of their own.
     CutWhileOffered,
 }
@@ -3755,10 +3756,9 @@ fn load_conserved<C: Cluster>(
 /// the asks did.
 ///
 /// Under [`Certificates::CutWhileOffered`] no certificate of one venue
-/// shard reaches the other until the offering ends, so each pair takes
-/// one route, its rows stand stated on both venue shards, and the
-/// readings are what tell each of the other; the cut then lifts and the
-/// certificates settle them.
+/// shard reaches the other until the offering ends. A sibling's
+/// certificate decides nothing on another shard, so the rows still
+/// settle: each venue shard reads the other's verdict from its state.
 ///
 /// Requires a grown four-shard cluster over
 /// [`core_load_genesis_accounts`] of `load.traders`, one that walks its
@@ -4139,8 +4139,7 @@ impl CoreLoadRun<'_> {
             println!(
                 "core load [0 what the cut does not show]: every reading here is a yes and \
                  changes an entry; the rows state together, so their leaves change together \
-                 and the readings ride densely batched; and the rows are settled by the \
-                 certificates once the cut lifts, never by a reading",
+                 and the readings ride densely batched",
             );
         }
         println!(
