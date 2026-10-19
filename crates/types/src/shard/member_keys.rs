@@ -30,6 +30,16 @@ pub enum MemberCollection {
 }
 
 impl MemberCollection {
+    /// Every collection of the family, in the order of their materials.
+    const ALL: [Self; 6] = [
+        Self::Members,
+        Self::Ticks,
+        Self::Seats,
+        Self::Reserved,
+        Self::Verdicts,
+        Self::Staged,
+    ];
+
     const fn material(self) -> u8 {
         match self {
             Self::Members => 0,
@@ -45,11 +55,12 @@ impl MemberCollection {
     #[must_use]
     pub fn of(self, shard: ShardId) -> (Address, CollectionId) {
         let owner = ShardTrie::shard_owner(shard);
+        (owner, self.id(owner, shard))
+    }
+
+    fn id(self, owner: Address, shard: ShardId) -> CollectionId {
         let material = [vec![self.material()], shard.inner().to_be_bytes().to_vec()];
-        (
-            owner,
-            collection_id(&ProtocolHasher, owner, TICK_MEMBER_SLOT, &material),
-        )
+        collection_id(&ProtocolHasher, owner, TICK_MEMBER_SLOT, &material)
     }
 
     /// The entry `tx` is keyed at in this collection of `shard`'s
@@ -61,6 +72,49 @@ impl MemberCollection {
             owner,
             collection,
             order: member_order(tx),
+        }
+    }
+}
+
+/// Every collection of one shard's family, each id derived once: what a
+/// holder that reads or writes the family many times keys it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberFamily {
+    owner: Address,
+    ids: [CollectionId; 6],
+}
+
+impl MemberFamily {
+    /// `shard`'s family, as [`MemberCollection::of`] places each of its
+    /// collections.
+    #[must_use]
+    pub fn of(shard: ShardId) -> Self {
+        let owner = ShardTrie::shard_owner(shard);
+        Self {
+            owner,
+            ids: MemberCollection::ALL.map(|kind| kind.id(owner, shard)),
+        }
+    }
+
+    /// The owner every collection of the family shares.
+    #[must_use]
+    pub const fn owner(&self) -> Address {
+        self.owner
+    }
+
+    /// The id of the family's `kind` collection.
+    #[must_use]
+    pub const fn id(&self, kind: MemberCollection) -> CollectionId {
+        self.ids[kind.material() as usize]
+    }
+
+    /// The entry at `order` in the family's `kind` collection.
+    #[must_use]
+    pub const fn entry(&self, kind: MemberCollection, order: u128) -> EntryKey {
+        EntryKey {
+            owner: self.owner,
+            collection: self.id(kind),
+            order,
         }
     }
 }
@@ -85,4 +139,19 @@ pub fn verdict_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
 #[must_use]
 pub fn staged_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
     entry_leaf_key(&ProtocolHasher, MemberCollection::Staged.entry(shard, tx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_family_places_each_collection_where_the_collection_does() {
+        for shard in [ShardId::ROOT, ShardId::leaf(1, 1), ShardId::leaf(3, 5)] {
+            let family = MemberFamily::of(shard);
+            for kind in MemberCollection::ALL {
+                assert_eq!((family.owner(), family.id(kind)), kind.of(shard));
+            }
+        }
+    }
 }

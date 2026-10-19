@@ -200,7 +200,9 @@ pub use shard::limits::{
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockManifestParts, BlockMetadata};
-pub use shard::member_keys::{MemberCollection, member_order, staged_leaf, verdict_leaf};
+pub use shard::member_keys::{
+    MemberCollection, MemberFamily, member_order, staged_leaf, verdict_leaf,
+};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::read_frontier::{

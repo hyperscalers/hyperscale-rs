@@ -52,10 +52,10 @@ use hyperscale_types::{
     ConsensusReceipt, Crossings, Deadline, DiscardCause, EntryKey, EntryLeaf, EpochWindows,
     Finalization, GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins,
     MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection,
-    MemberTerms, Movement, Owes, Reach, ReadMark, Reserves, Said, SettledEntries, Settlement,
-    ShardId, StateClaim, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId,
-    TickLine, TickManifest, Transaction, TxHash, TxOutcome, VerdictQuestion, Verifiable, Verified,
-    WeightedTimestamp, entry_leaf_key, member_order, said_at, verdict_leaf,
+    MemberFamily, MemberTerms, Movement, Owes, Reach, ReadMark, Reserves, Said, SettledEntries,
+    Settlement, ShardId, StateClaim, StateWrites, StatedTerms, StoredReceipt, SubstateKey,
+    TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash, TxOutcome, VerdictQuestion,
+    Verifiable, Verified, WeightedTimestamp, entry_leaf_key, member_order, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{ProtocolHasher, fee_hold_key, protocol_resource};
 
@@ -1045,8 +1045,13 @@ fn tick_entry(shard: ShardId, height: BlockHeight) -> EntryKey {
     EntryKey {
         owner,
         collection,
-        order: u128::from(height.inner()),
+        order: tick_order(height),
     }
+}
+
+/// A tick row's order key: its height.
+fn tick_order(height: BlockHeight) -> u128 {
+    u128::from(height.inner())
 }
 
 fn read_at<T: HborDecode>(state: &(impl Substates + ?Sized), key: EntryKey) -> Option<T> {
@@ -1071,6 +1076,7 @@ fn read_all(
 struct Working<'s, S: ?Sized> {
     state: &'s S,
     shard: ShardId,
+    family: &'s MemberFamily,
     members: BTreeMap<u128, Option<MemberRow>>,
     /// Each row read, as the state held it: what a changed row's seat
     /// and reservations are written against.
@@ -1083,10 +1089,11 @@ struct Working<'s, S: ?Sized> {
 }
 
 impl<'s, S: Substates + ?Sized> Working<'s, S> {
-    const fn new(state: &'s S, shard: ShardId) -> Self {
+    const fn new(state: &'s S, shard: ShardId, family: &'s MemberFamily) -> Self {
         Self {
             state,
             shard,
+            family,
             members: BTreeMap::new(),
             read: BTreeMap::new(),
             ticks: BTreeMap::new(),
@@ -1114,10 +1121,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// The row the state holds under `tx`'s key, whoever's it is.
     fn stored(&mut self, tx: TxHash) -> Option<MemberRow> {
-        let (state, shard) = (self.state, self.shard);
+        let (state, family) = (self.state, self.family);
+        let order = member_order(tx);
         self.read
-            .entry(member_order(tx))
-            .or_insert_with(|| read_at(state, member_entry(shard, tx)))
+            .entry(order)
+            .or_insert_with(|| read_at(state, family.entry(MemberCollection::Members, order)))
             .clone()
     }
 
@@ -1144,10 +1152,15 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     fn tick(&mut self, height: BlockHeight) -> Option<TickRow> {
-        let (state, shard) = (self.state, self.shard);
+        let (state, family) = (self.state, self.family);
         self.ticks
             .entry(height)
-            .or_insert_with(|| read_at(state, tick_entry(shard, height)))
+            .or_insert_with(|| {
+                read_at(
+                    state,
+                    family.entry(MemberCollection::Ticks, tick_order(height)),
+                )
+            })
             .clone()
     }
 
@@ -1581,17 +1594,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// [`MAX_HOLDS_PER_MEMBER`]: hyperscale_types::MAX_HOLDS_PER_MEMBER
     /// [`MAX_DECLARED_RESERVE`]: hyperscale_types::MAX_DECLARED_RESERVE
     fn into_writes(self, writes: &mut SettledEntries) {
-        let (owner, members) = MemberCollection::Members.of(self.shard);
-        let (_, seats) = MemberCollection::Seats.of(self.shard);
-        let (_, verdicts) = MemberCollection::Verdicts.of(self.shard);
-        let (_, staged) = MemberCollection::Staged.of(self.shard);
+        let family = self.family;
         let mut moved: BTreeMap<u128, (u128, u128)> = BTreeMap::new();
         for order in self.changed_members {
-            let key = EntryKey {
-                owner,
-                collection: members,
-                order,
-            };
+            let key = family.entry(MemberCollection::Members, order);
             let row = self.members[&order].as_ref();
             writes.insert(
                 key,
@@ -1616,11 +1622,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             let says = row.and_then(|row| row.verdict(self.shard));
             if said != says {
                 writes.insert(
-                    EntryKey {
-                        owner,
-                        collection: verdicts,
-                        order,
-                    },
+                    family.entry(MemberCollection::Verdicts, order),
                     says.map(|leaf| to_vec(&leaf).expect("a verdict leaf encodes")),
                 );
             }
@@ -1633,30 +1635,19 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         .expect("a row enters Stated only beside the yes receipt it stages");
                     to_vec(&**receipt).expect("a receipt encodes")
                 });
-                writes.insert(
-                    EntryKey {
-                        owner,
-                        collection: staged,
-                        order,
-                    },
-                    receipt,
-                );
+                writes.insert(family.entry(MemberCollection::Staged, order), receipt);
             }
             let was = held.is_some_and(|row| row.state.seated());
             let seat = row.filter(|row| row.state.seated());
             if was != seat.is_some() {
                 writes.insert(
-                    EntryKey {
-                        owner,
-                        collection: seats,
-                        order,
-                    },
+                    family.entry(MemberCollection::Seats, order),
                     seat.map(|row| to_vec(&row.tx).expect("a hash encodes")),
                 );
             }
         }
         for (order, (left, entered)) in moved {
-            let key = reserved_entry(self.shard, order);
+            let key = family.entry(MemberCollection::Reserved, order);
             let standing: u128 = read_at(self.state, key).unwrap_or(0);
             let total = standing
                 .checked_sub(left)
@@ -1673,7 +1664,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             let value = self.ticks[&height]
                 .as_ref()
                 .map(|row| to_vec(row).expect("a tick row encodes"));
-            writes.insert(tick_entry(self.shard, height), value);
+            writes.insert(
+                family.entry(MemberCollection::Ticks, tick_order(height)),
+                value,
+            );
         }
     }
 }
@@ -1742,12 +1736,17 @@ pub(crate) fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
 /// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
-    fold(state, inputs).0
+    fold(state, &MemberFamily::of(inputs.shard), inputs).0
 }
 
 /// [`member_writes`], beside what the block's rows heard of its claims.
-fn fold(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> (SettledEntries, HeardCells) {
-    let mut family = Working::new(state, inputs.shard);
+/// `family` is `inputs.shard`'s.
+fn fold(
+    state: &(impl Substates + ?Sized),
+    family: &MemberFamily,
+    inputs: &MemberInputs,
+) -> (SettledEntries, HeardCells) {
+    let mut family = Working::new(state, inputs.shard, family);
     for settled in &inputs.settled {
         family.settle(settled);
     }
@@ -2001,6 +2000,7 @@ fn member_taken(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberIndex {
     shard: ShardId,
+    family: MemberFamily,
     /// Every member row, by transaction.
     pub members: BTreeMap<TxHash, MemberRow>,
     /// Every tick row, by height.
@@ -2013,9 +2013,10 @@ pub struct MemberIndex {
 impl MemberIndex {
     /// No rows at all, for `shard`.
     #[must_use]
-    pub const fn empty(shard: ShardId) -> Self {
+    pub fn empty(shard: ShardId) -> Self {
         Self {
             shard,
+            family: MemberFamily::of(shard),
             members: BTreeMap::new(),
             ticks: BTreeMap::new(),
             reserved: BTreeMap::new(),
@@ -2076,6 +2077,7 @@ impl MemberIndex {
             .collect();
         Self {
             shard,
+            family: MemberFamily::of(shard),
             members,
             ticks,
             reserved,
@@ -2088,18 +2090,19 @@ impl MemberIndex {
         self.shard
     }
 
-    /// Fold one block's content in, as [`member_writes`] folds it into
-    /// state, and say which cells of the block's claims its rows heard.
+    /// Fold one of the shard's own blocks in, as [`member_writes`] folds
+    /// it into state, and say which cells of the block's claims its rows
+    /// heard.
     ///
     /// # Panics
     ///
     /// If a written row fails to decode, which a row this fold encoded
     /// cannot.
     pub fn advance(&mut self, inputs: &MemberInputs) -> HeardCells {
-        let (writes, heard) = fold(&*self, inputs);
-        let (_, members) = MemberCollection::Members.of(self.shard);
-        let (_, ticks) = MemberCollection::Ticks.of(self.shard);
-        let (_, reserved) = MemberCollection::Reserved.of(self.shard);
+        let (writes, heard) = fold(&*self, &self.family, inputs);
+        let members = self.family.id(MemberCollection::Members);
+        let ticks = self.family.id(MemberCollection::Ticks);
+        let reserved = self.family.id(MemberCollection::Reserved);
         for (key, change) in writes {
             if key.collection == members {
                 // One row stands under a key, whichever hash carries it.
@@ -2149,7 +2152,7 @@ impl MemberIndex {
     /// has heard them and before anything else of the block is folded.
     #[must_use]
     pub fn heard_rows(&self, inputs: &MemberInputs) -> BTreeMap<TxHash, MemberRow> {
-        let mut family = Working::new(self, self.shard);
+        let mut family = Working::new(self, self.shard, &self.family);
         family.hear(&inputs.heard);
         family
             .changed_members
@@ -2212,10 +2215,10 @@ impl Substates for MemberIndex {
         hi: u128,
         limit: usize,
     ) -> Vec<(u128, Vec<u8>)> {
-        let (own, members) = MemberCollection::Members.of(self.shard);
-        let (_, ticks) = MemberCollection::Ticks.of(self.shard);
-        let (_, reserved) = MemberCollection::Reserved.of(self.shard);
-        if owner != own || lo > hi {
+        let members = self.family.id(MemberCollection::Members);
+        let ticks = self.family.id(MemberCollection::Ticks);
+        let reserved = self.family.id(MemberCollection::Reserved);
+        if owner != self.family.owner() || lo > hi {
             return Vec::new();
         }
         if collection == members {
