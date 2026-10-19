@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 
-use crate::address_book::{AddressBook, IngestOutcome, sign_records};
+use crate::address_book::{AddressBook, IngestOutcome, record_sequence, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
 use crate::bind_gate::{BindGate, Origin, Ticket};
 use crate::config::{IrohConfig, MAX_RELAYS};
@@ -171,8 +171,16 @@ struct Inner {
     unbound: UnboundSlots,
     /// Which dialers this host signs for before they prove anything.
     bind_gate: BindGate,
-    /// This host's address records and the addresses they were signed for.
-    signed_records: Mutex<Option<(EndpointAddr, Vec<ValidatorAddressGossip>)>>,
+    /// This host's address records as last signed.
+    signed_records: Mutex<Option<SignedRecords>>,
+}
+
+/// This host's address records, the addresses they were signed for, and
+/// the sequence they carry, which the next signing moves past.
+struct SignedRecords {
+    addressed: EndpointAddr,
+    sequence: u64,
+    records: Vec<ValidatorAddressGossip>,
 }
 
 /// iroh-based network adapter: the host's endpoint and its bound
@@ -407,27 +415,30 @@ impl IrohAdapter {
             .signed_records
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some((addressed, records)) = signed.as_ref()
-            && *addressed == endpoint
+        if let Some(last) = signed.as_ref()
+            && last.addressed == endpoint
         {
-            return records.clone();
+            return last.records.clone();
         }
-        // Wall-clock milliseconds: orders re-announcements across process
-        // restarts, which a per-process counter cannot.
-        let sequence = u64::try_from(
+        let now_ms = u64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
+        let sequence = record_sequence(now_ms, signed.as_ref().map(|last| last.sequence));
         let records = sign_records(
             &endpoint,
             sequence,
             &self.inner.bind.network,
             &self.inner.bind.local_vnodes,
         );
-        *signed = Some((endpoint, records.clone()));
+        *signed = Some(SignedRecords {
+            addressed: endpoint,
+            sequence,
+            records: records.clone(),
+        });
         records
     }
 
