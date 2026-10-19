@@ -373,16 +373,15 @@ pub fn apply_epoch(
     // anchors forward instead, sparing a reshape that only looks quiet
     // because the beacon stalled.
     match input {
-        ApplyEpochInput::Normal { .. } => {
-            prune_stale_reshapes(state);
-            // Tally the parameter votes the boundary fold just recorded and
-            // apply any majority-backed change at its activation epoch. A
-            // skip folds no votes and activates none, carrying live
-            // proposals forward to a real epoch.
-            tally_param_votes(state);
-        }
+        ApplyEpochInput::Normal { .. } => prune_stale_reshapes(state),
         ApplyEpochInput::Skip => defer_reshape_ttls(state),
     }
+    // Decide the parameter votes naming the next epoch on every fold. A
+    // skip records no votes, but every vote recorded before it is already
+    // folded state, so the tally reads the same slots and stakes on every
+    // replica, and a vote whose decision epoch the beacon skipped still
+    // takes effect at its `activate_at`.
+    tally_param_votes(state);
     // The price level for the window after next, stepped by what this
     // epoch's blocks declared and held inside the bounds the vote above
     // just settled — so a vote that narrows an interval brings the level
@@ -1519,13 +1518,13 @@ mod tests {
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
         BoundaryAttestation, ChainOrigin, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
-        MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
-        QuorumCertificate, RETENTION_HORIZON, RecoveryBinding, ReshapeThresholds, Round,
-        SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad,
-        ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool,
-        StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule, TransitionCause,
-        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
-        derive_reshape_trigger,
+        MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, NetworkParams,
+        ParamProposal, PriceBounds, PriceTable, QuorumCertificate, RETENTION_HORIZON,
+        RecoveryBinding, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
+        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
+        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
+        TopologySchedule, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
+        compute_merkle_root, compute_range_proof, derive_reshape_trigger,
     };
 
     use super::*;
@@ -6837,5 +6836,71 @@ mod tests {
 
         assert!(!state.recoveries.contains_key(&gone));
         assert!(state.recoveries.contains_key(&kept));
+    }
+
+    // ─── parameter votes ────────────────────────────────────────────────────
+
+    /// A state whose single pool, holding all the stake, has voted a new
+    /// split threshold to take effect three epochs on. Returns the voted
+    /// params and their `activate_at`, whose decision epoch is the second
+    /// fold from here.
+    fn state_with_a_majority_threshold_vote() -> (BeaconState, NetworkParams, Epoch) {
+        let mut state = single_pool_state(4);
+        let voted = NetworkParams {
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 1_000_000,
+                ..state.params.reshape_thresholds
+            },
+            ..state.params
+        };
+        assert!(voted.validate().is_ok());
+        assert_ne!(voted, state.params);
+        let activate_at = Epoch::new(state.current_epoch.inner() + 3);
+        state.param_votes.insert(
+            StakePoolId::new(0),
+            ParamProposal {
+                params: voted,
+                activate_at,
+            },
+        );
+        (state, voted, activate_at)
+    }
+
+    #[test]
+    fn a_majority_vote_takes_effect_at_its_activation_epoch() {
+        let (mut state, voted, activate_at) = state_with_a_majority_threshold_vote();
+        let before = state.params;
+
+        apply_next_epoch(&mut state, &[]);
+        apply_next_epoch(&mut state, &[]);
+        assert_eq!(state.params, before, "the vote took effect early");
+        apply_next_epoch(&mut state, &[]);
+
+        assert_eq!(state.current_epoch, activate_at);
+        assert_eq!(state.params, voted);
+        assert!(state.param_votes.is_empty());
+    }
+
+    #[test]
+    fn a_skip_at_the_decision_epoch_still_activates_a_majority_vote() {
+        let (mut state, voted, activate_at) = state_with_a_majority_threshold_vote();
+        let before = state.params;
+
+        apply_next_epoch(&mut state, &[]);
+        // The decision epoch, `activate_at - 1`, is a Skip.
+        skip_fold(&mut state);
+        assert_eq!(state.params, before, "the vote took effect early");
+        assert_eq!(state.next_params, voted, "the skip did not decide the vote");
+        assert!(
+            state.param_votes.is_empty(),
+            "the decided vote is spent at its decision epoch",
+        );
+        apply_next_epoch(&mut state, &[]);
+
+        assert_eq!(state.current_epoch, activate_at);
+        assert_eq!(
+            state.params, voted,
+            "a majority vote must take effect at its activate_at across a Skip",
+        );
     }
 }

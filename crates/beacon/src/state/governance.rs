@@ -1,13 +1,12 @@
 //! Per-epoch network-parameter vote tally.
 //!
 //! The witness fold records each epoch's `ParamVote`s into
-//! [`BeaconState::param_votes`](BeaconState). Once per
-//! normal epoch [`tally_param_votes`] reads the accumulated slots, applies
-//! any proposal a stake majority backs at this epoch, and prunes spent
-//! votes. The outcome is a pure function of the live votes and pool
-//! stakes — re-derived every epoch — so every replica agrees, a
-//! flip-flopping pool can't sneak a change through, and there is nothing
-//! to unschedule.
+//! [`BeaconState::param_votes`](BeaconState). Once per epoch, skipped or
+//! not, [`tally_param_votes`] reads the accumulated slots, applies any
+//! proposal a stake majority backs at this epoch, and prunes spent votes.
+//! The outcome is a pure function of the live votes and pool stakes —
+//! re-derived every epoch — so every replica agrees, a flip-flopping pool
+//! can't sneak a change through, and there is nothing to unschedule.
 
 use std::collections::BTreeMap;
 
@@ -22,7 +21,9 @@ use hyperscale_types::{BeaconState, NetworkParams};
 /// topology snapshot before any block resolves against it. `apply_epoch`
 /// promotes the result into [`BeaconState::params`] at `E + 1`, so the
 /// change still takes effect at its `activate_at`; only the decision (and
-/// the vote deadline) lands an epoch earlier.
+/// the vote deadline) lands an epoch earlier. It runs on a skipped epoch
+/// as on a normal one, since a vote's only decision epoch is
+/// `activate_at - 1`, whatever that fold's input.
 ///
 /// Votes are bucketed by their proposed `(params, activate_at)` tuple,
 /// filtered to those naming the next epoch. Because each pool backs
