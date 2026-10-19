@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 
 use hyperscale_core::{
-    Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, TimerId,
+    Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, SyncClaimId, TimerId,
 };
 use hyperscale_types::{
     Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
@@ -164,13 +164,13 @@ use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
     AnswerAdditions, AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CarriedClaims, CertifiedBlock, CertifiedBlockHeader,
-    ChainOrigin, CommittedTip, Decision, Finalization, HALT_HARVEST_WAIT, IntakeView,
-    MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError, QuorumCertificate,
-    RecoveryCause, RevealChain, Round, SafeVoteRegisters, SiblingView, Source, StandingAnswers,
-    StandingToward, StateRoot, TickLine, Timeout, TimeoutCertificate, TimeoutCertificateContext,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, VerdictQuestion,
-    Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition, asks, counts, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    ChainOrigin, CommittedTip, Decision, Finalization, HALT_HARVEST_WAIT, HALT_THRESHOLD_EPOCHS,
+    IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
+    QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters, SiblingView, Source,
+    StandingAnswers, StandingToward, StateRoot, TickLine, Timeout, TimeoutCertificate,
+    TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
+    asks, counts, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -203,6 +203,7 @@ use crate::proposal::{
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::standing_answers::HeldAnswers;
+use crate::sync_claims::{Carrier, ClaimOutcome, EpochWalk, SyncClaims};
 use crate::tick_members::{
     Ancestry, OfferedLegs, OwnContent, committed_sets, derived_terms, ends_licensed, hearing_rows,
     legs_licensed, legs_that_stand, sibling_view, sibling_views, stated_terms,
@@ -246,6 +247,24 @@ enum Abandonment {
     /// A certificate assembled elsewhere.
     Certified,
 }
+
+/// How many windows below a cited certificate's own a sync claim walks
+/// looking for its signer.
+///
+/// The QC over a block is signed by the committee at its grandparent's QC
+/// stamp, so a signer `d` windows below the stamp means the chain certified
+/// nothing in the `d - 2` whole windows between: a stall. A stall of more
+/// than [`HALT_THRESHOLD_EPOCHS`] missed boundary folds flags the shard
+/// halted at the fold of the window after the last one it certified in,
+/// at the earliest, which seats a recovery whose bridge is the window after
+/// that. From then every QC stamped at or past one window below the bridge
+/// resolves the fresh committee, so a QC the stalled committee signs can
+/// be stamped at most `HALT_THRESHOLD_EPOCHS + 2` windows above its signer
+/// and still verify. A recovery the pool cannot seat at once leaves the
+/// stalled committee able to resume further up; the walk then misses the
+/// first two QCs it certifies, and the third, signed in its own window,
+/// starts the sync.
+const SYNC_CLAIM_WALK_DEPTH: u64 = HALT_THRESHOLD_EPOCHS + 2;
 
 /// Cap on distinct pending headers retained per `(height, round)`. An honest
 /// proposer signs exactly one block per round, so anything beyond a small
@@ -562,6 +581,10 @@ pub struct ShardCoordinator {
 
     /// Sync coordination (block buffering, verification tracking, sync flag).
     block_sync: BlockSyncManager,
+
+    /// Certificates peers cited for blocks this replica does not hold,
+    /// verified before a sync starts toward them.
+    sync_claims: SyncClaims,
 
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     proposal: ProposalTracker,
@@ -880,6 +903,7 @@ impl ShardCoordinator {
                 recovered.chain_origin,
             ),
             block_sync: BlockSyncManager::new(),
+            sync_claims: SyncClaims::default(),
             proposal: ProposalTracker::new(),
             dedup_index,
             committed_carried: CommittedCarried::default(),
@@ -1632,9 +1656,10 @@ impl ShardCoordinator {
 
     /// Set whether this validator is currently syncing.
     ///
-    /// When syncing:
-    /// - Proposer will create empty "sync blocks" instead of skipping their turn
-    /// - View changes are suppressed (we're intentionally behind)
+    /// While syncing a proposer builds empty sync blocks rather than
+    /// skipping its turn, and pending-block fetches stand aside for the
+    /// sync. The round timer runs as ever. Leaving sync resets the round
+    /// clock, once per view, sharing its latch with the header reset.
     fn set_block_syncing(&mut self, syncing: bool) {
         if syncing && !self.block_sync.is_syncing() {
             info!(
@@ -1646,8 +1671,7 @@ impl ShardCoordinator {
                 validator = ?self.me,
                 "Exiting sync mode - resuming normal block production"
             );
-            // Reset leader activity timeout since we've caught up
-            self.view_change.last_leader_activity = Some(self.now);
+            self.view_change.record_sync_exit_activity(self.now);
         }
         self.block_sync.set_syncing(syncing);
     }
@@ -1680,10 +1704,7 @@ impl ShardCoordinator {
     /// proposer builds empty sync blocks at once. `BlockSyncComplete`
     /// clears it.
     fn start_block_sync(&mut self, target_height: BlockHeight) -> Vec<Action> {
-        let frontier = self
-            .committed_height
-            .max(self.block_sync.sync_applied_height());
-        if target_height <= frontier {
+        if target_height <= self.sync_frontier() {
             return vec![];
         }
 
@@ -3839,16 +3860,20 @@ impl ShardCoordinator {
             "Received block header"
         );
 
-        // Absorbing the parent QC may have started block sync, latching the
-        // coordinator's syncing flag. The runner only learns the sync target
-        // from the returned action, so every drop path below must still
-        // return `sync_actions` — discarding them leaves the flag set with
-        // no fetch ever issued, and the flag blocks any retrigger.
-        let sync_actions = self.absorb_parent_qc_from_header(topology_schedule, header);
-
         if self.reject_invalid_header(topology_schedule, header) {
-            return sync_actions;
+            return vec![];
         }
+
+        // Absorbing the parent QC may adopt it, or dispatch the verification
+        // that gates a block sync toward a parent this replica does not hold.
+        // Every drop path below must still return `sync_actions`: a claim
+        // whose verification is discarded holds the proposer's slot until
+        // it ages out, and the proposer's later claims wait behind it. The
+        // claim is made before the lookahead cap, which bounds stored
+        // headers, not the heights a verified certificate proves exist: a
+        // replica further behind than the cap still learns its sync target
+        // from the header.
+        let sync_actions = self.absorb_parent_qc_from_header(topology_schedule, header);
 
         if self.pending_blocks.contains_key(block_hash) {
             trace!("Already have pending block {}", block_hash);
@@ -3932,9 +3957,13 @@ impl ShardCoordinator {
         // Process this block's own completion — unless vote verification was
         // already scheduled (we only short-circuit on that case, still falling
         // through for sync-only extensions).
-        let scheduled_vote_verification = actions
-            .iter()
-            .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
+        let scheduled_vote_verification = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::VerifyQcSignature { subject, .. }
+                    if !matches!(subject, QcSubject::SyncClaim(_))
+            )
+        });
         if !scheduled_vote_verification
             && !self.finalize_complete_block(topology_schedule, block_hash, &mut actions)
         {
@@ -3948,10 +3977,10 @@ impl ShardCoordinator {
         actions
     }
 
-    /// If `header.parent_qc()` moves the chain forward, adopt it: trigger sync
-    /// when the parent is missing, update `latest_qc`, fire two-chain commit,
-    /// and schedule a proposal attempt. Returns any sync/commit/continuation
-    /// actions produced along the way.
+    /// If `header.parent_qc()` moves the chain forward, adopt it: claim a
+    /// sync when the parent is missing, update `latest_qc`, fire two-chain
+    /// commit, and schedule a proposal attempt. Returns any
+    /// sync/commit/continuation actions produced along the way.
     ///
     /// Crucially this does NOT return early when sync is needed — we keep
     /// processing the header so the validator can still participate in
@@ -3974,7 +4003,11 @@ impl ShardCoordinator {
         let have_parent = self.holds_complete_block(parent_height, header.parent_qc().block_hash());
 
         if !have_parent {
-            actions = self.sync_to_certified_block(topology_schedule, header.parent_qc());
+            actions = self.sync_to_certified_block(
+                topology_schedule,
+                header.parent_qc_verifiable(),
+                Carrier::Proposer(header.proposer()),
+            );
         }
 
         // Defer adoption until the signature has been verified. Without
@@ -4005,12 +4038,283 @@ impl ShardCoordinator {
     }
 
     /// Sync toward the block `qc` certifies, which this replica does not
-    /// hold complete. The QC is a claim until its block arrives: its
-    /// committee resolves off that block's header, so it cannot be
-    /// verified first. Sync admits only blocks whose own QCs verify, so a
-    /// fabricated target costs a bounded fetch round that the sync settles
-    /// as unfounded, never state.
+    /// hold complete, once `qc` verifies. `carrier` is the peer that cited
+    /// it.
+    ///
+    /// Until it verifies the certified height is a claim, and block sync
+    /// has no exit for a target the network cannot serve: a sync toward a
+    /// fabricated height holds this replica in sync mode, proposing empty
+    /// blocks, until it restarts. So the signature is checked first. The
+    /// committee that signed `qc` resolves off its block's parent, which
+    /// is not held either, so it is checked against the committees
+    /// [`Self::sync_claim_candidates`] names, and the first that verifies
+    /// it starts the sync. A claim none of them verifies is dropped. A
+    /// certificate already verified, by an earlier claim, by the QC cache,
+    /// or by a local sender that hands it over verified, starts the sync
+    /// at once.
     fn sync_to_certified_block(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        qc: &Verifiable<QuorumCertificate>,
+        carrier: Carrier,
+    ) -> Vec<Action> {
+        if qc.shard_id() != self.local_shard
+            || qc.is_genesis()
+            || qc.height() <= self.sync_frontier()
+            || self.fork_refuses_retained_suffix(topology_schedule, qc)
+        {
+            return Vec::new();
+        }
+        let verified = qc.is_verified()
+            || self
+                .verification
+                .cached_qc(&qc.block_hash())
+                .is_some_and(|cached| cached.as_ref() == &**qc)
+            || self.sync_claims.is_verified(qc);
+        if verified {
+            return self.start_verified_claim_sync(topology_schedule, qc);
+        }
+        self.sync_claims.observe_schedule(
+            topology_schedule
+                .retained_epochs()
+                .map(|(_, newest)| newest),
+        );
+        if !self
+            .sync_claims
+            .admits(carrier, qc, self.view_change.view, self.now)
+        {
+            return Vec::new();
+        }
+        let (mut committees, mut walk) = self.sync_claim_candidates(topology_schedule, qc);
+        let mut tried: Vec<Hash> = committees
+            .iter()
+            .map(|committee| self.committee_digest(committee))
+            .collect();
+        if committees.is_empty()
+            && let Some((committee, digest)) = self.walk_committee(
+                topology_schedule,
+                qc.weighted_timestamp(),
+                &mut walk,
+                &tried,
+            )
+        {
+            committees.push(committee);
+            tried.push(digest);
+        }
+        if committees.is_empty() {
+            debug!(
+                validator = ?self.me,
+                ?carrier,
+                target_height = qc.height().inner(),
+                "No committee resolves for a cited certificate yet — not syncing toward it"
+            );
+            return Vec::new();
+        }
+        let id = self
+            .sync_claims
+            .track(carrier, (**qc).clone(), tried, walk, self.now);
+        committees
+            .into_iter()
+            .map(|committee| self.sync_claim_verification(committee, qc.clone(), id))
+            .collect()
+    }
+
+    /// The committees that can have signed `qc`, a certificate over a block
+    /// above this replica's tip, and the windows to walk once they all
+    /// refute.
+    ///
+    /// A QC over block `b` is signed by the committee at the timestamp of
+    /// the QC over `b`'s grandparent, which lies between this replica's tip
+    /// anchor and `qc`'s own timestamp. The candidates are the tip
+    /// committee and the committee of `qc`'s own window. They cover every
+    /// signer but the outgoing committee of a cut, whose last two blocks
+    /// carry QCs stamped in the incoming window, and, after a stall of a
+    /// whole window or more, the committee that resumes the chain, whose
+    /// first two QCs are stamped windows above it. So once both refute, the
+    /// windows between are walked from `qc`'s down, one pairing at a time,
+    /// skipping a committee already tried. The common case costs at most
+    /// two pairings.
+    ///
+    /// The walk stops at the window above the tip's, at the oldest window
+    /// the schedule holds, and [`SYNC_CLAIM_WALK_DEPTH`] windows below
+    /// `qc`'s, whichever is highest, so a stamp a forger chose costs at
+    /// most that many pairings however far behind this replica is. It also
+    /// stays below the newest window the schedule holds.
+    ///
+    /// A tip on a certified sibling the chain abandoned can anchor one
+    /// window above the canonical chain's, when the two siblings' parent
+    /// QCs straddle a cut; the canonical chain's next two QCs are then
+    /// signed below the floor. That is transient: the QCs after them are
+    /// signed at or above the tip's window, and a refutation lapses within
+    /// one retry interval.
+    ///
+    /// A committee the beacon has not committed yet is left out until it
+    /// has, an evicted one for good, and one that seats nobody here always:
+    /// its quorum is empty.
+    ///
+    /// During a pending recovery a certificate the retained committee
+    /// signed in the suffix band resolves nothing: a retained committee
+    /// beyond f can sign such a certificate at any height. That also
+    /// refuses an honest one, so a continuing member whose tip lags below
+    /// the halted tip cannot reach it through a claim; the halt harvest is
+    /// what carries it there, from the retained ex-members' timeouts.
+    fn sync_claim_candidates<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> (Vec<&'t TopologySnapshot>, Option<EpochWalk>) {
+        let qc_wt = qc.weighted_timestamp();
+        let qc_epoch = topology_schedule.epoch_for(qc_wt);
+        let tip_anchor = self.next_proposal_committee_anchor_wt();
+        let tip_epoch = tip_anchor.map(|anchor| topology_schedule.epoch_for(anchor));
+        let above_tip = |epoch: Epoch| tip_epoch.is_none_or(|tip| epoch > tip);
+        let mut committees: Vec<&'t TopologySnapshot> = Vec::new();
+        for anchor in tip_anchor
+            .into_iter()
+            .chain(above_tip(qc_epoch).then_some(qc_wt))
+        {
+            if let Some(committee) = self.sync_claim_committee(topology_schedule, anchor, qc_wt)
+                && !committees
+                    .iter()
+                    .any(|held| self.committee_digest(held) == self.committee_digest(committee))
+            {
+                committees.push(committee);
+            }
+        }
+        let walk = topology_schedule
+            .retained_epochs()
+            .zip(qc_epoch.inner().checked_sub(1))
+            .and_then(|((oldest, newest), below)| {
+                let floor = tip_epoch
+                    .map_or(oldest, |tip| tip.next().max(oldest))
+                    .max(qc_epoch.saturating_sub(SYNC_CLAIM_WALK_DEPTH));
+                EpochWalk::down(Epoch::new(below).min(newest), floor)
+            });
+        (committees, walk)
+    }
+
+    /// What verifying a QC against `committee` reads, as one digest: its
+    /// keys in seat order and its quorum threshold. Two committees with one
+    /// digest answer every verification alike.
+    fn committee_digest(&self, committee: &TopologySnapshot) -> Hash {
+        let keys = committee_public_keys(committee, self.local_shard);
+        let threshold = committee
+            .quorum_threshold_for_shard(self.local_shard)
+            .inner()
+            .to_le_bytes();
+        let mut parts: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes().as_slice()).collect();
+        parts.push(&threshold);
+        Hash::from_parts(&parts)
+    }
+
+    /// The next committee down `walk` whose digest is not in `tried`,
+    /// advancing `walk` past every window it passes.
+    fn walk_committee<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        qc_wt: WeightedTimestamp,
+        walk: &mut Option<EpochWalk>,
+        tried: &[Hash],
+    ) -> Option<(&'t TopologySnapshot, Hash)> {
+        while let Some(step) = *walk {
+            let (epoch, rest) = step.step();
+            *walk = rest;
+            let anchor = topology_schedule.windows().window_of(epoch).start;
+            if let Some(committee) = self.sync_claim_committee(topology_schedule, anchor, qc_wt) {
+                let digest = self.committee_digest(committee);
+                if !tried.contains(&digest) {
+                    return Some((committee, digest));
+                }
+            }
+        }
+        None
+    }
+
+    /// The committee at `anchor` that can have signed a certificate
+    /// stamped `qc_wt`, for a sync claim. See
+    /// [`Self::sync_claim_candidates`].
+    fn sync_claim_committee<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        anchor: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> Option<&'t TopologySnapshot> {
+        let Some((ScheduleLookup::Committee(committee), _)) =
+            topology_schedule.lookup_for_shard_certified_fenced(self.local_shard, anchor, qc_wt)
+        else {
+            return None;
+        };
+        (!committee
+            .consensus_committee_for_shard(self.local_shard)
+            .is_empty())
+        .then_some(committee.as_ref())
+    }
+
+    /// Verify sync claim `id`'s certificate against `committee`.
+    fn sync_claim_verification(
+        &self,
+        committee: &TopologySnapshot,
+        qc: Verifiable<QuorumCertificate>,
+        id: SyncClaimId,
+    ) -> Action {
+        Action::VerifyQcSignature {
+            qc,
+            public_keys: committee_public_keys(committee, self.local_shard),
+            quorum_threshold: committee.quorum_threshold_for_shard(self.local_shard),
+            subject: QcSubject::SyncClaim(id),
+        }
+    }
+
+    /// One committee answered sync claim `id`.
+    fn on_sync_claim_verified(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        id: SyncClaimId,
+        result: Option<Verified<QuorumCertificate>>,
+    ) -> Vec<Action> {
+        match self
+            .sync_claims
+            .on_result(id, result, self.view_change.view, self.now)
+        {
+            ClaimOutcome::Verified(qc) => self.start_verified_claim_sync(topology_schedule, &qc),
+            ClaimOutcome::Retry(id) => {
+                let Some((qc, mut walk, tried)) = self.sync_claims.walk_of(id) else {
+                    return Vec::new();
+                };
+                let next = self.walk_committee(
+                    topology_schedule,
+                    qc.weighted_timestamp(),
+                    &mut walk,
+                    &tried,
+                );
+                self.sync_claims.resume_walk(
+                    id,
+                    walk,
+                    next.as_ref().map(|(_, digest)| *digest),
+                    self.now,
+                );
+                match next {
+                    Some((committee, _)) => {
+                        vec![self.sync_claim_verification(committee, qc.into(), id)]
+                    }
+                    None => self.on_sync_claim_verified(topology_schedule, id, None),
+                }
+            }
+            ClaimOutcome::Refuted { carrier, qc } => {
+                warn!(
+                    validator = ?self.me,
+                    ?carrier,
+                    target_height = qc.height().inner(),
+                    "A cited certificate verifies under no committee — not syncing toward it"
+                );
+                Vec::new()
+            }
+            ClaimOutcome::Pending => Vec::new(),
+        }
+    }
+
+    /// Start the sync toward a claim that verified.
+    fn start_verified_claim_sync(
         &mut self,
         topology_schedule: &TopologySchedule,
         qc: &QuorumCertificate,
@@ -5450,6 +5754,9 @@ impl ShardCoordinator {
                     }
                 };
             }
+            QcSubject::SyncClaim(id) => {
+                return self.on_sync_claim_verified(topology_schedule, id, result.ok());
+            }
             QcSubject::ParentOf(block_hash) => block_hash,
         };
 
@@ -6238,10 +6545,12 @@ impl ShardCoordinator {
     /// A committee member announced the QC of a block it proposed. Adopt it
     /// when it is above our own `high_qc` and verifies, resetting the round
     /// timer when it moves the view: the round it closes produced a block.
-    /// A QC over a block this replica never received cannot be verified,
-    /// so the block is synced instead and arrives with it: the next leader
-    /// is the replica the announcement exists for, and without the block
-    /// it has nothing to extend.
+    /// A QC over a block this replica never received cannot be verified
+    /// against its own committee, so the block is synced instead once the
+    /// QC verifies under a committee the schedule names for it, and the
+    /// block arrives with it: the next leader is the replica the
+    /// announcement exists for, and without the block it has nothing to
+    /// extend.
     ///
     /// Screened before any crypto: the QC must be above our `high_qc` and
     /// within the pacemaker ceiling, and the announcer a committee member
@@ -6293,7 +6602,11 @@ impl ShardCoordinator {
         }
         let Some(verified) = self.verify_qc_sync(topology_schedule, qc) else {
             if !self.holds_complete_block(qc.height(), qc.block_hash()) {
-                return self.sync_to_certified_block(topology_schedule, qc);
+                return self.sync_to_certified_block(
+                    topology_schedule,
+                    &Verifiable::from(qc.clone()),
+                    Carrier::Relayer(sender),
+                );
             }
             warn!(validator = ?self.me, ?sender, round = round.inner(), "Announced QC failed verification");
             return Vec::new();
@@ -7948,6 +8261,7 @@ impl ShardCoordinator {
         // retransmitted timeout ships.
         let carried_high_qc = timeout.high_qc().clone();
         let carried_tc = timeout.high_tc().cloned();
+        let voter = timeout.voter();
         let mut actions = self.refresh_pacemaker(topology_schedule, committee);
         if !self.timeouts.record(timeout, power) {
             return actions;
@@ -7967,11 +8281,13 @@ impl ShardCoordinator {
         // forgeable, so it passes the same bound and verification as the
         // quorum-max path; a forged one costs one failed pairing.
         //
-        // A QC over a block whose header never arrived cannot be verified,
-        // since its committee resolves off that header, so the block is
-        // synced instead, and its QC arrives with it. Without it a leader
-        // handed its round by these shares has nothing to extend but an
-        // older QC, which no certificate for the abandoned round justifies.
+        // A QC over a block whose header never arrived cannot be verified
+        // against its own committee, which resolves off that header, so the
+        // block is synced instead once the QC verifies under a committee
+        // the schedule names for it, and its QC arrives with it. Without it
+        // a leader handed its round by these shares has nothing to extend
+        // but an older QC, which no certificate for the abandoned round
+        // justifies.
         if carried_high_qc.round() > self.high_qc_round()
             && !qc_weighted_timestamp_too_far_ahead(&carried_high_qc, self.now)
         {
@@ -7980,7 +8296,11 @@ impl ShardCoordinator {
             } else if !self
                 .holds_complete_block(carried_high_qc.height(), carried_high_qc.block_hash())
             {
-                actions.extend(self.sync_to_certified_block(topology_schedule, &carried_high_qc));
+                actions.extend(self.sync_to_certified_block(
+                    topology_schedule,
+                    &Verifiable::from(carried_high_qc),
+                    Carrier::Relayer(voter),
+                ));
             }
         }
         // The carried certificate is read after the carried QC, whose
@@ -15381,27 +15701,22 @@ mod tests {
         );
     }
 
-    /// A header can both trigger block sync (missing parent) and itself be
-    /// dropped (its committee epoch isn't in the schedule yet — the local
-    /// beacon is behind). The sync trigger latches the coordinator's syncing
-    /// flag, and the runner only learns the target from the returned
-    /// `StartBlockSync` action, so the drop path must still return it.
-    /// Swallowing it leaves the flag set with no fetch ever issued, and the
-    /// flag blocks every retrigger — a permanent sync wedge.
+    /// A header can both claim a block sync (missing parent) and itself be
+    /// dropped past the lookahead cap, which bounds stored headers and not
+    /// how far behind a replica can learn it is. The claim's verification
+    /// still reaches the runner: a claim discarded stays in flight, and the
+    /// proposer's later claims wait behind it.
     #[test]
-    fn dropped_header_still_returns_the_sync_trigger_it_latched() {
-        let (mut state, full) = make_multi_validator_state_at(1);
+    fn dropped_header_still_returns_the_sync_claim_it_dispatched() {
+        let (mut state, topology_schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
-        // Retain only epoch 0; the header below keys its committee at epoch
-        // 10, which resolves as not-yet-committed and drops the header.
-        let behind = TopologySchedule::new(5_000, Epoch::GENESIS, Arc::clone(full.head()));
-
-        let parent_height = BlockHeight::new(9);
+        let height = BlockHeight::new(MAX_HEADER_HEIGHT_LOOKAHEAD + 1);
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"missing_parent"));
         let parent_qc = QuorumCertificate::new(
             parent_block_hash,
             ShardId::ROOT,
-            parent_height,
+            BlockHeight::new(MAX_HEADER_HEIGHT_LOOKAHEAD),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(9),
             SignerBitfield::new(4),
@@ -15409,17 +15724,17 @@ mod tests {
             WeightedTimestamp::from_millis(50_000),
         );
         let header = BlockHeader::new(BlockHeaderParts {
-            height: BlockHeight::new(10),
+            height,
             parent_block_hash,
             parent_qc: parent_qc.into(),
             proposer: ValidatorId::new(2),
-            timestamp: ProposerTimestamp::from_millis(50_000),
+            timestamp: ProposerTimestamp::from_millis(100_000),
             round: Round::new(10),
             ..Default::default()
         });
 
         let actions = state.on_block_header(
-            &behind,
+            &topology_schedule,
             &header,
             BlockManifest::default(),
             |_| None,
@@ -15427,16 +15742,14 @@ mod tests {
             |_| None,
         );
 
+        assert!(!state.pending_blocks.contains_key(header.hash()));
         assert!(
-            state.is_block_syncing(),
-            "missing parent must latch the syncing flag"
+            claims_sync(&actions),
+            "the dropped header's sync claim must reach the runner: {actions:?}"
         );
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::StartBlockSync { target } if *target == parent_height
-            )),
-            "the dropped header's sync trigger must reach the runner"
+            !state.is_block_syncing(),
+            "an unverified claim must not latch the syncing flag"
         );
     }
 
@@ -15760,7 +16073,7 @@ mod tests {
         );
     }
 
-    /// A header whose parent QC certifies a block this node lacks starts
+    /// A header whose parent QC certifies a block this node lacks claims a
     /// sync toward it even when the node holds a complete sibling at that
     /// height: its own proposal from a round the chain abandoned is not
     /// the parent, and taking it for one leaves the certified block
@@ -15808,9 +16121,10 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+                Action::VerifyQcSignature { qc, subject: QcSubject::SyncClaim(_), .. }
+                    if qc.block_hash() == certified
             )),
-            "the certified parent must be fetched; got {actions:?}",
+            "the certified parent must be claimed for a sync; got {actions:?}",
         );
     }
 
@@ -16773,12 +17087,10 @@ mod tests {
             state.latest_qc().is_none(),
             "a QC over a block this replica lacks cannot be verified"
         );
+        let answered = answer_sync_claims(&mut state, &topology_schedule, &actions);
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::StartBlockSync { target } if *target == BlockHeight::new(1)
-            )),
-            "the carried QC's block is synced: {actions:?}"
+            starts_sync_to(&answered, BlockHeight::new(1)),
+            "the carried QC's block is synced: {answered:?}"
         );
 
         let block_hash = block.hash();
@@ -17453,12 +17765,10 @@ mod tests {
         let actions = stale_tally(&mut cut);
         assert_eq!(cut.state.view(), Round::new(6));
         assert!(cut.state.high_tc.is_none());
+        let answered = answer_sync_claims(&mut cut.state, &cut.schedule, &actions);
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::StartBlockSync { target } if *target == BlockHeight::new(6)
-            )),
-            "the carried QC's block is synced: {actions:?}"
+            starts_sync_to(&answered, BlockHeight::new(6)),
+            "the carried QC's block is synced: {answered:?}"
         );
 
         let _ = cut.land_q();
@@ -17984,6 +18294,569 @@ mod tests {
         assert_eq!(cut.state.view(), view);
     }
 
+    /// Answer every sync claim verification in `actions` as the crypto
+    /// pool would, and the follow-ups the answers dispatch, and return
+    /// everything else the answers produce.
+    fn answer_sync_claims(
+        state: &mut ShardCoordinator,
+        topology_schedule: &TopologySchedule,
+        actions: &[Action],
+    ) -> Vec<Action> {
+        answer_sync_claims_counted(state, topology_schedule, actions).0
+    }
+
+    /// [`answer_sync_claims`], with how many verifications it answered.
+    fn answer_sync_claims_counted(
+        state: &mut ShardCoordinator,
+        topology_schedule: &TopologySchedule,
+        actions: &[Action],
+    ) -> (Vec<Action>, usize) {
+        let net = NetworkDefinition::simulator();
+        let mut answered = Vec::new();
+        let mut verifications = 0;
+        let mut queue: Vec<Action> = actions.to_vec();
+        while !queue.is_empty() {
+            let mut follow_ups = Vec::new();
+            for action in queue {
+                let Action::VerifyQcSignature {
+                    qc,
+                    public_keys,
+                    quorum_threshold,
+                    subject: subject @ QcSubject::SyncClaim(_),
+                } = action
+                else {
+                    continue;
+                };
+                verifications += 1;
+                let result = qc.as_unverified().verify(&QcContext {
+                    verifier: &BlsVerifier,
+                    network: &net,
+                    public_keys: &public_keys,
+                    quorum_threshold,
+                });
+                for produced in state.on_qc_signature_verified(topology_schedule, subject, result) {
+                    if claims_sync(std::slice::from_ref(&produced)) {
+                        follow_ups.push(produced);
+                    } else {
+                        answered.push(produced);
+                    }
+                }
+            }
+            queue = follow_ups;
+        }
+        (answered, verifications)
+    }
+
+    fn starts_sync_to(actions: &[Action], height: BlockHeight) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::StartBlockSync { target } if *target == height))
+    }
+
+    fn claims_sync(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::VerifyQcSignature {
+                    subject: QcSubject::SyncClaim(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// A header over block 1 at round 2, citing `parent_qc` for it, from
+    /// round 2's proposer.
+    fn header_citing(
+        topology_schedule: &TopologySchedule,
+        block: &Block,
+        parent_qc: QuorumCertificate,
+    ) -> BlockHeader {
+        BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(2),
+            parent_block_hash: block.hash(),
+            parent_qc: parent_qc.into(),
+            proposer: topology_schedule
+                .head()
+                .proposer_for(ShardId::ROOT, Round::new(2)),
+            timestamp: ProposerTimestamp::from_millis(100_000),
+            round: Round::new(2),
+            ..Default::default()
+        })
+    }
+
+    /// A header citing a certificate over a block this replica lacks
+    /// starts the sync toward it once the certificate verifies.
+    #[test]
+    fn a_header_citing_a_certificate_that_verifies_starts_the_sync() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+        let header = header_citing(&topology_schedule, &block, (*qc).clone());
+
+        let actions = state.on_block_header(
+            &topology_schedule,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(claims_sync(&actions), "{actions:?}");
+        assert!(!state.is_block_syncing(), "a claim alone starts no sync");
+
+        let answered = answer_sync_claims(&mut state, &topology_schedule, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(1)),
+            "{answered:?}"
+        );
+        assert!(state.is_block_syncing());
+    }
+
+    /// A header citing a certificate whose signature does not verify
+    /// starts no sync: block sync has no exit for a height the network
+    /// cannot serve, so a forged target would hold the replica in sync
+    /// mode, proposing empty blocks, until it restarts.
+    #[test]
+    fn a_header_citing_a_forged_certificate_starts_no_sync() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let real = quorum_over_round_one(&state, &keys, &block);
+        let mut signers = SignerBitfield::new(4);
+        for idx in 0..4 {
+            signers.set(idx);
+        }
+        let forged = QuorumCertificate::new(
+            real.block_hash(),
+            real.shard_id(),
+            BlockHeight::new(1),
+            real.parent_block_hash(),
+            real.round(),
+            signers,
+            AggregateSignature::ZERO,
+            real.weighted_timestamp(),
+        );
+        let header = header_citing(&topology_schedule, &block, forged);
+
+        let actions = state.on_block_header(
+            &topology_schedule,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(claims_sync(&actions), "{actions:?}");
+        assert!(
+            !starts_sync_to(&actions, BlockHeight::new(1)),
+            "{actions:?}"
+        );
+
+        let answered = answer_sync_claims(&mut state, &topology_schedule, &actions);
+        assert!(
+            !answered
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. })),
+            "a forged certificate must start no sync: {answered:?}"
+        );
+        assert!(!state.is_block_syncing());
+
+        // The refuted proposer makes no other claim in this view; in the
+        // next, the real certificate it cites is checked and starts the
+        // sync.
+        let header = header_citing(&topology_schedule, &block, (*real).clone());
+        let deliver = |state: &mut ShardCoordinator| {
+            state.on_block_header(
+                &topology_schedule,
+                &header,
+                BlockManifest::default(),
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+        };
+        let actions = deliver(&mut state);
+        assert!(!claims_sync(&actions), "{actions:?}");
+        state.view_change.advance_to(state.view().next());
+        let actions = deliver(&mut state);
+        let answered = answer_sync_claims(&mut state, &topology_schedule, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(1)),
+            "{answered:?}"
+        );
+    }
+
+    /// A certificate a header carries while a halt recovery is pending,
+    /// signed by the retained committee and stamped in the suffix band,
+    /// starts no sync: a retained committee beyond f signs such a
+    /// certificate at any height, and the halted suffix is the harvest's
+    /// to fetch.
+    #[test]
+    fn a_retained_suffix_certificate_starts_no_sync_during_a_halt_recovery() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let recovering = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![
+                ValidatorId::new(1),
+                ValidatorId::new(2),
+                ValidatorId::new(3),
+            ],
+            Epoch::new(2),
+        ));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+        let header = header_citing(&recovering, &block, (*qc).clone());
+
+        let actions = state.on_block_header(
+            &recovering,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        let answered = answer_sync_claims(&mut state, &recovering, &actions);
+        assert!(!claims_sync(&actions), "{actions:?}");
+        assert!(
+            !starts_sync_to(&answered, BlockHeight::new(1)),
+            "{answered:?}"
+        );
+        assert!(!state.is_block_syncing());
+    }
+
+    /// Epoch duration of [`claim_epochs`].
+    const CLAIM_ED: u64 = 10_000;
+
+    /// A replica whose tip anchors in epoch 0, on a schedule whose epochs
+    /// 0 to 3 seat disjoint committees, so a certificate verifies under
+    /// exactly one of them.
+    fn claim_epochs() -> (
+        ShardCoordinator,
+        TopologySchedule,
+        BTreeMap<u64, BlsSigner>,
+        [Arc<TopologySnapshot>; 4],
+    ) {
+        let keys: BTreeMap<u64, BlsSigner> =
+            (0u64..16).map(|id| (id, BlsSigner::generate())).collect();
+        let epochs = [
+            [0u64, 1, 2, 3],
+            [4, 5, 6, 7],
+            [8, 9, 10, 11],
+            [12, 13, 14, 15],
+        ]
+        .map(|ids| Arc::new(committee_snapshot_over(&keys, &ids)));
+        let mut schedule = TopologySchedule::new(CLAIM_ED, Epoch::new(0), Arc::clone(&epochs[0]));
+        schedule.insert(Epoch::new(1), Arc::clone(&epochs[1]));
+        schedule.insert(Epoch::new(2), Arc::clone(&epochs[2]));
+        schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+        state.set_time(LocalTimestamp::from_millis(3 * CLAIM_ED));
+        (state, schedule, keys, epochs)
+    }
+
+    /// A QC at `height` stamped `stamp_ms`, signed by three of
+    /// `committee`'s members.
+    fn qc_signed_by(
+        keys: &BTreeMap<u64, BlsSigner>,
+        committee: &TopologySnapshot,
+        height: u64,
+        stamp_ms: u64,
+    ) -> QuorumCertificate {
+        let net = NetworkDefinition::simulator();
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(&height.to_le_bytes()));
+        let votes: Vec<(usize, Verified<BlockVote>)> = committee
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .iter()
+            .take(3)
+            .map(|voter| {
+                let vote = Verified::<BlockVote>::sign_local(
+                    &net,
+                    block_hash,
+                    BlockHash::ZERO,
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    Round::new(height),
+                    *voter,
+                    &keys[&voter.inner()],
+                    ProposerTimestamp::from_millis(stamp_ms),
+                )
+                .expect("sign");
+                let position = committee
+                    .committee_index_for_shard(ShardId::ROOT, *voter)
+                    .expect("a member");
+                (position, vote)
+            })
+            .collect();
+        Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
+            block_hash,
+            ShardId::ROOT,
+            BlockHeight::new(height),
+            Round::new(height),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(stamp_ms),
+            &votes,
+        )
+        .expect("vote aggregation succeeds")
+        .into_inner()
+    }
+
+    fn sync_claim_count(actions: &[Action]) -> usize {
+        actions
+            .iter()
+            .filter(|a| claims_sync(std::slice::from_ref(a)))
+            .count()
+    }
+
+    /// A certificate stamped two windows above the tip, signed by the
+    /// committee of the window it is stamped in, verifies under it.
+    #[test]
+    fn a_claim_verifies_under_the_window_its_certificate_is_stamped_in() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
+
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(qc),
+            Carrier::Proposer(ValidatorId::new(8)),
+        );
+        assert_eq!(sync_claim_count(&actions), 2, "{actions:?}");
+        let answered = answer_sync_claims(&mut state, &schedule, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(12)),
+            "{answered:?}"
+        );
+    }
+
+    /// A replica that cannot resolve its tip's anchor still checks a claim
+    /// against the committees the certificate's own stamp names.
+    #[test]
+    fn a_claim_without_a_tip_anchor_still_tries_the_stamped_window() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        let unheld = qc_signed_by(&keys, &epochs[0], 5, 100);
+        state.latest_qc = Some(Verified::new_unchecked_for_test(unheld));
+        assert_eq!(state.next_proposal_committee_anchor_wt(), None);
+        let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
+
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(qc),
+            Carrier::Proposer(ValidatorId::new(8)),
+        );
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
+        let answered = answer_sync_claims(&mut state, &schedule, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(12)),
+            "{answered:?}"
+        );
+    }
+
+    /// After a stall of a whole window, the committee that resumes the
+    /// chain signs its first QCs stamped two windows above its own. A
+    /// replica whose tip anchors below it walks the windows down from the
+    /// stamp's, one pairing at a time, until one verifies.
+    #[test]
+    fn a_claim_walks_down_past_a_stalled_window_to_its_signer() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        let qc = qc_signed_by(&keys, &epochs[1], 20, 3 * CLAIM_ED + 5);
+
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(qc),
+            Carrier::Proposer(ValidatorId::new(4)),
+        );
+        assert_eq!(sync_claim_count(&actions), 2, "{actions:?}");
+        let answered = answer_sync_claims(&mut state, &schedule, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(20)),
+            "{answered:?}"
+        );
+    }
+
+    /// An honest certificate refuted while this replica's beacon lacks its
+    /// signer's window is checked again once the beacon holds it, or once
+    /// the retry interval passes, in the same view: a lagging replica's
+    /// view does not move while it cannot verify the network's
+    /// certificates.
+    #[test]
+    fn a_claim_refuted_while_the_beacon_lags_is_retried_once_it_catches_up() {
+        let (mut state, full, keys, epochs) = claim_epochs();
+        let mut partial = TopologySchedule::new(CLAIM_ED, Epoch::new(0), Arc::clone(&epochs[0]));
+        partial.insert(Epoch::new(1), Arc::clone(&epochs[1]));
+        let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
+        let view = state.view();
+
+        let refute = |state: &mut ShardCoordinator, carrier: Carrier| {
+            let actions =
+                state.sync_to_certified_block(&partial, &Verifiable::from(qc.clone()), carrier);
+            assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
+            let answered = answer_sync_claims(state, &partial, &actions);
+            assert!(
+                !starts_sync_to(&answered, BlockHeight::new(12)),
+                "{answered:?}"
+            );
+        };
+
+        // Retried once the interval passes, with the schedule unchanged.
+        let waiting = Carrier::Proposer(ValidatorId::new(9));
+        refute(&mut state, waiting);
+        assert_eq!(
+            sync_claim_count(&state.sync_to_certified_block(
+                &partial,
+                &Verifiable::from(qc.clone()),
+                waiting
+            )),
+            0,
+            "a refuted carrier waits out the interval"
+        );
+        state.set_time(state.now.plus(VIEW_CHANGE_TIMEOUT_DEFAULT));
+        let actions =
+            state.sync_to_certified_block(&partial, &Verifiable::from(qc.clone()), waiting);
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
+        let _ = answer_sync_claims(&mut state, &partial, &actions);
+
+        // Retried at once when the beacon gains the signer's window.
+        let lagging = Carrier::Proposer(ValidatorId::new(8));
+        refute(&mut state, lagging);
+        assert_eq!(state.view(), view);
+        let actions = state.sync_to_certified_block(&full, &Verifiable::from(qc.clone()), lagging);
+        assert!(sync_claim_count(&actions) > 0, "{actions:?}");
+        let answered = answer_sync_claims(&mut state, &full, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(12)),
+            "{answered:?}"
+        );
+        assert_eq!(state.view(), view);
+    }
+
+    /// A window that seats a committee already tried is skipped: here the
+    /// stalled window seats the stamp's committee again, so the walk spends
+    /// no pairing on it and goes on to the signer below.
+    #[test]
+    fn a_walk_skips_a_window_seating_a_committee_already_tried() {
+        let (mut state, _, keys, epochs) = claim_epochs();
+        let mut schedule = TopologySchedule::new(CLAIM_ED, Epoch::new(0), Arc::clone(&epochs[0]));
+        schedule.insert(Epoch::new(1), Arc::clone(&epochs[1]));
+        schedule.insert(Epoch::new(2), Arc::clone(&epochs[3]));
+        schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
+        let qc = qc_signed_by(&keys, &epochs[1], 20, 3 * CLAIM_ED + 5);
+
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(qc),
+            Carrier::Proposer(ValidatorId::new(4)),
+        );
+        let (answered, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
+        assert_eq!(verifications, 3, "tip, stamp and the signer's window");
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(20)),
+            "{answered:?}"
+        );
+    }
+
+    /// With no tip anchor the walk runs down to the oldest window the
+    /// schedule holds.
+    #[test]
+    fn a_walk_without_a_tip_anchor_reaches_the_oldest_retained_window() {
+        let (mut state, _, keys, epochs) = claim_epochs();
+        let mut schedule = TopologySchedule::new(CLAIM_ED, Epoch::new(1), Arc::clone(&epochs[1]));
+        schedule.insert(Epoch::new(2), Arc::clone(&epochs[2]));
+        schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
+        let unheld = qc_signed_by(&keys, &epochs[0], 5, 100);
+        state.latest_qc = Some(Verified::new_unchecked_for_test(unheld));
+        assert_eq!(state.next_proposal_committee_anchor_wt(), None);
+        let qc = qc_signed_by(&keys, &epochs[1], 20, 3 * CLAIM_ED + 5);
+
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(qc),
+            Carrier::Proposer(ValidatorId::new(4)),
+        );
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
+        let (answered, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
+        assert_eq!(verifications, 3, "the stamp's window, then 2 and 1");
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(20)),
+            "{answered:?}"
+        );
+    }
+
+    /// A certificate no retained committee signed walks every window down
+    /// to the floor, one pairing each, then is refuted and its carrier
+    /// held off.
+    #[test]
+    fn a_walk_that_finds_no_signer_is_refuted_after_every_window() {
+        let (mut state, schedule, _, _) = claim_epochs();
+        let stranger: BTreeMap<u64, BlsSigner> =
+            (0u64..4).map(|id| (id, BlsSigner::generate())).collect();
+        let outsiders = committee_snapshot_over(&stranger, &[0, 1, 2, 3]);
+        let qc = qc_signed_by(&stranger, &outsiders, 20, 3 * CLAIM_ED + 5);
+        let carrier = Carrier::Proposer(ValidatorId::new(4));
+
+        let actions =
+            state.sync_to_certified_block(&schedule, &Verifiable::from(qc.clone()), carrier);
+        let (answered, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
+        assert_eq!(verifications, 4, "tip, stamp, then windows 2 and 1");
+        assert!(
+            !answered
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. })),
+            "{answered:?}"
+        );
+        let again = state.sync_to_certified_block(&schedule, &Verifiable::from(qc), carrier);
+        assert_eq!(sync_claim_count(&again), 0, "{again:?}");
+    }
+
+    /// A certificate stamped far past every window the schedule holds is
+    /// checked against the tip committee alone: its own window is not
+    /// committed, and the walk stays within the windows held.
+    #[test]
+    fn a_far_future_stamp_walks_no_further_than_the_schedule_holds() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        let qc = qc_signed_by(&keys, &epochs[1], 20, u64::MAX / 2);
+
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(qc),
+            Carrier::Proposer(ValidatorId::new(4)),
+        );
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
+        let (_, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
+        assert_eq!(verifications, 1);
+    }
+
+    /// The last two blocks an outgoing committee signs carry QCs stamped
+    /// in the incoming window. For a replica whose tip anchors a window
+    /// before both, they verify under the window before the stamp, tried
+    /// once the tip's and the stamp's committees refute.
+    #[test]
+    fn an_outgoing_committees_last_two_blocks_verify_under_the_window_before() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        for (height, stamp) in [(10, 2 * CLAIM_ED + 5), (11, 2 * CLAIM_ED + 50)] {
+            let qc = qc_signed_by(&keys, &epochs[1], height, stamp);
+            let actions = state.sync_to_certified_block(
+                &schedule,
+                &Verifiable::from(qc),
+                Carrier::Proposer(ValidatorId::new(height)),
+            );
+            assert_eq!(sync_claim_count(&actions), 2, "{actions:?}");
+            let answered = answer_sync_claims(&mut state, &schedule, &actions);
+            assert!(
+                starts_sync_to(&answered, BlockHeight::new(height)),
+                "height {height}: {answered:?}"
+            );
+        }
+    }
+
     /// A 3-of-4 QC over `block` at round 1, signed by `keys[1..=3]`.
     fn quorum_over_round_one(
         state: &ShardCoordinator,
@@ -18065,7 +18938,8 @@ mod tests {
     }
 
     /// A member that never received the announced QC's block syncs it: the
-    /// QC cannot be verified without the block's header, and the block
+    /// QC cannot be verified against its own committee without the block's
+    /// header, so it is checked against the tip committee, and the block
     /// arrives with it.
     #[test]
     fn an_announced_qc_over_a_missing_block_syncs_the_block() {
@@ -18075,14 +18949,12 @@ mod tests {
         let qc = quorum_over_round_one(&state, &keys, &block);
 
         let actions = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+        let answered = answer_sync_claims(&mut state, &topology_schedule, &actions);
 
         assert!(state.latest_qc().is_none());
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::StartBlockSync { target } if *target == BlockHeight::new(1)
-            )),
-            "the announced QC's block is synced; got {actions:?}",
+            starts_sync_to(&answered, BlockHeight::new(1)),
+            "the announced QC's block is synced; got {answered:?}",
         );
     }
 

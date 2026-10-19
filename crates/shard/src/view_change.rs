@@ -11,9 +11,10 @@
 //!   the backoff (the timeout doubles per round since the last commit).
 //! - `last_leader_activity` — any signal from the leader (proposal, header,
 //!   QC, commit) resets the timeout.
-//! - `last_header_reset` — rate-limits `record_header_activity` to once per
-//!   view, so neither a Byzantine leader's distinct headers nor a peer
-//!   replaying old ones can delay a view change indefinitely.
+//! - `latched_reset` — rate-limits the resets no quorum backs, a header's
+//!   and a sync exit's, to one per view between them, so neither a
+//!   Byzantine leader's distinct headers, a peer replaying old ones, nor a
+//!   sync completing late in the view can delay a view change indefinitely.
 
 use std::time::Duration;
 
@@ -41,10 +42,11 @@ pub struct ViewChangeController {
     /// changes before any leader has had a chance to act.
     pub(crate) last_leader_activity: Option<LocalTimestamp>,
 
-    /// The view in which a header last reset the leader-activity timer.
-    /// Ensures a single header reset per view: cleared only when the view
-    /// moves, never by a timer fire.
-    pub(crate) last_header_reset: Option<Round>,
+    /// The view in which a header or a sync exit last reset the
+    /// leader-activity timer. Ensures one such reset per view, whichever
+    /// comes first: cleared only when the view moves, never by a timer
+    /// fire.
+    pub(crate) latched_reset: Option<Round>,
 
     /// Cumulative count of view changes (round advances due to local
     /// leader-activity timeout). Self-originated only; does not count
@@ -74,7 +76,7 @@ impl ViewChangeController {
             view: initial_view,
             view_at_height_start: initial_view,
             last_leader_activity: None,
-            last_header_reset: None,
+            latched_reset: None,
             view_changes: 0,
             view_syncs: 0,
             delay: DelayEstimator::new(),
@@ -110,12 +112,24 @@ impl ViewChangeController {
 
     /// Record leader progress from a received header of `round`. Only a
     /// header of the current view counts, and only the first one in that
-    /// view, so the round timer fires within one progress wait of the view's
-    /// last reset whatever headers keep arriving.
+    /// view, before any sync exit there, so the round timer fires within
+    /// one progress wait of the view's last reset whatever headers keep
+    /// arriving.
     pub(crate) fn record_header_activity(&mut self, round: Round, now: LocalTimestamp) {
-        if round == self.view && self.last_header_reset != Some(round) {
+        if round == self.view && self.latched_reset != Some(round) {
             self.last_leader_activity = Some(now);
-            self.last_header_reset = Some(round);
+            self.latched_reset = Some(round);
+        }
+    }
+
+    /// Record a block sync's exit, which caught this replica up to a
+    /// certified height: the view's leader gets a full round from here,
+    /// unless a header or an earlier exit already reset the clock in this
+    /// view.
+    pub(crate) fn record_sync_exit_activity(&mut self, now: LocalTimestamp) {
+        if self.latched_reset != Some(self.view) {
+            self.last_leader_activity = Some(now);
+            self.latched_reset = Some(self.view);
         }
     }
 
@@ -204,13 +218,13 @@ impl ViewChangeController {
 
     /// Advance the view to `target` because a 2f+1 timeout quorum proved the
     /// round abandoned. Counts as a view change (the pacemaker synchronised the
-    /// cluster), and clears the header-reset tracker so the new round accepts a
-    /// fresh header-activity reset. Returns `true` if the view advanced.
+    /// cluster), and clears the reset latch so the new round accepts a
+    /// fresh latched reset. Returns `true` if the view advanced.
     pub(crate) fn advance_to(&mut self, target: Round) -> bool {
         if target > self.view {
             self.view = target;
             self.view_changes += 1;
-            self.last_header_reset = None;
+            self.latched_reset = None;
             true
         } else {
             false
@@ -220,7 +234,7 @@ impl ViewChangeController {
     /// Lower the view to `target`, the round the tip committee's
     /// certificates justify, when a change of that committee left the view
     /// above it. The backoff baseline never sits above the view, and the
-    /// lowered round accepts a fresh header-activity reset. Counters are
+    /// lowered round accepts a fresh latched reset. Counters are
     /// untouched. Returns `true` if the view fell.
     pub(crate) fn fall_back(&mut self, target: Round) -> bool {
         if target >= self.view {
@@ -228,20 +242,20 @@ impl ViewChangeController {
         }
         self.view = target;
         self.view_at_height_start = self.view_at_height_start.min(target);
-        self.last_header_reset = None;
+        self.latched_reset = None;
         true
     }
 
     /// Synchronize the local round to a higher round proven by a verified
     /// quorum certificate. A QC at round R proves 2f+1 validators reached R,
     /// so the target reflects real network progress and is adopted as-is,
-    /// and the new round accepts a fresh header-activity reset. Returns
+    /// and the new round accepts a fresh latched reset. Returns
     /// `true` if the view was advanced.
     pub(crate) fn sync_to_qc_round(&mut self, qc_round: Round) -> bool {
         if qc_round > self.view {
             self.view = qc_round;
             self.view_syncs += 1;
-            self.last_header_reset = None;
+            self.latched_reset = None;
             true
         } else {
             false
@@ -355,15 +369,15 @@ mod tests {
     }
 
     #[test]
-    fn advance_to_increments_view_and_metric_and_clears_header_reset() {
+    fn advance_to_increments_view_and_metric_and_clears_the_reset_latch() {
         let mut vc = ViewChangeController::new(Round::INITIAL);
-        vc.last_header_reset = Some(Round::INITIAL);
+        vc.latched_reset = Some(Round::INITIAL);
 
         assert!(vc.advance_to(Round::new(3)));
 
         assert_eq!(vc.view, Round::new(3));
         assert_eq!(vc.view_changes, 1);
-        assert!(vc.last_header_reset.is_none());
+        assert!(vc.latched_reset.is_none());
 
         // A target at or below the current view is a no-op and doesn't tick
         // the counter.
@@ -376,18 +390,18 @@ mod tests {
     fn sync_to_qc_round_only_advances_forward() {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(5);
-        vc.last_header_reset = Some(Round::new(5));
+        vc.latched_reset = Some(Round::new(5));
 
         assert!(!vc.sync_to_qc_round(Round::new(3)));
         assert_eq!(vc.view, Round::new(5));
 
         assert!(!vc.sync_to_qc_round(Round::new(5)));
         assert_eq!(vc.view, Round::new(5));
-        assert_eq!(vc.last_header_reset, Some(Round::new(5)));
+        assert_eq!(vc.latched_reset, Some(Round::new(5)));
 
         assert!(vc.sync_to_qc_round(Round::new(10)));
         assert_eq!(vc.view, Round::new(10));
-        assert!(vc.last_header_reset.is_none());
+        assert!(vc.latched_reset.is_none());
     }
 
     #[test]
@@ -395,7 +409,7 @@ mod tests {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(9);
         vc.view_at_height_start = Round::new(8);
-        vc.last_header_reset = Some(Round::new(9));
+        vc.latched_reset = Some(Round::new(9));
         vc.view_changes = 4;
 
         assert!(
@@ -407,12 +421,12 @@ mod tests {
             "a target above the view is a no-op"
         );
         assert_eq!(vc.view, Round::new(9));
-        assert!(vc.last_header_reset.is_some());
+        assert!(vc.latched_reset.is_some());
 
         assert!(vc.fall_back(Round::new(7)));
         assert_eq!(vc.view, Round::new(7));
         assert_eq!(vc.view_at_height_start, Round::new(7));
-        assert!(vc.last_header_reset.is_none());
+        assert!(vc.latched_reset.is_none());
         assert_eq!(vc.view_changes, 4);
 
         vc.view = Round::new(9);
@@ -451,6 +465,33 @@ mod tests {
         vc.record_header_activity(Round::new(4), t3);
         assert_eq!(vc.last_leader_activity, Some(t2));
         vc.record_header_activity(Round::new(5), t3);
+        assert_eq!(vc.last_leader_activity, Some(t3));
+    }
+
+    #[test]
+    fn a_sync_exit_shares_the_header_latch() {
+        let mut vc = ViewChangeController::new(Round::new(4));
+        let t1 = LocalTimestamp::from_millis(1_000);
+        let t2 = LocalTimestamp::from_millis(2_000);
+        let t3 = LocalTimestamp::from_millis(3_000);
+
+        vc.record_sync_exit_activity(t1);
+        assert_eq!(vc.last_leader_activity, Some(t1));
+
+        // A second exit, or a header, in the same view resets nothing.
+        vc.record_sync_exit_activity(t2);
+        vc.record_header_activity(Round::new(4), t2);
+        assert_eq!(vc.last_leader_activity, Some(t1));
+
+        // Nor does an exit after a header reset the view.
+        assert!(vc.advance_to(Round::new(5)));
+        vc.record_header_activity(Round::new(5), t2);
+        vc.record_sync_exit_activity(t3);
+        assert_eq!(vc.last_leader_activity, Some(t2));
+
+        // The next view accepts one again.
+        assert!(vc.sync_to_qc_round(Round::new(6)));
+        vc.record_sync_exit_activity(t3);
         assert_eq!(vc.last_leader_activity, Some(t3));
     }
 

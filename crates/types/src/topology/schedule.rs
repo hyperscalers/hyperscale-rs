@@ -431,6 +431,16 @@ impl TopologySchedule {
             .is_some_and(|(oldest, _)| self.epoch_for(wt) < *oldest)
     }
 
+    /// The oldest and the newest epoch whose committee is retained, or
+    /// `None` for an empty schedule.
+    #[must_use]
+    pub fn retained_epochs(&self) -> Option<(Epoch, Epoch)> {
+        Some((
+            *self.by_epoch.first_key_value()?.0,
+            *self.by_epoch.last_key_value()?.0,
+        ))
+    }
+
     /// [`at`](Self::at) with the miss reason surfaced: an epoch above every
     /// retained entry is [`NotYetCommitted`](WindowLookup::NotYetCommitted)
     /// (defer and retry), anything else absent is

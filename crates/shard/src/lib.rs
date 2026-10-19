@@ -94,6 +94,7 @@ mod precut;
 mod proposal;
 mod read_fence;
 mod standing_answers;
+mod sync_claims;
 mod tick_members;
 mod timeout_keeper;
 mod validation;
