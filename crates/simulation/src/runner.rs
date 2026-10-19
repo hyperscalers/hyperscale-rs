@@ -429,6 +429,9 @@ pub struct SimulationRunner {
     /// scope, type and sequence. Two runs agree on it exactly when they
     /// processed the same events in the same order.
     trace: Blake3Hasher,
+    /// One event's bytes for [`Self::trace`], gathered so the digest
+    /// takes them in a single update; cleared for every event.
+    trace_input: Vec<u8>,
 
     /// Cross-replica safety checks, run at the end of every `run_until`.
     invariants: Invariants,
@@ -894,6 +897,7 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             stall: ClockStall::new(network_config.stall_events_per_host),
             trace: Blake3Hasher::new(),
+            trace_input: Vec::new(),
             invariants: Invariants::default(),
             archive: ChainArchive::default(),
             last_chain_walk: Duration::ZERO,
@@ -1722,40 +1726,31 @@ impl SimulationRunner {
 
     /// Fold one processed event into the trace digest.
     fn fold_into_trace(&mut self, key: EventKey, event: &SimEvent) {
-        self.trace.update(&key.time.as_nanos().to_le_bytes());
-        self.trace.update(&key.node_index.to_le_bytes());
-        self.trace.update(&key.sequence.to_le_bytes());
-        let event = match event {
-            SimEvent::Host(event) => event,
-            SimEvent::BatchDeadline => {
-                self.trace.update(&[3]);
-                return;
-            }
-            SimEvent::Deferred(_) => {
-                self.trace.update(&[4]);
-                return;
-            }
-            SimEvent::Restart => {
-                self.trace.update(&[5]);
-                return;
-            }
-        };
+        let input = &mut self.trace_input;
+        input.clear();
+        input.extend_from_slice(&key.time.as_nanos().to_le_bytes());
+        input.extend_from_slice(&key.node_index.to_le_bytes());
+        input.extend_from_slice(&key.sequence.to_le_bytes());
         match event {
-            HostEvent::Shard(shard, _) => {
-                self.trace.update(&[0]);
-                self.trace.update(&shard.depth().to_le_bytes());
-                self.trace.update(&shard.path().to_le_bytes());
+            SimEvent::Host(event) => {
+                match event {
+                    HostEvent::Shard(shard, _) => {
+                        input.push(0);
+                        input.extend_from_slice(&shard.depth().to_le_bytes());
+                        input.extend_from_slice(&shard.path().to_le_bytes());
+                    }
+                    HostEvent::Process(_) => input.push(1),
+                    HostEvent::Beacon(_) => input.push(2),
+                }
+                // Type names are ASCII, so a 0xFF terminator delimits them.
+                input.extend_from_slice(event.type_name().as_bytes());
+                input.push(0xFF);
             }
-            HostEvent::Process(_) => {
-                self.trace.update(&[1]);
-            }
-            HostEvent::Beacon(_) => {
-                self.trace.update(&[2]);
-            }
+            SimEvent::BatchDeadline => input.push(3),
+            SimEvent::Deferred(_) => input.push(4),
+            SimEvent::Restart => input.push(5),
         }
-        // Type names are ASCII, so a 0xFF terminator delimits them.
-        self.trace.update(event.type_name().as_bytes());
-        self.trace.update(&[0xFF]);
+        self.trace.update(input);
     }
 
     /// Hand `host` one event, then keep its batch wake at its nearest
