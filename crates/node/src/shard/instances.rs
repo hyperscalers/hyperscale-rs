@@ -27,13 +27,10 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST,
 };
-use hyperscale_types::{
-    Address, Hash, LocalTimestamp, MessageClass, ShardId, Transaction, TxHash, Unresolved,
-    ValidatorId,
-};
+use hyperscale_types::{Address, Hash, LocalTimestamp, ShardId, Transaction, TxHash, Unresolved};
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, FetchInput, failed_chunk, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, FetchInput, Route, failed_chunk, partition_solicited};
 use crate::shard::mempool::{DeferredOrigin, DeferredTransaction, Orphaned};
 use crate::shard::packages::PackageArtifactBinding;
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
@@ -83,21 +80,17 @@ impl FetchBinding for InstanceRecordBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Address>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
         let es = sender.clone();
         let requested = ids.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             GetInstanceRecordsRequest::new(
                 Capped::new(ids).expect("the fetch config clamps a chunk to the record cap"),
             ),
-            class,
             Box::new(move |result| {
                 let resp = match result {
                     Ok(resp) => resp,

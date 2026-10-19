@@ -15,8 +15,8 @@ use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    ResponseVerdict, Topic, ValidatorKeyMap, Verdict, VerdictKey,
+    Answerers, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, ResponseVerdict, Topic, ValidatorKeyMap, Verdict, VerdictKey,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -446,9 +446,10 @@ impl Network for Libp2pNetwork {
     }
 
     #[allow(clippy::too_many_lines)] // single dispatch over the request lifecycle (local-serve → wire)
-    fn request<R: Request + Clone + 'static>(
+    fn request_from<R: Request + Clone + 'static>(
         &self,
         shard: ShardId,
+        answerers: Answerers,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,
@@ -458,11 +459,9 @@ impl Network for Libp2pNetwork {
         // fallback both run there. Local-serve runs off the pinned thread
         // because handlers may take locks or block on condvars (the
         // provision-dedup handler is the canonical example).
-        let registry = self
-            .adapter
-            .local_shards()
-            .contains(&shard)
-            .then(|| Arc::clone(&self.registry));
+        let registry = (answerers == Answerers::LocalFirst
+            && self.adapter.local_shards().contains(&shard))
+        .then(|| Arc::clone(&self.registry));
         let topology_snapshot = Arc::clone(&self.topology_snapshot);
         let routing_committees = Arc::clone(&self.routing_committees);
         let adapter = Arc::clone(&self.adapter);
@@ -470,7 +469,8 @@ impl Network for Libp2pNetwork {
         let peer_unreachable_count = Arc::clone(&self.peer_unreachable_count);
 
         self.tokio_handle.spawn(async move {
-            // Step 1 — local-serve if we host the shard. A non-empty hit
+            // Step 1 — local-serve if we host the shard and the caller
+            // has not asked past its own seats. A non-empty hit
             // is terminal; an empty hit (e.g. our co-located vnode has
             // not committed what was asked for yet) falls through
             // to the remote committee. Without this fall-through, a

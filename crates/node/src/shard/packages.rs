@@ -31,10 +31,10 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetPackageArtifactsRequest, MAX_PACKAGE_ARTIFACTS_PER_REQUEST,
 };
-use hyperscale_types::{Address, Hash, MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{Address, Hash, ShardId};
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, FetchInput, failed_chunk, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, FetchInput, Route, failed_chunk, partition_solicited};
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Per-package artifact fetch keyed by content address.
@@ -91,21 +91,17 @@ impl FetchBinding for PackageArtifactBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Hash>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
         let es = sender.clone();
         let requested = ids.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             GetPackageArtifactsRequest::new(
                 Capped::new(ids).expect("the fetch config clamps a chunk to the artifact cap"),
             ),
-            class,
             Box::new(move |result| {
                 let resp = match result {
                     Ok(resp) => resp,

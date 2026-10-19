@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    ResponseVerdict, compression,
+    Answerers, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, ResponseVerdict, compression,
 };
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, ValidatorId,
@@ -70,6 +70,8 @@ pub struct PendingRequest {
     /// Shard whose committee should serve this request. The harness
     /// resolves it to a peer list from its topology view.
     pub shard: ShardId,
+    /// Whether this host's own handler may answer before the committee.
+    pub(crate) answerers: Answerers,
     /// Optional preferred peer (e.g., block proposer for fetch).
     pub(crate) preferred_peer: Option<ValidatorId>,
     /// Message type ID for handler lookup (e.g., "block.request").
@@ -289,9 +291,10 @@ impl Network for SimNetworkAdapter {
         self.registry.register_request(shard, handler);
     }
 
-    fn request<R: Request + Clone + 'static>(
+    fn request_from<R: Request + Clone + 'static>(
         &self,
         shard: ShardId,
+        answerers: Answerers,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,
@@ -313,6 +316,7 @@ impl Network for SimNetworkAdapter {
 
         self.pending_requests.lock().unwrap().push(PendingRequest {
             shard,
+            answerers,
             preferred_peer,
             type_id: R::message_type_id(),
             class: class_override.unwrap_or_else(R::class),

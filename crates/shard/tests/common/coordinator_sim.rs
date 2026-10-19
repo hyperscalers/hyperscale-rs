@@ -36,7 +36,8 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::{ExecutionMode, Executor};
 use hyperscale_hbor::Capped;
 use hyperscale_network::{
-    GossipHandler, Network, NotificationHandler, RequestError, RequestHandler, ResponseVerdict,
+    Answerers, GossipHandler, Network, NotificationHandler, RequestError, RequestHandler,
+    ResponseVerdict,
 };
 use hyperscale_shard::action_handlers::{
     build_proposal, committing_shards, handle_action, swept_by, verify_and_build_qc,
@@ -2375,9 +2376,10 @@ impl Network for Silent {
     fn unsubscribe_shard(&self, _: ShardId) {}
     fn update_topology(&self, _: Arc<TopologySnapshot>) {}
     fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
-    fn request<R: Request + Clone + 'static>(
+    fn request_from<R: Request + Clone + 'static>(
         &self,
         _: ShardId,
+        _: Answerers,
         _: Option<ValidatorId>,
         _: R,
         _: Option<MessageClass>,

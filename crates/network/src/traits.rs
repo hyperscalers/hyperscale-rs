@@ -420,6 +420,10 @@ pub trait Network: Send + Sync + 'static {
     /// static [`NetworkMessage::class()`]. Bimodal types like
     /// `GetTransactionsRequest` use this to differentiate hot-path
     /// pending-block fetches from sync / DA-backfill fetches.
+    ///
+    /// A seat this process hosts on `shard` answers first, and the
+    /// committee only when that answer is empty; see
+    /// [`Answerers::LocalFirst`].
     fn request<R: Request + Clone + 'static>(
         &self,
         shard: ShardId,
@@ -427,7 +431,46 @@ pub trait Network: Send + Sync + 'static {
         request: R,
         class_override: Option<MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
+    ) {
+        self.request_from(
+            shard,
+            Answerers::LocalFirst,
+            preferred_peer,
+            request,
+            class_override,
+            on_response,
+        );
+    }
+
+    /// [`Self::request`], asked of `answerers`: with
+    /// [`Answerers::PeersOnly`] no seat this process hosts answers, and
+    /// the request goes to the committee's other members at once.
+    fn request_from<R: Request + Clone + 'static>(
+        &self,
+        shard: ShardId,
+        answerers: Answerers,
+        preferred_peer: Option<ValidatorId>,
+        request: R,
+        class_override: Option<MessageClass>,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     );
+}
+
+/// Who may answer a request.
+///
+/// A seat this process hosts answers at no cost and comes first. Its
+/// answer is final unless it is empty, so a seat that answers with
+/// something the requester refuses — a store on another branch at the
+/// height asked, say — would answer every retry the same way and keep
+/// the committee from ever being asked. A requester whose attempt failed
+/// for any reason asks whichever of the two it did not ask last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Answerers {
+    /// A seat this process hosts on the shard, then the committee's other
+    /// members when that answer is empty.
+    LocalFirst,
+    /// The committee's other members only.
+    PeersOnly,
 }
 
 #[cfg(test)]

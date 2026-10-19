@@ -23,11 +23,11 @@ use hyperscale_types::network::response::beacon::{
     GetBeaconCandidateResponse, GetBeaconProposalResponse, GetShardWitnessesResponse,
 };
 use hyperscale_types::{
-    BeaconBlockHash, BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ShardId, ValidatorId,
+    BeaconBlockHash, BlockHash, BlockHeight, Epoch, LeafIndex, ShardId, ValidatorId,
 };
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, Refusal, ScopedAnswer, dispatch_scoped};
+use crate::fetch::{Fetch, FetchBinding, Refusal, Route, ScopedAnswer, dispatch_scoped};
 use crate::shard::{HostEvent, ShardIo};
 
 /// Cross-shard beacon-witness fetch keyed by
@@ -106,13 +106,11 @@ impl FetchBinding for ShardWitnessBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
     }
 }
 
@@ -174,13 +172,11 @@ impl FetchBinding for BeaconProposalBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
     }
 }
 
@@ -245,13 +241,11 @@ impl FetchBinding for BeaconCandidateBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
     }
 }
 
