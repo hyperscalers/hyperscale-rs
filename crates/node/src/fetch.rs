@@ -100,7 +100,8 @@ pub enum FetchInput<Id> {
         class: Option<MessageClass>,
     },
     /// A network attempt for `ids` failed (or returned an unusable response);
-    /// reclaim them for retry on the next tick.
+    /// reclaim them for retry, at once on the first failure since the last
+    /// [`Self::Tick`] and on the tick after that.
     Failed {
         /// Ids that were in flight on the failed chunk.
         ids: Vec<Id>,
@@ -128,6 +129,7 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
     },
     /// Drive pending fetches: emit chunks up to per-tick and global caps.
+    /// Every id's inline retry is restored first.
     Tick,
 }
 
@@ -167,6 +169,13 @@ struct Entry {
     /// catching novel pin scenarios the existing per-drop notifications
     /// haven't been wired for yet.
     dispatched_at: Option<Stopwatch>,
+    /// Failures since the last tick. The first retries at once; past it
+    /// the id waits for the tick, since the same answer is coming back.
+    /// A re-ask keeps the hold and only the tick lifts it: a consumer
+    /// that re-asks on every failure would otherwise reopen the loop the
+    /// hold closes. An unroutable chunk does not count, as it waits for
+    /// the tick anyway.
+    failures_since_tick: u8,
 }
 
 /// Why an id is being removed from the pending set — drives which counter
@@ -219,7 +228,12 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             FetchInput::Unroutable { ids } => self.handle_failed(&ids, Respawn::OnTick),
             FetchInput::Admitted { ids } => self.handle_drop(&ids, DropKind::Admitted),
             FetchInput::Abandoned { ids } => self.handle_drop(&ids, DropKind::Abandoned),
-            FetchInput::Tick => self.spawn_pending_fetches(),
+            FetchInput::Tick => {
+                for entry in self.pending.values_mut() {
+                    entry.failures_since_tick = 0;
+                }
+                self.spawn_pending_fetches()
+            }
         }
     }
 
@@ -298,6 +312,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                         in_flight: false,
                         asked: None,
                         dispatched_at: None,
+                        failures_since_tick: 0,
                     },
                 );
             }
@@ -317,6 +332,15 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// and pinning every retry to it would let one peer that answers
     /// "not held" keep the requester from ever reaching the peers that
     /// do hold it.
+    ///
+    /// Only the first failure since the tick retries at once. An answer
+    /// served from a co-hosted seat costs no round trip and comes back the
+    /// same each time, as does one from a committee that all answers alike,
+    /// so a second failure before the tick waits for it. Where a round
+    /// trip is a few milliseconds, as on a LAN or within one region, two
+    /// failed sweeps of a small committee fit well inside one tick, so an
+    /// id whose payload is still in gossip can wait up to a tick longer
+    /// than it would by asking again at once.
     fn handle_failed(&mut self, ids: &[Id], respawn: Respawn) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
         for id in ids {
@@ -326,8 +350,11 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 entry.in_flight = false;
                 entry.dispatched_at = None;
                 let asked = entry.asked.take();
-                if matches!(respawn, Respawn::Now) && asked == entry.preferred {
-                    entry.preferred = None;
+                if matches!(respawn, Respawn::Now) {
+                    entry.failures_since_tick = entry.failures_since_tick.saturating_add(1);
+                    if asked == entry.preferred {
+                        entry.preferred = None;
+                    }
                 }
                 released += 1;
             }
@@ -379,7 +406,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             if taken >= global_room {
                 break;
             }
-            if entry.in_flight {
+            if entry.in_flight || entry.failures_since_tick > 1 {
                 continue;
             }
             groups
@@ -666,8 +693,11 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
 /// its binding whichever way it is being released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release {
-    /// The attempt failed or went unanswered; retry at once, since the
-    /// transport already spent a round trip on it.
+    /// The attempt failed or went unanswered; retry at once the first
+    /// time since the tick, and on the tick after that. A remote failure
+    /// has spent its round trip and the retry rotates to another peer. A
+    /// locally served answer has spent none, and the retry asks the local
+    /// seat first again, so it repeats itself until the tick.
     Failed,
     /// The request never reached a peer. Retry on the tick — see
     /// [`Respawn`].
@@ -743,9 +773,11 @@ impl From<Release> for Intent {
 /// When a released chunk goes out again.
 ///
 /// A request the transport answered — a timeout, an exhausted rotation,
-/// a peer that held nothing, an answer this node could not use — has
-/// already cost a round trip and its peer budget, so the next attempt
-/// leaves at once. A request that never reached a peer has not: no
+/// a peer that held nothing, an answer this node could not use — leaves
+/// again at once, once per tick: a remote answer has cost a round trip
+/// and the retry rotates off its peer, while a locally served answer has
+/// cost nothing and only the tick lets time pass before it is asked
+/// again. A request that never reached a peer has not been answered: no
 /// committee resolves it, or none of its members is up, and it fails
 /// again as fast as it is asked. Re-sending that here spins between this
 /// thread and the transport for as long as the cause stands, which after
@@ -988,6 +1020,119 @@ mod tests {
         let retried = p.handle(FetchInput::Failed { ids: ids.clone() });
         let FetchOutput::Send { preferred, .. } = &retried[0];
         assert_eq!(*preferred, None);
+    }
+
+    /// An answer that fails the same way each time it is asked costs one
+    /// inline retry, then waits for the tick: a locally served answer
+    /// spends no round trip, so re-sending on every refusal would never let
+    /// time pass.
+    #[test]
+    fn a_second_failure_before_the_tick_waits_for_the_tick() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        p.handle(FetchInput::Request {
+            ids: vec![tx(1)],
+            shard: SHARD,
+            preferred: None,
+            class: None,
+        });
+        assert_eq!(
+            p.handle(FetchInput::Failed { ids: vec![tx(1)] }).len(),
+            1,
+            "the first failure retries at once"
+        );
+        assert!(
+            p.handle(FetchInput::Failed { ids: vec![tx(1)] }).is_empty(),
+            "the second waits for the tick"
+        );
+        // Another id's ask does not carry the held one out with it.
+        let out = p.handle(FetchInput::Request {
+            ids: vec![tx(2)],
+            shard: SHARD,
+            preferred: None,
+            class: None,
+        });
+        let [FetchOutput::Send { ids, .. }] = out.as_slice() else {
+            panic!("one send, got {out:?}");
+        };
+        assert_eq!(ids, &vec![tx(2)]);
+
+        let out = p.handle(FetchInput::Tick);
+        let [FetchOutput::Send { ids, .. }] = out.as_slice() else {
+            panic!("one send, got {out:?}");
+        };
+        assert_eq!(ids, &vec![tx(1)]);
+    }
+
+    fn ask(p: &mut Fetch<TxHash>, id: TxHash, preferred: Option<ValidatorId>) -> Vec<TxHash> {
+        p.handle(FetchInput::Request {
+            ids: vec![id],
+            shard: SHARD,
+            preferred,
+            class: None,
+        })
+        .into_iter()
+        .flat_map(|FetchOutput::Send { ids, .. }| ids)
+        .collect()
+    }
+
+    /// A re-ask restates where the answer is but keeps the hold: a
+    /// consumer that re-asks on every failure would otherwise reopen the
+    /// loop the hold closes. The tick sends it to the restated peer.
+    #[test]
+    fn a_re_ask_keeps_the_hold_until_the_tick() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        ask(&mut p, tx(1), None);
+        p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert!(p.handle(FetchInput::Failed { ids: vec![tx(1)] }).is_empty());
+
+        assert!(
+            ask(&mut p, tx(1), Some(vid(7))).is_empty(),
+            "the re-ask does not lift the hold"
+        );
+        let out = p.handle(FetchInput::Tick);
+        let [FetchOutput::Send { ids, preferred, .. }] = out.as_slice() else {
+            panic!("one send, got {out:?}");
+        };
+        assert_eq!(ids, &vec![tx(1)]);
+        assert_eq!(*preferred, Some(vid(7)));
+    }
+
+    /// A chunk that never reached a peer waits for the tick already, so
+    /// it does not count toward the hold: the next failure that did reach
+    /// one still retries at once.
+    #[test]
+    fn an_unroutable_chunk_does_not_count_toward_the_hold() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        ask(&mut p, tx(1), None);
+        assert!(
+            p.handle(FetchInput::Unroutable { ids: vec![tx(1)] })
+                .is_empty()
+        );
+        // Another id's ask carries the released one out with it.
+        assert_eq!(ask(&mut p, tx(2), None), vec![tx(1), tx(2)]);
+        assert_eq!(
+            p.handle(FetchInput::Failed { ids: vec![tx(1)] }).len(),
+            1,
+            "the first failure that reached a peer retries at once"
+        );
+    }
+
+    /// A chunk in flight across a tick fails into a fresh count: the tick
+    /// restores every id's inline retry, the ones in flight included.
+    #[test]
+    fn a_failure_after_the_tick_retries_at_once() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        ask(&mut p, tx(1), None);
+        assert_eq!(p.handle(FetchInput::Failed { ids: vec![tx(1)] }).len(), 1);
+        assert!(
+            p.handle(FetchInput::Tick).is_empty(),
+            "the retry is still in flight"
+        );
+        assert_eq!(
+            p.handle(FetchInput::Failed { ids: vec![tx(1)] }).len(),
+            1,
+            "the failure after the tick retries at once"
+        );
     }
 
     /// A chunk that never reached a peer asked no one, so it keeps its

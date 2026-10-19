@@ -21,6 +21,31 @@ use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
 use crate::shard::packages::PackageArtifactBinding;
 
+/// Every fetch binding a shard loop drives, by the [`FetchIds`] arm that
+/// carries its ids, handed to `$apply` as `Arm => Binding,` pairs. The
+/// router's match over [`FetchIds`] is exhaustive, so a new arm cannot
+/// leave this list, and everything that fans out over the bindings
+/// expands it rather than keeping its own copy.
+macro_rules! every_fetch_binding {
+    ($apply:ident) => {
+        $apply! {
+            Transactions => TransactionBinding,
+            LocalProvisions => LocalProvisionBinding,
+            Finalizations => FinalizationBinding,
+            RemoteProvisions => ProvisionBinding,
+            StateProofs => StateProofBinding,
+            VerdictProofs => VerdictProofBinding,
+            SettledTxs => SettledTxsBinding,
+            Proposals => ProposalBinding,
+            BeaconProposals => BeaconProposalBinding,
+            BeaconCandidates => BeaconCandidateBinding,
+            ShardWitnesses => ShardWitnessBinding,
+            PackageArtifacts => PackageArtifactBinding,
+            InstanceRecords => InstanceRecordBinding,
+        }
+    };
+}
+
 impl<S, N, D> ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -128,41 +153,26 @@ where
     /// [`Intent`] builds, so they share this walk rather than each
     /// keeping their own copy of it.
     fn drive_fetch_ids(&mut self, ids: FetchIds, intent: Intent) {
-        match ids {
-            FetchIds::Transactions(ids) => {
-                self.drive_fetch::<TransactionBinding>(intent.input(ids));
-            }
-            FetchIds::LocalProvisions(ids) => {
-                self.drive_fetch::<LocalProvisionBinding>(intent.input(ids));
-            }
-            FetchIds::Finalizations(ids) => {
-                self.drive_fetch::<FinalizationBinding>(intent.input(ids));
-            }
-            FetchIds::RemoteProvisions(ids) => {
-                self.drive_fetch::<ProvisionBinding>(intent.input(ids));
-            }
-            FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(intent.input(ids)),
-            FetchIds::VerdictProofs(ids) => {
-                self.drive_fetch::<VerdictProofBinding>(intent.input(ids));
-            }
-            FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(intent.input(ids)),
-            FetchIds::Proposals(ids) => self.drive_fetch::<ProposalBinding>(intent.input(ids)),
-            FetchIds::BeaconProposals(ids) => {
-                self.drive_fetch::<BeaconProposalBinding>(intent.input(ids));
-            }
-            FetchIds::BeaconCandidates(ids) => {
-                self.drive_fetch::<BeaconCandidateBinding>(intent.input(ids));
-            }
-            FetchIds::ShardWitnesses(ids) => {
-                self.drive_fetch::<ShardWitnessBinding>(intent.input(ids));
-            }
-            FetchIds::PackageArtifacts(ids) => {
-                self.drive_fetch::<PackageArtifactBinding>(intent.input(ids));
-            }
-            FetchIds::InstanceRecords(ids) => {
-                self.drive_fetch::<InstanceRecordBinding>(intent.input(ids));
-            }
+        macro_rules! route {
+            ($($arm:ident => $binding:ty,)*) => {
+                match ids {
+                    $(FetchIds::$arm(ids) => self.drive_fetch::<$binding>(intent.input(ids)),)*
+                }
+            };
         }
+        every_fetch_binding!(route);
+    }
+
+    /// Tick every fetch binding on this shard. The list is the one
+    /// [`Self::drive_fetch_ids`] matches over, so a binding its ids can
+    /// reach is a binding the tick reaches.
+    pub(in crate::shard) fn tick_every_fetch(&mut self) {
+        macro_rules! tick {
+            ($($arm:ident => $binding:ty,)*) => {
+                $(self.drive_fetch::<$binding>(FetchInput::Tick);)*
+            };
+        }
+        every_fetch_binding!(tick);
     }
 
     /// Release what `B`'s fetch still holds `within` a scope that
@@ -289,9 +299,50 @@ impl FetchTicker {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::{BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash};
+
     use super::*;
+    use crate::shard::seated_host::{Fixture, Loop, loop_of};
 
     const SHARD: ShardId = ShardId::leaf(1, 0);
+
+    /// Fail `id` on `B`'s fetch twice before a tick, so it is held, and
+    /// return whether the loop's fetch tick sent it again.
+    fn tick_resends_a_held<B: FetchBinding>(shard_loop: &mut Loop, id: &B::Id) -> bool {
+        let ids = || B::ids(vec![id.clone()]);
+        shard_loop.request_fetch(ids(), SHARD, None, None);
+        shard_loop.release_fetch(ids(), Release::Failed);
+        shard_loop.release_fetch(ids(), Release::Failed);
+        assert_eq!(
+            B::fetch_mut(&mut shard_loop.io).in_flight_count(),
+            0,
+            "{}: a second failure before the tick holds the id",
+            B::NAME,
+        );
+        shard_loop.handle_fetch_tick();
+        B::fetch_mut(&mut shard_loop.io).in_flight_count() == 1
+    }
+
+    /// The loop's fetch tick reaches the vote-named proposal fetch and
+    /// the ratify-candidate fetch, so an id either holds after a second
+    /// failure goes out again on the tick.
+    #[test]
+    fn the_fetch_tick_resends_a_held_proposal_and_beacon_candidate() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let shard_loop = loop_of(&mut host);
+        assert!(tick_resends_a_held::<ProposalBinding>(
+            shard_loop,
+            &BlockHash::from_raw(Hash::from_bytes(b"proposal")),
+        ));
+        assert!(tick_resends_a_held::<BeaconCandidateBinding>(
+            shard_loop,
+            &(
+                Epoch::new(1),
+                BeaconBlockHash::from_raw(Hash::from_bytes(b"candidate"))
+            ),
+        ));
+    }
 
     fn is_set(op: Option<&TimerOp>) -> bool {
         matches!(
