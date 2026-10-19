@@ -44,7 +44,7 @@ use hyperscale_network::retry::{
     AllHeld, Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig,
 };
 use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
-use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
+use hyperscale_network::{Answerers, HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
@@ -1088,10 +1088,14 @@ impl SimulatedNetwork {
     }
 
     /// What `requester`'s own handler answers `request` with, where the
-    /// host serves the target shard and the answer is not empty in the
+    /// host serves the target shard, the request may be answered locally
+    /// ([`Answerers::LocalFirst`]), and the answer is not empty in the
     /// request type's terms. No transport is involved, so no fault, loss or
     /// latency applies.
     fn serve_locally(&self, requester: NodeIndex, request: &PendingRequest) -> Option<Vec<u8>> {
+        if request.answerers == Answerers::PeersOnly {
+            return None;
+        }
         let registry = self.registries.get(requester as usize)?;
         if !registry.hosted_shards().contains(&request.shard) {
             return None;
@@ -2424,6 +2428,7 @@ mod tests {
         let result_clone = result.clone();
         let request = PendingRequest {
             shard,
+            answerers: Answerers::LocalFirst,
             preferred_peer,
             type_id: "test.request",
             class: MessageClass::Recovery,
@@ -2617,6 +2622,7 @@ mod tests {
             let counter = Arc::clone(&from_rejected);
             let request = PendingRequest {
                 shard: ShardId::leaf(1, 0),
+                answerers: Answerers::LocalFirst,
                 preferred_peer: None,
                 type_id: "test.request",
                 class: MessageClass::Recovery,
@@ -3060,6 +3066,34 @@ mod tests {
             );
         }
         network.flush_requests(Duration::ZERO, &mut streams);
+    }
+
+    /// A request asked past this host's own seats is not answered by them,
+    /// however much they would say: it goes to the committee's other
+    /// members, and their answer is the one that lands.
+    #[test]
+    fn test_accept_requests_asks_only_peers_when_told() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut rng = LinkStreams::new(42);
+        let stale: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { vec![9] });
+        network.create_adapter(0).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            stale,
+        );
+        for i in 1..4 {
+            let adapter = network.create_adapter(i);
+            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
+        }
+
+        let (mut request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
+        request.answerers = Answerers::PeersOnly;
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert_eq!(captured.unwrap(), vec![1, 2, 3]);
     }
 
     #[test]

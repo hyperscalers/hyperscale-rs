@@ -12,9 +12,9 @@ use hyperscale_hbor::Capped;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetTransactionsRequest;
-use hyperscale_types::{MessageClass, ShardId, TxHash, ValidatorId};
+use hyperscale_types::{ShardId, TxHash};
 
-use crate::fetch::{Fetch, FetchBinding, failed_chunk, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, Route, failed_chunk, partition_solicited};
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_shard_input};
 
 /// Per-tx fetch keyed by [`TxHash`].
@@ -39,21 +39,17 @@ impl FetchBinding for TransactionBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<TxHash>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
         let es = sender.clone();
         let hs = ids.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             GetTransactionsRequest::new(
                 Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
             ),
-            class,
             Box::new(move |result| {
                 let resp = match result {
                     Ok(resp) => resp,

@@ -11,7 +11,8 @@ use hyperscale_beacon::action_handlers::handle_action;
 use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::{
-    GossipHandler, Network, NotificationHandler, RequestError, RequestHandler, ResponseVerdict,
+    Answerers, GossipHandler, Network, NotificationHandler, RequestError, RequestHandler,
+    ResponseVerdict,
 };
 use hyperscale_storage_memory::SimBeaconStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -55,9 +56,10 @@ impl Network for Outbox {
     fn unsubscribe_shard(&self, _: ShardId) {}
     fn update_topology(&self, _: Arc<TopologySnapshot>) {}
     fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
-    fn request<R: Request + Clone + 'static>(
+    fn request_from<R: Request + Clone + 'static>(
         &self,
         _: ShardId,
+        _: Answerers,
         _: Option<ValidatorId>,
         _: R,
         _: Option<MessageClass>,

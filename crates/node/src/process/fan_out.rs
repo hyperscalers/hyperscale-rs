@@ -354,7 +354,9 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-    use hyperscale_network::{GossipHandler, NotificationHandler, RequestError, RequestHandler};
+    use hyperscale_network::{
+        Answerers, GossipHandler, NotificationHandler, RequestError, RequestHandler,
+    };
     use hyperscale_storage::test_helpers::{
         commit_settled_at, commit_writes, entry_key, make_settled_entries, make_test_certified,
     };
@@ -411,9 +413,10 @@ mod tests {
         fn unsubscribe_shard(&self, _: ShardId) {}
         fn update_topology(&self, _: Arc<TopologySnapshot>) {}
         fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
-        fn request<R: Request + Clone + 'static>(
+        fn request_from<R: Request + Clone + 'static>(
             &self,
             shard: ShardId,
+            _: Answerers,
             _: Option<ValidatorId>,
             _: R,
             _: Option<MessageClass>,
@@ -509,9 +512,10 @@ mod tests {
         fn unsubscribe_shard(&self, _: ShardId) {}
         fn update_topology(&self, _: Arc<TopologySnapshot>) {}
         fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
-        fn request<R: Request + Clone + 'static>(
+        fn request_from<R: Request + Clone + 'static>(
             &self,
             _: ShardId,
+            _: Answerers,
             _: Option<ValidatorId>,
             _: R,
             _: Option<MessageClass>,

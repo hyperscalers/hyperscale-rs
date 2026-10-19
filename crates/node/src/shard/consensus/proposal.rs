@@ -21,10 +21,10 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::network::request::GetProposalRequest;
 use hyperscale_types::network::response::GetProposalResponse;
-use hyperscale_types::{BlockHash, BlockHeight, MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{BlockHash, BlockHeight, ShardId};
 use tracing::warn;
 
-use crate::fetch::{Fetch, FetchBinding, defers_to_the_tick};
+use crate::fetch::{Fetch, FetchBinding, Route, defers_to_the_tick};
 use crate::shard::verify::verify_signed_by_proposer;
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
@@ -108,19 +108,15 @@ impl FetchBinding for ProposalBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
         for block_hash in ids {
             let es = sender.clone();
-            network.request(
-                shard,
-                preferred,
+            route.request(
+                network,
                 GetProposalRequest::new(block_hash),
-                class,
                 Box::new(move |result: Result<GetProposalResponse, RequestError>| {
                     let requested = FetchIds::Proposals(vec![block_hash]);
                     let response = match result {
@@ -223,12 +219,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::time::Duration;
+
+    use crossbeam::channel::unbounded;
+    use hyperscale_network_memory::{HostLayout, LinkStreams, NetworkConfig, SimulatedNetwork};
     use hyperscale_types::{
         BlockHeader, BlockHeaderParts, BlockManifest, ChainOrigin, ConsensusSignature, Hash,
-        QuorumCertificate,
+        QuorumCertificate, ValidatorId,
     };
 
     use super::*;
+    use crate::fetch::{FetchConfig, FetchInput, FetchOutput};
 
     fn proposal_at(height: u64, tag: &[u8]) -> BlockHeaderNotification {
         let header = BlockHeader::new(BlockHeaderParts {
@@ -288,5 +290,74 @@ mod tests {
                 .proposal,
             None
         );
+    }
+
+    /// A co-hosted seat that answers with a proposal other than the one
+    /// asked for does not hold the fetch: the retry is asked past it, and
+    /// the peer that holds the proposal answers it before any tick.
+    #[test]
+    fn a_refused_local_answer_is_asked_again_of_a_peer() {
+        const SHARD: ShardId = ShardId::leaf(1, 0);
+        let mut network = SimulatedNetwork::new(
+            NetworkConfig::default(),
+            HostLayout {
+                hosted: vec![BTreeSet::from([SHARD]); 2],
+                validator_to_host: HashMap::from([
+                    (ValidatorId::new(0), 0),
+                    (ValidatorId::new(1), 1),
+                ]),
+            },
+            7,
+        );
+        let mut streams = LinkStreams::new(7);
+        let wanted = proposal_at(7, b"wanted");
+        let stale = proposal_at(7, b"stale");
+        let here = network.create_adapter(0);
+        here.register_request_handler(SHARD, move |_: GetProposalRequest| {
+            GetProposalResponse::new(Some(stale.clone()))
+        });
+        let held = wanted.clone();
+        network
+            .create_adapter(1)
+            .register_request_handler(SHARD, move |_: GetProposalRequest| {
+                GetProposalResponse::new(Some(held.clone()))
+            });
+
+        let mut fetch = ProposalFetch::new("proposal", FetchConfig::default());
+        let (sender, events) = unbounded();
+        let mut outputs = fetch.handle(FetchInput::Request {
+            ids: vec![wanted.header.hash()],
+            shard: SHARD,
+            preferred: None,
+            class: None,
+        });
+        let mut fetched = None;
+        while !outputs.is_empty() {
+            for FetchOutput::Send { ids, route } in std::mem::take(&mut outputs) {
+                ProposalBinding::dispatch_chunk(ids, SHARD, route, &here, &sender);
+            }
+            network.accept_requests(
+                0,
+                Duration::ZERO,
+                here.drain_pending_requests(),
+                &mut streams,
+            );
+            network.flush_requests(Duration::from_secs(60), &mut streams);
+            for event in events.try_iter() {
+                match event {
+                    HostEvent::Shard(
+                        _,
+                        ShardScopedInput::FetchFailed(FetchIds::Proposals(ids)),
+                    ) => {
+                        outputs.extend(fetch.handle(FetchInput::Failed { ids }));
+                    }
+                    HostEvent::Shard(_, ShardScopedInput::ProposalFetched { proposal }) => {
+                        fetched = Some(*proposal);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(fetched, Some(wanted), "the peer's answer lands");
     }
 }

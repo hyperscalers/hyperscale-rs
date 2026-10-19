@@ -24,7 +24,7 @@ use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_latency,
     record_fetch_response_refused, record_fetch_retried, record_fetch_started,
 };
-use hyperscale_network::{Network, RequestError, ResponseVerdict};
+use hyperscale_network::{Answerers, Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::Request;
 use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
@@ -136,20 +136,52 @@ pub enum FetchInput<Id> {
 /// Outputs from the protocol state machine.
 #[derive(Debug)]
 pub enum FetchOutput<Id> {
-    /// Issue a network request for `ids`. The output handler translates this
-    /// into `Network::request(shard, preferred, .., class, ..)`.
+    /// Issue a network request for `ids` along `route`.
     Send {
         /// Ids in this chunk.
         ids: Vec<Id>,
-        /// Shard whose committee answers — forwarded as the routing
-        /// argument to `Network::request`.
-        shard: ShardId,
-        /// Canonical-source hint forwarded to the network layer.
-        preferred: Option<ValidatorId>,
-        /// Class override shared by every id in this chunk; chunks are
-        /// grouped by `(shard, preferred, class)` so this is well-defined.
-        class: Option<MessageClass>,
+        /// Where the chunk is asked. Chunks are grouped by it, so every id
+        /// in one shares it.
+        route: Route,
     },
+}
+
+/// Where one chunk is asked. Chunks that differ on any field issue as
+/// separate requests: different shards route to different committees,
+/// different preferreds bias different peers, different classes carry
+/// different network urgencies, and a chunk asked past the local seats
+/// cannot ride with one that asks them first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Route {
+    /// Shard whose committee answers.
+    pub shard: ShardId,
+    /// Canonical-source hint, when one exists.
+    pub preferred: Option<ValidatorId>,
+    /// Class override forwarded to the network layer.
+    pub class: Option<MessageClass>,
+    /// Who may answer. A failed attempt's retry asks whichever of the
+    /// local seats and the committee's other members the attempt did not,
+    /// since a seat this host runs answers every retry the same way.
+    pub answerers: Answerers,
+}
+
+impl Route {
+    /// Send `request` along this route.
+    pub fn request<N: Network, R: Request + Clone + 'static>(
+        self,
+        network: &N,
+        request: R,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
+    ) {
+        network.request_from(
+            self.shard,
+            self.answerers,
+            self.preferred,
+            request,
+            self.class,
+            on_response,
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -169,12 +201,18 @@ struct Entry {
     /// catching novel pin scenarios the existing per-drop notifications
     /// haven't been wired for yet.
     dispatched_at: Option<Stopwatch>,
+    /// Who the in-flight attempt asked, or who the next one asks. A
+    /// failure flips it, so the local seats and the committee's other
+    /// members take turns and neither is asked twice running between
+    /// ticks; the tick resets it to [`Answerers::LocalFirst`] on every
+    /// entry it may send.
+    answerers: Answerers,
     /// Failures since the last tick. The first retries at once; past it
-    /// the id waits for the tick, since the same answer is coming back.
-    /// A re-ask keeps the hold and only the tick lifts it: a consumer
-    /// that re-asks on every failure would otherwise reopen the loop the
-    /// hold closes. An unroutable chunk does not count, as it waits for
-    /// the tick anyway.
+    /// the id waits for the tick, since the same answer is coming back. A
+    /// re-ask keeps the hold and only the tick lifts it: a consumer that
+    /// re-asks on every failure would otherwise reopen the loop the hold
+    /// closes. An unroutable chunk does not count, as it waits for the
+    /// tick anyway.
     failures_since_tick: u8,
 }
 
@@ -185,13 +223,6 @@ enum DropKind {
     Admitted,
     Abandoned,
 }
-
-/// Group key for ready ids during chunk assembly: same `(shard, preferred,
-/// class)` coalesce; chunks that differ on any of those three issue as
-/// separate `Send`s (different shards route to different committees,
-/// different preferreds bias different peers, different classes carry
-/// different network urgencies).
-type GroupKey = (ShardId, Option<ValidatorId>, Option<MessageClass>);
 
 /// Id-keyed fetch state machine.
 pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
@@ -231,6 +262,9 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             FetchInput::Tick => {
                 for entry in self.pending.values_mut() {
                     entry.failures_since_tick = 0;
+                    if !entry.in_flight {
+                        entry.answerers = Answerers::LocalFirst;
+                    }
                 }
                 self.spawn_pending_fetches()
             }
@@ -312,6 +346,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                         in_flight: false,
                         asked: None,
                         dispatched_at: None,
+                        answerers: Answerers::LocalFirst,
                         failures_since_tick: 0,
                     },
                 );
@@ -333,13 +368,17 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// "not held" keep the requester from ever reaching the peers that
     /// do hold it.
     ///
-    /// Only the first failure since the tick retries at once. An answer
-    /// served from a co-hosted seat costs no round trip and comes back the
-    /// same each time, as does one from a committee that all answers alike,
-    /// so a second failure before the tick waits for it. Where a round
-    /// trip is a few milliseconds, as on a LAN or within one region, two
-    /// failed sweeps of a small committee fit well inside one tick, so an
-    /// id whose payload is still in gossip can wait up to a tick longer
+    /// A failure's retry asks whoever the failed attempt did not: an
+    /// answer served from a co-hosted seat costs no round trip and comes
+    /// back the same each time it is asked, so a failure after asking the
+    /// local seats goes to the committee's other members, and one after
+    /// asking only them gives the local seats, which may have caught up
+    /// since, the next turn. Only the first failure since the tick retries
+    /// at once. One from a committee that all answers alike comes back the
+    /// same too, so a second failure before the tick waits for it. Where a
+    /// round trip is a few milliseconds, as on a LAN or within one region,
+    /// two failed sweeps of a small committee fit well inside one tick, so
+    /// an id whose payload is still in gossip can wait up to a tick longer
     /// than it would by asking again at once.
     fn handle_failed(&mut self, ids: &[Id], respawn: Respawn) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
@@ -352,6 +391,10 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 let asked = entry.asked.take();
                 if matches!(respawn, Respawn::Now) {
                     entry.failures_since_tick = entry.failures_since_tick.saturating_add(1);
+                    entry.answerers = match entry.answerers {
+                        Answerers::LocalFirst => Answerers::PeersOnly,
+                        Answerers::PeersOnly => Answerers::LocalFirst,
+                    };
                     if asked == entry.preferred {
                         entry.preferred = None;
                     }
@@ -397,10 +440,8 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             return vec![];
         }
 
-        // Group ready ids by `(shard, preferred, class)`. Two ids with the
-        // same shard+preferred but different classes issue as separate
-        // `Send`s.
-        let mut groups: HashMap<GroupKey, Vec<Id>> = HashMap::new();
+        // Group ready ids by route.
+        let mut groups: HashMap<Route, Vec<Id>> = HashMap::new();
         let mut taken = 0usize;
         for (id, entry) in &self.pending {
             if taken >= global_room {
@@ -410,29 +451,36 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 continue;
             }
             groups
-                .entry((entry.shard, entry.preferred, entry.class))
+                .entry(Route {
+                    shard: entry.shard,
+                    preferred: entry.preferred,
+                    class: entry.class,
+                    answerers: entry.answerers,
+                })
                 .or_default()
                 .push(id.clone());
             taken += 1;
         }
 
         // Iterate groups in sorted order for deterministic test output.
-        let mut group_order: Vec<GroupKey> = groups.keys().copied().collect();
+        let mut group_order: Vec<Route> = groups.keys().copied().collect();
         group_order.sort_unstable_by(|a, b| {
-            a.0.inner()
-                .cmp(&b.0.inner())
+            a.shard
+                .inner()
+                .cmp(&b.shard.inner())
                 .then_with(|| {
-                    a.1.map(ValidatorId::inner)
-                        .cmp(&b.1.map(ValidatorId::inner))
+                    a.preferred
+                        .map(ValidatorId::inner)
+                        .cmp(&b.preferred.map(ValidatorId::inner))
                 })
-                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.class.cmp(&b.class))
+                .then_with(|| a.answerers.cmp(&b.answerers))
         });
 
         let mut outputs = Vec::new();
         let mut chunks_emitted = 0usize;
-        'outer: for key in group_order {
-            let (shard, preferred, class) = key;
-            let ids = groups.remove(&key).expect("key just collected");
+        'outer: for route in group_order {
+            let ids = groups.remove(&route).expect("route just collected");
             for chunk in ids.chunks(self.config.max_ids_per_request) {
                 if chunks_emitted >= self.config.parallel_chunks_per_tick {
                     break 'outer;
@@ -441,15 +489,13 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 for id in chunk {
                     if let Some(entry) = self.pending.get_mut(id) {
                         entry.in_flight = true;
-                        entry.asked = preferred;
+                        entry.asked = route.preferred;
                         entry.dispatched_at = Some(dispatched_at);
                     }
                 }
                 outputs.push(FetchOutput::Send {
                     ids: chunk.to_vec(),
-                    shard,
-                    preferred,
-                    class,
+                    route,
                 });
                 chunks_emitted += 1;
             }
@@ -487,23 +533,20 @@ pub trait FetchBinding: 'static {
     /// each impl navigates to its own subsystem's state.
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id>;
 
-    /// Send one request covering `ids` against `shard`'s committee and
-    /// route the response back through the event sender. `class` flows
-    /// down to `Network::request` as the per-call class override. For
+    /// Send one request covering `ids` along `route` and route the
+    /// response back through the event sender. For
     /// [`PER_ID`](Self::PER_ID) bindings the dispatcher pre-splits into
     /// single-element chunks before calling this.
     ///
     /// `local_shard` is the hosted shard that produced this request — it's
     /// threaded into the response callback so the resulting
     /// `ShardScopedInput::Protocol` and `*FetchFailed` events route to the right
-    /// hosted shard under cross-shard hosting (distinct from `shard`,
-    /// which selects the *target* committee).
+    /// hosted shard under cross-shard hosting (distinct from
+    /// `route.shard`, which selects the *target* committee).
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     );
@@ -625,9 +668,7 @@ pub const fn failed_chunk(error: &RequestError, ids: FetchIds) -> ShardScopedInp
 pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
     ids: Vec<B::Id>,
     local_shard: ShardId,
-    shard: ShardId,
-    preferred: Option<ValidatorId>,
-    class: Option<MessageClass>,
+    route: Route,
     network: &N,
     sender: &Sender<HostEvent>,
 ) {
@@ -639,11 +680,9 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
     for (scope, keys) in by_scope {
         let requested: Vec<B::Id> = keys.iter().map(|key| B::join(scope, *key)).collect();
         let es = sender.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             B::request(scope, &keys, local_shard),
-            class,
             Box::new(move |result| {
                 let response = match result {
                     Ok(response) => response,
@@ -693,11 +732,13 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
 /// its binding whichever way it is being released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release {
-    /// The attempt failed or went unanswered; retry at once the first
-    /// time since the tick, and on the tick after that. A remote failure
-    /// has spent its round trip and the retry rotates to another peer. A
-    /// locally served answer has spent none, and the retry asks the local
-    /// seat first again, so it repeats itself until the tick.
+    /// The attempt failed or went unanswered, whatever the reason; retry
+    /// at once the first time since the tick, and on the tick after that.
+    /// The retry asks whichever of the local seats and the committee's
+    /// other members the failed attempt did not, so a refused local
+    /// answer is not asked again before the tick. Peer selection is
+    /// weighted, so a refused remote peer is penalised rather than
+    /// excluded and may be chosen again.
     Failed,
     /// The request never reached a peer. Retry on the tick — see
     /// [`Respawn`].
@@ -774,11 +815,12 @@ impl From<Release> for Intent {
 ///
 /// A request the transport answered — a timeout, an exhausted rotation,
 /// a peer that held nothing, an answer this node could not use — leaves
-/// again at once, once per tick: a remote answer has cost a round trip
-/// and the retry rotates off its peer, while a locally served answer has
-/// cost nothing and only the tick lets time pass before it is asked
-/// again. A request that never reached a peer has not been answered: no
-/// committee resolves it, or none of its members is up, and it fails
+/// again at once, once per tick, asking whoever the failed attempt did
+/// not: a remote answer has cost a round trip and the retry rotates off
+/// its peer, and a locally served answer would come back the same, so a
+/// failure after asking the local seats goes to the committee's other
+/// members. A request that never reached a peer has not been answered:
+/// no committee resolves it, or none of its members is up, and it fails
 /// again as fast as it is asked. Re-sending that here spins between this
 /// thread and the transport for as long as the cause stands, which after
 /// a restart is until the beacon folds a topology.
@@ -933,8 +975,8 @@ mod tests {
         });
         assert_eq!(out.len(), 3);
         for o in &out {
-            let FetchOutput::Send { preferred, .. } = o;
-            assert_eq!(*preferred, Some(vid(1)));
+            let FetchOutput::Send { route, .. } = o;
+            assert_eq!(route.preferred, Some(vid(1)));
         }
         assert_eq!(p.in_flight_count(), 5);
     }
@@ -968,18 +1010,13 @@ mod tests {
         assert_eq!(p.pending_count(), 1, "the id is tracked once");
 
         let retried = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
-        let [
-            FetchOutput::Send {
-                shard,
-                preferred,
-                class,
-                ..
-            },
-        ] = retried.as_slice()
-        else {
+        let [FetchOutput::Send { route, .. }] = retried.as_slice() else {
             panic!("one re-send, got {retried:?}");
         };
-        assert_eq!((*shard, *preferred, *class), (SHARD, Some(vid(7)), None));
+        assert_eq!(
+            (route.shard, route.preferred, route.class),
+            (SHARD, Some(vid(7)), None)
+        );
     }
 
     /// A chunk the transport answered goes out again at once: the round
@@ -1014,12 +1051,12 @@ mod tests {
             preferred: Some(vid(1)),
             class: None,
         });
-        let FetchOutput::Send { ids, preferred, .. } = &out[0];
-        assert_eq!(*preferred, Some(vid(1)));
+        let FetchOutput::Send { ids, route } = &out[0];
+        assert_eq!(route.preferred, Some(vid(1)));
 
         let retried = p.handle(FetchInput::Failed { ids: ids.clone() });
-        let FetchOutput::Send { preferred, .. } = &retried[0];
-        assert_eq!(*preferred, None);
+        let FetchOutput::Send { route, .. } = &retried[0];
+        assert_eq!(route.preferred, None);
     }
 
     /// An answer that fails the same way each time it is asked costs one
@@ -1090,11 +1127,11 @@ mod tests {
             "the re-ask does not lift the hold"
         );
         let out = p.handle(FetchInput::Tick);
-        let [FetchOutput::Send { ids, preferred, .. }] = out.as_slice() else {
+        let [FetchOutput::Send { ids, route }] = out.as_slice() else {
             panic!("one send, got {out:?}");
         };
         assert_eq!(ids, &vec![tx(1)]);
-        assert_eq!(*preferred, Some(vid(7)));
+        assert_eq!(route.preferred, Some(vid(7)));
     }
 
     /// A chunk that never reached a peer waits for the tick already, so
@@ -1135,6 +1172,61 @@ mod tests {
         );
     }
 
+    fn ask_out(p: &mut Fetch<TxHash>, id: TxHash) -> Vec<FetchOutput<TxHash>> {
+        p.handle(FetchInput::Request {
+            ids: vec![id],
+            shard: SHARD,
+            preferred: None,
+            class: None,
+        })
+    }
+
+    fn answerers(out: &[FetchOutput<TxHash>]) -> Vec<Answerers> {
+        out.iter()
+            .map(|FetchOutput::Send { route, .. }| route.answerers)
+            .collect()
+    }
+
+    /// A failure's retry asks whoever the failed attempt did not: a seat
+    /// this host runs answers every retry the same way, and the
+    /// committee's other members may not. The second failure before the
+    /// tick holds, and the tick asks the local seats first.
+    #[test]
+    fn a_failed_retry_takes_turns_with_the_local_seats() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let out = ask_out(&mut p, tx(1));
+        assert_eq!(answerers(&out), [Answerers::LocalFirst]);
+        let out = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(answerers(&out), [Answerers::PeersOnly]);
+        assert!(p.handle(FetchInput::Failed { ids: vec![tx(1)] }).is_empty());
+        let out = p.handle(FetchInput::Tick);
+        assert_eq!(answerers(&out), [Answerers::LocalFirst]);
+    }
+
+    /// A peer round that outlasts the tick fails back to the local seats:
+    /// the next answerers follow from what the failed attempt asked, not
+    /// from a count the tick cleared while it was out.
+    #[test]
+    fn a_peer_round_failing_after_the_tick_asks_the_local_seats_next() {
+        let mut p = Fetch::<TxHash>::new("test", config());
+        let out = ask_out(&mut p, tx(1));
+        assert_eq!(answerers(&out), [Answerers::LocalFirst]);
+        let out = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(answerers(&out), [Answerers::PeersOnly]);
+        assert!(
+            p.handle(FetchInput::Tick).is_empty(),
+            "the peer round is still in flight"
+        );
+        let out = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(answerers(&out), [Answerers::LocalFirst]);
+        assert!(
+            p.handle(FetchInput::Failed { ids: vec![tx(1)] }).is_empty(),
+            "two failures since the tick hold"
+        );
+        let out = p.handle(FetchInput::Tick);
+        assert_eq!(answerers(&out), [Answerers::LocalFirst]);
+    }
+
     /// A chunk that never reached a peer asked no one, so it keeps its
     /// preferred peer for the tick's retry.
     #[test]
@@ -1150,8 +1242,8 @@ mod tests {
         p.handle(FetchInput::Unroutable { ids: ids.clone() });
 
         let retried = p.handle(FetchInput::Tick);
-        let FetchOutput::Send { preferred, .. } = &retried[0];
-        assert_eq!(*preferred, Some(vid(1)));
+        let FetchOutput::Send { route, .. } = &retried[0];
+        assert_eq!(route.preferred, Some(vid(1)));
     }
 
     /// A chunk that never reached a peer waits for the tick. Re-sending
@@ -1246,8 +1338,8 @@ mod tests {
             class: None,
         });
         assert_eq!(second.len(), 1);
-        let FetchOutput::Send { preferred, ids, .. } = &second[0];
-        assert_eq!(*preferred, Some(vid(2)));
+        let FetchOutput::Send { route, ids } = &second[0];
+        assert_eq!(route.preferred, Some(vid(2)));
         assert_eq!(ids, &vec![tx(2)]);
     }
 

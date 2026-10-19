@@ -305,7 +305,7 @@ mod tests {
             class: None,
         });
         assert!(
-            matches!(sent.as_slice(), [FetchOutput::Send { shard, .. }] if *shard == healthy),
+            matches!(sent.as_slice(), [FetchOutput::Send { route, .. }] if route.shard == healthy),
             "the record ask is dispatched: {sent:?}",
         );
     }
@@ -333,7 +333,7 @@ mod tests {
         assert!(
             matches!(
                 sent.as_slice(),
-                [FetchOutput::Send { shard, ids, .. }] if *shard == healthy && *ids == asked
+                [FetchOutput::Send { route, ids }] if route.shard == healthy && *ids == asked
             ),
             "the ask toward the healthy sibling is dispatched: {sent:?}",
         );
@@ -349,8 +349,8 @@ mod tests {
         let mut verdicts = VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH);
         let unreached = |fetch: &mut VerdictProofFetch, sent: Vec<FetchOutput<_>>| {
             let mut toward_healthy = Vec::new();
-            for FetchOutput::Send { ids, shard, .. } in sent {
-                if shard == healthy {
+            for FetchOutput::Send { ids, route } in sent {
+                if route.shard == healthy {
                     toward_healthy.push(ids);
                 } else {
                     assert!(

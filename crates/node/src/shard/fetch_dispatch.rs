@@ -63,21 +63,13 @@ where
         outputs: Vec<FetchOutput<B::Id>>,
     ) {
         let local_shard = self.shard;
-        for FetchOutput::Send {
-            ids,
-            shard,
-            preferred,
-            class,
-        } in outputs
-        {
+        for FetchOutput::Send { ids, route } in outputs {
             if B::PER_ID {
                 for id in ids {
                     B::dispatch_chunk(
                         vec![id],
                         local_shard,
-                        shard,
-                        preferred,
-                        class,
+                        route,
                         &*self.process.network,
                         self.event_sender(),
                     );
@@ -86,9 +78,7 @@ where
                 B::dispatch_chunk(
                     ids,
                     local_shard,
-                    shard,
-                    preferred,
-                    class,
+                    route,
                     &*self.process.network,
                     self.event_sender(),
                 );

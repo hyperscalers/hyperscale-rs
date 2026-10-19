@@ -16,8 +16,8 @@ use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    ResponseVerdict, ValidatorKeyMap, Verdict, VerdictKey,
+    Answerers, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, ResponseVerdict, ValidatorKeyMap, Verdict, VerdictKey,
 };
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
@@ -286,9 +286,10 @@ impl Network for IrohNetwork {
     }
 
     #[allow(clippy::too_many_lines)] // single dispatch over the request lifecycle (local-serve → wire)
-    fn request<R: Request + Clone + 'static>(
+    fn request_from<R: Request + Clone + 'static>(
         &self,
         shard: ShardId,
+        answerers: Answerers,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,
@@ -296,11 +297,9 @@ impl Network for IrohNetwork {
     ) {
         // Local-serve runs off the caller's thread because handlers may
         // take locks or block on condvars.
-        let registry = self
-            .adapter
-            .local_shards()
-            .contains(&shard)
-            .then(|| Arc::clone(&self.registry));
+        let registry = (answerers == Answerers::LocalFirst
+            && self.adapter.local_shards().contains(&shard))
+        .then(|| Arc::clone(&self.registry));
         let topology_snapshot = Arc::clone(&self.topology_snapshot);
         let routing_committees = Arc::clone(&self.routing_committees);
         let adapter = Arc::clone(&self.adapter);
@@ -308,7 +307,8 @@ impl Network for IrohNetwork {
         let peer_unreachable_count = Arc::clone(&self.peer_unreachable_count);
 
         self.tokio_handle.spawn(async move {
-            // Step 1: local-serve if we host the shard. A non-empty hit is
+            // Step 1: local-serve if we host the shard and the caller has
+            // not asked past its own seats. A non-empty hit is
             // terminal; an empty hit falls through to the remote committee,
             // or a host packed across shards would never ask another peer.
             if let Some(registry) = registry {

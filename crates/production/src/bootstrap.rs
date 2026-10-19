@@ -499,7 +499,7 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use hyperscale_hbor::{Bytes, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
-    use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
+    use hyperscale_network::{Answerers, GossipHandler, NotificationHandler, RequestHandler};
     use hyperscale_node::{
         serve_block_request, serve_state_range_request, serve_witness_history_request,
     };
@@ -563,9 +563,10 @@ mod tests {
     }
 
     impl Network for StubNetwork {
-        fn request<R: Request + Clone + 'static>(
+        fn request_from<R: Request + Clone + 'static>(
             &self,
             _shard: ShardId,
+            _: Answerers,
             _preferred_peer: Option<ValidatorId>,
             request: R,
             _class_override: Option<MessageClass>,

@@ -23,13 +23,13 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{GetSettledTxsResponse, GetStateProofResponse};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, BlockHeight, Finalization, FinalizationHash, MessageClass, ProvisionHash, ShardId,
-    SubstateKey, TerminalEvidence, ValidatorId, VerdictCells, Verifiable,
-    settled_txs_root_from_hashes,
+    Anchor, BlockHeight, Finalization, FinalizationHash, ProvisionHash, ShardId, SubstateKey,
+    TerminalEvidence, ValidatorId, VerdictCells, Verifiable, settled_txs_root_from_hashes,
 };
 
 use crate::fetch::{
-    Fetch, FetchBinding, Refusal, ScopedAnswer, dispatch_scoped, failed_chunk, partition_solicited,
+    Fetch, FetchBinding, Refusal, Route, ScopedAnswer, dispatch_scoped, failed_chunk,
+    partition_solicited,
 };
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
@@ -73,21 +73,17 @@ impl FetchBinding for LocalProvisionBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<ProvisionHash>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
         let es = sender.clone();
         let hs = ids.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             GetLocalProvisionsRequest::new(
                 Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
             ),
-            class,
             Box::new(move |result| {
                 let resp = match result {
                     Ok(resp) => resp,
@@ -161,21 +157,17 @@ impl FetchBinding for FinalizationBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<FinalizationHash>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
         let es = sender.clone();
         let requested_ids = ids.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             GetFinalizationsRequest::new(
                 Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
             ),
-            class,
             Box::new(move |result| {
                 let resp = match result {
                     Ok(resp) => resp,
@@ -250,13 +242,11 @@ impl FetchBinding for StateProofBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
     }
 }
 
@@ -338,13 +328,11 @@ impl FetchBinding for VerdictProofBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
     }
 }
 
@@ -412,13 +400,11 @@ impl FetchBinding for SettledTxsBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
     }
 }
 
@@ -484,9 +470,7 @@ impl FetchBinding for ProvisionBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<(ShardId, ShardId, BlockHeight)>,
         local_shard: ShardId,
-        shard: ShardId,
-        preferred: Option<ValidatorId>,
-        class: Option<MessageClass>,
+        route: Route,
         network: &N,
         sender: &Sender<HostEvent>,
     ) {
@@ -494,7 +478,7 @@ impl FetchBinding for ProvisionBinding {
         debug_assert_eq!(ids.len(), 1);
         let (source_shard, target_shard, block_height) = ids[0];
         debug_assert_eq!(
-            shard, source_shard,
+            route.shard, source_shard,
             "ProvisionBinding routes to the source shard; the runner sets it from the variant"
         );
         // `target_shard` (the requester's shard) is the body field: the
@@ -502,11 +486,9 @@ impl FetchBinding for ProvisionBinding {
         // shard `shard = source_shard` picks the responding committee.
         let request = GetProvisionsRequest::new(block_height, target_shard);
         let es = sender.clone();
-        network.request(
-            shard,
-            preferred,
+        route.request(
+            network,
             request,
-            class,
             Box::new(move |result| {
                 let ids = || Self::ids(vec![(source_shard, target_shard, block_height)]);
                 let push_fetch_failed = || {
