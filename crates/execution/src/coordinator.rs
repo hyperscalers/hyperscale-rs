@@ -7278,7 +7278,7 @@ mod tests {
         }
         anchors.forget_orphaned(&schedule);
         let offered = anchors
-            .newest_licensed(recovered, now, |_| true)
+            .newest_licensed(recovered, now, ..)
             .expect("the frontier's proof stands");
         assert_eq!(offered.height, BlockHeight::new(5));
         assert!(admitted(offered));
@@ -7286,7 +7286,7 @@ mod tests {
         anchors.record(proof(12, 21 * epoch_ms + 100));
         anchors.forget_orphaned(&schedule);
         let offered = anchors
-            .newest_licensed(recovered, now, |_| true)
+            .newest_licensed(recovered, now, ..)
             .expect("the fresh block's proof stands");
         assert_eq!(offered.height, BlockHeight::new(12));
         assert!(admitted(offered));

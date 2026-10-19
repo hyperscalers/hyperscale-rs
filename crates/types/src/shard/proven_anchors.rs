@@ -31,7 +31,7 @@
 //! terms: one per host, read wherever it is needed.
 
 use std::collections::BTreeMap;
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -96,8 +96,8 @@ impl ProvenAnchors {
             .copied()
     }
 
-    /// The highest anchor of `shard` this node has proven that `licensed`
-    /// accepts, of those standing at `at`.
+    /// The highest anchor of `shard` this node has proven inside
+    /// `window`, of those standing at `at`.
     ///
     /// The ceiling is what makes the choice agreed. Which headers a node
     /// holds is its own view, and a counterpart's land a block apart, so
@@ -112,6 +112,13 @@ impl ProvenAnchors {
     /// bounded history behind it, and a window outruns that history by
     /// an order of magnitude.
     ///
+    /// Reads down from the top only to the first anchor under both
+    /// ceilings, which answers if it is inside `window` and otherwise
+    /// says none below it is: a shard's `ts` never falls as its height
+    /// rises. An orphan [`Self::forget_orphaned`] has yet to forget can
+    /// stand above a fresh anchor with a later `ts`; until it does, an
+    /// orphan below `window` hides that anchor, and the answer is none.
+    ///
     /// # Panics
     ///
     /// As [`Self::record`].
@@ -120,15 +127,21 @@ impl ProvenAnchors {
         &self,
         shard: ShardId,
         at: WeightedTimestamp,
-        licensed: impl Fn(WeightedTimestamp) -> bool,
+        window: impl RangeBounds<WeightedTimestamp>,
     ) -> Option<Anchor> {
+        let under_end = |ts: WeightedTimestamp| match window.end_bound() {
+            Bound::Included(end) => ts <= *end,
+            Bound::Excluded(end) => ts < *end,
+            Bound::Unbounded => true,
+        };
         self.by_shard
             .read()
             .expect("proven anchors lock poisoned")
             .get(&shard)?
             .values()
             .rev()
-            .find(|anchor| anchor.ts <= at && licensed(anchor.ts))
+            .find(|anchor| anchor.ts <= at && under_end(anchor.ts))
+            .filter(|anchor| window.contains(&anchor.ts))
             .copied()
     }
 
@@ -259,7 +272,7 @@ mod tests {
         assert_eq!(anchors.at(shard, BlockHeight::new(5)), None);
         assert_eq!(
             anchors
-                .newest_licensed(shard, ms(99_000), |_| true)
+                .newest_licensed(shard, ms(99_000), ..)
                 .unwrap()
                 .height,
             BlockHeight::new(9),
@@ -267,7 +280,7 @@ mod tests {
         );
         assert_eq!(
             anchors
-                .newest_licensed(shard, ms(99_000), |ts| ts <= ms(5_000))
+                .newest_licensed(shard, ms(99_000), ..=ms(5_000))
                 .unwrap()
                 .height,
             BlockHeight::new(4),
@@ -289,19 +302,16 @@ mod tests {
 
         let at = ms(5_000);
         assert_eq!(
-            ahead.newest_licensed(shard, at, |_| true),
-            behind.newest_licensed(shard, at, |_| true),
+            ahead.newest_licensed(shard, at, ..),
+            behind.newest_licensed(shard, at, ..),
             "the header past the clock is not the one either asks of",
         );
         assert_eq!(
-            ahead.newest_licensed(shard, at, |_| true).unwrap().height,
+            ahead.newest_licensed(shard, at, ..).unwrap().height,
             BlockHeight::new(4),
         );
         assert_eq!(
-            ahead
-                .newest_licensed(shard, ms(9_000), |_| true)
-                .unwrap()
-                .height,
+            ahead.newest_licensed(shard, ms(9_000), ..).unwrap().height,
             BlockHeight::new(9),
             "and the clock reaching it is what lets it be asked of",
         );
@@ -391,6 +401,35 @@ mod tests {
     }
 
     proptest! {
+        /// Over a shard whose `ts` never falls as its height rises, the
+        /// scan that stops at the first anchor under both ceilings
+        /// answers as testing every anchor would.
+        #[test]
+        fn stopping_at_the_ceiling_matches_testing_every_anchor(
+            steps in vec((1u64..4, 0u64..1_500), 0..40),
+            at in 0u64..25_000,
+            start in 0u64..25_000,
+            span in 0u64..10_000,
+        ) {
+            let shard = ShardId::leaf(1, 1);
+            let anchors = ProvenAnchors::new();
+            let (mut height, mut ts) = (0, 0);
+            for (rise, later) in steps {
+                height += rise;
+                ts += later;
+                anchors.record(anchor(shard, height, 0, ms(ts)));
+            }
+            let (at, window) = (ms(at), ms(start)..ms(start + span));
+            let every = anchors.by_shard.read().expect("unpoisoned").get(&shard).and_then(|heights| {
+                heights
+                    .values()
+                    .rev()
+                    .find(|anchor| anchor.ts <= at && window.contains(&anchor.ts))
+                    .copied()
+            });
+            prop_assert_eq!(anchors.newest_licensed(shard, at, window), every);
+        }
+
         /// Forgetting touches only heights above a shard's lowest
         /// recovery frontier, and forgets exactly what testing every
         /// anchor of every shard would.
