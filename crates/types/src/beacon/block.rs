@@ -11,6 +11,8 @@
 //! authenticate the same block hash, so adoption converges.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::OnceLock;
 
 use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 
@@ -74,6 +76,33 @@ pub struct BeaconBlock {
     prev_block_hash: BeaconBlockHash,
     committed_proposals: Capped<Vec<(ValidatorId, BeaconProposal)>, MAX_BEACON_COMMITTEE>,
     shard_contributions: Capped<BTreeMap<ShardId, ShardEpochContribution>, MAX_SHARDS>,
+    /// The block's hash, computed on first [`Self::block_hash`] call. Not
+    /// on the wire: every holder derives it from the fields above.
+    #[hbor(skip)]
+    hash: BlockHashMemo,
+}
+
+/// A beacon block's memoised hash.
+///
+/// The block's fields never change once it is built, so the hash of its
+/// encoding is fixed too. Two blocks with the same fields are the same
+/// block whether or not either has been hashed yet, so the memo takes no
+/// part in equality.
+#[derive(Clone, Default)]
+struct BlockHashMemo(OnceLock<BeaconBlockHash>);
+
+impl PartialEq for BlockHashMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for BlockHashMemo {}
+
+impl fmt::Debug for BlockHashMemo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("..")
+    }
 }
 
 impl BeaconBlock {
@@ -90,6 +119,7 @@ impl BeaconBlock {
             prev_block_hash,
             committed_proposals,
             shard_contributions: Capped::default(),
+            hash: BlockHashMemo::default(),
         }
     }
 
@@ -107,6 +137,7 @@ impl BeaconBlock {
             prev_block_hash,
             committed_proposals,
             shard_contributions,
+            hash: BlockHashMemo(OnceLock::new()),
         }
     }
 
@@ -120,6 +151,7 @@ impl BeaconBlock {
             prev_block_hash: BeaconBlockHash::ZERO,
             committed_proposals: Capped::empty(),
             shard_contributions: Capped::default(),
+            hash: BlockHashMemo::default(),
         }
     }
 
@@ -133,6 +165,7 @@ impl BeaconBlock {
             prev_block_hash,
             committed_proposals: Capped::empty(),
             shard_contributions: Capped::default(),
+            hash: BlockHashMemo::default(),
         }
     }
 
@@ -172,8 +205,10 @@ impl BeaconBlock {
     /// closed, so encoding is total.
     #[must_use]
     pub fn block_hash(&self) -> BeaconBlockHash {
-        let bytes = hbor_to_vec(self).expect("BeaconBlock serialization is infallible");
-        BeaconBlockHash::from_raw(Hash::from_bytes(&bytes))
+        *self.hash.0.get_or_init(|| {
+            let bytes = hbor_to_vec(self).expect("BeaconBlock serialization is infallible");
+            BeaconBlockHash::from_raw(Hash::from_bytes(&bytes))
+        })
     }
 
     /// Whether this is the genesis block (epoch 0).
@@ -267,6 +302,27 @@ mod tests {
     /// Normal-shaped block with the same `(epoch, prev_block_hash,
     /// empty_proposals)` produce identical hashes. The discriminator
     /// lives on the cert.
+    #[test]
+    fn a_memoised_hash_is_the_hash_of_the_encoding() {
+        let block = BeaconBlock::new(
+            Epoch::new(7),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"parent")),
+            Capped::from_array([(ValidatorId::new(3), sample_proposal(3))]),
+        );
+        let bytes = hbor_to_vec(&block).unwrap();
+        let fresh = BeaconBlockHash::from_raw(Hash::from_bytes(&bytes));
+        assert_eq!(block.block_hash(), fresh);
+        assert_eq!(block.block_hash(), fresh, "the memo answers what it stored");
+        assert_eq!(
+            hbor_to_vec(&block).unwrap(),
+            bytes,
+            "the memo is not encoded"
+        );
+        let decoded: BeaconBlock = hbor_from_slice(&bytes).unwrap();
+        assert_eq!(decoded, block, "the memo takes no part in equality");
+        assert_eq!(decoded.block_hash(), fresh);
+    }
+
     #[test]
     fn skip_and_empty_normal_have_identical_block_hash() {
         let epoch = Epoch::new(5);
