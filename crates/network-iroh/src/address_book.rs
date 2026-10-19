@@ -113,6 +113,18 @@ fn announced_addresses(endpoint: &EndpointAddr) -> AnnouncedAddresses {
     announced
 }
 
+/// The sequence a record signed at wall-clock `now_ms` carries, after
+/// the last this host signed at `previous`.
+///
+/// Wall-clock milliseconds order re-announcements across process
+/// restarts, which a per-process counter cannot. Within one process the
+/// sequence also moves strictly past `previous`: two signings can land in
+/// one millisecond, and a book keeps a record only over a lower sequence.
+#[must_use]
+pub fn record_sequence(now_ms: u64, previous: Option<u64>) -> u64 {
+    previous.map_or(now_ms, |previous| now_ms.max(previous.saturating_add(1)))
+}
+
 /// One signed address record per hosted vnode, naming `endpoint` at
 /// `sequence`. Empty when `endpoint` has no address a record can carry. A
 /// vnode whose signer cannot sign contributes no record.
@@ -403,6 +415,27 @@ mod tests {
         gossip: &ValidatorAddressGossip,
     ) -> IngestOutcome {
         book.ingest(&BlsVerifier, &net(), keys, gossip).0
+    }
+
+    #[test]
+    fn a_record_signed_again_in_the_same_millisecond_supersedes_the_last() {
+        let book = AddressBook::default();
+        let vid = ValidatorId::new(4);
+        let keys = keys_for(&[vid]);
+        let first = record_sequence(1_000, None);
+        assert_eq!(
+            ingest(&book, &keys, &announce(vid, &endpoint(1), first)),
+            IngestOutcome::Recorded
+        );
+
+        let moved = record_sequence(1_000, Some(first));
+        assert!(moved > first);
+        assert_eq!(
+            ingest(&book, &keys, &announce(vid, &endpoint(2), moved)),
+            IngestOutcome::Recorded
+        );
+        assert_eq!(book.get(vid).unwrap().endpoint, endpoint(2));
+        assert_eq!(record_sequence(5_000, Some(moved)), 5_000);
     }
 
     #[test]
