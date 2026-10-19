@@ -48,6 +48,12 @@ use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs, member_host
 /// headers still flow, so `shard` still executes the tick and produces its own
 /// certificate; it just never receives `peer_shard`'s.
 ///
+/// A peer's certificate decides nothing on `shard`: it arms the read of the
+/// crossing records its transactions write and acknowledges the provision
+/// batches sent to `shard`. A stated core member settles off its siblings'
+/// verdicts read from their state, so holding one takes
+/// [`isolate_crossing_intake`] as well.
+///
 /// The cut follows membership, so it holds across a rotation, a recovery
 /// and a cohort draw. It is faithful only while no host serves both shards:
 /// a host's co-hosted vnodes hand the EC across in-process, which no network
