@@ -31,6 +31,7 @@
 //! terms: one per host, read wherever it is needed.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -198,7 +199,14 @@ impl ProvenAnchors {
     pub fn forget_orphaned(&self, schedule: &TopologySchedule) {
         let mut by_shard = self.by_shard.write().expect("proven anchors lock poisoned");
         by_shard.retain(|&shard, heights| {
-            heights.retain(|&height, anchor| !schedule.recovery_orphaned(shard, anchor.ts, height));
+            if let Some(floor) = schedule.recovery_orphan_floor(shard) {
+                heights
+                    .extract_if(
+                        (Bound::Excluded(floor), Bound::Unbounded),
+                        |&height, anchor| schedule.recovery_orphaned(shard, anchor.ts, height),
+                    )
+                    .for_each(drop);
+            }
             !heights.is_empty()
         });
     }
@@ -207,6 +215,9 @@ impl ProvenAnchors {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::{
@@ -377,6 +388,53 @@ mod tests {
         let elsewhere = across_a_recovery(other);
         elsewhere.forget_orphaned(&recovered(shard, true));
         assert_eq!(elsewhere.len(), 3);
+    }
+
+    proptest! {
+        /// Forgetting touches only heights above a shard's lowest
+        /// recovery frontier, and forgets exactly what testing every
+        /// anchor of every shard would.
+        #[test]
+        fn forgetting_matches_testing_every_anchor(
+            bindings in vec((1u64..6, 0u64..20, any::<bool>()), 0..4),
+            held in vec((0u64..3, 0u64..24, 0u64..8_000), 0..40),
+        ) {
+            let shards = [ShardId::leaf(2, 0), ShardId::leaf(2, 1), ShardId::leaf(2, 2)];
+            let mut rotated = 0;
+            let history: Vec<RecoveryBinding> = bindings
+                .iter()
+                .map(|&(step, frontier, completed)| {
+                    rotated += step;
+                    RecoveryBinding {
+                        rotated_at: Epoch::new(rotated),
+                        attested_frontier: BlockHeight::new(frontier),
+                        completed,
+                    }
+                })
+                .collect();
+            let head = TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(Vec::new()),
+            )
+            .with_recoveries(BTreeMap::from([(shards[0], history)]));
+            let schedule = TopologySchedule::new(1_000, Epoch::new(rotated + 1), Arc::new(head));
+
+            let anchors = ProvenAnchors::new();
+            for &(shard, height, ts) in &held {
+                let shard = shards[usize::try_from(shard).expect("fits")];
+                anchors.record(anchor(shard, height, 0, ms(ts)));
+            }
+            let mut expected = anchors.by_shard.read().expect("unpoisoned").clone();
+            expected.retain(|&shard, heights| {
+                heights.retain(|&height, anchor| {
+                    !schedule.recovery_orphaned(shard, anchor.ts, height)
+                });
+                !heights.is_empty()
+            });
+            anchors.forget_orphaned(&schedule);
+            prop_assert_eq!(&*anchors.by_shard.read().expect("unpoisoned"), &expected);
+        }
     }
 
     /// A harvested block's proof stays forgotten once the record clears:
