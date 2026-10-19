@@ -196,6 +196,10 @@ pub struct SimConfig {
     /// behaviour a spare artifact changes. A scenario that calls a
     /// fixture asks for it.
     pub packages: GenesisPackages,
+    /// Events one host may step at one simulated instant before the run
+    /// fails as stalled. A load that submits many transactions to a host
+    /// at one instant raises it in proportion.
+    pub stall_events_per_host: u64,
 }
 
 impl Default for SimConfig {
@@ -225,11 +229,17 @@ impl Default for SimConfig {
             pools: Vec::new(),
             execution_mode: ExecutionMode::Serial,
             packages: GenesisPackages::protocol(),
+            stall_events_per_host: Self::STALL_EVENTS_PER_HOST,
         }
     }
 }
 
 impl SimConfig {
+    /// The default [`Self::stall_events_per_host`]: about ten times the
+    /// most one host was measured to step at one instant across the
+    /// scenario suites, under sixty thousand.
+    pub const STALL_EVENTS_PER_HOST: u64 = 600_000;
+
     /// The transport-only config the simulated network consumes.
     const fn network_config(&self) -> NetworkConfig {
         NetworkConfig {
@@ -411,6 +421,9 @@ pub struct SimulationRunner {
 
     /// Statistics.
     stats: SimulationStats,
+
+    /// How far the run has gone at its current instant.
+    stall: ClockStall,
 
     /// Running digest of every event processed, in order: its time, host,
     /// scope, type and sequence. Two runs agree on it exactly when they
@@ -879,6 +892,7 @@ impl SimulationRunner {
             clocks,
             timers: HashMap::new(),
             stats: SimulationStats::default(),
+            stall: ClockStall::new(network_config.stall_events_per_host),
             trace: Blake3Hasher::new(),
             invariants: Invariants::default(),
             archive: ChainArchive::default(),
@@ -1395,7 +1409,11 @@ impl SimulationRunner {
     /// # Panics
     ///
     /// Panics if `event_queue.pop_first()` returns `None` after `first_key_value()`
-    /// returned `Some` (impossible: `&mut self` blocks any other writer).
+    /// returned `Some` (impossible: `&mut self` blocks any other writer),
+    /// or if the run stops advancing its clock: more than
+    /// [`ClockStall::PASSES`] passes of its loop, or more than
+    /// [`SimConfig::stall_events_per_host`] events on one host, at one
+    /// simulated instant.
     pub fn run_until(&mut self, end_time: Duration) {
         // Walk the committed chains every simulated minute, far inside the
         // span a replica keeps a block for before its chain floor passes
@@ -1431,6 +1449,7 @@ impl SimulationRunner {
             }
 
             self.now = next_time;
+            self.stall.pass(self.now);
 
             if self.now.saturating_sub(self.last_chain_walk) >= CHAIN_WALK_INTERVAL {
                 self.walk_chains();
@@ -1476,6 +1495,7 @@ impl SimulationRunner {
 
                 self.stats.events_processed += 1;
                 self.stats.events_by_priority[event.priority() as usize] += 1;
+                self.stall.step(host_index, event.kind());
                 self.fold_into_trace(key, &event);
 
                 self.process_event(host_index, event);
@@ -1877,6 +1897,107 @@ impl HostClock {
     }
 }
 
+/// How far a run has gone at one simulated instant.
+///
+/// Every honest cycle in the cluster passes through a timer, a latency or
+/// a processing time, so the clock moves. One that does not — an answer
+/// served at the instant it is asked and refused at that instant, say —
+/// would run forever at one instant, out of reach of every simulated
+/// budget. Two counts catch it: the passes of the run loop at the
+/// instant, which a cycle through the network's zero-latency deliveries
+/// drives, and the events each host steps at it, which a cycle through
+/// one host's own events drives. A cycle that advances the clock by a
+/// microsecond a turn is neither, and is not caught here.
+struct ClockStall {
+    /// The instant counted.
+    at: Duration,
+    /// Passes of the run loop at `at`.
+    passes: u64,
+    /// Per host, the instant its count is of and the events it stepped
+    /// at it.
+    events: Vec<(Duration, u64)>,
+    /// Events one host may step at one instant.
+    events_per_host: u64,
+    /// The last events stepped by a host near the limit, by host and
+    /// kind; `recorded` of them are filled.
+    recent: [(NodeIndex, &'static str); Self::RECENT],
+    recorded: usize,
+}
+
+impl ClockStall {
+    /// Passes of the run loop at one instant past which the run is
+    /// stalled. Each pass is one round of deliveries at the instant, so
+    /// an honest instant takes few whatever the cluster's size or load:
+    /// the scenario suites were measured at under twenty.
+    const PASSES: u64 = 10_000;
+
+    /// Events the panic names, most recent last.
+    const RECENT: usize = 8;
+
+    const fn new(events_per_host: u64) -> Self {
+        Self {
+            at: Duration::ZERO,
+            passes: 0,
+            events: Vec::new(),
+            events_per_host,
+            recent: [(0, ""); Self::RECENT],
+            recorded: 0,
+        }
+    }
+
+    /// Count one pass of the run loop at `now`, panicking once the run
+    /// has passed more than [`Self::PASSES`] times at one instant.
+    fn pass(&mut self, now: Duration) {
+        if now != self.at {
+            self.at = now;
+            self.passes = 0;
+            self.recorded = 0;
+        }
+        self.passes += 1;
+        assert!(
+            self.passes <= Self::PASSES,
+            "simulation clock stalled at {:?}: the run loop passed {} times without time advancing",
+            self.at,
+            self.passes,
+        );
+    }
+
+    /// Count one event `host` stepped at the instant of the last pass,
+    /// panicking once it has stepped more than its limit there.
+    fn step(&mut self, host: NodeIndex, kind: &'static str) {
+        let index = host as usize;
+        if self.events.len() <= index {
+            self.events.resize(index + 1, (Duration::ZERO, 0));
+        }
+        let (at, events) = &mut self.events[index];
+        if *at != self.at {
+            *at = self.at;
+            *events = 0;
+        }
+        *events += 1;
+        let events = *events;
+        if events + Self::RECENT as u64 > self.events_per_host {
+            self.recent[self.recorded % Self::RECENT] = (host, kind);
+            self.recorded += 1;
+        }
+        assert!(
+            events <= self.events_per_host,
+            "simulation clock stalled at {:?}: host {host} stepped {events} events without time advancing; last events (host, kind): {:?}",
+            self.at,
+            self.recent(),
+        );
+    }
+
+    /// The events recorded near the limit, oldest first.
+    fn recent(&self) -> Vec<(NodeIndex, &'static str)> {
+        let filled = self.recorded.min(Self::RECENT);
+        let start = self.recorded - filled;
+        (start..self.recorded)
+            .map(|i| self.recent[i % Self::RECENT])
+            .collect()
+    }
+}
+
 /// A run that panics names what replays it: the seed, the features that
 /// shape its sample space, and a command that reruns the failing test.
 impl Drop for SimulationRunner {
@@ -1907,15 +2028,23 @@ impl Drop for SimulationRunner {
         } else {
             format!(" HYPERSCALE_SIM_WORLD_SEED={}", self.world_seed)
         };
+        // A test runs on a thread named after it; a binary driving the
+        // runner runs it on its main thread, and replays by its own seed.
+        let replay = if test == "main" {
+            format!("rerun the same command with seed {}", self.seed)
+        } else {
+            format!(
+                "HYPERSCALE_SIM_SEED={}{world} cargo nextest run {profile} \
+                 -p hyperscale-simulation{feature_args} -E 'test(={test})'",
+                self.seed,
+            )
+        };
         eprintln!(
-            "\nsimulation failed: seed {} at {:?} after {} events, trace {}\n\
-             replay: HYPERSCALE_SIM_SEED={}{world} cargo nextest run {profile} \
-             -p hyperscale-simulation{feature_args} -E 'test(={test})'\n",
+            "\nsimulation failed: seed {} at {:?} after {} events, trace {}\nreplay: {replay}\n",
             self.seed,
             self.now,
             self.stats.events_processed,
             hex_digest(&self.trace_digest()),
-            self.seed,
         );
         eprintln!("committed heights per host:");
         for host in 0..self.num_hosts() {
@@ -2094,5 +2223,71 @@ mod clock_tests {
                 "host {host} read {read}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use hyperscale_dispatch::{Dispatch, DispatchPool};
+
+    use super::*;
+
+    /// Queue a job that queues itself again when it runs.
+    fn respawn(dispatch: &SyncDispatch) {
+        let next = dispatch.clone();
+        dispatch.spawn(DispatchPool::Consensus, move || respawn(&next));
+    }
+
+    #[test]
+    #[should_panic(expected = "simulation clock stalled at 0ns: host 0 stepped")]
+    fn an_event_that_reschedules_itself_at_once_stalls_the_run() {
+        let mut runner = SimulationRunner::new(&SimConfig::default(), 7);
+        // Only the io pool takes time, so a consensus job is due at once.
+        let jobs = Arc::new(DeferredJobs::new(ProcessingTimes::disk(7), 7));
+        runner.deferred[0] = Some(Arc::clone(&jobs));
+        respawn(&SyncDispatch::deferred(jobs));
+        runner.drain_events(0);
+        runner.run_until(Duration::from_secs(1));
+    }
+
+    /// A loop that keeps passing at one instant stalls the run whether or
+    /// not any event steps in it.
+    #[test]
+    #[should_panic(expected = "the run loop passed 10001 times without time advancing")]
+    fn a_loop_that_passes_at_one_instant_stalls_the_run() {
+        let mut stall = ClockStall::new(SimConfig::STALL_EVENTS_PER_HOST);
+        for _ in 0..=ClockStall::PASSES {
+            stall.pass(Duration::from_secs(1));
+        }
+    }
+
+    /// Each host is held to its own limit at each instant, and the panic
+    /// names the host and the last events it stepped.
+    #[test]
+    fn a_stalled_host_is_named_with_its_last_events() {
+        let mut stall = ClockStall::new(10);
+        let first = Duration::from_secs(1);
+        stall.pass(first);
+        for _ in 0..10 {
+            stall.step(1, "Other");
+            stall.step(3, "Old");
+        }
+        stall.pass(first + Duration::from_micros(1));
+        for _ in 0..10 {
+            stall.step(1, "Other");
+            stall.step(3, "Stepped");
+        }
+        let stalled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stall.step(3, "Last");
+        }))
+        .expect_err("an eleventh event at one instant stalls the run");
+        let message = stalled.downcast_ref::<String>().expect("a formatted panic");
+        assert!(message.contains("host 3 stepped 11 events"), "{message}");
+        assert!(
+            message.ends_with(
+                r#"[(3, "Stepped"), (1, "Other"), (3, "Stepped"), (1, "Other"), (3, "Stepped"), (1, "Other"), (3, "Stepped"), (3, "Last")]"#
+            ),
+            "{message}"
+        );
     }
 }

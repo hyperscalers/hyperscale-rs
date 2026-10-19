@@ -30,6 +30,16 @@ impl SimEvent {
             Self::Deferred(_) | Self::Restart => EventPriority::Internal,
         }
     }
+
+    /// What the event is, for a diagnostic naming the events a run stepped.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Host(event) => event.type_name(),
+            Self::BatchDeadline => "BatchDeadline",
+            Self::Deferred(_) => "Deferred",
+            Self::Restart => "Restart",
+        }
+    }
 }
 
 /// Key for ordering events in the queue.

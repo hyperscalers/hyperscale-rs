@@ -40,6 +40,7 @@ hex.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 hyperscale-effects-bridge.workspace = true
+hyperscale-dispatch.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true

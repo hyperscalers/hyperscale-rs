@@ -2802,6 +2802,7 @@ dependencies = [
  "hyperscale-core",
  "hyperscale-crypto-bls",
  "hyperscale-crypto-mock",
+ "hyperscale-dispatch",
  "hyperscale-dispatch-sync",
  "hyperscale-effects-bridge",
  "hyperscale-engine",
