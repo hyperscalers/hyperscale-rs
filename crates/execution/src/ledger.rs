@@ -522,12 +522,18 @@ impl Question {
         self.deadline.passed(now)
     }
 
-    /// Whether a header at `anchor_wt` is one to ask at: inside
-    /// [`Window::Core`], where an absence of the sibling's committed
-    /// cell answers.
+    /// The anchors a header is one to ask at: [`Window::Core`], where an
+    /// absence of the sibling's committed cell answers.
+    #[must_use]
+    pub(crate) fn asked_within(self) -> Range<WeightedTimestamp> {
+        Window::Core.of(self.deadline)
+    }
+
+    /// Whether a header at `anchor_wt` is one to ask at, inside
+    /// [`Self::asked_within`].
     #[must_use]
     pub(crate) fn asks_at(self, anchor_wt: WeightedTimestamp) -> bool {
-        Window::Core.of(self.deadline).contains(&anchor_wt)
+        self.asked_within().contains(&anchor_wt)
     }
 
     /// Whether `inclusion`, read at `read_at`, answers the question: an

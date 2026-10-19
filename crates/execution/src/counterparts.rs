@@ -2201,10 +2201,7 @@ impl Counterparts {
             if question.proven_by(self.fetched.claims()) {
                 continue;
             }
-            let Some(anchor) = self
-                .proven_anchors
-                .newest_licensed(question.shard, now, |_| true)
-            else {
+            let Some(anchor) = self.proven_anchors.newest_licensed(question.shard, now, ..) else {
                 continue;
             };
             let prior = self
@@ -2271,9 +2268,9 @@ impl Counterparts {
             // standing at the chain's clock: the one the shard is
             // likeliest to still serve, and the one every member of
             // this committee is asking of.
-            let Some(anchor) = self
-                .proven_anchors
-                .newest_licensed(shard, now, |ts| question.asks_at(ts))
+            let Some(anchor) =
+                self.proven_anchors
+                    .newest_licensed(shard, now, question.asked_within())
             else {
                 continue;
             };
@@ -2493,7 +2490,7 @@ impl Counterparts {
                 continue;
             }
             let shard = trie.shard_for_prefix(claim.owner);
-            let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, |_| true) else {
+            let Some(anchor) = self.proven_anchors.newest_licensed(shard, now, ..) else {
                 continue;
             };
             if asked_at
@@ -2566,7 +2563,7 @@ impl Counterparts {
         windows: EpochWindows,
     ) -> Option<Anchor> {
         self.proven_anchors
-            .newest_licensed(shard, now, |_| true)
+            .newest_licensed(shard, now, ..)
             .filter(|anchor| !self.frontier.refuses(shard, ReadMark::of(anchor, windows)))
     }
 
@@ -2994,7 +2991,7 @@ impl Counterparts {
             let sibling = question.sibling;
             let named = (sibling, question.tx);
             let toward = toward.entry(sibling).or_insert_with(|| Toward {
-                newest: self.proven_anchors.newest_licensed(sibling, now, |_| true),
+                newest: self.proven_anchors.newest_licensed(sibling, now, ..),
                 out: false,
                 due: Vec::new(),
             });
