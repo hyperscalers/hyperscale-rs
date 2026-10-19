@@ -1007,7 +1007,10 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
 /// it and the record gone, with nothing of the return held in memory.
 #[test]
 fn a_restarted_or_snap_synced_replica_folds_the_same_reclaim() {
-    let mut cluster = SimCluster::with_grown_packages(
+    // Every validator on a host of its own, so the payer's committee
+    // spans a host apiece: one restarted, one snap-synced, and a peer
+    // left untouched to hold them to.
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &venue_config(),
         42,
         &venue_genesis_accounts(),
@@ -1038,7 +1041,9 @@ fn a_restarted_or_snap_synced_replica_folds_the_same_reclaim() {
     );
 
     let hosts = cluster.committee_hosts(SWAPPER_SHARD);
-    let (restarted, synced, peer) = (hosts[0], hosts[1], hosts[2]);
+    let [restarted, synced, peer, ..] = hosts[..] else {
+        panic!("the payer's committee must span three hosts, one per validator: {hosts:?}");
+    };
     cluster.restart_host(restarted);
     cluster.resync_host(synced, SWAPPER_SHARD);
     assert!(

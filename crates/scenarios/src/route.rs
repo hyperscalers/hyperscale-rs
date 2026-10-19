@@ -918,9 +918,9 @@ const RESUMED_TRANSFERS: u8 = 3;
 /// A shard halted across a waiting member's whole abandon window still
 /// settles what it commits once it resumes.
 ///
-/// A route's core holds the first venue's reserves while its sibling's
-/// certificate is cut, so a swap by a caller on that venue's shard
-/// commits and waits behind the hold. The shard then certifies nothing
+/// A route's core holds the first venue's reserves while neither venue
+/// can read the other's verdict, so a swap by a caller on the first
+/// venue's shard commits and waits behind the hold. The shard then certifies nothing
 /// until the swap's deadline and the validity range past it are both
 /// behind the cluster clock: no block's anchor lands inside the swap's
 /// abandon window, so the block that names its abort is one whose
@@ -961,9 +961,12 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
         "a transfer local to {shard:?} must accept while nothing is cut",
     );
 
+    // Neither venue can read the other's verdict by any path, push or
+    // pull, so the core states and stands held: a sibling's certificate
+    // decides nothing here, and needs no cut.
     let cut = [
-        isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
-        isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+        isolate_crossing_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_crossing_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
     let route = build_route_tx(
         key,
@@ -1010,7 +1013,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
     let frozen = halt.stand_until(c, window.plus(HALT_PAST_WINDOW));
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
-        "the certificate channel must actually have been exercised and cut",
+        "the verdict readings must actually have been exercised and cut",
     );
     assert_eq!(
         row(c, swap_hash),
