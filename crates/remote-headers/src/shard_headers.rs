@@ -89,12 +89,13 @@ pub struct ShardHeaders {
     proven: BTreeSet<BlockHeight>,
 
     /// Heights in `proven` whose `RemoteHeaderCommitted` continuation has
-    /// been emitted. A fork fence withholds the promotion of a proven
-    /// height without forgetting the proof, so the fence-clear sweep reads
-    /// the difference between the two sets to release exactly the withheld
-    /// heights — each proven height promotes exactly once across fence
+    /// not been emitted; the rest of `proven` is promoted. A fork fence
+    /// withholds the promotion of a proven height without forgetting the
+    /// proof, so the fence-clear sweep reads this set to release exactly
+    /// the withheld heights. A height enters it only on first being
+    /// proven, so each proven height promotes exactly once across fence
     /// transitions. Always a subset of `proven`; evicted with it.
-    promoted: BTreeSet<BlockHeight>,
+    withheld: BTreeSet<BlockHeight>,
 
     /// Verified headers that lost the canonical `verified` slot to a
     /// first-seen different-hash header at their height — the off-branch
@@ -135,12 +136,12 @@ impl ShardHeaders {
     }
 
     pub fn is_promoted(&self, height: BlockHeight) -> bool {
-        self.promoted.contains(&height)
+        self.proven.contains(&height) && !self.withheld.contains(&height)
     }
 
     /// The proven heights whose promotion a fork fence withheld, ascending.
     pub fn withheld(&self) -> impl Iterator<Item = BlockHeight> + '_ {
-        self.proven.difference(&self.promoted).copied()
+        self.withheld.iter().copied()
     }
 
     /// Raise the tip to `(height, ts)` if `height` is above it, returning
@@ -302,16 +303,18 @@ impl ShardHeaders {
         self.fork_siblings.entry(height).or_default().push(squatter);
         self.reindex_siblings(height, before);
         self.proven.remove(&height);
-        self.promoted.remove(&height);
+        self.withheld.remove(&height);
         seated
     }
 
     pub fn mark_proven(&mut self, height: BlockHeight) {
-        self.proven.insert(height);
+        if self.proven.insert(height) {
+            self.withheld.insert(height);
+        }
     }
 
     pub fn mark_promoted(&mut self, height: BlockHeight) {
-        self.promoted.insert(height);
+        self.withheld.remove(&height);
     }
 
     /// The age index `height` belongs in under the current frontier.
@@ -370,7 +373,7 @@ impl ShardHeaders {
                 .remove(&(retention_ts(&header), height));
         }
         self.proven.remove(&height);
-        self.promoted.remove(&height);
+        self.withheld.remove(&height);
     }
 
     /// Drop what has aged past `cutoff`, visiting only the entries it
@@ -439,7 +442,7 @@ impl ShardHeaders {
 #[cfg(test)]
 impl ShardHeaders {
     /// Panic unless every age index holds exactly the `(timestamp, height)`
-    /// its map implies, and `promoted ⊆ proven ⊆ verified`.
+    /// its map implies, and `withheld ⊆ proven ⊆ verified`.
     pub fn assert_indexed(&self) {
         let pending: BTreeSet<_> = self
             .pending
@@ -465,7 +468,7 @@ impl ShardHeaders {
                 .iter()
                 .all(|height| self.verified.contains_key(height))
         );
-        assert!(self.promoted.is_subset(&self.proven));
+        assert!(self.withheld.is_subset(&self.proven));
     }
 }
 
