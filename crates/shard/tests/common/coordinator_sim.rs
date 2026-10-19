@@ -428,6 +428,10 @@ pub struct ShardCoordinatorSim {
     /// triggered a sync, then drive recovery manually via
     /// [`Self::deliver_synced_block`].
     pub sync_targets: Vec<Vec<BlockHeight>>,
+    /// Per-replica outcome of every sync claim verification it
+    /// dispatched: whether the cited certificate verified under the
+    /// committee it was checked against.
+    pub sync_claim_results: Vec<Vec<bool>>,
     /// Shared sim clock. Threaded into every coordinator via
     /// `set_time` so per-replica timestamps don't drift.
     pub now: LocalTimestamp,
@@ -516,35 +520,7 @@ impl ShardCoordinatorSim {
     ) -> Self {
         assert!(n >= 1, "ShardCoordinatorSim n must be >= 1");
         let committee = TestCommittee::new(n, seed);
-        let snapshot = shard.sibling().map_or_else(
-            || committee.topology_snapshot(1),
-            |sibling| {
-                let seats: Vec<ValidatorId> =
-                    (0..n).map(|idx| committee.validator_id(idx)).collect();
-                let validators = ValidatorSet::new(
-                    (0..n)
-                        .map(|idx| ValidatorInfo {
-                            validator_id: committee.validator_id(idx),
-                            public_key: *committee.public_key(idx),
-                        })
-                        .collect(),
-                );
-                let seated: HashMap<ShardId, Vec<ValidatorId>> =
-                    HashMap::from([(shard, seats.clone()), (sibling, seats)]);
-                TopologySnapshot::from_explicit_committees(
-                    NetworkDefinition::simulator(),
-                    &validators,
-                    seated.clone(),
-                    seated,
-                    BTreeMap::new(),
-                    HashMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                    BTreeSet::new(),
-                )
-            },
-        );
+        let snapshot = hosted_snapshot(&committee, shard, n);
         let topology_schedule = build(Arc::new(snapshot));
         let network = NetworkDefinition::simulator();
 
@@ -621,6 +597,7 @@ impl ShardCoordinatorSim {
             manifest_by_block: HashMap::new(),
             byzantine_fires: vec![0; n],
             sync_targets: (0..n).map(|_| Vec::new()).collect(),
+            sync_claim_results: (0..n).map(|_| Vec::new()).collect(),
             now: LocalTimestamp::ZERO,
         }
     }
@@ -1957,6 +1934,9 @@ impl ShardCoordinatorSim {
                     quorum_threshold,
                 };
                 let result = qc.upgrade(&qc_ctx).map_err(|(_, e)| e);
+                if matches!(subject, QcSubject::SyncClaim(_)) {
+                    self.sync_claim_results[emitter_idx].push(result.is_ok());
+                }
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: SimEvent::QcSignatureVerified { subject, result },
@@ -2417,6 +2397,40 @@ fn fixture_payer_funding() -> SettledWrites {
                 )
             })
             .collect(),
+    )
+}
+
+/// The snapshot a sim of `shard` runs under: `committee` alone where
+/// `shard` is the root, and otherwise seated on both `shard` and its
+/// sibling.
+fn hosted_snapshot(committee: &TestCommittee, shard: ShardId, n: usize) -> TopologySnapshot {
+    shard.sibling().map_or_else(
+        || committee.topology_snapshot(1),
+        |sibling| {
+            let seats: Vec<ValidatorId> = (0..n).map(|idx| committee.validator_id(idx)).collect();
+            let validators = ValidatorSet::new(
+                (0..n)
+                    .map(|idx| ValidatorInfo {
+                        validator_id: committee.validator_id(idx),
+                        public_key: *committee.public_key(idx),
+                    })
+                    .collect(),
+            );
+            let seated: HashMap<ShardId, Vec<ValidatorId>> =
+                HashMap::from([(shard, seats.clone()), (sibling, seats)]);
+            TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &validators,
+                seated.clone(),
+                seated,
+                BTreeMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )
+        },
     )
 }
 

@@ -45,7 +45,18 @@ pub enum QcSubject {
     /// The QC sync fetched alongside this block, which certifies the block
     /// itself.
     SyncedBlock(BlockHash),
+    /// A certificate over a block this replica does not hold, cited by a
+    /// peer: a header's `parent_qc`, an announced QC or a timeout's
+    /// carried high QC. Verifying it gates the block sync toward the
+    /// height it certifies.
+    SyncClaim(SyncClaimId),
 }
+
+/// The number the shard coordinator gives a sync claim, so a verification
+/// result reaches the claim that dispatched it and not a later one from
+/// the same peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SyncClaimId(pub u64);
 
 /// What a block that arrives as a proposal is held to at its parent,
 /// beside the root.

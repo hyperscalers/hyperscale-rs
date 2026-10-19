@@ -41,7 +41,7 @@ mod traits;
 
 pub use action::{
     Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParentJudgement,
-    ParticipationChange, ProvisionsRequest, QcSubject,
+    ParticipationChange, ProvisionsRequest, QcSubject, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
 pub use fetch_ids::FetchIds;

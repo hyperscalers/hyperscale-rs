@@ -2,8 +2,15 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::{HoldFilter, ShardCoordinatorSim};
-use hyperscale_types::{BlockHeight, CertifiedBlock, ValidatorId};
+use hyperscale_types::test_utils::verified_test_transaction;
+use hyperscale_types::{
+    AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest,
+    CertifiedBlock, Hash, ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, ValidatorId,
+    WeightedTimestamp,
+};
 
 const MAX_STEPS: usize = 10_000;
 
@@ -157,6 +164,85 @@ fn silenced_replica_triggers_sync_and_catches_up_via_apply() {
             "replica 3 diverged on state root at height index {h}",
         );
     }
+}
+
+/// A header whose parent QC claims every signer over a block far above
+/// the chain, with no real signature behind it, starts no block sync.
+/// Block sync has no exit for a height the network cannot serve, so a
+/// sync toward it would hold the replica in sync mode, proposing only
+/// empty blocks, until it restarts. The replica stays out of sync mode and
+/// the chain goes on committing the transactions it is handed.
+#[test]
+fn a_forged_parent_certificate_starts_no_sync() {
+    let mut sim = ShardCoordinatorSim::new(4, 0xF0_57);
+    let receiver = ValidatorId::new(3);
+    sim.kick_off();
+    sim.run_until_committed(2, MAX_STEPS);
+    let base = sim.commits[3]
+        .last()
+        .expect("the receiver committed")
+        .certified
+        .block()
+        .header()
+        .clone();
+
+    let claimed_height = BlockHeight::new(sim.coordinators[3].committed_height().inner() + 100);
+    let claimed_round = Round::new(base.round().inner() + 100);
+    let mut signers = SignerBitfield::new(sim.n());
+    for idx in 0..sim.n() {
+        signers.set(idx);
+    }
+    let claimed = BlockHash::from_raw(Hash::from_bytes(b"a block nobody certified"));
+    let forged = QuorumCertificate::new(
+        claimed,
+        base.shard_id(),
+        claimed_height,
+        BlockHash::ZERO,
+        claimed_round,
+        signers,
+        AggregateSignature::ZERO,
+        WeightedTimestamp::ZERO,
+    );
+    let header = BlockHeader::new(BlockHeaderParts {
+        height: claimed_height.next(),
+        round: claimed_round.next(),
+        parent_block_hash: claimed,
+        parent_qc: forged.into(),
+        proposer: ValidatorId::new(1),
+        timestamp: ProposerTimestamp::from_millis(sim.now.as_millis()),
+        ..base.into_parts()
+    });
+    sim.deliver_header_now(receiver, &header, BlockManifest::default());
+
+    let tx = Arc::new(verified_test_transaction(0x5C));
+    let tx_hash = tx.hash();
+    sim.admit_transaction(&tx);
+    let before = sim.commits[3].len();
+    sim.run_until_committed(before + 4, MAX_STEPS);
+
+    assert!(
+        !sim.sync_claim_results[3].is_empty() && sim.sync_claim_results[3].iter().all(|ok| !ok),
+        "the forged certificate must be checked and refuted: {:?}",
+        sim.sync_claim_results[3],
+    );
+    assert!(
+        sim.sync_targets[3].is_empty(),
+        "a forged certificate set a sync target: {:?}",
+        sim.sync_targets[3],
+    );
+    assert!(
+        !sim.coordinators[3].is_block_syncing(),
+        "a forged certificate put the receiver in sync mode",
+    );
+    assert!(
+        sim.commits[3][before..].iter().any(|commit| commit
+            .certified
+            .block()
+            .transactions()
+            .iter()
+            .any(|t| t.hash() == tx_hash)),
+        "the chain stopped carrying transactions after the forged header",
+    );
 }
 
 /// Tripwire on the sim's capture machinery: a fresh coordinator
