@@ -12,15 +12,14 @@
 //! - `last_leader_activity` — any signal from the leader (proposal, header,
 //!   QC, commit) resets the timeout.
 //! - `last_header_reset` — rate-limits `record_header_activity` to once per
-//!   `(height, round)` so a Byzantine leader can't spam different headers to
-//!   delay view changes indefinitely.
+//!   view, so neither a Byzantine leader's distinct headers nor a peer
+//!   replaying old ones can delay a view change indefinitely.
 
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeader, BlockHeight, LocalTimestamp, PROGRESS_WAIT_MULTIPLIER, Round,
-    VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX,
-    VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
+    BlockHeader, LocalTimestamp, PROGRESS_WAIT_MULTIPLIER, Round, VIEW_CHANGE_DELAY_MULTIPLIER,
+    VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
 
 use crate::delay::{
@@ -42,10 +41,10 @@ pub struct ViewChangeController {
     /// changes before any leader has had a chance to act.
     pub(crate) last_leader_activity: Option<LocalTimestamp>,
 
-    /// `(height, round)` for which the leader-activity timer was last reset on
-    /// header receipt. Ensures a single reset per `(height, round)` so a
-    /// Byzantine leader can't spam headers to delay view changes.
-    pub(crate) last_header_reset: Option<(BlockHeight, Round)>,
+    /// The view in which a header last reset the leader-activity timer.
+    /// Ensures a single header reset per view: cleared only when the view
+    /// moves, never by a timer fire.
+    pub(crate) last_header_reset: Option<Round>,
 
     /// Cumulative count of view changes (round advances due to local
     /// leader-activity timeout). Self-originated only; does not count
@@ -109,18 +108,14 @@ impl ViewChangeController {
         self.last_leader_activity = Some(now);
     }
 
-    /// Record leader progress from a received header, rate-limited to once
-    /// per `(height, round)` to thwart Byzantine header-spam.
-    pub(crate) fn record_header_activity(
-        &mut self,
-        height: BlockHeight,
-        round: Round,
-        now: LocalTimestamp,
-    ) {
-        let key = (height, round);
-        if self.last_header_reset != Some(key) {
+    /// Record leader progress from a received header of `round`. Only a
+    /// header of the current view counts, and only the first one in that
+    /// view, so the round timer fires within one progress wait of the view's
+    /// last reset whatever headers keep arriving.
+    pub(crate) fn record_header_activity(&mut self, round: Round, now: LocalTimestamp) {
+        if round == self.view && self.last_header_reset != Some(round) {
             self.last_leader_activity = Some(now);
-            self.last_header_reset = Some(key);
+            self.last_header_reset = Some(round);
         }
     }
 
@@ -239,12 +234,14 @@ impl ViewChangeController {
 
     /// Synchronize the local round to a higher round proven by a verified
     /// quorum certificate. A QC at round R proves 2f+1 validators reached R,
-    /// so the target reflects real network progress and is adopted as-is.
-    /// Returns `true` if the view was advanced.
+    /// so the target reflects real network progress and is adopted as-is,
+    /// and the new round accepts a fresh header-activity reset. Returns
+    /// `true` if the view was advanced.
     pub(crate) fn sync_to_qc_round(&mut self, qc_round: Round) -> bool {
         if qc_round > self.view {
             self.view = qc_round;
             self.view_syncs += 1;
+            self.last_header_reset = None;
             true
         } else {
             false
@@ -360,7 +357,7 @@ mod tests {
     #[test]
     fn advance_to_increments_view_and_metric_and_clears_header_reset() {
         let mut vc = ViewChangeController::new(Round::INITIAL);
-        vc.last_header_reset = Some((BlockHeight::new(5), Round::new(0)));
+        vc.last_header_reset = Some(Round::INITIAL);
 
         assert!(vc.advance_to(Round::new(3)));
 
@@ -379,15 +376,18 @@ mod tests {
     fn sync_to_qc_round_only_advances_forward() {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(5);
+        vc.last_header_reset = Some(Round::new(5));
 
         assert!(!vc.sync_to_qc_round(Round::new(3)));
         assert_eq!(vc.view, Round::new(5));
 
         assert!(!vc.sync_to_qc_round(Round::new(5)));
         assert_eq!(vc.view, Round::new(5));
+        assert_eq!(vc.last_header_reset, Some(Round::new(5)));
 
         assert!(vc.sync_to_qc_round(Round::new(10)));
         assert_eq!(vc.view, Round::new(10));
+        assert!(vc.last_header_reset.is_none());
     }
 
     #[test]
@@ -395,7 +395,7 @@ mod tests {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(9);
         vc.view_at_height_start = Round::new(8);
-        vc.last_header_reset = Some((BlockHeight::new(5), Round::new(9)));
+        vc.last_header_reset = Some(Round::new(9));
         vc.view_changes = 4;
 
         assert!(
@@ -422,21 +422,36 @@ mod tests {
     }
 
     #[test]
-    fn record_header_activity_is_rate_limited_per_height_round() {
-        let mut vc = ViewChangeController::new(Round::INITIAL);
+    fn record_header_activity_resets_once_per_view_and_only_in_it() {
+        let mut vc = ViewChangeController::new(Round::new(4));
         let t1 = LocalTimestamp::from_millis(1_000);
         let t2 = LocalTimestamp::from_millis(2_000);
+        let t3 = LocalTimestamp::from_millis(3_000);
 
-        vc.record_header_activity(BlockHeight::new(5), Round::new(0), t1);
+        // A header of another round resets nothing.
+        vc.record_header_activity(Round::new(3), t1);
+        vc.record_header_activity(Round::new(5), t1);
+        assert_eq!(vc.last_leader_activity, None);
+
+        vc.record_header_activity(Round::new(4), t1);
         assert_eq!(vc.last_leader_activity, Some(t1));
 
-        // Same (height, round): must not reset again.
-        vc.record_header_activity(BlockHeight::new(5), Round::new(0), t2);
+        // A second header in the same view does not reset again.
+        vc.record_header_activity(Round::new(4), t2);
         assert_eq!(vc.last_leader_activity, Some(t1));
 
-        // Different round at same height: resets.
-        vc.record_header_activity(BlockHeight::new(5), Round::new(1), t2);
+        // A timer fire records its own activity but leaves the latch set,
+        // so a replayed header after it resets nothing.
+        vc.record_leader_activity(t2);
+        vc.record_header_activity(Round::new(4), t3);
         assert_eq!(vc.last_leader_activity, Some(t2));
+
+        // The next view accepts its own header once.
+        assert!(vc.advance_to(Round::new(5)));
+        vc.record_header_activity(Round::new(4), t3);
+        assert_eq!(vc.last_leader_activity, Some(t2));
+        vc.record_header_activity(Round::new(5), t3);
+        assert_eq!(vc.last_leader_activity, Some(t3));
     }
 
     #[test]

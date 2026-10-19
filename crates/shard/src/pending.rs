@@ -244,19 +244,26 @@ impl PendingBlocks {
             .any(|pending| pending.header().height() == height && pending.header().round() == round)
     }
 
-    /// True when a block at `(height, round)` is one this replica still
-    /// owes work to itself — content to gather, roots to check — rather
-    /// than one waiting on another chain to answer for a claim.
+    /// True when `proposer`'s block at `(height, round)` is one this
+    /// replica still owes work to itself — content to gather, roots to
+    /// check — rather than one waiting on another chain to answer for a
+    /// claim.
     ///
     /// The round timer suppresses on the first and not the second. A
     /// replica gathering a block's own content finishes on its own and
     /// is worth waiting the long window for; one held at the fence is
     /// waiting on a counterpart it cannot make answer, which is the
     /// case the ordinary round timeout is there to bound.
-    pub fn has_own_work_at_round(&self, height: BlockHeight, round: Round) -> bool {
+    pub fn has_own_work_at_round(
+        &self,
+        height: BlockHeight,
+        round: Round,
+        proposer: ValidatorId,
+    ) -> bool {
         self.0.values().any(|pending| {
             pending.header().height() == height
                 && pending.header().round() == round
+                && pending.header().proposer() == proposer
                 && !pending.awaiting_counterpart()
         })
     }
@@ -943,15 +950,20 @@ mod tests {
         let height = BlockHeight::new(5);
         let round = Round::new(1);
         let hash = insert_at(&mut pending, height, round);
+        let proposer = ValidatorId::new(0);
 
-        assert!(pending.has_own_work_at_round(height, round));
+        assert!(pending.has_own_work_at_round(height, round, proposer));
+        assert!(
+            !pending.has_own_work_at_round(height, round, ValidatorId::new(1)),
+            "a block is work only for the proposer that signed it",
+        );
 
         pending
             .get_mut(hash)
             .expect("the block was just inserted")
             .set_awaiting_counterpart(true);
         assert!(
-            !pending.has_own_work_at_round(height, round),
+            !pending.has_own_work_at_round(height, round, proposer),
             "a block waiting on a counterpart is not work that finishes here",
         );
         assert!(
@@ -964,7 +976,7 @@ mod tests {
             .expect("the block is still pending")
             .set_awaiting_counterpart(false);
         assert!(
-            pending.has_own_work_at_round(height, round),
+            pending.has_own_work_at_round(height, round, proposer),
             "evidence that lands puts the block back in this replica's hands",
         );
     }
