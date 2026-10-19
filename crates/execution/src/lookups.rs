@@ -291,6 +291,10 @@ pub fn record_pushes(
 /// Build provision requests and shard recipients for the block's
 /// cross-shard transactions: read sets only.
 ///
+/// A transaction this node never routed is skipped: whether it crosses
+/// at all is a derivation only the nodes holding its records reach, and
+/// a proposer replaying its own block after a restart may hold none.
+///
 /// Returns `None` if nothing in the block owes anyone a bundle.
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
@@ -302,7 +306,7 @@ pub fn build_provision_requests(
 
     let mut provision_requests = Vec::new();
     for tx in transactions {
-        if topology_snapshot.is_single_shard_transaction(tx) {
+        if !tx.as_unverified().is_routed() || topology_snapshot.is_single_shard_transaction(tx) {
             continue;
         }
         if let Some(request) = provision_request(topology_snapshot.shard_trie(), tx, local_shard) {
@@ -359,6 +363,35 @@ mod tests {
         assert!(!unrouted.as_unverified().is_routed());
 
         assert!(provision_request(topology.shard_trie(), &unrouted, ShardId::ROOT).is_none());
+    }
+
+    /// A committed block holding a transaction this node never routed
+    /// owes no bundle for it, rather than reading the routing it lacks.
+    #[test]
+    fn a_block_of_an_unrouted_transaction_owes_no_bundle() {
+        let committee = TestCommittee::new(4, 1);
+        let topology = single_shard_topology(&committee);
+        let payer = PrincipalAddr::new([0x42; 31]);
+        let signed = test_utils::stub_transaction(
+            payer,
+            &[payer.address()],
+            1,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let unrouted = Arc::new(Verifiable::from(Transaction::new(signed.body().clone())));
+
+        assert!(
+            build_provision_requests(
+                &topology,
+                &[unrouted],
+                committee.validator_id(0),
+                ShardId::ROOT,
+            )
+            .is_none()
+        );
     }
 
     fn single_shard_topology(committee: &TestCommittee) -> TopologySnapshot {

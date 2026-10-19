@@ -523,8 +523,13 @@ impl Harness {
     /// `false` only when the host is shutting down. Submit through a host
     /// that runs the transaction's source shard so it admits directly
     /// rather than relying on a gossip hop.
-    pub fn submit_transaction(&self, idx: usize, tx: Arc<Transaction>) -> bool {
-        (self.hosts[idx].tx_submission)(tx)
+    ///
+    /// The host takes the envelope alone, as the RPC decodes it: an
+    /// envelope the harness already derived would hand the host a
+    /// routing it never reached itself, and with it skip the record
+    /// fetch its replay of the commit reads back after a restart.
+    pub fn submit_transaction(&self, idx: usize, tx: &Transaction) -> bool {
+        (self.hosts[idx].tx_submission)(Arc::new(Transaction::new(tx.body().clone())))
     }
 
     /// The status host `idx`'s process recorded for `hash`, with the

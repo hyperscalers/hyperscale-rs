@@ -364,12 +364,12 @@ impl Cluster for ProdCluster {
 
     fn submit(&mut self, tx: Arc<Transaction>) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.inner.submit_transaction(host, tx);
+        self.inner.submit_transaction(host, &tx);
     }
 
     fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
         let host = self.committee_hosts(shard).first().copied().unwrap_or(0);
-        self.inner.submit_transaction(host, tx);
+        self.inner.submit_transaction(host, &tx);
     }
 
     fn vote_fold_budget_ms(&self) -> u64 {

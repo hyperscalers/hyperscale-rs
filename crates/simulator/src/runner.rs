@@ -218,7 +218,6 @@ impl Simulator {
             for tx in batch {
                 let hash = tx.hash();
                 let target_shard = self.get_target_shard(&tx);
-                let tx = Arc::new(tx);
 
                 // Submit to ALL validators in the shard to ensure the proposer has the tx.
                 // This mirrors real-world behavior where clients submit to multiple validators.
@@ -226,11 +225,14 @@ impl Simulator {
                 // propagated to the proposer yet when their proposal timer fires.
                 let shard_nodes = self.nodes_for_shard(target_shard);
                 for node_idx in shard_nodes {
+                    // Each host its own copy: hosts share memory here, and
+                    // one host's derivation of a shared envelope would be
+                    // every other host's cache hit.
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
                         HostEvent::process(ProcessScopedInput::SubmitTransaction {
-                            tx: Arc::clone(&tx),
+                            tx: Arc::new(Transaction::new(tx.body().clone())),
                         }),
                     );
                 }
