@@ -1100,10 +1100,23 @@ impl SimulatedNetwork {
         Some(handler(&request.request_bytes)).filter(|bytes| !(request.is_empty_response)(bytes))
     }
 
+    /// Request events one flush may step per host before the run fails as
+    /// stalled. Every step but a settle schedules the next a latency or a
+    /// timeout later, so an honest flush steps only what was due at its
+    /// instant, which the scenario suites measured at under two hundred
+    /// across a whole cluster.
+    const FLUSH_STEPS_PER_HOST: usize = 1_000;
+
     /// Run every request event due by `now`: attempts dispatched, request
     /// legs arriving at their peers, answers and timeouts resolving attempts,
     /// and final results handed to their requesters. Returns how many
     /// requesters were answered, and what the legs sent and dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the flush steps more than [`Self::FLUSH_STEPS_PER_HOST`]
+    /// events per host at once: a cycle of request events that never
+    /// lets time pass.
     pub fn flush_requests(
         &mut self,
         now: Duration,
@@ -1111,10 +1124,16 @@ impl SimulatedNetwork {
     ) -> (usize, FulfillmentStats) {
         let mut stats = FulfillmentStats::default();
         let mut answered = 0;
+        let mut steps = 0usize;
         while let Some(Reverse(next)) = self.pending_requests.peek() {
             if next.time > now {
                 break;
             }
+            steps += 1;
+            assert!(
+                steps <= Self::FLUSH_STEPS_PER_HOST * self.total_nodes(),
+                "simulation clock stalled at {now:?}: the request flush stepped {steps} events without time advancing",
+            );
             let Some(Reverse(ScheduledRequestEvent { time, event, .. })) =
                 self.pending_requests.pop()
             else {
@@ -3022,6 +3041,25 @@ mod tests {
         assert_eq!(sent.messages_sent + answered.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert_eq!(captured.unwrap(), vec![1, 2, 3]);
+    }
+
+    /// A flush that keeps stepping request events at one instant stalls
+    /// the run rather than spinning.
+    #[test]
+    #[should_panic(expected = "the request flush stepped 1001 events without time advancing")]
+    fn a_flush_that_never_lets_time_pass_stalls_the_run() {
+        let mut network = sim_network(1, 1);
+        let mut streams = LinkStreams::new(42);
+        for _ in 0..=SimulatedNetwork::FLUSH_STEPS_PER_HOST {
+            network.schedule_request_event(
+                Duration::ZERO,
+                RequestEvent::Settle {
+                    on_response: Box::new(|_| ResponseVerdict::Accept),
+                    result: Err(RequestError::Timeout),
+                },
+            );
+        }
+        network.flush_requests(Duration::ZERO, &mut streams);
     }
 
     #[test]

@@ -6,6 +6,11 @@ use hyperscale_simulation::{EPOCH_MS, SimConfig};
 use hyperscale_spammer::SelectionMode;
 use hyperscale_types::{BeaconChainConfig, ReshapeThresholds};
 
+/// Events a host may step at one instant for each transaction a batch
+/// submits to it: about ten times the most a submission was measured to
+/// cost there, under a batch of ten thousand.
+const EVENTS_PER_SUBMISSION: u64 = 50;
+
 /// Configuration for a simulation run.
 #[derive(Clone, Debug)]
 pub struct SimulatorConfig {
@@ -92,17 +97,28 @@ impl SimulatorConfig {
     /// production-sized timeouts.
     ///
     /// [`grow_to`]: hyperscale_simulation::SimulationRunner::grow_to
+    ///
+    /// Every host of a shard is handed each transaction of a batch at one
+    /// instant, so the events a host steps there grow with the batch, and
+    /// the stall limit grows with it.
     #[must_use]
     pub(crate) fn to_sim_config(&self) -> SimConfig {
         let committee = self.validators_per_shard;
+        let stall_events_per_host = SimConfig::STALL_EVENTS_PER_HOST.saturating_add(
+            u64::try_from(self.workload.batch_size)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(EVENTS_PER_SUBMISSION),
+        );
         if self.num_shards <= 1 {
             return SimConfig {
                 shard_size: committee,
+                stall_events_per_host,
                 ..Default::default()
             };
         }
         SimConfig {
             shard_size: committee,
+            stall_events_per_host,
             pool_surplus: (self.num_shards - 1) * committee,
             beacon_chain_config: Some(BeaconChainConfig {
                 epoch_duration_ms: EPOCH_MS,
