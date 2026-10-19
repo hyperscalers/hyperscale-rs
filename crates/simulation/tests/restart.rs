@@ -2036,12 +2036,10 @@ mod a_commit_past_the_replay {
         }
         let (caller_key, caller) = grind_onto(HOME, &mut funded);
 
-        // The vote that takes the counterpart over the threshold
-        // activates epochs from here, and its own tick has to certify
-        // before the counterpart falls silent.
+        // The vote that takes the counterpart over the threshold. It
+        // returns once the vote has taken effect, so its tick has
+        // certified before the counterpart falls silent.
         cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
-        let cast = c.runner().now() + Duration::from_secs(30);
-        c.runner_mut().run_until(cast);
 
         cut_votes_outside_home(c);
         let swap = build_sponsored_swap_tx(

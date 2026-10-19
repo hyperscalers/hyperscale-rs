@@ -461,11 +461,13 @@ pub fn vote_splitter_down_to<C: Cluster>(c: &mut C, split_bytes: u64) {
 }
 
 /// Cast the vote that takes the threshold to `split_bytes`, below the
-/// splitter's bytes, without waiting for the admission it leads to.
+/// splitter's bytes, and wait for it to take effect, but not for the
+/// admission it leads to.
 ///
 /// # Panics
 ///
-/// Panics if either shard of the pair is unserved.
+/// Panics if either shard of the pair is unserved, or as
+/// [`cast_threshold_vote`].
 pub fn cast_splitter_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
     assert!(
         c.serves_shard(STRADDLER_SPLITTER) && c.serves_shard(STRADDLER_SURVIVOR),
@@ -475,24 +477,42 @@ pub fn cast_splitter_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
 }
 
 /// Cast the vote that takes the threshold to `split_bytes`, on whatever
-/// partition the world has, without waiting for the admission it leads
-/// to.
+/// partition the world has, and wait for its activation epoch.
+///
+/// The threshold reads `split_bytes` from that epoch on; the admission
+/// the vote leads to is not waited for. The vote is cast once, since its
+/// activation epoch anchors the choreography that follows, so a vote that
+/// misses is a failure here rather than a retry.
 ///
 /// # Panics
 ///
-/// Panics if the beacon serves no epoch yet.
+/// Panics if the beacon serves no epoch yet, or if the vote has not taken
+/// effect a few epochs past its activation epoch.
 pub fn cast_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
     let current = beacon_epoch(c).expect("post-grow beacon epoch");
     let state = c.beacon_state().expect("post-grow beacon state");
     let epoch_ms = state.chain_config.epoch_duration_ms;
+    let lead = vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
+    let activate_at = Epoch::new(current.inner() + lead);
     let vote = build_reshape_threshold_vote_tx(
         &pool_operator().0,
         &state.params,
         split_bytes,
-        Epoch::new(current.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms)),
+        activate_at,
         validity_around(c.now()),
     );
     c.submit(Arc::new(vote));
+    // The wait covers the lead the harness's fold budget sets, which is
+    // longer on a wall-clock harness than on the simulator.
+    let budget = epochs(u32::try_from(lead + 4).expect("a lead of a few epochs"));
+    assert!(
+        c.run_until(budget, |c| c.beacon_state().is_some_and(|state| state
+            .params
+            .reshape_thresholds
+            .split_bytes
+            == split_bytes)),
+        "the threshold vote for {split_bytes} split bytes did not take effect at {activate_at:?}",
+    );
 }
 
 /// What a straddler choreography leaves for its caller to judge: the
@@ -682,22 +702,7 @@ fn issue_a_leg_under_a_cut_push<C: FaultableCluster>(
     payer: PrincipalAddr,
     recipient: PrincipalAddr,
 ) -> CutLeg {
-    let cast_at = beacon_epoch(c).expect("post-grow beacon epoch");
-    let epoch_ms = c
-        .beacon_state()
-        .expect("post-grow beacon state")
-        .chain_config
-        .epoch_duration_ms;
     cast_splitter_vote(c, straddler_split_bytes());
-    let lead = vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms);
-    let activation = cast_at.inner() + lead;
-    // The wait covers the lead the harness's fold budget sets, which is
-    // longer on a wall-clock harness than on the simulator.
-    let budget = epochs(u32::try_from(lead + 4).expect("a lead of a few epochs"));
-    assert!(
-        await_beacon_epoch(c, activation, budget),
-        "the vote's activation epoch must open within budget",
-    );
     let cuts = RecordCuts {
         push: c.drop_type("crossing.readings"),
     };
