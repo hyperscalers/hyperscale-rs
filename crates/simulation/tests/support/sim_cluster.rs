@@ -759,11 +759,11 @@ impl SimCluster {
     /// after the teardown on a host that serves nothing — dropped, not
     /// delayed. A client routes to the committee the beacon names, and
     /// so does this.
-    fn submit_at(&mut self, host: NodeIndex, tx: Arc<Transaction>) {
+    fn submit_at(&mut self, host: NodeIndex, tx: &Transaction) {
         self.runner.schedule_initial_event(
             host,
             Duration::ZERO,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(tx) }),
         );
     }
 
@@ -784,6 +784,17 @@ impl SimCluster {
             .into_iter()
             .find_map(|shard| self.live_committee_hosts(shard).first().copied())
     }
+}
+
+/// `tx` as a host receives it off the wire: its envelope alone.
+///
+/// Hosts share memory here, so an envelope the harness or another host
+/// already derived would hand its routing to the receiving host as a
+/// cache hit. A host derives what it admits, and on a miss fetches and
+/// keeps the records it lacks, which its own replay of the commit reads
+/// back after a restart.
+fn underived(tx: &Transaction) -> Arc<Transaction> {
+    Arc::new(Transaction::new(tx.body().clone()))
 }
 
 /// A portable `0..host_count` host index as the sim's [`NodeIndex`].
@@ -808,7 +819,7 @@ impl Cluster for SimCluster {
 
     fn submit(&mut self, tx: Arc<Transaction>) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.submit_at(host, tx);
+        self.submit_at(host, &tx);
     }
 
     fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
@@ -816,7 +827,7 @@ impl Cluster for SimCluster {
         self.runner.schedule_initial_event(
             host,
             delay,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(&tx) }),
         );
         true
     }
@@ -827,7 +838,7 @@ impl Cluster for SimCluster {
             .first()
             .copied()
             .unwrap_or(0);
-        self.submit_at(host, tx);
+        self.submit_at(host, &tx);
     }
 
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
