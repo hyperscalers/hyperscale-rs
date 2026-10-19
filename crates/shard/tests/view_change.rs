@@ -5,8 +5,12 @@ mod common;
 
 use std::time::Duration;
 
-use common::{HoldFilter, ShardCoordinatorSim};
-use hyperscale_types::{BlockHeight, Round, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId};
+use common::{HoldFilter, ShardCoordinatorSim, perturb_header_timestamp};
+use hyperscale_types::{
+    AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, Hash,
+    ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, VIEW_CHANGE_TIMEOUT_DEFAULT,
+    ValidatorId, WeightedTimestamp,
+};
 
 const MAX_STEPS: usize = 5_000;
 
@@ -68,6 +72,279 @@ fn silent_leader_triggers_view_change() {
             coordinator.stats().view_changes,
         );
     }
+}
+
+/// The round-1 leader's header, built and broadcast but held at every
+/// receiver, on a sim where no header is delivered unless a test hands it
+/// over. Every replica sits in view 1 with its round clock running from
+/// genesis.
+fn sim_with_held_headers(seed: u64) -> (ShardCoordinatorSim, BlockHeader, BlockManifest) {
+    let mut sim = ShardCoordinatorSim::new(4, seed);
+    for idx in 0..sim.n() {
+        sim.hold_matching(ValidatorId::new(idx as u64), HoldFilter::AnyHeader);
+    }
+    sim.kick_off();
+    sim.run_for_at_most(100);
+    let (header, manifest) = sim
+        .proposed_block_at(BlockHeight::new(1))
+        .expect("the round-1 leader proposed");
+    assert_eq!(header.round(), Round::new(1));
+    assert_eq!(header.proposer(), ValidatorId::new(1));
+    (sim, (*header).clone(), manifest)
+}
+
+/// A copy of `base` named for `proposer` at `round` on `parent`, stamped
+/// `now`.
+fn minted_header(
+    sim: &ShardCoordinatorSim,
+    base: &BlockHeader,
+    proposer: ValidatorId,
+    round: Round,
+    parent: BlockHash,
+) -> BlockHeader {
+    BlockHeader::new(BlockHeaderParts {
+        proposer,
+        round,
+        parent_block_hash: parent,
+        timestamp: ProposerTimestamp::from_millis(sim.now.as_millis()),
+        ..base.clone().into_parts()
+    })
+}
+
+/// A copy of `base` at `round` whose parent QC claims every signer over a
+/// block at `parent_height` and `parent_round`, with no real signature: a
+/// header's admission checks the claimed signing power, and only a vote
+/// verifies the signature.
+fn header_on_a_claimed_qc(
+    sim: &ShardCoordinatorSim,
+    base: &BlockHeader,
+    proposer: ValidatorId,
+    round: Round,
+    parent: (BlockHash, BlockHeight, Round),
+) -> BlockHeader {
+    let (parent_hash, parent_height, parent_round) = parent;
+    let mut signers = SignerBitfield::new(sim.n());
+    for idx in 0..sim.n() {
+        signers.set(idx);
+    }
+    let parent_qc = QuorumCertificate::new(
+        parent_hash,
+        base.shard_id(),
+        parent_height,
+        BlockHash::ZERO,
+        parent_round,
+        signers,
+        AggregateSignature::ZERO,
+        WeightedTimestamp::ZERO,
+    );
+    BlockHeader::new(BlockHeaderParts {
+        height: parent_height.next(),
+        parent_qc: parent_qc.into(),
+        ..minted_header(sim, base, proposer, round, parent_hash).into_parts()
+    })
+}
+
+/// A parent nobody in the sim holds.
+fn unknown_parent() -> BlockHash {
+    BlockHash::from_raw(Hash::from_bytes(b"a parent nobody holds"))
+}
+
+/// A header resets the round clock only when it is from the current
+/// view's leader and of the view's round, whether or not the receiver
+/// holds its parent; and then once per view, across heights and across a
+/// timer fire.
+///
+/// Every case reads replica 0's remaining round time, which a reset sets
+/// back to the full timeout. None of its headers is followed by a step, so
+/// no vote of its own resets the clock in their place.
+#[test]
+fn a_header_resets_the_round_clock_once_per_view_only_from_its_leader() {
+    let (mut sim, leader_header, manifest) = sim_with_held_headers(0x4E_AD);
+    let receiver = ValidatorId::new(0);
+    let leader = leader_header.proposer();
+    let timeout = sim.coordinators[0].current_view_change_timeout();
+    let second = Duration::from_secs(1);
+    sim.advance_clock(second);
+    let unreset = timeout
+        .checked_sub(second)
+        .expect("the timeout exceeds a second");
+    assert_eq!(sim.coordinators[0].remaining_view_change_timeout(), unreset);
+
+    // Round 0's proposer, on the held genesis parent: valid, but neither
+    // the view's round nor its leader.
+    let other_round = minted_header(
+        &sim,
+        &leader_header,
+        ValidatorId::new(0),
+        Round::INITIAL,
+        leader_header.parent_block_hash(),
+    );
+    sim.deliver_header_now(receiver, &other_round, manifest.clone());
+    assert_eq!(
+        sim.coordinators[0].remaining_view_change_timeout(),
+        unreset,
+        "a member's header for another round reset the round clock",
+    );
+
+    // A non-leader at the view's round on a parent nobody holds: admitted,
+    // since its proposer cannot be checked against its committee, but not
+    // the view's leader.
+    let non_leader = minted_header(
+        &sim,
+        &leader_header,
+        ValidatorId::new(3),
+        Round::new(1),
+        unknown_parent(),
+    );
+    sim.deliver_header_now(receiver, &non_leader, manifest.clone());
+    assert_eq!(
+        sim.coordinators[0].remaining_view_change_timeout(),
+        unreset,
+        "a non-leader's header at the view's round reset the round clock",
+    );
+
+    // The leader's own header resets it.
+    sim.deliver_header_now(receiver, &leader_header, manifest.clone());
+    assert_eq!(
+        sim.coordinators[0].remaining_view_change_timeout(),
+        timeout,
+        "the view's leader's header did not reset the round clock",
+    );
+
+    // More headers of the leader's in the same view reset nothing more:
+    // a sibling at the same height, one a height above on the held
+    // header, alternating, and the held header's own hash again.
+    sim.advance_clock(second);
+    let sibling = perturb_header_timestamp(&leader_header);
+    let taller = header_on_a_claimed_qc(
+        &sim,
+        &leader_header,
+        leader,
+        Round::new(1),
+        (leader_header.hash(), leader_header.height(), Round::INITIAL),
+    );
+    assert_eq!(taller.height(), BlockHeight::new(2));
+    for header in [&taller, &sibling, &taller, &leader_header] {
+        sim.deliver_header_now(receiver, header, manifest.clone());
+        assert_eq!(
+            sim.coordinators[0].remaining_view_change_timeout(),
+            unreset,
+            "a further header of the leader's, at height {}, reset the round clock",
+            header.height().inner(),
+        );
+    }
+
+    // Past the progress wait the timer fires and restarts the clock; a
+    // new header of the leader's in the same view still resets nothing.
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait);
+    sim.fire_view_change_timer(receiver);
+    assert_eq!(sim.coordinators[0].view(), Round::new(1));
+    assert_eq!(sim.coordinators[0].remaining_view_change_timeout(), timeout);
+    sim.advance_clock(second);
+    let fresh_sibling = perturb_header_timestamp(&sibling);
+    sim.deliver_header_now(receiver, &fresh_sibling, manifest);
+    assert_eq!(
+        sim.coordinators[0].remaining_view_change_timeout(),
+        unreset,
+        "a new header after a timer fire reset the round clock again",
+    );
+
+    // On a fresh view, the leader's header resets the clock though the
+    // receiver holds none of its parent.
+    let (mut sim, leader_header, manifest) = sim_with_held_headers(0x4E_AE);
+    sim.advance_clock(second);
+    let orphan = minted_header(
+        &sim,
+        &leader_header,
+        leader,
+        Round::new(1),
+        unknown_parent(),
+    );
+    sim.deliver_header_now(receiver, &orphan, manifest);
+    assert_eq!(
+        sim.coordinators[0].remaining_view_change_timeout(),
+        timeout,
+        "the leader's header on an unknown parent did not reset the round clock",
+    );
+}
+
+/// Headers that keep arriving from members other than the view's leader
+/// do not hold the view: with every proposer silent, the cluster leaves
+/// view 2 within that view's round timeout of entering it.
+///
+/// Three admitted headers alternate at every replica: round 0's proposer
+/// on the genesis parent, a non-leader at round 1 on a parent nobody
+/// holds, and a non-leader at view 2's round at the tip height on a
+/// parent nobody holds. The last sits where the view's own proposal
+/// would, and is still no work at the tip that a progress wait covers,
+/// since the view's leader did not sign it.
+#[test]
+fn headers_from_other_members_do_not_hold_a_silent_leaders_view() {
+    let (mut sim, leader_header, manifest) = sim_with_held_headers(0x5_11E);
+
+    // Leave view 1 on a timeout quorum, as every replica's timer fires.
+    let progress_wait = sim.coordinators[0].progress_wait();
+    sim.advance_clock(progress_wait + Duration::from_millis(100));
+    sim.fire_view_change_timer_all();
+    sim.run_for_at_most(MAX_STEPS);
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
+        assert_eq!(coordinator.view(), Round::new(2), "replica {idx} view");
+    }
+    let entered = sim.now;
+    let timeout = sim.coordinators[0].current_view_change_timeout();
+
+    let other_round = minted_header(
+        &sim,
+        &leader_header,
+        ValidatorId::new(0),
+        Round::INITIAL,
+        leader_header.parent_block_hash(),
+    );
+    let earlier_round = minted_header(
+        &sim,
+        &leader_header,
+        ValidatorId::new(3),
+        Round::new(1),
+        unknown_parent(),
+    );
+    let at_the_tip = header_on_a_claimed_qc(
+        &sim,
+        &leader_header,
+        ValidatorId::new(3),
+        Round::new(2),
+        (unknown_parent(), BlockHeight::GENESIS, Round::new(1)),
+    );
+    assert_eq!(at_the_tip.height(), leader_header.height());
+    let tick = Duration::from_millis(250);
+    let horizon = timeout * 4;
+    let mut elapsed = Duration::ZERO;
+    let mut alternate = [&other_round, &earlier_round, &at_the_tip]
+        .into_iter()
+        .cycle();
+    while sim.coordinators.iter().any(|c| c.view() <= Round::new(2)) && elapsed < horizon {
+        let header = alternate.next().expect("cycles");
+        for idx in 0..sim.n() {
+            sim.deliver_header_now(ValidatorId::new(idx as u64), header, manifest.clone());
+        }
+        sim.advance_clock(tick);
+        sim.fire_view_change_timer_all();
+        sim.run_for_at_most(MAX_STEPS);
+        elapsed = Duration::from_millis(sim.now.as_millis() - entered.as_millis());
+    }
+
+    for (idx, coordinator) in sim.coordinators.iter().enumerate() {
+        assert!(
+            coordinator.view() > Round::new(2),
+            "replica {idx} still in view {} after {elapsed:?}",
+            coordinator.view().inner(),
+        );
+    }
+    // The fire lands on the first tick at or past the timeout.
+    assert!(
+        elapsed <= timeout + tick,
+        "the view changed after {elapsed:?}, past its {timeout:?} timeout",
+    );
 }
 
 /// Local view changes vs. view syncs:

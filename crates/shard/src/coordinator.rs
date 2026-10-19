@@ -1799,18 +1799,38 @@ impl ShardCoordinator {
     /// - We propose a block
     /// - A QC forms
     /// - A block commits
-    /// - We receive a valid header (rate-limited per height/round)
+    /// - We receive the view leader's header (once per view)
     const fn record_leader_activity(&mut self) {
         self.view_change.record_leader_activity(self.now);
     }
 
-    /// Record leader activity from receiving a block header.
+    /// Record leader activity from a block header just stored in
+    /// `pending_blocks`.
     ///
-    /// Rate-limited to once per (height, round) to prevent a Byzantine leader
-    /// from spamming headers with different hashes to delay view changes.
-    fn record_header_activity(&mut self, height: BlockHeight, round: Round) {
-        self.view_change
-            .record_header_activity(height, round, self.now);
+    /// Counts only a header from the current view's own leader, as
+    /// [`Self::view_leader`] resolves it; a header's proposer is signed
+    /// before it reaches the coordinator. The controller admits one reset
+    /// per view, and only for a header of the view's round, so no other
+    /// validator's header, and no replay, resets the clock.
+    fn record_header_activity(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        header: &BlockHeader,
+    ) {
+        if self.view_leader(topology_schedule) == Some(header.proposer()) {
+            self.view_change
+                .record_header_activity(header.round(), self.now);
+        }
+    }
+
+    /// The current view's leader: the tip committee's `proposer_for` the
+    /// view, the resolution the leader's own election reads. `None` while
+    /// the tip committee is unknown. Across a committee change it can
+    /// differ from the committee a header's own parent anchors, while this
+    /// replica's high QC lags that parent's.
+    fn view_leader(&self, topology_schedule: &TopologySchedule) -> Option<ValidatorId> {
+        self.tip_committee(topology_schedule)
+            .map(|c| c.proposer_for(self.local_shard, self.view_change.view))
     }
 
     /// View change timeout for the current round.
@@ -1843,7 +1863,7 @@ impl ShardCoordinator {
     /// from the network at the current height/round and need to help advance
     /// the view if the leader fails. When a syncing node becomes the proposer
     /// after a view change, they propose an empty sync block.
-    fn should_advance_round(&self) -> bool {
+    fn should_advance_round(&self, topology_schedule: &TopologySchedule) -> bool {
         // Don't view-change while we're actively processing or waiting on
         // the leader's block. The timeout should detect leader *failure*,
         // not slow vote/QC propagation around a healthy proposal.
@@ -1854,8 +1874,9 @@ impl ShardCoordinator {
         // can't pin us at a stale round forever:
         //
         // 1. Verification in flight — block roots being checked.
-        // 2. This round's proposal sits at the tip and we have yet to vote on
-        //    it — content still landing, or roots still to check.
+        // 2. This round's leader's proposal sits at the tip and we have yet
+        //    to vote on it — content still landing, or roots still to check.
+        //    Another member's header there is no proposal this round owes.
         // 3. Block sync has unverified work in flight.
         //
         // Each is work this replica still owes the tip, which is what the
@@ -1877,9 +1898,13 @@ impl ShardCoordinator {
             |qc| qc.height().inner() + 1,
         );
         let awaiting_tip_proposal = self.last_voted_round < self.view_change.view
-            && self
-                .pending_blocks
-                .has_own_work_at_round(BlockHeight::new(next_height), self.view_change.view);
+            && self.view_leader(topology_schedule).is_some_and(|leader| {
+                self.pending_blocks.has_own_work_at_round(
+                    BlockHeight::new(next_height),
+                    self.view_change.view,
+                    leader,
+                )
+            });
         let suppressed = self.verification.has_verification_in_flight()
             || awaiting_tip_proposal
             || self.block_sync.has_unverified_in_flight();
@@ -1908,7 +1933,7 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
     ) -> Option<Vec<Action>> {
         let refreshed = self.refresh_pacemaker_at_tip(topology_schedule);
-        if !self.should_advance_round() {
+        if !self.should_advance_round(topology_schedule) {
             if refreshed.is_empty() {
                 return None;
             }
@@ -1937,7 +1962,6 @@ impl ShardCoordinator {
         // advances on a 2f+1 timeout quorum (`advance_on_timeout_quorum`), not
         // on this local timer.
         self.view_change.record_leader_activity(self.now);
-        self.view_change.last_header_reset = None;
 
         let round = self.view_change.view;
         info!(
@@ -3826,8 +3850,6 @@ impl ShardCoordinator {
             return sync_actions;
         }
 
-        self.record_header_activity(height, round);
-
         if self.pending_blocks.contains_key(block_hash) {
             trace!("Already have pending block {}", block_hash);
             return sync_actions;
@@ -3889,6 +3911,7 @@ impl ShardCoordinator {
             lookup_finalization,
             lookup_provision,
         );
+        self.record_header_activity(topology_schedule, header);
         self.adopt_deferred_qc_if_matches(block_hash);
 
         // Admit any pre-header votes for this block (held raw until now), then
@@ -6282,7 +6305,6 @@ impl ShardCoordinator {
         let view = self.view_change.view;
         let mut actions = self.try_adopt_verified_qc(&verified);
         if self.view_change.view > view {
-            self.record_leader_activity();
             actions.push(Action::SetTimer {
                 id: TimerId::ViewChange,
                 duration: self.current_view_change_timeout(),
@@ -8409,7 +8431,14 @@ impl ShardCoordinator {
     /// Synchronise our view to a QC we adopted: a QC for round `r` means the
     /// chain reached `r`, so the successor block is proposed in `r + 1`. Rounds
     /// therefore increase per block, keeping a lagging node in step with the
-    /// network as it adopts QCs (via headers, votes, or timeout quorums).
+    /// network as it adopts QCs (via headers, votes, announcements, timeouts
+    /// or sync).
+    ///
+    /// A view the QC advances counts as leader activity: the QC is its
+    /// round's leader's progress. A follower whose QC arrives in the next
+    /// round's header, and verifies only after that header lands, holds the
+    /// view below the header's round when it lands, so the header resets
+    /// nothing and this advance resets the clock in its place.
     ///
     /// The safe-vote lock is *not* touched here — `locked_round` only ever
     /// advances on a vote (`create_vote`), never on adopting someone else's QC.
@@ -8419,6 +8448,7 @@ impl ShardCoordinator {
         }
         let old_view = self.view_change.view;
         if self.view_change.advance_on_qc(qc.round()) {
+            self.record_leader_activity();
             info!(
                 validator = ?self.me,
                 old_view = old_view.inner(),
@@ -22109,9 +22139,9 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
-        assert!(state.should_advance_round());
+        assert!(state.should_advance_round(&topology_schedule));
         state.set_block_syncing(true);
-        assert!(state.should_advance_round());
+        assert!(state.should_advance_round(&topology_schedule));
         assert!(state.check_round_timeout(&topology_schedule).is_some());
     }
 
@@ -22143,13 +22173,16 @@ mod tests {
     /// check stalls every transaction beside it for three rounds.
     #[test]
     fn a_block_held_at_the_fence_times_out_on_the_round_and_not_the_window() {
-        let (mut state, _) = make_test_state();
+        let (mut state, topology_schedule) = make_test_state();
         let round = state.view_change.view;
         let height = BlockHeight::new(state.committed_height.inner() + 1);
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: state.local_shard,
             height,
             round,
+            proposer: topology_schedule
+                .head()
+                .proposer_for(state.local_shard, round),
             ..Default::default()
         });
         let hash = header.hash();
@@ -22165,7 +22198,7 @@ mod tests {
             LocalTimestamp::ZERO.plus(VIEW_CHANGE_TIMEOUT_DEFAULT + Duration::from_millis(1)),
         );
         assert!(
-            !state.should_advance_round(),
+            !state.should_advance_round(&topology_schedule),
             "content still landing here is worth the window",
         );
 
@@ -22175,7 +22208,7 @@ mod tests {
             .expect("the block was just inserted")
             .set_awaiting_counterpart(true);
         assert!(
-            state.should_advance_round(),
+            state.should_advance_round(&topology_schedule),
             "a block waiting on a counterpart is not, and the round timer bounds it",
         );
     }
