@@ -884,6 +884,17 @@ impl TopologySchedule {
             .is_some_and(|newest| parent < newest.bridge() && newest.bridge() <= anchor)
     }
 
+    /// The highest height at which no work of `shard` is
+    /// [`recovery_orphaned`](Self::recovery_orphaned): the lowest frontier
+    /// among its recovery bindings, or `None` where it has none and
+    /// nothing of it is.
+    #[must_use]
+    pub fn recovery_orphan_floor(&self, shard: ShardId) -> Option<BlockHeight> {
+        self.bindings(shard)
+            .map(|binding| binding.attested_frontier)
+            .min()
+    }
+
     /// Whether work of `shard` at `height` anchored at `anchor_wt` is in
     /// the band of any recovery the head holds for it, pending or not
     /// ([`RecoveryBinding::orphans`]).
