@@ -148,9 +148,9 @@ impl ViewChangeController {
 
     /// View change timeout for the current round: the base doubled per
     /// round entered since this replica's last commit, certified rounds
-    /// included, capped at `VIEW_CHANGE_TIMEOUT_MAX`, plus
-    /// `IDLE_PROPOSAL_INTERVAL` in the first round after the high QC at
-    /// `high_qc_round`, whose leader may hold an empty block that long. All
+    /// included, plus `IDLE_PROPOSAL_INTERVAL` in the first round after the
+    /// high QC at `high_qc_round`, whose leader may hold an empty block that
+    /// long, capped at `VIEW_CHANGE_TIMEOUT_MAX`. All
     /// validators compute the same timeout: the base is a function of the
     /// committed chain and round numbers are QC- and header-attested.
     pub(crate) fn current_timeout(&self, high_qc_round: Round) -> Duration {
@@ -160,15 +160,15 @@ impl ViewChangeController {
             .saturating_sub(self.view_at_height_start.inner());
         // Five doublings of the floor already clear the cap.
         let doublings = u32::try_from(rounds_at_height.min(5)).expect("at most five");
-        let timeout = self
-            .base_timeout()
-            .saturating_mul(1 << doublings)
-            .min(VIEW_CHANGE_TIMEOUT_MAX);
-        if self.view == high_qc_round.next() {
-            timeout + IDLE_PROPOSAL_INTERVAL
+        let timeout = self.base_timeout().saturating_mul(1 << doublings);
+        let allowance = if self.view == high_qc_round.next() {
+            IDLE_PROPOSAL_INTERVAL
         } else {
-            timeout
-        }
+            Duration::ZERO
+        };
+        timeout
+            .saturating_add(allowance)
+            .min(VIEW_CHANGE_TIMEOUT_MAX)
     }
 
     /// Ceiling on view-change suppression while a proposal is in flight:
@@ -360,6 +360,11 @@ mod tests {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(10_000);
         assert_eq!(vc.current_timeout(vc.view), VIEW_CHANGE_TIMEOUT_MAX);
+        assert_eq!(
+            vc.current_timeout(Round::new(9_999)),
+            VIEW_CHANGE_TIMEOUT_MAX,
+            "the idle allowance stays under the cap",
+        );
 
         let mut floored = with_delay(20, 4);
         floored.view = Round::new(10_000);

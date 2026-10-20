@@ -19,7 +19,7 @@ use crate::support::tx::{
 use crate::support::wait::{
     assert_height_frozen, await_beacon_epoch, await_blocks, await_height, await_merge_keeper_count,
     await_root_matches_anchor, await_serves, await_serves_ahead_of_anchor, await_split_admitted,
-    measure_blocks_per_epoch,
+    epoch_fraction,
 };
 use crate::support::{Cluster, epochs, grow_to, vote_reshape_threshold};
 
@@ -188,12 +188,12 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
 
     let mut world = probe_world(c);
     let mut charges = Charges::default();
-    let spacing = measure_probe_spacing(c, &mut charges, root);
+    let spacing = epoch_fraction(c, PROBES_PER_EPOCH);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, &mut charges, &mut world, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
@@ -229,16 +229,6 @@ pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
 /// the harness clock has left it.
 const REPLAY_TAIL_BLOCKS: u64 = 8;
 
-/// How many blocks `shard` should commit between consecutive probes.
-///
-/// Block cadence is activity-driven and scales with neither the epoch nor
-/// the harness, so the train's spacing is measured rather than assumed.
-/// One probe supplies the activity the sample prices in.
-fn measure_probe_spacing(c: &mut impl Cluster, charges: &mut Charges, shard: ShardId) -> u64 {
-    charges.submit(c, build_probe_transfer_tx(validity_around(c.now())));
-    (measure_blocks_per_epoch(c, shard) / PROBES_PER_EPOCH).max(1)
-}
-
 /// Submit a train of probes across a terminating shard's remaining life
 /// and return it, ordered by submission.
 ///
@@ -258,8 +248,7 @@ fn run_probe_train<C: Cluster>(
     c: &mut C,
     charges: &mut Charges,
     world: &mut World,
-    terminating: ShardId,
-    spacing: u64,
+    spacing: Duration,
     handed_over: impl Fn(&C) -> bool,
 ) -> Vec<Arc<Transaction>> {
     let live = handed_over;
@@ -278,10 +267,8 @@ fn run_probe_train<C: Cluster>(
         ));
         probes.push(Arc::clone(&probe));
         c.submit(probe);
-        let from = committed_height(c, terminating);
-        c.run_until(epochs(4), |c| {
-            live(c) || committed_height(c, terminating) >= from + spacing
-        });
+        let until = c.now() + spacing;
+        c.run_until(epochs(4), |c| live(c) || c.now() >= until);
     }
 
     assert!(
@@ -411,12 +398,12 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
 
     let mut world = probe_world(c);
     let mut charges = Charges::default();
-    let spacing = measure_probe_spacing(c, &mut charges, root);
+    let spacing = epoch_fraction(c, PROBES_PER_EPOCH);
     assert!(
         await_split_admitted(c, root, epochs(8)),
         "beacon did not admit the root split within budget"
     );
-    let probes = run_probe_train(c, &mut charges, &mut world, root, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, spacing, |c| {
         [left, right].iter().all(|&child| shard_live(c, child))
     });
     let replay = pick_replay(c, root, &probes);
@@ -654,12 +641,12 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     let mut world = probe_world(c);
     let mut charges = Charges::default();
     let payer_child = probe_payer_shard(c, &mut charges, root);
-    let spacing = measure_probe_spacing(c, &mut charges, payer_child);
+    let spacing = epoch_fraction(c, PROBES_PER_EPOCH);
     // The reformed parent reclaims a shard id its own predecessor held,
     // so serving is no signal. Its height line continues from the taller
     // child, so passing the child it succeeds is: nothing the departed
     // root chain froze at can reach there.
-    let probes = run_probe_train(c, &mut charges, &mut world, payer_child, spacing, |c| {
+    let probes = run_probe_train(c, &mut charges, &mut world, spacing, |c| {
         c.serves_shard(root) && committed_height(c, root) > committed_height(c, payer_child)
     });
 
