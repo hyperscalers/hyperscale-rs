@@ -5,12 +5,12 @@
 //! ([`impl Verified<CertifiedBlockHeader>::from_qc_attestation`] — the
 //! light-client trust path for remote-shard headers).
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Hbor, to_vec};
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, QcVerifyError, QuorumCertificate, ShardId, StateRoot,
-    Verifiable, Verified,
+    BlockHash, BlockHeader, BlockHeight, Hash, QcVerifyError, QuorumCertificate, ShardId,
+    StateRoot, Verifiable, Verified,
 };
 
 /// Failure modes of [`CertifiedBlockHeader`] verification.
@@ -92,6 +92,22 @@ impl CertifiedBlockHeader {
     #[must_use]
     pub const fn state_root(&self) -> StateRoot {
         self.header.state_root()
+    }
+
+    /// A digest naming this exact copy: the header by its cached hash, and
+    /// the QC by its encoding. Copies differing in any byte differ here.
+    ///
+    /// # Panics
+    ///
+    /// If the QC does not encode; every QC that decoded or formed does.
+    #[must_use]
+    pub fn copy_digest(&self) -> Hash {
+        let qc = to_vec(self.qc()).expect("a QC encodes");
+        Hash::from_parts(&[
+            b"hyperscale.verdict.header-copy",
+            self.header.hash().as_bytes(),
+            &qc,
+        ])
     }
 }
 
