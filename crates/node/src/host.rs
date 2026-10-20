@@ -779,6 +779,7 @@ where
     };
     shard_loop.share_host_seats();
     register_shard_request_handlers(process, &shard_loop.io, shard);
+    process.release_parked_submissions();
     shard_loop
 }
 
@@ -799,6 +800,7 @@ where
     process.network.unsubscribe_shard(shard);
     process.remove_shard_sender(shard);
     process.dispatch_handles.remove_shard(shard);
+    process.release_parked_submissions();
 }
 
 /// Build one shard's `ShardIo` plus its dispatch-handle entry from the
