@@ -45,7 +45,7 @@ use hyperscale_types::{
 };
 use tracing::error;
 
-use super::SimulationRunner;
+use super::{SimulationRunner, open_store};
 
 /// Every answer this harness serves comes from an honest host's store, so
 /// the screen production scores peers by must pass it: a rejection here is
@@ -250,7 +250,7 @@ impl SimulationRunner {
     /// Open a fresh duty store, replicate the engine bootstrap into it, and
     /// cache it for the duty.
     fn reshape_open_store(&mut self, host: NodeIndex, shard: ShardId) {
-        let storage = SimShardStorage::new(shard_prefix_path(shard));
+        let storage = open_store(shard, self.power_loss);
         replicate_engine_bootstrap(&storage, &self.genesis_config());
         let recovered = storage.load_recovered_state(shard);
         self.reshape_stores.insert(

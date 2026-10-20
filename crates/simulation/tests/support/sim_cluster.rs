@@ -81,6 +81,8 @@ struct BuildArgs<'a> {
     /// How long each pool's work takes, where a swarm draw does not say;
     /// `None` leaves it to the run seed.
     processing: Option<ProcessingTimes>,
+    /// Whether a host may lose power; see [`SimConfig::power_loss`].
+    power_loss: bool,
 }
 
 /// A [`FaultableCluster::drop_type_between_members`] rule: its edge, the
@@ -135,7 +137,7 @@ impl SimCluster {
     }
 
     /// [`Self::with_accounts`] with every pool's work taking time as
-    /// `processing` says.
+    /// `processing` says, on hosts that may lose power.
     #[must_use]
     pub fn with_accounts_and_processing(
         config: &ScenarioConfig,
@@ -153,6 +155,7 @@ impl SimCluster {
             swarm: false,
             staged_pool_extras: 0,
             processing: Some(processing),
+            power_loss: true,
         })
     }
 
@@ -175,6 +178,7 @@ impl SimCluster {
             swarm: false,
             staged_pool_extras: 0,
             processing: None,
+            power_loss: false,
         })
     }
 
@@ -201,6 +205,7 @@ impl SimCluster {
             swarm: false,
             staged_pool_extras: 0,
             processing: None,
+            power_loss: false,
         })
     }
 
@@ -225,6 +230,7 @@ impl SimCluster {
             swarm: false,
             staged_pool_extras: 0,
             processing: None,
+            power_loss: false,
         })
     }
 
@@ -267,6 +273,7 @@ impl SimCluster {
             swarm: false,
             staged_pool_extras: 0,
             processing: None,
+            power_loss: false,
         })
     }
 
@@ -336,6 +343,7 @@ impl SimCluster {
             timer_lateness: tuning
                 .as_ref()
                 .map_or(defaults.timer_lateness, |t| t.timer_lateness),
+            power_loss: args.power_loss,
             ..defaults
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
@@ -373,7 +381,7 @@ impl SimCluster {
     }
 
     /// [`Self::with_grown_accounts`] under transport and node tuning drawn
-    /// from the seed, as every swarm run is.
+    /// from the seed, on hosts that may lose power, as every swarm run is.
     #[must_use]
     pub fn with_grown_accounts_swarmed(
         config: &ScenarioConfig,
@@ -480,6 +488,7 @@ impl SimCluster {
             swarm,
             staged_pool_extras: config.staged_pool_extras(),
             processing,
+            power_loss: swarm,
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster

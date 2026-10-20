@@ -952,6 +952,14 @@ fn a_store_no_write_synced_comes_back_empty() {
     assert_eq!(storage.state_root(), fresh.state_root());
 }
 
+#[test]
+#[should_panic(expected = "does not track durability")]
+fn an_untracked_store_cannot_lose_power() {
+    let storage = SimShardStorage::untracked(shard_prefix_path(ShardId::ROOT));
+    commit_next(&storage, SyncHint::FlushNow);
+    storage.lose_unsynced();
+}
+
 /// A tree node superseded below the retention floor is reclaimed, unless
 /// a pinned boundary's root still reaches it; trimming the pin releases
 /// it on the next commit.

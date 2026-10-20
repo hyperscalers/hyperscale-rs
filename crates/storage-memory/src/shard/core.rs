@@ -26,6 +26,7 @@ use im::{OrdMap, OrdSet};
 
 use super::state::{ConsensusState, SharedState, apply_writes};
 use crate::crash_point;
+use crate::durability::Durability;
 
 /// In-memory storage for simulation and testing.
 ///
@@ -73,9 +74,8 @@ pub struct SimShardStorage {
 
     /// The store as its last synced write left it: what survives a
     /// machine that loses power. A synced write covers every write to the
-    /// store before it, as one fsync of a write-ahead log does. `None`
-    /// until a write syncs.
-    pub(crate) durable: Arc<RwLock<Option<ShardImage>>>,
+    /// store before it, as one fsync of a write-ahead log does.
+    pub(crate) durable: Arc<RwLock<Durability<ShardImage>>>,
 }
 
 /// Everything a [`SimShardStorage`] holds, as of one moment.
@@ -107,9 +107,22 @@ impl SimShardStorage {
     /// of the shard it serves (via [`hyperscale_types::shard_prefix_path`]), so
     /// its `state_root` is the global tree's subtree at that prefix. Pass
     /// [`NibblePath::empty`] (or use [`Self::default`]) for a single-shard /
-    /// whole-keyspace store.
+    /// whole-keyspace store. It tracks what its syncs make durable, so it
+    /// can [lose power](Self::lose_unsynced).
     #[must_use]
     pub fn new(root_path: NibblePath) -> Self {
+        Self::open(root_path, Durability::Tracked(None))
+    }
+
+    /// [`Self::new`] for a store that never loses power: its syncs keep
+    /// no image, so its writes copy nothing an image shares, and
+    /// [`Self::lose_unsynced`] panics.
+    #[must_use]
+    pub fn untracked(root_path: NibblePath) -> Self {
+        Self::open(root_path, Durability::Untracked)
+    }
+
+    fn open(root_path: NibblePath, durability: Durability<ShardImage>) -> Self {
         let mut shared = SharedState::new();
         shared.tree_store.set_root_path(root_path);
         Self {
@@ -117,7 +130,7 @@ impl SimShardStorage {
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
-            durable: Arc::new(RwLock::new(None)),
+            durable: Arc::new(RwLock::new(durability)),
         }
     }
 
@@ -139,18 +152,22 @@ impl SimShardStorage {
         *write_or_recover(&self.consensus) = image.consensus.clone();
         *write_or_recover(&self.boundary_pins) = image.boundary_pins.clone();
         *write_or_recover(&self.import_staging) = image.import_staging.clone();
-        *write_or_recover(&self.durable) = Some(image.clone());
+        write_or_recover(&self.durable).sync(|| image.clone());
     }
 
     /// Make every write so far durable, as a synced write does.
     pub(crate) fn sync(&self) {
-        *write_or_recover(&self.durable) = Some(self.image());
+        write_or_recover(&self.durable).sync(|| self.image());
     }
 
     /// Lose every write since the last synced one, as a machine that
     /// loses power does; a store no write has synced comes back empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store was opened [untracked](Self::untracked).
     pub fn lose_unsynced(&self) {
-        let image = read_or_recover(&self.durable).clone();
+        let image = read_or_recover(&self.durable).last_synced().cloned();
         let image = image.unwrap_or_else(|| {
             let mut state = SharedState::new();
             state
@@ -196,7 +213,8 @@ impl SimShardStorage {
         *write_or_recover(&self.consensus) = ConsensusState::new();
         write_or_recover(&self.boundary_pins).clear();
         *write_or_recover(&self.import_staging) = SimImportStaging::default();
-        *write_or_recover(&self.durable) = None;
+        let mut durable = write_or_recover(&self.durable);
+        *durable = durable.fresh();
     }
 
     /// Load recovered state for restarting a state machine on this

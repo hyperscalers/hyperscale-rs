@@ -16,6 +16,7 @@
 
 pub mod beacon;
 pub mod crash_point;
+mod durability;
 pub mod shard;
 
 pub use beacon::core::SimBeaconStorage;

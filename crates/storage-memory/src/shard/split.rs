@@ -43,7 +43,7 @@ impl SimShardStorage {
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
-            durable: Arc::new(RwLock::new(None)),
+            durable: Arc::new(RwLock::new(read_or_recover(&self.durable).fresh())),
         };
         // A checkpoint is written whole and synced before it is renamed
         // into place.

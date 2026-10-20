@@ -200,6 +200,11 @@ pub struct SimConfig {
     /// fails as stalled. A load that submits many transactions to a host
     /// at one instant raises it in proportion.
     pub stall_events_per_host: u64,
+    /// Whether a host may lose power: a [`CrashKind::Machine`] crash
+    /// rolls its stores back to their last synced write. Off, the stores
+    /// keep no synced image and a machine crash panics; keeping one makes
+    /// every write copy what the image shares with the live store.
+    pub power_loss: bool,
 }
 
 impl Default for SimConfig {
@@ -230,6 +235,7 @@ impl Default for SimConfig {
             execution_mode: ExecutionMode::Serial,
             packages: GenesisPackages::protocol(),
             stall_events_per_host: Self::STALL_EVENTS_PER_HOST,
+            power_loss: false,
         }
     }
 }
@@ -251,6 +257,16 @@ impl SimConfig {
             spike_rate: self.spike_rate,
             regions: self.regions,
         }
+    }
+}
+
+/// An empty store for `shard`, tracking what its syncs make durable only
+/// when a host may lose power.
+fn open_store(shard: ShardId, power_loss: bool) -> SimShardStorage {
+    if power_loss {
+        SimShardStorage::new(shard_prefix_path(shard))
+    } else {
+        SimShardStorage::untracked(shard_prefix_path(shard))
     }
 }
 
@@ -529,6 +545,9 @@ pub struct SimulationRunner {
     /// Per host, the state of the stream each timer fire's lateness is
     /// drawn from.
     lateness_streams: Vec<u64>,
+
+    /// [`SimConfig::power_loss`].
+    power_loss: bool,
 }
 
 /// A crash armed at a host's coming storage write.
@@ -728,7 +747,11 @@ impl SimulationRunner {
             // Per-host beacon storage. Warm-restart: resume from the latest
             // committed (block, state); commit the genesis pair first on an
             // empty store so fresh-start and restart share one load path.
-            let beacon_store = Arc::new(SimBeaconStorage::new());
+            let beacon_store = Arc::new(if network_config.power_loss {
+                SimBeaconStorage::new()
+            } else {
+                SimBeaconStorage::untracked()
+            });
             boot.commit_if_empty(beacon_store.as_ref());
             beacon_stores.push(Arc::clone(&beacon_store));
             let beacon_storage: Arc<dyn BeaconStorage> = beacon_store;
@@ -808,7 +831,7 @@ impl SimulationRunner {
             // One `SimShardStorage` per hosted shard on this host.
             let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
                 .keys()
-                .map(|s| (*s, SimShardStorage::new(shard_prefix_path(*s))))
+                .map(|s| (*s, open_store(*s, network_config.power_loss)))
                 .collect();
             // Single receiver per host: every hosted shard's sender is a
             // clone of the same `event_tx`, and the harness drains all
@@ -924,6 +947,7 @@ impl SimulationRunner {
                     seed ^ 0x5449_4D45_524C_4154 ^ u64::try_from(host).expect("host index fits u64")
                 })
                 .collect(),
+            power_loss: network_config.power_loss,
         }
     }
 
