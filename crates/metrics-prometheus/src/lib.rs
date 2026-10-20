@@ -216,12 +216,17 @@ pub struct Metrics {
     /// read.
     pub retirements_spent: Counter,
     /// Records a proposing replica pushed to their consumers again, by
-    /// terms and by whether the replica was seated above its chain's
-    /// genesis.
+    /// terms, by whether the replica was seated above its chain's
+    /// genesis, and by whether a pause on them had cleared.
     pub records_repushed: CounterVec,
     /// Carried records a proposing replica first found due for a
-    /// re-push, by whether it was seated above its chain's genesis.
+    /// re-push, by whether it was seated above its chain's genesis and
+    /// whether a pause stood on them.
     pub repush_due: CounterVec,
+    /// Pauses on records' re-pushes moving, by what moved them.
+    pub repush_paused: CounterVec,
+    /// Pushes held for a record not yet carried, placed again once it is.
+    pub pushes_placed_on_carry: Counter,
     /// Seconds from a record's re-push due instant to its retirement.
     pub retirement_wait: Histogram,
     /// Seconds an answer whose record another shard holds stood, by
@@ -974,14 +979,27 @@ impl Metrics {
             records_repushed: register_counter_vec!(
                 "hyperscale_records_repushed_total",
                 "Crossing records pushed to their consumers again",
-                &["kind", "seated"]
+                &["kind", "seated", "paused"]
             )
             .unwrap(),
 
             repush_due: register_counter_vec!(
                 "hyperscale_repush_due_total",
                 "Carried crossing records first found due for a re-push",
-                &["seated"]
+                &["seated", "paused"]
+            )
+            .unwrap(),
+
+            repush_paused: register_counter_vec!(
+                "hyperscale_repush_paused_total",
+                "Pauses on crossing records' re-pushes set, seeded or cleared",
+                &["outcome"]
+            )
+            .unwrap(),
+
+            pushes_placed_on_carry: register_counter!(
+                "hyperscale_pushes_placed_on_carry_total",
+                "Crossing pushes held for a record not yet carried, placed again once it is"
             )
             .unwrap(),
 
@@ -1490,18 +1508,29 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.retirements_spent.inc_by(retirements as f64);
     }
 
-    fn record_records_repushed(&self, kind: &str, seated: bool) {
+    fn record_records_repushed(&self, kind: &str, seated: bool, paused: bool) {
         self.metrics
             .records_repushed
-            .with_label_values(&[kind, flag(seated)])
+            .with_label_values(&[kind, flag(seated), flag(paused)])
             .inc();
     }
 
-    fn record_repush_due(&self, seated: bool) {
+    fn record_repush_due(&self, seated: bool, paused: bool) {
         self.metrics
             .repush_due
-            .with_label_values(&[flag(seated)])
+            .with_label_values(&[flag(seated), flag(paused)])
             .inc();
+    }
+
+    fn record_repush_paused(&self, outcome: &str) {
+        self.metrics
+            .repush_paused
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    fn record_pushes_placed_on_carry(&self, count: usize) {
+        self.metrics.pushes_placed_on_carry.inc_by(count as f64);
     }
 
     fn record_retirement_wait(&self, millis: u64) {

@@ -21,8 +21,9 @@ use hyperscale_metrics::{
     record_answer_life, record_boundary_cells_asked, record_boundary_claims_carried,
     record_boundary_drained, record_decline_folded, record_fenced_claim,
     record_rebuilt_record_entry, record_reclaim_folded, record_records_repushed, record_repush_due,
-    record_retirement_carry_wait, record_retirement_wait, record_sibling_absence_read,
-    record_sibling_question_pending, set_standing_answers, set_wanted_records,
+    record_repush_paused, record_retirement_carry_wait, record_retirement_wait,
+    record_sibling_absence_read, record_sibling_question_pending, set_standing_answers,
+    set_wanted_records,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
@@ -676,6 +677,51 @@ fn answer_ask_gap(asked: u32) -> u64 {
     (1u64 << asked.saturating_sub(1).min(6)).min(MAX_ANSWER_ASK_GAP)
 }
 
+/// One carried record's re-push pacing on this validator alone.
+///
+/// A fresh `Taken` a push brings retires nothing, since a recovery of
+/// the consumer's shard can discard it, but it says the consumer
+/// answered: the record waits for that answer read at a boundary, and is
+/// pushed no more meanwhile. The pause clears at the first boundary of
+/// the answer key's holder whose clock is later than the pushed reading
+/// and whose read of the key is refuted or let go. A later clock is a
+/// later state of the holder's chain or of a chain recovered past the
+/// pushed block, and either way one that holds no such `Taken` where the
+/// read refutes it. Heights do not order a recovery's branches, so the
+/// comparison is by clock. No pause is set after the refutation that
+/// would clear it: the coordinator drops a push of a discarded `Taken`
+/// before it is offered here, as fenced once the recovery is in this
+/// validator's schedule (`TopologySchedule::recovery_orphaned`), which
+/// holds the recovery before any boundary of the recovered chain, as
+/// `anchor_disagrees` once the recovered chain passes its height, or at
+/// the horizon.
+///
+/// A pause lasts at most until the holder's next recorded boundary is
+/// read: one epoch crossing of the holder at most, or the first boundary
+/// of a recovered chain. A validator that seeds its pauses at a start or
+/// a seat pushes none of its past-due records again for up to that long,
+/// and where a whole committee restarts none of its members does: a
+/// decline that needs the push is delayed, never lost.
+/// A read let go because the key's holder moved clears a pause whose
+/// `Taken` may stand, which costs only pushes until the new holder's
+/// boundary holds it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Repush {
+    /// When the record was last pushed again, at this shard's height,
+    /// and how many times, if it has been.
+    last: Option<(BlockHeight, u32)>,
+    /// The clock of the newest fresh `Taken` of the record's own
+    /// transaction a push brought, while it stands for the answer.
+    paused_from: Option<WeightedTimestamp>,
+    /// Whether a re-push has found the record due.
+    found_due: bool,
+    /// The clock of the boundary that last cleared a pause on the
+    /// record, if one has. That boundary refuted or let go every reading
+    /// of the `Taken` no later than it, so a push read at or before it
+    /// pauses nothing.
+    cleared_at: Option<WeightedTimestamp>,
+}
+
 /// One record this shard holds for a consumer elsewhere, which it
 /// pushes to the consumer's shard again until the record goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -988,6 +1034,9 @@ struct CrossingRows {
     /// Whether every held boundary reading is to be judged again: the
     /// rows were read whole.
     rejudge: bool,
+
+    /// The `Taken` keys of the records the last read put up.
+    newly_carried: Vec<SubstateKey>,
 }
 
 impl CrossingRows {
@@ -1008,6 +1057,7 @@ impl CrossingRows {
         cursor: Option<CrossingCursor>,
         now: WeightedTimestamp,
     ) {
+        self.newly_carried.clear();
         match read {
             CrossingRead::Whole(rows) => {
                 let mut before = std::mem::take(&mut self.answers);
@@ -1108,6 +1158,7 @@ impl CrossingRows {
             } => {
                 self.name(cells.taken, id);
                 self.name(cells.never, id);
+                self.newly_carried.push(cells.taken);
                 self.carried.insert(key, carried);
                 for ask in asks {
                     self.answer_asks.insert(ask.key(), ask);
@@ -1799,6 +1850,12 @@ pub struct CommitFolded {
     /// transaction accepted. No finalization drives these, so the
     /// mempool hears them from here.
     pub(crate) settled: Vec<(TxHash, TxResolution)>,
+    /// The `Taken` keys of the records the commit's read put up: every
+    /// record carried on a whole read, and on a read of the changes every
+    /// record row it wrote. A held push naming one is placed again, so a
+    /// push that landed before its record was carried here paces the
+    /// record's re-push.
+    pub(crate) carried: Vec<SubstateKey>,
 }
 
 /// What this validator holds to offer in a block it proposes.
@@ -1901,11 +1958,15 @@ pub struct Counterparts {
     /// held claim.
     boundaries: BoundaryClaims,
 
-    /// Each carried record a re-push has found due, with when it was
-    /// last re-pushed, at this shard's height, and how many times, if it
-    /// has been: node-local pacing, so a restarted replica re-pushes at
-    /// once. One entry at most per carried record.
-    repushed: BTreeMap<SubstateKey, Option<(BlockHeight, u32)>>,
+    /// Each carried record's re-push pacing ([`Repush`]): node-local, so
+    /// a new account seeds what it can of it at its first read of the
+    /// rows. One entry at most per carried record.
+    repushed: BTreeMap<SubstateKey, Repush>,
+
+    /// Whether the rows have been read since this account was built: the
+    /// first read seeds a pause on every record already due, which a push
+    /// this account never saw may have answered.
+    seeded: bool,
 
     /// The height of the last block this account folded when each
     /// record's consumer's `Taken` was first held here at a boundary, by
@@ -2023,6 +2084,7 @@ impl Counterparts {
             boundary_asked: BTreeMap::new(),
             boundaries: BoundaryClaims::default(),
             repushed: BTreeMap::new(),
+            seeded: false,
             retirement_held: BTreeMap::new(),
             folded: BlockHeight::GENESIS,
             seated: None,
@@ -2152,7 +2214,7 @@ impl Counterparts {
         self.frontier
             .advance(&FrontierInputs::of_block(block, windows));
         self.drop_below_floor(windows);
-        self.derive_asks(trie);
+        let carried = self.derive_asks(trie);
         actions.extend(self.settle_boundaries(topology_schedule, now));
         actions.extend(self.release_answered_fetches());
         self.cap_held_unsolicited();
@@ -2164,6 +2226,7 @@ impl Counterparts {
             actions,
             unanswerable,
             settled,
+            carried,
         }
     }
 
@@ -2184,6 +2247,14 @@ impl Counterparts {
         // the marker read beside it stay held: another answer of the
         // same transaction reads them too.
         self.boundaries.cut(carried.deleted());
+    }
+
+    /// Whether this validator's re-push of `record` stands paused.
+    #[cfg(test)]
+    pub(crate) fn repush_paused(&self, record: SubstateKey) -> bool {
+        self.repushed
+            .get(&record)
+            .is_some_and(|repush| repush.paused_from.is_some())
     }
 
     /// Whether the records here ask `answer` at their consumers'
@@ -2462,7 +2533,10 @@ impl Counterparts {
     /// the question: a consumer that halts can write its answer after
     /// recovering, and a return a recovery discards is made again on the
     /// next reading.
-    pub(crate) fn derive_asks(&mut self, trie: &ShardTrie) {
+    ///
+    /// Returns the `Taken` keys of the records this read put up, which a
+    /// push that ran ahead of a record's commit here may carry.
+    pub(crate) fn derive_asks(&mut self, trie: &ShardTrie) -> Vec<SubstateKey> {
         let local = self.ledger.local();
         let (read, cursor) = self.index.crossing_changes(local, self.rows.since(trie));
         self.rows.take(trie, local, read, cursor, self.clock);
@@ -2470,6 +2544,18 @@ impl Counterparts {
         let carried = &self.rows.carried;
         self.repushed
             .retain(|record, _| carried.contains_key(record));
+        if !std::mem::replace(&mut self.seeded, true) {
+            for (record, carried) in &self.rows.carried {
+                if self.clock < carried.due_from {
+                    continue;
+                }
+                let paused = &mut self.repushed.entry(*record).or_default().paused_from;
+                if paused.is_none() {
+                    *paused = Some(self.clock);
+                    record_repush_paused("seeded");
+                }
+            }
+        }
         self.retirement_held
             .retain(|record, _| carried.contains_key(record));
         let settling: BTreeSet<CrossingId> = self
@@ -2487,6 +2573,7 @@ impl Counterparts {
             )
             .collect();
         self.local_crossings = settling;
+        std::mem::take(&mut self.rows.newly_carried)
     }
 
     /// Take `records` as what consumers here wait on from now.
@@ -2524,6 +2611,30 @@ impl Counterparts {
             )
     }
 
+    /// Clear the pause on the record whose `Taken` `key` is, where
+    /// `anchor`, a boundary of the key's holder whose read of it is
+    /// refuted or let go, is later than the pushed reading: no state of
+    /// the holder from there holds that `Taken`.
+    fn resume(&mut self, key: &SubstateKey, anchor: &Anchor, outcome: &str) {
+        let Some(ask) = self
+            .rows
+            .answer_asks
+            .get(key)
+            .filter(|ask| ask.answered == Answered::Taken)
+        else {
+            return;
+        };
+        if let Some(entry) = self
+            .repushed
+            .get_mut(&ask.id.record_key(&ProtocolHasher))
+            .filter(|entry| entry.paused_from.is_some_and(|from| anchor.ts > from))
+        {
+            entry.paused_from = None;
+            entry.cleared_at = Some(anchor.ts);
+            record_repush_paused(outcome);
+        }
+    }
+
     /// Count the blocks from the last block folded when `record`'s
     /// consumer's `Taken` was first held here to `height`, the block that
     /// carried it, where one was held.
@@ -2555,6 +2666,10 @@ impl Counterparts {
     /// never pushed before any, so the places rotate over every record
     /// standing; one left out is due at the next height.
     ///
+    /// A record whose consumer's fresh `Taken` a push brought is paused
+    /// ([`Repush`]) and passed over before the escrowed count, so it
+    /// takes no place under the cap.
+    ///
     /// The pacing is taken as the push is, so a call only a proposer
     /// makes paces only its own pushes.
     pub(crate) fn record_repushes(
@@ -2569,11 +2684,15 @@ impl Counterparts {
             if now < carried.due_from {
                 continue;
             }
-            let last = *self.repushed.entry(*record).or_insert_with(|| {
-                record_repush_due(seated);
-                None
-            });
-            let (at, times) = last.unzip();
+            let entry = self.repushed.entry(*record).or_default();
+            if !entry.found_due {
+                entry.found_due = true;
+                record_repush_due(seated, entry.paused_from.is_some());
+            }
+            if entry.paused_from.is_some() {
+                continue;
+            }
+            let (at, times) = entry.last.unzip();
             let times = times.unwrap_or(0);
             if at.is_none_or(|at: BlockHeight| height.inner() >= at.inner() + answer_ask_gap(times))
             {
@@ -2593,10 +2712,10 @@ impl Counterparts {
                 }
                 *sent += 1;
             }
-            self.repushed
-                .insert(record, Some((height, times.saturating_add(1))));
+            let entry = self.repushed.entry(record).or_default();
+            entry.last = Some((height, times.saturating_add(1)));
             let kind = if carried.escrowed { "escrowed" } else { "owed" };
-            record_records_repushed(kind, seated);
+            record_records_repushed(kind, seated, entry.cleared_at.is_some());
             targets.entry(target).or_default().push(record);
         }
         for records in targets.values_mut() {
@@ -2768,6 +2887,9 @@ impl Counterparts {
         for asked_at in drained {
             record_boundary_drained(millis(now.elapsed_since(asked_at)));
         }
+        for (anchor, key) in &released {
+            self.resume(key, anchor, "released");
+        }
         if released.is_empty() {
             Vec::new()
         } else {
@@ -2843,6 +2965,7 @@ impl Counterparts {
         // what else they read here may be needed by none.
         for key in &refuted {
             self.rows.unread_with(*key);
+            self.resume(key, &anchor, "refuted");
         }
         for key in &kept {
             if let Some(ask) = self
@@ -3966,6 +4089,34 @@ impl Counterparts {
             .collect()
     }
 
+    /// Pause the re-push of every record whose consumer's `Taken` of the
+    /// record's own transaction `claim`, a push, reads present, from the
+    /// claim's clock, keeping the later of two. A claim no later than the
+    /// boundary that last cleared the record's pause pauses nothing: that
+    /// boundary already refuted or let go its reading.
+    fn pause_on(&mut self, claim: &StateClaim) {
+        let pausing: Vec<SubstateKey> = claim
+            .keys()
+            .into_iter()
+            .filter_map(|key| self.rows.answer_asks.get(&key))
+            .filter(|ask| {
+                ask.answered == Answered::Taken
+                    && claim.answers(&ask.id, Issuer::from(&ask.record), Answered::Taken)
+            })
+            .map(|ask| ask.id.record_key(&ProtocolHasher))
+            .collect();
+        let at = claim.anchor.ts;
+        for record in pausing {
+            let entry = self.repushed.entry(record).or_default();
+            if entry.cleared_at.is_none_or(|cleared| at > cleared)
+                && entry.paused_from.is_none_or(|from| from < at)
+            {
+                entry.paused_from = Some(at);
+                record_repush_paused("set");
+            }
+        }
+    }
+
     /// Keep a pushed claim's cells while something here wants them, and
     /// say whether the claim is done with: `false` where nothing wants
     /// it yet and something may come to. `records` is the wanted set as
@@ -4005,6 +4156,7 @@ impl Counterparts {
         }
         self.want(records);
         self.clock = now;
+        self.pause_on(claim);
         let anchor = claim.anchor;
         let local = self.ledger.local();
         let unasked: Vec<(WeightedTimestamp, SubstateKey)> = claim
@@ -5028,6 +5180,406 @@ mod tests {
             terms,
             witness_sources,
         }
+    }
+
+    /// The clock [`escrowed_producer`]'s records fall due at.
+    const DUE_MS: u64 = 36_000;
+
+    /// A push from `CONSUMER`, at `ts_ms`, of `id`'s `Taken` as `by`
+    /// answers the record `cell`.
+    fn pushed_taken(id: &CrossingId, cell: &CrossingCell, by: TxHash, ts_ms: u64) -> StateClaim {
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let (anchor, proof) = answered_at(id, cell, &[(Answered::Taken, by)], &[taken], 30, ts_ms);
+        let cells = proof
+            .inclusions(anchor.state_root, CONSUMER, &[taken])
+            .expect("the fixture proof answers for its key");
+        StateClaim::new(anchor, cells, proof)
+    }
+
+    /// Whether `producer` pushes `record` again at `height`, the clock
+    /// past every fixture's due instant.
+    fn pushes(producer: &mut Counterparts, record: SubstateKey, height: u64) -> bool {
+        producer
+            .record_repushes(
+                &ShardTrie::from_leaves([CONSUMER, PRODUCER]),
+                WeightedTimestamp::from_millis(100_000),
+                BlockHeight::new(height),
+            )
+            .values()
+            .any(|records| records.contains(&record))
+    }
+
+    /// The clock `producer`'s re-push of `record` is paused from.
+    fn paused_from(producer: &Counterparts, record: SubstateKey) -> Option<u64> {
+        producer
+            .repushed
+            .get(&record)
+            .and_then(|repush| repush.paused_from)
+            .map(WeightedTimestamp::as_millis)
+    }
+
+    /// Ask `producer`'s record's answers at a boundary of `CONSUMER` at
+    /// `ts_ms`, and serve them as `present` reads.
+    fn read_at_boundary(
+        producer: &mut Counterparts,
+        (id, cell): (&CrossingId, &CrossingCell),
+        present: &[(Answered, TxHash)],
+        height: u64,
+        ts_ms: u64,
+    ) {
+        let both = sorted(vec![
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            id.answer_key(&ProtocolHasher, Answered::Never),
+        ]);
+        let (boundary, proof) = answered_at(id, cell, present, &both, height, ts_ms);
+        let asked = producer.ask_boundaries(
+            &recording(&[boundary]),
+            WeightedTimestamp::from_millis(ts_ms),
+        );
+        assert!(!asked.is_empty(), "the boundary is asked");
+        producer.on_proof_fetched(boundary, &both, &proof, &[]);
+    }
+
+    /// A pushed `Taken` of the record's own transaction pauses its
+    /// re-push: the record is pushed no more while the pause stands, and
+    /// the claim is done with.
+    #[test]
+    fn a_pushed_taken_pauses_its_records_repush() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x71, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        assert!(producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now));
+        assert_eq!(paused_from(&producer, record), Some(40_000));
+        assert!(
+            !pushes(&mut producer, record, 1),
+            "a paused record is pushed no more"
+        );
+    }
+
+    /// A boundary of the holder later than the pushed reading that reads
+    /// the `Taken` absent clears the pause, and the record is pushed
+    /// again, counted as a push after a pause.
+    #[test]
+    fn a_refutation_at_a_later_boundary_resumes_the_repush() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x72, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        let recorder = MemoryRecorder::new();
+        with_recorder(&recorder, || {
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            read_at_boundary(&mut producer, (&id, &cell), &[], 40, 50_000);
+        });
+        assert_eq!(paused_from(&producer, record), None);
+        assert_eq!(recorder.counter("repush_paused", Some("refuted")), 1);
+        let pushed = with_recorder(&recorder, || pushes(&mut producer, record, 1));
+        assert!(pushed, "the record is pushed again");
+        assert_eq!(
+            recorder.counter("records_repushed_after_a_pause", Some("escrowed")),
+            1,
+        );
+    }
+
+    /// A push placed again once a later boundary cleared its pause, as a
+    /// claim held early is when its record is carried, pauses nothing:
+    /// that boundary refuted it. A push read past the clear pauses again.
+    #[test]
+    fn a_push_no_later_than_the_clear_pauses_nothing() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7A, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        let pushed = pushed_taken(&id, &cell, cell.tx, 40_000);
+        let recorder = MemoryRecorder::new();
+        with_recorder(&recorder, || {
+            producer.offer_pushed(&pushed, &[], now);
+            read_at_boundary(&mut producer, (&id, &cell), &[], 40, 50_000);
+            producer.offer_pushed(&pushed, &[], now);
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 50_000), &[], now);
+        });
+        assert_eq!(paused_from(&producer, record), None);
+        assert_eq!(recorder.counter("repush_paused", Some("set")), 1);
+        assert!(
+            pushes(&mut producer, record, 1),
+            "the record is pushed again"
+        );
+        with_recorder(&recorder, || {
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 55_000), &[], now);
+        });
+        assert_eq!(paused_from(&producer, record), Some(55_000));
+        assert_eq!(recorder.counter("repush_paused", Some("set")), 2);
+    }
+
+    /// A refutation at a boundary no later than the pushed reading leaves
+    /// the pause: that boundary is older than the `Taken`.
+    #[test]
+    fn a_refutation_at_an_earlier_boundary_leaves_the_pause() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x73, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        read_at_boundary(&mut producer, (&id, &cell), &[], 40, 40_000);
+        assert_eq!(paused_from(&producer, record), Some(40_000));
+        assert!(!pushes(&mut producer, record, 1));
+    }
+
+    /// A read of the `Taken` at a later boundary let go clears the
+    /// pause, as a refutation there does: a read that never comes back
+    /// holds no record paused for good.
+    #[test]
+    fn a_read_let_go_at_a_later_boundary_resumes_the_repush() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x74, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        let boundary = Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(40),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: WeightedTimestamp::from_millis(50_000),
+        };
+        let _ = producer.ask_boundaries(&recording(&[boundary]), now);
+        let recorder = MemoryRecorder::new();
+        let released = with_recorder(&recorder, || {
+            producer.settle_boundaries(&recording(&[]), now)
+        });
+        assert!(!released.is_empty(), "the read is let go");
+        assert_eq!(paused_from(&producer, record), None);
+        assert_eq!(recorder.counter("repush_paused", Some("released")), 1);
+        assert!(pushes(&mut producer, record, 1));
+    }
+
+    /// A `Taken` held present at a later boundary keeps the pause: it is
+    /// an attested `Taken`, and the record needs no further push.
+    #[test]
+    fn a_taken_held_present_keeps_the_repush_paused() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x75, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        read_at_boundary(
+            &mut producer,
+            (&id, &cell),
+            &[(Answered::Taken, cell.tx)],
+            40,
+            50_000,
+        );
+        assert_eq!(paused_from(&producer, record), Some(40_000));
+        assert!(!pushes(&mut producer, record, 1));
+    }
+
+    /// A pushed `Taken` another transaction left at the key is no answer
+    /// to this record and pauses nothing.
+    #[test]
+    fn a_taken_of_another_transaction_pauses_nothing() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x76, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let stranger = TxHash::from(Hash::from_bytes(b"another transaction"));
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, stranger, 40_000), &[], now);
+        assert_eq!(paused_from(&producer, record), None);
+        assert!(pushes(&mut producer, record, 1));
+    }
+
+    /// A paused escrowed record takes no place under the cap on records
+    /// pushed to one shard at one height: the others fill it.
+    #[test]
+    fn a_paused_escrowed_record_takes_no_place_under_the_cap() {
+        let rows = Arc::new(TestRows::default());
+        let records: Vec<(SubstateKey, CrossingId, CrossingCell)> = (0
+            ..=MAX_UNSOLICITED_RECORDS_PER_PRODUCER)
+            .map(|seed| {
+                let (record, id, cell) =
+                    escrowed_record(u8::try_from(seed).expect("small"), DUE_MS);
+                rows.put(record, cell.to_bytes());
+                (record, id, cell)
+            })
+            .collect();
+        let mut producer = Counterparts::new(
+            PRODUCER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
+        let (paused, id, cell) = &records[0];
+        producer.offer_pushed(
+            &pushed_taken(id, cell, cell.tx, 40_000),
+            &[],
+            WeightedTimestamp::from_millis(40_000),
+        );
+        let pushed = producer.record_repushes(
+            &ShardTrie::from_leaves([CONSUMER, PRODUCER]),
+            WeightedTimestamp::from_millis(100_000),
+            BlockHeight::new(1),
+        );
+        let pushed = &pushed[&CONSUMER];
+        assert_eq!(pushed.len(), MAX_UNSOLICITED_RECORDS_PER_PRODUCER);
+        assert!(!pushed.contains(paused));
+        assert!(
+            records[1..]
+                .iter()
+                .all(|(record, _, _)| pushed.contains(record)),
+            "every unpaused record goes at the first height",
+        );
+    }
+
+    /// Of two pushed clocks the later is kept, and a pause is counted set
+    /// only where a push sets or raises it.
+    #[test]
+    fn the_later_of_two_pushed_clocks_is_kept() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x77, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        let recorder = MemoryRecorder::new();
+        with_recorder(&recorder, || {
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 35_000), &[], now);
+        });
+        assert_eq!(paused_from(&producer, record), Some(40_000));
+        assert_eq!(recorder.counter("repush_paused", Some("set")), 1);
+        let later = WeightedTimestamp::from_millis(45_000);
+        with_recorder(&recorder, || {
+            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 45_000), &[], later);
+        });
+        assert_eq!(paused_from(&producer, record), Some(45_000));
+        assert_eq!(recorder.counter("repush_paused", Some("set")), 2);
+    }
+
+    /// A new account seeds a pause, at its first read of the rows, on
+    /// every record already past its due instant: a push it never saw
+    /// may have answered it.
+    #[test]
+    fn a_new_counterparts_seeds_a_pause_on_every_past_due_record() {
+        let rows = Arc::new(TestRows::default());
+        let (record, _, cell) = escrowed_record(0x78, DUE_MS);
+        rows.put(record, cell.to_bytes());
+        let mut producer = Counterparts::new(
+            PRODUCER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        producer.clock = WeightedTimestamp::from_millis(50_000);
+        let recorder = MemoryRecorder::new();
+        with_recorder(&recorder, || {
+            producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
+        });
+        assert_eq!(paused_from(&producer, record), Some(50_000));
+        assert_eq!(recorder.counter("repush_paused", Some("seeded")), 1);
+        assert!(!pushes(&mut producer, record, 1));
+    }
+
+    /// A seeded pause stands through a refutation at a boundary older
+    /// than the seat's clock, and clears at the first later one that
+    /// refutes the `Taken`.
+    #[test]
+    fn a_seeded_pause_clears_at_a_later_refuting_boundary() {
+        let rows = Arc::new(TestRows::default());
+        let (record, id, cell) = escrowed_record(0x7B, DUE_MS);
+        rows.put(record, cell.to_bytes());
+        let mut producer = Counterparts::new(
+            PRODUCER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        producer.clock = WeightedTimestamp::from_millis(50_000);
+        producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
+        read_at_boundary(&mut producer, (&id, &cell), &[], 40, 45_000);
+        assert_eq!(
+            paused_from(&producer, record),
+            Some(50_000),
+            "a boundary older than the seat stands for no push it missed",
+        );
+        read_at_boundary(&mut producer, (&id, &cell), &[], 41, 60_000);
+        assert_eq!(paused_from(&producer, record), None);
+        assert!(pushes(&mut producer, record, 1));
+    }
+
+    /// A pause stands across a reshape of its answer key's holder that
+    /// finds no read of the key pending: the rows are read whole under
+    /// the new trie, and the pacing is kept by the record.
+    #[test]
+    fn a_pause_stands_across_a_reshape_of_its_holder() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, taken, _) = escrowed_producer(&rows, 0x7C, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        let (left, right) = CONSUMER.children();
+        let split = ShardTrie::from_leaves([left, right, PRODUCER]);
+        assert!([left, right].contains(&split.shard_for_prefix(taken.owner)));
+        producer.derive_asks(&split);
+        assert_eq!(paused_from(&producer, record), Some(40_000));
+        assert!(!pushes(&mut producer, record, 1));
+    }
+
+    /// A read of the `Taken` pending at the old holder's later boundary
+    /// when a reshape moves the key is let go, and its pause clears with
+    /// it: the record is pushed again until a boundary of the new holder
+    /// is read.
+    #[test]
+    fn a_read_let_go_by_a_reshape_of_its_holder_resumes_the_repush() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7D, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        let boundary = Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(40),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: WeightedTimestamp::from_millis(50_000),
+        };
+        let schedule = recording(&[boundary]);
+        assert!(!producer.ask_boundaries(&schedule, now).is_empty());
+        let (left, right) = CONSUMER.children();
+        producer.derive_asks(&ShardTrie::from_leaves([left, right, PRODUCER]));
+        let recorder = MemoryRecorder::new();
+        let released = with_recorder(&recorder, || producer.settle_boundaries(&schedule, now));
+        assert!(!released.is_empty(), "the read at the old holder is let go");
+        assert_eq!(paused_from(&producer, record), None);
+        assert_eq!(recorder.counter("repush_paused", Some("released")), 1);
+        assert!(pushes(&mut producer, record, 1));
+    }
+
+    /// A record that falls due after the account's first read is not
+    /// seeded a pause: no push it missed can stand for it.
+    #[test]
+    fn a_record_falling_due_after_the_seeding_is_not_paused() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, _, _, _) = escrowed_producer(&rows, 0x79, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        producer.clock = WeightedTimestamp::from_millis(50_000);
+        producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
+        assert_eq!(paused_from(&producer, record), None);
+        assert!(pushes(&mut producer, record, 1));
+    }
+
+    /// A pause survives a whole read of the rows: the pacing is kept by
+    /// the record it stands for.
+    #[test]
+    fn a_hint_survives_a_whole_read() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7A, DUE_MS);
+        let record = id.record_key(&ProtocolHasher);
+        let now = WeightedTimestamp::from_millis(40_000);
+        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        rows.restart();
+        producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
+        assert!(producer.rows.rejudge, "the read was whole");
+        assert_eq!(paused_from(&producer, record), Some(40_000));
     }
 
     /// Two records' answers held at one boundary: one record's `Never`

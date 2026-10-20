@@ -62,7 +62,7 @@ use hyperscale_engine::{
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
-    record_unresolvable_tx,
+    record_pushes_placed_on_carry, record_unresolvable_tx,
 };
 use hyperscale_storage::{
     FeeTerms, ProvisionalTx, RecoveredState, TickResolution, declared_reservations,
@@ -2627,6 +2627,28 @@ impl ExecutionCoordinator {
         self.release_early_naming(topology_schedule, &keys)
     }
 
+    /// Re-place the early pushes naming any of `carried`, the `Taken`
+    /// keys of the records this commit's read put up, and count them.
+    ///
+    /// A push naming a record this validator never carries, as one whose
+    /// `Whole` read after a sync or a restart finds the record already
+    /// gone, or one toward a prefix a reshape moved away, is released by
+    /// nothing here. It stays held until the horizon retires it or a
+    /// later push evicts it, within the bound the early buffer holds.
+    fn release_carried(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        carried: &BTreeSet<SubstateKey>,
+    ) -> Vec<Action> {
+        let now = self.committed_ts;
+        let released = self.parked_claims.release_early(carried);
+        record_pushes_placed_on_carry(released.len());
+        released
+            .into_iter()
+            .flat_map(|claim| self.place_pushed_claim(topology_schedule, claim, now))
+            .collect()
+    }
+
     /// Re-place the early pushes carrying any of `keys`.
     fn release_early_naming(
         &mut self,
@@ -3146,6 +3168,10 @@ impl ExecutionCoordinator {
             self.counterparts
                 .on_commit(trie, topology_schedule, block, self.committed_ts, &wanted);
         actions.extend(committed.actions);
+        if !committed.carried.is_empty() {
+            let carried: BTreeSet<SubstateKey> = committed.carried.iter().copied().collect();
+            actions.extend(self.release_carried(topology_schedule, &carried));
+        }
         // The leg entries the fold closed, for the mempool: no
         // finalization names them, so this is where their acceptance is
         // reported.
@@ -7110,6 +7136,13 @@ mod tests {
     /// seated at epoch 20, bridge 21, frozen at height 5. Answers the
     /// schedule, the local shard and the recovered one.
     fn pending_recovery_at_production_epochs() -> (TopologySchedule, ShardId, ShardId) {
+        production_epochs_schedule(true)
+    }
+
+    /// [`pending_recovery_at_production_epochs`]'s schedule, with the
+    /// recovery pending where `recovering` and with none otherwise: the
+    /// schedule a validator holds before the recovery reaches it.
+    fn production_epochs_schedule(recovering: bool) -> (TopologySchedule, ShardId, ShardId) {
         let epoch_ms = PRODUCTION_EPOCH_MS;
         let (local, recovered) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
         let frontier = BlockHeight::new(5);
@@ -7119,30 +7152,33 @@ mod tests {
                 public_key: BlsSigner::generate().public_key(),
             })
             .collect();
-        let snapshot = Arc::new(
-            TopologySnapshot::new(
-                NetworkDefinition::simulator(),
-                2,
-                ValidatorSet::new(validators),
-            )
-            .with_recoveries(BTreeMap::from([(
-                recovered,
-                vec![RecoveryBinding {
-                    rotated_at: Epoch::new(20),
-                    attested_frontier: frontier,
-                    completed: false,
-                }],
-            )]))
-            .with_pending_recoveries(BTreeMap::from([(
-                recovered,
-                ShardRecovery {
-                    cause: RecoveryCause::Halt,
-                    rotated_at: Epoch::new(20),
-                    retained: Vec::new(),
-                    attested_frontier: frontier,
-                },
-            )])),
+        let plain = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
         );
+        let snapshot = Arc::new(if recovering {
+            plain
+                .with_recoveries(BTreeMap::from([(
+                    recovered,
+                    vec![RecoveryBinding {
+                        rotated_at: Epoch::new(20),
+                        attested_frontier: frontier,
+                        completed: false,
+                    }],
+                )]))
+                .with_pending_recoveries(BTreeMap::from([(
+                    recovered,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at: Epoch::new(20),
+                        retained: Vec::new(),
+                        attested_frontier: frontier,
+                    },
+                )]))
+        } else {
+            plain
+        });
         let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(19), Arc::clone(&snapshot));
         for epoch in 20..=21 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
@@ -7241,6 +7277,209 @@ mod tests {
             actions.is_empty(),
             "a band certificate is refused: {actions:?}"
         );
+    }
+
+    /// A push of a `Taken` the consumer's recovery discards, arriving once
+    /// the recovery is in this validator's schedule, is dropped as fenced
+    /// before it is offered, and sets no pause: the boundary that would
+    /// refute it may already have cleared the pause, and nothing would
+    /// clear one set after. The same `Taken` at an anchor the recovery
+    /// keeps pauses the record.
+    #[test]
+    fn a_push_of_a_discarded_taken_after_its_refutation_pauses_nothing() {
+        let epoch_ms = PRODUCTION_EPOCH_MS;
+        let (schedule, local, recovered) = pending_recovery_at_production_epochs();
+        let pushed = |height: u64, ts_ms: u64| {
+            let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+            let (record_key, claim, cell) = crossing_fixture(0x7B, 1_000, local, recovered);
+            hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+            let id = CrossingId::of_record(record_key.owner, &cell);
+            let took = id
+                .answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+                .to_bytes();
+            let (state_root, proof) =
+                state_and_proof_holding(recovered, &[(claim, took)], &[claim]);
+            let anchor = Anchor {
+                shard: recovered,
+                height: BlockHeight::new(height),
+                state_root,
+                ts: WeightedTimestamp::from_millis(ts_ms),
+            };
+            let cells = proof
+                .inclusions(state_root, recovered, &[claim])
+                .expect("the fixture proof answers for its key");
+            state.proven_anchors().record(anchor);
+            state.committed_ts = anchor.ts;
+            let orphaned = schedule.recovery_orphaned(recovered, anchor.ts, anchor.height);
+            let recorder = MemoryRecorder::new();
+            let scoped: Arc<dyn MetricsRecorder> = Arc::new(recorder.clone());
+            with_scoped_recorder(scoped, || {
+                state.on_crossing_readings(&schedule, vec![StateClaim::new(anchor, cells, proof)]);
+            });
+            (
+                orphaned,
+                recorder.counter("crossing_pushes_dropped", Some("fenced")),
+                state.counterparts.repush_paused(record_key),
+            )
+        };
+        assert_eq!(
+            pushed(9, 19 * epoch_ms + 1),
+            (true, 1, false),
+            "a harvested block's Taken is fenced and pauses nothing",
+        );
+        assert_eq!(
+            pushed(4, 19 * epoch_ms),
+            (false, 0, true),
+            "below the frontier the same Taken pauses the record",
+        );
+    }
+
+    /// A `Taken` pushed before its record is carried here is parked, and
+    /// placed again at the commit whose read puts the record up, where it
+    /// pauses the record's re-push.
+    #[test]
+    fn a_taken_pushed_ahead_of_its_records_commit_pauses_it_once_carried() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, claim, cell) = crossing_fixture(0x7C, 1_000, HOME, PEER);
+        let rows = hold(&mut state, &schedule, []);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let took = id
+            .answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+            .to_bytes();
+        let (state_root, proof) = state_and_proof_holding(PEER, &[(claim, took)], &[claim]);
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(9),
+            state_root,
+            ts: now,
+        };
+        let cells = proof
+            .inclusions(state_root, PEER, &[claim])
+            .expect("the fixture proof answers for its key");
+        state.proven_anchors().record(anchor);
+        state.committed_ts = now;
+        state.on_crossing_readings(&schedule, vec![StateClaim::new(anchor, cells, proof)]);
+        assert!(!state.counterparts.repush_paused(record_key));
+        assert!(
+            !state.parked_claims.is_empty(),
+            "the push waits for its record"
+        );
+
+        rows.put(record_key, cell.to_bytes());
+        commit_empty_on(&mut state, &schedule, HOME, 1, now);
+        assert!(
+            state.counterparts.repush_paused(record_key),
+            "the carried record's re-push pauses on the push",
+        );
+        assert!(state.parked_claims.is_empty());
+    }
+
+    /// A `Taken` pushed ahead of its record's commit, at an anchor a
+    /// recovery of its consumer's shard later discards, is held before the
+    /// recovery reaches this validator's schedule. Placed again at the
+    /// commit that carries the record, once the recovery is in the
+    /// schedule, it is fenced as a push arriving then is, and pauses
+    /// nothing.
+    #[test]
+    fn a_taken_held_ahead_of_a_recovery_is_fenced_when_its_record_is_carried() {
+        let epoch_ms = PRODUCTION_EPOCH_MS;
+        let (before, local, recovered) = production_epochs_schedule(false);
+        let (recovering, _, _) = production_epochs_schedule(true);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+        let (record_key, claim, cell) = crossing_fixture(0x7D, 1_000, local, recovered);
+        let rows = hold(&mut state, &before, []);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let took = id
+            .answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+            .to_bytes();
+        let (state_root, proof) = state_and_proof_holding(recovered, &[(claim, took)], &[claim]);
+        let anchor = Anchor {
+            shard: recovered,
+            height: BlockHeight::new(9),
+            state_root,
+            ts: WeightedTimestamp::from_millis(19 * epoch_ms + 1),
+        };
+        let cells = proof
+            .inclusions(state_root, recovered, &[claim])
+            .expect("the fixture proof answers for its key");
+        assert!(!before.recovery_orphaned(recovered, anchor.ts, anchor.height));
+        assert!(recovering.recovery_orphaned(recovered, anchor.ts, anchor.height));
+        state.proven_anchors().record(anchor);
+        state.committed_ts = anchor.ts;
+        state.on_crossing_readings(&before, vec![StateClaim::new(anchor, cells, proof)]);
+        assert!(
+            !state.parked_claims.is_empty(),
+            "the push waits for its record"
+        );
+
+        rows.put(record_key, cell.to_bytes());
+        let recorder = MemoryRecorder::new();
+        let scoped: Arc<dyn MetricsRecorder> = Arc::new(recorder.clone());
+        with_scoped_recorder(scoped, || {
+            commit_empty_on(
+                &mut state,
+                &recovering,
+                local,
+                1,
+                WeightedTimestamp::from_millis(19 * epoch_ms + 1_001),
+            );
+        });
+        assert_eq!(
+            recorder.counter("crossing_pushes_dropped", Some("fenced")),
+            1
+        );
+        assert!(
+            !state.counterparts.repush_paused(record_key),
+            "a fenced Taken pauses nothing",
+        );
+        assert!(state.parked_claims.is_empty());
+    }
+
+    /// A `Taken` pushed ahead of its record's commit is placed again when
+    /// a read of the rows whole puts the record up, as after a trie
+    /// change, and pauses the record's re-push there.
+    #[test]
+    fn a_taken_held_ahead_of_its_record_is_placed_again_on_a_whole_read() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let (record_key, claim, cell) = crossing_fixture(0x7E, 1_000, HOME, PEER);
+        let rows = hold(&mut state, &schedule, []);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let took = id
+            .answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+            .to_bytes();
+        let (state_root, proof) = state_and_proof_holding(PEER, &[(claim, took)], &[claim]);
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(9),
+            state_root,
+            ts: now,
+        };
+        let cells = proof
+            .inclusions(state_root, PEER, &[claim])
+            .expect("the fixture proof answers for its key");
+        state.proven_anchors().record(anchor);
+        state.committed_ts = now;
+        state.on_crossing_readings(&schedule, vec![StateClaim::new(anchor, cells, proof)]);
+        assert!(!state.parked_claims.is_empty());
+
+        rows.put(record_key, cell.to_bytes());
+        let elsewhere = ShardTrie::uniform_from_count(4);
+        let _ = state.counterparts.derive_asks(&elsewhere);
+        assert!(
+            !state.counterparts.repush_paused(record_key),
+            "a read under another trie carries nothing here",
+        );
+        commit_empty_on(&mut state, &schedule, HOME, 1, now);
+        assert!(
+            state.counterparts.repush_paused(record_key),
+            "the whole read under the shard's own trie carries the record and the push \
+             pauses it",
+        );
+        assert!(state.parked_claims.is_empty());
     }
 
     /// While a recovery is pending, the prober asks a counterpart only at
