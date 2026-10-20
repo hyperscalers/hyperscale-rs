@@ -516,18 +516,32 @@ impl MetricsRecorder for MemoryRecorder {
     // A series here holds one label, so the `seated` label a
     // Prometheus series carries is a `_seated` series of its own beside
     // the total.
-    fn record_records_repushed(&self, kind: &str, seated: bool) {
+    fn record_records_repushed(&self, kind: &str, seated: bool, paused: bool) {
         self.inc("records_repushed", Some(kind), 1);
         if seated {
             self.inc("records_repushed_seated", Some(kind), 1);
         }
+        if paused {
+            self.inc("records_repushed_after_a_pause", Some(kind), 1);
+        }
     }
 
-    fn record_repush_due(&self, seated: bool) {
+    fn record_repush_due(&self, seated: bool, paused: bool) {
         self.inc("repush_due", None, 1);
         if seated {
             self.inc("repush_due_seated", None, 1);
         }
+        if paused {
+            self.inc("repush_due_paused", None, 1);
+        }
+    }
+
+    fn record_repush_paused(&self, outcome: &str) {
+        self.inc("repush_paused", Some(outcome), 1);
+    }
+
+    fn record_pushes_placed_on_carry(&self, count: usize) {
+        self.inc("pushes_placed_on_carry", None, count as u64);
     }
 
     fn record_retirement_wait(&self, millis: u64) {

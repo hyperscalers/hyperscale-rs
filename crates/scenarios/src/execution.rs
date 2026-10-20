@@ -1984,6 +1984,85 @@ pub fn a_consumer_never_committing_declines_a_pushed_record<C: FaultableCluster>
     );
 }
 
+/// How many payments [`a_pushed_taken_holds_its_records_repush_past_its_validity_end`]
+/// makes, one every sixth of [`SHORT_VALIDITY`], so their validity ends
+/// fall at more than one phase of the recipient's boundaries.
+const PACED_PAYMENTS: u32 = 6;
+
+/// A record whose consumer takes it is pushed no more once the consumer's
+/// pushed `Taken` reaches its producer, though it falls due before any
+/// boundary of the consumer's retires it.
+///
+/// Each payment is a withdrawal leg escrowing to a bounded deposit, the
+/// core, on the recipient's shard, valid for [`SHORT_VALIDITY`]. The
+/// recipient's shard commits the core well inside the window and pushes
+/// its `Taken` to the payer's shard, which pauses the record's re-push.
+/// The record retires only at a boundary the beacon records for the
+/// recipient's shard after that, once an epoch crossing, so a window
+/// shorter than an epoch has records fall due while paused.
+///
+/// Nothing is lost, so every `Taken` reaches its producer by push, and
+/// one landing on a replica that has not committed its record yet is
+/// held and placed again once it has. The hold is bounded: a replica
+/// holds pushes ahead of their records for eight heights of each
+/// consumer shard, and one lagging its record's commit past that loses
+/// the later pushes and pushes those records again until a boundary
+/// retires them. No replica here lags that far, and every payment
+/// accepts, so no decline needs a record pushed past its validity end:
+/// no record is pushed again. The run prints how many held pushes were
+/// placed again on their record's commit.
+///
+/// # Panics
+///
+/// Panics if a payment does not accept, if a record does not retire, if
+/// no record falls due while paused, or if any record is pushed again.
+pub fn a_pushed_taken_holds_its_records_repush_past_its_validity_end<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+    let spacing = SHORT_VALIDITY / PACED_PAYMENTS;
+    let mut hashes = Vec::new();
+    for _ in 0..PACED_PAYMENTS {
+        let tx =
+            build_bounded_transfer_tx(&payer_key, from, to, BOUNDED_PAYMENT, short_validity(c));
+        hashes.push(charges.submit(c, tx));
+        let next = c.now() + spacing;
+        c.run_until(epochs(1), |c| c.now() >= next);
+    }
+    for hash in hashes {
+        assert_eq!(
+            await_tx_terminal(c, hash, epochs(4)),
+            Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+            "every payment accepts",
+        );
+    }
+    let records = charges.records(c);
+    assert!(
+        c.run_until(epochs(12), |c| records
+            .iter()
+            .all(|record| !stands_at(c, *record))),
+        "every record retires at a boundary of the recipient's shard",
+    );
+    world.assert_settles_within(c, &charges, epochs(4), "paced cross-shard payments");
+    let due = c.metric("repush_due", None);
+    let due_paused = c.metric("repush_due_paused", None);
+    let set = c.metric("repush_paused", Some("set"));
+    assert!(
+        due > 0 && due_paused > 0 && set > 0,
+        "records must fall due while a pushed Taken pauses them to measure anything: \
+         {due} due, {due_paused} of them paused, {set} pauses set",
+    );
+    println!(
+        "paced cross-shard payments: {} held pushes placed again on their record's commit",
+        c.metric("pushes_placed_on_carry", None),
+    );
+    let repushed =
+        c.metric("records_repushed", Some("owed")) + c.metric("records_repushed", Some("escrowed"));
+    assert_eq!(repushed, 0, "a record pushed again past its pushed Taken");
+}
+
 /// How many payments [`more_records_than_the_cap_are_declined_in_turn`]
 /// leaves standing at once: past what one producing shard is held to in
 /// a block of its consumer's.

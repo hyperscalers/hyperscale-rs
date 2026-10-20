@@ -45,6 +45,7 @@ pub use execution::{
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_mass_decline_brings_every_payment_home, a_native_post_quantum_account_pays_its_own_way,
     a_payer_cannot_spend_one_balance_twice, a_published_package_runs_where_it_was_never_committed,
+    a_pushed_taken_holds_its_records_repush_past_its_validity_end,
     a_spent_nullifier_is_swept_once_unreachable, a_wallet_signs_the_ceilings_a_preview_measured,
     abort_converges, attested_load_reaches_the_beacon,
     cross_shard_credit_survives_a_later_local_credit, cross_shard_transfer, deploy_storm_rides_out,

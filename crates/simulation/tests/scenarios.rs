@@ -59,6 +59,7 @@ use hyperscale_scenarios::{
     a_producer_that_read_a_discarded_credit_delivers_it_again,
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
+    a_pushed_taken_holds_its_records_repush_past_its_validity_end,
     a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_recovered_venue_keeps_what_its_sibling_accepted,
@@ -1831,6 +1832,13 @@ fn a_consumer_never_committing_declines_a_pushed_record_sim() {
         &cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(a_consumer_never_committing_declines_a_pushed_record);
+}
+
+#[test]
+fn a_pushed_taken_holds_its_records_repush_past_its_validity_end_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    cluster.run_faultable(a_pushed_taken_holds_its_records_repush_past_its_validity_end);
 }
 
 #[test]
