@@ -56,7 +56,7 @@ use crate::support::tx::{
 };
 use crate::support::wait::{
     await_anchor_seeded, await_crossings_end, await_merge_keeper_count, await_serves,
-    await_split_admitted, await_tx_terminal, measure_blocks_per_epoch,
+    await_split_admitted, await_tx_terminal, epoch_fraction,
 };
 use crate::support::{
     Budget, Cluster, FaultHandle, FaultableCluster, committees_on_separate_hosts, epochs,
@@ -5124,7 +5124,6 @@ pub fn a_train_into_a_splitter_strands_nothing<C: Cluster>(c: &mut C) {
 
     let sent = drive_train(
         c,
-        splitter,
         &setup.legs,
         &mut charges,
         &mut world,
@@ -5171,7 +5170,6 @@ pub fn a_train_into_a_merging_shard_strands_nothing<C: Cluster>(c: &mut C) {
 
     let sent = drive_train(
         c,
-        merging,
         &setup.legs,
         &mut charges,
         &mut world,
@@ -5198,12 +5196,12 @@ fn train_world<C: Cluster>(
     )
 }
 
-/// Send `legs` into `terminating` every few blocks until its reshape has
+/// Send `legs` into the reshaping shard twice an epoch until its reshape has
 /// drained and several more have gone after it, recording the phase each
 /// went in — and sooner than that wherever a phase nothing has covered
 /// opens, so the coverage the train exists for does not turn on the
 /// reshape's timing. `pending` reads whether the reshape is admitted and
-/// pending; `arm` runs once the cadence is measured, before the second
+/// pending; `arm` runs once the first leg is sent, before the second
 /// leg — where a scenario casts the vote that starts its reshape.
 ///
 /// # Panics
@@ -5211,22 +5209,15 @@ fn train_world<C: Cluster>(
 /// Panics if the train ends without a transfer sent in every [`Phase`].
 fn drive_train<C: Cluster>(
     c: &mut C,
-    terminating: ShardId,
     legs: &[(Ed25519PrivateKey, PrincipalAddr, PrincipalAddr)],
     charges: &mut Charges,
     world: &mut World,
     pending: impl Fn(&C) -> bool,
     arm: impl FnOnce(&mut C),
 ) -> Vec<(TxHash, PrincipalAddr, Phase)> {
-    // Block cadence is activity-driven, so the spacing is measured off
-    // the first leg rather than assumed.
     let mut legs = legs.iter();
     let mut sent: Vec<(TxHash, PrincipalAddr, Phase)> = Vec::new();
     let mut admitted_once = false;
-    let height = |c: &C| {
-        c.committed_height(terminating)
-            .map_or(0, BlockHeight::inner)
-    };
     send_leg(
         c,
         legs.next().expect("a funded leg"),
@@ -5236,7 +5227,7 @@ fn drive_train<C: Cluster>(
         &mut admitted_once,
         &pending,
     );
-    let spacing = (measure_blocks_per_epoch(c, terminating) / TRAIN_PER_EPOCH).max(1);
+    let spacing = epoch_fraction(c, TRAIN_PER_EPOCH);
 
     arm(c);
 
@@ -5262,12 +5253,11 @@ fn drive_train<C: Cluster>(
         // leg at all, and the assertion below would fail on the reshape's
         // timing rather than on anything the train measures. So the wait
         // ends early the moment a phase nothing has been sent in opens.
-        let from_height = height(c);
+        let until = c.now() + spacing;
         let covered: Vec<Phase> = sent.iter().map(|(_, _, phase)| *phase).collect();
         let seen_admitted = admitted_once;
         c.run_until(epochs(2), |c| {
-            height(c) >= from_height + spacing
-                || !covered.contains(&phase_of(pending(c), seen_admitted))
+            c.now() >= until || !covered.contains(&phase_of(pending(c), seen_admitted))
         });
     }
     for phase in [Phase::Live, Phase::Departing, Phase::Draining] {
