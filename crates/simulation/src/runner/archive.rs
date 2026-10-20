@@ -4,7 +4,7 @@
 //! A replica keeps its chain only down to its chain floor, so a scenario
 //! asking where a transaction committed hours of simulated time ago asks
 //! a store that has pruned the answer. The archive holds one copy of each
-//! committed block per shard, encoded, taken from whichever replica
+//! committed block per shard, decoded, taken from whichever replica
 //! committed it first and walked often enough that every height is taken
 //! before any replica's floor passes it.
 //!
@@ -19,19 +19,19 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
-use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, ShardId, Verified};
 
 use super::SimulationRunner;
 use crate::NodeIndex;
 
-/// One archived block: its hash, and its encoding.
-type Archived = (BlockHash, Arc<[u8]>);
+/// One archived block, keyed by its hash for the fork check. A block's
+/// sections are shared, so the archive costs little beyond the stores' own
+/// copies, and a chain walk reads blocks without decoding or rehashing them.
+type Archived = (BlockHash, Verified<CertifiedBlock>);
 
-/// One encoded block per committed `(shard, height)`.
+/// One block per committed `(shard, height)`.
 #[derive(Default)]
 pub struct ChainArchive {
     blocks: BTreeMap<ShardId, BTreeMap<BlockHeight, Archived>>,
@@ -109,8 +109,7 @@ impl ChainArchive {
                                  chain floor, and cannot rebuild the block"
                             )
                         });
-                        let bytes = to_vec(&*certified).expect("a committed block encodes");
-                        archived.insert(height, (certified.block().hash(), Arc::from(bytes)));
+                        archived.insert(height, (certified.block().hash(), certified));
                     }
                     height = height.next();
                 }
@@ -169,14 +168,10 @@ impl ArchivedChain<'_> {
     }
 
     /// The block committed at `height`, if archived.
-    ///
-    /// # Panics
-    ///
-    /// If an archived block no longer decodes.
     #[must_use]
     pub fn block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
-        let (_, bytes) = self.blocks?.get(&height)?;
-        let certified: CertifiedBlock = from_slice(bytes).expect("an archived block decodes");
-        Some(Verified::<CertifiedBlock>::from_persisted(certified))
+        self.blocks?
+            .get(&height)
+            .map(|(_, certified)| certified.clone())
     }
 }
