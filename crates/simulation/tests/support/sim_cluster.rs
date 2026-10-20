@@ -24,6 +24,7 @@ use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
     chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
+    retirements_by_holder,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -1130,6 +1131,14 @@ impl Cluster for SimCluster {
 
     fn claims_sections(&self, shard: ShardId, from: BlockHeight) -> Option<Vec<ClaimsSection>> {
         Some(claims_sections(&self.history(shard), from))
+    }
+
+    fn retirements_by_holder(
+        &self,
+        shard: ShardId,
+        from: BlockHeight,
+    ) -> Option<BTreeMap<ShardId, u64>> {
+        Some(retirements_by_holder(&self.history(shard), from))
     }
 }
 

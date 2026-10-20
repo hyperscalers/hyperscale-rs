@@ -404,4 +404,19 @@ pub trait Cluster {
     fn claims_sections(&self, _shard: ShardId, _from: BlockHeight) -> Option<Vec<ClaimsSection>> {
         None
     }
+
+    /// The retirements each block of `shard`'s chain from `from` up read,
+    /// by the shard each was read at, in one walk, or `None` where this
+    /// cluster keeps no chain it walks that way.
+    ///
+    /// An observation seam, like [`Self::claims_sections`]: which
+    /// consumer a producer retired toward is a fact about its blocks
+    /// that no counter summed over replicas and shards reads back.
+    fn retirements_by_holder(
+        &self,
+        _shard: ShardId,
+        _from: BlockHeight,
+    ) -> Option<BTreeMap<ShardId, u64>> {
+        None
+    }
 }

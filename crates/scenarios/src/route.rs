@@ -3321,6 +3321,8 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ),
     ("record_asks", &[None]),
     ("crossing_fallback_asks", &[Some("producer")]),
+    ("records_repushed", &[Some("owed"), Some("escrowed")]),
+    ("repush_due", &[None]),
     ("rebuilt_record_entries", &[None]),
     ("batches_unavailable", &[None]),
     ("early_votes_refused", &[None]),
@@ -3861,31 +3863,49 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
     );
 }
 
-/// How near its cap [`standing_answers_level_off_under_sustained_load`]
-/// reads a lineage as standing at the ceiling: within a sixteenth.
+/// How near its cap a sustained load reads a pair as standing at the
+/// ceiling: within a sixteenth.
 const AT_THE_CEILING: u64 = MAX_STANDING_ANSWERS_FROM_SHARD - MAX_STANDING_ANSWERS_FROM_SHARD / 16;
 
-/// How many epochs [`standing_answers_level_off_under_sustained_load`]
-/// holds its load once a lineage stands at the ceiling.
+/// How many epochs a sustained load holds its load once its pairs stand
+/// at the ceiling.
 const LEVEL_OFF_EPOCHS: u32 = 8;
+
+/// How many epochs past the last offer a sustained load waits for every
+/// load shard to stand no answer.
+const ANSWER_DRAIN_EPOCHS: u32 = 12;
 
 /// How long past a route's validity a load waits for the venue chains
 /// to show it before it reads the route as one the pool held past its
 /// window: the chains it walks may trail their tips.
 const LAPSE_SLACK: Duration = Duration::from_secs(30);
 
+/// What a load shard stands toward a lineage: a consumer shard and the
+/// lineage of the producers it holds answers from.
+type StandingPair = (ShardId, ShardId);
+
 /// A consumer's standing answers level off at the cap under a load
 /// that would carry them past it.
 ///
 /// [`core_routes_under_load`]'s routes are offered until some lineage of
 /// some load shard stands within a sixteenth of
-/// [`MAX_STANDING_ANSWERS_FROM_SHARD`], then for [`LEVEL_OFF_EPOCHS`]
+/// [`MAX_STANDING_ANSWERS_FROM_SHARD`], then for `LEVEL_OFF_EPOCHS`
 /// epochs more. `load.duration` bounds the wait for the ceiling. A route
 /// the cap keeps in its pool past its window lapses there, and its pair
 /// takes the next. At every reading, through the offering and the
 /// drain, every load shard stands within the cap on every lineage and
-/// in total. Once the routes still out settle, both sides of the pair
-/// are conserved and every route is decided or lapsed.
+/// in total.
+///
+/// At the held window's end the run prints the retirements a second the
+/// pair at the ceiling read over the window, counted on its lineage's
+/// chain, and what the claims sections spent on boundary claims and on
+/// the rest. It then prints, over the whole run so far, how long answers
+/// stood, how long records waited from their re-push due instant to
+/// their retirement, the records consumers waited on and the re-pushes.
+/// Once the routes still out settle, the run goes on until no load shard
+/// stands an answer, within `ANSWER_DRAIN_EPOCHS` epochs of the last
+/// offer, and prints how long that took; then both sides of the pair are
+/// conserved and every route is decided or lapsed.
 ///
 /// Requires a grown four-shard cluster over
 /// [`core_load_genesis_accounts`] of `load.traders`, one that walks its
@@ -3894,13 +3914,15 @@ const LAPSE_SLACK: Duration = Duration::from_secs(30);
 /// # Panics
 ///
 /// Panics if a venue misses its budget standing up, a cap is passed at
-/// any reading, no lineage reaches the ceiling within `load.duration`,
-/// either side of the pair is not conserved, or a route is still out
-/// once its window and the drain have passed.
+/// any reading, no lineage reaches the ceiling within `load.duration`, a
+/// load shard still stands an answer `ANSWER_DRAIN_EPOCHS` epochs past
+/// the last offer, either side of the pair is not conserved, or a route
+/// is still out once its window and the drain have passed.
 pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
     c: &mut C,
     load: CoreLoad,
 ) {
+    let label = "standing answers level off";
     let cast = LoadCast::stand_up(c, load);
     let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
     let units = cast.world(c, cast.firsts[0].unit);
@@ -3910,47 +3932,56 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
     let opened_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard).next());
     let opened = c.now();
     let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
-    let mut ceiling_at: Option<Duration> = None;
-    let mut held_low = u64::MAX;
+    let mut held: Option<HeldWindow> = None;
     loop {
         cast.offer(c, load, &mut flight);
         flight.tick(c, "offering");
         flight.lapse(c);
-        let highest = highest_within_the_answer_caps(c);
-        match ceiling_at {
-            Some(at) => {
-                held_low = held_low.min(highest);
-                if c.now() >= at + epoch * LEVEL_OFF_EPOCHS {
+        let standing = standing_within_the_answer_caps(c);
+        match &mut held {
+            Some(window) => {
+                window.low = window
+                    .low
+                    .min(standing.get(&window.pair).copied().unwrap_or(0));
+                if c.now() >= window.at + epoch * LEVEL_OFF_EPOCHS {
                     break;
                 }
             }
-            None if highest >= AT_THE_CEILING => {
-                println!(
-                    "standing answers at the ceiling at {:?}: {highest}",
-                    c.now()
-                );
-                ceiling_at = Some(c.now());
-            }
-            None => assert!(
-                c.now() < opened + load.duration,
-                "no lineage reached the ceiling within {:?}; the highest stands at {highest}",
-                load.duration,
-            ),
+            None => match standing.iter().max_by_key(|(_, count)| **count) {
+                Some((pair, count)) if *count >= AT_THE_CEILING => {
+                    held = Some(HeldWindow::open(c, label, *pair, *count));
+                }
+                _ => assert!(
+                    c.now() < opened + load.duration,
+                    "no pair reached the ceiling within {:?}; the highest stands at {}",
+                    load.duration,
+                    standing.values().max().copied().unwrap_or(0),
+                ),
+            },
         }
     }
+    let window = held.expect("the loop ends only on a held window");
+    let (consumer, lineage) = window.pair;
     println!(
-        "standing answers held {LEVEL_OFF_EPOCHS} epochs at the ceiling, the highest lineage \
-         never below {held_low}; {} routes lapsed in the pool",
-        flight.lapsed,
+        "{label}: standing answers held {LEVEL_OFF_EPOCHS} epochs at the ceiling, \
+         {consumer:?} toward lineage {lineage:?} never below {}; {} routes lapsed in the pool",
+        window.low, flight.lapsed,
     );
+    window.report(c, label);
+    report_retirement_figures(c, label);
     let closed = c.now();
     while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
         flight.tick(c, "draining");
         flight.lapse(c);
-        highest_within_the_answer_caps(c);
+        standing_within_the_answer_caps(c);
     }
+    drain_standing_answers(c, closed + epoch * ANSWER_DRAIN_EPOCHS, label);
+    println!(
+        "{label}: no load shard stands an answer {:?} past the last offer",
+        c.now().saturating_sub(closed),
+    );
     let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
-    highest_within_the_answer_caps(c);
+    standing_within_the_answer_caps(c);
     for (side, before, held, burned) in conserved {
         assert_eq!(
             held + burned,
@@ -3967,29 +3998,186 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
     );
 }
 
-/// The most any lineage stands at on any of [`LOAD_SHARDS`], asserting
+/// Run the cluster on until no load shard stands an answer.
+///
+/// # Panics
+///
+/// If one still stands one at `by`.
+fn drain_standing_answers<C: FaultableCluster>(c: &mut C, by: Duration, label: &str) {
+    loop {
+        let standing: u64 = standing_within_the_answer_caps(c).values().sum();
+        if standing == 0 {
+            return;
+        }
+        assert!(
+            c.now() < by,
+            "{label}: the load shards still stand {standing} answers {ANSWER_DRAIN_EPOCHS} \
+             epochs past the last offer",
+        );
+        let next = c.now() + Duration::from_secs(5);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+    }
+}
+
+/// The window a sustained load holds at the ceiling, from the instant
+/// its pair first stood there.
+struct HeldWindow {
+    /// When the pair first stood at the ceiling.
+    at: Duration,
+    /// The pair at the ceiling.
+    pair: StandingPair,
+    /// The first height of the pair's lineage's chain in the window.
+    from: BlockHeight,
+    /// The least the pair stood at over the window.
+    low: u64,
+    /// The claims bytes as the window opened.
+    bytes: ClaimBytes,
+}
+
+impl HeldWindow {
+    /// Open the window now on `pair`, standing `count` answers, and say
+    /// so.
+    fn open<C: FaultableCluster>(c: &C, label: &str, pair: StandingPair, count: u64) -> Self {
+        let (consumer, lineage) = pair;
+        println!(
+            "{label}: standing answers at the ceiling at {:?}: {count} toward lineage \
+             {lineage:?} on {consumer:?}",
+            c.now(),
+        );
+        Self {
+            at: c.now(),
+            pair,
+            from: c
+                .committed_height(lineage)
+                .unwrap_or(BlockHeight::GENESIS)
+                .next(),
+            low: u64::MAX,
+            bytes: ClaimBytes::read(c),
+        }
+    }
+
+    /// Print the retirements a second the pair's consumer read on its
+    /// lineage's chain over the window, and what the claims sections
+    /// spent.
+    fn report<C: FaultableCluster>(&self, c: &C, label: &str) {
+        let (consumer, lineage) = self.pair;
+        let held = c.now().saturating_sub(self.at);
+        let held_ms = u64::try_from(held.as_millis()).unwrap_or(u64::MAX);
+        let retired = c
+            .retirements_by_holder(lineage, self.from)
+            .expect("a load runs on a cluster that walks its shards' chains")
+            .get(&consumer)
+            .copied()
+            .unwrap_or(0);
+        println!(
+            "{label} [retirements over the held {held:?}, read on lineage {lineage:?}'s \
+             chain]: toward {consumer:?} {retired}, {} a second",
+            mean(retired.saturating_mul(1_000), held_ms),
+        );
+        ClaimBytes::read(c).report(&self.bytes, label);
+    }
+}
+
+/// What the state claims of every replica's committed blocks weighed,
+/// as it stood at one instant: the boundary claims' bytes, every state
+/// claim's bytes that is no verdict claim, and the blocks weighed.
+#[derive(Debug, Clone, Copy)]
+struct ClaimBytes {
+    boundary: u64,
+    claims: u64,
+    blocks: u64,
+}
+
+impl ClaimBytes {
+    fn read(c: &impl FaultableCluster) -> Self {
+        Self {
+            boundary: c.metric("boundary_claim_bytes", None),
+            claims: c.metric("state_claims_bytes", None),
+            blocks: c.metric_count("state_claims_weight", None),
+        }
+    }
+
+    /// Print what the claims spent since `earlier`: the boundary claims'
+    /// share of the bytes, and the bytes a block of the fresh claims and
+    /// parent readings that are the rest.
+    fn report(&self, earlier: &Self, label: &str) {
+        let boundary = self.boundary.saturating_sub(earlier.boundary);
+        let claims = self.claims.saturating_sub(earlier.claims);
+        let blocks = self.blocks.saturating_sub(earlier.blocks);
+        println!(
+            "{label} [claims over the held window, every replica's commits on every shard]: \
+             boundary claim bytes {boundary} of {claims}, {}; fresh claim bytes a block {} \
+             over {blocks} commits",
+            percent(boundary, claims),
+            mean(claims.saturating_sub(boundary), blocks),
+        );
+    }
+}
+
+/// Print, over the whole run, how long answers stood by kind, how long
+/// records waited from their re-push due instant to their retirement,
+/// the records consumers waited on with no arrival, and the re-pushes.
+fn report_retirement_figures<C: FaultableCluster>(c: &C, label: &str) {
+    let at = |metric, kind, q| {
+        c.metric_quantile_above(metric, kind, q, f64::NEG_INFINITY)
+            .unwrap_or(0.0)
+    };
+    for kind in ["taken", "never"] {
+        println!(
+            "{label} [{kind} answer life, every replica, committed clock from the read first \
+             putting an answer to the read finding it gone, each quantile the upper edge of \
+             its bucket]: {} answers, p50 {:.0}ms, p99 {:.0}ms, max {:.0}ms",
+            c.metric_count("answer_life_ms", Some(kind)),
+            at("answer_life_ms", Some(kind), 0.5),
+            at("answer_life_ms", Some(kind), 0.99),
+            at("answer_life_ms", Some(kind), 1.0),
+        );
+    }
+    println!(
+        "{label} [retirement wait, every replica, committed clock from a record's re-push due \
+         instant to its retirement]: {} retirements, p50 {:.0}ms, max {:.0}ms",
+        c.metric_count("retirement_wait_ms", None),
+        at("retirement_wait_ms", None, 0.5),
+        at("retirement_wait_ms", None, 1.0),
+    );
+    println!(
+        "{label} [wanted records, every replica at each commit]: p50 {:.0}, p99 {:.0}, max {:.0}",
+        at("wanted_records", None, 0.5),
+        at("wanted_records", None, 0.99),
+        at("wanted_records", None, 1.0),
+    );
+    println!(
+        "{label} [re-pushes, per proposing replica]: owed {}, escrowed {}; records first found \
+         due {}",
+        c.metric("records_repushed", Some("owed")),
+        c.metric("records_repushed", Some("escrowed")),
+        c.metric("repush_due", None),
+    );
+}
+
+/// What each of [`LOAD_SHARDS`] stands toward each lineage, asserting
 /// each shard stands within the cap on every lineage and in total.
-fn highest_within_the_answer_caps<C: Cluster>(c: &C) -> u64 {
+fn standing_within_the_answer_caps<C: Cluster>(c: &C) -> BTreeMap<StandingPair, u64> {
     let trie = ShardTrie::uniform_from_count(4);
-    let mut highest = 0;
+    let mut standing = BTreeMap::new();
     for (name, shard) in LOAD_SHARDS {
-        let standing = c
+        let answers = c
             .standing_answers(shard)
             .expect("the harness reads a load shard's standing answers");
         assert!(
-            standing.total() <= MAX_STANDING_ANSWERS,
+            answers.total() <= MAX_STANDING_ANSWERS,
             "the {name} stands {}, past the total cap",
-            standing.total(),
+            answers.total(),
         );
-        for (lineage, count) in standing.per_lineage(&trie) {
+        for (lineage, count) in answers.per_lineage(&trie) {
             assert!(
                 count <= MAX_STANDING_ANSWERS_FROM_SHARD,
                 "the {name} stands {count} toward lineage {lineage:?}, past its cap",
             );
-            highest = highest.max(count);
+            standing.insert((shard, lineage), count);
         }
     }
-    highest
+    standing
 }
 
 /// Everything one run of [`core_routes_under_load`] is reported from.
@@ -4300,6 +4488,8 @@ impl CoreLoadRun<'_> {
                 "crossing_pushes_dropped",
                 "record_asks",
                 "crossing_fallback_asks",
+                "records_repushed",
+                "repush_due",
                 "rebuilt_record_entries",
             ],
         );
