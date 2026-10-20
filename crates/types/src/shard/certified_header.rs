@@ -5,7 +5,8 @@
 //! ([`impl Verified<CertifiedBlockHeader>::from_qc_attestation`] — the
 //! light-client trust path for remote-shard headers).
 
-use hyperscale_hbor::{Hbor, to_vec};
+use blake3::Hasher as Blake3;
+use hyperscale_hbor::{DEFAULT_MAX_DEPTH, Encoder, Hbor, HborEncode, Sink};
 use thiserror::Error;
 
 use crate::{
@@ -95,19 +96,44 @@ impl CertifiedBlockHeader {
     }
 
     /// A digest naming this exact copy: the header by its cached hash, and
-    /// the QC by its encoding. Copies differing in any byte differ here.
+    /// the QC by its encoding, streamed into the hash. Copies differing in
+    /// any byte differ here.
     ///
     /// # Panics
     ///
     /// If the QC does not encode; every QC that decoded or formed does.
     #[must_use]
     pub fn copy_digest(&self) -> Hash {
-        let qc = to_vec(self.qc()).expect("a QC encodes");
-        Hash::from_parts(&[
-            b"hyperscale.verdict.header-copy",
-            self.header.hash().as_bytes(),
-            &qc,
-        ])
+        let mut hasher = Blake3::new();
+        hasher.update(b"hyperscale.verdict.header-copy");
+        hasher.update(self.header.hash().as_bytes());
+        self.qc()
+            .encode(&mut Encoder::new(
+                HashSink {
+                    hasher: &mut hasher,
+                    written: 0,
+                },
+                DEFAULT_MAX_DEPTH,
+            ))
+            .expect("a QC encodes");
+        Hash::from_hash_bytes(hasher.finalize().as_bytes())
+    }
+}
+
+/// An encoding sink that feeds a hash rather than a buffer.
+struct HashSink<'a> {
+    hasher: &'a mut Blake3,
+    written: usize,
+}
+
+impl Sink for HashSink<'_> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.written += bytes.len();
+    }
+
+    fn written(&self) -> usize {
+        self.written
     }
 }
 
