@@ -875,36 +875,20 @@ pub struct VenueReport {
     /// The median swap's time from the queue opening to its own
     /// settlement.
     pub(crate) latency_p50: Duration,
-    /// Blocks the venue's own shard committed across the same span.
+    /// The venue chain's committed clock across the same span: from
+    /// its tip when the queue opened to its tip once the last swap
+    /// settled.
     ///
-    /// The resolution the clock readings do not have. A harness samples
+    /// The resolution the harness clock does not have. A harness samples
     /// its predicate once a second, so a queue that drains in six or
     /// eight of them is measured in a handful of steps and a bar loose
     /// enough to survive the two epoch clocks is loose enough to admit
-    /// the regression it exists to catch. The venue's chain commits many
-    /// times a second and its height is exact.
-    pub blocks: u64,
-    /// Blocks the venue's shard committed across [`IDLE_SPAN`] with
-    /// nothing queued, just before the queue opened: its own pace.
-    pub idle_blocks: u64,
-}
-
-/// How long the venue's shard is watched idle before its queue opens.
-const IDLE_SPAN: Duration = Duration::from_secs(10);
-
-impl VenueReport {
-    /// What the queue took in thousandths of the venue's idle pace.
-    ///
-    /// The shards of one world commit at their own pace whatever their
-    /// load — forty blocks in ten idle seconds on one, seventy on
-    /// another — so a raw block count says as much about which shard
-    /// the venue landed on as about the queue. Divided by the shard's
-    /// own idle count it keeps the chain's resolution and loses its
-    /// pace.
-    #[must_use]
-    pub fn paced(&self) -> u64 {
-        self.blocks * 1_000 / self.idle_blocks.max(1)
-    }
+    /// the regression it exists to catch. The chain's clock is its
+    /// quorum's, read off the blocks themselves. A block count is not:
+    /// a shard with content to carry commits at network speed and an
+    /// idle one at its heartbeat, so the count measures how busy the
+    /// venue was as much as how long it took.
+    pub chain_span: Duration,
 }
 
 /// Stand a venue up and drive every swapper at it at once.
@@ -946,19 +930,12 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
     let worlds = venue_worlds(c, &venue, swappers.iter().map(|(_, account)| *account));
     let mut charges = Charges::default();
 
-    let idle_from = c.now();
-    let idle_opened = c
-        .committed_height(venue_shard)
-        .expect("the venue's shard commits")
-        .inner();
-    let _ = c.run_until(budget, |c| c.now() >= idle_from + IDLE_SPAN);
     // Every swapper at once: the venue's cells are what they contend
     // for, so what the run measures is how fast that queue drains.
     let start = c.now();
     let opened = c
         .committed_height(venue_shard)
-        .expect("the venue's shard commits")
-        .inner();
+        .expect("the venue's shard commits");
     let mut submissions: Vec<TxHash> = Vec::with_capacity(swappers.len());
     for (key, account) in &swappers {
         let tx = build_swap_tx(
@@ -973,10 +950,7 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
         submissions.push(charges.submit(c, tx));
     }
 
-    let report = VenueReport {
-        idle_blocks: opened.saturating_sub(idle_opened),
-        ..settle_swaps(c, &submissions, (start, opened), venue_shard, budget)
-    };
+    let report = settle_swaps(c, &submissions, (start, opened), venue_shard, budget);
     assert_pair_conserved(c, &worlds, &charges, budget, "a hot venue's queue");
     report
 }
@@ -986,7 +960,7 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
 fn settle_swaps<C: Cluster>(
     c: &mut C,
     submissions: &[TxHash],
-    (start, opened): (Duration, u64),
+    (start, opened): (Duration, BlockHeight),
     venue_shard: ShardId,
     budget: Budget,
 ) -> VenueReport {
@@ -1024,14 +998,16 @@ fn settle_swaps<C: Cluster>(
     let last = settled.values().max().copied().unwrap_or(start);
     let closed = c
         .committed_height(venue_shard)
-        .expect("the venue's shard commits")
-        .inner();
+        .expect("the venue's shard commits");
+    let clock = |height| {
+        c.committed_clock(venue_shard, height)
+            .expect("the venue's committed blocks are held")
+    };
     VenueReport {
         submitted: submissions.len(),
         elapsed: last.saturating_sub(start),
         latency_p50: latencies[latencies.len() / 2],
-        blocks: closed.saturating_sub(opened),
-        idle_blocks: 0,
+        chain_span: clock(closed).elapsed_since(clock(opened)),
     }
 }
 

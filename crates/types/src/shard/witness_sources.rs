@@ -91,6 +91,13 @@ impl WitnessSources {
         self.reshape_trigger
     }
 
+    /// Whether the block says anything to the beacon beyond its reveal:
+    /// a ready signal or a reshape assertion.
+    #[must_use]
+    pub fn carries_content(&self) -> bool {
+        !self.ready_signals.is_empty() || self.reshape_trigger.is_some()
+    }
+
     /// The proposer's randomness reveal.
     #[must_use]
     pub const fn randomness_reveal(&self) -> &VrfProof {

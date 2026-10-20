@@ -102,6 +102,22 @@ impl QueuedProvisionBuffer {
             .collect()
     }
 
+    /// The earliest instant strictly after `now` at which a dwelling
+    /// entry becomes eligible, skipping entries past their deadline at
+    /// `weighted_now`. `None` when no live entry dwells.
+    pub(crate) fn next_eligible_at(
+        &self,
+        now: LocalTimestamp,
+        weighted_now: WeightedTimestamp,
+    ) -> Option<LocalTimestamp> {
+        self.queue
+            .iter()
+            .filter(|q| q.provisions.deadline(q.source_block_ts) > weighted_now)
+            .map(|q| q.added_at.plus(self.min_dwell_time))
+            .filter(|eligible_at| *eligible_at > now)
+            .min()
+    }
+
     pub(crate) const fn queue_len(&self) -> usize {
         self.queue.len()
     }
@@ -164,6 +180,32 @@ mod tests {
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
         assert!(buf.queued(local(100), ts(1_000)).is_empty());
         assert_eq!(buf.queued(local(500), ts(1_000)).len(), 1);
+    }
+
+    #[test]
+    fn next_eligible_at_is_the_earliest_live_dwell_end() {
+        let mut buf = QueuedProvisionBuffer::new(Duration::from_millis(500));
+        assert_eq!(buf.next_eligible_at(local(0), ts(1_000)), None);
+
+        let early = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
+        let late = make_provisions(2, ShardId::leaf(1, 1), BlockHeight::new(11));
+        buf.enqueue(Arc::clone(&early), ts(1_000), local(100));
+        buf.enqueue(Arc::clone(&late), ts(2_000), local(300));
+        assert_eq!(
+            buf.next_eligible_at(local(200), ts(1_000)),
+            Some(local(600))
+        );
+        assert_eq!(
+            buf.next_eligible_at(local(600), ts(1_000)),
+            Some(local(800)),
+            "strictly after now"
+        );
+        assert_eq!(buf.next_eligible_at(local(800), ts(1_000)), None);
+
+        // Past its deadline, the early batch wakes nothing.
+        let expired = early.deadline(ts(1_000));
+        assert!(expired < late.deadline(ts(2_000)));
+        assert_eq!(buf.next_eligible_at(local(200), expired), Some(local(800)));
     }
 
     #[test]

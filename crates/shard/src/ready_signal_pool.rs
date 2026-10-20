@@ -93,12 +93,15 @@ impl ReadySignalPool {
     /// sig over the signal's own signing bytes) before
     /// calling — the pool trusts what it's given and only enforces
     /// pool-shape invariants.
-    pub fn admit(&mut self, signal: ReadySignal, received_at: LocalTimestamp) {
+    ///
+    /// Returns whether the pool changed: `false` for a repeat of the
+    /// window already held.
+    pub fn admit(&mut self, signal: ReadySignal, received_at: LocalTimestamp) -> bool {
         if let Some(existing) = self.pending.get(&signal.validator_id())
             && existing.signal.wt_window_start() == signal.wt_window_start()
             && existing.signal.wt_window_end() == signal.wt_window_end()
         {
-            return;
+            return false;
         }
         self.pending.insert(
             signal.validator_id(),
@@ -107,6 +110,7 @@ impl ReadySignalPool {
                 received_at,
             },
         );
+        true
     }
 
     /// Drop entries whose window-end has passed `committed_wt`.
@@ -170,6 +174,44 @@ impl ReadySignalPool {
             self.pending.remove(&id);
         }
         drained
+    }
+
+    /// Whether [`Self::drain_eligible`] at `proposal_wt` and `now` would
+    /// yield a signal `held` does not already account for. Drains
+    /// nothing.
+    pub fn has_eligible(
+        &self,
+        proposal_wt: WeightedTimestamp,
+        now: LocalTimestamp,
+        held: impl Fn(&ReadySignal) -> bool,
+    ) -> bool {
+        self.pending.values().any(|entry| {
+            now.saturating_sub(entry.received_at) >= MIN_READY_SIGNAL_DWELL
+                && Self::window_covers(&entry.signal, proposal_wt)
+                && !held(&entry.signal)
+        })
+    }
+
+    /// The earliest instant strictly after `now` at which a signal still
+    /// dwelling becomes eligible at `proposal_wt`, among those whose
+    /// window covers it and that `held` does not already account for.
+    /// `None` when no such signal dwells.
+    pub fn next_eligible_at(
+        &self,
+        proposal_wt: WeightedTimestamp,
+        now: LocalTimestamp,
+        held: impl Fn(&ReadySignal) -> bool,
+    ) -> Option<LocalTimestamp> {
+        self.pending
+            .values()
+            .filter(|entry| Self::window_covers(&entry.signal, proposal_wt) && !held(&entry.signal))
+            .map(|entry| entry.received_at.plus(MIN_READY_SIGNAL_DWELL))
+            .filter(|eligible_at| *eligible_at > now)
+            .min()
+    }
+
+    fn window_covers(signal: &ReadySignal, proposal_wt: WeightedTimestamp) -> bool {
+        signal.wt_window_start() <= proposal_wt && proposal_wt <= signal.wt_window_end()
     }
 
     /// Read-only iterator over the pool's current entries. Order is
@@ -338,5 +380,58 @@ mod tests {
         let drained = pool.drain_eligible(wt(10), ts(500), DWELL, 3);
         assert_eq!(drained.len(), 3);
         assert_eq!(pool.len(), 2, "remainder stays for a future proposal");
+    }
+
+    #[test]
+    fn has_eligible_peeks_what_a_drain_would_take() {
+        let mut pool = ReadySignalPool::new();
+        pool.admit(signal(1, 100, 1_000), ts(0));
+        let none_held = |_: &ReadySignal| false;
+        assert!(
+            !pool.has_eligible(wt(500), ts(100), none_held),
+            "still dwelling"
+        );
+        assert!(pool.has_eligible(wt(500), ts(150), none_held));
+        assert!(
+            !pool.has_eligible(wt(50), ts(150), none_held),
+            "window not open"
+        );
+        assert!(
+            !pool.has_eligible(wt(500), ts(150), |_| true),
+            "already held"
+        );
+        assert_eq!(pool.len(), 1, "nothing drained");
+    }
+
+    #[test]
+    fn next_eligible_at_is_the_earliest_dwell_end_in_an_open_window() {
+        let mut pool = ReadySignalPool::new();
+        let none_held = |_: &ReadySignal| false;
+        assert_eq!(pool.next_eligible_at(wt(500), ts(0), none_held), None);
+
+        pool.admit(signal(1, 100, 1_000), ts(0));
+        pool.admit(signal(2, 100, 1_000), ts(40));
+        pool.admit(signal(3, 600, 1_000), ts(0));
+        assert_eq!(
+            pool.next_eligible_at(wt(500), ts(10), none_held),
+            Some(ts(150))
+        );
+        assert_eq!(
+            pool.next_eligible_at(wt(500), ts(150), none_held),
+            Some(ts(190)),
+            "strictly after now"
+        );
+        assert_eq!(pool.next_eligible_at(wt(500), ts(190), none_held), None);
+        assert_eq!(
+            pool.next_eligible_at(wt(500), ts(10), |signal| signal.validator_id()
+                == ValidatorId::new(1)),
+            Some(ts(190)),
+            "a signal the window holds arms nothing"
+        );
+        assert_eq!(
+            pool.next_eligible_at(wt(50), ts(10), none_held),
+            None,
+            "a window not yet open arms nothing"
+        );
     }
 }

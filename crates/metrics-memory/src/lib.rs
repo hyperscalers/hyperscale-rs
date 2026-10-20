@@ -516,6 +516,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc(name, Some(reading), 1);
     }
 
+    fn record_eager_proposal(&self, reason: &str) {
+        self.inc("eager_proposals", Some(reason), 1);
+    }
+
     fn record_crossing_push_dropped(&self, reason: &str) {
         self.inc("crossing_pushes_dropped", None, 1);
         self.inc("crossing_pushes_dropped", Some(reason), 1);

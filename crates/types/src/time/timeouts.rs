@@ -184,6 +184,14 @@ pub const VIEW_CHANGE_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 /// is at most two delays; six is a threefold margin over that.
 pub const VIEW_CHANGE_DELAY_MULTIPLIER: u32 = 6;
 
+/// How long a leader with nothing to carry holds an empty block.
+///
+/// The hold applies only in the first round after the leader's high QC,
+/// and every follower adds this to that round's timer, so the wait never
+/// reads as a silent leader. It is protocol rather than local because the
+/// allowance must agree on every replica that adopted the QC.
+pub const IDLE_PROPOSAL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Round timer bases per progress wait: the ceiling on view-change
 /// suppression while a block is in progress at the proposal tip.
 ///

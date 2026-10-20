@@ -19,9 +19,9 @@ use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
     ExecutionOutcome, Inclusion, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK,
     PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim,
-    StateRoot, SubstateKey, TickLine, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
-    verdict_leaf,
+    StateRoot, SubstateKey, TickLine, TimestampRange, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window,
+    sweep_admits_block, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms,
@@ -1071,6 +1071,21 @@ pub(crate) fn beacon_epoch<C: Cluster>(c: &C) -> Option<Epoch> {
 #[must_use]
 pub(crate) fn clock<C: Cluster + ?Sized>(c: &C) -> WeightedTimestamp {
     WeightedTimestamp::ZERO.plus(c.now())
+}
+
+/// Whether `shard`'s chain has committed past `validity`: its tip
+/// anchors at or after the window's end, so every block it commits from
+/// here judges the window by a clock past it. A chain's clock trails the
+/// cluster's by what its quorum has yet to certify.
+#[must_use]
+pub(crate) fn committed_past_validity<C: Cluster + ?Sized>(
+    c: &C,
+    shard: ShardId,
+    validity: &TimestampRange,
+) -> bool {
+    c.committed_height(shard)
+        .and_then(|height| c.committed_clock(shard, height))
+        .is_some_and(|at| at >= validity.end_timestamp_exclusive)
 }
 
 /// Whether the beacon has admitted a split for `parent` — a pending `Split`

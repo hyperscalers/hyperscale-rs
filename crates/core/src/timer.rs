@@ -10,10 +10,11 @@ pub enum TimerId {
     ViewChange,
     /// Periodic cleanup timer. Shard-scoped.
     Cleanup,
-    /// Proposal pace of a one-member committee — one-shot, armed when the
-    /// member's own vote forms a QC, so the next block waits rather than
-    /// following at once. Shard-scoped.
-    SoloProposal,
+    /// A leader's proposal pace — one-shot, armed when a quorum seated on
+    /// this host alone forms a QC, so the next block waits rather than
+    /// following at once, and while an empty block is held, for when the
+    /// hold ends or withheld content's dwell does. Shard-scoped.
+    ProposalPace,
     /// Gossip grace for a proposal a vote named and this replica never
     /// received — one-shot, armed when the vote arrives; on fire, the
     /// proposals still missing are fetched. Shard-scoped.

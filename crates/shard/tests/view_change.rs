@@ -8,8 +8,8 @@ use std::time::Duration;
 use common::{HoldFilter, ShardCoordinatorSim, perturb_header_timestamp};
 use hyperscale_types::{
     AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, Hash,
-    ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, VIEW_CHANGE_TIMEOUT_DEFAULT,
-    ValidatorId, WeightedTimestamp,
+    IDLE_PROPOSAL_INTERVAL, ProposerTimestamp, QuorumCertificate, Round, SignerBitfield,
+    VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, WeightedTimestamp,
 };
 
 const MAX_STEPS: usize = 5_000;
@@ -424,10 +424,11 @@ fn backoff_doubles_timeout_per_consecutive_view_change() {
         sim.hold_matching(ValidatorId::new(idx as u64), HoldFilter::AnyHeader);
     }
     // `initialize_genesis` records last_leader_activity at now=0;
-    // r=1 (genesis QC round 0 + 1), no commits.
+    // r=1 (genesis QC round 0 + 1), no commits. The round after the high
+    // QC carries the idle allowance; the rounds timeouts open do not.
     assert_eq!(
         sim.coordinators[0].current_view_change_timeout(),
-        VIEW_CHANGE_TIMEOUT_DEFAULT
+        VIEW_CHANGE_TIMEOUT_DEFAULT + IDLE_PROPOSAL_INTERVAL
     );
 
     for k in 1u32..=3 {

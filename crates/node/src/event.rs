@@ -508,7 +508,7 @@ impl ShardScopedInput {
             Self::Protocol(event) => match event.as_ref() {
                 ProtocolEvent::ViewChangeTimer
                 | ProtocolEvent::CleanupTimer
-                | ProtocolEvent::SoloProposalTimer
+                | ProtocolEvent::ProposalPaceTimer
                 | ProtocolEvent::ProposalFetchTimer => EventPriority::Timer,
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }

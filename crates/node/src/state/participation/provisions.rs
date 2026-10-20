@@ -41,8 +41,11 @@ impl ShardParticipation {
                         !fenced
                     })
                     .collect();
-                self.execution_coordinator
-                    .on_crossing_readings(sched, claims)
+                let actions = self
+                    .execution_coordinator
+                    .on_crossing_readings(sched, claims);
+                self.shard_coordinator.queue_ready_proposal();
+                actions
             }
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 // A verified bundle is engagement evidence: promote any

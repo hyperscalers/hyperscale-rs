@@ -163,10 +163,14 @@ use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::{RowState, ShardChainReader};
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
-    BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
-    ShardId, Timeout, TransactionDecision, TxHash, VIEW_CHANGE_TIMEOUT_DEFAULT,
-    VIEW_CHANGE_TIMEOUT_MIN, ValidatorId, WeightedTimestamp,
+    BlockHash, BlockHeight, IDLE_PROPOSAL_INTERVAL, NetworkDefinition, PrincipalAddr,
+    RecoveryCause, Round, ShardForkProof, ShardId, Timeout, TransactionDecision, TxHash,
+    VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId, WeightedTimestamp,
 };
+#[cfg(feature = "production-epochs")]
+use hyperscale_types::{JailReason, MISSED_PROPOSAL_JAIL_SHARE_BPS, ValidatorStatus};
+#[cfg(feature = "production-epochs")]
+use support::sim_seed;
 use support::{SEED_VAR, SimCluster, seeded};
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
@@ -405,6 +409,191 @@ seeded!(
     seed_1337 = 1337,
     seed_2026 = 2026,
 );
+
+/// Why a leader proposed at once, by the label each reason counts under.
+const EAGER_REASONS: [&str; 8] = [
+    "round",
+    "unresolved",
+    "content",
+    "two_chain",
+    "watermark",
+    "epoch",
+    "offered",
+    "walk",
+];
+
+/// The beacon's committed epoch.
+fn beacon_epoch_of(cluster: &SimCluster) -> u64 {
+    cluster
+        .beacon_state()
+        .map_or(0, |state| state.current_epoch.inner())
+}
+
+/// A shard with nothing to carry commits at its heartbeat: one block per
+/// idle interval and two delays, plus the few each epoch crossing keeps
+/// eager. Every block it proposes at once is the crossing's or its
+/// genesis's.
+#[test]
+fn an_idle_shard_commits_at_its_heartbeat_sim() {
+    let config = liveness_config();
+    let mut cluster = SimCluster::new(&config, 11);
+    cluster.run_faultable(|c| {
+        // Past the first fold, so the chain's entry is behind the count.
+        let first = beacon_epoch_of(c) + 1;
+        assert!(c.run_until(epochs(3), |c| beacon_epoch_of(c) >= first));
+        let height = |c: &SimCluster| {
+            c.committed_height(ShardId::ROOT)
+                .map_or(0, BlockHeight::inner)
+        };
+        let from = height(c);
+        assert!(c.run_until(epochs(3), |c| beacon_epoch_of(c) > first));
+        let blocks = height(c) - from;
+
+        let cycle = IDLE_PROPOSAL_INTERVAL + config.latency * 2;
+        let heartbeats = EPOCH_MS / u64::try_from(cycle.as_millis()).expect("a short cycle");
+        let budget = heartbeats + 15;
+        assert!(
+            blocks <= budget,
+            "an idle shard committed {blocks} blocks in an epoch, over {budget}"
+        );
+        assert!(
+            blocks * 10 >= heartbeats * 9,
+            "an idle shard committed {blocks} blocks in an epoch, short of its heartbeat"
+        );
+
+        let eager: BTreeMap<&str, u64> = EAGER_REASONS
+            .iter()
+            .map(|reason| (*reason, c.metric("eager_proposals", Some(reason))))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        assert!(
+            eager.contains_key("epoch"),
+            "a crossing goes out at once: {eager:?}"
+        );
+        // The chain's first two blocks: the first before any QC is
+        // adopted, the second under genesis's watermark.
+        assert!(
+            eager.iter().all(|(reason, count)| *reason == "epoch"
+                || (["round", "watermark"].contains(reason) && *count == 1)),
+            "only a crossing or the chain's entry goes out at once: {eager:?}"
+        );
+    });
+}
+
+/// An idle four-member shard's honest block cycle, and one rotation's
+/// time through a crashed member's turn: the QC gaps
+/// `a_crashed_leader_costs_one_adaptive_timeout_sim` reads, the crashed
+/// gap plus three of the eager rounds after it.
+#[cfg(feature = "production-epochs")]
+const IDLE_CYCLE: Duration = Duration::from_millis(1_300);
+#[cfg(feature = "production-epochs")]
+const CRASHED_ROTATION: Duration = Duration::from_millis(3_510);
+
+/// How long one member of an idle four-member shard can be down in an
+/// epoch before its misses reach the jail share of its turns.
+///
+/// Down for `d` it misses `d / R` turns, `R` the rotation through it;
+/// its turns are the blocks committed while it is up, `(E - d) / c`,
+/// and the rounds of each rotation while it is down, `4d / R`, over
+/// the four members. The threshold is the `d` at which the misses are
+/// the share of the turns.
+#[cfg(feature = "production-epochs")]
+fn idle_jailing_threshold() -> Duration {
+    let share = f64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS) / 10_000.0;
+    let members = 4.0;
+    let epoch = Duration::from_millis(EPOCH_MS).as_secs_f64();
+    let cycle = IDLE_CYCLE.as_secs_f64();
+    let rotation = CRASHED_ROTATION.as_secs_f64();
+    Duration::from_secs_f64(
+        share * epoch / (members * cycle) / ((1.0 - share) / rotation + share / (members * cycle)),
+    )
+}
+
+/// The shard consensus traffic a member down for its shard neither
+/// sends nor receives.
+#[cfg(feature = "production-epochs")]
+const SHARD_CONSENSUS_TYPES: [&str; 8] = [
+    "block.header",
+    "block.vote",
+    "block.proposal.request",
+    "block.proposal.response",
+    "block.request",
+    "block.response",
+    "shard.qc",
+    "shard.timeout",
+];
+
+/// Take one member of an idle four-member shard of a two-shard world
+/// down for `down` inside one epoch, and report whether the fold of that
+/// epoch jails it for its missed proposals. Only its shard traffic is
+/// cut, so its beacon duties jail nothing.
+#[cfg(feature = "production-epochs")]
+fn an_idle_member_down_for(seed: u64, down: Duration) -> bool {
+    // Grown to two shards, so the beacon holds members enough to jail
+    // one without falling below its floor, each validator on a host of
+    // its own, so cutting the member's host cuts no other member.
+    let mut cluster =
+        SimCluster::with_grown_accounts_on_dedicated_pool_hosts(&cross_shard_config(), seed, &[]);
+    let settled = beacon_epoch_of(&cluster) + 1;
+    assert!(
+        cluster.run_until(epochs(2), |c| beacon_epoch_of(c) >= settled),
+        "seed {seed}: the beacon must fold past the grow"
+    );
+    let state = cluster.beacon_state().expect("a committed beacon state");
+    let victim = state
+        .shard_consensus_members
+        .values()
+        .next()
+        .and_then(|members| members.first().copied())
+        .expect("a seated shard");
+    let host = cluster.host_of(victim).expect("the member runs a host");
+    let others: Vec<usize> = (0..cluster.host_count()).filter(|h| *h != host).collect();
+
+    let epoch = Duration::from_millis(EPOCH_MS);
+    let window =
+        u32::try_from(cluster.now().as_millis() / u128::from(EPOCH_MS)).expect("a short run") + 1;
+    let start = epoch * window + Duration::from_secs(5);
+    assert!(cluster.run_until(epochs(2), |c| c.now() >= start));
+    for type_id in SHARD_CONSENSUS_TYPES {
+        let _ = cluster.drop_type_between(&[host], &others, type_id);
+        let _ = cluster.drop_type_between(&others, &[host], type_id);
+    }
+    assert!(cluster.run_until(epochs(1), |c| c.now() >= start + down));
+    cluster.clear_drops();
+
+    let folded = u64::from(window) + 2;
+    assert!(
+        cluster.run_until(epochs(4), |c| beacon_epoch_of(c) >= folded),
+        "seed {seed}: the beacon must fold the outage's epoch"
+    );
+    matches!(
+        cluster
+            .beacon_state()
+            .and_then(|state| state.validators.get(&victim).map(|record| record.status)),
+        Some(ValidatorStatus::Jailed {
+            reason: JailReason::Performance,
+            ..
+        })
+    )
+}
+
+/// The jail share bites an idle shard where its cycle and crashed
+/// rotation put it: a member down for a fifth less than the threshold
+/// stays, and one down for a fifth more is jailed.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn an_idle_member_down_for_part_of_an_epoch_sim() {
+    let threshold = idle_jailing_threshold();
+    let seed = sim_seed(11);
+    assert!(
+        !an_idle_member_down_for(seed, threshold.mul_f64(0.8)),
+        "seed {seed}: a member down for 0.8 of the {threshold:?} threshold was jailed"
+    );
+    assert!(
+        an_idle_member_down_for(seed, threshold.mul_f64(1.2)),
+        "seed {seed}: a member down for 1.2 of the {threshold:?} threshold was not jailed"
+    );
+}
 
 #[test]
 fn gossip_drop_engages_fetch_fallback_sim() {
@@ -1089,9 +1278,9 @@ fn wide_venue_cluster(seed: u64) -> SimCluster {
 /// The seeds the fan-in bar is read over.
 ///
 /// One reading is not a measurement. Per seed the fanned-in queue lands
-/// anywhere from eight blocks under the single-caller one to sixteen
-/// over, because what either queue costs in blocks depends on where the
-/// last swap falls against the venue's cadence. A bar one seed satisfies
+/// anywhere from level with the single-caller one to a third over,
+/// because what either queue costs depends on where the last swap falls
+/// against the venue's cadence. A bar one seed satisfies
 /// says nothing about the next. Summed, the readings settle — and the sum
 /// is what the claim is about anyway, since a per-caller cost would show
 /// on every seed rather than on some.
@@ -1102,29 +1291,27 @@ const FAN_IN_SEEDS: [u64; 4] = [42, 7, 11, 1337];
 /// cost is the hold on its own cells, not a round trip per caller, and
 /// this is the property a regression eats first.
 ///
-/// Measured in the venue's own blocks, not in clock readings. The
-/// harness samples once a second and each queue drains in six to eight
-/// of those, so a clock bar loose enough to survive the two epoch clocks
-/// is loose enough to admit the whole regression it exists to catch. The
-/// venue's chain commits many times a second, so its own height is the
-/// finer instrument — read against its own idle pace
-/// (`VenueReport::paced`), since the shards of one world commit at
-/// their own pace whatever their load.
+/// Measured on the venue chain's own committed clock, not in harness
+/// clock readings. The harness samples once a second and each queue
+/// drains in six to eight of those, so a harness bar loose enough to
+/// survive the two epoch clocks is loose enough to admit the whole
+/// regression it exists to catch. The chain's clock reads at its
+/// quorum's resolution (`VenueReport::chain_span`).
 ///
 /// The bar is the design table's own figure: a round trip per caller
 /// would cost a third of the queue, and three callers would show it
-/// three times over. What the four seeds read is under a fifth of that.
+/// three times over. What the four seeds read is under half of that.
 #[test]
 fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
     // The bar reads four seeds' aggregate; one swept seed is not a sample of it.
     if env::var(SEED_VAR).is_ok() {
         discard("the fan-in bar reads its own seeds' aggregate");
     }
-    let mut single = 0;
-    let mut fanned = 0;
+    let mut single = Duration::ZERO;
+    let mut fanned = Duration::ZERO;
     for seed in FAN_IN_SEEDS {
         let mut narrow = venue_cluster(seed);
-        single += hot_venue_clears_swaps(&mut narrow, epochs(40)).paced();
+        single += hot_venue_clears_swaps(&mut narrow, epochs(40)).chain_span;
         let mut wide = wide_venue_cluster(seed);
         fanned += hot_venue_clears_swaps_on(
             &mut wide,
@@ -1132,12 +1319,12 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
             &wide_swapper_shards(),
             epochs(40),
         )
-        .paced();
+        .chain_span;
     }
     assert!(
         fanned * 3 <= single * 4,
         "fan-in from three caller shards must not cost a third of the queue: \
-         {fanned} against {single} thousandths of each venue's idle pace over {} seeds",
+         {fanned:?} against {single:?} on the venues' committed clocks over {} seeds",
         FAN_IN_SEEDS.len(),
     );
 }

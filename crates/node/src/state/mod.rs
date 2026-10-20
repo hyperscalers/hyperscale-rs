@@ -367,7 +367,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ViewChangeTimer => {
                 self.with_shard(ShardParticipation::on_view_change_timer)
             }
-            ProtocolEvent::SoloProposalTimer => {
+            ProtocolEvent::ProposalPaceTimer => {
                 self.with_shard(ShardParticipation::try_event_driven_proposal)
             }
             ProtocolEvent::ProposalFetchTimer => {

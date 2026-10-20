@@ -1314,6 +1314,35 @@ impl MempoolCoordinator {
         selected.into_iter().map(|(_, tx)| tx).collect()
     }
 
+    /// The earliest instant strictly after `now` at which a transaction
+    /// [`Self::ready_transactions`] passes over only for its dwell ends
+    /// it: one pending, not carried, not parked on engagement and
+    /// `engaged`, in a pool whose drain leaves places. `None` when no such
+    /// transaction dwells.
+    #[must_use]
+    pub fn next_ready_at(
+        &self,
+        now: LocalTimestamp,
+        intake: &IntakeView<'_>,
+        engaged: impl Fn(&Arc<Verified<Transaction>>) -> bool,
+    ) -> Option<LocalTimestamp> {
+        if MAX_UNSETTLED_TXS <= intake.in_flight.inner() {
+            return None;
+        }
+        let min_dwell = self.config.min_dwell_time;
+        self.pool
+            .iter()
+            .filter(|(hash, entry)| {
+                matches!(entry.status, TransactionStatus::Pending)
+                    && !intake.carried.contains(*hash)
+                    && !self.parked_engagement.contains_key(*hash)
+            })
+            .map(|(_, entry)| (entry.admitted_at.plus(min_dwell), entry))
+            .filter(|(ready_at, entry)| *ready_at > now && engaged(&entry.tx))
+            .map(|(ready_at, _)| ready_at)
+            .min()
+    }
+
     /// The number of transactions still awaiting inclusion, parked ones
     /// included — they occupy the pool whether or not they are currently
     /// selectable.
@@ -2942,6 +2971,67 @@ mod tests {
             |_| true,
         );
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
+    }
+
+    /// The pace wakes for the earliest dwell end still ahead, among the
+    /// transactions the ready set passes over for their dwell alone.
+    #[test]
+    fn next_ready_at_is_the_earliest_dwell_end_selection_would_take() {
+        let config = MempoolConfig {
+            min_dwell_time: Duration::from_millis(500),
+            ..MempoolConfig::default()
+        };
+        let mut mempool = MempoolCoordinator::with_config(ShardId::ROOT, config);
+        let topology_snapshot = make_test_topology();
+        let trie = ShardTrie::single();
+        let ms = LocalTimestamp::from_millis;
+        assert_eq!(
+            mempool.next_ready_at(ms(0), &IntakeView::idle(&trie), |_| true),
+            None,
+            "nothing dwells in an empty pool"
+        );
+
+        let early = test_transaction(1);
+        let late = test_transaction(2);
+        mempool.on_submit_transaction(
+            &topology_snapshot,
+            Arc::new(verified(early.clone())),
+            ms(10_000),
+        );
+        mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(late)), ms(10_200));
+
+        let idle = IntakeView::idle(&trie);
+        assert_eq!(
+            mempool.next_ready_at(ms(10_300), &idle, |_| true),
+            Some(ms(10_500))
+        );
+        assert_eq!(
+            mempool.next_ready_at(ms(10_500), &idle, |_| true),
+            Some(ms(10_700)),
+            "strictly after now"
+        );
+        assert_eq!(mempool.next_ready_at(ms(10_700), &idle, |_| true), None);
+
+        // Carried, unengaged, or past the drain, the early one is not
+        // what the wake waits for.
+        let carried = HashSet::from([early.hash()]);
+        let carrying = IntakeView {
+            carried: &carried,
+            ..IntakeView::idle(&trie)
+        };
+        assert_eq!(
+            mempool.next_ready_at(ms(10_300), &carrying, |_| true),
+            Some(ms(10_700))
+        );
+        assert_eq!(
+            mempool.next_ready_at(ms(10_300), &idle, |tx| tx.hash() != early.hash()),
+            Some(ms(10_700))
+        );
+        let drained = IntakeView {
+            in_flight: TxsInFlight::new(MAX_UNSETTLED_TXS),
+            ..IntakeView::idle(&trie)
+        };
+        assert_eq!(mempool.next_ready_at(ms(10_300), &drained, |_| true), None);
     }
 
     #[test]

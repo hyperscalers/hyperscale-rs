@@ -343,6 +343,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
         let _ = (reading, carried);
     }
 
+    /// A leader proposed at once rather than holding an empty block, by
+    /// the condition that held it to network speed.
+    fn record_eager_proposal(&self, reason: &str) {}
+
     /// A pushed crossing reading dropped on the consumer's side, by the
     /// check that dropped it: at ingress, at the anchor, or at the
     /// park. Each drop is one the fallback read has to make up.
@@ -949,6 +953,12 @@ pub fn record_crossing_fallback_ask(asker: &str) {
 #[inline]
 pub fn record_fenced_claim(reading: &str, carried: bool) {
     recorder().record_fenced_claim(reading, carried);
+}
+
+/// Record a proposal a leader made at once, by the condition that forced it.
+#[inline]
+pub fn record_eager_proposal(reason: &str) {
+    recorder().record_eager_proposal(reason);
 }
 
 /// Record a pushed crossing reading dropped by the consumer, by reason.

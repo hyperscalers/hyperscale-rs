@@ -138,6 +138,9 @@ pub struct ProposalInputs {
     pub boundary_claims: Vec<BoundaryOffer>,
     /// Crossings whose ends share this shard.
     pub local_crossings: Vec<CrossingId>,
+    /// The earliest instant after the ask at which something the sources
+    /// withheld only for its dwell becomes ready to offer.
+    pub ready_at: Option<LocalTimestamp>,
 }
 
 /// Variant-specific content for a proposal build.
@@ -217,6 +220,23 @@ pub struct ProposalPayload {
     /// names that stand at the block's anchor: no other replica holds
     /// them, so they are handed to the node that serves them.
     pub(crate) cut_legs: Vec<Arc<Verifiable<Finalization>>>,
+}
+
+impl ProposalPayload {
+    /// Whether the block would carry nothing of what was offered.
+    /// `cut_legs` lies within `finalizations`.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+            && self.finalizations.is_empty()
+            && self.provisions.is_empty()
+            && self.abandonment_records.is_empty()
+            && self.state_claims.is_empty()
+            && self.local_crossings.is_empty()
+            && self.rowless.is_empty()
+            && self.fence.presences.is_empty()
+            && self.fence.absences.is_empty()
+            && self.fence.deletions.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
