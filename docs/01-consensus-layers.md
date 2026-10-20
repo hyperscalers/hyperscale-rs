@@ -16,7 +16,7 @@ Key types are named inline; the main homes are `crates/shard` (shard consensus),
 
 ## 1. Shard consensus: HotStuff-2
 
-Each shard is an independent BFT chain producing `Block`s over the shard's transactions. The implementation is HotStuff-2: two-chain commit latency, a timeout-message pacemaker whose certificates appear only where a block skips rounds, and optimistic pipelining (a proposer proposes immediately after the previous block's QC forms, without waiting for commit).
+Each shard is an independent BFT chain producing `Block`s over the shard's transactions. The implementation is HotStuff-2: two-chain commit latency, a timeout-message pacemaker whose certificates appear only where a block skips rounds, and optimistic pipelining (a proposer proposes immediately after the previous block's QC forms, without waiting for commit, while the chain or the proposer holds content, and at a heartbeat otherwise).
 
 ### 1.1 Heights, rounds, proposers
 

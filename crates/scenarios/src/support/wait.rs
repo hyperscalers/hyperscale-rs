@@ -46,9 +46,10 @@ pub(crate) fn await_height<C: Cluster>(
 ///
 /// The hold behind a claim about what a chain does *not* do next. A
 /// delivery, a reclaim or a credit rides a block, so "nothing more comes
-/// back" is read over blocks: a shard commits many times a second
-/// whatever the epoch length, and an epoch of that is thousands of
-/// blocks for a question a handful decides.
+/// back" is read over blocks: a shard with content to carry commits at
+/// network speed and an idle one at its heartbeat, whatever the epoch
+/// length, and an epoch of that is hundreds of blocks for a question a
+/// handful decides.
 pub(crate) fn await_blocks<C: Cluster>(
     c: &mut C,
     shard: ShardId,

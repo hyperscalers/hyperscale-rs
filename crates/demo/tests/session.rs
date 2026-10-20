@@ -53,6 +53,12 @@ fn step_past_split(session: &mut Session, tail: usize) -> Vec<TraceEvent> {
     events
 }
 
+/// Half-second steps past the observed split before a host submits: the
+/// topology flips at the cut, and each child takes over at its parent's
+/// terminal crossing a few blocks later, so a host may still be seating
+/// the child it serves when the flip is first seen.
+const SEATING_STEPS: usize = 1;
+
 /// Half-second steps a test runs past the split for the children's chains
 /// to commit and the parent's terminal to be reported.
 const PAST_SPLIT_STEPS: usize = 160;
@@ -246,7 +252,7 @@ fn transfers_reach_a_terminal_outcome_on_either_side_of_a_split() {
         42,
     );
 
-    let mut events = step_past_split(&mut session, 0);
+    let mut events = step_past_split(&mut session, SEATING_STEPS);
 
     let mut submitted = 0;
     for i in 0..460 {
@@ -298,7 +304,7 @@ fn run_past_split(seed: u64, count: usize) -> Vec<TraceEvent> {
         },
         seed,
     );
-    let mut events = step_past_split(&mut session, 0);
+    let mut events = step_past_split(&mut session, SEATING_STEPS);
     for i in 0..(count * 20 + 100) {
         if i % 20 == 0 && i / 20 < count {
             session.submit_transfer();

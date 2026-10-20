@@ -190,6 +190,8 @@ impl NodeStateMachine {
             s.execution_coordinator
                 .on_committed_remote_header(topology_schedule, Anchor::of(certified_header)),
         );
+        // What the anchor releases is offered to the next proposal.
+        s.shard_coordinator.queue_ready_proposal();
         actions
     }
 }

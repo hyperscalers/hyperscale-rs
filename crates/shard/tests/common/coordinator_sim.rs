@@ -436,6 +436,10 @@ pub struct ShardCoordinatorSim {
     /// Shared sim clock. Threaded into every coordinator via
     /// `set_time` so per-replica timestamps don't drift.
     pub now: LocalTimestamp,
+    /// Each replica's armed proposal pace timer, by when it fires. When
+    /// both queues drain, [`Self::step`] moves the clock to the earliest
+    /// and fires it, as a runner would.
+    pace_timers: BTreeMap<usize, LocalTimestamp>,
     /// Sim time each delivery costs. Zero — the default — freezes the clock
     /// between pacing ticks, which leaves every weighted timestamp at the
     /// genesis value and so exercises nothing that reads the chain clock:
@@ -572,6 +576,7 @@ impl ShardCoordinatorSim {
         }
 
         Self {
+            pace_timers: BTreeMap::new(),
             clock_step: Duration::ZERO,
             coordinators,
             members,
@@ -1006,14 +1011,16 @@ impl ShardCoordinatorSim {
     }
 
     /// Drain one envelope through its addressee. Network-priority
-    /// before loopback. Returns `false` once both queues empty.
+    /// before loopback. With both queues empty, fire the earliest armed
+    /// proposal pace timer, moving the clock to it. Returns `false` once
+    /// nothing is queued or armed.
     pub fn step(&mut self) -> bool {
         let env = self
             .network_q
             .pop_front()
             .or_else(|| self.loopback_q.pop_front());
         let Some(env) = env else {
-            return false;
+            return self.fire_pace_timer();
         };
         if !self.clock_step.is_zero() {
             self.advance_clock(self.clock_step);
@@ -1030,6 +1037,21 @@ impl ShardCoordinatorSim {
         let to_idx = env.to_idx;
         let actions = self.deliver(env);
         self.absorb(to_idx, actions);
+        true
+    }
+
+    /// Fire the earliest armed proposal pace timer, moving the clock to
+    /// it. `false` when none is armed.
+    fn fire_pace_timer(&mut self) -> bool {
+        let Some((&idx, &at)) = self.pace_timers.iter().min_by_key(|(_, at)| **at) else {
+            return false;
+        };
+        self.pace_timers.remove(&idx);
+        if at > self.now {
+            self.advance_clock(at.saturating_sub(self.now));
+        }
+        let actions = self.try_propose_for(idx);
+        self.absorb(idx, actions);
         true
     }
 
@@ -2272,6 +2294,13 @@ impl ShardCoordinatorSim {
                 // Mirror the production handler: the certified tip
                 // becomes servable to block sync ahead of its commit.
                 self.pending_chains[emitter_idx].attach_certified_uncommitted(certified);
+            }
+            Action::SetTimer {
+                id: TimerId::ProposalPace,
+                duration,
+            } => {
+                self.pace_timers
+                    .insert(emitter_idx, self.now.plus(duration));
             }
             Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SetTimer { .. }

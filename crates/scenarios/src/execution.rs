@@ -37,8 +37,8 @@ use crate::support::faultable::{
     Crash, CrashableCluster, FaultHandle, FaultableCluster, report_claims_recarried,
 };
 use crate::support::query::{
-    answer_standing, await_leg_fated, beacon_epoch, clock, declared_price, escrowed_into,
-    owning_shard, stands_at, vault_balance,
+    answer_standing, await_leg_fated, beacon_epoch, clock, committed_past_validity, declared_price,
+    escrowed_into, owning_shard, stands_at, vault_balance,
 };
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_bounded_transfer_tx, build_close_tx,
@@ -1837,9 +1837,10 @@ const BOUNDED_PAYMENT: u128 = 100;
 ///
 /// What a validity window too short for the consumer's shard to include
 /// a transaction in comes to: its payer's shard commits it and the
-/// consumer's never holds it while it is valid. Faithful only with
-/// disjoint committees, as [`committees_on_separate_hosts`] holds the
-/// layout to.
+/// consumer's never holds it while it is valid. The cut stands until the
+/// consumer's own chain is past the window, which is the clock its blocks
+/// judge validity by. Faithful only with disjoint committees, as
+/// [`committees_on_separate_hosts`] holds the layout to.
 fn hold_transactions_off<C: FaultableCluster>(
     c: &mut C,
     payer_shard: ShardId,
@@ -1874,8 +1875,9 @@ fn short_validity<C: Cluster>(c: &C) -> TimestampRange {
 /// shard the leg reads nothing of, so the leg waits on no commit there:
 /// it runs and stages the payment as soon as the payer's shard commits
 /// the transaction. The transaction is held off the recipient's
-/// committee until its validity has ended, so no block there commits
-/// it and no member of it ever stands there.
+/// committee until that shard's own chain has committed past its
+/// validity end, so no block there commits it and no member of it ever
+/// stands there.
 ///
 /// From the validity end the payer's shard pushes the standing record.
 /// The recipient's shard holds no row of the transaction, so it keeps
@@ -1932,9 +1934,10 @@ pub fn a_consumer_never_committing_declines_a_pushed_record<C: FaultableCluster>
     );
     let (record, id) = escrowed_into(c, &charges.records(c), recipient_shard);
     let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+    let past = |c: &C| committed_past_validity(c, recipient_shard, &validity);
     assert!(
-        c.run_until(epochs(8), |c| clock(c) >= validity.end_timestamp_exclusive),
-        "the cut must stand to the end of the payment's validity",
+        c.run_until(epochs(8), past),
+        "the cut must stand until the recipient's chain is past the payment's validity",
     );
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),
@@ -2083,9 +2086,10 @@ pub fn more_records_than_the_cap_are_declined_in_turn<C: FaultableCluster>(c: &m
     let staged_at = c
         .committed_height(recipient_shard)
         .expect("the recipient's shard commits");
+    let past = |c: &C| committed_past_validity(c, recipient_shard, &validity);
     assert!(
-        c.run_until(epochs(8), |c| clock(c) >= validity.end_timestamp_exclusive),
-        "the cut must stand to the end of the payments' validity",
+        c.run_until(epochs(8), past),
+        "the cut must stand until the recipient's chain is past the payments' validity",
     );
     assert!(cut.iter().any(|handle| handle.fired() > 0));
     c.clear_drops();
@@ -2209,9 +2213,10 @@ pub fn a_mass_decline_brings_every_payment_home<C: FaultableCluster>(c: &mut C) 
         c.run_until(epochs(4), |c| held_by_payers(c) == before - staged - price),
         "every payment must be staged with the recipient's shard holding nothing of it",
     );
+    let past = |c: &C| committed_past_validity(c, recipient_shard, &validity);
     assert!(
-        c.run_until(epochs(8), |c| clock(c) >= validity.end_timestamp_exclusive),
-        "the cut must stand to the end of the payments' validity",
+        c.run_until(epochs(8), past),
+        "the cut must stand until the recipient's chain is past the payments' validity",
     );
     assert!(
         cut.iter().any(|handle| handle.fired() > 0),

@@ -45,7 +45,7 @@ use hyperscale_types::{
     ConsensusReceipt, Derivation, Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds,
     ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, Transaction,
     TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified,
-    shard_prefix_path,
+    WeightedTimestamp, shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -1071,6 +1071,12 @@ impl Cluster for SimCluster {
 
     fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
         reads_record(&self.history(shard), key)
+    }
+
+    fn committed_clock(&self, shard: ShardId, height: BlockHeight) -> Option<WeightedTimestamp> {
+        self.history(shard)
+            .block(height)
+            .map(|certified| certified.block().header().parent_qc().weighted_timestamp())
     }
 
     fn record_wait(&self, shard: ShardId, tx: TxHash, key: SubstateKey) -> Option<Duration> {

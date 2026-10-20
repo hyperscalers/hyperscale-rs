@@ -96,9 +96,8 @@ pub enum ProtocolEvent {
     /// Periodic cleanup of stale state.
     CleanupTimer,
 
-    /// A one-member committee's proposal pace elapsed — propose on the QC
-    /// its own vote formed.
-    SoloProposalTimer,
+    /// A leader's proposal pace elapsed — try the proposal it held.
+    ProposalPaceTimer,
 
     /// The gossip grace for a proposal a vote named elapsed — fetch the
     /// proposals still missing.

@@ -16,7 +16,8 @@ use hyperscale_mempool::MempoolCoordinator;
 use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_shard::{ProposalAsk, ProposalInputs, ShardCoordinator};
 use hyperscale_types::{
-    LocalTimestamp, MAX_TXS_PER_BLOCK, Provisions, ShardId, TopologySchedule, TxHash, Verified,
+    LocalTimestamp, MAX_TXS_PER_BLOCK, Provisions, ShardId, TopologySchedule, Transaction, TxHash,
+    Verified,
 };
 
 use super::ShardParticipation;
@@ -73,11 +74,20 @@ impl ProposalSources<'_> {
         // offered is the drain's count and the block's caps inside
         // `ready_transactions`.
         let riding = Self::riding_this_proposal(&queued);
+        let engaged = |tx: &Arc<Verified<Transaction>>| {
+            ask.engagement_held(tx, |payer, tx_hash| riding.contains(&(payer, tx_hash)))
+        };
         let ready_txs =
             self.mempool
-                .ready_transactions(MAX_TXS_PER_BLOCK, &ask.intake, self.now, |tx| {
-                    ask.engagement_held(tx, |payer, tx_hash| riding.contains(&(payer, tx_hash)))
-                });
+                .ready_transactions(MAX_TXS_PER_BLOCK, &ask.intake, self.now, engaged);
+        // What the pool and the queue withhold only for its dwell: the
+        // pace timer wakes the leader for it when no other event will.
+        let ready_at = self
+            .mempool
+            .next_ready_at(self.now, &ask.intake, engaged)
+            .into_iter()
+            .chain(self.provisions.next_eligible_at(self.now))
+            .min();
 
         // Provisions coordinator stores `Verified` internally; lift each
         // batch into the `Verifiable` transport shape so the marker
@@ -96,6 +106,7 @@ impl ProposalSources<'_> {
             verdict_claims,
             boundary_claims,
             local_crossings,
+            ready_at,
         }
     }
 
@@ -136,8 +147,8 @@ impl ShardParticipation {
         )
     }
 
-    /// The proposal attempt of the post-dispatch retry hook and the solo
-    /// pace timer.
+    /// The proposal attempt of the post-dispatch retry hook and the
+    /// proposal pace timer.
     pub(in crate::state) fn try_event_driven_proposal(
         &mut self,
         sched: &TopologySchedule,

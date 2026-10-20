@@ -151,9 +151,9 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_metrics::{
     record_accepted_rows_toward_a_sibling, record_blocks_from_stated_to_heard,
-    record_claims_recarried, record_core_members_settled, record_halt_recovery_offer_refused,
-    record_state_claims_weight, record_verdict_cells, record_verdict_claims_weight,
-    set_standing_answers_by_lineage,
+    record_claims_recarried, record_core_members_settled, record_eager_proposal,
+    record_halt_recovery_offer_refused, record_state_claims_weight, record_verdict_cells,
+    record_verdict_claims_weight, set_standing_answers_by_lineage,
 };
 use hyperscale_storage::{
     CommittedProvisions, MemberIndex, MemberInputs, MemberSections, RecoveredState, RowState,
@@ -165,12 +165,13 @@ use hyperscale_types::{
     AnswerAdditions, AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CarriedClaims, CertifiedBlock, CertifiedBlockHeader,
     ChainOrigin, CommittedTip, Decision, Finalization, HALT_HARVEST_WAIT, HALT_THRESHOLD_EPOCHS,
-    IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters, SiblingView, Source,
-    StandingAnswers, StandingToward, StateRoot, TickLine, Timeout, TimeoutCertificate,
-    TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
-    asks, counts, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    IDLE_PROPOSAL_INTERVAL, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext,
+    QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
+    SiblingView, Source, StandingAnswers, StandingToward, StateRoot, TickLine, Timeout,
+    TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VotePosition, asks, counts, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -189,7 +190,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
-use crate::delay::SOLO_PROPOSAL_FLOOR;
+use crate::delay::{FETCH_TIMEOUT_DEFAULT, SOLO_PROPOSAL_FLOOR};
 use crate::fence::{VoteFence, Withheld};
 use crate::lookups::{committee_public_keys, pacemaker_members, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
@@ -357,6 +358,71 @@ impl ProposalFrame<'_> {
     fn rounds_justified(&self, round: Round) -> bool {
         round <= self.parent_qc.round().next() || self.timeout_cert.is_some()
     }
+}
+
+/// When a leader's next proposal may go out.
+#[derive(Debug, Default)]
+struct ProposalPace {
+    /// Until when a quorum this host seats alone holds its next proposal:
+    /// armed when votes cast here alone form a QC, so the chain is paced
+    /// by time rather than by a vote round trip it does not have.
+    floor: Option<LocalTimestamp>,
+    /// Until when the leader of a round with nothing to carry holds its
+    /// empty block, for the round it was computed in. Computed once per
+    /// round and never re-armed in it; a round other than the view's
+    /// reads as unset.
+    idle_until: Option<(Round, LocalTimestamp)>,
+}
+
+/// Why a leader proposed at once rather than holding an empty block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EagerReason {
+    /// The view is not the first round after the high QC, a timeout
+    /// certificate at or above it is held, or its adoption is unknown.
+    Round,
+    /// The block the high QC certifies is not held.
+    Unresolved,
+    /// The certified tip carries content.
+    Content,
+    /// The certified tip does not commit its parent.
+    TwoChain,
+    /// A commit that carried content or crossed an epoch covers the tip.
+    Watermark,
+    /// The high QC sits in a later epoch than the committed anchor.
+    Epoch,
+    /// The sources offer something, or a ready signal is eligible.
+    Offered,
+    /// The parent's witness window does not resolve, so the ready-signal
+    /// pool cannot be judged against it.
+    Walk,
+}
+
+impl EagerReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Round => "round",
+            Self::Unresolved => "unresolved",
+            Self::Content => "content",
+            Self::TwoChain => "two_chain",
+            Self::Watermark => "watermark",
+            Self::Epoch => "epoch",
+            Self::Offered => "offered",
+            Self::Walk => "walk",
+        }
+    }
+}
+
+/// `leaves`, starting at leaf `start`, less those below `base`.
+fn trimmed_to_base(
+    base: BeaconWitnessLeafCount,
+    start: BeaconWitnessLeafCount,
+    mut leaves: Vec<Hash>,
+) -> Vec<Hash> {
+    let trim = usize::try_from(base.inner().saturating_sub(start.inner()))
+        .unwrap_or(usize::MAX)
+        .min(leaves.len());
+    leaves.drain(..trim);
+    leaves
 }
 
 /// The terminal roots a header carries.
@@ -642,10 +708,18 @@ pub struct ShardCoordinator {
     /// anchor (use `committed_ts: WeightedTimestamp` for that).
     now: LocalTimestamp,
 
-    /// Until when a quorum this host seats alone holds its next proposal:
-    /// armed when votes cast here alone form a QC, so the chain is paced
-    /// by time rather than by a vote round trip it does not have.
-    solo_paced_until: Option<LocalTimestamp>,
+    /// When this seat's next proposal may go out.
+    pace: ProposalPace,
+
+    /// The round of the QC whose adoption last moved the view, and the
+    /// instant it did. An idle leader's wait runs from here.
+    qc_adopted_at: Option<(Round, LocalTimestamp)>,
+
+    /// The highest certified tip this seat, leading, builds on at once
+    /// whatever it holds: one past the newest commit that carried content
+    /// or crossed an epoch, so that commit's follow-ups go out at network
+    /// speed. Local to the leader; no follower reads it.
+    eager_through: BlockHeight,
 
     /// Validators this host seats in this shard, this one among them.
     /// Their votes reach each other without crossing the network.
@@ -851,6 +925,12 @@ impl ShardCoordinator {
             dedup_index.cover_to_origin();
         }
         let (pending_blocks, recovered_blocks) = restored_pending_blocks(&recovered.voted_blocks);
+        // A restart adopted its high QC before it had a clock, so the
+        // first round it leads is past any wait that adoption opened.
+        let qc_adopted_at = high_qc
+            .as_ref()
+            .filter(|qc| !qc.is_genesis())
+            .map(|qc| (qc.round(), LocalTimestamp::ZERO));
         Self {
             verifier,
             view_change: ViewChangeController::new(initial_view),
@@ -920,7 +1000,11 @@ impl ShardCoordinator {
             ),
             config,
             now: LocalTimestamp::ZERO,
-            solo_paced_until: None,
+            pace: ProposalPace::default(),
+            qc_adopted_at,
+            // A restored chain's next blocks go out at network speed, as a
+            // fresh chain's first ones do.
+            eager_through: recovered.committed_height.next(),
             host_seats: BTreeSet::from([me]),
             me,
             local_shard,
@@ -1857,7 +1941,7 @@ impl ShardCoordinator {
     /// View change timeout for the current round.
     #[must_use]
     pub fn current_view_change_timeout(&self) -> Duration {
-        self.view_change.current_timeout()
+        self.view_change.current_timeout(self.high_qc_round())
     }
 
     /// Ceiling on view-change suppression while a proposal is in flight.
@@ -1869,7 +1953,8 @@ impl ShardCoordinator {
     /// Time remaining until the view change timer should fire.
     #[must_use]
     pub fn remaining_view_change_timeout(&self) -> Duration {
-        self.view_change.remaining_timeout(self.now)
+        self.view_change
+            .remaining_timeout(self.now, self.high_qc_round())
     }
 
     /// Check if we should advance the round due to timeout.
@@ -1939,7 +2024,8 @@ impl ShardCoordinator {
             }
         }
 
-        self.view_change.timeout_elapsed(self.now)
+        self.view_change
+            .timeout_elapsed(self.now, self.high_qc_round())
     }
 
     /// Refresh the pacemaker, then check for a round timeout and broadcast
@@ -2020,6 +2106,10 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = genesis_anchor;
         self.committed_committee_anchor_wt = genesis_anchor;
         self.substate_bytes_frontier.0 = genesis.height();
+        // No commit precedes the chain's first blocks to mark them, and a
+        // split child or merged parent opens on business its predecessor
+        // left: the first two go out at network speed.
+        self.eager_through = genesis.height().next();
 
         // Record genesis time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -2914,11 +3004,15 @@ impl ShardCoordinator {
     ///
     /// This is the unified proposal entry point, called from:
     /// - new-content events (transactions, ticks, or provisions)
-    /// - `on_qc_formed` (eager next-block proposal)
+    /// - `on_qc_formed` (the next block, once a QC certifies the tip)
+    /// - the proposal pace timer
     ///
     /// Returns empty if preconditions aren't met (not proposer, build in-flight,
-    /// already voted at this height, etc.). No periodic rescheduling — callers
-    /// are responsible for triggering the next attempt via events.
+    /// already voted at this height, etc.). A block that would go out empty
+    /// with nothing calling for it is held until the round's idle deadline,
+    /// with the proposal pace timer armed for whichever comes first of that
+    /// deadline and a dwell ending on withheld content; every other retry
+    /// is the caller's, triggered by events.
     ///
     /// `gather` supplies the block's content. It is asked at most once,
     /// with the readings of the parent the block extends, and only once
@@ -2974,11 +3068,31 @@ impl ShardCoordinator {
             );
         }
         let goes_out = self.build_goes_out(&frame, round);
+        let pinned = goes_out.then(|| {
+            self.eager_before_gather(
+                topology_schedule,
+                round,
+                frame.parent_block_hash,
+                &frame.parent_qc,
+            )
+        });
+        let mut ready_at = None;
+        let gather = |ask: &ProposalAsk<'_>| {
+            let inputs = gather(ask);
+            ready_at = inputs.ready_at;
+            inputs
+        };
         let Some(mut payload) =
             self.gathered_payload(topology_schedule, &frame, goes_out.then_some(gather))
         else {
             return vec![];
         };
+        if let Some(pinned) = pinned
+            && let Some(idle) =
+                self.hold_idle(topology_schedule, &frame, round, pinned, &payload, ready_at)
+        {
+            return idle;
+        }
         let cut_legs = std::mem::take(&mut payload.cut_legs);
         let mut actions = self.dispatch_framed(
             topology_schedule,
@@ -3002,6 +3116,170 @@ impl ShardCoordinator {
             "a build predicted not to go out, and so asked for no content, was dispatched"
         );
         actions
+    }
+
+    /// Why the leader of `round` proposes at once on `tip`, the block
+    /// `high_qc` certifies, judged before anything is gathered: every
+    /// condition but what is on offer. `None` leaves the block to idle
+    /// unless something is offered.
+    fn eager_before_gather(
+        &self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+        tip: BlockHash,
+        high_qc: &QuorumCertificate,
+    ) -> Option<EagerReason> {
+        if round != high_qc.round().next()
+            || self
+                .high_tc
+                .as_deref()
+                .is_some_and(|tc| tc.round() >= high_qc.round())
+            || self
+                .qc_adopted_at
+                .is_none_or(|(adopted, _)| adopted != high_qc.round())
+        {
+            return Some(EagerReason::Round);
+        }
+        let view = self.chain_view();
+        let (Some(header), Some(content)) = (view.get_header(tip), view.carries_content(tip))
+        else {
+            return Some(EagerReason::Unresolved);
+        };
+        if content {
+            return Some(EagerReason::Content);
+        }
+        if header.round() != header.parent_qc().round().next() {
+            return Some(EagerReason::TwoChain);
+        }
+        if header.height() <= self.eager_through {
+            return Some(EagerReason::Watermark);
+        }
+        if topology_schedule.epoch_for(high_qc.weighted_timestamp())
+            != topology_schedule.epoch_for(self.committed_block_anchor_wt)
+        {
+            return Some(EagerReason::Epoch);
+        }
+        None
+    }
+
+    /// Whether anything is on offer for the block on `parent`, built
+    /// under `topology_snapshot` at `proposal_wt` with `payload`: `Err`
+    /// names what forces it out at once, a selected section or an
+    /// eligible ready signal outside the parent's window, or a window
+    /// that does not resolve. `Ok` holds that window.
+    ///
+    /// Where the walk fails the build previews against the committed
+    /// prefix; the pool is not judged against that guess.
+    fn on_offer(
+        &self,
+        topology_schedule: &TopologySchedule,
+        topology_snapshot: &TopologySnapshot,
+        proposal_wt: WeightedTimestamp,
+        parent: BlockHash,
+        payload: &ProposalPayload,
+    ) -> Result<Vec<Hash>, EagerReason> {
+        if !payload.is_empty() {
+            return Err(EagerReason::Offered);
+        }
+        let window = self
+            .parent_witness_window(topology_schedule, topology_snapshot, proposal_wt, parent)
+            .map_err(|_| EagerReason::Walk)?;
+        let held = self.ready_signal_held(topology_snapshot, &window);
+        if self
+            .ready_signal_pool
+            .has_eligible(proposal_wt, self.now, held)
+        {
+            return Err(EagerReason::Offered);
+        }
+        Ok(window)
+    }
+
+    /// Hold the block on `frame` at `round` back if it would go out empty
+    /// before the round's idle deadline, arming the pace timer for the
+    /// earliest instant that could change: the deadline, or a dwell
+    /// ending on content the sources withheld (`ready_at`) or on a ready
+    /// signal. `None` proposes, counted by the condition `pinned` or the
+    /// offer names when the block is eager.
+    fn hold_idle(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        frame: &ProposalFrame<'_>,
+        round: Round,
+        pinned: Option<EagerReason>,
+        payload: &ProposalPayload,
+        ready_at: Option<LocalTimestamp>,
+    ) -> Option<Vec<Action>> {
+        let proposal_wt = frame.parent_qc.weighted_timestamp();
+        let offer = pinned.map_or_else(
+            || {
+                self.on_offer(
+                    topology_schedule,
+                    frame.committee,
+                    proposal_wt,
+                    frame.parent_block_hash,
+                    payload,
+                )
+            },
+            Err,
+        );
+        let window = match offer {
+            Ok(window) => window,
+            Err(reason) => {
+                record_eager_proposal(reason.label());
+                return None;
+            }
+        };
+        let idle_until = self.idle_until(topology_schedule, round, proposal_wt);
+        if self.now >= idle_until {
+            return None;
+        }
+        let held = self.ready_signal_held(frame.committee, &window);
+        let signal_at = self
+            .ready_signal_pool
+            .next_eligible_at(proposal_wt, self.now, held);
+        let wake = [ready_at, signal_at]
+            .into_iter()
+            .flatten()
+            .fold(idle_until, LocalTimestamp::min);
+        trace!(
+            validator = ?self.me,
+            round = round.inner(),
+            "Nothing to carry; holding the empty block"
+        );
+        Some(vec![Action::SetTimer {
+            id: TimerId::ProposalPace,
+            duration: wake.saturating_sub(self.now),
+        }])
+    }
+
+    /// The instant the leader of `round` stops holding an empty block:
+    /// `IDLE_PROPOSAL_INTERVAL` past the adoption of the high QC, stamped
+    /// at `high_qc_wt`, or two delays past the epoch cut after it when
+    /// that comes sooner. Computed on the round's first ask and kept for
+    /// the rest of it.
+    fn idle_until(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+        high_qc_wt: WeightedTimestamp,
+    ) -> LocalTimestamp {
+        if let Some((computed, until)) = self.pace.idle_until
+            && computed == round
+        {
+            return until;
+        }
+        let adopted = self.qc_adopted_at.map_or(self.now, |(_, at)| at);
+        let delay = self.view_change.delay().unwrap_or(FETCH_TIMEOUT_DEFAULT);
+        let windows = topology_schedule.windows();
+        let wait = if windows.epoch_duration_ms() == 0 {
+            IDLE_PROPOSAL_INTERVAL
+        } else {
+            let cut = windows.window_of(windows.epoch_for(high_qc_wt)).end;
+            IDLE_PROPOSAL_INTERVAL.min(cut.elapsed_since(high_qc_wt) + delay * 2)
+        };
+        let until = adopted.plus(wait);
+        self.pace.idle_until = Some((round, until));
+        until
     }
 
     /// Whether the block on `frame`'s parent is built empty whatever is
@@ -3109,6 +3387,7 @@ impl ShardCoordinator {
             verdict_claims,
             boundary_claims,
             local_crossings,
+            ready_at: _,
         } = gather(&self.ask_at(
             committee,
             ctx.reshaping,
@@ -3257,7 +3536,7 @@ impl ShardCoordinator {
         // until a QC forms, so that second block would be a sibling of the
         // first. A QC or timeout always advances the view past
         // `last_voted_round`, so the legitimate next proposal passes.
-        if self.solo_paced_until.is_some_and(|until| self.now < until) {
+        if self.pace.floor.is_some_and(|until| self.now < until) {
             return false;
         }
 
@@ -3467,39 +3746,26 @@ impl ShardCoordinator {
             MIN_READY_SIGNAL_DWELL,
             MAX_READY_SIGNALS_PER_BLOCK,
         );
-        let (parent_start, mut parent_leaves) = prospective_parent_witness_leaves(
-            &self.beacon_witness_accumulator,
-            self.committed_hash,
-            self.committed_block_anchor_wt,
-            parent_block_hash,
-            proposal_wt,
-            &self.pending_blocks,
-            self.verification.verified_certified_blocks(),
-            self.local_shard,
-            topology_schedule,
-        )
-        .unwrap_or_else(|blocking| {
-            warn!(
-                validator = ?self.me,
-                ?blocking,
-                "Beacon-witness ancestor walk blocked at proposal; previewing against committed prefix"
-            );
-            (
-                self.beacon_witness_accumulator.start_index(),
-                self.beacon_witness_accumulator.leaves().to_vec(),
-            )
-        });
-        // The window base resolves from the same schedule entry as the
-        // committee — verifiers check the header's claim against it.
-        // The root commits the window only, so parent leaves below the
-        // base trim off before the preview; the base never undercuts the
-        // parent window's start (it is bounded by a committed ancestor's
-        // count, and pruning follows commits).
         let base = topology_snapshot.witness_base(self.local_shard);
-        let trim = usize::try_from(base.inner().saturating_sub(parent_start.inner()))
-            .unwrap_or(usize::MAX)
-            .min(parent_leaves.len());
-        parent_leaves.drain(..trim);
+        let parent_leaves = self
+            .parent_witness_window(
+                topology_schedule,
+                topology_snapshot,
+                proposal_wt,
+                parent_block_hash,
+            )
+            .unwrap_or_else(|blocking| {
+                warn!(
+                    validator = ?self.me,
+                    ?blocking,
+                    "Beacon-witness ancestor walk blocked at proposal; previewing against committed prefix"
+                );
+                trimmed_to_base(
+                    base,
+                    self.beacon_witness_accumulator.start_index(),
+                    self.beacon_witness_accumulator.leaves().to_vec(),
+                )
+            });
 
         // A ready signal whose leaf already sits in this window is committed
         // for good — the merkle accumulator retains it and the beacon folds
@@ -3507,15 +3773,10 @@ impl ShardCoordinator {
         // fetch. Drop it, mirroring the reshape-trigger dedup against the
         // same window. The re-emission that landed it here is absorbed: the
         // pool already dropped it on drain.
-        ready_signals.retain(|signal| {
-            let leaf = ready_leaf_payload(
-                self.local_shard,
-                topology_snapshot,
-                signal.validator_id(),
-                signal.shard(),
-            );
-            !parent_leaves.contains(&leaf.leaf_hash())
-        });
+        {
+            let held = self.ready_signal_held(topology_snapshot, &parent_leaves);
+            ready_signals.retain(|signal| !held(signal));
+        }
 
         let reshape_trigger = self.derive_proposal_reshape_trigger(
             topology_snapshot,
@@ -3535,6 +3796,58 @@ impl ShardCoordinator {
             parent_window: parent_leaves,
             base,
         })
+    }
+
+    /// The witness window a block on `parent_block_hash` appends to: the
+    /// prefix the parent leaves behind, trimmed to the window base
+    /// `topology_snapshot` resolves. `Err` names the ancestor the walk
+    /// blocked on.
+    ///
+    /// The base resolves from the same schedule entry as the committee,
+    /// which verifiers check the header's claim against. The root commits
+    /// the window only, so parent leaves below the base trim off; the base
+    /// never undercuts the parent window's start, since it is bounded by a
+    /// committed ancestor's count and pruning follows commits.
+    fn parent_witness_window(
+        &self,
+        topology_schedule: &TopologySchedule,
+        topology_snapshot: &TopologySnapshot,
+        proposal_wt: WeightedTimestamp,
+        parent_block_hash: BlockHash,
+    ) -> Result<Vec<Hash>, BlockHash> {
+        let (start, leaves) = prospective_parent_witness_leaves(
+            &self.beacon_witness_accumulator,
+            self.committed_hash,
+            self.committed_block_anchor_wt,
+            parent_block_hash,
+            proposal_wt,
+            &self.pending_blocks,
+            self.verification.verified_certified_blocks(),
+            self.local_shard,
+            topology_schedule,
+        )?;
+        Ok(trimmed_to_base(
+            topology_snapshot.witness_base(self.local_shard),
+            start,
+            leaves,
+        ))
+    }
+
+    /// Whether a ready signal's leaf already sits in `window`.
+    fn ready_signal_held<'a>(
+        &'a self,
+        topology_snapshot: &'a TopologySnapshot,
+        window: &'a [Hash],
+    ) -> impl Fn(&ReadySignal) -> bool + 'a {
+        move |signal| {
+            let leaf = ready_leaf_payload(
+                self.local_shard,
+                topology_snapshot,
+                signal.validator_id(),
+                signal.shard(),
+            );
+            window.contains(&leaf.leaf_hash())
+        }
     }
 
     /// Unified proposal build + dispatch.
@@ -5630,7 +5943,9 @@ impl ShardCoordinator {
         if signal.wt_window_end() < self.clock.now() {
             return;
         }
-        self.ready_signal_pool.admit(signal, self.now);
+        if self.ready_signal_pool.admit(signal, self.now) {
+            self.queue_ready_proposal();
+        }
     }
 
     /// Handle QC verification and building result.
@@ -6456,18 +6771,19 @@ impl ShardCoordinator {
                 .map_or(self.now, |pending| pending.created_at().min(self.now));
             let until = arrived.plus(pace);
             if until > self.now {
-                self.solo_paced_until = Some(until);
+                self.pace.floor = Some(until);
                 actions.push(Action::SetTimer {
-                    id: TimerId::SoloProposal,
+                    id: TimerId::ProposalPace,
                     duration: until.saturating_sub(self.now),
                 });
             }
         }
 
-        // Propose the next block immediately — under the 2-chain commit rule,
-        // block N+1 is what certifies block N, so any gap in proposing N+1
-        // stalls the finalization of N and everything pending behind it.
-        // `try_propose` handles the proposer-rotation / backpressure checks.
+        // Propose the next block — under the 2-chain commit rule, block N+1
+        // is what certifies block N, so any gap in proposing N+1 stalls the
+        // finalization of N and everything pending behind it while N
+        // carries anything. `try_propose` handles the proposer-rotation and
+        // backpressure checks, and holds an empty block nothing calls for.
         actions.extend(self.try_propose(topology_schedule, gather));
 
         actions
@@ -7244,6 +7560,7 @@ impl ShardCoordinator {
         let parent_sweep_frontier = self
             .chain_view()
             .parent_sweep_frontier(certified.block().header().parent_block_hash());
+        let prior_anchor_epoch = topology_schedule.epoch_for(self.committed_block_anchor_wt);
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
@@ -7262,6 +7579,21 @@ impl ShardCoordinator {
             weighted_ts,
         );
         actions.extend(abandon);
+        // A commit with content to follow up, or one that crosses an
+        // epoch, keeps the block after its successor eager: what the
+        // commit sets moving, and the certified header the beacon reads
+        // the crossing from, go out at network speed.
+        let block = certified.block();
+        let crosses_epoch = topology_schedule
+            .epoch_for(block.header().parent_qc().weighted_timestamp())
+            != prior_anchor_epoch;
+        if crosses_epoch
+            || !witness.leaves.is_empty()
+            || block.header().carries_content()
+            || block.witness_sources().carries_content()
+        {
+            self.eager_through = self.eager_through.max(height.next());
+        }
         // The just-committed block's leaves are now folded into the
         // committed accumulator and `committed_hash` advanced to it,
         // so any beacon-witness verifications previously parked on
@@ -8768,6 +9100,7 @@ impl ShardCoordinator {
         }
         let old_view = self.view_change.view;
         if self.view_change.advance_on_qc(qc.round()) {
+            self.qc_adopted_at = Some((qc.round(), self.now));
             self.record_leader_activity();
             info!(
                 validator = ?self.me,
@@ -9491,24 +9824,24 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, ChainOrigin, CollectionId,
-        CommittedAt, ConsensusReceipt, ConsensusSignature, Deadline, Decision, Declared,
-        DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
-        Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER,
-        MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_TICK_MANIFEST_BYTES,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
-        MerkleInclusionProof, Mode, NetworkDefinition, NetworkId, NetworkParams, Owes,
-        PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, ReadFence, ReadMark, Reading,
-        RevealChain, Role, RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot,
-        SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateClaimsRoot, StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint,
-        TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId,
-        TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction,
-        TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT,
-        ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp,
-        WindowLookup, WitnessSources, decide, encode_amount, read_amount, receipt_hash_of, said_at,
-        test_utils, tick_terms_admit_block, verdict_leaf,
+        BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, BodyRoot, ChainOrigin,
+        CollectionId, CommittedAt, ConsensusReceipt, ConsensusSignature, Deadline, Decision,
+        Declared, DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause,
+        Epoch, Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LEAF_KEY_BYTES, LeafRoot,
+        MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
+        MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
+        MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, NetworkDefinition, NetworkId,
+        NetworkParams, Owes, PrincipalAddr, ProvisionEntry, ProvisionTxRoot, RETENTION_HORIZON,
+        ReadFence, ReadMark, Reading, RevealChain, Role, RoutePrefix, Routing, Said, SectionRoots,
+        SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaimsRoot, StateWrites, StatedTerms, SubstateClaim,
+        SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES, TICK_RESERVE_BYTES,
+        Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
+        Transaction, TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount,
+        VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, decide, encode_amount,
+        read_amount, receipt_hash_of, said_at, test_utils, tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -20631,6 +20964,8 @@ mod tests {
         };
 
         let (mut leader, schedule, qc) = about_to_certify(3, 7, &[]);
+        // A commit with content behind the tip keeps the leader eager.
+        leader.eager_through = qc.height();
         let actions = leader.on_qc_formed(&schedule, qc.block_hash(), &qc, counting);
         assert!(proposed(&actions).is_empty());
         assert_eq!(asked.get(), 1, "the leader is asked once");
@@ -20974,7 +21309,7 @@ mod tests {
         assert!(!proposes(&actions), "the next block waits out the pace");
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::SetTimer { id: TimerId::SoloProposal, duration } if *duration == SOLO_PROPOSAL_FLOOR
+            Action::SetTimer { id: TimerId::ProposalPace, duration } if *duration == SOLO_PROPOSAL_FLOOR
         )));
 
         state.set_time(formed_at.plus(SOLO_PROPOSAL_FLOOR));
@@ -21036,7 +21371,7 @@ mod tests {
                 matches!(
                     a,
                     Action::SetTimer {
-                        id: TimerId::SoloProposal,
+                        id: TimerId::ProposalPace,
                         ..
                     }
                 )
@@ -23067,7 +23402,8 @@ mod tests {
         // Past the round timeout, inside the progress window.
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
         state.set_time(
-            LocalTimestamp::ZERO.plus(VIEW_CHANGE_TIMEOUT_DEFAULT + Duration::from_millis(1)),
+            LocalTimestamp::ZERO
+                .plus(state.current_view_change_timeout() + Duration::from_millis(1)),
         );
         assert!(
             !state.should_advance_round(&topology_schedule),
@@ -26166,5 +26502,496 @@ mod tests {
                 .map(Transaction::hash)
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ─── Idle proposal ─────────────────────────────────────────────────
+
+    /// A complete block from `header`, carrying nothing but `sources`.
+    fn bare_block(header: BlockHeader, sources: WitnessSources) -> Block {
+        Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(sources),
+        }
+    }
+
+    /// Validator 0 at 30 s, committed at height 2, holding the block at
+    /// height 3 over it with `edit` applied to its header and `sources`
+    /// as its witness sources, and having adopted the QC over that block
+    /// just now: the leader of the round after it.
+    fn leading_after(
+        edit: impl FnOnce(&mut BlockHeaderParts),
+        sources: WitnessSources,
+    ) -> (
+        ShardCoordinator,
+        TopologySchedule,
+        Verified<QuorumCertificate>,
+    ) {
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(30_000));
+        let tip = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(2),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            round: Round::new(2),
+            ..Default::default()
+        });
+        state.committed_height = tip.height();
+        state.committed_hash = tip.hash();
+        let tip_qc = QuorumCertificate::new(
+            tip.hash(),
+            ShardId::ROOT,
+            tip.height(),
+            tip.parent_block_hash(),
+            tip.round(),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(20_000),
+        );
+        let mut parts = BlockHeaderParts {
+            height: BlockHeight::new(3),
+            parent_block_hash: tip.hash(),
+            parent_qc: tip_qc.into(),
+            proposer: ValidatorId::new(3),
+            round: Round::new(3),
+            ..Default::default()
+        };
+        edit(&mut parts);
+        let block = bare_block(BlockHeader::new(parts), sources);
+        install_complete_block(&mut state, &block);
+        let qc = Verified::new_unchecked_for_test(QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            tip.hash(),
+            block.header().round(),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(30_000),
+        ));
+        state.latest_qc = Some(qc.clone());
+        state.advance_view_for_qc(&qc);
+        (state, schedule, qc)
+    }
+
+    /// Why `state`, leading its view, proposes at once on the block `qc`
+    /// certifies, before anything is gathered.
+    fn eager_on(
+        state: &ShardCoordinator,
+        schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> Option<EagerReason> {
+        state.eager_before_gather(schedule, state.view_change.view, qc.block_hash(), qc)
+    }
+
+    /// A ready signal from validator 1 whose window spans the first
+    /// minute.
+    fn ready_from_one() -> ReadySignal {
+        ReadySignal::new(
+            ValidatorId::new(1),
+            ShardId::ROOT,
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(60_000),
+            ConsensusSignature::ZERO,
+        )
+    }
+
+    fn builds(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::BuildProposal { .. }))
+    }
+
+    /// The delay the proposal pace timer among `actions` is armed for.
+    fn pace_armed(actions: &[Action]) -> Option<Duration> {
+        actions.iter().find_map(|action| match action {
+            Action::SetTimer {
+                id: TimerId::ProposalPace,
+                duration,
+            } => Some(*duration),
+            _ => None,
+        })
+    }
+
+    /// A tip that carries nothing, commits its parent, sits above the
+    /// watermark and in the committed anchor's epoch leaves the first
+    /// round after its QC free to idle; each condition alone forces the
+    /// block out at once.
+    #[test]
+    fn each_condition_on_the_tip_forces_the_block_out_at_once() {
+        let (state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
+        assert_eq!(eager_on(&state, &schedule, &qc), None);
+
+        let (state, schedule, qc) = leading_after(
+            |parts| parts.body_root = BodyRoot::from_raw(Hash::from_bytes(b"a body")),
+            WitnessSources::empty(),
+        );
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Content));
+
+        let (state, schedule, qc) = leading_after(
+            |parts| {
+                parts.provision_tx_roots = Capped::new(BTreeMap::from([(
+                    ShardId::leaf(1, 1),
+                    ProvisionTxRoot::from_raw(Hash::from_bytes(b"provisioned")),
+                )]))
+                .expect("one target");
+            },
+            WitnessSources::empty(),
+        );
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Content));
+
+        let signalled = WitnessSources::new(
+            Capped::new(vec![ready_from_one()]).expect("one signal"),
+            None,
+            VrfProof::ZERO,
+        );
+        let (state, schedule, qc) = leading_after(|_| {}, signalled);
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Content));
+
+        let asserted = WitnessSources::new(
+            Capped::empty(),
+            Some(ReshapeTrigger::Split {
+                epoch: Epoch::GENESIS,
+                settling: None,
+            }),
+            VrfProof::ZERO,
+        );
+        let (state, schedule, qc) = leading_after(|_| {}, asserted);
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Content));
+
+        // Certified a round past its parent's QC: no two-chain over it.
+        let (state, schedule, qc) =
+            leading_after(|parts| parts.round = Round::new(4), WitnessSources::empty());
+        assert_eq!(
+            eager_on(&state, &schedule, &qc),
+            Some(EagerReason::TwoChain)
+        );
+
+        let (mut state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
+        state.eager_through = BlockHeight::new(3);
+        assert_eq!(
+            eager_on(&state, &schedule, &qc),
+            Some(EagerReason::Watermark)
+        );
+        state.eager_through = BlockHeight::new(2);
+        assert_eq!(eager_on(&state, &schedule, &qc), None);
+
+        // The QC sits in epoch 1 of a 20 s grid; the committed anchor in 0.
+        let gridded = TopologySchedule::new(20_000, Epoch::new(1), Arc::clone(schedule.head()));
+        assert_eq!(eager_on(&state, &gridded, &qc), Some(EagerReason::Epoch));
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(25_000);
+        assert_eq!(eager_on(&state, &gridded, &qc), None);
+
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        state.high_tc = Some(Arc::new(Verified::new_unchecked_for_test(certificate_at(
+            &keys, 3,
+        ))));
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Round));
+    }
+
+    /// The block the high QC certifies must be held to be judged: a tip
+    /// adopted by sync, outside the pending set, is read through the
+    /// certified blocks, and one held nowhere goes out at once.
+    #[test]
+    fn a_tip_is_judged_wherever_the_chain_holds_it() {
+        let (state, schedule, _) = leading_after(|_| {}, WitnessSources::empty());
+        let unheld = make_test_qc(
+            BlockHash::from_raw(Hash::from_bytes(b"held nowhere")),
+            BlockHeight::new(3),
+        );
+        assert_eq!(
+            state.eager_before_gather(
+                &schedule,
+                unheld.round().next(),
+                unheld.block_hash(),
+                &unheld
+            ),
+            Some(EagerReason::Unresolved)
+        );
+
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent_qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let synced = bare_block(
+            BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(1),
+                parent_block_hash: parent_qc.block_hash(),
+                parent_qc: parent_qc.into(),
+                round: Round::new(1),
+                body_root: BodyRoot::from_raw(Hash::from_bytes(b"a synced body")),
+                ..Default::default()
+            }),
+            WitnessSources::empty(),
+        );
+        let qc = make_test_qc(synced.hash(), synced.height());
+        let _ = state.apply_synced_block(&schedule, synced, qc.clone());
+        assert!(!state.pending_blocks.contains_key(qc.block_hash()));
+        assert_eq!(
+            state.qc_adopted_at,
+            Some((qc.round(), state.now)),
+            "a sync adoption that moves the view stamps it"
+        );
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Content));
+    }
+
+    /// Only the first round after the high QC, adopted in that round,
+    /// idles: a view a timeout certificate opened, an adoption unknown or
+    /// for another round, each go out at once.
+    #[test]
+    fn only_the_round_the_adoption_opened_idles() {
+        let (mut state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
+        assert_eq!(state.qc_adopted_at, Some((qc.round(), state.now)));
+
+        state.qc_adopted_at = None;
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Round));
+        state.qc_adopted_at = Some((Round::new(2), state.now));
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Round));
+
+        let (mut state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
+        assert!(state.view_change.advance_to(qc.round().next().next()));
+        assert_eq!(eager_on(&state, &schedule, &qc), Some(EagerReason::Round));
+    }
+
+    /// The idle wait runs from the QC's adoption: the interval, or two
+    /// delays past the next epoch cut when that comes first. It is
+    /// computed once per round.
+    #[test]
+    fn the_idle_wait_runs_from_the_adoption_and_stops_short_of_a_cut() {
+        let (mut state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
+        let adopted = state.now;
+        let round = state.view_change.view;
+        assert_eq!(
+            state.idle_until(&schedule, round, qc.weighted_timestamp()),
+            adopted.plus(IDLE_PROPOSAL_INTERVAL)
+        );
+        state.set_time(adopted.plus(Duration::from_millis(400)));
+        assert_eq!(
+            state.idle_until(&schedule, round, qc.weighted_timestamp()),
+            adopted.plus(IDLE_PROPOSAL_INTERVAL),
+            "not re-armed later in the round"
+        );
+
+        // The cut is 100 ms past the QC; no delay is measured yet.
+        let gridded = TopologySchedule::new(30_100, Epoch::GENESIS, Arc::clone(schedule.head()));
+        let (mut state, _, qc) = leading_after(|_| {}, WitnessSources::empty());
+        assert_eq!(
+            state.idle_until(&gridded, state.view_change.view, qc.weighted_timestamp()),
+            adopted.plus(Duration::from_millis(100) + FETCH_TIMEOUT_DEFAULT * 2)
+        );
+    }
+
+    /// An idle leader holds its empty block until the wait ends, armed to
+    /// wake for it, and proposes at the wake.
+    #[test]
+    fn an_idle_leader_holds_its_empty_block_until_the_wait_ends() {
+        let (mut leader, schedule, qc) = about_to_certify(3, 7, &[]);
+        let formed_at = leader.now;
+        let actions = leader.on_qc_formed(&schedule, qc.block_hash(), &qc, |_| {
+            ProposalInputs::default()
+        });
+        assert_eq!(leader.qc_adopted_at, Some((qc.round(), formed_at)));
+        assert!(!builds(&actions), "nothing to carry: {actions:?}");
+        assert_eq!(pace_armed(&actions), Some(IDLE_PROPOSAL_INTERVAL));
+
+        let short = Duration::from_millis(1);
+        leader.set_time(formed_at.plus(IDLE_PROPOSAL_INTERVAL).minus(short));
+        let actions = leader.try_propose(&schedule, |_| ProposalInputs::default());
+        assert!(!builds(&actions));
+        assert_eq!(pace_armed(&actions), Some(short));
+
+        leader.set_time(formed_at.plus(IDLE_PROPOSAL_INTERVAL));
+        let actions = leader.try_propose(&schedule, |_| ProposalInputs::default());
+        assert!(builds(&actions), "the wait is over: {actions:?}");
+    }
+
+    /// While idle, content offered goes out at once, and content the
+    /// sources hold back for its dwell goes out when the dwell ends.
+    #[test]
+    fn an_idle_leader_proposes_what_is_offered_at_once_and_waits_out_a_dwell() {
+        let (mut leader, schedule, qc) = about_to_certify(3, 7, &[]);
+        let formed_at = leader.now;
+        let _ = leader.on_qc_formed(&schedule, qc.block_hash(), &qc, |_| {
+            ProposalInputs::default()
+        });
+        let tx = admissible_at(qc.weighted_timestamp().as_millis());
+
+        // Admitted mid-wait, dwelling for 150 ms.
+        let dwell_ends = formed_at.plus(Duration::from_millis(300));
+        leader.set_time(formed_at.plus(Duration::from_millis(150)));
+        let actions = leader.try_propose(&schedule, |_| ProposalInputs {
+            ready_at: Some(dwell_ends),
+            ..ProposalInputs::default()
+        });
+        assert!(!builds(&actions));
+        assert_eq!(pace_armed(&actions), Some(Duration::from_millis(150)));
+
+        leader.set_time(dwell_ends);
+        let asked = Cell::new(false);
+        let actions = leader.try_propose(&schedule, offering(&asked, &tx));
+        assert_eq!(proposed(&actions), [tx.hash()]);
+    }
+
+    /// A ready signal admitted while idle wakes the leader: the admission
+    /// latches a proposal attempt, which arms the pace for the end of the
+    /// signal's dwell, and the block it wakes to carries the signal.
+    #[test]
+    fn a_ready_signal_wakes_an_idle_leader_at_its_dwell_end() {
+        let (mut leader, schedule, qc) = about_to_certify(3, 7, &[]);
+        let _ = leader.on_qc_formed(&schedule, qc.block_hash(), &qc, |_| {
+            ProposalInputs::default()
+        });
+        let _ = leader.take_ready_proposal();
+
+        leader.on_ready_signal_received(&schedule, ready_from_one());
+        assert!(leader.take_ready_proposal(), "a new signal latches");
+        let actions = leader.try_propose(&schedule, |_| ProposalInputs::default());
+        assert!(!builds(&actions));
+        assert_eq!(pace_armed(&actions), Some(MIN_READY_SIGNAL_DWELL));
+
+        leader.on_ready_signal_received(&schedule, ready_from_one());
+        assert!(!leader.take_ready_proposal(), "a repeat does not");
+
+        leader.set_time(leader.now.plus(MIN_READY_SIGNAL_DWELL));
+        let actions = leader.try_propose(&schedule, |_| ProposalInputs::default());
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::BuildProposal { ready_signals, .. } if ready_signals.len() == 1
+            )),
+            "the block carries the signal: {actions:?}"
+        );
+    }
+
+    /// What is offered is judged after admission: a selected section, or
+    /// an eligible ready signal whose leaf the parent's window lacks,
+    /// forces the block out; a window that does not resolve does too.
+    #[test]
+    fn an_offer_or_an_unwalkable_window_forces_the_block_out() {
+        let (mut state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
+        let head = Arc::clone(schedule.head());
+        let wt = qc.weighted_timestamp();
+        let tip = qc.block_hash();
+        let empty = ProposalPayload::default();
+        assert!(state.on_offer(&schedule, &head, wt, tip, &empty).is_ok());
+
+        let carrying = ProposalPayload {
+            rowless: vec![test_transaction(1).hash()],
+            ..ProposalPayload::default()
+        };
+        assert_eq!(
+            state.on_offer(&schedule, &head, wt, tip, &carrying),
+            Err(EagerReason::Offered)
+        );
+
+        let unheld = BlockHash::from_raw(Hash::from_bytes(b"an unheld parent"));
+        assert_eq!(
+            state.on_offer(&schedule, &head, wt, unheld, &empty),
+            Err(EagerReason::Walk)
+        );
+
+        state
+            .ready_signal_pool
+            .admit(ready_from_one(), state.now.minus(MIN_READY_SIGNAL_DWELL));
+        assert_eq!(
+            state.on_offer(&schedule, &head, wt, tip, &empty),
+            Err(EagerReason::Offered)
+        );
+    }
+
+    /// A split child's or merged parent's first two blocks go out at once:
+    /// genesis sets the watermark one past itself.
+    #[test]
+    fn a_structural_genesis_keeps_its_first_blocks_eager() {
+        let (mut state, _) = make_test_state();
+        let genesis = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(10),
+            1_000,
+            ValidatorId::new(0),
+            Vec::new(),
+            Vec::new(),
+        );
+        let _ = state.initialize_genesis(&genesis);
+        assert_eq!(state.eager_through, BlockHeight::new(11));
+    }
+
+    /// The watermark after committing, on a state anchored at 500 ms, the
+    /// block at height 1 anchored at `anchor_ms` with `edit` applied to
+    /// its header, under `schedule`.
+    fn watermark_after_committing(
+        schedule: &TopologySchedule,
+        anchor_ms: u64,
+        edit: impl FnOnce(&mut BlockHeaderParts),
+    ) -> BlockHeight {
+        let (mut state, _) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"the watermark's tip"));
+        state.committed_hash = tip;
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(500);
+        let parent_qc = QuorumCertificate::new(
+            tip,
+            ShardId::ROOT,
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::new(0),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(anchor_ms),
+        );
+        let mut parts = BlockHeaderParts {
+            height: BlockHeight::new(1),
+            parent_block_hash: tip,
+            parent_qc: parent_qc.into(),
+            round: Round::new(1),
+            ..Default::default()
+        };
+        edit(&mut parts);
+        let block = bare_block(BlockHeader::new(parts), WitnessSources::empty());
+        let certified = Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(
+                block.clone(),
+                make_test_qc(block.hash(), block.height()),
+            ),
+        ));
+        let _ = state.on_block_ready_to_commit(schedule, certified, CommitSource::Aggregator);
+        assert_eq!(state.committed_height, BlockHeight::new(1));
+        state.eager_through
+    }
+
+    /// A commit carrying content, one appending witness leaves and one
+    /// crossing an epoch each move the watermark one past themselves; an
+    /// empty commit does not, its sweep frontier moved or not.
+    #[test]
+    fn a_commit_with_follow_ups_moves_the_watermark() {
+        let (_, schedule) = make_test_state();
+        let unmoved = BlockHeight::new(1);
+        let moved = BlockHeight::new(2);
+        assert_eq!(watermark_after_committing(&schedule, 600, |_| {}), unmoved);
+        assert_eq!(
+            watermark_after_committing(&schedule, 600, |parts| {
+                parts.sweep_frontier = SweepFrontier([0x80; LEAF_KEY_BYTES]);
+            }),
+            unmoved
+        );
+        assert_eq!(
+            watermark_after_committing(&schedule, 600, |parts| {
+                parts.body_root = BodyRoot::from_raw(Hash::from_bytes(b"committed body"));
+            }),
+            moved
+        );
+        // Two rounds the committee missed append their leaves.
+        assert_eq!(
+            watermark_after_committing(&schedule, 600, |parts| parts.round = Round::new(3)),
+            moved
+        );
+        let mut gridded = TopologySchedule::new(1_000, Epoch::new(1), Arc::clone(schedule.head()));
+        gridded.insert(Epoch::GENESIS, Arc::clone(schedule.head()));
+        assert_eq!(watermark_after_committing(&gridded, 900, |_| {}), unmoved);
+        assert_eq!(watermark_after_committing(&gridded, 1_500, |_| {}), moved);
     }
 }

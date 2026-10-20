@@ -553,6 +553,14 @@ impl BlockHeader {
         &self.provision_tx_roots
     }
 
+    /// Whether the header commits to anything the block carries: a
+    /// non-empty body, or transactions it provisions to another shard.
+    /// The block's witness sources ride outside both.
+    #[must_use]
+    pub fn carries_content(&self) -> bool {
+        self.body_root != BodyRoot::ZERO || !self.provision_tx_roots.is_empty()
+    }
+
     /// The drain this shard owes after this block: the number of member
     /// rows standing in its committed state once the block's own fold has
     /// run, one for each transaction committed and not finished with.

@@ -112,6 +112,20 @@ impl<'a> ChainView<'a> {
             })
     }
 
+    /// Whether `block_hash`'s block carries content: its header commits
+    /// to a body or to provisions, or its witness sources carry a ready
+    /// signal or a reshape assertion. `None` when the block is not held.
+    pub(crate) fn carries_content(&self, block_hash: BlockHash) -> Option<bool> {
+        if let Some(pending) = self.pending.get(block_hash) {
+            return Some(
+                pending.header().carries_content()
+                    || pending.manifest().witness_sources().carries_content(),
+            );
+        }
+        let block = self.certified.get(&block_hash)?.block();
+        Some(block.header().carries_content() || block.witness_sources().carries_content())
+    }
+
     /// State root of the parent block. Returns the committed-tip state root
     /// when `parent_block_hash` IS the committed tip (may have been pruned
     /// from `pending` by cleanup) or when lookup otherwise fails.

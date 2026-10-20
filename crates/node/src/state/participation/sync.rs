@@ -97,10 +97,10 @@ impl ShardParticipation {
                         .collect();
                     self.shard_coordinator
                         .record_precut_proof(anchor, &presences);
-                    self.shard_coordinator.queue_ready_proposal();
                 }
                 self.execution_coordinator
                     .on_proof_fetched(anchor, &keys, &proof, &values);
+                self.shard_coordinator.queue_ready_proposal();
                 Vec::new()
             }
 
@@ -117,6 +117,7 @@ impl ShardParticipation {
                     &proof,
                     topology_schedule.windows(),
                 );
+                self.shard_coordinator.queue_ready_proposal();
                 Vec::new()
             }
             _ => unreachable!("non-sync event routed to handle_sync"),
@@ -194,8 +195,11 @@ impl ShardParticipation {
         shard: ShardId,
         set: SettledTxSet,
     ) -> Vec<Action> {
-        self.execution_coordinator
-            .record_settled_txs(topology_schedule, shard, set)
+        let actions = self
+            .execution_coordinator
+            .record_settled_txs(topology_schedule, shard, set);
+        self.shard_coordinator.queue_ready_proposal();
+        actions
     }
 }
 

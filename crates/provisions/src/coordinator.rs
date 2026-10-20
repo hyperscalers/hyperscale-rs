@@ -969,6 +969,14 @@ impl ProvisionCoordinator {
         self.queue.queued(now, self.expected.local_ts())
     }
 
+    /// The earliest instant strictly after `now` at which a queued batch
+    /// [`Self::queued_provisions`] withholds for its dwell becomes
+    /// eligible. `None` when no live batch dwells.
+    #[must_use]
+    pub fn next_eligible_at(&self, now: LocalTimestamp) -> Option<LocalTimestamp> {
+        self.queue.next_eligible_at(now, self.expected.local_ts())
+    }
+
     /// Look up verified provisions by their content hash. Reads the
     /// pipeline's verified map (not the raw wire-store), so callers
     /// receive the typed handle when the bundle has cleared verification.

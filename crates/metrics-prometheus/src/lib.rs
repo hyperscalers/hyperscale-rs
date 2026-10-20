@@ -207,6 +207,9 @@ pub struct Metrics {
     /// held to offer, by what they read.
     pub fenced_claims_refused: CounterVec,
     pub crossing_fallback_asks: CounterVec,
+    /// Proposals a leader made at once rather than holding an empty
+    /// block, by the condition that forced it.
+    pub eager_proposals: CounterVec,
     /// Pushed crossing readings the consumer dropped, by reason.
     pub crossing_pushes_dropped: CounterVec,
     /// What committed blocks' claims carried that a committed block just
@@ -934,6 +937,13 @@ impl Metrics {
             )
             .unwrap(),
 
+            eager_proposals: register_counter_vec!(
+                "hyperscale_eager_proposals_total",
+                "Proposals a leader made at once rather than holding an empty block, by reason",
+                &["reason"]
+            )
+            .unwrap(),
+
             crossing_pushes_dropped: register_counter_vec!(
                 "hyperscale_crossing_pushes_dropped_total",
                 "Pushed crossing readings the consumer dropped, by reason",
@@ -1411,6 +1421,13 @@ impl MetricsRecorder for PrometheusRecorder {
             &self.metrics.fenced_claims_refused
         };
         counter.with_label_values(&[reading]).inc();
+    }
+
+    fn record_eager_proposal(&self, reason: &str) {
+        self.metrics
+            .eager_proposals
+            .with_label_values(&[reason])
+            .inc();
     }
 
     fn record_crossing_push_dropped(&self, reason: &str) {

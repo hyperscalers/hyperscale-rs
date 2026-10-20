@@ -59,7 +59,8 @@ fn metrics_recorder_collects_values_from_running_sim() {
 /// `BlockCommitted` past the lag bound until the write lands, and keeps
 /// committing and persisting through it.
 ///
-/// Writes slower than blocks leave the persisted height trailing the tip;
+/// A write outlasting the lag bound's worth of an idle shard's heartbeat
+/// blocks leaves the persisted height trailing the tip past the bound;
 /// with work that completes at once it never trails, and nothing is held
 /// back. The writes run deferred, so every store reaching past the lag is
 /// also each host running its queued writes when their time comes.
@@ -69,7 +70,7 @@ fn a_shard_whose_writes_lag_holds_block_committed_back() {
     let config = SimConfig {
         shard_size: 4,
         processing: Some(ProcessingTimes {
-            io: Duration::from_secs(2),
+            io: Duration::from_secs(8),
             ..ProcessingTimes::INSTANT
         }),
         ..Default::default()

@@ -262,7 +262,7 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
     let event = match id {
         TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
         TimerId::Cleanup => ProtocolEvent::CleanupTimer,
-        TimerId::SoloProposal => ProtocolEvent::SoloProposalTimer,
+        TimerId::ProposalPace => ProtocolEvent::ProposalPaceTimer,
         TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
         TimerId::FetchTick => {
             return match owner {

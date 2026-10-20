@@ -10,7 +10,7 @@ use hyperscale_storage::RowState;
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, Heard, PriceTable, ShardId,
     Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -112,6 +112,14 @@ pub trait Cluster {
 
     /// The committed state root at `shard`'s tip, if any host serves it.
     fn committed_state_root(&self, shard: ShardId) -> Option<StateRoot>;
+
+    /// The committed clock of `shard`'s block at `height`: its parent
+    /// QC's weighted timestamp, where a host holds the block. A chain's
+    /// own measure of time between two of its blocks, at the resolution
+    /// of its quorum's votes rather than of a scenario's polls.
+    fn committed_clock(&self, _shard: ShardId, _height: BlockHeight) -> Option<WeightedTimestamp> {
+        None
+    }
 
     /// Whether any host currently serves `shard`.
     fn serves_shard(&self, shard: ShardId) -> bool;

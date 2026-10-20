@@ -184,9 +184,13 @@ impl ShardParticipation {
                 );
                 actions
             }
-            ProtocolEvent::FinalizationsAdmitted { finalizations } => self
-                .shard_coordinator
-                .on_finalizations_admitted(topology_schedule, &finalizations),
+            ProtocolEvent::FinalizationsAdmitted { finalizations } => {
+                let actions = self
+                    .shard_coordinator
+                    .on_finalizations_admitted(topology_schedule, &finalizations);
+                self.shard_coordinator.queue_ready_proposal();
+                actions
+            }
             // Locally assembled from already-verified headers — engage the
             // fence and re-gossip directly (no re-verification needed).
             ProtocolEvent::ShardForkDetected { proof } => {

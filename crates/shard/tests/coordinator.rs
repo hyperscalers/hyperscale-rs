@@ -11,8 +11,8 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats,
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, Round, SafeVoteRegisters, ShardId, TopologySchedule,
-    VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId,
+    BlockHeight, IDLE_PROPOSAL_INTERVAL, LocalTimestamp, Round, SafeVoteRegisters, ShardId,
+    TopologySchedule, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId,
 };
 
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
@@ -45,13 +45,15 @@ fn fresh_coordinator_reports_genesis_chain_state() {
     assert!(!coordinator.is_block_syncing());
 }
 
+/// The first round is the one after the genesis QC, whose leader may
+/// hold an empty block for the idle interval.
 #[test]
-fn current_view_change_timeout_at_initial_round_is_the_default() {
+fn current_view_change_timeout_at_initial_round_is_the_default_and_the_idle_allowance() {
     let coordinator = fresh_coordinator(ShardConsensusConfig::default());
 
     assert_eq!(
         coordinator.current_view_change_timeout(),
-        VIEW_CHANGE_TIMEOUT_DEFAULT
+        VIEW_CHANGE_TIMEOUT_DEFAULT + IDLE_PROPOSAL_INTERVAL
     );
 }
 
