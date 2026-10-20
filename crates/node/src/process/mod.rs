@@ -13,7 +13,7 @@ mod fan_out;
 mod network_handlers;
 mod tx_status;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -29,8 +29,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::{
-    Derivation, Epoch, RatifyPhase, RatifyRound, ShardId, SpcView, TopologySchedule, Transaction,
-    Unresolved, ValidatorId, Verifier,
+    Derivation, Epoch, MAX_TXS_PER_BLOCK, RatifyPhase, RatifyRound, ShardId, SpcView,
+    TopologySchedule, TopologySnapshot, Transaction, Unresolved, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -250,7 +250,19 @@ where
     /// what keeps a fresh claimant from contradicting a pre-crash
     /// signature.
     beacon_signers: Mutex<HashMap<ValidatorId, BeaconSignerSeat>>,
+
+    /// Submissions held while this host seats the reshape successor they
+    /// route to, oldest first. Routing reads the shard map under this
+    /// lock, and every change to that map or to the topology re-routes
+    /// what is held after the change, so a submission is never parked
+    /// behind a change that has already released the queue.
+    parked_submissions: Mutex<VecDeque<Arc<Transaction>>>,
 }
+
+/// How many submissions a host holds while it seats a reshape successor:
+/// one block's worth, since the successor's first block carries no more.
+/// The oldest goes when a new one arrives.
+const MAX_PARKED_SUBMISSIONS: usize = MAX_TXS_PER_BLOCK;
 
 impl<S, N, D> ProcessIo<S, N, D>
 where
@@ -298,6 +310,7 @@ where
             tx_status: Arc::new(TxStatusCache::new()),
             canonical_txs: Arc::new(CanonicalTxs::new()),
             beacon_signers: Mutex::new(HashMap::new()),
+            parked_submissions: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -461,10 +474,16 @@ where
     /// gossip for every destination (hosted or not). Remaining hosted
     /// touched shards admit only (passive co-hosts).
     ///
-    /// If no hosted shard is touched, returns
+    /// If no hosted shard is touched but this host is still seating the
+    /// reshape successor a touched shard is, the submission is parked
+    /// ([`SubmitFanout::Parked`]) and routed again once the host's shards
+    /// or the topology change. No peer runs that successor yet either, so
+    /// gossip to it would reach nobody.
+    ///
+    /// Otherwise, if no hosted shard is touched, returns
     /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
     /// hosted shard, but no shard admits or takes ownership.
-    pub(crate) fn compute_submit_fanout(&self, tx: &Transaction) -> SubmitFanout {
+    pub(crate) fn compute_submit_fanout(&self, tx: &Arc<Transaction>) -> SubmitFanout {
         // Ingress bytes are unverified, and routing is a derivation the
         // envelope has to earn: asking an envelope that derives no
         // routing which shards it touches is asking for an answer it
@@ -487,12 +506,11 @@ where
             );
             return SubmitFanout::Underivable;
         }
-        let topology_snapshot = self.topology_snapshot.load();
-        let touched_shards: Vec<ShardId> = topology_snapshot.all_shards_for_transaction(tx);
-
-        let senders = self.shard_event_senders.load();
-        let mut hosted_touched = senders
-            .keys()
+        let Some((hosted, touched_shards)) = self.route_or_park(tx) else {
+            return SubmitFanout::Parked;
+        };
+        let mut hosted_touched = hosted
+            .iter()
             .copied()
             .filter(|s| touched_shards.contains(s));
 
@@ -502,7 +520,7 @@ where
                 passive: hosted_touched.collect(),
                 touched_shards,
             }
-        } else if let Some(host) = senders.keys().copied().next() {
+        } else if let Some(host) = hosted.first().copied() {
             // No touched shard is hosted, but the host carries some shard
             // it can flush outbound gossip through.
             SubmitFanout::GossipOnly {
@@ -514,6 +532,36 @@ where
             // no pipeline to admit or gossip through.
             SubmitFanout::NoHostedShard
         }
+    }
+
+    /// The shards this host serves and the shards a derived `tx` touches,
+    /// or `None` once `tx` is parked because none of the first is among
+    /// the second and the host is still seating the successor one is.
+    /// Both are read under the parking lock, so a change that releases the
+    /// queue either finds this submission in it or is seen by this read.
+    fn route_or_park(&self, tx: &Arc<Transaction>) -> Option<(Vec<ShardId>, Vec<ShardId>)> {
+        let mut parked = self
+            .parked_submissions
+            .lock()
+            .expect("parked submissions lock");
+        let topology = self.topology_snapshot.load();
+        let touched: Vec<ShardId> = topology.all_shards_for_transaction(tx);
+        let hosted: Vec<ShardId> = self.shard_event_senders.load().keys().copied().collect();
+        if hosted.iter().any(|shard| touched.contains(shard))
+            || !seating_successor(&topology, &hosted, &touched)
+        {
+            return Some((hosted, touched));
+        }
+        if parked.len() >= MAX_PARKED_SUBMISSIONS
+            && let Some(evicted) = parked.pop_front()
+        {
+            tracing::warn!(
+                tx_hash = ?evicted.hash(),
+                "Dropping a parked submission: the queue is full"
+            );
+        }
+        parked.push_back(Arc::clone(tx));
+        None
     }
 
     /// Fan a locally-submitted transaction out via
@@ -592,10 +640,42 @@ where
                     ok = false;
                 }
             }
+            SubmitFanout::Parked => {}
             SubmitFanout::Underivable => ok = false,
         }
         ok
     }
+
+    /// Route every parked submission again against the current shards and
+    /// topology. Whatever the fanout now yields is its answer, a renewed
+    /// park included.
+    pub(crate) fn release_parked_submissions(&self) {
+        let released = std::mem::take(
+            &mut *self
+                .parked_submissions
+                .lock()
+                .expect("parked submissions lock"),
+        );
+        for tx in released {
+            self.submit_transaction(&tx);
+        }
+    }
+}
+
+/// Whether this host is still seating the reshape successor of a shard it
+/// serves, and `touched` reaches that successor: a hosted predecessor
+/// mid-handoff whose trie line holds a touched shard and no other hosted
+/// one. Once the host serves any shard on that line, the handoff it was
+/// waiting on has reached it.
+fn seating_successor(topology: &TopologySnapshot, hosted: &[ShardId], touched: &[ShardId]) -> bool {
+    let on_line = |a: ShardId, b: ShardId| a.is_ancestor_of(b) || b.is_ancestor_of(a);
+    hosted.iter().any(|&predecessor| {
+        topology.reshape_handoff_pending(predecessor)
+            && touched.iter().any(|&shard| on_line(predecessor, shard))
+            && !hosted
+                .iter()
+                .any(|&other| other != predecessor && on_line(predecessor, other))
+    })
 }
 
 impl<S, N, D> ProcessIo<S, N, D>
@@ -728,6 +808,8 @@ where
         self.topology_schedule.store(schedule);
         self.network.update_topology(head);
         self.network.update_routing_committees(routing_committees);
+        drop(applied);
+        self.release_parked_submissions();
     }
 }
 
@@ -772,6 +854,10 @@ pub(crate) enum SubmitFanout {
         /// Every shard the tx touches (declared reads ∪ writes).
         touched_shards: Vec<ShardId>,
     },
+    /// No hosted shard is touched, and this host is still seating the
+    /// reshape successor a touched shard is. The submission waits in
+    /// [`ProcessIo`] until the host's shards or the topology change.
+    Parked,
     /// The host carries no shard at all — a pooled-only beacon follower.
     /// It runs no shard pipeline to admit or gossip through, so a
     /// locally-submitted tx is dropped.

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Receiver, unbounded};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
@@ -20,7 +20,7 @@ use hyperscale_hbor::Capped;
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
-use hyperscale_node::shard::{HostEvent, ShardScopedInput};
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput, ShardScopedInput};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SeatConfig, VnodeInit, VnodeSeat};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
@@ -33,8 +33,9 @@ use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_transactio
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifiable, Verified, genesis_config_hash, shard_prefix_path,
+    NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot, Transaction,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, genesis_config_hash,
+    shard_prefix_path,
 };
 
 const SHARD_A: ShardId = ShardId::leaf(1, 0);
@@ -568,4 +569,143 @@ fn the_last_seat_leaves_only_with_its_loop() {
     let fix = fixture();
     let mut host = fix.shard_a_host(&[]);
     host.remove_vnode(SHARD_A, fix.committee.validator_id(0));
+}
+
+/// The split predecessor a mid-handoff host still serves, its two
+/// children, and an unrelated live leaf.
+const PREDECESSOR: ShardId = ShardId::leaf(1, 0);
+const SUCCESSOR: ShardId = ShardId::leaf(2, 0);
+const UNRELATED: ShardId = ShardId::leaf(2, 2);
+
+impl Fixture {
+    /// A host on a four-leaf trie that still serves `PREDECESSOR`, whose
+    /// children are in the trie but not yet live, beside `UNRELATED`.
+    fn seating_host(
+        &self,
+        event_tx: &Sender<HostEvent>,
+    ) -> NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch> {
+        let validator_set = ValidatorSet::new(
+            (0..4)
+                .map(|i| ValidatorInfo {
+                    validator_id: self.committee.validator_id(i),
+                    public_key: *self.committee.public_key(i),
+                })
+                .collect(),
+        );
+        let committees: BTreeMap<ShardId, Vec<ValidatorId>> = (0..4u64)
+            .map(|i| {
+                let idx = usize::try_from(i).expect("small index");
+                (ShardId::leaf(2, i), vec![self.committee.validator_id(idx)])
+            })
+            .collect();
+        let topology = Arc::new(TopologySnapshot::with_shard_committees(
+            NetworkDefinition::simulator(),
+            4,
+            &validator_set,
+            committees,
+        ));
+        assert!(topology.reshape_handoff_pending(PREDECESSOR));
+        let hosted = [PREDECESSOR, UNRELATED];
+        let registry = Arc::new(HandlerRegistry::new(hosted.into_iter().collect()));
+        let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
+        beacon_storage
+            .commit_beacon_block(&self.genesis_block, &Arc::new(self.genesis_state.clone()));
+        let mut host = NodeHost::new(
+            vec![
+                self.vnode_init(0, PREDECESSOR),
+                self.vnode_init(2, UNRELATED),
+            ],
+            hosted
+                .into_iter()
+                .map(|shard| (shard, SimShardStorage::new(shard_prefix_path(shard))))
+                .collect(),
+            beacon_storage,
+            NetworkDefinition::simulator(),
+            Arc::new(Executor::new(ExecutionMode::Serial)),
+            SimNetworkAdapter::new(registry),
+            SyncDispatch::new(),
+            hosted
+                .into_iter()
+                .map(|shard| (shard, event_tx.clone()))
+                .collect(),
+            event_tx.clone(),
+            Arc::new(ArcSwap::from(topology)),
+            NodeConfig::default(),
+        );
+        host.register_inbound_handlers();
+        host
+    }
+}
+
+/// Submit a transaction touching only `SUCCESSOR`, returning it once the
+/// host has routed it and its channel is drained.
+fn submit_to_successor(
+    host: &mut NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>,
+    event_rx: &Receiver<HostEvent>,
+) -> Arc<Transaction> {
+    let tx = Arc::new(test_transaction(1));
+    let _ = host.step(HostEvent::process(ProcessScopedInput::SubmitTransaction {
+        tx: Arc::clone(&tx),
+    }));
+    while event_rx.try_recv().is_ok() {}
+    tx
+}
+
+/// The shard and input that first carry `tx` out of `event_rx`.
+fn routed(event_rx: &Receiver<HostEvent>, tx: &Transaction) -> Option<(ShardId, ShardScopedInput)> {
+    event_rx.try_iter().find_map(|event| match event {
+        HostEvent::Shard(shard, input) => match &input {
+            ShardScopedInput::AdmitAndGossipTransaction { tx: routed, .. }
+            | ShardScopedInput::GossipTransaction { tx: routed, .. }
+                if routed.hash() == tx.hash() =>
+            {
+                Some((shard, input))
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+#[test]
+fn a_submission_parked_on_a_seating_successor_is_admitted_once_it_attaches() {
+    let fix = fixture();
+    let (event_tx, event_rx) = unbounded();
+    let mut host = fix.seating_host(&event_tx);
+    while event_rx.try_recv().is_ok() {}
+
+    let tx = submit_to_successor(&mut host, &event_rx);
+    host.add_shard(
+        vec![fix.vnode_init(0, SUCCESSOR)],
+        SimShardStorage::new(shard_prefix_path(SUCCESSOR)),
+        event_tx,
+    );
+
+    let (shard, input) = routed(&event_rx, &tx).expect("the attach releases the submission");
+    assert_eq!(
+        shard, SUCCESSOR,
+        "the successor admits what it was held for"
+    );
+    assert!(matches!(
+        input,
+        ShardScopedInput::AdmitAndGossipTransaction { .. }
+    ));
+}
+
+#[test]
+fn a_submission_parked_on_a_seating_successor_is_gossiped_once_its_predecessor_detaches() {
+    let fix = fixture();
+    let (event_tx, event_rx) = unbounded();
+    let mut host = fix.seating_host(&event_tx);
+    while event_rx.try_recv().is_ok() {}
+
+    let tx = submit_to_successor(&mut host, &event_rx);
+    assert!(host.remove_shard(PREDECESSOR).is_some());
+
+    let (shard, input) = routed(&event_rx, &tx).expect("the detach releases the submission");
+    assert_eq!(
+        shard, UNRELATED,
+        "a host seating nothing gossips through what it serves"
+    );
+    assert!(matches!(input, ShardScopedInput::GossipTransaction { .. }));
 }
