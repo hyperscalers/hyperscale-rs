@@ -29,11 +29,9 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{
-    BeaconState, LocalTimestamp, ShardId, TopologySnapshot, ValidatorId, shard_prefix_path,
-};
+use hyperscale_types::{BeaconState, LocalTimestamp, ShardId, TopologySnapshot, ValidatorId};
 
-use super::{SimulationRunner, WriteCrash};
+use super::{SimulationRunner, WriteCrash, open_store};
 
 /// What a crash takes with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +141,11 @@ impl SimulationRunner {
                 .or_insert(prepared.storage);
         }
         if kind == CrashKind::Machine {
+            assert!(
+                self.power_loss,
+                "host {host} lost power in a run whose stores track no durability; \
+                 set SimConfig::power_loss to cut power"
+            );
             // Each store rolls back on its own; the order they do it in
             // reads nothing.
             for (_, store) in self
@@ -273,6 +276,7 @@ impl SimulationRunner {
             .map(|validator| (validator, self.signer_of(validator)))
             .collect();
         let routing = boot_routing(beacon_storage, &self.beacon_network, now);
+        let power_loss = self.power_loss;
         let plan = plan_seats(
             beacon_state,
             &routing,
@@ -282,7 +286,7 @@ impl SimulationRunner {
                 Ok::<_, Infallible>(Arc::new(
                     disk.get(&shard)
                         .cloned()
-                        .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard))),
+                        .unwrap_or_else(|| open_store(shard, power_loss)),
                 ))
             },
         )

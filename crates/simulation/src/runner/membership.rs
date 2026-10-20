@@ -38,9 +38,9 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, history_floor};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId, shard_prefix_path};
+use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId};
 
-use super::SimulationRunner;
+use super::{SimulationRunner, open_store};
 
 /// Drive cap for the snap-sync pump — generous over the dozens of
 /// rounds a small-state bootstrap takes, so exhaustion means a wedge.
@@ -423,7 +423,7 @@ impl SimulationRunner {
                                 > BlockHeight::GENESIS
                                 && !storage.holds_foreign_chain(shard)
                         })
-                        .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
+                        .unwrap_or_else(|| open_store(shard, self.power_loss));
                     self.seat_joined_group(host, shard, &placed, storage);
                     // A join that deferred — no anchor yet, or one whose state
                     // has aged out — seats nothing; the scan runs again next
@@ -526,7 +526,7 @@ impl SimulationRunner {
             .load()
             .boundary(shard)
             .expect("a recovering shard has an attested anchor");
-        let staging = SimShardStorage::new(shard_prefix_path(shard));
+        let staging = open_store(shard, self.power_loss);
         replicate_engine_bootstrap(&staging, &self.genesis_config());
         let Some(mut recovered) =
             self.bootstrap_from_committee(host, shard, anchor, &staging, true)

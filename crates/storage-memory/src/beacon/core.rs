@@ -19,17 +19,25 @@ use hyperscale_types::{
 };
 use im::OrdMap;
 
+use crate::durability::Durability;
+
 /// In-memory implementation of the beacon storage tier.
 ///
 /// Backs `SimulationRunner`'s process-level beacon chain. One
 /// `Arc<SimBeaconStorage>` is shared across every vnode's
 /// `BeaconCoordinator`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SimBeaconStorage {
     pub(super) inner: RwLock<Inner>,
     /// The store as its last synced write left it: what survives a
-    /// machine that loses power. `None` until a write syncs.
-    durable: RwLock<Option<Inner>>,
+    /// machine that loses power.
+    durable: RwLock<Durability<Inner>>,
+}
+
+impl Default for SimBeaconStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -58,22 +66,44 @@ pub(super) struct Inner {
 }
 
 impl SimBeaconStorage {
-    /// Construct an empty in-memory beacon store.
+    /// Construct an empty in-memory beacon store that tracks what its
+    /// syncs make durable, so it can [lose power](Self::lose_unsynced).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::open(Durability::Tracked(None))
+    }
+
+    /// [`Self::new`] for a store that never loses power: its syncs keep
+    /// no image, so its writes copy nothing an image shares, and
+    /// [`Self::lose_unsynced`] panics.
+    #[must_use]
+    pub fn untracked() -> Self {
+        Self::open(Durability::Untracked)
+    }
+
+    fn open(durability: Durability<Inner>) -> Self {
+        Self {
+            inner: RwLock::new(Inner::default()),
+            durable: RwLock::new(durability),
+        }
     }
 
     /// Make every write so far durable, as a synced write does.
     pub(super) fn sync(&self) {
-        let image = read_or_recover(&self.inner).clone();
-        *write_or_recover(&self.durable) = Some(image);
+        write_or_recover(&self.durable).sync(|| read_or_recover(&self.inner).clone());
     }
 
     /// Lose every write since the last synced one, as a machine that
     /// loses power does; a store no write has synced comes back empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store was opened [untracked](Self::untracked).
     pub fn lose_unsynced(&self) {
-        let image = read_or_recover(&self.durable).clone().unwrap_or_default();
+        let image = read_or_recover(&self.durable)
+            .last_synced()
+            .cloned()
+            .unwrap_or_default();
         *write_or_recover(&self.inner) = image;
     }
 }
