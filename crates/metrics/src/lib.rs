@@ -246,14 +246,14 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     /// What a committed block's claims carry that one of the
     /// committed blocks just below it carried too, by kind: cells read
-    /// at one anchor by claims that delete and return nothing, record
-    /// keys read absent, `Never` keys read present, and crossings read
-    /// at the parent.
+    /// at one anchor by claims that delete, return and retire nothing,
+    /// record keys read absent, `Taken` and `Never` keys read present,
+    /// and crossings read at the parent.
     fn record_claims_recarried(
         &self,
         cells: usize,
         deletions: usize,
-        returns: usize,
+        answers: usize,
         local: usize,
     ) {
     }
@@ -326,12 +326,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
 
-    /// A crossing question asked past its transaction's deadline, where
-    /// a push did not answer it, by who asks: the record's producer
-    /// (`"producer"`), of its consumer's answers.
-    fn record_crossing_fallback_ask(&self, asker: &str) {
-        let _ = asker;
-    }
+    /// A retirement offer a proposer carried in a block it proposed,
+    /// whether or not the block commits: the bytes its claims weigh cut
+    /// on their own, proofs included, and the retirements they read.
+    fn record_retirements_spent(&self, bytes: usize, retirements: usize) {}
 
     /// A record a proposing replica pushed to its consumer's shard
     /// again, by its terms (`"owed"` or `"escrowed"`), and by whether
@@ -893,8 +891,8 @@ pub fn record_state_claims_weight(bytes: usize, verdict_bytes: usize) {
 /// Record what a committed block's claims carry that a committed block
 /// just below it carried too.
 #[inline]
-pub fn record_claims_recarried(cells: usize, deletions: usize, returns: usize, local: usize) {
-    recorder().record_claims_recarried(cells, deletions, returns, local);
+pub fn record_claims_recarried(cells: usize, deletions: usize, answers: usize, local: usize) {
+    recorder().record_claims_recarried(cells, deletions, answers, local);
 }
 
 /// Record the verdict cells a committed block's rows heard.
@@ -971,10 +969,10 @@ pub fn record_record_ask() {
     recorder().record_record_ask();
 }
 
-/// Record a crossing question asked past its deadline, by `asker`.
+/// Record a retirement offer a proposer carried.
 #[inline]
-pub fn record_crossing_fallback_ask(asker: &str) {
-    recorder().record_crossing_fallback_ask(asker);
+pub fn record_retirements_spent(bytes: usize, retirements: usize) {
+    recorder().record_retirements_spent(bytes, retirements);
 }
 
 /// Record a record pushed to its consumer's shard again.

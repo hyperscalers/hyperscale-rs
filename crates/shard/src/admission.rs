@@ -1367,14 +1367,15 @@ impl Section for StateClaimsSection {
     /// claim: anchored on another shard more than a horizon before the
     /// block ([`StateClaim::at_boundary`]), naming no member, holding no
     /// value and reading nothing present under a crossing it names but
-    /// that crossing's `Never` ([`StateClaim::reads_as_a_boundary`]). It
-    /// is the reading a commit fold deletes an answer on, and takes a
-    /// record back on, and the anchor it names is one the vote fence
-    /// holds to the boundaries the beacon recorded, which every voter
-    /// has without a header. A `Never` read present under its crossing's
+    /// that crossing's `Taken` or `Never`
+    /// ([`StateClaim::reads_as_a_boundary`]). It is the reading a commit
+    /// fold deletes an answer on, and retires or takes a record back on,
+    /// and the anchor it names is one the vote fence holds to the
+    /// boundaries the beacon recorded, which every voter has without a
+    /// header. A `Taken` or `Never` read present under its crossing's
     /// name is refused at every other anchor of another shard: a
     /// recovery of the shard that wrote it can discard any state of it
-    /// above its last recorded boundary, and with it the `Never`. The
+    /// above its last recorded boundary, and with it the answer. The
     /// class is told from the claim and the block's anchor, so proposer
     /// and voter sort one claim alike. A claim of this shard's own,
     /// anchored at the parent, is no boundary claim however old the
@@ -1496,9 +1497,9 @@ fn certified_below_a_crossed_bridge(ctx: &Committed<'_>, vote_anchor: WeightedTi
 
 /// Why `claim`, anchored anywhere but the block's parent, is refused,
 /// if it is: anchored on this shard, reading a crossing whose key routes
-/// here, reading a crossing's `Never` present at an anchor that is no
-/// boundary of the block, proving nothing, or, short of a boundary
-/// claim, in the band of a recovery of its shard.
+/// here, reading a crossing's `Taken` or `Never` present at an anchor
+/// that is no boundary of the block, proving nothing, or, short of a
+/// boundary claim, in the band of a recovery of its shard.
 fn refused_away_from_the_parent(
     ctx: &Committed<'_>,
     claim: &StateClaim,
@@ -1510,9 +1511,10 @@ fn refused_away_from_the_parent(
     if claim.crossings.iter().any(|(key, _)| routed_here(key)) {
         return Err("reads a crossing of this shard's away from the parent".to_string());
     }
-    if claim.reads_a_never() && !claim.at_boundary(ctx.anchor) {
+    if claim.reads_an_answer() && !claim.at_boundary(ctx.anchor) {
         return Err(
-            "reads a crossing's Never present at an anchor that is no boundary".to_string(),
+            "reads a crossing's Taken or Never present at an anchor that is no boundary"
+                .to_string(),
         );
     }
     claim
@@ -2138,7 +2140,7 @@ mod state_claim_tests {
         let never = id.answer_key(&ProtocolHasher, Answered::Never);
         let bare = proven_claim(counterpart, 9, &[never], &[never]);
         let declined = bare.clone().naming([(never, id)]);
-        assert!(declined.reads_a_never());
+        assert!(declined.reads_an_answer());
         assert!(declined.reads_as_a_boundary());
 
         let at_the_horizon = declined.anchor.ts.plus(RETENTION_HORIZON);
@@ -2161,12 +2163,48 @@ mod state_claim_tests {
             Ok(()),
             "a Never at a boundary is a boundary reading",
         );
+    }
+
+    /// A consumer's `Taken` read present under its crossing's name is
+    /// carried only at a boundary of the shard that wrote it, as its
+    /// `Never` is: refused at an anchor fresh to the block, where a
+    /// recovery of that shard can still discard the take, and admitted
+    /// past the horizon. Unnamed, the cell licenses nothing and is
+    /// admitted fresh.
+    #[test]
+    fn a_fresh_taken_away_from_the_parent_is_refused() {
+        let (_, counterpart) = beside_a_counterpart(WeightedTimestamp::ZERO);
+        let component = |byte: u8| Address::new([byte; 31], AddressClass::Component);
+        let id = CrossingId {
+            producer: component(0x90),
+            consumer: component(0x10),
+            intent: IntentHash(Hash32([0x5F; 32])),
+            local: 0,
+            output: 0,
+        };
         let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
-        let took = proven_claim(counterpart, 9, &[taken], &[taken]).naming([(taken, id)]);
+        let bare = proven_claim(counterpart, 9, &[taken], &[taken]);
+        let took = bare.clone().naming([(taken, id)]);
+        assert!(took.reads_an_answer() && took.reads_as_a_boundary());
+
+        let at_the_horizon = took.anchor.ts.plus(RETENTION_HORIZON);
+        let (fresh, _) = beside_a_counterpart(at_the_horizon);
         assert!(
-            admit(&boundary, &took)
-                .is_err_and(|err| err.contains("no boundary reading of another shard")),
-            "a Taken read present is no boundary reading",
+            admit(&fresh, &took)
+                .is_err_and(|err| err.contains("Taken or Never present at an anchor that is no")),
+            "a fresh Taken is refused",
+        );
+        assert_eq!(
+            admit(&fresh, &bare),
+            Ok(()),
+            "an unnamed presence is opaque"
+        );
+
+        let (boundary, _) = beside_a_counterpart(at_the_horizon.plus(Duration::from_millis(1)));
+        assert_eq!(
+            admit(&boundary, &took),
+            Ok(()),
+            "a Taken at a boundary is a boundary reading",
         );
     }
 

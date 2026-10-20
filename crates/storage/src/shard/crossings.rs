@@ -2,7 +2,8 @@
 //! applied in its commit fold.
 //!
 //! A producer's record is removed once its consumer's `Taken` of the
-//! record's own transaction is read present, and a consumer's answer is
+//! record's own transaction is read present at a boundary the beacon
+//! recorded for the consumer's shard, and a consumer's answer is
 //! removed once the record it answers for is read absent, with its
 //! producing member's exit, at a boundary the beacon recorded for the
 //! record's shard. Each is a value-free write the evidence for is a
@@ -12,12 +13,18 @@
 //! reads the answer, so it is decided here, where the readings meet the
 //! state the block lands on.
 //!
-//! An answer is the one trace that its record was taken or refused. A
-//! recovery of the record's shard discards that shard's chain above its
-//! last recorded boundary, and a retirement discarded with it leaves the
-//! record standing again: with the answer still here the record meets
-//! it, is credited or taken no second time and is retired again. So an
-//! answer goes only on a reading no recovery discards.
+//! A recovery of either shard discards its chain above its last
+//! recorded boundary. So a record goes only on an answer read at a
+//! boundary of the answer's shard, and an answer goes only on its record
+//! read absent at a boundary of the record's shard; where one chain
+//! holds both ends, its parent reads them. A record retired on a `Taken`
+//! the consumer's recovery discarded would leave its value gone and
+//! never arrived; an answer deleted on an absence the producer's
+//! recovery discarded would leave the record standing with nothing to
+//! meet it. A removal its own shard's recovery discards is made again on
+//! the next reading, since what it read still stands: a record standing
+//! again meets the answer still here, is credited or taken no second
+//! time, and is retired again.
 //!
 //! An owed crossing's consumer runs no member either: a valued reading
 //! of the record, with no `Taken` of its transaction standing in the
@@ -421,13 +428,13 @@ pub fn reclaimed(
             let issuer = Issuer::from(cell);
             let never = id.answer_key(&ProtocolHasher, Answered::Never);
             let declined = state_claims.iter().any(|claim| {
-                (claim.anchor.shard == local || claim.at_boundary(anchor))
+                claim.attested(local, anchor)
                     && claim.crossing_of(never) == Some(*id)
                     && claim.answers(id, issuer, Answered::Never)
             });
             let retired = state_claims.iter().any(|claim| {
                 !claim
-                    .retires(|named| (named == id).then_some(issuer))
+                    .retires(local, anchor, |named| (named == id).then_some(issuer))
                     .is_empty()
             });
             declined && !retired
@@ -681,8 +688,9 @@ pub struct CrossingSettlements {
 /// Every key `written` writes is left alone: a receipt is its member's
 /// own decision and always lands.
 ///
-/// - A record whose `Taken` is read present as the answer to it is
-///   removed ([`StateClaim::retires`], over the record `state` holds).
+/// - A record whose `Taken` is read present as the answer to it, at
+///   the parent or at a boundary of the block, is removed
+///   ([`StateClaim::retires`], over the record `state` holds).
 /// - An answer whose record is read absent, under the crossing's name,
 ///   is removed where the claim is anchored on this chain itself (a
 ///   crossing a merge brought together, read at the parent), or where
@@ -715,7 +723,7 @@ pub fn crossing_settlements(
     };
     let mut removed: BTreeSet<SubstateKey> = state_claims
         .iter()
-        .flat_map(|claim| claim.retires(standing))
+        .flat_map(|claim| claim.retires(local, anchor, standing))
         .map(|(key, _)| key)
         .filter(untouched)
         .collect();
@@ -734,9 +742,9 @@ pub fn crossing_settlements(
                 let Some(bytes) = state.cell(answer_key) else {
                     continue;
                 };
-                let deletes = claim.anchor.shard == local
-                    || (claim.at_boundary(anchor)
-                        && CrossingAnswer::from_bytes(&bytes).is_none_or(|answer| {
+                let deletes = claim.attested(local, anchor)
+                    && (claim.anchor.shard == local
+                        || CrossingAnswer::from_bytes(&bytes).is_none_or(|answer| {
                             exit_proven(state_claims, &claim.anchor, &answer)
                         }));
                 if deletes {
@@ -2670,8 +2678,9 @@ mod tests {
     /// transaction outlives the retirement the recovery discarded, so a
     /// reading of the record past its validity end, with no row of its
     /// transaction standing, meets that `Taken` and writes nothing; the
-    /// same `Taken` retires the record again on the recovered chain. A
-    /// `Taken` another transaction left at the key guards nothing of it.
+    /// same `Taken`, read at a boundary of the consumer's shard, retires
+    /// the record again on the recovered chain. A `Taken` another
+    /// transaction left at the key guards nothing of it.
     #[test]
     fn a_record_standing_again_after_its_producers_recovery_is_not_declined() {
         let id = homed_crossing(0x24);
@@ -2699,13 +2708,13 @@ mod tests {
             crossing_settlements(
                 &answer,
                 HOLDER,
-                fresh_to(&answer),
+                past(&answer),
                 &SettledWrites::default(),
                 &producer,
             )
             .removed,
             vec![record],
-            "and retires the record standing again",
+            "and retires the record standing again, read at a boundary",
         );
 
         consumer.0.insert(
@@ -3083,6 +3092,101 @@ mod tests {
             .len(),
             1,
             "a take of another transaction retires nothing of this record",
+        );
+    }
+
+    /// `HOME`'s reading at `height` of `id`'s `Taken`, present as `tx`'s
+    /// take, named for the crossing.
+    fn taken_read(id: &CrossingId, tx: TxHash, height: u64) -> StateClaim {
+        let taken_key = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let taken = id.answer(tx, Answered::Taken, VALIDITY_END_MS).to_bytes();
+        claim_on(
+            HOME,
+            height,
+            vec![(taken_key, Inclusion::Present(jmt_value_hash(&taken)).into())],
+            vec![(taken_key, *id)],
+        )
+    }
+
+    /// The fold retires a record on its consumer's `Taken` read at a
+    /// boundary of the consumer's shard, or at the parent of a chain
+    /// holding both ends, and not on one read fresh off the consumer's
+    /// shard: that `Taken` is one the consumer's recovery can discard.
+    #[test]
+    fn crossing_settlements_retires_only_on_an_attested_taken() {
+        let id = homed_crossing(0x56);
+        let record = id.record_key(&ProtocolHasher);
+        let producer = Cells(BTreeMap::from([(record, escrowed(&id, issuer()))]));
+        let took = taken_read(&id, issuer(), 30);
+        let removed = |claim: &StateClaim, block: WeightedTimestamp| {
+            crossing_settlements(
+                from_ref(claim),
+                HOLDER,
+                block,
+                &SettledWrites::default(),
+                &producer,
+            )
+            .removed
+        };
+        assert!(
+            removed(&took, fresh_to(from_ref(&took))).is_empty(),
+            "a fresh Taken retires nothing",
+        );
+        assert_eq!(
+            removed(&took, past(from_ref(&took))),
+            vec![record],
+            "a Taken at a boundary retires the record",
+        );
+        let at_the_parent = StateClaim {
+            anchor: Anchor {
+                shard: HOLDER,
+                ..took.anchor
+            },
+            ..took
+        };
+        assert_eq!(
+            removed(&at_the_parent, fresh_to(from_ref(&at_the_parent))),
+            vec![record],
+            "and so does one read at the parent",
+        );
+    }
+
+    /// A `Taken` of the record's transaction keeps the record from going
+    /// back on a `Never` beside it only where it would retire it: read
+    /// at a boundary. One read fresh retires nothing, and the return
+    /// stands.
+    #[test]
+    fn a_return_is_blocked_only_by_an_attested_taken() {
+        let id = homed_crossing(0x57);
+        let never = never_read(&id, issuer(), 9);
+        let anchor = past(from_ref(&never));
+        let fresh_take = taken_read(&id, issuer(), 100_000);
+        assert!(
+            !fresh_take.at_boundary(anchor),
+            "the take is fresh to the block"
+        );
+        assert_eq!(
+            reclaimed(
+                &[parent_record(&id, issuer()), never.clone(), fresh_take],
+                HOLDER,
+                anchor,
+            )
+            .len(),
+            1,
+            "a fresh Taken blocks nothing",
+        );
+        assert!(
+            reclaimed(
+                &[
+                    parent_record(&id, issuer()),
+                    never,
+                    taken_read(&id, issuer(), 5)
+                ],
+                HOLDER,
+                anchor,
+            )
+            .is_empty(),
+            "a Taken at a boundary retires the record, which goes back on nothing",
         );
     }
 
@@ -3541,7 +3645,11 @@ mod tests {
             };
             for claim in &claims {
                 prop_assert!(claim.crossings.is_empty() && !claim.holds_a_value());
-                prop_assert!(claim.retires(|_| Some(holder)).is_empty());
+                prop_assert!(
+                    claim
+                        .retires(claim.anchor.shard, claim.anchor.ts, |_| Some(holder))
+                        .is_empty()
+                );
                 prop_assert_eq!(claim.deleting().count(), 0);
             }
             for local in [ELSEWHERE, PRODUCER] {

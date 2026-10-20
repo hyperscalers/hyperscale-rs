@@ -206,7 +206,12 @@ pub struct Metrics {
     /// Fenced claims the read frontier refused from what a validator
     /// held to offer, by what they read.
     pub fenced_claims_refused: CounterVec,
-    pub crossing_fallback_asks: CounterVec,
+    /// Bytes of the retirement offers proposers carried in blocks they
+    /// proposed, proofs included.
+    pub retirement_bytes_spent: Counter,
+    /// Retirements the offers proposers carried in blocks they proposed
+    /// read.
+    pub retirements_spent: Counter,
     /// Records a proposing replica pushed to their consumers again, by
     /// terms and by whether the replica was seated above its chain's
     /// genesis.
@@ -944,10 +949,15 @@ impl Metrics {
             )
             .unwrap(),
 
-            crossing_fallback_asks: register_counter_vec!(
-                "hyperscale_crossing_fallback_asks_total",
-                "Crossing questions asked past their deadline, where no push answered them",
-                &["asker"]
+            retirement_bytes_spent: register_counter!(
+                "hyperscale_retirement_bytes_spent_total",
+                "Bytes of the retirement offers proposers carried in blocks they proposed"
+            )
+            .unwrap(),
+
+            retirements_spent: register_counter!(
+                "hyperscale_retirements_spent_total",
+                "Retirements the offers proposers carried in blocks they proposed read"
             )
             .unwrap(),
 
@@ -1365,13 +1375,13 @@ impl MetricsRecorder for PrometheusRecorder {
         &self,
         cells: usize,
         deletions: usize,
-        returns: usize,
+        answers: usize,
         local: usize,
     ) {
         for (kind, count) in [
             ("cells", cells),
             ("deletions", deletions),
-            ("returns", returns),
+            ("answers", answers),
             ("local", local),
         ] {
             self.metrics
@@ -1461,11 +1471,9 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.record_asks.inc();
     }
 
-    fn record_crossing_fallback_ask(&self, asker: &str) {
-        self.metrics
-            .crossing_fallback_asks
-            .with_label_values(&[asker])
-            .inc();
+    fn record_retirements_spent(&self, bytes: usize, retirements: usize) {
+        self.metrics.retirement_bytes_spent.inc_by(bytes as f64);
+        self.metrics.retirements_spent.inc_by(retirements as f64);
     }
 
     fn record_records_repushed(&self, kind: &str, seated: bool) {

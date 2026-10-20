@@ -188,52 +188,58 @@ impl BoundaryOffer {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let mut carried = Vec::new();
-        for run in keys.chunks(MAX_PROOFS_PER_QUERY) {
-            let (first, last) = (run[0], run[run.len() - 1]);
-            let pieces: Vec<StateClaim> = self
-                .claims
-                .iter()
-                .filter(|claim| {
-                    claim
-                        .cells
-                        .first()
-                        .zip(claim.cells.last())
-                        .is_some_and(|((lo, _), (hi, _))| *lo <= last && first <= *hi)
-                })
-                .filter_map(|claim| claim.restrict(|key| run.binary_search(&key).is_ok()))
-                .collect();
-            match StateClaim::merge(&pieces) {
-                Some(merged) => carried.push(merged),
-                None => carried.extend(pieces),
-            }
-        }
-        carried
+        keys.chunks(MAX_PROOFS_PER_QUERY)
+            .flat_map(|run| self.run_of(run))
+            .collect()
+    }
+
+    /// The claims one run of [`Self::carrying`]'s list rides as: `run`'s
+    /// cells, ascending, cut from the held claims that read them and
+    /// merged into one claim, or the pieces where they do not merge.
+    #[must_use]
+    pub fn run_of(&self, run: &[SubstateKey]) -> Vec<StateClaim> {
+        let (Some(first), Some(last)) = (run.first().copied(), run.last().copied()) else {
+            return Vec::new();
+        };
+        let pieces: Vec<StateClaim> = self
+            .claims
+            .iter()
+            .filter(|claim| {
+                claim
+                    .cells
+                    .first()
+                    .zip(claim.cells.last())
+                    .is_some_and(|((lo, _), (hi, _))| *lo <= last && first <= *hi)
+            })
+            .filter_map(|claim| claim.restrict(|key| run.binary_search(&key).is_ok()))
+            .collect();
+        StateClaim::merge(&pieces).map_or(pieces, |merged| vec![merged])
     }
 }
 
 /// What a block's claims carry, read the one way the commit fold
 /// retires it and a proposer passes it over.
 ///
-/// A deletion is one answer's and a return one record's, whatever
-/// anchor reads it, so [`Self::deletes`] and [`Self::returns`] ask by
-/// key across anchors. `deleted` stays keyed by anchor, as the commit
+/// A deletion is one answer's, and a return or a retirement one record's,
+/// whatever anchor reads it, so [`Self::deletes`] and [`Self::answers`] ask
+/// by key across anchors. `deleted` stays keyed by anchor, as the commit
 /// cut is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CarriedClaims {
     /// The keys of every claim that names no member, by anchor.
     cells: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
-    /// The part of `cells` read by claims that delete and return
-    /// nothing. A deletion's row and marker are read again by the next
-    /// answer of the same transaction, and a `Never` is a return, so
-    /// neither is a cell carried twice.
+    /// The part of `cells` read by claims that delete, return and
+    /// retire nothing. A deletion's row and marker are read again by the
+    /// next answer of the same transaction, and an answer read present
+    /// is a return or a retirement, so neither is a cell carried twice.
     read: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
     /// The record keys read absent under their crossing's name
     /// ([`StateClaim::deleting`]), by anchor.
     deleted: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
-    /// The `Never` keys read present under their crossing's name
-    /// ([`StateClaim::returning`]).
-    returned: BTreeSet<SubstateKey>,
+    /// The answer keys read present under their crossing's name
+    /// ([`StateClaim::answering`]): a `Never` a record is returned on,
+    /// and a `Taken` it is retired on.
+    answered: BTreeSet<SubstateKey>,
     /// The crossings named by claims anchored on the carrying block's
     /// own shard: the ones it reads at its parent.
     local: BTreeSet<CrossingId>,
@@ -243,12 +249,13 @@ pub struct CarriedClaims {
 /// kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Recarried {
-    /// Cells of claims that delete and return nothing, at one anchor.
+    /// Cells of claims that delete, return and retire nothing, at one
+    /// anchor.
     pub cells: usize,
     /// Record keys read absent, at any anchor.
     pub deletions: usize,
-    /// `Never` keys read present.
-    pub returns: usize,
+    /// Answer keys read present.
+    pub answers: usize,
     /// Crossings read at the parent.
     pub local: usize,
 }
@@ -261,7 +268,7 @@ impl CarriedClaims {
         for claim in claims {
             if claim.verdicts.is_empty() {
                 let keys = claim.keys();
-                if claim.deleting().next().is_none() && claim.returning().next().is_none() {
+                if claim.deleting().next().is_none() && claim.answering().next().is_none() {
                     carried
                         .read
                         .entry(claim.anchor)
@@ -279,8 +286,8 @@ impl CarriedClaims {
                     .extend(deleting);
             }
             carried
-                .returned
-                .extend(claim.returning().map(|(never, _)| never));
+                .answered
+                .extend(claim.answering().map(|(answer, _)| answer));
             if claim.anchor.shard == shard {
                 carried
                     .local
@@ -303,7 +310,7 @@ impl CarriedClaims {
         union(&mut self.cells, &other.cells);
         union(&mut self.read, &other.read);
         union(&mut self.deleted, &other.deleted);
-        self.returned.extend(other.returned.iter().copied());
+        self.answered.extend(other.answered.iter().copied());
         self.local.extend(other.local.iter().copied());
     }
 
@@ -333,10 +340,10 @@ impl CarriedClaims {
         self.deleted.values().any(|keys| keys.contains(&record))
     }
 
-    /// Whether `never` is read present.
+    /// Whether `answer`, a `Taken` or a `Never` key, is read present.
     #[must_use]
-    pub fn returns(&self, never: SubstateKey) -> bool {
-        self.returned.contains(&never)
+    pub fn answers(&self, answer: SubstateKey) -> bool {
+        self.answered.contains(&answer)
     }
 
     /// Whether `id` is read at the carrying block's parent.
@@ -347,7 +354,7 @@ impl CarriedClaims {
 
     /// How much of what this carries `earlier` carried too: cells this
     /// reads that `earlier` carried at the same anchor, record keys and
-    /// `Never` keys by key, and crossings read at the parent.
+    /// answer keys by key, and crossings read at the parent.
     #[must_use]
     pub fn recarried(&self, earlier: &Self) -> Recarried {
         let cells = self
@@ -365,7 +372,7 @@ impl CarriedClaims {
                 .into_iter()
                 .filter(|record| earlier.deletes(*record))
                 .count(),
-            returns: self.returned.intersection(&earlier.returned).count(),
+            answers: self.answered.intersection(&earlier.answered).count(),
             local: self.local.intersection(&earlier.local).count(),
         }
     }
@@ -425,6 +432,12 @@ pub fn answer_hashes(id: &CrossingId, issuer: Issuer, answered: Answered) -> Vec
         .iter()
         .map(|value| jmt_value_hash(value))
         .collect()
+}
+
+/// Whether `key` is one of `id`'s two answer keys.
+fn is_answer_key(id: &CrossingId, key: SubstateKey) -> bool {
+    key == id.answer_key(&ProtocolHasher, Answered::Taken)
+        || key == id.answer_key(&ProtocolHasher, Answered::Never)
 }
 
 /// The three keys `id` derives: its record, its `Taken` and its `Never`.
@@ -573,16 +586,32 @@ impl StateClaim {
         block_anchor.elapsed_since(self.anchor.ts) > RETENTION_HORIZON
     }
 
+    /// Whether the claim reads state no recovery of its shard discards,
+    /// for a block of `local`'s chain anchored at `block_anchor`: the
+    /// block's own parent, which every voter re-reads, or a boundary of
+    /// another shard ([`Self::at_boundary`]), which the vote fence holds
+    /// to a boundary the beacon recorded. A recovery discards a shard's
+    /// chain above its last recorded boundary, so a reading at any other
+    /// anchor is one it can discard.
+    ///
+    /// What removes a crossing's value, or its last trace, reads this:
+    /// a record retired on its `Taken`, a record returned on its `Never`
+    /// and an answer deleted on its record's absence.
+    #[must_use]
+    pub fn attested(&self, local: ShardId, block_anchor: WeightedTimestamp) -> bool {
+        self.anchor.shard == local || self.at_boundary(block_anchor)
+    }
+
     /// Whether the claim reads only what a boundary reading may: it
     /// names no member, holds no value, and reads nothing present under
-    /// a crossing it names but that crossing's `Never`.
+    /// a crossing it names but one of that crossing's answers.
     ///
     /// What is left is a record read absent under its crossing's name,
-    /// which an answer is deleted on; a consumer's `Never` read present
-    /// under its crossing's name, which its record is taken back on;
-    /// and cells that name nothing: the member row and the committed
-    /// marker an exit is proven by. An unnamed cell licenses nothing on
-    /// its own at any age.
+    /// which an answer is deleted on; a consumer's `Taken` or `Never`
+    /// read present under its crossing's name, which its record is
+    /// retired or taken back on; and cells that name nothing: the member
+    /// row and the committed marker an exit is proven by. An unnamed cell
+    /// licenses nothing on its own at any age.
     #[must_use]
     pub fn reads_as_a_boundary(&self) -> bool {
         self.verdicts.is_empty()
@@ -592,23 +621,18 @@ impl StateClaim {
                 .iter()
                 .all(|(key, id)| match self.reading(*key) {
                     Some(Inclusion::Absent) => true,
-                    Some(Inclusion::Present(_)) => {
-                        *key == id.answer_key(&ProtocolHasher, Answered::Never)
-                    }
+                    Some(Inclusion::Present(_)) => is_answer_key(id, *key),
                     None => false,
                 })
     }
 
-    /// Whether the claim reads a crossing's `Never` present under that
-    /// crossing's name: the one presence a record is taken back on,
-    /// which is read only at a boundary of the shard that wrote it or at
-    /// the parent of a chain holding both ends.
+    /// Whether the claim reads a crossing's `Taken` or `Never` present
+    /// under that crossing's name: the presences a record is retired or
+    /// taken back on, which are read only at a boundary of the shard
+    /// that wrote them or at the parent of a chain holding both ends.
     #[must_use]
-    pub fn reads_a_never(&self) -> bool {
-        self.crossings.iter().any(|(key, id)| {
-            *key == id.answer_key(&ProtocolHasher, Answered::Never)
-                && matches!(self.reading(*key), Some(Inclusion::Present(_)))
-        })
+    pub fn reads_an_answer(&self) -> bool {
+        self.answering().next().is_some()
     }
 
     /// Whether `key` is a cell of the claim.
@@ -645,10 +669,14 @@ impl StateClaim {
         }
     }
 
-    /// The records the readings retire, each with the transaction whose
+    /// The records the readings retire, for a block of `local`'s chain
+    /// anchored at `block_anchor`, each with the transaction whose
     /// record it is, ascending and each once: the record of a crossing
     /// whose `Taken` is read present as the answer to that record
-    /// ([`Self::answers`]). Every other reading retires nothing.
+    /// ([`Self::answers`]), by a claim read attested
+    /// ([`Self::attested`]). Every other reading retires nothing: a
+    /// `Taken` the consumer's recovery can discard would leave the value
+    /// gone from the record and never arrived.
     ///
     /// `issued` says whose record of a crossing the reader holds: the
     /// record in the state a fold lands on, or the entries a ledger
@@ -662,10 +690,18 @@ impl StateClaim {
     /// absent does to its answers depends on the answers themselves, so
     /// the fold, which reads them, decides it.
     #[must_use]
-    pub fn retires<I>(&self, issued: impl Fn(&CrossingId) -> I) -> Vec<(SubstateKey, TxHash)>
+    pub fn retires<I>(
+        &self,
+        local: ShardId,
+        block_anchor: WeightedTimestamp,
+        issued: impl Fn(&CrossingId) -> I,
+    ) -> Vec<(SubstateKey, TxHash)>
     where
         I: IntoIterator<Item = Issuer>,
     {
+        if !self.attested(local, block_anchor) {
+            return Vec::new();
+        }
         let mut retired: Vec<(SubstateKey, TxHash)> = self
             .crossings
             .iter()
@@ -690,6 +726,16 @@ impl StateClaim {
             (*key == id.record_key(&ProtocolHasher)
                 && self.reading(*key) == Some(Inclusion::Absent))
             .then_some(*key)
+        })
+    }
+
+    /// The answer keys, `Taken` and `Never`, read present under their
+    /// crossing's name, each with that crossing: the records a block
+    /// carrying the claim retires or takes back.
+    pub fn answering(&self) -> impl Iterator<Item = (SubstateKey, CrossingId)> + '_ {
+        self.crossings.iter().filter_map(|(key, id)| {
+            (is_answer_key(id, *key) && matches!(self.reading(*key), Some(Inclusion::Present(_))))
+                .then_some((*key, *id))
         })
     }
 
@@ -898,6 +944,113 @@ mod tests {
             state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
             ts: WeightedTimestamp::ZERO,
         }
+    }
+
+    /// The issuer [`retiring_cases`] reads its crossing's record as.
+    fn issuer() -> Issuer {
+        Issuer {
+            tx: member(1),
+            validity_end_ms: 60_000,
+        }
+    }
+
+    /// A shard other than [`anchor`]'s, which reads that anchor away
+    /// from its parent.
+    const ELSEWHERE: ShardId = ShardId::leaf(1, 1);
+
+    /// A block anchor at which [`anchor`] is a boundary.
+    fn past_the_horizon() -> WeightedTimestamp {
+        WeightedTimestamp::ZERO
+            .plus(RETENTION_HORIZON)
+            .plus(std::time::Duration::from_millis(1))
+    }
+
+    /// A claim at [`anchor`] reading `id`'s `Taken` present as the
+    /// answer to [`issuer`]'s record.
+    fn taking(id: CrossingId) -> StateClaim {
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let took = Inclusion::Present(answer_hashes(&id, issuer(), Answered::Taken)[0]);
+        speaking(vec![(taken, took, Some(id))])
+    }
+
+    /// A claim is attested at the block's own parent, or at a boundary
+    /// of another shard; a fresh reading of another shard is not.
+    #[test]
+    fn attested_is_the_parent_or_a_boundary() {
+        let claim = speaking(vec![(key(1), Inclusion::Absent, None)]);
+        let fresh = WeightedTimestamp::from_millis(1_000);
+        assert!(claim.attested(ShardId::ROOT, fresh), "the parent");
+        assert!(claim.attested(ELSEWHERE, past_the_horizon()), "a boundary");
+        assert!(
+            !claim.attested(ELSEWHERE, fresh),
+            "a fresh reading of another shard",
+        );
+    }
+
+    /// A `Taken` read fresh off another shard retires nothing, however
+    /// it answers the record.
+    #[test]
+    fn a_fresh_taken_retires_nothing() {
+        let id = crossing(0x31);
+        let held = |named: &CrossingId| (*named == id).then_some(issuer());
+        let fresh = WeightedTimestamp::from_millis(1_000);
+        assert!(taking(id).retires(ELSEWHERE, fresh, held).is_empty());
+    }
+
+    /// A `Taken` of the record's own transaction read at a boundary, or
+    /// at the parent, retires the record; nothing else does.
+    #[test]
+    fn a_taken_at_a_boundary_or_the_parent_retires_its_record() {
+        let id = crossing(0x31);
+        let [record, taken, never] = crossing_keys(&id);
+        let held = |named: &CrossingId| (*named == id).then_some(issuer());
+        let boundary = past_the_horizon();
+        let retires = |claim: &StateClaim| claim.retires(ELSEWHERE, boundary, held);
+        let fresh = WeightedTimestamp::from_millis(1_000);
+        assert_eq!(
+            taking(id).retires(ShardId::ROOT, fresh, held),
+            vec![(record, issuer().tx)],
+            "at the parent",
+        );
+        assert_eq!(
+            retires(&taking(id)),
+            vec![(record, issuer().tx)],
+            "at a boundary",
+        );
+        let present = Inclusion::Present([7; 32]);
+        let declined = Inclusion::Present(answer_hashes(&id, issuer(), Answered::Never)[0]);
+        let took = Inclusion::Present(answer_hashes(&id, issuer(), Answered::Taken)[0]);
+        assert!(
+            retires(&speaking(vec![(taken, present, Some(id))])).is_empty(),
+            "a Taken stating any other bytes is no answer to this record",
+        );
+        assert!(
+            taking(id).retires(ELSEWHERE, boundary, |_| None).is_empty(),
+            "and a Taken retires nothing where no record of its crossing is held",
+        );
+        assert!(
+            retires(&speaking(vec![(record, Inclusion::Absent, Some(id))])).is_empty(),
+            "a record read absent retires nothing; its answers are the fold's",
+        );
+        assert!(retires(&speaking(vec![(record, took, Some(id))])).is_empty());
+        assert!(retires(&speaking(vec![(taken, Inclusion::Absent, Some(id))])).is_empty());
+        assert!(retires(&speaking(vec![(never, declined, Some(id))])).is_empty());
+        assert!(retires(&speaking(vec![(taken, took, None)])).is_empty());
+    }
+
+    /// A `Taken` read present under its crossing's name reads as a
+    /// boundary reading, beside a `Never`; a record read present does
+    /// not.
+    #[test]
+    fn a_taken_at_a_boundary_reads_as_a_boundary() {
+        let id = crossing(0x31);
+        let [record, _, never] = crossing_keys(&id);
+        let present = Inclusion::Present([7; 32]);
+        assert!(taking(id).reads_as_a_boundary());
+        assert!(taking(id).reads_an_answer());
+        assert!(speaking(vec![(never, present, Some(id))]).reads_as_a_boundary());
+        assert!(!speaking(vec![(record, present, Some(id))]).reads_as_a_boundary());
+        assert!(!speaking(vec![(record, Inclusion::Absent, Some(id))]).reads_an_answer());
     }
 
     /// A verdict claim names a member and nothing else: a claim naming
@@ -1150,16 +1303,13 @@ mod tests {
         )
     }
 
-    /// A reading names only a crossing that derives its key, and what
-    /// it licenses is read off the identity: a `Taken` present removes
-    /// the record, a record absent removes both answers, and a record
-    /// present, an answer absent, a `Never` present or a bare reading
-    /// remove nothing.
+    /// A reading names only a crossing that derives its key, and only a
+    /// record read absent under its name deletes.
     #[test]
     fn a_reading_speaks_for_the_crossing_that_derives_its_key() {
         let id = crossing(0x31);
         let other = crossing(0x32);
-        let [record, taken, never] = crossing_keys(&id);
+        let [record, taken, _] = crossing_keys(&id);
         let present = Inclusion::Present([7; 32]);
 
         assert!(speaking(vec![(taken, present, Some(id))]).is_well_formed());
@@ -1173,53 +1323,6 @@ mod tests {
                 .is_well_formed(),
             "and only beside a cell the claim reads",
         );
-
-        let issuer = Issuer {
-            tx: member(1),
-            validity_end_ms: 60_000,
-        };
-        let held = |named: &CrossingId| (*named == id).then_some(issuer);
-        let stating = |answered| Inclusion::Present(answer_hashes(&id, issuer, answered)[0]);
-        let (took, declined) = (stating(Answered::Taken), stating(Answered::Never));
-        assert_eq!(
-            speaking(vec![(taken, took, Some(id))]).retires(held),
-            vec![(record, issuer.tx)],
-            "the consumer's Taken of the record's transaction retires the record",
-        );
-        assert!(
-            speaking(vec![(taken, present, Some(id))])
-                .retires(held)
-                .is_empty(),
-            "a Taken stating any other bytes is no answer to this record",
-        );
-        assert!(
-            speaking(vec![(taken, took, Some(id))])
-                .retires(|_| None)
-                .is_empty(),
-            "and a Taken retires nothing where no record of its crossing is held",
-        );
-        assert!(
-            speaking(vec![(record, Inclusion::Absent, Some(id))])
-                .retires(held)
-                .is_empty(),
-            "a record read absent retires nothing; its answers are the fold's",
-        );
-        assert!(
-            speaking(vec![(record, took, Some(id))])
-                .retires(held)
-                .is_empty()
-        );
-        assert!(
-            speaking(vec![(taken, Inclusion::Absent, Some(id))])
-                .retires(held)
-                .is_empty()
-        );
-        assert!(
-            speaking(vec![(never, declined, Some(id))])
-                .retires(held)
-                .is_empty()
-        );
-        assert!(speaking(vec![(taken, took, None)]).retires(held).is_empty());
 
         let deleting: Vec<SubstateKey> = speaking(vec![
             (record, Inclusion::Absent, Some(id)),
@@ -1735,8 +1838,8 @@ mod tests {
             &BTreeMap::from([(older, BTreeSet::from([record]))]),
         );
         assert!(carried.deletes(record) && !carried.deletes(row));
-        assert!(carried.returns(returned.answer_key(&ProtocolHasher, Answered::Never)));
-        assert!(!carried.returns(deleted.answer_key(&ProtocolHasher, Answered::Never)));
+        assert!(carried.answers(returned.answer_key(&ProtocolHasher, Answered::Never)));
+        assert!(!carried.answers(deleted.answer_key(&ProtocolHasher, Answered::Never)));
         assert!(carried.reads_locally(&local));
         assert!(
             !carried.reads_locally(&deleted) && !carried.reads_locally(&returned),
@@ -1803,7 +1906,7 @@ mod tests {
             Recarried {
                 cells: 1,
                 deletions: 1,
-                returns: 1,
+                answers: 1,
                 local: 1,
             },
         );

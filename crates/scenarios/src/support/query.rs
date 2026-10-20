@@ -17,11 +17,12 @@ use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::{ShardChainReader, member_row_leaf};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
-    ExecutionOutcome, Inclusion, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim,
-    StateRoot, SubstateKey, TickLine, TimestampRange, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window,
-    sweep_admits_block, verdict_leaf,
+    ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, PendingReshape, RETENTION_HORIZON, ResourceAddr, ShardId, ShardTrie, Stake,
+    StakePool, StakePoolId, StateClaim, StateRoot, SubstateKey, TickLine, TimestampRange,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, VIEW_CHANGE_TIMEOUT_MAX,
+    ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
+    verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms,
@@ -1157,6 +1158,43 @@ pub(crate) fn epoch_duration_ms<C: Cluster>(c: &C) -> Option<u64> {
     c.beacon_state()
         .map(|state| state.chain_config.epoch_duration_ms)
 }
+
+/// The clock of the boundary the beacon last recorded for `shard`.
+#[must_use]
+pub(crate) fn boundary_clock<C: Cluster + ?Sized>(
+    c: &C,
+    shard: ShardId,
+) -> Option<WeightedTimestamp> {
+    c.beacon_state()
+        .and_then(|state| state.boundaries.get(&shard).map(|b| b.weighted_timestamp))
+}
+
+/// What one hop through a recorded boundary takes on `c`, in its epochs:
+/// a write is covered by its shard's next boundary within an epoch; that
+/// boundary is recorded within one more, and a boundary reading rides
+/// only once older than [`RETENTION_HORIZON`]; and [`HOP_ALLOWANCE`]
+/// covers a proposer failing before it carries the reading, and the
+/// reading's fetch with one retry. A wait on an answer read at a
+/// boundary, a record retired on its consumer's `Taken`, waits one
+/// hop more than a wait on a fresh reading.
+///
+/// # Panics
+///
+/// If the beacon carries no epoch length.
+#[must_use]
+pub(crate) fn retirement_wait<C: Cluster>(c: &C) -> Budget {
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let hop = epoch + epoch.max(RETENTION_HORIZON) + HOP_ALLOWANCE;
+    Budget(u32::try_from(hop.as_millis().div_ceil(epoch.as_millis())).unwrap_or(u32::MAX))
+}
+
+/// What a hop through a recorded boundary allows beside the epochs it
+/// waits: [`VIEW_CHANGE_TIMEOUT_MAX`] for a proposer that fails before
+/// carrying the reading, and two [`MAX_FINALIZATION_DELAY`]s for the
+/// reading's fetch and one retry.
+const HOP_ALLOWANCE: Duration =
+    Duration::from_secs(VIEW_CHANGE_TIMEOUT_MAX.as_secs() + 2 * MAX_FINALIZATION_DELAY.as_secs());
 
 /// The beacon-composed anchor root for `shard` — the `boundaries` `state_root`
 /// a flip must reproduce.

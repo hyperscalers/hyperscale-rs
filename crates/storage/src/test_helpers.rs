@@ -2315,11 +2315,10 @@ impl Settling {
     const BLOCK_ANCHOR_MS: u64 = 500_000;
 
     /// A block at `height` carrying the claims that settle both, each
-    /// naming its crossing: the retired crossing's `Taken` read present
-    /// at an anchor fresh to the block, and the answered crossing's
-    /// record read absent at a boundary of it, beside the row of the
-    /// transaction that answered, read absent there past its validity
-    /// end.
+    /// naming its crossing and read at a boundary of the block: the
+    /// retired crossing's `Taken` read present, and the answered
+    /// crossing's record read absent, beside the row of the transaction
+    /// that answered, read absent there past its validity end.
     fn block(&self, height: u64) -> (Block, FrontierInputs) {
         let counterpart = ShardId::leaf(2, 3);
         let taken = self.retired.answer_key(&ProtocolHasher, Answered::Taken);
@@ -2346,17 +2345,17 @@ impl Settling {
             MerkleInclusionProof::dummy(),
         )
         .naming([(record, self.answered)]);
-        let fresh = StateClaim::new(
-            at(90, Self::BLOCK_ANCHOR_MS - 1_000),
+        let retiring = StateClaim::new(
+            at(8, 8_000),
             [(taken, Inclusion::Present(jmt_value_hash(&took)))],
             MerkleInclusionProof::dummy(),
         )
         .naming([(taken, self.retired)]);
         let anchor = WeightedTimestamp::from_millis(Self::BLOCK_ANCHOR_MS);
-        assert!(boundary.at_boundary(anchor) && !fresh.at_boundary(anchor));
+        assert!(boundary.at_boundary(anchor) && retiring.at_boundary(anchor));
         let block = with_state_claims(
             make_test_block_with_anchor_wt(BlockHeight::new(height), Self::BLOCK_ANCHOR_MS),
-            vec![boundary, fresh],
+            vec![boundary, retiring],
         );
         let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
         (block, inputs)
@@ -2365,11 +2364,11 @@ impl Settling {
 
 /// Shared: a block's claims settle crossings in its commit fold.
 ///
-/// A record whose consumer's `Taken` a claim reads present is removed,
-/// and an answer whose record a claim reads absent at a boundary, its
-/// producing member exited, is removed, under the root the one commit
-/// path prepares and commits; the same block again, with nothing left
-/// to remove, prepares its parent's root.
+/// A record whose consumer's `Taken` a claim reads present at a boundary is
+/// removed, and an answer whose record a claim reads absent at a boundary,
+/// its producing member exited, is removed, under the root the one commit
+/// path prepares and commits; the same block again, with nothing left to
+/// remove, prepares its parent's root.
 ///
 /// # Panics
 ///
@@ -2421,8 +2420,15 @@ where
     S: BoundaryStore + TestStore,
 {
     let settling = Settling::new();
+    // A bystander on each half, so the block leaves the parent's tree
+    // non-empty: an emptied tree's root is no internal node, and two
+    // empty halves compose to none.
+    let mut standing_cells = settling.standing();
+    for bystander in [state_key(0x10, 1), state_key(0x90, 1)] {
+        standing_cells.insert(bystander, Some(vec![1]));
+    }
     let mut writes = StateWrites::default();
-    for (key, value) in settling.standing() {
+    for (key, value) in standing_cells.clone() {
         writes.cells.insert(key, value);
     }
     let receipt = StoredReceipt::new(
@@ -2435,7 +2441,7 @@ where
         }),
     );
     let standing = block_settling(BlockHeight::new(1), vec![receipt]);
-    commit_writes(parent, &SettledWrites::from_absolutes(settling.standing()));
+    commit_writes(parent, &SettledWrites::from_absolutes(standing_cells));
     let still = FrontierInputs::still(ShardId::ROOT);
     left.follow_block_writes(&standing, &[], &still).unwrap();
     right.follow_block_writes(&standing, &[], &still).unwrap();
@@ -2472,6 +2478,7 @@ where
 
     let (block, inputs) = settling.block(2);
     let (_, parent_root) = commit_raising(parent, block.clone(), &inputs);
+    assert_ne!(parent_root, StateRoot::ZERO, "the bystanders keep the tree");
     let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
     let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
     assert!(

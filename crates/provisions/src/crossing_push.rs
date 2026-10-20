@@ -1,15 +1,17 @@
 //! The push of the crossing changes a block made, as self-proving claims
 //! at the block's own anchor, to the shards that read them.
 //!
-//! One push per target shard per block. A record the block wrote goes
-//! to its consumer as a held reading, and a `Taken` it wrote, a
-//! receipt's or its fold's own credit, to its record's producer as a
-//! presence. A `Never` goes to nobody: its producer reads it only at a
-//! boundary of this shard. A record the block removed is
-//! pushed to nobody: its consumer deletes the answer only on the
-//! record read absent at a boundary the beacon recorded, and asks for
-//! that reading itself. A push never carries a reading at another
-//! anchor, so it can be delayed or withheld and never forged.
+//! One push per target shard per block. A record the block wrote goes to
+//! its consumer as a held reading, and a `Taken` it wrote, a receipt's or
+//! its fold's own credit, to its record's producer as a presence: pacing
+//! for the producer's re-push, since the producer retires the record only
+//! on a reading of the `Taken` at a boundary of this shard, which a
+//! recovery of this shard cannot discard. A `Never` goes to nobody: its
+//! producer reads it only at a boundary of this shard. A record the block
+//! removed is pushed to nobody: its consumer deletes the answer only on the
+//! record read absent at a boundary the beacon recorded, and asks for that
+//! reading itself. A push never carries a reading at another anchor, so it
+//! can be delayed or withheld and never forged.
 
 use std::collections::{BTreeMap, HashMap};
 use std::iter::once;
@@ -79,8 +81,11 @@ fn credited<'a>(
 /// The `Taken` answers a block writes are among its settling receipts'
 /// writes, and the ones its fold writes crediting an owed record's
 /// reading, each where `prior` holds no `Taken` of the record's
-/// transaction. A target equal to `local` is left out: the local rule
-/// reads the cell at the parent. A `Never` is pushed to nobody: its
+/// transaction. Each goes to its record's producer as pacing: the
+/// producer retires the record only on a reading of it at a boundary of
+/// this shard, and a fresh one is refused wherever it rides. A target
+/// equal to `local` is left out: the local rule reads the cell at the
+/// parent. A `Never` is pushed to nobody: its
 /// record is taken back only on a reading at a boundary of this shard,
 /// which its producer asks for, and a fresh one is refused wherever it
 /// rides. An answer deleted is not pushed, since nothing reads it; a

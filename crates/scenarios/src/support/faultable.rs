@@ -403,12 +403,13 @@ pub fn committees_on_separate_hosts(
 /// replicas and shards as the counters are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimsRecarried {
-    /// Cells read at one anchor by claims that delete and return nothing.
+    /// Cells read at one anchor by claims that delete, return and retire
+    /// nothing.
     pub cells: u64,
     /// Record keys read absent.
     pub deletions: u64,
-    /// `Never` keys read present.
-    pub returns: u64,
+    /// `Taken` and `Never` keys read present.
+    pub answers: u64,
     /// Crossings read at the parent.
     pub local: u64,
 }
@@ -417,10 +418,10 @@ pub struct ClaimsRecarried {
 /// committed block, and hand the counts back.
 ///
 /// A proposer passes over what the chain to its parent carries, so an
-/// honest run carries no cell and no deletion twice. A return or a
-/// crossing read at the parent that its carrier does not settle is
-/// offered again once the carrier folds, so those two are reported and
-/// not held to zero.
+/// honest run carries no cell and no deletion twice. An answer read
+/// present or a crossing read at the parent that its carrier does not
+/// settle is offered again once the carrier folds, so those two are
+/// reported and not held to zero.
 ///
 /// # Panics
 ///
@@ -430,7 +431,7 @@ pub fn report_claims_recarried(c: &impl FaultableCluster, scenario: &str) -> Cla
     let recarried = ClaimsRecarried {
         cells: c.metric("claims_recarried", Some("cells")),
         deletions: c.metric("claims_recarried", Some("deletions")),
-        returns: c.metric("claims_recarried", Some("returns")),
+        answers: c.metric("claims_recarried", Some("answers")),
         local: c.metric("claims_recarried", Some("local")),
     };
     let blocks = c.metric_count("state_claims_weight", None);
@@ -445,14 +446,14 @@ pub fn report_claims_recarried(c: &impl FaultableCluster, scenario: &str) -> Cla
     println!(
         "{scenario} [claims a committed block carried that one of the four below it carried, \
          summed over replicas and shards, over {blocks} commits]: cells {} ({:.2} a block), \
-         deletions {} ({:.2} a block), returns {} ({:.2} a block), local crossings {} ({:.2} \
+         deletions {} ({:.2} a block), answers {} ({:.2} a block), local crossings {} ({:.2} \
          a block)",
         recarried.cells,
         per_block(recarried.cells),
         recarried.deletions,
         per_block(recarried.deletions),
-        recarried.returns,
-        per_block(recarried.returns),
+        recarried.answers,
+        per_block(recarried.answers),
         recarried.local,
         per_block(recarried.local),
     );

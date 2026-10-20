@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
@@ -1693,8 +1694,8 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
 }
 
 /// The claim a block of the producer's shard carries once the
-/// consumer's `Taken` for `id` is read present at some anchor of the
-/// consumer's, named for the crossing and stating the answer the
+/// consumer's `Taken` for `id` is read present at a boundary of the
+/// consumer's shard, named for the crossing and stating the answer the
 /// consumer writes on reading `record`: what licenses the fold to
 /// remove that record.
 fn taken_read_present(id: CrossingId, consumer: ShardId, record: &[u8]) -> StateClaim {
@@ -1716,18 +1717,20 @@ fn taken_read_present(id: CrossingId, consumer: ShardId, record: &[u8]) -> State
     .naming([(taken, id)])
 }
 
-/// Apply to `store` what the commit fold does for `claims`, and return
-/// what it removed.
+/// Apply to `store` what the commit fold of a block at a boundary of
+/// every one of `claims` does for them, and return what it removed.
 fn fold_settlements(store: &mut MapDb, claims: &[StateClaim]) -> Vec<SubstateKey> {
-    let fresh = claims
+    let boundary = claims
         .iter()
         .map(|claim| claim.anchor.ts)
         .max()
-        .unwrap_or(WeightedTimestamp::ZERO);
+        .unwrap_or(WeightedTimestamp::ZERO)
+        .plus(RETENTION_HORIZON)
+        .plus(Duration::from_millis(1));
     let settled = crossing_settlements(
         claims,
         ShardId::ROOT,
-        fresh,
+        boundary,
         &SettledWrites::default(),
         store,
     );
@@ -1744,7 +1747,8 @@ fn fold_settlements(store: &mut MapDb, claims: &[StateClaim]) -> Vec<SubstateKey
 
 /// Once the recipient's claim is on record, the sender's shard removes
 /// the record it held for it in its commit fold: the block carries the
-/// consumer's `Taken` read present, named for the crossing, and that
+/// consumer's `Taken` read present at a boundary of the consumer's
+/// shard, named for the crossing, and that
 /// reading is the whole licence. No node, no fee, nothing moved, and a
 /// later block with the same reading finds nothing left to remove.
 #[test]
@@ -3142,13 +3146,13 @@ fn naming(metadata: &mut PackageMetadata, event: &str) {
 /// Wait out the compile worker; the bound is a harness valve, not a
 /// verdict — consensus never reads a clock here.
 fn await_code_runnable(executor: &Executor, package: PackageHash) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while executor.package_standing(package) != Availability::Runnable {
         assert!(
             std::time::Instant::now() < deadline,
             "the package's code never became resolvable"
         );
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

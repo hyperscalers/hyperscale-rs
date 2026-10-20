@@ -3320,7 +3320,6 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
         ],
     ),
     ("record_asks", &[None]),
-    ("crossing_fallback_asks", &[Some("producer")]),
     ("records_repushed", &[Some("owed"), Some("escrowed")]),
     ("repush_due", &[None]),
     ("rebuilt_record_entries", &[None]),
@@ -4116,8 +4115,16 @@ impl ClaimBytes {
 
 /// Print, over the whole run, how long answers stood by kind, how long
 /// records waited from their re-push due instant to their retirement,
-/// the records consumers waited on with no arrival, and the re-pushes.
+/// the bytes a carried retirement weighed, the records consumers waited
+/// on with no arrival, and the re-pushes.
 fn report_retirement_figures<C: FaultableCluster>(c: &C, label: &str) {
+    let bytes = c.metric("retirement_bytes_spent", None);
+    let retirements = c.metric("retirements_spent", None);
+    println!(
+        "{label} [retirements carried, every proposer's blocks]: {retirements} retirements in \
+         {bytes} bytes, {} bytes a retirement",
+        mean(bytes, retirements),
+    );
     let at = |metric, kind, q| {
         c.metric_quantile_above(metric, kind, q, f64::NEG_INFINITY)
             .unwrap_or(0.0)
@@ -4487,7 +4494,6 @@ impl CoreLoadRun<'_> {
                 "boundary_cells_asked",
                 "crossing_pushes_dropped",
                 "record_asks",
-                "crossing_fallback_asks",
                 "records_repushed",
                 "repush_due",
                 "rebuilt_record_entries",

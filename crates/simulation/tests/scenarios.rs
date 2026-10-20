@@ -51,11 +51,12 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
-    a_lost_answer_push_is_asked_past_the_deadline, a_mass_decline_brings_every_payment_home,
+    a_lost_answer_push_is_read_at_the_consumers_boundary, a_mass_decline_brings_every_payment_home,
     a_merged_pair_returns_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
     a_payer_spends_beside_its_routes_pending_core, a_priority_is_charged_over_the_table_price,
+    a_producer_that_read_a_discarded_credit_delivers_it_again,
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
     a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
@@ -84,6 +85,7 @@ use hyperscale_scenarios::{
     a_split_under_steady_core_load_lands_without_a_cancel,
     a_sponsor_spends_its_balance_beside_its_held_cores_abort,
     a_stall_past_the_finalization_delay_states_every_member_of_its_tick,
+    a_survivor_that_read_a_discarded_tail_gets_its_escrow_back,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
@@ -92,10 +94,10 @@ use hyperscale_scenarios::{
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
-    a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
+    a_withheld_boundary_read_is_carried_by_an_honest_validator, abort_converges,
     an_abandoned_never_outlives_a_late_record,
     an_answer_goes_at_its_producers_boundary_with_every_push_cut,
-    an_answer_written_past_the_deadline_is_read_on_a_later_ask,
+    an_answer_written_past_the_deadline_is_read_at_a_later_boundary,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     an_unseen_never_goes_once_its_producers_leg_is_fated,
     an_unseen_never_goes_when_its_producer_aborts,
@@ -848,11 +850,6 @@ fn cross_shard_transfer_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cross_shard_transfer(&mut cluster);
-    assert_eq!(
-        cluster.metric("crossing_fallback_asks", None),
-        0,
-        "with no loss the answer and the removal both arrive by push",
-    );
 }
 
 #[test]
@@ -1333,11 +1330,6 @@ fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
 fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
     let mut cluster = venue_cluster(42);
     a_swap_charges_its_caller_its_input_and_one_price(&mut cluster, epochs(40));
-    assert_eq!(
-        cluster.metric("crossing_fallback_asks", None),
-        0,
-        "an escrowed crossing's answers and removals arrive by push",
-    );
 }
 
 #[test]
@@ -1431,11 +1423,6 @@ fn a_route_settles_across_two_venues_sim() {
     println!(
         "two-venue route: {} routes settled in {:?}",
         report.submitted, report.elapsed,
-    );
-    assert_eq!(
-        cluster.metric("crossing_fallback_asks", None),
-        0,
-        "every hop's answers and removals arrive by push",
     );
 }
 
@@ -1891,13 +1878,13 @@ fn a_healed_network_delivers_past_the_old_window_sim() {
 }
 
 #[test]
-fn a_lost_answer_push_is_asked_past_the_deadline_sim() {
+fn a_lost_answer_push_is_read_at_the_consumers_boundary_sim() {
     let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(a_lost_answer_push_is_asked_past_the_deadline);
+    cluster.run_faultable(a_lost_answer_push_is_read_at_the_consumers_boundary);
 }
 
 #[test]
@@ -1911,13 +1898,13 @@ fn a_replica_that_missed_the_credit_commits_it_from_the_block_sim() {
 }
 
 #[test]
-fn a_withheld_fallback_is_asked_by_an_honest_validator_sim() {
+fn a_withheld_boundary_read_is_carried_by_an_honest_validator_sim() {
     let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(a_withheld_fallback_is_asked_by_an_honest_validator);
+    cluster.run_faultable(a_withheld_boundary_read_is_carried_by_an_honest_validator);
 }
 
 #[test]
@@ -1931,13 +1918,13 @@ fn an_answer_goes_at_its_producers_boundary_with_every_push_cut_sim() {
 }
 
 #[test]
-fn an_answer_written_past_the_deadline_is_read_on_a_later_ask_sim() {
+fn an_answer_written_past_the_deadline_is_read_at_a_later_boundary_sim() {
     let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(an_answer_written_past_the_deadline_is_read_on_a_later_ask);
+    cluster.run_faultable(an_answer_written_past_the_deadline_is_read_at_a_later_boundary);
 }
 
 #[test]
@@ -2346,6 +2333,49 @@ seeded!(
     seed_2026 = 2026,
     seed_2027 = 2027,
     seed_45 = 45,
+);
+
+/// [`a_harvested_tick_over_a_discarded_tick_settles_nothing_at_seed`]'s
+/// cluster, with the survivor reading the tail the recovery discards.
+fn a_survivor_that_read_a_discarded_tail_gets_its_escrow_back_at_seed(seed: u64) {
+    let setup = harvested_tick_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        seed,
+        &setup.accounts,
+    );
+    // The fresh chain builds above the harvested tip, at heights the
+    // retained replicas committed the tail nobody served.
+    cluster.runner_mut().permit_forks();
+    cluster.run_faultable(a_survivor_that_read_a_discarded_tail_gets_its_escrow_back);
+}
+
+seeded!(
+    a_survivor_that_read_a_discarded_tail_gets_its_escrow_back_at_seed:
+    seed_7 = 7,
+    seed_42 = 42,
+);
+
+/// A producer that read a credit its consumer's recovery discards, on
+/// dedicated pool hosts, so the fresh committee seats the shard afresh
+/// and harvests it over the network, where the serving cap reaches it.
+fn a_producer_that_read_a_discarded_credit_delivers_it_again_at_seed(seed: u64) {
+    let setup = halt_straddler_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        seed,
+        &setup.accounts,
+    );
+    // The fresh chain builds above the harvested tip, at heights the
+    // retained replicas committed the tail nobody served.
+    cluster.runner_mut().permit_forks();
+    cluster.run_faultable(a_producer_that_read_a_discarded_credit_delivers_it_again);
+}
+
+seeded!(
+    a_producer_that_read_a_discarded_credit_delivers_it_again_at_seed:
+    seed_7 = 7,
+    seed_42 = 42,
 );
 
 /// A provable committee-level fork drives the same full re-draw a halt does,
