@@ -46,6 +46,7 @@ impl ProposalSources<'_> {
             state_claims,
             verdict_claims,
             boundary_claims,
+            retirement_claims,
             abandonment_records,
             local_crossings,
         } = self
@@ -105,6 +106,7 @@ impl ProposalSources<'_> {
             state_claims,
             verdict_claims,
             boundary_claims,
+            retirement_claims,
             local_crossings,
             ready_at,
         }

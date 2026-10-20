@@ -3386,6 +3386,7 @@ impl ShardCoordinator {
             state_claims,
             verdict_claims,
             boundary_claims,
+            retirement_claims,
             local_crossings,
             ready_at: _,
         } = gather(&self.ask_at(
@@ -3426,6 +3427,7 @@ impl ShardCoordinator {
             state_claims,
             verdict_claims,
             &boundary_claims,
+            &retirement_claims,
             &capped,
             local_crossings,
             &finalizations,
@@ -7152,7 +7154,7 @@ impl ShardCoordinator {
         record_claims_recarried(
             recarried.cells,
             recarried.deletions,
-            recarried.returns,
+            recarried.answers,
             recarried.local,
         );
     }

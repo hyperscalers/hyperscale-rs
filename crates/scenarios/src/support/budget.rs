@@ -9,6 +9,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Budget(pub u32);
 
+impl std::ops::Add for Budget {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+}
+
 /// A [`Budget`] of `n` epochs.
 #[must_use]
 pub const fn epochs(n: u32) -> Budget {

@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::tick_select::{awaited_core, member_of};
@@ -22,7 +23,9 @@ use crate::route::{FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, sponsor, stand_up_venu
 use crate::straddler::{STRADDLER_PAYMENT, chain_settled, isolate_crossing_intake};
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::{FaultableCluster, report_crossing_measures};
-use crate::support::query::{beacon_epoch, clock, epoch_duration_ms, vault_balance};
+use crate::support::query::{
+    beacon_epoch, clock, epoch_duration_ms, retirement_wait, vault_balance,
+};
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, HaltStraddlerSetup, HarvestedTickSetup, PaymentLeg, account_shard,
     build_composed_tx, build_probe_transfer_tx, build_route_tx,
@@ -1297,6 +1300,232 @@ pub fn a_harvested_tick_over_a_discarded_tick_settles_nothing<C: FaultableCluste
     assert!(
         !delivered_and_returned(c),
         "the escrow is both delivered and credited back",
+    );
+}
+
+/// A survivor that read a tail its counterpart's recovery discards keeps
+/// the escrow it holds there, and gets it back once the recovered chain
+/// refuses the transfer.
+///
+/// [`a_harvested_tick_over_a_discarded_tick_settles_nothing`] without the
+/// survivor's crossing intake cut: the tail holding `K`'s finalization
+/// commits before the halt, and the survivor reads `K`'s `Taken` there
+/// fresh, off a chain above the halting shard's last recorded boundary.
+/// It retires nothing on that reading, so its escrow record stands. The
+/// recovered shard settles `K` as an abort and declines the record, and
+/// the survivor reads the `Never` at a boundary of the recovered shard
+/// and credits the escrow back to its source.
+///
+/// # Panics
+///
+/// As that scenario, but for the survivor's cut, and if the source is
+/// not credited back.
+pub fn a_survivor_that_read_a_discarded_tail_gets_its_escrow_back<C: FaultableCluster>(c: &mut C) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = harvested_tick_setup();
+    split_lifecycle(c);
+    let (_, payer) = &setup.payer;
+    let (_, source) = &setup.source;
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [*payer, setup.beneficiary, *source, setup.recipient].map(PrincipalAddr::address),
+        [],
+    );
+    let mut charges = Charges::default();
+
+    let hosts = c.committee_hosts(halted);
+    let UncertifiedTicks {
+        j,
+        j_at,
+        k,
+        k_at,
+        k_lapse,
+    } = commit_over_uncertified_ticks(c, halted, &setup, &mut charges, &hosts);
+
+    // Both ticks certify once the votes flow, and their finalizations
+    // land above `K`'s tick, in the tail the cap keeps from the harvest.
+    // The survivor reads that tail before the halt.
+    c.clear_drops();
+    let in_flight = |c: &C, tx: TxHash| tick_of(c, halted, tx).is_some();
+    assert!(
+        c.run_until(epochs(2), |c| !in_flight(c, j) && !in_flight(c, k)),
+        "both ticks must certify once the votes flow",
+    );
+    let cap = c.cap_block_serving(halted, k_at);
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    await_halt_recovery(c, &halt);
+    assert!(
+        cap.fired() > 0,
+        "the harvest must have been refused a block above {k_at:?}",
+    );
+    c.clear_drops();
+
+    let frontier = c
+        .beacon_state()
+        .and_then(|state| state.latest_completed_recovery(halted))
+        .expect("a cleared recovery leaves its completed record")
+        .attested_frontier;
+    assert!(
+        j_at <= frontier && frontier < k_at,
+        "the recovery's frontier {frontier:?} must stand at or above the payer's payment \
+         at {j_at:?} and below the transfer's tick at {k_at:?}",
+    );
+
+    assert_discarded_ticks_end(c, halted, k_at, k_lapse, j, k);
+
+    let delivered_and_returned = |c: &C| {
+        vault_balance(c, halted, setup.recipient) == 10 + HARVESTED_PAYMENT
+            && vault_balance(c, survivor, *source) == 10_000
+    };
+    assert!(
+        !delivered_and_returned(c),
+        "the escrow is both delivered and credited back",
+    );
+    assert!(
+        c.run_until(epochs(8) + retirement_wait(c), |c| vault_balance(
+            c, survivor, *source
+        ) == 10_000),
+        "the survivor's escrow for a transfer its counterpart's recovered chain aborted is \
+         credited back to its source: source holds {}, recipient holds {}",
+        vault_balance(c, survivor, *source),
+        vault_balance(c, halted, setup.recipient),
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a survivor that read a discarded tail",
+    );
+    assert!(
+        !delivered_and_returned(c),
+        "the escrow is both delivered and credited back",
+    );
+}
+
+/// A producer that read its consumer's `Taken` of a credit the
+/// consumer's recovery discards delivers the credit again.
+///
+/// The survivor pays a transfer into the halting shard, an owed
+/// crossing, just past a boundary the beacon recorded for the halting
+/// shard. The halting shard's fold credits the recipient and writes the
+/// `Taken`, and the survivor reads the `Taken`'s push, fresh, off a
+/// chain above that boundary. Every host serving the halting shard is
+/// capped to serve no block from the transfer's submission up, so the
+/// fresh committee harvests a tip without the credit. The shard freezes
+/// and recovers on that tip.
+///
+/// The survivor retired nothing on the fresh `Taken`, so its record
+/// stands and is pushed again. The recovered shard's fold credits the
+/// recipient once, on the record it reads with no `Taken` of the
+/// transfer standing, and the survivor retires the record on the new
+/// `Taken` read at a boundary of the recovered shard. The world settles.
+///
+/// Requires [`halt_straddler_setup`] at genesis and two committees'
+/// worth of pool surplus.
+///
+/// # Panics
+///
+/// Panics if the transfer does not commit or credit before the halt, if
+/// the cap never refuses a block, if the recovery's frontier is not
+/// below the credit, if the recipient is not credited exactly once or
+/// the record is not retired after the recovery, or if the world does
+/// not settle.
+pub fn a_producer_that_read_a_discarded_credit_delivers_it_again<C: FaultableCluster>(c: &mut C) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let HaltStraddlerSetup { straddlers, .. } = halt_straddler_setup();
+    split_lifecycle(c);
+    let Some((payer_key, payer, _, recipient)) = straddlers.into_iter().next() else {
+        panic!("the setup grinds straddlers");
+    };
+    assert!(
+        account_shard(payer.address(), 2) == survivor
+            && account_shard(recipient.address(), 2) == halted,
+        "the first straddler pays from the survivor into the halting shard",
+    );
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [payer, recipient].map(PrincipalAddr::address),
+        [],
+    );
+    let mut charges = Charges::default();
+    let recorded = |c: &C| {
+        c.beacon_state().and_then(|state| {
+            state
+                .boundaries
+                .get(&halted)
+                .map(|boundary| boundary.height)
+        })
+    };
+
+    // Just past a newly recorded boundary, so the credit lands above it
+    // and the shard halts before the next.
+    let before = recorded(c);
+    assert!(
+        c.run_until(epochs(2), |c| recorded(c) != before),
+        "the beacon records a boundary of the halting shard",
+    );
+    let uncredited = c.committed_height(halted).expect("the halting shard runs");
+    let tx = charges.submit(
+        c,
+        build_transfer_tx(
+            &payer_key,
+            payer,
+            recipient,
+            STRADDLER_PAYMENT,
+            validity_around(c.now()),
+        ),
+    );
+    let [record] = charges.records(c)[..] else {
+        panic!("a transfer crosses once");
+    };
+    let credited = |c: &C| vault_balance(c, halted, recipient) == 10 + STRADDLER_PAYMENT;
+    assert!(
+        c.run_until(epochs(2), credited),
+        "the halting shard's fold credits the recipient: {:?}",
+        c.tx_status(tx),
+    );
+    let stands = |c: &C| c.substate(survivor, record.owner, record.local.0).is_some();
+    let read_by = c.now() + Duration::from_secs(5);
+    let _ = c.run_until(epochs(1), |c| c.now() >= read_by);
+
+    let cap = c.cap_block_serving(halted, uncredited);
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    await_halt_recovery(c, &halt);
+    assert!(
+        cap.fired() > 0,
+        "the harvest must have been refused a block above {uncredited:?}",
+    );
+    c.clear_drops();
+    let frontier = c
+        .beacon_state()
+        .and_then(|state| state.latest_completed_recovery(halted))
+        .expect("a cleared recovery leaves its completed record")
+        .attested_frontier;
+    assert!(
+        frontier <= uncredited,
+        "the recovery's frontier {frontier:?} must stand below the credit, above {uncredited:?}",
+    );
+
+    assert!(
+        c.run_until(epochs(8) + retirement_wait(c), |c| credited(c)
+            && !stands(c)),
+        "the recovered shard credits the recipient again and the survivor retires the \
+         record: recipient holds {}, record stands {}",
+        vault_balance(c, halted, recipient),
+        stands(c),
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a producer that read a discarded credit",
+    );
+    assert!(
+        credited(c),
+        "the recipient is credited exactly once: holds {}",
+        vault_balance(c, halted, recipient),
     );
 }
 

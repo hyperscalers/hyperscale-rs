@@ -29,8 +29,8 @@ use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
     Cluster, Crash, CrashableCluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, SWAPPERS,
     ScenarioConfig, VENUE_SHARD, a_late_settled_nullifier_still_refuses_its_intent,
-    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
-    venue_genesis_accounts,
+    a_rejoined_producer_reads_a_lost_answer_at_a_boundary, epochs, grind_onto, split_lifecycle,
+    stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
@@ -1070,31 +1070,33 @@ fn a_restarted_or_snap_synced_replica_folds_the_same_reclaim() {
     }
 }
 
-/// A payer replica restarted past a crossing's deadline asks the answer
-/// whose push was lost at once, carrying no backoff across the restart.
+/// A payer replica restarted past a crossing's deadline reads the
+/// answer whose push was lost at a boundary of the consumer's shard at
+/// once, carrying nothing across the restart.
 #[test]
-fn a_restarted_producer_asks_a_lost_answer_at_once() {
+fn a_restarted_producer_reads_a_lost_answer_at_a_boundary() {
     let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &venue_config(),
         42,
         &cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(|c| {
-        a_rejoined_producer_asks_a_lost_answer(c, |c, host, _| c.restart_host(host));
+        a_rejoined_producer_reads_a_lost_answer_at_a_boundary(c, |c, host, _| c.restart_host(host));
     });
 }
 
-/// A payer replica snap-synced past a crossing's deadline asks the
-/// answer whose push was lost at once, off the rows it imported.
+/// A payer replica snap-synced past a crossing's deadline reads the
+/// answer whose push was lost at a boundary of the consumer's shard at
+/// once, off the rows it imported.
 #[test]
-fn a_snap_synced_producer_asks_a_lost_answer_at_once() {
+fn a_snap_synced_producer_reads_a_lost_answer_at_a_boundary() {
     let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &venue_config(),
         42,
         &cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(|c| {
-        a_rejoined_producer_asks_a_lost_answer(c, |c, host, shard| {
+        a_rejoined_producer_reads_a_lost_answer_at_a_boundary(c, |c, host, shard| {
             c.resync_host(host, shard);
         });
     });

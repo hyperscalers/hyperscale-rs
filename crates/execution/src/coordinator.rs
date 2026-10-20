@@ -12645,14 +12645,12 @@ mod tests {
             &present_keys,
             &[claim, decline],
         );
-        assert_eq!(
+        assert!(
             state_proof_fetches(&opened)
                 .iter()
-                .filter(|(_, keys)| keys.contains(&claim))
-                .count(),
-            1,
-            "the shard asks whoever holds the claim's prefix, once: the leaf asks \
-             only where no entry of its own is already asking",
+                .all(|(_, keys)| !keys.contains(&claim) && !keys.contains(&decline)),
+            "a fresh header is asked neither answer: a record's answers are read at its \
+             consumer's boundaries",
         );
         let id = CrossingId::of_record(record_key.owner, &cell);
         let actions = commit_carrying(
@@ -12736,7 +12734,8 @@ mod tests {
     /// record the first one issued. That entry asks only for its own
     /// transaction's answers and settles nothing of the first's record,
     /// so with the first's entry gone the leaf still asks the record's
-    /// consumer whether it took the record.
+    /// consumer whether it took the record, at the consumer's boundaries,
+    /// and asks a fresh header of neither answer.
     #[test]
     fn a_record_beside_another_transactions_entry_is_still_asked_about() {
         let schedule = two_shard_topology();
@@ -12788,14 +12787,15 @@ mod tests {
         };
         state.proven_anchors().record(anchor);
         let opened = state.on_committed_remote_header(&schedule, anchor);
-        assert_eq!(
+        assert!(
+            state.counterparts.asks_at_boundaries(claim),
+            "the leaf asks the record's consumer whether it took the record",
+        );
+        assert!(
             state_proof_fetches(&opened)
                 .iter()
-                .filter(|(_, keys)| keys.contains(&claim) && !keys.contains(&decline))
-                .count(),
-            1,
-            "the leaf asks the record's consumer whether it took the record, and asks its \
-             decline of no fresh header: {opened:?}",
+                .all(|(_, keys)| !keys.contains(&claim) && !keys.contains(&decline)),
+            "and asks a fresh header of neither answer: {opened:?}",
         );
 
         state.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
@@ -13881,11 +13881,11 @@ mod tests {
         (transaction, figures, claim, state)
     }
 
-    /// A consumer's claim proved present, named for its crossing, is
-    /// what settles the record: the commit fold removes it, the entry
-    /// that issued it closes as the transaction accepted, and no member
-    /// is composed. The committed claim is the whole of the evidence: no
-    /// certificate is fetched after it.
+    /// A consumer's claim proved present at a boundary of its shard, named
+    /// for its crossing, is what settles the record: the commit fold
+    /// removes it, the entry that issued it closes as the transaction
+    /// accepted, and no member is composed. The committed claim is the
+    /// whole of the evidence: no certificate is fetched after it.
     #[test]
     fn a_claim_proved_present_settles_the_record_in_the_fold() {
         let schedule = two_shard_topology();
@@ -13914,7 +13914,7 @@ mod tests {
         );
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
         let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
-        let (bundle, opened) = proven_at(
+        let (bundle, _) = proven_at(
             &mut state,
             &schedule,
             PEER,
@@ -13923,18 +13923,26 @@ mod tests {
             &[claim],
             &[claim],
         );
+        let fresh = commit_carrying(
+            &mut state,
+            &schedule,
+            1,
+            probed_wt.as_millis(),
+            vec![bundle.clone().naming([(claim, crossing)])],
+        );
         assert!(
-            state_proof_fetches(&opened)
-                .iter()
-                .any(|(at, keys)| *at == bundle.anchor && keys.contains(&claim)),
-            "the claim is asked about"
+            !fresh.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::TransactionsResolved { .. })
+            )) && state.counterparts.ledger.contains(tx_hash),
+            "a claim read fresh off the consumer's shard settles nothing",
         );
 
         let folded = commit_carrying(
             &mut state,
             &schedule,
-            1,
-            probed_wt.as_millis(),
+            2,
+            probed_wt.plus(RETENTION_HORIZON).as_millis() + 1,
             vec![bundle.naming([(claim, crossing)])],
         );
         assert!(
@@ -14009,7 +14017,7 @@ mod tests {
                 &mut state,
                 &schedule,
                 1,
-                probed_wt.as_millis(),
+                probed_wt.plus(RETENTION_HORIZON).as_millis() + 1,
                 vec![bundle.naming([(claim, crossing)])],
             )
         });

@@ -62,10 +62,13 @@ pub use faults::{
     a_halt_recovery_with_answers_in_its_suffix_completes,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
     a_harvested_tick_over_a_discarded_tick_settles_nothing,
-    a_silent_sibling_holds_no_more_than_a_quarter, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_header_fetch_fallback,
-    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    a_producer_that_read_a_discarded_credit_delivers_it_again,
+    a_silent_sibling_holds_no_more_than_a_quarter,
+    a_survivor_that_read_a_discarded_tail_gets_its_escrow_back,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
+    cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, gossip_drop_engages_fetch_fallback,
     halted_shard_recovers_by_committee_redraw,
@@ -89,11 +92,12 @@ pub use payer_floor::{
     publish_beside_spend_genesis_accounts,
 };
 pub use pushes::{
-    a_lost_answer_push_is_asked_past_the_deadline, a_rejoined_producer_asks_a_lost_answer,
+    a_lost_answer_push_is_read_at_the_consumers_boundary,
+    a_rejoined_producer_reads_a_lost_answer_at_a_boundary,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
-    a_withheld_fallback_is_asked_by_an_honest_validator,
+    a_withheld_boundary_read_is_carried_by_an_honest_validator,
     an_answer_goes_at_its_producers_boundary_with_every_push_cut,
-    an_answer_written_past_the_deadline_is_read_on_a_later_ask,
+    an_answer_written_past_the_deadline_is_read_at_a_later_boundary,
 };
 pub use reshape::{
     MAX_REPLAY_PROBES, grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,

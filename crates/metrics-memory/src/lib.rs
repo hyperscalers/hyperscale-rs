@@ -429,13 +429,13 @@ impl MetricsRecorder for MemoryRecorder {
         &self,
         cells: usize,
         deletions: usize,
-        returns: usize,
+        answers: usize,
         local: usize,
     ) {
         for (kind, count) in [
             ("cells", cells),
             ("deletions", deletions),
-            ("returns", returns),
+            ("answers", answers),
             ("local", local),
         ] {
             self.inc("claims_recarried", Some(kind), count as u64);
@@ -504,8 +504,9 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("record_asks", None, 1);
     }
 
-    fn record_crossing_fallback_ask(&self, asker: &str) {
-        self.inc("crossing_fallback_asks", Some(asker), 1);
+    fn record_retirements_spent(&self, bytes: usize, retirements: usize) {
+        self.inc("retirement_bytes_spent", None, bytes as u64);
+        self.inc("retirements_spent", None, retirements as u64);
     }
 
     // A series here holds one label, so the `seated` label a
