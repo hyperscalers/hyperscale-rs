@@ -21,8 +21,8 @@ use hyperscale_metrics::{
     record_answer_life, record_boundary_cells_asked, record_boundary_claims_carried,
     record_boundary_drained, record_decline_folded, record_fenced_claim,
     record_rebuilt_record_entry, record_reclaim_folded, record_records_repushed, record_repush_due,
-    record_retirement_wait, record_sibling_absence_read, record_sibling_question_pending,
-    set_standing_answers, set_wanted_records,
+    record_retirement_carry_wait, record_retirement_wait, record_sibling_absence_read,
+    record_sibling_question_pending, set_standing_answers, set_wanted_records,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
@@ -1907,6 +1907,17 @@ pub struct Counterparts {
     /// once. One entry at most per carried record.
     repushed: BTreeMap<SubstateKey, Option<(BlockHeight, u32)>>,
 
+    /// The height of the last block this account folded when each
+    /// record's consumer's `Taken` was first held here at a boundary, by
+    /// record key: what a retirement's carry wait is counted from.
+    /// Dropped where a block retires the record, counting the wait, and
+    /// where its row goes otherwise, counting nothing. Node-local, so a
+    /// new account starts with none.
+    retirement_held: BTreeMap<SubstateKey, BlockHeight>,
+
+    /// The height of the last block this account folded.
+    folded: BlockHeight,
+
     /// Whether the first block this account folded stood above its
     /// chain's genesis: neither the genesis block nor a block over the
     /// genesis QC. A validator that took its seat, or restarted, mid
@@ -2012,6 +2023,8 @@ impl Counterparts {
             boundary_asked: BTreeMap::new(),
             boundaries: BoundaryClaims::default(),
             repushed: BTreeMap::new(),
+            retirement_held: BTreeMap::new(),
+            folded: BlockHeight::GENESIS,
             seated: None,
             clock: WeightedTimestamp::ZERO,
             frontier,
@@ -2048,6 +2061,7 @@ impl Counterparts {
     ) -> CommitFolded {
         let windows = topology_schedule.windows();
         self.clock = now;
+        self.folded = block.height();
         self.seated.get_or_insert_with(|| {
             !(block.is_genesis() || block.header().parent_qc().is_genesis())
         });
@@ -2078,6 +2092,7 @@ impl Counterparts {
             if let Some(carried) = self.rows.carried.get(&record) {
                 record_retirement_wait(millis(now.elapsed_since(carried.due_from)));
             }
+            self.carried_retirement(record, block.height());
         }
         // What the fold takes back is marked returned on the entry that
         // issued it: a record returned on its consumer's `Never` closes
@@ -2455,6 +2470,8 @@ impl Counterparts {
         let carried = &self.rows.carried;
         self.repushed
             .retain(|record, _| carried.contains_key(record));
+        self.retirement_held
+            .retain(|record, _| carried.contains_key(record));
         let settling: BTreeSet<CrossingId> = self
             .rows
             .settling
@@ -2505,6 +2522,15 @@ impl Counterparts {
                 self.clock,
                 self.index.as_ref(),
             )
+    }
+
+    /// Count the blocks from the last block folded when `record`'s
+    /// consumer's `Taken` was first held here to `height`, the block that
+    /// carried it, where one was held.
+    fn carried_retirement(&mut self, record: SubstateKey, height: BlockHeight) {
+        if let Some(held) = self.retirement_held.remove(&record) {
+            record_retirement_carry_wait(height.inner().saturating_sub(held.inner()));
+        }
     }
 
     /// The records to push to their consumers again at `height`, by the
@@ -2817,6 +2843,18 @@ impl Counterparts {
         // what else they read here may be needed by none.
         for key in &refuted {
             self.rows.unread_with(*key);
+        }
+        for key in &kept {
+            if let Some(ask) = self
+                .rows
+                .answer_asks
+                .get(key)
+                .filter(|ask| ask.answered == Answered::Taken)
+            {
+                self.retirement_held
+                    .entry(ask.id.record_key(&ProtocolHasher))
+                    .or_insert(self.folded);
+            }
         }
         self.boundaries.hold(anchor, &asked, claim, refuted);
         asked
@@ -4861,6 +4899,135 @@ mod tests {
             vec![(next, both)],
             "the record put back is asked at the holder's next boundary",
         );
+    }
+
+    /// A retirement's carry wait counts the blocks from the last block
+    /// folded when its consumer's `Taken` was first held to the block
+    /// that carries it, read off that block whether or not a ledger entry
+    /// names the record: held after one commit and carried by the next is
+    /// a wait of one. A record whose row goes otherwise counts nothing.
+    #[test]
+    fn a_carried_retirement_records_its_carry_wait_from_its_first_hold() {
+        let rows = Arc::new(TestRows::default());
+        let (mut producer, id, cell, taken, never) = escrowed_producer(&rows, 0x69, 36_000);
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let both = sorted(vec![taken, never]);
+        let (boundary, proof) =
+            answered_at(&id, &cell, &[(Answered::Taken, cell.tx)], &both, 40, 60_000);
+        let schedule = recording(&[boundary]);
+        let past = boundary
+            .ts
+            .plus(RETENTION_HORIZON)
+            .plus(Duration::from_secs(1));
+        let commit = |producer: &mut Counterparts, height: u64, claims: Vec<StateClaim>| {
+            let block = block_carrying(PRODUCER, height, past, claims);
+            let _ = producer.on_commit(&trie, &schedule, &block, past, &[]);
+        };
+        commit(&mut producer, 10, Vec::new());
+        producer.on_proof_fetched(boundary, &both, &proof, &[]);
+        let record = id.record_key(&ProtocolHasher);
+        assert_eq!(
+            producer.retirement_held.get(&record),
+            Some(&BlockHeight::new(10)),
+            "held after the commit at 10",
+        );
+        let carried = producer.offers(&CarriedClaims::default()).retirement_claims[0].carrying(1);
+        let recorder = MemoryRecorder::new();
+        with_recorder(&recorder, || commit(&mut producer, 11, carried));
+        assert!(
+            producer.ledger.issuers_of(&id).is_empty(),
+            "no ledger entry names it"
+        );
+        assert_eq!(recorder.histogram_count("retirement_carry_wait", None), 1);
+        assert_eq!(
+            recorder.histogram_sum("retirement_carry_wait", None),
+            1.0,
+            "held and carried within one commit interval",
+        );
+
+        let (other_id, other_cell, other_taken, other_never) = {
+            let cell = CrossingCell {
+                terms: Terms::Escrowed {
+                    credit: producer_record(0x6C),
+                },
+                validity_end_ms: 36_000,
+                ..producer_cell(0x6B, Deadline::of(WeightedTimestamp::from_millis(36_000)))
+            };
+            let id = CrossingId::of_record(producer_record(0x6B).owner, &cell);
+            rows.put(id.record_key(&ProtocolHasher), cell.to_bytes());
+            (
+                id,
+                cell,
+                id.answer_key(&ProtocolHasher, Answered::Taken),
+                id.answer_key(&ProtocolHasher, Answered::Never),
+            )
+        };
+        commit(&mut producer, 12, Vec::new());
+        let other = sorted(vec![other_taken, other_never]);
+        let (later, other_proof) = answered_at(
+            &other_id,
+            &other_cell,
+            &[(Answered::Taken, other_cell.tx)],
+            &other,
+            40,
+            60_000,
+        );
+        let _ = producer.ask_boundaries(&recording(&[later]), past);
+        producer.on_proof_fetched(later, &other, &other_proof, &[]);
+        assert!(
+            producer
+                .retirement_held
+                .contains_key(&other_id.record_key(&ProtocolHasher))
+        );
+        rows.remove(other_id.record_key(&ProtocolHasher));
+        commit(&mut producer, 13, Vec::new());
+        assert!(
+            producer.retirement_held.is_empty(),
+            "a record whose row goes otherwise is dropped uncounted",
+        );
+    }
+
+    /// A block of `shard`'s at `height` over a parent QC at `anchor`,
+    /// carrying `claims`.
+    fn block_carrying(
+        shard: ShardId,
+        height: u64,
+        anchor: WeightedTimestamp,
+        claims: Vec<StateClaim>,
+    ) -> Block {
+        let origin = ChainOrigin {
+            genesis_height: BlockHeight::new(height - 1),
+            anchor_wt: anchor,
+        };
+        let Block::Live {
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            tick_manifest,
+            terms,
+            witness_sources,
+            ..
+        } = block_over(height, QuorumCertificate::genesis(shard, origin))
+        else {
+            unreachable!("a live block")
+        };
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                shard_id: shard,
+                height: BlockHeight::new(height),
+                parent_qc: QuorumCertificate::genesis(shard, origin).into(),
+                ..Default::default()
+            }),
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            tick_manifest,
+            terms,
+            witness_sources,
+        }
     }
 
     /// Two records' answers held at one boundary: one record's `Never`

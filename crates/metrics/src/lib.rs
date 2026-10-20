@@ -326,6 +326,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
 
+    /// The blocks from the last block a validator folded when it first
+    /// held a record's consumer's `Taken` at a boundary to the committed
+    /// block that retired the record.
+    fn record_retirement_carry_wait(&self, blocks: u64) {}
+
     /// A retirement offer a proposer carried in a block it proposed,
     /// whether or not the block commits: the bytes its claims weigh cut
     /// on their own, proofs included, and the retirements they read.
@@ -967,6 +972,13 @@ pub fn record_intake_capped(what: &str, count: u64) {
 #[inline]
 pub fn record_record_ask() {
     recorder().record_record_ask();
+}
+
+/// Record the blocks a retirement waited from its first hold to its
+/// carry.
+#[inline]
+pub fn record_retirement_carry_wait(blocks: u64) {
+    recorder().record_retirement_carry_wait(blocks);
 }
 
 /// Record a retirement offer a proposer carried.

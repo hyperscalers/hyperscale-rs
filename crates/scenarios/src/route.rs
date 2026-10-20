@@ -4115,6 +4115,7 @@ impl ClaimBytes {
 
 /// Print, over the whole run, how long answers stood by kind, how long
 /// records waited from their re-push due instant to their retirement,
+/// how many blocks a retirement waited from its first hold to its carry,
 /// the bytes a carried retirement weighed, the records consumers waited
 /// on with no arrival, and the re-pushes.
 fn report_retirement_figures<C: FaultableCluster>(c: &C, label: &str) {
@@ -4146,6 +4147,14 @@ fn report_retirement_figures<C: FaultableCluster>(c: &C, label: &str) {
         c.metric_count("retirement_wait_ms", None),
         at("retirement_wait_ms", None, 0.5),
         at("retirement_wait_ms", None, 1.0),
+    );
+    println!(
+        "{label} [retirement carry wait, every replica, blocks from the last commit when a \
+         record's consumer's Taken was first held to the block carrying it]: {} \
+         retirements, p50 {:.0}, max {:.0}",
+        c.metric_count("retirement_carry_wait", None),
+        at("retirement_carry_wait", None, 0.5),
+        at("retirement_carry_wait", None, 1.0),
     );
     println!(
         "{label} [wanted records, every replica at each commit]: p50 {:.0}, p99 {:.0}, max {:.0}",

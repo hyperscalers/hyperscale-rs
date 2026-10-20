@@ -206,6 +206,9 @@ pub struct Metrics {
     /// Fenced claims the read frontier refused from what a validator
     /// held to offer, by what they read.
     pub fenced_claims_refused: CounterVec,
+    /// Blocks from a retirement's `Taken` first held to the block
+    /// carrying it.
+    pub retirement_carry_wait: Histogram,
     /// Bytes of the retirement offers proposers carried in blocks they
     /// proposed, proofs included.
     pub retirement_bytes_spent: Counter,
@@ -949,6 +952,13 @@ impl Metrics {
             )
             .unwrap(),
 
+            retirement_carry_wait: register_histogram!(
+                "hyperscale_retirement_carry_wait_blocks",
+                "Blocks from a retirement's Taken first held to the committed block carrying it",
+                vec![0.0, 1.0, 2.0, 5.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
+            )
+            .unwrap(),
+
             retirement_bytes_spent: register_counter!(
                 "hyperscale_retirement_bytes_spent_total",
                 "Bytes of the retirement offers proposers carried in blocks they proposed"
@@ -1469,6 +1479,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_record_ask(&self) {
         self.metrics.record_asks.inc();
+    }
+
+    fn record_retirement_carry_wait(&self, blocks: u64) {
+        self.metrics.retirement_carry_wait.observe(blocks as f64);
     }
 
     fn record_retirements_spent(&self, bytes: usize, retirements: usize) {

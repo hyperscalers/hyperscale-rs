@@ -607,22 +607,25 @@ pub struct ParentReads {
 /// after the reserve: the boundary claims that delete at a boundary of a
 /// lineage `capped` names first of all, in [`RESERVED_BYTES`] and
 /// [`RESERVED_PLACES`], by [`spend_the_reserve`], so a lineage standing
-/// near its cap drains whatever else waits; then the claims held for
-/// crossing, seat and ledger questions, as [`select_state_claims`] takes
-/// them; then the parent's readings, the member rows a decline of those
-/// claims reads, as [`rowless_issuers`] names them, and the local
+/// near its cap drains whatever else waits; then the retirements, in
+/// [`RETIREMENT_BYTES`] and [`RETIREMENT_PLACES`], by [`spend_the_floor`],
+/// what the floor leaves unspent going to what follows; then the claims
+/// held for crossing, seat and ledger questions, as [`select_state_claims`]
+/// takes them; then the parent's readings, the member rows a decline of
+/// those claims reads, as [`rowless_issuers`] names them, and the local
 /// crossings, as [`trim_parent_reads`] fits both behind those; then the
-/// claims held for verdict questions, in what bytes and places the first
-/// two leave of the section; then the boundary claims, in what all three
-/// leave; and the retirements last, in what is left after them. So no
-/// verdict reading takes a place from a reading that gates execution, at
-/// any anchor or at the parent, and none waits on one: the first two spend
-/// no more than [`MAX_STATE_CLAIMS_BYTES`] and
-/// [`MAX_STATE_CLAIMS_PER_BLOCK`] between them, of a section holding
-/// `MAX_CLAIMS_BYTES` and [`MAX_CLAIMS_PER_BLOCK`], so what is left to the
-/// verdict claims is never under `MAX_VERDICT_CLAIMS_BYTES`, and is more
-/// wherever the first two take less. Each claim is charged as admission
-/// charges it.
+/// claims held for verdict questions, in what bytes and places the
+/// claims before them leave of the section; then the boundary claims, in
+/// what all of those leave; and the retirements beyond the floor last, in
+/// what is left after them. So no verdict reading takes a place from a
+/// reading that gates execution, at any anchor or at the parent, and none
+/// waits on one: the reserve, the floor, the claims held for crossing,
+/// seat and ledger questions and the parent's readings spend no more than
+/// [`MAX_STATE_CLAIMS_BYTES`] and [`MAX_STATE_CLAIMS_PER_BLOCK`] between
+/// them, of a section holding `MAX_CLAIMS_BYTES` and
+/// [`MAX_CLAIMS_PER_BLOCK`], so what is left to the verdict claims is never
+/// under `MAX_VERDICT_CLAIMS_BYTES`, and is more wherever those take less.
+/// Each claim is charged as admission charges it.
 ///
 /// The verdict claims are taken in the order offered, those naming a row
 /// stated at the parent first where this shard is reshaping at the
@@ -662,9 +665,12 @@ pub struct ParentReads {
 /// A record of this shard's is retired only on its consumer's `Taken`
 /// read at a boundary of the consumer's shard, so `retirement_claims`
 /// are boundary readings too, one `Taken` an item, each anchor's an
-/// offer of its own. They ride after every boundary offer, in what
-/// those leave, by [`spend_on_retirements`], and every claim at one
-/// anchor is cut from one key-ordered list ([`AnchorLists`]).
+/// offer of its own. A retirement is what lets its consumer delete the
+/// answer, so the floor carries them ahead of fresh claims, and the ones
+/// beyond it ride after every boundary offer, in what those leave, by
+/// [`spend_on_retirements`]. The reserve spends none. Every claim at one
+/// anchor is cut from one key-ordered list ([`AnchorLists`]), whichever
+/// spend chose its items.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // one list per kind of claim the section spends on
 pub fn select_claims(
@@ -680,6 +686,7 @@ pub fn select_claims(
 ) -> (Vec<StateClaim>, ParentReads) {
     let mut lists = AnchorLists::default();
     let (taken_back, rest) = spend_the_reserve(ctx, fold, boundary_claims, capped, &mut lists);
+    let surplus = spend_the_floor(ctx, fold, retirement_claims, &mut lists);
     let mut selected = Vec::new();
     let reserved = (fold.count, fold.weight);
     selected.extend(select_state_claims(ctx, fold, state_claims, reserved));
@@ -765,13 +772,7 @@ pub fn select_claims(
         count: fresh,
         previous: None,
     };
-    let returned = spend_last(
-        ctx,
-        &mut left,
-        count,
-        (&rest, retirement_claims),
-        &mut lists,
-    );
+    let returned = spend_last(ctx, &mut left, count, (&rest, &surplus), &mut lists);
     selected.extend(lists.into_claims());
     selected.sort_unstable();
     at_parent
@@ -780,10 +781,10 @@ pub fn select_claims(
     (selected, at_parent)
 }
 
-/// The boundary offers `rest` and then the retirements a block carries
-/// in what `left` leaves, `count` places already taken, into `lists`
-/// beside what the reserve chose; and every crossing whose record the
-/// boundary offers take back.
+/// The boundary offers `rest` and then the retirements beyond the floor
+/// a block carries in what `left` leaves, `count` places already taken,
+/// into `lists` beside what the reserve and the floor chose; and every
+/// crossing whose record the boundary offers take back.
 fn spend_last(
     ctx: &Committed<'_>,
     left: &mut StateClaimsFold,
@@ -801,7 +802,7 @@ fn spend_last(
     );
     let taken = lists.places().saturating_sub(before) + return_reads(0, returned.len()).0;
     let places = MAX_CLAIMS_PER_BLOCK.saturating_sub(count.saturating_add(taken));
-    spend_on_retirements(ctx, left, places, retirement_claims, lists);
+    let _ = spend_on_retirements(ctx, left, (places, usize::MAX), retirement_claims, lists);
     returned
 }
 
@@ -862,6 +863,63 @@ fn spend_the_reserve(
     fold.count = reserve.count;
     (returned, rest)
 }
+
+/// The retirements spent right after the reserve, in [`RETIREMENT_BYTES`]
+/// and [`RETIREMENT_PLACES`] and charged to `fold`, into `lists`; and
+/// what of each offer is left, to ride after the boundary offers. What
+/// the floor leaves unspent is the section's.
+fn spend_the_floor(
+    ctx: &Committed<'_>,
+    fold: &mut StateClaimsFold,
+    offers: &[BoundaryOffer],
+    lists: &mut AnchorLists,
+) -> Vec<BoundaryOffer> {
+    let mut floor = StateClaimsFold {
+        weight: fold.weight,
+        verdict_weight: fold.verdict_weight,
+        count: fold.count,
+        previous: None,
+    };
+    let taken = spend_on_retirements(
+        ctx,
+        &mut floor,
+        (
+            RETIREMENT_PLACES,
+            fold.weight.saturating_add(RETIREMENT_BYTES),
+        ),
+        offers,
+        lists,
+    );
+    fold.weight = floor.weight;
+    fold.count = floor.count;
+    offers
+        .iter()
+        .zip(taken)
+        .filter(|(offer, taken)| *taken < offer.deletions.len())
+        .map(|(offer, taken)| BoundaryOffer {
+            claims: offer.claims.clone(),
+            deletions: offer.deletions[taken..].to_vec(),
+        })
+        .collect()
+}
+
+/// The bytes of [`MAX_STATE_CLAIMS_BYTES`] retirements are spent in
+/// right after the reserve, ahead of fresh claims: a third.
+///
+/// A retirement is what lets its consumer delete the answer, and under
+/// sustained fresh load on its producer, retirements spent only in what
+/// the rest leaves would wait without bound while the consumer's intake
+/// from the producer stays closed. A third carries 75 retirements a
+/// block at the 943 bytes a retirement weighs unshared, which at a block
+/// a second with a third of rounds Byzantine is 50 a second: it clears
+/// the 41 a second a producer's attested retirements are to reach by the
+/// 15% margin, 41 × 1.15 = 47.2.
+const RETIREMENT_BYTES: usize = MAX_STATE_CLAIMS_BYTES / 3;
+
+/// The places of [`MAX_STATE_CLAIMS_PER_BLOCK`] held beside
+/// [`RETIREMENT_BYTES`]: a quarter. One merged run of retirements takes
+/// one place, so a block's retirements toward that many anchors fit.
+const RETIREMENT_PLACES: usize = MAX_STATE_CLAIMS_PER_BLOCK / 4;
 
 /// The transactions whose rows `finalizations` delete.
 fn deleted_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> BTreeSet<TxHash> {
@@ -1042,9 +1100,9 @@ fn spend_on_boundary_claims(
 /// chose there, and the claims those items are cut into as one
 /// key-ordered list.
 ///
-/// The reserve, the boundary offers and the retirements each choose
-/// items at an anchor, and a run of one spend's items cut on its own can
-/// span keys of another's, which a
+/// The reserve, the floor, the boundary offers and the retirements
+/// beyond the floor each choose items at an anchor, and a run of one
+/// spend's items cut on its own can span keys of another's, which a
 /// block's disjoint spans at one anchor refuse. Cut from the union of
 /// every item chosen there, in runs of [`MAX_PROOFS_PER_QUERY`] from the
 /// lowest key as [`BoundaryOffer::carrying`] cuts them, the anchor's
@@ -1160,57 +1218,59 @@ impl AnchorLists {
 }
 
 /// The retirements a block carries in what `spent` leaves of its claims
-/// section and `places` of its claims, offer by offer as
+/// section, `places` of its claims and `bytes`, offer by offer as
 /// [`spend_on_boundary_claims`] spends them, into `lists`, ending at the
-/// first offer carried cut. An offer it carries nothing of, at an anchor
-/// this proposer's schedule does not attest or one nothing of fits,
-/// holds up no other. Every offer carried is counted as proposed: its
-/// bytes cut on their own, and the retirements it reads.
+/// first offer carried cut; and how many items of each offer it carried.
+/// An offer it carries nothing of, at an anchor this proposer's schedule
+/// does not attest or one nothing of fits, holds up no other. Every
+/// offer carried is counted as proposed: its bytes cut on their own, and
+/// the retirements it reads.
 fn spend_on_retirements(
     ctx: &Committed<'_>,
     spent: &mut StateClaimsFold,
-    places: usize,
+    (places, bytes): (usize, usize),
     offers: &[BoundaryOffer],
     lists: &mut AnchorLists,
-) {
+) -> Vec<usize> {
     let start = lists.places();
-    for offer in offers {
+    let chosen = |lists: &AnchorLists, anchor: &Anchor| {
+        lists
+            .at
+            .get(anchor)
+            .map_or(0, |list| list.chosen.deletions.len())
+    };
+    let mut taken = vec![0; offers.len()];
+    for (offer, taken) in offers.iter().zip(&mut taken) {
         let Some(anchor) = offer.claims.first().map(|claim| claim.anchor) else {
             continue;
         };
-        let before = lists
-            .at
-            .get(&anchor)
-            .map_or(0, |list| list.chosen.deletions.len());
+        let before = chosen(lists, &anchor);
         let _ = spend_on_boundary_claims(
             ctx,
             spent,
             (
                 places.saturating_sub(lists.places().saturating_sub(start)),
-                usize::MAX,
+                bytes,
             ),
             std::slice::from_ref(offer),
             lists,
         );
-        let items = lists
-            .at
-            .get(&anchor)
-            .map_or(0, |list| list.chosen.deletions.len())
-            - before;
-        if items > 0 {
+        *taken = chosen(lists, &anchor) - before;
+        if *taken > 0 {
             record_retirements_spent(
                 offer
-                    .carrying(items)
+                    .carrying(*taken)
                     .iter()
                     .map(StateClaim::wire_weight)
                     .sum(),
-                items,
+                *taken,
             );
         }
-        if items > 0 && items < offer.deletions.len() {
+        if *taken > 0 && *taken < offer.deletions.len() {
             break;
         }
     }
+    taken
 }
 
 /// What reading at the parent the records of `more` returns costs, beside
@@ -1585,6 +1645,9 @@ mod tests {
         TxOutcome, UnsettledTx, ValidatorSet,
     };
     use hyperscale_vm_effects::{Answered, Hash32, IntentHash, ProtocolHasher};
+    use proptest::collection::vec as prop_vec;
+    use proptest::prelude::{ProptestConfig, any, prop_assert, prop_assert_eq, proptest};
+    use proptest::sample::Index;
 
     use super::*;
     use crate::admission::admit_all;
@@ -2536,6 +2599,112 @@ mod tests {
         (BoundaryOffer { claims, deletions }, sorted)
     }
 
+    /// Where an offer's keys fall in the wide fixture's list, by a mode
+    /// drawn per offer: anywhere, in the first run, in the last runs,
+    /// across the first run's upper edge, or above every key an earlier
+    /// offer drew, which leaves the runs below to stand.
+    fn drawn_key_at(mode: usize, draw: usize, floor: usize, len: usize) -> usize {
+        match mode {
+            0 => draw % len,
+            1 => draw % 200,
+            2 => len - 1 - draw % 300,
+            3 => 200 + draw % 120,
+            _ => (floor + draw % 400).min(len - 1),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// A list cut again only from its first moved run holds the runs
+        /// one cut of its whole key set makes, whatever order and overlap
+        /// the offers joining it come in, and the spend's charge is the
+        /// list's change: its claims less those of the runs cut again,
+        /// plus the runs cut fresh.
+        #[test]
+        fn a_list_cut_again_from_its_first_moved_run_is_the_list_cut_whole(
+            overlap in any::<bool>(),
+            offers in prop_vec(
+                (0usize..7, prop_vec(prop_vec(any::<usize>(), 1..=3), 1..=400), any::<Index>()),
+                1..=8,
+            ),
+        ) {
+            let (_, held) = wide_claims_at(SIBLING, boundary_and_fresh_heights().0);
+            let sorted: Vec<SubstateKey> = held.iter().flat_map(StateClaim::keys).collect();
+            let weigh = |list: Option<&AnchorList>| {
+                list.map_or((0, 0), |list| {
+                    list.claims()
+                        .fold((0, 0), |(count, weight), claim| {
+                            (count + 1, weight + claim.wire_weight())
+                        })
+                })
+            };
+            let mut used: BTreeSet<SubstateKey> = BTreeSet::new();
+            let mut lists = AnchorLists::default();
+            let mut highest = 0;
+            for (mode, draws, take) in offers {
+                let floor = highest;
+                let deletions: Vec<Vec<SubstateKey>> = draws
+                    .iter()
+                    .map(|item| {
+                        item.iter()
+                            .map(|draw| {
+                                let at = drawn_key_at(mode, *draw, floor, sorted.len());
+                                highest = highest.max(at);
+                                sorted[at]
+                            })
+                            .filter(|key| overlap || !used.contains(key))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|item| !item.is_empty())
+                    .collect();
+                if deletions.is_empty() {
+                    continue;
+                }
+                let read: BTreeSet<SubstateKey> = deletions.iter().flatten().copied().collect();
+                let offer = BoundaryOffer {
+                    claims: held
+                        .iter()
+                        .filter_map(|claim| claim.restrict(|key| read.contains(&key)))
+                        .collect(),
+                    deletions,
+                };
+                let items = 1 + take.index(offer.deletions.len());
+                used.extend(offer.deletions[..items].iter().flatten().copied());
+                let before = weigh(lists.at.get(&offer.claims[0].anchor));
+                let (list, kept, (replaced, replaced_weight)) = lists.joined(&offer, items);
+                let whole: Vec<SubstateKey> = list
+                    .chosen
+                    .deletions
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                prop_assert_eq!(&list.keys, &whole);
+                let cut: Vec<Vec<StateClaim>> = whole
+                    .chunks(MAX_PROOFS_PER_QUERY)
+                    .map(|run| list.chosen.run_of(run))
+                    .collect();
+                prop_assert_eq!(&list.runs, &cut);
+                prop_assert_eq!(
+                    list.chosen.carrying(list.chosen.deletions.len()),
+                    list.claims().cloned().collect::<Vec<_>>(),
+                );
+                prop_assert!(list.in_order());
+                let fresh = weigh(Some(&AnchorList {
+                    runs: list.runs[kept..].to_vec(),
+                    ..list.clone()
+                }));
+                let after = weigh(Some(&list));
+                prop_assert_eq!(after.0, before.0 - replaced + fresh.0);
+                prop_assert_eq!(after.1, before.1 - replaced_weight + fresh.1);
+                lists.put(list);
+            }
+        }
+    }
+
     /// How many of the burst's deletions `carried` reads whole, having
     /// checked that it reads no cell of any other.
     fn whole_deletions(sorted: &[SubstateKey], carried: &[StateClaim]) -> usize {
@@ -2868,6 +3037,419 @@ mod tests {
                 .collect::<BTreeSet<SubstateKey>>(),
             BTreeSet::from([t1, d1, d2, t2]),
             "the deletion and both retirements ride",
+        );
+    }
+
+    /// `count` retirements and, where `deletions`, a burst of deletions
+    /// more than a block holds, read at one boundary of [`SIBLING`]: one
+    /// tree holding every cell, each kind's offer cut into claims of 200
+    /// cells over it.
+    fn floor_fixture(count: u16, deletions: bool) -> (Vec<BoundaryOffer>, BoundaryOffer) {
+        let retired: Vec<CrossingId> = (0..count)
+            .map(|at| {
+                let mut intent = [0xB0; 32];
+                intent[..2].copy_from_slice(&at.to_le_bytes());
+                CrossingId {
+                    producer: test_prefix(0xA4),
+                    consumer: test_prefix(0x21),
+                    intent: IntentHash(Hash32(intent)),
+                    local: 0,
+                    output: 0,
+                }
+            })
+            .collect();
+        let mut taken: Vec<(SubstateKey, CrossingId)> = retired
+            .iter()
+            .map(|id| (id.answer_key(&ProtocolHasher, Answered::Taken), *id))
+            .collect();
+        taken.sort_unstable();
+        let height = boundary_and_fresh_heights().0;
+        let (leaves, _) = wide_claims_at(SIBLING, height);
+        let mut sorted = leaves.clone();
+        sorted.sort_unstable();
+        let present: Vec<SubstateKey> = leaves
+            .iter()
+            .copied()
+            .chain(taken.iter().map(|(key, _)| *key))
+            .collect();
+        let retirements = BoundaryOffer {
+            claims: taken
+                .chunks(200)
+                .map(|chunk| {
+                    let keys: Vec<SubstateKey> = chunk.iter().map(|(key, _)| *key).collect();
+                    proven_claim(SIBLING, height, &present, &keys).naming(chunk.iter().copied())
+                })
+                .collect(),
+            deletions: taken.iter().map(|(key, _)| vec![*key]).collect(),
+        };
+        let half = sorted.len() / 2;
+        let burst = BoundaryOffer {
+            claims: sorted
+                .chunks(200)
+                .map(|chunk| proven_claim(SIBLING, height, &present, chunk))
+                .collect(),
+            deletions: (0..half)
+                .map(|at| vec![sorted[at], sorted[at + half]])
+                .collect(),
+        };
+        (
+            deletions.then_some(burst).into_iter().collect(),
+            retirements,
+        )
+    }
+
+    /// What a block of [`SURVIVOR`]'s at a boundary of the
+    /// [`floor_fixture`] selects of `state`, `boundary` and
+    /// `retirements` with `capped` lineages: the bytes of the claims it
+    /// carries that read a `Taken`, the bytes of its fresh claims, and
+    /// the retirements it carries, having checked the section passes
+    /// admission.
+    fn spent_on(
+        state: &[StateClaim],
+        boundary: &[BoundaryOffer],
+        retirements: &BoundaryOffer,
+        capped: &[ShardId],
+    ) -> (usize, usize, usize) {
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = SURVIVOR;
+        let mut against = recording(against, &retirements.claims[0].anchor);
+        against.anchor = past_the_boundary(1);
+        let ctx = against.ctx();
+        let (selected, _) = select_claims(
+            &ctx,
+            &mut StateClaimsFold::default(),
+            state.to_vec(),
+            Vec::new(),
+            boundary,
+            from_ref(retirements),
+            capped,
+            Vec::new(),
+            &[],
+        );
+        let mut checked = StateClaimsFold::default();
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+            Ok(()),
+            "what is selected passes admission",
+        );
+        let retiring = selected
+            .iter()
+            .filter(|claim| claim.reads_an_answer())
+            .map(StateClaim::wire_weight)
+            .sum();
+        let fresh = selected
+            .iter()
+            .filter(|claim| !claim.at_boundary(ctx.anchor))
+            .map(StateClaim::wire_weight)
+            .sum();
+        let retired = selected.iter().map(|claim| claim.answering().count()).sum();
+        (retiring, fresh, retired)
+    }
+
+    /// The floor carries retirements ahead of fresh claims that would
+    /// fill the section, in no more than [`RETIREMENT_BYTES`], and what
+    /// it leaves unspent goes to the fresh claims.
+    #[test]
+    fn the_retirement_floor_is_spent_before_fresh_claims_and_returns_what_it_leaves() {
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let (_, many) = floor_fixture(600, false);
+        let (_, few) = floor_fixture(4, false);
+        let none = BoundaryOffer {
+            claims: many.claims.clone(),
+            deletions: Vec::new(),
+        };
+        let (alone, fresh_alone, _) = spent_on(&filling, &[], &none, &[]);
+        assert_eq!(alone, 0);
+        let (floor, fresh_beside_many, _) = spent_on(&filling, &[], &many, &[]);
+        assert!(
+            0 < floor && floor <= RETIREMENT_BYTES,
+            "the floor carries retirements beside fresh claims that fill the section: {floor}",
+        );
+        assert!(
+            fresh_beside_many < fresh_alone,
+            "and takes its bytes ahead of them",
+        );
+        let (spent, fresh_beside_few, retired) = spent_on(&filling, &[], &few, &[]);
+        assert!(0 < spent && spent < RETIREMENT_BYTES);
+        assert_eq!(retired, 4, "every retirement the floor holds rides");
+        assert!(
+            fresh_beside_few > fresh_beside_many,
+            "what the floor leaves unspent goes to the fresh claims: {fresh_beside_few} \
+             against {fresh_beside_many}",
+        );
+    }
+
+    /// A capped lineage's reserve spends no retirement: with a burst of
+    /// its deletions at the retirements' own boundary and fresh claims
+    /// filling the section, the reserve spends the deletions, the floor
+    /// the retirements, and the fresh claims keep what both leave. The
+    /// retirements ride as many as the floor carries alone, less at most
+    /// one where the reserve's runs at the shared anchor cut the list
+    /// differently.
+    #[test]
+    fn the_reserve_spends_no_retirement() {
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let (burst, many) = floor_fixture(600, true);
+        let (_, _, floor_alone) = spent_on(&filling, &[], &many, &[]);
+        let (_, fresh, beside_the_reserve) = spent_on(&filling, &burst, &many, &[ShardId::ROOT]);
+        assert!(
+            fresh >= MAX_STATE_CLAIMS_BYTES - RESERVED_BYTES - RETIREMENT_BYTES,
+            "the fresh claims keep what the reserve and the floor leave: {fresh}",
+        );
+        assert!(
+            beside_the_reserve + 1 >= floor_alone && beside_the_reserve <= floor_alone,
+            "the reserve takes no retirement's place: {beside_the_reserve} beside it, \
+             {floor_alone} alone",
+        );
+    }
+
+    /// The floor's places bound retirements read at more anchors than it
+    /// holds: one per anchor, [`RETIREMENT_PLACES`] of them beside fresh
+    /// claims that fill the section.
+    #[test]
+    fn the_floor_holds_retirements_at_no_more_anchors_than_its_places() {
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let height = boundary_and_fresh_heights().0;
+        let anchors = RETIREMENT_PLACES + 6;
+        let offers: Vec<BoundaryOffer> = (0..anchors)
+            .map(|at| {
+                let seed = u8::try_from(at).expect("small");
+                let id = CrossingId {
+                    producer: test_prefix(0xA4),
+                    consumer: test_prefix(seed),
+                    intent: IntentHash(Hash32([seed; 32])),
+                    local: 0,
+                    output: 0,
+                };
+                let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+                let shard = ShardId::leaf(8, u64::try_from(at).expect("small"));
+                BoundaryOffer {
+                    claims: vec![
+                        proven_claim(shard, height, &[taken], &[taken]).naming([(taken, id)]),
+                    ],
+                    deletions: vec![vec![taken]],
+                }
+            })
+            .collect();
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = SURVIVOR;
+        let recorded = offers
+            .iter()
+            .map(|offer| {
+                let anchor = offer.claims[0].anchor;
+                (
+                    anchor.shard,
+                    ShardAnchor {
+                        state_root: anchor.state_root,
+                        block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary")),
+                        height: anchor.height,
+                        weighted_timestamp: anchor.ts,
+                        witness_base: BeaconWitnessLeafCount::ZERO,
+                        terminal_settled_txs: None,
+                        handoff_complete: None,
+                        terminal_epoch: None,
+                    },
+                )
+            })
+            .collect();
+        let snapshot = against.snapshot.clone().with_boundaries(recorded);
+        against.schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot));
+        against.anchor = past_the_boundary(1);
+        let ctx = against.ctx();
+        let (selected, _) = select_claims(
+            &ctx,
+            &mut StateClaimsFold::default(),
+            filling,
+            Vec::new(),
+            &[],
+            &offers,
+            &[],
+            Vec::new(),
+            &[],
+        );
+        let mut checked = StateClaimsFold::default();
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+            Ok(()),
+        );
+        let retired: usize = selected.iter().map(|claim| claim.answering().count()).sum();
+        assert_eq!(retired, RETIREMENT_PLACES);
+    }
+
+    /// One retirement read alone at a boundary of `shard`, as heavy as it
+    /// comes without passing `weight`: its `Taken` sits beside cells that
+    /// each part from it at a deeper bit of its slot, so each one the tree
+    /// holds lengthens the proof by a sibling.
+    fn retirement_weighing(shard: ShardId, seed: u8, weight: usize) -> BoundaryOffer {
+        let id = CrossingId {
+            producer: test_prefix(0xA4),
+            consumer: test_prefix(seed),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        };
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let height = boundary_and_fresh_heights().0;
+        let beside = |bits: usize| {
+            let present: Vec<SubstateKey> = (0..bits)
+                .map(|bit| {
+                    let mut local = taken.local;
+                    local.0[bit / 8] ^= 0x80 >> (bit % 8);
+                    SubstateKey {
+                        owner: taken.owner,
+                        local,
+                    }
+                })
+                .chain([taken])
+                .collect();
+            proven_claim(shard, height, &present, &[taken]).naming([(taken, id)])
+        };
+        let mut claim = beside(0);
+        for bits in 1..=128 {
+            let heavier = beside(bits);
+            if heavier.wire_weight() > weight {
+                break;
+            }
+            claim = heavier;
+        }
+        BoundaryOffer {
+            claims: vec![claim],
+            deletions: vec![vec![taken]],
+        }
+    }
+
+    /// A block whose claims section is contended still carries at least
+    /// 62 retirements of the largest weight the floor is sized for,
+    /// [`RETIREMENT_BYTES`] / 62 each, and so at least 41 a second at a
+    /// block a second with a third of rounds Byzantine: fresh claims fill
+    /// the section, a capped lineage's burst of deletions takes the
+    /// reserve, and a backlog of more such retirements than the floor
+    /// holds waits, each at its own boundary so none shares a proof with
+    /// another. Each weighs no more than that and more than
+    /// [`RETIREMENT_BYTES`] / 63, so the floor's bytes hold exactly 62 of
+    /// them. What is selected passes admission.
+    #[test]
+    fn a_contended_block_carries_62_of_the_heaviest_retirements_in_its_floor() {
+        const HEAVIEST: usize = RETIREMENT_BYTES / 62;
+        const BACKLOG: u8 = 80;
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let (burst, _) = floor_fixture(0, true);
+        let offers: Vec<BoundaryOffer> = (0..BACKLOG)
+            .map(|seed| retirement_weighing(ShardId::leaf(8, u64::from(seed)), seed, HEAVIEST))
+            .collect();
+        for offer in &offers {
+            let weight = offer.claims[0].wire_weight();
+            assert!(
+                RETIREMENT_BYTES / 63 < weight && weight <= HEAVIEST,
+                "a retirement of the backlog weighs {weight}",
+            );
+        }
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = SURVIVOR;
+        let recorded = offers
+            .iter()
+            .chain(&burst)
+            .map(|offer| {
+                let anchor = offer.claims[0].anchor;
+                (
+                    anchor.shard,
+                    ShardAnchor {
+                        state_root: anchor.state_root,
+                        block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary")),
+                        height: anchor.height,
+                        weighted_timestamp: anchor.ts,
+                        witness_base: BeaconWitnessLeafCount::ZERO,
+                        terminal_settled_txs: None,
+                        handoff_complete: None,
+                        terminal_epoch: None,
+                    },
+                )
+            })
+            .collect();
+        let snapshot = against.snapshot.clone().with_boundaries(recorded);
+        against.schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot));
+        against.anchor = past_the_boundary(1);
+        let ctx = against.ctx();
+        let (selected, _) = select_claims(
+            &ctx,
+            &mut StateClaimsFold::default(),
+            filling,
+            Vec::new(),
+            &burst,
+            &offers,
+            &[SIBLING],
+            Vec::new(),
+            &[],
+        );
+        let mut checked = StateClaimsFold::default();
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+            Ok(()),
+            "what is selected passes admission",
+        );
+        let reserve: usize = selected
+            .iter()
+            .filter(|claim| claim.anchor.shard == SIBLING && claim.at_boundary(ctx.anchor))
+            .map(StateClaim::wire_weight)
+            .sum();
+        let fresh: usize = selected
+            .iter()
+            .filter(|claim| !claim.at_boundary(ctx.anchor))
+            .map(StateClaim::wire_weight)
+            .sum();
+        assert!(
+            reserve > RESERVED_BYTES / 2,
+            "the capped lineage's burst takes the reserve: {reserve}",
+        );
+        assert!(
+            fresh >= MAX_STATE_CLAIMS_BYTES - RESERVED_BYTES - RETIREMENT_BYTES,
+            "fresh claims fill what the reserve and the floor leave: {fresh}",
+        );
+        let retired: usize = selected.iter().map(|claim| claim.answering().count()).sum();
+        assert!(
+            retired >= 62,
+            "the floor carries at least 62 retirements of up to {HEAVIEST} bytes: {retired}",
+        );
+    }
+
+    /// Retirements beyond the floor ride after the boundary offers: a
+    /// burst of deletions at the same boundary leaves them no more than
+    /// with the section free, and no fewer than the floor's share beside
+    /// fresh claims that fill it; with the section free, they ride past
+    /// the floor.
+    #[test]
+    fn retirements_beyond_the_floor_ride_after_the_boundary_offers() {
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let (burst, many) = floor_fixture(600, true);
+        let (floor_bytes, _, floor) = spent_on(&filling, &[], &many, &[]);
+        assert!(floor_bytes <= RETIREMENT_BYTES);
+        let (_, _, beside_the_burst) = spent_on(&[], &burst, &many, &[]);
+        let (alone_bytes, _, alone) = spent_on(&[], &[], &many, &[]);
+        assert!(
+            0 < floor && floor <= beside_the_burst && beside_the_burst < alone,
+            "the floor's {floor} retirements ride whatever waits; beside a burst of \
+             deletions {beside_the_burst}, and alone {alone}",
+        );
+        assert!(
+            alone_bytes > RETIREMENT_BYTES,
+            "with the section free, retirements ride past the floor: {alone_bytes}",
         );
     }
 

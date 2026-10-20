@@ -504,6 +504,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("record_asks", None, 1);
     }
 
+    fn record_retirement_carry_wait(&self, blocks: u64) {
+        self.observe("retirement_carry_wait", None, blocks as f64);
+    }
+
     fn record_retirements_spent(&self, bytes: usize, retirements: usize) {
         self.inc("retirement_bytes_spent", None, bytes as u64);
         self.inc("retirements_spent", None, retirements as u64);
