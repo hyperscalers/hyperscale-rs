@@ -4865,6 +4865,8 @@ mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
+    use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
@@ -13954,6 +13956,72 @@ mod tests {
         assert!(
             !state.counterparts.ledger.contains(tx_hash),
             "the ledger has let the entry go"
+        );
+    }
+
+    /// A record the fold retires on its consumer's `Taken` counts the
+    /// committed clock from its re-push due instant, an escrowed
+    /// record's validity end, to the block that retires it.
+    #[test]
+    fn a_retirement_records_its_wait_from_the_due_instant() {
+        let schedule = two_shard_topology();
+        let (transaction, figures, claim, mut state) = consumer_claim_fixture();
+        let crossing = leg_classified()
+            .crossings()
+            .find(|(edge, _)| edge.from == HOME)
+            .map(|(edge, _)| edge.crossing.id)
+            .expect("the leg issues one crossing");
+        let validity_end = transaction
+            .validity_range()
+            .end_timestamp_exclusive
+            .as_millis();
+        let cell = crossing.cell(
+            transaction.hash(),
+            *PROTOCOL_RESOURCE,
+            10,
+            validity_end,
+            Terms::Escrowed {
+                credit: SubstateKey {
+                    owner: crossing.producer,
+                    local: LocalKey([0x33; 16]),
+                },
+            },
+        );
+        hold(
+            &mut state,
+            &schedule,
+            [(crossing.record_key(&ProtocolHasher), cell.to_bytes())],
+        );
+        let probed_wt = figures.deadline.at().plus(Duration::from_secs(2));
+        let (bundle, _) = proven_at(
+            &mut state,
+            &schedule,
+            PEER,
+            5,
+            probed_wt,
+            &[claim],
+            &[claim],
+        );
+        let recorder = MemoryRecorder::new();
+        let scoped: Arc<dyn MetricsRecorder> = Arc::new(recorder.clone());
+        with_scoped_recorder(scoped, || {
+            commit_carrying(
+                &mut state,
+                &schedule,
+                1,
+                probed_wt.as_millis(),
+                vec![bundle.naming([(claim, crossing)])],
+            )
+        });
+        assert_eq!(recorder.histogram_count("retirement_wait_ms", None), 1);
+        let waited = state
+            .committed_ts
+            .elapsed_since(WeightedTimestamp::from_millis(validity_end))
+            .as_millis();
+        assert!(waited > 0, "the record retires past its due instant");
+        assert_eq!(
+            recorder.histogram_sum("retirement_wait_ms", None),
+            f64::from(u32::try_from(waited).expect("a wait of minutes")),
         );
     }
 

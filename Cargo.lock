@@ -2460,6 +2460,7 @@ dependencies = [
  "hyperscale-engine",
  "hyperscale-hbor",
  "hyperscale-metrics",
+ "hyperscale-metrics-memory",
  "hyperscale-network",
  "hyperscale-shard",
  "hyperscale-storage",

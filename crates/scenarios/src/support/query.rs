@@ -734,6 +734,43 @@ pub fn claims_sections(store: &impl CommittedChain, from: BlockHeight) -> Vec<Cl
     sections
 }
 
+/// Walk `store`'s committed chain from `from` up for the retirements its
+/// claims read, by the shard each was read at.
+///
+/// A retirement is a `Taken` read present under its crossing's name,
+/// the cell [`StateClaim::retires`] retires a record on, counted by the
+/// claim's anchor shard. A [`ClaimsSection`] counts its cells by kind
+/// alone, so it cannot say which consumer a producer retired toward.
+#[must_use]
+pub fn retirements_by_holder(
+    store: &impl CommittedChain,
+    from: BlockHeight,
+) -> BTreeMap<ShardId, u64> {
+    let mut retired: BTreeMap<ShardId, u64> = BTreeMap::new();
+    let tip = store.tip();
+    let mut height = store.first().max(from).max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            for claim in certified.block().state_claims() {
+                let taken = claim
+                    .crossings
+                    .iter()
+                    .filter(|(key, id)| {
+                        *key == id.answer_key(&ProtocolHasher, Answered::Taken)
+                            && claim.reading(*key).is_some_and(Inclusion::is_present)
+                    })
+                    .count();
+                if taken > 0 {
+                    *retired.entry(claim.anchor.shard).or_default() +=
+                        u64::try_from(taken).unwrap_or(u64::MAX);
+                }
+            }
+        }
+        height = height.next();
+    }
+    retired
+}
+
 /// Walk `store`'s committed chain for every abandonment record naming
 /// `tx`: the height each committed at and the departed shard it speaks
 /// for.

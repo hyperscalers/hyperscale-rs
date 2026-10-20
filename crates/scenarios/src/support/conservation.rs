@@ -439,6 +439,19 @@ impl Charges {
         self.owed.get(&hash)
     }
 
+    /// How many crossing records the recorded transactions that were
+    /// charged issued between them.
+    #[must_use]
+    pub fn issued<C: Cluster + ?Sized>(&self, c: &C) -> usize {
+        let derivation = c.derivation();
+        self.owed
+            .iter()
+            .filter(|(hash, _)| self.is_charged(c, **hash))
+            .filter_map(|(_, tx)| tx.try_derived(derivation.as_ref()).ok())
+            .map(|derived| crossing_records(&derived.legs).len())
+            .sum()
+    }
+
     /// How many of the recorded transactions have been charged.
     #[must_use]
     pub fn charged<C: Cluster + ?Sized>(&self, c: &C) -> usize {

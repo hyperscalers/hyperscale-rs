@@ -420,6 +420,7 @@ impl MetricsRecorder for MemoryRecorder {
     }
 
     fn record_state_claims_weight(&self, bytes: usize, verdict_bytes: usize) {
+        self.inc("state_claims_bytes", None, bytes as u64);
         self.observe("state_claims_weight", None, bytes as f64);
         self.observe("verdict_claims_block_weight", None, verdict_bytes as f64);
     }
@@ -505,6 +506,36 @@ impl MetricsRecorder for MemoryRecorder {
 
     fn record_crossing_fallback_ask(&self, asker: &str) {
         self.inc("crossing_fallback_asks", Some(asker), 1);
+    }
+
+    // A series here holds one label, so the `seated` label a
+    // Prometheus series carries is a `_seated` series of its own beside
+    // the total.
+    fn record_records_repushed(&self, kind: &str, seated: bool) {
+        self.inc("records_repushed", Some(kind), 1);
+        if seated {
+            self.inc("records_repushed_seated", Some(kind), 1);
+        }
+    }
+
+    fn record_repush_due(&self, seated: bool) {
+        self.inc("repush_due", None, 1);
+        if seated {
+            self.inc("repush_due_seated", None, 1);
+        }
+    }
+
+    fn record_retirement_wait(&self, millis: u64) {
+        self.observe("retirement_wait_ms", None, millis as f64);
+    }
+
+    fn record_answer_life(&self, answered: &str, millis: u64) {
+        self.observe("answer_life_ms", Some(answered), millis as f64);
+    }
+
+    fn set_wanted_records(&self, count: usize) {
+        self.set("wanted_records", None, count as f64);
+        self.observe("wanted_records", None, count as f64);
     }
 
     fn record_fenced_claim(&self, reading: &str, carried: bool) {

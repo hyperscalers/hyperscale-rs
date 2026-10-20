@@ -207,6 +207,20 @@ pub struct Metrics {
     /// held to offer, by what they read.
     pub fenced_claims_refused: CounterVec,
     pub crossing_fallback_asks: CounterVec,
+    /// Records a proposing replica pushed to their consumers again, by
+    /// terms and by whether the replica was seated above its chain's
+    /// genesis.
+    pub records_repushed: CounterVec,
+    /// Carried records a proposing replica first found due for a
+    /// re-push, by whether it was seated above its chain's genesis.
+    pub repush_due: CounterVec,
+    /// Seconds from a record's re-push due instant to its retirement.
+    pub retirement_wait: Histogram,
+    /// Seconds an answer whose record another shard holds stood, by
+    /// which way it answered.
+    pub answer_life: HistogramVec,
+    /// Records consumers here wait on with no arrival for, at a commit.
+    pub wanted_records: Gauge,
     /// Proposals a leader made at once rather than holding an empty
     /// block, by the condition that forced it.
     pub eager_proposals: CounterVec,
@@ -937,6 +951,41 @@ impl Metrics {
             )
             .unwrap(),
 
+            records_repushed: register_counter_vec!(
+                "hyperscale_records_repushed_total",
+                "Crossing records pushed to their consumers again",
+                &["kind", "seated"]
+            )
+            .unwrap(),
+
+            repush_due: register_counter_vec!(
+                "hyperscale_repush_due_total",
+                "Carried crossing records first found due for a re-push",
+                &["seated"]
+            )
+            .unwrap(),
+
+            retirement_wait: register_histogram!(
+                "hyperscale_retirement_wait_seconds",
+                "Seconds from a crossing record's re-push due instant to its retirement",
+                vec![0.0, 1.0, 5.0, 30.0, 60.0, 150.0, 300.0, 600.0, 1200.0, 2400.0]
+            )
+            .unwrap(),
+
+            answer_life: register_histogram_vec!(
+                "hyperscale_answer_life_seconds",
+                "Seconds a crossing answer whose record another shard holds stood",
+                &["answered"],
+                vec![1.0, 5.0, 30.0, 60.0, 150.0, 300.0, 600.0, 1200.0, 2400.0, 4800.0]
+            )
+            .unwrap(),
+
+            wanted_records: register_gauge!(
+                "hyperscale_wanted_records",
+                "Crossing records consumers here wait on with no arrival for"
+            )
+            .unwrap(),
+
             eager_proposals: register_counter_vec!(
                 "hyperscale_eager_proposals_total",
                 "Proposals a leader made at once rather than holding an empty block, by reason",
@@ -1033,6 +1082,11 @@ impl PrometheusRecorder {
             metrics: Metrics::new(),
         }
     }
+}
+
+/// A boolean label's value.
+const fn flag(set: bool) -> &'static str {
+    if set { "true" } else { "false" }
 }
 
 impl MetricsRecorder for PrometheusRecorder {
@@ -1412,6 +1466,37 @@ impl MetricsRecorder for PrometheusRecorder {
             .crossing_fallback_asks
             .with_label_values(&[asker])
             .inc();
+    }
+
+    fn record_records_repushed(&self, kind: &str, seated: bool) {
+        self.metrics
+            .records_repushed
+            .with_label_values(&[kind, flag(seated)])
+            .inc();
+    }
+
+    fn record_repush_due(&self, seated: bool) {
+        self.metrics
+            .repush_due
+            .with_label_values(&[flag(seated)])
+            .inc();
+    }
+
+    fn record_retirement_wait(&self, millis: u64) {
+        self.metrics
+            .retirement_wait
+            .observe(millis as f64 / 1_000.0);
+    }
+
+    fn record_answer_life(&self, answered: &str, millis: u64) {
+        self.metrics
+            .answer_life
+            .with_label_values(&[answered])
+            .observe(millis as f64 / 1_000.0);
+    }
+
+    fn set_wanted_records(&self, count: usize) {
+        self.metrics.wanted_records.set(count as f64);
     }
 
     fn record_fenced_claim(&self, reading: &str, carried: bool) {

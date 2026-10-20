@@ -333,6 +333,35 @@ pub trait MetricsRecorder: Send + Sync + 'static {
         let _ = asker;
     }
 
+    /// A record a proposing replica pushed to its consumer's shard
+    /// again, by its terms (`"owed"` or `"escrowed"`), and by whether
+    /// that replica began folding its chain above the chain's genesis,
+    /// having taken its seat or restarted there (`seated`). Counted per
+    /// proposing replica: each one that proposes while the record is due
+    /// pushes it on its own pacing.
+    fn record_records_repushed(&self, kind: &str, seated: bool) {}
+
+    /// A carried record a proposing replica's re-push found due for the
+    /// first time, by `seated` as [`Self::record_records_repushed`]
+    /// reads it. Counted once per proposing replica and record.
+    fn record_repush_due(&self, seated: bool) {}
+
+    /// The committed clock from a carried record's re-push due instant
+    /// to the block that retires it, zero where the retirement comes
+    /// first.
+    fn record_retirement_wait(&self, millis: u64) {}
+
+    /// How long an answer stood under this shard's prefix whose record
+    /// another shard holds, by which way it answered (`"taken"` or
+    /// `"never"`): the committed clock from the commit that first read it
+    /// to the commit that read it gone or holding another transaction's
+    /// answer.
+    fn record_answer_life(&self, answered: &str, millis: u64) {}
+
+    /// The records consumers here wait on with no arrival for, at a
+    /// commit.
+    fn set_wanted_records(&self, count: usize) {}
+
     /// A claim the commit fold acts on by its anchor: one carrying a
     /// record presence (`"record"`), either carried by a committed block
     /// or dropped from what a validator held to offer because the block
@@ -946,6 +975,36 @@ pub fn record_record_ask() {
 #[inline]
 pub fn record_crossing_fallback_ask(asker: &str) {
     recorder().record_crossing_fallback_ask(asker);
+}
+
+/// Record a record pushed to its consumer's shard again.
+#[inline]
+pub fn record_records_repushed(kind: &str, seated: bool) {
+    recorder().record_records_repushed(kind, seated);
+}
+
+/// Record a carried record its re-push first found due.
+#[inline]
+pub fn record_repush_due(seated: bool) {
+    recorder().record_repush_due(seated);
+}
+
+/// Record the wait from a record's re-push due instant to its retirement.
+#[inline]
+pub fn record_retirement_wait(millis: u64) {
+    recorder().record_retirement_wait(millis);
+}
+
+/// Record how long an answer stood, by which way it answered.
+#[inline]
+pub fn record_answer_life(answered: &str, millis: u64) {
+    recorder().record_answer_life(answered, millis);
+}
+
+/// Set the records consumers here wait on with no arrival for.
+#[inline]
+pub fn set_wanted_records(count: usize) {
+    recorder().set_wanted_records(count);
 }
 
 /// Record a fenced claim carried by a block or refused by the read
