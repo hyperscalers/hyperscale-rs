@@ -2718,7 +2718,7 @@ fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C, late: Lat
     }
     // The grow that seated these shards left two terminal records.
     assert!(
-        load.run(c, epoch * RESHAPE_EVIDENCE_EPOCHS, no_reshape_evidence),
+        c.run_until(epochs(RESHAPE_EVIDENCE_EPOCHS), no_reshape_evidence),
         "the grow's terminal records must go before a certificate can lapse",
     );
 
