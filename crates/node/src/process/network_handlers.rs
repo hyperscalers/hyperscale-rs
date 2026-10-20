@@ -170,8 +170,10 @@ where
                     // remote header coordinator's of the quorum certificate,
                     // which runs once the signature holds.
                     let checks = [
-                        VerdictKey::of(&gossip),
-                        VerdictKey::of(gossip.certified_header.as_unverified()),
+                        VerdictKey::from_digest(gossip.copy_digest()),
+                        VerdictKey::from_digest(
+                            gossip.certified_header.as_unverified().copy_digest(),
+                        ),
                     ];
                     push_shard_input(
                         tx,

@@ -171,6 +171,13 @@ impl VerdictKey {
         let bytes = hbor_to_vec(item).expect("a decoded item encodes");
         Self(*Hash::from_bytes(&bytes).as_bytes())
     }
+
+    /// The key named by a digest the item computes itself, for an item
+    /// whose encoding costs more than a digest of fields it already holds.
+    #[must_use]
+    pub const fn from_digest(digest: Hash) -> Self {
+        Self(*digest.as_bytes())
+    }
 }
 
 /// Result of request-response evaluation by the application callback.

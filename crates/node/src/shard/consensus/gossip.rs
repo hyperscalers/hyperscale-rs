@@ -164,7 +164,7 @@ where
                         start.elapsed().as_secs_f64(),
                     );
                     network.settle(
-                        VerdictKey::of(&gossip),
+                        VerdictKey::from_digest(gossip.copy_digest()),
                         if valid {
                             Verdict::Accept
                         } else {

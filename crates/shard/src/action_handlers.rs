@@ -1050,7 +1050,7 @@ where
             // A gossiped copy of the header travels on only once its
             // certificate holds; a false one is its sender's to answer for.
             ctx.network.settle(
-                VerdictKey::of(&*certified_header),
+                VerdictKey::from_digest(certified_header.copy_digest()),
                 if result.is_ok() {
                     Verdict::Accept
                 } else {
