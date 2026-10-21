@@ -18,12 +18,10 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_engine::tick_select::SeatQuestion;
 use hyperscale_metrics::{
-    record_answer_life, record_boundary_cells_asked, record_boundary_claims_carried,
-    record_boundary_drained, record_decline_folded, record_fenced_claim,
-    record_rebuilt_record_entry, record_reclaim_folded, record_records_repushed, record_repush_due,
-    record_repush_paused, record_retirement_carry_wait, record_retirement_wait,
-    record_sibling_absence_read, record_sibling_question_pending, set_standing_answers,
-    set_wanted_records,
+    record_boundary_cells_asked, record_boundary_claims_carried, record_boundary_drained,
+    record_decline_folded, record_fenced_claim, record_rebuilt_record_entry, record_reclaim_folded,
+    record_records_repushed, record_repush_due, record_repush_paused, record_sibling_absence_read,
+    record_sibling_question_pending, set_standing_answers, set_wanted_records,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
@@ -759,35 +757,9 @@ struct AnswerRow {
     marker: SubstateKey,
     /// The transaction's validity end.
     validity_end: WeightedTimestamp,
-    /// The answering transaction.
-    tx: TxHash,
-    /// Which way the answer went.
-    answered: Answered,
-    /// The committed clock of the read that first put the answer, kept
-    /// while its key holds the same transaction's answer: unknown for an
-    /// answer a whole read found with no row before it.
-    since: Option<WeightedTimestamp>,
 }
 
 impl AnswerRow {
-    /// Whether `other` is the answer of the same transaction to the same
-    /// record, the way this one went, whichever shard holds the record.
-    fn same_answer(&self, other: &Self) -> bool {
-        self.record == other.record && self.tx == other.tx && self.answered == other.answered
-    }
-
-    /// Count the answer's life, read gone at `now`, where its first
-    /// reading is known.
-    fn record_life(&self, now: WeightedTimestamp) {
-        if let Some(since) = self.since {
-            let kind = match self.answered {
-                Answered::Taken => "taken",
-                Answered::Never => "never",
-            };
-            record_answer_life(kind, millis(now.elapsed_since(since)));
-        }
-    }
-
     /// The cells the answer's deletion reads at `boundary`, ascending.
     fn cells(&self, boundary: &Anchor) -> Vec<SubstateKey> {
         let mut cells = vec![self.record, self.row];
@@ -935,9 +907,6 @@ impl RowRead {
                         row: member_row_leaf(holder, answer.tx),
                         marker: committed_tx_cell_key(holder, answer.tx, validity_end),
                         validity_end,
-                        tx: answer.tx,
-                        answered: answer.answered,
-                        since: None,
                     },
                     bytes,
                 })
@@ -1041,75 +1010,33 @@ struct CrossingRows {
 
 impl CrossingRows {
     /// Take what a read of the index under `trie` brought, `read` to
-    /// `cursor`, for `local`, at `now`, the committed clock.
-    ///
-    /// An answer whose record another shard holds is dated from the
-    /// read that first put it, and a rewrite of the same transaction's
-    /// answer keeps that date, as does a new holder of its record. Where
-    /// a read finds its key gone, or holding another transaction's
-    /// answer, its life is counted; an answer whose record this shard
-    /// now holds still stands, and is not.
+    /// `cursor`, for `local`.
     fn take(
         &mut self,
         trie: &ShardTrie,
         local: ShardId,
         read: CrossingRead,
         cursor: Option<CrossingCursor>,
-        now: WeightedTimestamp,
     ) {
         self.newly_carried.clear();
         match read {
             CrossingRead::Whole(rows) => {
-                let mut before = std::mem::take(&mut self.answers);
                 *self = Self {
                     rejudge: true,
                     ..Self::default()
                 };
                 for (key, value) in rows {
-                    if let Some(mut read) = RowRead::of(trie, local, key, &value) {
-                        if let RowRead::Answer { row, .. } = &mut read {
-                            row.since = match before.remove(&key) {
-                                Some(old) if old.same_answer(row) => old.since,
-                                Some(old) => {
-                                    old.record_life(now);
-                                    Some(now)
-                                }
-                                None => None,
-                            };
-                        } else {
-                            before.remove(&key);
-                        }
+                    if let Some(read) = RowRead::of(trie, local, key, &value) {
                         self.put(key, read);
-                    }
-                }
-                // A key no longer under this shard's prefix moved with
-                // its answer; every other one left is gone.
-                for (key, old) in before {
-                    if trie.shard_for_prefix(key.owner) == local {
-                        old.record_life(now);
                     }
                 }
             }
             CrossingRead::Changed(rows) => {
                 for (key, value) in rows {
-                    let before = self.answers.get(&key).copied();
                     self.retract(key);
-                    let mut read = value.and_then(|value| RowRead::of(trie, local, key, &value));
-                    match (before, &mut read) {
-                        (Some(old), Some(RowRead::Answer { row, .. })) if old.same_answer(row) => {
-                            row.since = old.since;
-                        }
-                        (_, Some(RowRead::Closing { .. })) => {}
-                        (old, read) => {
-                            if let Some(old) = old {
-                                old.record_life(now);
-                            }
-                            if let Some(RowRead::Answer { row, .. }) = read {
-                                row.since = Some(now);
-                            }
-                        }
-                    }
-                    if let Some(read) = read {
+                    if let Some(read) =
+                        value.and_then(|value| RowRead::of(trie, local, key, &value))
+                    {
                         self.put(key, read);
                     }
                 }
@@ -1266,28 +1193,6 @@ impl CrossingRows {
             .collect();
         self.unread.extend(cells);
         self.unread.insert(cell);
-    }
-
-    /// The records held here for consumers elsewhere that `claims`, a
-    /// block of `local`'s chain at `block_anchor`, retire: each read off
-    /// the record's own question of its `Taken`.
-    fn retired_by(
-        &self,
-        claims: &[StateClaim],
-        local: ShardId,
-        block_anchor: WeightedTimestamp,
-    ) -> BTreeSet<SubstateKey> {
-        let issuer = |id: &CrossingId| {
-            self.answer_asks
-                .get(&id.answer_key(&ProtocolHasher, Answered::Taken))
-                .filter(|ask| ask.id == *id)
-                .map(|ask| Issuer::from(&ask.record))
-        };
-        claims
-            .iter()
-            .flat_map(|claim| claim.retires(local, block_anchor, issuer))
-            .map(|(record, _)| record)
-            .collect()
     }
 
     /// Whether `key` is the `Taken` of a record this shard holds for a
@@ -1968,26 +1873,6 @@ pub struct Counterparts {
     /// this account never saw may have answered.
     seeded: bool,
 
-    /// The height of the last block this account folded when each
-    /// record's consumer's `Taken` was first held here at a boundary, by
-    /// record key: what a retirement's carry wait is counted from.
-    /// Dropped where a block retires the record, counting the wait, and
-    /// where its row goes otherwise, counting nothing. Node-local, so a
-    /// new account starts with none.
-    retirement_held: BTreeMap<SubstateKey, BlockHeight>,
-
-    /// The height of the last block this account folded.
-    folded: BlockHeight,
-
-    /// Whether the first block this account folded stood above its
-    /// chain's genesis: neither the genesis block nor a block over the
-    /// genesis QC. A validator that took its seat, or restarted, mid
-    /// chain folds first above them; one seated at a reshape
-    /// successor's genesis does not, though the successor's heights
-    /// continue its parent's. Unset until a block is folded; read by the
-    /// re-push counters alone.
-    seated: Option<bool>,
-
     /// The committed clock as of the last commit or push: what an
     /// escrowed record's validity end is read against where no caller
     /// hands a clock in.
@@ -2085,9 +1970,6 @@ impl Counterparts {
             boundaries: BoundaryClaims::default(),
             repushed: BTreeMap::new(),
             seeded: false,
-            retirement_held: BTreeMap::new(),
-            folded: BlockHeight::GENESIS,
-            seated: None,
             clock: WeightedTimestamp::ZERO,
             frontier,
             wanted: BTreeSet::new(),
@@ -2123,10 +2005,6 @@ impl Counterparts {
     ) -> CommitFolded {
         let windows = topology_schedule.windows();
         self.clock = now;
-        self.folded = block.height();
-        self.seated.get_or_insert_with(|| {
-            !(block.is_genesis() || block.header().parent_qc().is_genesis())
-        });
         self.gc_settled_sets(topology_schedule, now);
         self.want(wanted);
         set_wanted_records(self.wanted.len());
@@ -2143,18 +2021,6 @@ impl Counterparts {
             .collect();
         for (record, tx_hash) in retired {
             self.ledger.settled(record, tx_hash);
-        }
-        // Each record of this shard's the block retires, read off the
-        // block against the record's own row, whether or not a ledger
-        // entry still names it.
-        for record in self
-            .rows
-            .retired_by(block.state_claims(), local, block_anchor)
-        {
-            if let Some(carried) = self.rows.carried.get(&record) {
-                record_retirement_wait(millis(now.elapsed_since(carried.due_from)));
-            }
-            self.carried_retirement(record, block.height());
         }
         // What the fold takes back is marked returned on the entry that
         // issued it: a record returned on its consumer's `Never` closes
@@ -2539,7 +2405,7 @@ impl Counterparts {
     pub(crate) fn derive_asks(&mut self, trie: &ShardTrie) -> Vec<SubstateKey> {
         let local = self.ledger.local();
         let (read, cursor) = self.index.crossing_changes(local, self.rows.since(trie));
-        self.rows.take(trie, local, read, cursor, self.clock);
+        self.rows.take(trie, local, read, cursor);
         set_standing_answers(local.inner(), self.rows.standing, self.rows.standing_bytes);
         let carried = &self.rows.carried;
         self.repushed
@@ -2556,8 +2422,6 @@ impl Counterparts {
                 }
             }
         }
-        self.retirement_held
-            .retain(|record, _| carried.contains_key(record));
         let settling: BTreeSet<CrossingId> = self
             .rows
             .settling
@@ -2635,15 +2499,6 @@ impl Counterparts {
         }
     }
 
-    /// Count the blocks from the last block folded when `record`'s
-    /// consumer's `Taken` was first held here to `height`, the block that
-    /// carried it, where one was held.
-    fn carried_retirement(&mut self, record: SubstateKey, height: BlockHeight) {
-        if let Some(held) = self.retirement_held.remove(&record) {
-            record_retirement_carry_wait(height.inner().saturating_sub(held.inner()));
-        }
-    }
-
     /// The records to push to their consumers again at `height`, by the
     /// shard holding each consumer's prefix under `trie`, ascending.
     ///
@@ -2678,7 +2533,6 @@ impl Counterparts {
         now: WeightedTimestamp,
         height: BlockHeight,
     ) -> BTreeMap<ShardId, Vec<SubstateKey>> {
-        let seated = self.seated.unwrap_or(false);
         let mut due: Vec<(Option<BlockHeight>, WeightedTimestamp, SubstateKey, u32)> = Vec::new();
         for (record, carried) in &self.rows.carried {
             if now < carried.due_from {
@@ -2687,7 +2541,7 @@ impl Counterparts {
             let entry = self.repushed.entry(*record).or_default();
             if !entry.found_due {
                 entry.found_due = true;
-                record_repush_due(seated, entry.paused_from.is_some());
+                record_repush_due(entry.paused_from.is_some());
             }
             if entry.paused_from.is_some() {
                 continue;
@@ -2715,7 +2569,7 @@ impl Counterparts {
             let entry = self.repushed.entry(record).or_default();
             entry.last = Some((height, times.saturating_add(1)));
             let kind = if carried.escrowed { "escrowed" } else { "owed" };
-            record_records_repushed(kind, seated, entry.cleared_at.is_some());
+            record_records_repushed(kind, entry.cleared_at.is_some());
             targets.entry(target).or_default().push(record);
         }
         for records in targets.values_mut() {
@@ -2966,18 +2820,6 @@ impl Counterparts {
         for key in &refuted {
             self.rows.unread_with(*key);
             self.resume(key, &anchor, "refuted");
-        }
-        for key in &kept {
-            if let Some(ask) = self
-                .rows
-                .answer_asks
-                .get(key)
-                .filter(|ask| ask.answered == Answered::Taken)
-            {
-                self.retirement_held
-                    .entry(ask.id.record_key(&ProtocolHasher))
-                    .or_insert(self.folded);
-            }
         }
         self.boundaries.hold(anchor, &asked, claim, refuted);
         asked
@@ -4458,16 +4300,13 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_storage::{Substates, owed_credits, unclaimed_declines};
     use hyperscale_types::state_key::jmt_value_hash;
-    use hyperscale_types::test_utils::{
-        make_live_block, proven_claim, state_and_proof, state_and_proof_holding,
-    };
+    use hyperscale_types::test_utils::{proven_claim, state_and_proof, state_and_proof_holding};
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, CollectionId, CommittedAt,
-        Deadline, Epoch, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_PROOFS_PER_QUERY,
-        NetworkDefinition, QuorumCertificate, ResourceAddr, Round, RoutePrefix, Said,
-        SettledTxsRoot, ShardAnchor, SignerBitfield, StateRoot, StateWrites, TopologySnapshot,
-        ValidatorId, ValidatorSet, encode_amount, evidence_admits_block,
+        AbortCharge, Address, AddressClass, BeaconWitnessLeafCount, BlockHash, BlockHeight,
+        CollectionId, CommittedAt, Deadline, Epoch, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
+        MAX_PROOFS_PER_QUERY, NetworkDefinition, ResourceAddr, RoutePrefix, Said, SettledTxsRoot,
+        ShardAnchor, StateRoot, StateWrites, TopologySnapshot, ValidatorSet, encode_amount,
+        evidence_admits_block,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, Terms,
@@ -5051,135 +4890,6 @@ mod tests {
             vec![(next, both)],
             "the record put back is asked at the holder's next boundary",
         );
-    }
-
-    /// A retirement's carry wait counts the blocks from the last block
-    /// folded when its consumer's `Taken` was first held to the block
-    /// that carries it, read off that block whether or not a ledger entry
-    /// names the record: held after one commit and carried by the next is
-    /// a wait of one. A record whose row goes otherwise counts nothing.
-    #[test]
-    fn a_carried_retirement_records_its_carry_wait_from_its_first_hold() {
-        let rows = Arc::new(TestRows::default());
-        let (mut producer, id, cell, taken, never) = escrowed_producer(&rows, 0x69, 36_000);
-        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
-        let both = sorted(vec![taken, never]);
-        let (boundary, proof) =
-            answered_at(&id, &cell, &[(Answered::Taken, cell.tx)], &both, 40, 60_000);
-        let schedule = recording(&[boundary]);
-        let past = boundary
-            .ts
-            .plus(RETENTION_HORIZON)
-            .plus(Duration::from_secs(1));
-        let commit = |producer: &mut Counterparts, height: u64, claims: Vec<StateClaim>| {
-            let block = block_carrying(PRODUCER, height, past, claims);
-            let _ = producer.on_commit(&trie, &schedule, &block, past, &[]);
-        };
-        commit(&mut producer, 10, Vec::new());
-        producer.on_proof_fetched(boundary, &both, &proof, &[]);
-        let record = id.record_key(&ProtocolHasher);
-        assert_eq!(
-            producer.retirement_held.get(&record),
-            Some(&BlockHeight::new(10)),
-            "held after the commit at 10",
-        );
-        let carried = producer.offers(&CarriedClaims::default()).retirement_claims[0].carrying(1);
-        let recorder = MemoryRecorder::new();
-        with_recorder(&recorder, || commit(&mut producer, 11, carried));
-        assert!(
-            producer.ledger.issuers_of(&id).is_empty(),
-            "no ledger entry names it"
-        );
-        assert_eq!(recorder.histogram_count("retirement_carry_wait", None), 1);
-        assert_eq!(
-            recorder.histogram_sum("retirement_carry_wait", None),
-            1.0,
-            "held and carried within one commit interval",
-        );
-
-        let (other_id, other_cell, other_taken, other_never) = {
-            let cell = CrossingCell {
-                terms: Terms::Escrowed {
-                    credit: producer_record(0x6C),
-                },
-                validity_end_ms: 36_000,
-                ..producer_cell(0x6B, Deadline::of(WeightedTimestamp::from_millis(36_000)))
-            };
-            let id = CrossingId::of_record(producer_record(0x6B).owner, &cell);
-            rows.put(id.record_key(&ProtocolHasher), cell.to_bytes());
-            (
-                id,
-                cell,
-                id.answer_key(&ProtocolHasher, Answered::Taken),
-                id.answer_key(&ProtocolHasher, Answered::Never),
-            )
-        };
-        commit(&mut producer, 12, Vec::new());
-        let other = sorted(vec![other_taken, other_never]);
-        let (later, other_proof) = answered_at(
-            &other_id,
-            &other_cell,
-            &[(Answered::Taken, other_cell.tx)],
-            &other,
-            40,
-            60_000,
-        );
-        let _ = producer.ask_boundaries(&recording(&[later]), past);
-        producer.on_proof_fetched(later, &other, &other_proof, &[]);
-        assert!(
-            producer
-                .retirement_held
-                .contains_key(&other_id.record_key(&ProtocolHasher))
-        );
-        rows.remove(other_id.record_key(&ProtocolHasher));
-        commit(&mut producer, 13, Vec::new());
-        assert!(
-            producer.retirement_held.is_empty(),
-            "a record whose row goes otherwise is dropped uncounted",
-        );
-    }
-
-    /// A block of `shard`'s at `height` over a parent QC at `anchor`,
-    /// carrying `claims`.
-    fn block_carrying(
-        shard: ShardId,
-        height: u64,
-        anchor: WeightedTimestamp,
-        claims: Vec<StateClaim>,
-    ) -> Block {
-        let origin = ChainOrigin {
-            genesis_height: BlockHeight::new(height - 1),
-            anchor_wt: anchor,
-        };
-        let Block::Live {
-            transactions,
-            certificates,
-            provisions,
-            abandonment_records,
-            tick_manifest,
-            terms,
-            witness_sources,
-            ..
-        } = block_over(height, QuorumCertificate::genesis(shard, origin))
-        else {
-            unreachable!("a live block")
-        };
-        Block::Live {
-            header: BlockHeader::new(BlockHeaderParts {
-                shard_id: shard,
-                height: BlockHeight::new(height),
-                parent_qc: QuorumCertificate::genesis(shard, origin).into(),
-                ..Default::default()
-            }),
-            transactions,
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
-            tick_manifest,
-            terms,
-            witness_sources,
-        }
     }
 
     /// The clock [`escrowed_producer`]'s records fall due at.
@@ -9806,26 +9516,12 @@ mod tests {
     /// less how it came to read them.
     fn derived(counterparts: &Counterparts) -> String {
         let rows = &counterparts.rows;
-        // An answer's first reading is how the replica came to read it.
-        let answers: BTreeMap<&SubstateKey, AnswerRow> = rows
-            .answers
-            .iter()
-            .map(|(key, row)| {
-                (
-                    key,
-                    AnswerRow {
-                        since: None,
-                        ..*row
-                    },
-                )
-            })
-            .collect();
         format!(
             "{:?}",
             (
                 (
                     &rows.rows.keys().collect::<Vec<_>>(),
-                    &answers,
+                    &rows.answers,
                     &rows.readers,
                     &rows.holders,
                     &rows.answer_asks,
@@ -10124,9 +9820,6 @@ mod tests {
                             row: member_row_leaf(holder, answer.tx),
                             marker: committed_tx_cell_key(holder, answer.tx, end),
                             validity_end: end,
-                            tx: answer.tx,
-                            answered: answer.answered,
-                            since: None,
                         });
                     }
                 }
@@ -10153,7 +9846,7 @@ mod tests {
             for step in 0..120 {
                 write_at_random(&mut draws, &index, &mut written);
                 let (read, cursor) = index.crossing_changes(CONSUMER, rows.since(&trie));
-                rows.take(&trie, CONSUMER, read, cursor, WeightedTimestamp::ZERO);
+                rows.take(&trie, CONSUMER, read, cursor);
                 let CrossingRead::Whole(all) = index.crossing_changes(CONSUMER, None).0 else {
                     panic!("no cursor reads whole");
                 };
@@ -10329,212 +10022,10 @@ mod tests {
         }
     }
 
-    /// What the consumer's rows take of `index` read at `at`
-    /// milliseconds of the committed clock, under the differential's
-    /// trie.
-    fn take_at(rows: &mut CrossingRows, index: &TestRows, at: u64) {
-        take_under(
-            &ShardTrie::from_leaves([CONSUMER, PRODUCER]),
-            rows,
-            index,
-            at,
-        );
-    }
-
-    /// What the consumer's rows take of `index` read at `at`
-    /// milliseconds of the committed clock, under `trie`.
-    fn take_under(trie: &ShardTrie, rows: &mut CrossingRows, index: &TestRows, at: u64) {
-        let (read, cursor) = index.crossing_changes(CONSUMER, rows.since(trie));
-        rows.take(
-            trie,
-            CONSUMER,
-            read,
-            cursor,
-            WeightedTimestamp::from_millis(at),
-        );
-    }
-
     /// `recorder` installed while `f` runs.
     fn with_recorder<R>(recorder: &MemoryRecorder, f: impl FnOnce() -> R) -> R {
         let scoped: Arc<dyn MetricsRecorder> = Arc::new(recorder.clone());
         with_scoped_recorder(scoped, f)
-    }
-
-    /// An answer whose record the producer holds is dated from the read
-    /// that first put it, and counted by the way it went once a read
-    /// finds its key gone or holding another transaction's answer.
-    #[test]
-    fn an_answer_row_records_its_life_by_kind_on_removal() {
-        let index = TestRows::default();
-        let mut rows = CrossingRows::default();
-        let recorder = MemoryRecorder::new();
-        let (taken_id, taken_cell) = differential_crossing(0, 0, false, Terms::Owed);
-        let (never_id, never_cell) = differential_crossing(3, 0, false, Terms::Owed);
-        let taken_key = taken_id.answer_key(&ProtocolHasher, Answered::Taken);
-        let never_key = never_id.answer_key(&ProtocolHasher, Answered::Never);
-        let other_tx = TxHash::from(Hash::from_bytes(&[0xEE; 32]));
-        with_recorder(&recorder, || {
-            take_at(&mut rows, &index, 0);
-            index.put(
-                taken_key,
-                taken_id
-                    .answer(taken_cell.tx, Answered::Taken, taken_cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            index.put(
-                never_key,
-                never_id
-                    .answer(never_cell.tx, Answered::Never, never_cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            take_at(&mut rows, &index, 10_000);
-            assert_eq!(
-                rows.answers[&taken_key].since,
-                Some(WeightedTimestamp::from_millis(10_000))
-            );
-            index.remove(taken_key);
-            take_at(&mut rows, &index, 25_000);
-            index.put(
-                never_key,
-                never_id
-                    .answer(other_tx, Answered::Never, never_cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            take_at(&mut rows, &index, 40_000);
-        });
-        assert_eq!(recorder.histogram_count("answer_life_ms", Some("taken")), 1);
-        assert_eq!(
-            recorder.histogram_sum("answer_life_ms", Some("taken")),
-            15_000.0
-        );
-        assert_eq!(recorder.histogram_count("answer_life_ms", Some("never")), 1);
-        assert_eq!(
-            recorder.histogram_sum("answer_life_ms", Some("never")),
-            30_000.0
-        );
-        assert_eq!(
-            rows.answers[&never_key].since,
-            Some(WeightedTimestamp::from_millis(40_000)),
-            "the other transaction's answer is dated from the read that found it",
-        );
-    }
-
-    /// A `Never` marked seen is the same transaction's answer: it keeps
-    /// the date of its first reading, and no life is counted.
-    #[test]
-    fn a_rewritten_answer_keeps_its_since() {
-        let index = TestRows::default();
-        let mut rows = CrossingRows::default();
-        let recorder = MemoryRecorder::new();
-        let (id, cell) = differential_crossing(3, 0, false, Terms::Owed);
-        let key = id.answer_key(&ProtocolHasher, Answered::Never);
-        with_recorder(&recorder, || {
-            take_at(&mut rows, &index, 0);
-            index.put(
-                key,
-                id.unseen_never(cell.tx, cell.validity_end_ms).to_bytes(),
-            );
-            take_at(&mut rows, &index, 10_000);
-            index.put(
-                key,
-                id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            take_at(&mut rows, &index, 20_000);
-        });
-        assert_eq!(
-            rows.answers[&key].since,
-            Some(WeightedTimestamp::from_millis(10_000))
-        );
-        assert_eq!(recorder.histogram_count("answer_life_ms", Some("never")), 0);
-    }
-
-    /// A whole read carries an answer's date over from the row it
-    /// replaces, leaves undated one it finds with no row before it, and
-    /// counts the life of one it finds gone.
-    #[test]
-    fn a_whole_read_keeps_the_since_of_a_standing_answer() {
-        let index = TestRows::default();
-        let mut rows = CrossingRows::default();
-        let recorder = MemoryRecorder::new();
-        let (standing_id, standing_cell) = differential_crossing(0, 0, false, Terms::Owed);
-        let (found_id, found_cell) = differential_crossing(3, 0, false, Terms::Owed);
-        let (gone_id, gone_cell) = differential_crossing(6, 0, false, Terms::Owed);
-        let standing = standing_id.answer_key(&ProtocolHasher, Answered::Taken);
-        let found = found_id.answer_key(&ProtocolHasher, Answered::Taken);
-        let gone = gone_id.answer_key(&ProtocolHasher, Answered::Taken);
-        with_recorder(&recorder, || {
-            take_at(&mut rows, &index, 0);
-            index.put(
-                standing,
-                standing_id
-                    .answer(
-                        standing_cell.tx,
-                        Answered::Taken,
-                        standing_cell.validity_end_ms,
-                    )
-                    .to_bytes(),
-            );
-            index.put(
-                gone,
-                gone_id
-                    .answer(gone_cell.tx, Answered::Taken, gone_cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            take_at(&mut rows, &index, 10_000);
-            index.remove(gone);
-            index.put(
-                found,
-                found_id
-                    .answer(found_cell.tx, Answered::Taken, found_cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            index.restart();
-            take_at(&mut rows, &index, 20_000);
-        });
-        assert!(rows.rejudge, "the read was whole");
-        assert_eq!(
-            rows.answers[&standing].since,
-            Some(WeightedTimestamp::from_millis(10_000))
-        );
-        assert_eq!(rows.answers[&found].since, None);
-        assert!(!rows.answers.contains_key(&gone));
-        assert_eq!(recorder.histogram_count("answer_life_ms", Some("taken")), 1);
-        assert_eq!(
-            recorder.histogram_sum("answer_life_ms", Some("taken")),
-            10_000.0
-        );
-    }
-
-    /// A whole read under a trie that moves an answer's record to
-    /// another holder finds the same answer: it keeps its date, and no
-    /// life is counted.
-    #[test]
-    fn a_holder_change_on_a_whole_read_keeps_the_since() {
-        let index = TestRows::default();
-        let mut rows = CrossingRows::default();
-        let recorder = MemoryRecorder::new();
-        let (id, cell) = differential_crossing(0, 0, false, Terms::Owed);
-        let key = id.answer_key(&ProtocolHasher, Answered::Taken);
-        let split = ShardTrie::from_leaves([CONSUMER, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
-        with_recorder(&recorder, || {
-            take_at(&mut rows, &index, 0);
-            index.put(
-                key,
-                id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
-                    .to_bytes(),
-            );
-            take_at(&mut rows, &index, 10_000);
-            let before = rows.answers[&key].holder;
-            take_under(&split, &mut rows, &index, 20_000);
-            assert!(rows.rejudge, "the read under a new trie was whole");
-            assert_ne!(rows.answers[&key].holder, before, "the record moved");
-        });
-        assert_eq!(
-            rows.answers[&key].since,
-            Some(WeightedTimestamp::from_millis(10_000))
-        );
-        assert_eq!(recorder.histogram_count("answer_life_ms", Some("taken")), 0);
     }
 
     /// Records the cap holds back are each counted due once, when first
@@ -10588,88 +10079,5 @@ mod tests {
             u64::try_from(MAX_UNSOLICITED_RECORDS_PER_PRODUCER * 2).expect("small"),
             "and each push is counted",
         );
-    }
-
-    /// A validator folding from its chain's genesis reads unseated, a
-    /// reshape successor's whose heights continue its parent's among
-    /// them; one whose first block stands over a certified block reads
-    /// seated.
-    #[test]
-    fn a_successor_shards_genesis_validators_read_unseated() {
-        let schedule = recording(&[]);
-        let trie = ShardTrie::from_leaves([ShardId::ROOT]);
-        let origin = ChainOrigin {
-            genesis_height: BlockHeight::new(10),
-            anchor_wt: WeightedTimestamp::ZERO,
-        };
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
-        let certified = QuorumCertificate::new(
-            BlockHash::from_raw(Hash::from_bytes(b"block eleven")),
-            ShardId::ROOT,
-            BlockHeight::new(11),
-            BlockHash::ZERO,
-            Round::INITIAL,
-            signers,
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-        for (height, parent_qc, seated) in [
-            (11, QuorumCertificate::genesis(ShardId::ROOT, origin), false),
-            (12, certified, true),
-        ] {
-            let mut counterparts = Counterparts::new(
-                ShardId::ROOT,
-                Arc::new(ProvenAnchors::default()),
-                Arc::new(CounterpartMirror::default()),
-                Arc::new(TestRows::default()),
-                ReadFrontier::default(),
-            );
-            let block = block_over(height, parent_qc);
-            let now = WeightedTimestamp::from_millis(1_000);
-            let _ = counterparts.on_commit(&trie, &schedule, &block, now, &[]);
-            assert_eq!(counterparts.seated, Some(seated), "at height {height}");
-        }
-    }
-
-    /// An empty block at `height` over `parent_qc`.
-    fn block_over(height: u64, parent_qc: QuorumCertificate) -> Block {
-        let Block::Live {
-            transactions,
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            terms,
-            witness_sources,
-            ..
-        } = make_live_block(
-            ShardId::ROOT,
-            BlockHeight::new(height),
-            1_000,
-            ValidatorId::new(0),
-            vec![],
-            vec![],
-        )
-        else {
-            unreachable!("a live block")
-        };
-        Block::Live {
-            header: BlockHeader::new(BlockHeaderParts {
-                shard_id: ShardId::ROOT,
-                height: BlockHeight::new(height),
-                parent_qc: parent_qc.into(),
-                ..Default::default()
-            }),
-            transactions,
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            terms,
-            witness_sources,
-        }
     }
 }

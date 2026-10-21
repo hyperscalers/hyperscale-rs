@@ -4113,11 +4113,8 @@ impl ClaimBytes {
     }
 }
 
-/// Print, over the whole run, how long answers stood by kind, how long
-/// records waited from their re-push due instant to their retirement,
-/// how many blocks a retirement waited from its first hold to its carry,
-/// the bytes a carried retirement weighed, the records consumers waited
-/// on with no arrival, and the re-pushes.
+/// Print, over the whole run, the bytes a carried retirement weighed,
+/// the records consumers waited on with no arrival, and the re-pushes.
 fn report_retirement_figures<C: FaultableCluster>(c: &C, label: &str) {
     let bytes = c.metric("retirement_bytes_spent", None);
     let retirements = c.metric("retirements_spent", None);
@@ -4130,32 +4127,6 @@ fn report_retirement_figures<C: FaultableCluster>(c: &C, label: &str) {
         c.metric_quantile_above(metric, kind, q, f64::NEG_INFINITY)
             .unwrap_or(0.0)
     };
-    for kind in ["taken", "never"] {
-        println!(
-            "{label} [{kind} answer life, every replica, committed clock from the read first \
-             putting an answer to the read finding it gone, each quantile the upper edge of \
-             its bucket]: {} answers, p50 {:.0}ms, p99 {:.0}ms, max {:.0}ms",
-            c.metric_count("answer_life_ms", Some(kind)),
-            at("answer_life_ms", Some(kind), 0.5),
-            at("answer_life_ms", Some(kind), 0.99),
-            at("answer_life_ms", Some(kind), 1.0),
-        );
-    }
-    println!(
-        "{label} [retirement wait, every replica, committed clock from a record's re-push due \
-         instant to its retirement]: {} retirements, p50 {:.0}ms, max {:.0}ms",
-        c.metric_count("retirement_wait_ms", None),
-        at("retirement_wait_ms", None, 0.5),
-        at("retirement_wait_ms", None, 1.0),
-    );
-    println!(
-        "{label} [retirement carry wait, every replica, blocks from the last commit when a \
-         record's consumer's Taken was first held to the block carrying it]: {} \
-         retirements, p50 {:.0}, max {:.0}",
-        c.metric_count("retirement_carry_wait", None),
-        at("retirement_carry_wait", None, 0.5),
-        at("retirement_carry_wait", None, 1.0),
-    );
     println!(
         "{label} [wanted records, every replica at each commit]: p50 {:.0}, p99 {:.0}, max {:.0}",
         at("wanted_records", None, 0.5),

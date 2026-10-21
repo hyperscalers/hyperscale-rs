@@ -326,30 +326,22 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
 
-    /// The blocks from the last block a validator folded when it first
-    /// held a record's consumer's `Taken` at a boundary to the committed
-    /// block that retired the record.
-    fn record_retirement_carry_wait(&self, blocks: u64) {}
-
     /// A retirement offer a proposer carried in a block it proposed,
     /// whether or not the block commits: the bytes its claims weigh cut
     /// on their own, proofs included, and the retirements they read.
     fn record_retirements_spent(&self, bytes: usize, retirements: usize) {}
 
     /// A record a proposing replica pushed to its consumer's shard
-    /// again, by its terms (`"owed"` or `"escrowed"`), by whether that
-    /// replica began folding its chain above the chain's genesis, having
-    /// taken its seat or restarted there (`seated`), and by whether a
+    /// again, by its terms (`"owed"` or `"escrowed"`), and by whether a
     /// pause on the record's re-push had cleared before (`paused`).
     /// Counted per proposing replica: each one that proposes while the
     /// record is due pushes it on its own pacing.
-    fn record_records_repushed(&self, kind: &str, seated: bool, paused: bool) {}
+    fn record_records_repushed(&self, kind: &str, paused: bool) {}
 
     /// A carried record a proposing replica's re-push found due for the
-    /// first time, by `seated` as [`Self::record_records_repushed`] reads
-    /// it, and by whether a pause stood on it then (`paused`). Counted
-    /// once per proposing replica and record.
-    fn record_repush_due(&self, seated: bool, paused: bool) {}
+    /// first time, by whether a pause stood on it then (`paused`).
+    /// Counted once per proposing replica and record.
+    fn record_repush_due(&self, paused: bool) {}
 
     /// A pause on a record's re-push, by what moved it: `"set"` by a
     /// pushed `Taken`, `"seeded"` at a new account's first read of the
@@ -360,18 +352,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Pushes held for a record not yet carried here, placed again at the
     /// commit whose read puts the record up.
     fn record_pushes_placed_on_carry(&self, count: usize) {}
-
-    /// The committed clock from a carried record's re-push due instant
-    /// to the block that retires it, zero where the retirement comes
-    /// first.
-    fn record_retirement_wait(&self, millis: u64) {}
-
-    /// How long an answer stood under this shard's prefix whose record
-    /// another shard holds, by which way it answered (`"taken"` or
-    /// `"never"`): the committed clock from the commit that first read it
-    /// to the commit that read it gone or holding another transaction's
-    /// answer.
-    fn record_answer_life(&self, answered: &str, millis: u64) {}
 
     /// The records consumers here wait on with no arrival for, at a
     /// commit.
@@ -986,13 +966,6 @@ pub fn record_record_ask() {
     recorder().record_record_ask();
 }
 
-/// Record the blocks a retirement waited from its first hold to its
-/// carry.
-#[inline]
-pub fn record_retirement_carry_wait(blocks: u64) {
-    recorder().record_retirement_carry_wait(blocks);
-}
-
 /// Record a retirement offer a proposer carried.
 #[inline]
 pub fn record_retirements_spent(bytes: usize, retirements: usize) {
@@ -1001,14 +974,14 @@ pub fn record_retirements_spent(bytes: usize, retirements: usize) {
 
 /// Record a record pushed to its consumer's shard again.
 #[inline]
-pub fn record_records_repushed(kind: &str, seated: bool, paused: bool) {
-    recorder().record_records_repushed(kind, seated, paused);
+pub fn record_records_repushed(kind: &str, paused: bool) {
+    recorder().record_records_repushed(kind, paused);
 }
 
 /// Record a carried record its re-push first found due.
 #[inline]
-pub fn record_repush_due(seated: bool, paused: bool) {
-    recorder().record_repush_due(seated, paused);
+pub fn record_repush_due(paused: bool) {
+    recorder().record_repush_due(paused);
 }
 
 /// Record a pause on a record's re-push moving, by `outcome`.
@@ -1021,18 +994,6 @@ pub fn record_repush_paused(outcome: &str) {
 #[inline]
 pub fn record_pushes_placed_on_carry(count: usize) {
     recorder().record_pushes_placed_on_carry(count);
-}
-
-/// Record the wait from a record's re-push due instant to its retirement.
-#[inline]
-pub fn record_retirement_wait(millis: u64) {
-    recorder().record_retirement_wait(millis);
-}
-
-/// Record how long an answer stood, by which way it answered.
-#[inline]
-pub fn record_answer_life(answered: &str, millis: u64) {
-    recorder().record_answer_life(answered, millis);
 }
 
 /// Set the records consumers here wait on with no arrival for.

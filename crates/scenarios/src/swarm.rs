@@ -122,26 +122,16 @@ pub fn transfers_survive_a_nemesis<C: CrashableCluster>(c: &mut C, seed: u64, ro
     report_repushes(c, &charges);
 }
 
-/// Print the crossings the run's charged transfers issued, the records
-/// their producers pushed again and first found due, counted per
-/// proposing replica, all of them and those of replicas seated above
-/// their chain's genesis, and the longest a record waited from its
-/// re-push due instant to its retirement.
+/// Print the crossings the run's charged transfers issued and the
+/// records their producers pushed again and first found due, counted per
+/// proposing replica.
 fn report_repushes<C: CrashableCluster>(c: &C, charges: &Charges) {
-    let wait = c
-        .metric_quantile_above("retirement_wait_ms", None, 1.0, f64::NEG_INFINITY)
-        .unwrap_or(0.0);
     println!(
         "transfers under a nemesis [re-pushes]: crossings issued {}; re-pushed owed {} \
-         escrowed {}, of them seated owed {} escrowed {}; first found due {}, of them seated \
-         {}; retirement wait max {wait:.0}ms over {} retirements",
+         escrowed {}; first found due {}",
         charges.issued(c),
         c.metric("records_repushed", Some("owed")),
         c.metric("records_repushed", Some("escrowed")),
-        c.metric("records_repushed_seated", Some("owed")),
-        c.metric("records_repushed_seated", Some("escrowed")),
         c.metric("repush_due", None),
-        c.metric("repush_due_seated", None),
-        c.metric_count("retirement_wait_ms", None),
     );
 }
