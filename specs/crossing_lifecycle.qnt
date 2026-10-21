@@ -1,9 +1,10 @@
 // Model L (register: specs/README.md) — the crossing lifecycle: an
 // escrowed value crossing is issued by its producer's shard and disposed
-// at most once (INV-EXEC-11), and never left with no admissible disposal
-// (INV-EXEC-12). Both disposals are the producer's commit fold reading
-// the consumer's one answer of the issuing transaction: retired on its
-// `Taken`, taken back on its `Never`.
+// at most once (INV-EXEC-11), never left with no admissible disposal
+// (INV-EXEC-12), and never lost to a recovery of the consumer.
+// Both disposals are the producer's commit fold reading the consumer's
+// one answer of the issuing transaction at a boundary of the consumer's
+// shard: retired on its `Taken`, taken back on its `Never`.
 //
 // One crossing of one transaction T, two shards: the producer P and the
 // consumer C. Shard consensus is an oracle (Model B): a chain is a
@@ -26,8 +27,10 @@
 //     answer of T stands (`unclaimed_declines` in
 //     crates/storage/src/shard/crossings.rs).
 //   - The retirement: P's commit fold removes the record on T's `Taken`
-//     read present at any anchor of C (`StateClaim::retires`,
-//     `crossing_settlements` in crates/storage/src/shard/crossings.rs).
+//     read present at a boundary of C (`StateClaim::retires`, which reads
+//     `StateClaim::attested`; `crossing_settlements` in
+//     crates/storage/src/shard/crossings.rs), never on a fresh one, which
+//     a recovery of C may discard.
 //   - The return: P's commit fold removes the record and credits the cell
 //     its value left on T's `Never` read present at a boundary of C
 //     (`reclaimed` and `reclaim_credits` in
@@ -60,11 +63,12 @@
 //   quint verify --main=crossing_ok   --invariant=invAll --max-steps=14 specs/crossing_lifecycle.qnt
 //   quint verify --main=unscreened_ok --invariant=invAll --max-steps=14 specs/crossing_lifecycle.qnt
 //   quint verify --main=fates_ok      --invariant=invAll --max-steps=14 specs/crossing_lifecycle.qnt
-//   # twins, each violating at its floor (7, 7, 6, 4) and clean one step below it:
+//   # twins, each violating at its floor (7, 7, 6, 4, 5) and clean one step below it:
 //   quint verify --main=fresh_never_return     --invariant=invExclusive --max-steps=7 specs/crossing_lifecycle.qnt
 //   quint verify --main=decline_beside_a_row   --invariant=invExclusive --max-steps=7 specs/crossing_lifecycle.qnt
 //   quint verify --main=decline_before_the_end --invariant=invExclusive --max-steps=6 specs/crossing_lifecycle.qnt
 //   quint verify --main=no_decline             --invariant=invDisposed  --max-steps=4 specs/crossing_lifecycle.qnt
+//   quint verify --main=fresh_taken_retire     --invariant=invConserved --max-steps=5 specs/crossing_lifecycle.qnt
 // Give every concurrent `verify` its own `--server-endpoint=localhost:<port>`.
 
 module crossing_core {
@@ -87,6 +91,9 @@ module crossing_core {
   // Whether P returns the record on a fresh `Never` rather than on one
   // read at a boundary of C. Twin `fresh_never_return`: true.
   const FRESH_NEVER: bool
+  // Whether P retires the record on a fresh `Taken` rather than on one
+  // read at a boundary of C. Twin `fresh_taken_retire`: true.
+  const FRESH_TAKEN: bool
   // Whether C's chain may fate T's row, ending it with no answer written
   // (a terminal, or a member nobody can answer for). `fates_ok`: true.
   const FATES: bool
@@ -238,7 +245,8 @@ module crossing_core {
   }
 
   // P's fold retires the record on T's `Taken`.
-  val canRetire = recordStands and answer == TAKEN
+  val takenRead = if (FRESH_TAKEN) answer == TAKEN else durableAnswer == TAKEN
+  val canRetire = recordStands and takenRead
   action retire = all {
     canRetire,
     recordStands' = false, retired' = true,
@@ -265,6 +273,10 @@ module crossing_core {
   // of it.
   val invExclusive = not(returned and answer == TAKEN)
 
+  // The crossing leaves P on a retirement only where C holds its take:
+  // no recovery of C leaves the value gone from P and never arrived.
+  val invConserved = not(retired and answer != TAKEN)
+
   // C's one answer of T is never contradicted once it is durable.
   val invAnswerStable = durableAnswer != NONE implies answer == durableAnswer
 
@@ -276,16 +288,17 @@ module crossing_core {
   // happen, the record is gone.
   val invDisposed = (clock == MAX_CLOCK and quiescent) implies not(recordStands)
 
-  val invAll = invExclusive and invAnswerStable and invDisposed
+  val invAll = invExclusive and invConserved and invAnswerStable and invDisposed
 }
 
 // Healthy: the decline from T's validity end over T's row read absent,
-// the screen, and the return on a `Never` read at a boundary of C.
+// the screen, and the retirement and the return on an answer read at a
+// boundary of C.
 module crossing_ok {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = true, DECLINE = true,
-    SCREEN = true, FRESH_NEVER = false, FATES = false, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = true, FRESH_NEVER = false, FRESH_TAKEN = false, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
 
@@ -294,8 +307,8 @@ module crossing_ok {
 module unscreened_ok {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = true, DECLINE = true,
-    SCREEN = false, FRESH_NEVER = false, FATES = false, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = false, FRESH_NEVER = false, FRESH_TAKEN = false, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
 
@@ -305,8 +318,8 @@ module unscreened_ok {
 module fresh_never_return {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = true, DECLINE = true,
-    SCREEN = true, FRESH_NEVER = true, FATES = false, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = true, FRESH_NEVER = true, FRESH_TAKEN = false, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
 
@@ -316,8 +329,8 @@ module fresh_never_return {
 module decline_beside_a_row {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = false, DECLINE = true,
-    SCREEN = false, FRESH_NEVER = false, FATES = false, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = false, FRESH_NEVER = false, FRESH_TAKEN = false, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
 
@@ -327,8 +340,8 @@ module decline_beside_a_row {
 module decline_before_the_end {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 0, ROW_CHECK = true, DECLINE = true,
-    SCREEN = false, FRESH_NEVER = false, FATES = false, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = false, FRESH_NEVER = false, FRESH_TAKEN = false, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
 
@@ -337,8 +350,8 @@ module decline_before_the_end {
 module no_decline {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = true, DECLINE = false,
-    SCREEN = true, FRESH_NEVER = false, FATES = false, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = true, FRESH_NEVER = false, FRESH_TAKEN = false, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
 
@@ -346,7 +359,18 @@ module no_decline {
 module fates_ok {
   import crossing_core(
     END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = true, DECLINE = true,
-    SCREEN = true, FRESH_NEVER = false, FATES = true, MAX_RECOVERIES = 2,
-    MAX_TICK = 2, MAX_CLOCK = 5
+    SCREEN = true, FRESH_NEVER = false, FRESH_TAKEN = false, FATES = true,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
+  ).*
+}
+
+// Twin: P retires the record on a fresh `Taken`. T's member takes the
+// crossing, P retires the record, and C recovers below the take: the
+// value has left P and C holds no take of it.
+module fresh_taken_retire {
+  import crossing_core(
+    END = 2, DEADLINE = 3, DECLINE_FROM = 2, ROW_CHECK = true, DECLINE = true,
+    SCREEN = true, FRESH_NEVER = false, FRESH_TAKEN = true, FATES = false,
+    MAX_RECOVERIES = 2, MAX_TICK = 2, MAX_CLOCK = 5
   ).*
 }
