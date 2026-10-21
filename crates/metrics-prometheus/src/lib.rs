@@ -206,9 +206,6 @@ pub struct Metrics {
     /// Fenced claims the read frontier refused from what a validator
     /// held to offer, by what they read.
     pub fenced_claims_refused: CounterVec,
-    /// Blocks from a retirement's `Taken` first held to the block
-    /// carrying it.
-    pub retirement_carry_wait: Histogram,
     /// Bytes of the retirement offers proposers carried in blocks they
     /// proposed, proofs included.
     pub retirement_bytes_spent: Counter,
@@ -216,22 +213,15 @@ pub struct Metrics {
     /// read.
     pub retirements_spent: Counter,
     /// Records a proposing replica pushed to their consumers again, by
-    /// terms, by whether the replica was seated above its chain's
-    /// genesis, and by whether a pause on them had cleared.
+    /// terms and by whether a pause on them had cleared.
     pub records_repushed: CounterVec,
     /// Carried records a proposing replica first found due for a
-    /// re-push, by whether it was seated above its chain's genesis and
-    /// whether a pause stood on them.
+    /// re-push, by whether a pause stood on them.
     pub repush_due: CounterVec,
     /// Pauses on records' re-pushes moving, by what moved them.
     pub repush_paused: CounterVec,
     /// Pushes held for a record not yet carried, placed again once it is.
     pub pushes_placed_on_carry: Counter,
-    /// Seconds from a record's re-push due instant to its retirement.
-    pub retirement_wait: Histogram,
-    /// Seconds an answer whose record another shard holds stood, by
-    /// which way it answered.
-    pub answer_life: HistogramVec,
     /// Records consumers here wait on with no arrival for, at a commit.
     pub wanted_records: Gauge,
     /// Proposals a leader made at once rather than holding an empty
@@ -957,13 +947,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            retirement_carry_wait: register_histogram!(
-                "hyperscale_retirement_carry_wait_blocks",
-                "Blocks from a retirement's Taken first held to the committed block carrying it",
-                vec![0.0, 1.0, 2.0, 5.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
-            )
-            .unwrap(),
-
             retirement_bytes_spent: register_counter!(
                 "hyperscale_retirement_bytes_spent_total",
                 "Bytes of the retirement offers proposers carried in blocks they proposed"
@@ -979,14 +962,14 @@ impl Metrics {
             records_repushed: register_counter_vec!(
                 "hyperscale_records_repushed_total",
                 "Crossing records pushed to their consumers again",
-                &["kind", "seated", "paused"]
+                &["kind", "paused"]
             )
             .unwrap(),
 
             repush_due: register_counter_vec!(
                 "hyperscale_repush_due_total",
                 "Carried crossing records first found due for a re-push",
-                &["seated", "paused"]
+                &["paused"]
             )
             .unwrap(),
 
@@ -1000,21 +983,6 @@ impl Metrics {
             pushes_placed_on_carry: register_counter!(
                 "hyperscale_pushes_placed_on_carry_total",
                 "Crossing pushes held for a record not yet carried, placed again once it is"
-            )
-            .unwrap(),
-
-            retirement_wait: register_histogram!(
-                "hyperscale_retirement_wait_seconds",
-                "Seconds from a crossing record's re-push due instant to its retirement",
-                vec![0.0, 1.0, 5.0, 30.0, 60.0, 150.0, 300.0, 600.0, 1200.0, 2400.0]
-            )
-            .unwrap(),
-
-            answer_life: register_histogram_vec!(
-                "hyperscale_answer_life_seconds",
-                "Seconds a crossing answer whose record another shard holds stood",
-                &["answered"],
-                vec![1.0, 5.0, 30.0, 60.0, 150.0, 300.0, 600.0, 1200.0, 2400.0, 4800.0]
             )
             .unwrap(),
 
@@ -1499,26 +1467,22 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.record_asks.inc();
     }
 
-    fn record_retirement_carry_wait(&self, blocks: u64) {
-        self.metrics.retirement_carry_wait.observe(blocks as f64);
-    }
-
     fn record_retirements_spent(&self, bytes: usize, retirements: usize) {
         self.metrics.retirement_bytes_spent.inc_by(bytes as f64);
         self.metrics.retirements_spent.inc_by(retirements as f64);
     }
 
-    fn record_records_repushed(&self, kind: &str, seated: bool, paused: bool) {
+    fn record_records_repushed(&self, kind: &str, paused: bool) {
         self.metrics
             .records_repushed
-            .with_label_values(&[kind, flag(seated), flag(paused)])
+            .with_label_values(&[kind, flag(paused)])
             .inc();
     }
 
-    fn record_repush_due(&self, seated: bool, paused: bool) {
+    fn record_repush_due(&self, paused: bool) {
         self.metrics
             .repush_due
-            .with_label_values(&[flag(seated), flag(paused)])
+            .with_label_values(&[flag(paused)])
             .inc();
     }
 
@@ -1531,19 +1495,6 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_pushes_placed_on_carry(&self, count: usize) {
         self.metrics.pushes_placed_on_carry.inc_by(count as f64);
-    }
-
-    fn record_retirement_wait(&self, millis: u64) {
-        self.metrics
-            .retirement_wait
-            .observe(millis as f64 / 1_000.0);
-    }
-
-    fn record_answer_life(&self, answered: &str, millis: u64) {
-        self.metrics
-            .answer_life
-            .with_label_values(&[answered])
-            .observe(millis as f64 / 1_000.0);
     }
 
     fn set_wanted_records(&self, count: usize) {
