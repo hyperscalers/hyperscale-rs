@@ -9,14 +9,15 @@
 use hyperscale_storage::RatifyRegisterStore;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_types::{
-    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
+    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteAdmission,
+    RatifyVoteRecord, ValidatorId,
 };
 
 use super::core::SimBeaconStorage;
 use crate::crash_point;
 
 impl RatifyRegisterStore for SimBeaconStorage {
-    fn record_ratify_vote(
+    fn admit_ratify_vote(
         &self,
         validator: ValidatorId,
         epoch: Epoch,
@@ -24,24 +25,19 @@ impl RatifyRegisterStore for SimBeaconStorage {
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
         polka: RatifyPolka,
-    ) {
+    ) -> bool {
         crash_point::write();
         let mut inner = write_or_recover(&self.inner);
-        let record = inner
-            .ratify_records
-            .entry(validator)
-            .or_insert_with(|| RatifyVoteRecord::new(epoch));
-        // A stored record for a newer epoch never regresses; one for an
-        // older epoch is superseded outright.
-        if record.epoch > epoch {
-            return;
-        }
-        if record.epoch < epoch {
-            *record = RatifyVoteRecord::new(epoch);
-        }
-        record.record(round, phase, block_hash, polka);
+        let stored = inner.ratify_records.get(&validator);
+        let record = match RatifyVoteRecord::admit(stored, epoch, round, phase, block_hash, polka) {
+            RatifyVoteAdmission::Record(record) => record,
+            RatifyVoteAdmission::Repeat => return true,
+            RatifyVoteAdmission::Refuse => return false,
+        };
+        inner.ratify_records.insert(validator, record);
         drop(inner);
         self.sync();
+        true
     }
 
     fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {

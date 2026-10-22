@@ -174,6 +174,8 @@ impl ShardSourceTracker {
     /// round can arrive for a height already held. A chain commits one
     /// block per height: a held block whose commit the window proves
     /// keeps its slot, and any other block at that height is the loser.
+    /// A block already held is recorded once: a second report of it
+    /// keeps the copy first held.
     pub fn on_verified_source_header(
         &mut self,
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
@@ -183,8 +185,8 @@ impl ShardSourceTracker {
         let height = header.height();
         let headers = self.shard_headers.entry(shard).or_default();
         if headers.get(&height).is_some_and(|held| {
-            held.block_hash() != certified_header.block_hash()
-                && window_commits(headers, held.header())
+            held.block_hash() == certified_header.block_hash()
+                || window_commits(headers, held.header())
         }) {
             return;
         }

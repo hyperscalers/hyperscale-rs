@@ -24,9 +24,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
-    MIN_STAKE_FLOOR, NetworkDefinition, Randomness, RecoveryBinding, ShardId, Stake, StakePoolId,
-    ValidatorId, Verified, genesis_config_hash,
+    BeaconChainConfig, BeaconGenesisConfig, BeaconState, CertifiedBeaconBlock, GenesisPool,
+    GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, Randomness, RecoveryBinding, ShardId,
+    Stake, StakePoolId, ValidatorId, Verified, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
@@ -52,11 +52,17 @@ impl TestNode {
     }
 }
 
+/// Turns the genesis beacon state into the history the coordinator
+/// resumes over, oldest first.
+type BeaconHistory = Box<dyn FnOnce(BeaconState) -> Vec<BeaconState>>;
+
 #[derive(Default)]
 pub struct TestNodeBuilder {
     local_idx: usize,
+    local_shard: Option<ShardId>,
     recovered: RecoveredState,
     recoveries: Vec<(ShardId, Vec<RecoveryBinding>)>,
+    beacon_history: Option<BeaconHistory>,
 }
 
 impl TestNodeBuilder {
@@ -72,6 +78,22 @@ impl TestNodeBuilder {
         self
     }
 
+    /// Seat the node on `shard` instead of the root.
+    pub(crate) const fn local_shard(mut self, shard: ShardId) -> Self {
+        self.local_shard = Some(shard);
+        self
+    }
+
+    /// Resume the beacon over the history `history` makes of the genesis
+    /// state, instead of genesis alone.
+    pub(crate) fn beacon_history(
+        mut self,
+        history: impl FnOnce(BeaconState) -> Vec<BeaconState> + 'static,
+    ) -> Self {
+        self.beacon_history = Some(Box::new(history));
+        self
+    }
+
     /// Genesis beacon state carrying `history` as `shard`'s recoveries.
     pub(crate) fn recoveries(mut self, shard: ShardId, history: Vec<RecoveryBinding>) -> Self {
         self.recoveries.push((shard, history));
@@ -82,9 +104,16 @@ impl TestNodeBuilder {
         let committee = TestCommittee::new(4, 7);
         let me = committee.validator_id(self.local_idx);
         // The beacon harness consolidates every validator onto the root shard.
-        let local_shard = ShardId::ROOT;
+        let local_shard = self.local_shard.unwrap_or(ShardId::ROOT);
         let provision_store = Arc::new(ProvisionStore::new());
-        let beacon_coordinator = test_beacon_coordinator(&committee, me, self.recoveries);
+        let beacon_coordinator = test_beacon_coordinator(
+            &committee,
+            me,
+            local_shard,
+            &self.recovered,
+            self.recoveries,
+            self.beacon_history,
+        );
 
         let node = NodeStateMachine::new(
             me,
@@ -113,7 +142,10 @@ impl TestNodeBuilder {
 fn test_beacon_coordinator(
     committee: &TestCommittee,
     me: ValidatorId,
+    local_shard: ShardId,
+    recovered: &RecoveredState,
     recoveries: Vec<(ShardId, Vec<RecoveryBinding>)>,
+    history: Option<BeaconHistory>,
 ) -> BeaconCoordinator {
     let network = NetworkDefinition::simulator();
     let pool_id = StakePoolId::new(0);
@@ -148,13 +180,21 @@ fn test_beacon_coordinator(
     state.recoveries.extend(recoveries);
     let config_hash = genesis_config_hash(&config, &network, &[]);
     let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+    let history = match history {
+        Some(history) => history(state),
+        None => vec![state],
+    };
+    let local_chain = LocalChainAnchors {
+        committee: recovered.committee_anchor_wt(),
+        block: recovered.block_anchor_wt(),
+    };
     BeaconCoordinator::new(
         Arc::new(BlsVerifier),
         block,
-        vec![state],
+        history,
         me,
-        ShardId::ROOT,
-        Some(LocalChainAnchors::GENESIS),
+        local_shard,
+        Some((local_chain, recovered.committed_height)),
         network,
         config_hash,
     )

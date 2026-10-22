@@ -3,7 +3,8 @@
 
 use hyperscale_storage::RatifyRegisterStore;
 use hyperscale_types::{
-    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
+    BeaconBlockHash, Epoch, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteAdmission,
+    RatifyVoteRecord, ValidatorId,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -12,7 +13,7 @@ use super::core::RocksDbBeaconStorage;
 use crate::typed_cf::{TypedCf, batch_put};
 
 impl RatifyRegisterStore for RocksDbBeaconStorage {
-    fn record_ratify_vote(
+    fn admit_ratify_vote(
         &self,
         validator: ValidatorId,
         epoch: Epoch,
@@ -20,20 +21,25 @@ impl RatifyRegisterStore for RocksDbBeaconStorage {
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
         polka: RatifyPolka,
-    ) {
-        // One guard spans the read-merge-write so concurrent signers'
-        // writes stay monotone; ratify votes are write-cold (one or two
-        // per member per epoch), so serialising the fsync costs nothing.
+    ) -> bool {
+        // One guard spans the read-decide-write so concurrent signers
+        // cannot both admit at one slot; ratify votes are write-cold (one
+        // or two per member per epoch), so serialising the fsync costs
+        // nothing.
         let _guard = self.ratify_lock.lock().expect("ratify_lock poisoned");
-        let mut record = self
-            .cf_get::<RatifyRegistersCf>(&validator)
-            // A stored record for a newer epoch never regresses; one
-            // for an older epoch is superseded outright.
-            .filter(|stored| stored.epoch >= epoch)
-            .unwrap_or_else(|| RatifyVoteRecord::new(epoch));
-        if record.epoch > epoch || !record.record(round, phase, block_hash, polka) {
-            return; // superseded epoch or occupied slot — nothing to persist
-        }
+        let stored = self.cf_get::<RatifyRegistersCf>(&validator);
+        let record = match RatifyVoteRecord::admit(
+            stored.as_ref(),
+            epoch,
+            round,
+            phase,
+            block_hash,
+            polka,
+        ) {
+            RatifyVoteAdmission::Record(record) => record,
+            RatifyVoteAdmission::Repeat => return true,
+            RatifyVoteAdmission::Refuse => return false,
+        };
 
         let mut batch = WriteBatch::default();
         batch_put::<RatifyRegistersCf>(
@@ -47,6 +53,7 @@ impl RatifyRegisterStore for RocksDbBeaconStorage {
         self.db
             .write_opt(batch, &write_opts)
             .expect("BFT CRITICAL: ratify register write failed");
+        true
     }
 
     fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {

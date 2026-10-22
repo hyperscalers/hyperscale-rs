@@ -121,8 +121,8 @@ fn commit_is_idempotent_on_same_epoch_block_and_state() {
     assert_eq!(*stored_state, *state);
 }
 
-/// Ratify records merge first-wins per slot, supersede on a newer
-/// epoch, and never regress to an older one.
+/// A ratify register admits one value per slot, supersedes on a newer
+/// epoch, and refuses an older one.
 #[test]
 fn ratify_records_first_wins_and_epoch_supersede() {
     let store = SimBeaconStorage::new();
@@ -132,53 +132,57 @@ fn ratify_records_first_wins_and_epoch_supersede() {
     let (e5, r1) = (Epoch::new(5), RatifyRound::new(1));
 
     assert!(store.ratify_record(v).is_none());
-    store.record_ratify_vote(
+    assert!(store.admit_ratify_vote(
         v,
         e5,
         r1,
         RatifyPhase::Prevote,
         hash_a,
         RatifyPolka::empty(),
-    );
-    store.record_ratify_vote(
+    ));
+    assert!(!store.admit_ratify_vote(
         v,
         e5,
         r1,
         RatifyPhase::Prevote,
         hash_b,
         RatifyPolka::empty(),
-    );
+    ));
     let record = store.ratify_record(v).expect("record exists");
     assert_eq!(record.epoch, e5);
-    assert_eq!(record.prevoted.get(&r1), Some(&hash_a), "first write wins");
+    assert_eq!(
+        record.prevoted.get(&r1),
+        Some(&hash_a),
+        "the first value holds its slot"
+    );
     assert_eq!(
         record.max_position(),
         Some((e5, r1, RatifyPhase::Prevote)),
         "fence floor tracks the highest recorded position",
     );
 
-    // A newer epoch supersedes the whole record; an older one is ignored.
-    store.record_ratify_vote(
+    // A newer epoch supersedes the whole record; an older one is refused.
+    assert!(store.admit_ratify_vote(
         v,
         Epoch::new(6),
         r1,
         RatifyPhase::Precommit,
         hash_b,
         RatifyPolka::empty(),
-    );
+    ));
     let record = store.ratify_record(v).expect("record exists");
     assert_eq!(record.epoch, Epoch::new(6));
     assert!(record.prevoted.is_empty());
     assert_eq!(record.precommitted.get(&r1), Some(&hash_b));
 
-    store.record_ratify_vote(
+    assert!(!store.admit_ratify_vote(
         v,
         e5,
         RatifyRound::new(9),
         RatifyPhase::Prevote,
         hash_a,
         RatifyPolka::empty(),
-    );
+    ));
     assert_eq!(
         store.ratify_record(v).expect("record exists").epoch,
         Epoch::new(6)

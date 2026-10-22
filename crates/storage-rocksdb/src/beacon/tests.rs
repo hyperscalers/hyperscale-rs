@@ -132,8 +132,8 @@ fn reopen_recovers_committed_block_and_state_pairs() {
     }
 }
 
-/// Ratify records merge first-wins per slot, supersede on a newer
-/// epoch, and survive a reopen with the lock's polka.
+/// A ratify register admits one value per slot, supersedes on a newer
+/// epoch, and survives a reopen with the lock's polka.
 #[test]
 fn ratify_records_survive_reopen_with_epoch_supersede() {
     let tmp = TempDir::new().expect("tempdir");
@@ -159,29 +159,33 @@ fn ratify_records_survive_reopen_with_epoch_supersede() {
     .expect("three votes fit the cap");
     {
         let store = RocksDbBeaconStorage::open(tmp.path()).expect("open beacon store");
-        store.record_ratify_vote(
+        assert!(store.admit_ratify_vote(
             v,
             e5,
             r1,
             RatifyPhase::Prevote,
             hash_a,
             RatifyPolka::empty(),
-        );
-        store.record_ratify_vote(
+        ));
+        assert!(!store.admit_ratify_vote(
             v,
             e5,
             r1,
             RatifyPhase::Prevote,
             hash_b,
             RatifyPolka::empty(),
-        );
-        store.record_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a, polka.clone());
+        ));
+        assert!(store.admit_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a, polka.clone()));
     }
 
     let reopened = RocksDbBeaconStorage::open(tmp.path()).expect("reopen beacon store");
     let record = reopened.ratify_record(v).expect("record survives reopen");
     assert_eq!(record.epoch, e5);
-    assert_eq!(record.prevoted.get(&r1), Some(&hash_a), "first write wins");
+    assert_eq!(
+        record.prevoted.get(&r1),
+        Some(&hash_a),
+        "the first value holds its slot"
+    );
     assert_eq!(record.precommitted.get(&r1), Some(&hash_a));
     assert_eq!(
         record.lock_polka, polka,
@@ -192,28 +196,28 @@ fn ratify_records_survive_reopen_with_epoch_supersede() {
         Some((e5, r1, RatifyPhase::Precommit))
     );
 
-    // A newer epoch supersedes the whole record; an older one is ignored.
-    reopened.record_ratify_vote(
+    // A newer epoch supersedes the whole record; an older one is refused.
+    assert!(reopened.admit_ratify_vote(
         v,
         Epoch::new(6),
         r1,
         RatifyPhase::Prevote,
         hash_b,
         RatifyPolka::empty(),
-    );
+    ));
     let record = reopened.ratify_record(v).expect("record exists");
     assert_eq!(record.epoch, Epoch::new(6));
     assert_eq!(record.prevoted.get(&r1), Some(&hash_b));
     assert!(record.precommitted.is_empty());
     assert!(record.lock_polka.is_empty());
-    reopened.record_ratify_vote(
+    assert!(!reopened.admit_ratify_vote(
         v,
         e5,
         r1,
         RatifyPhase::Precommit,
         hash_a,
         RatifyPolka::empty(),
-    );
+    ));
     assert_eq!(
         reopened.ratify_record(v).expect("record exists").epoch,
         Epoch::new(6),

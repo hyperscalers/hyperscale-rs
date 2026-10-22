@@ -330,20 +330,28 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
     }
 }
 
-// ─── Named gates ────────────────────────────────────────────────────────────
+/// A proposal `signer` is building for `epoch`, its body not yet signed.
+///
+/// The VRF reveal is derived and the body fixed. The reveal alone signs
+/// no body, so a draft commits its signer to nothing, and
+/// [`Self::body_digest`] names the body before it is signed.
+pub struct BeaconProposalDraft<'a> {
+    signer: &'a dyn Signer,
+    network: &'a NetworkDefinition,
+    epoch: Epoch,
+    proposal: BeaconProposal,
+}
 
-impl Verified<BeaconProposal> {
-    /// Sign a beacon proposal locally — derive the VRF reveal under
-    /// the signer's key, pair it with the proposer's observations, sign
-    /// the resulting body, and produce a `Verified<BeaconProposal>` whose
-    /// predicate holds by construction.
+impl<'a> BeaconProposalDraft<'a> {
+    /// Derive the VRF reveal under `signer`'s key and pair it with the
+    /// proposer's observations.
     ///
     /// # Errors
     ///
-    /// Propagates [`SignError`] when the signer cannot sign.
-    pub fn sign_local(
-        signer: &dyn Signer,
-        network: &NetworkDefinition,
+    /// Propagates [`SignError`] when the signer cannot sign the reveal.
+    pub fn new(
+        signer: &'a dyn Signer,
+        network: &'a NetworkDefinition,
         epoch: Epoch,
         boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>>,
         equivocations: Vec<PcVoteEquivocation>,
@@ -351,18 +359,45 @@ impl Verified<BeaconProposal> {
         vote_equivocations: Vec<ShardVoteEquivocation>,
     ) -> Result<Self, SignError> {
         let vrf_proof = beacon_reveal_sign(signer, network, epoch)?;
-        Ok(Self::new_unchecked(
-            BeaconProposal::new(
+        Ok(Self {
+            signer,
+            network,
+            epoch,
+            proposal: BeaconProposal::new(
                 boundary_qcs,
                 equivocations,
                 fork_proofs,
                 vote_equivocations,
                 vrf_proof,
-            )
-            .signed(signer, network, epoch)?,
-        ))
+            ),
+        })
     }
 
+    /// The digest the body signature will cover.
+    #[must_use]
+    pub fn body_digest(&self) -> Hash {
+        self.proposal.body.signing_message(self.epoch).body
+    }
+
+    /// Sign the body, producing a `Verified<BeaconProposal>` whose
+    /// predicate holds by construction: the reveal and the body
+    /// signature are both the draft's signer's.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
+    pub fn sign(self) -> Result<Verified<BeaconProposal>, SignError> {
+        Ok(Verified::new_unchecked(self.proposal.signed(
+            self.signer,
+            self.network,
+            self.epoch,
+        )?))
+    }
+}
+
+// ─── Named gates ────────────────────────────────────────────────────────────
+
+impl Verified<BeaconProposal> {
     /// Rebind the proposal's equivocation list to its marker-upgraded
     /// form. The supplied list must be content-identical to the proposal's
     /// own (`Verifiable` compares by raw `T`, so only the verification
@@ -544,7 +579,7 @@ mod tests {
         let signer = signer_from_u64_seed(7);
         let network = NetworkDefinition::simulator();
         let epoch = Epoch::new(3);
-        let proposal = Verified::<BeaconProposal>::sign_local(
+        let proposal = BeaconProposalDraft::new(
             &signer,
             &network,
             epoch,
@@ -553,6 +588,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
         )
+        .and_then(BeaconProposalDraft::sign)
         .expect("sign")
         .into_inner();
         assert!(verify_under(&proposal, &signer, epoch).is_ok());
@@ -569,7 +605,7 @@ mod tests {
         let signer = signer_from_u64_seed(7);
         let network = NetworkDefinition::simulator();
         let epoch = Epoch::new(3);
-        let genuine = Verified::<BeaconProposal>::sign_local(
+        let genuine = BeaconProposalDraft::new(
             &signer,
             &network,
             epoch,
@@ -578,6 +614,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
         )
+        .and_then(BeaconProposalDraft::sign)
         .expect("sign")
         .into_inner();
 

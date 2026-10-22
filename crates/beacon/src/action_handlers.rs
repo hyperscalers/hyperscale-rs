@@ -22,10 +22,10 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, BeaconVote, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, PcScope,
-    PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka, RatifyVerifyContext,
-    RatifyVote, RatifyVoteVerifyError, SpcEmptyViewMsg, SpcRelayKind, SpcRelayMessage,
-    SpcVerifyContext, Verifiable, Verified, signed_bytes,
+    BeaconProposalDraft, BeaconVote, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext,
+    PcScope, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka,
+    RatifyVerifyContext, RatifyVote, RatifyVoteVerifyError, SpcEmptyViewMsg, SpcRelayKind,
+    SpcRelayMessage, SpcVerifyContext, Verifiable, Verified, signed_bytes,
 };
 
 /// Admit `vote` through the durable beacon consensus register before
@@ -219,7 +219,11 @@ where
             vote_equivocations,
             recipients,
         } => {
-            let Ok(verified) = Verified::<BeaconProposal>::sign_local(
+            // The epoch's one proposal slot must be durable before the
+            // body signature exists: a rebuilt participant whose evidence
+            // buffers drained differently would otherwise sign a second
+            // body for the epoch.
+            let Ok(draft) = BeaconProposalDraft::new(
                 ctx.signer.as_ref(),
                 network,
                 epoch,
@@ -228,6 +232,13 @@ where
                 fork_proofs,
                 vote_equivocations,
             ) else {
+                tracing::error!(?epoch, "cannot sign beacon proposal reveal; skipping");
+                return;
+            };
+            if !admit_signature(ctx, &BeaconVote::proposal(epoch, draft.body_digest())) {
+                return;
+            }
+            let Ok(verified) = draft.sign() else {
                 tracing::error!(?epoch, "cannot sign beacon proposal; skipping");
                 return;
             };
@@ -286,8 +297,18 @@ where
             // precommit's polka — must be durable before the signature
             // exists: a crash between them costs at most an abstention,
             // never a double-vote, a lost lock, or a lock without proof.
-            ctx.ratify_registers
-                .record_ratify_vote(me, epoch, round, phase, block_hash, polka);
+            if !ctx
+                .ratify_registers
+                .admit_ratify_vote(me, epoch, round, phase, block_hash, polka)
+            {
+                tracing::info!(
+                    ?epoch,
+                    ?round,
+                    ?phase,
+                    "ratify vote would contradict the durable register; abstaining"
+                );
+                return;
+            }
             let Ok(verified) = Verified::<RatifyVote>::sign_local(
                 ctx.signer.as_ref(),
                 me,

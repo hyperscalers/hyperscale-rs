@@ -1013,8 +1013,8 @@ pub enum ProtocolEvent {
         /// inside `proposal`.
         epoch: Epoch,
         /// Received proposal, sealed via
-        /// [`Verified::<BeaconProposal>::sign_local`] when its producer
-        /// held the signing key.
+        /// [`BeaconProposalDraft::sign`](hyperscale_types::BeaconProposalDraft::sign)
+        /// when its producer held the signing key.
         proposal: Arc<Verifiable<BeaconProposal>>,
     },
 

@@ -52,6 +52,7 @@ impl ShardParticipation {
                 let mut actions = self
                     .shard_coordinator
                     .on_committed_state_restored(height, hash, qc);
+                self.shard_coordinator.latch_dissolution(topology_schedule);
                 let effects = self
                     .execution_coordinator
                     .on_committed_state_restored(topology_schedule, self.derivation.as_ref());

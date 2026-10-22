@@ -207,7 +207,7 @@ pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> 
                 beacon_history.clone(),
                 validator,
                 args.shard,
-                Some(local_chain),
+                Some((local_chain, args.recovered.committed_height)),
                 config.beacon_network.clone(),
                 config.beacon_config_hash,
             );

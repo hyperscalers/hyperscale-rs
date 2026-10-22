@@ -98,7 +98,51 @@ pub struct RatifyVoteRecord {
     pub lock_polka: RatifyPolka,
 }
 
+/// What a ratify register does with a vote about to be signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RatifyVoteAdmission {
+    /// The slot is fresh: persist this record, then sign.
+    Record(RatifyVoteRecord),
+    /// The slot already holds this value: sign it again, nothing to
+    /// persist.
+    Repeat,
+    /// Signing would contradict the record: a different value at a held
+    /// slot, or an epoch the record has moved past.
+    Refuse,
+}
+
 impl RatifyVoteRecord {
+    /// Decide a vote for `block_hash` at `(epoch, round, phase)`, with
+    /// `polka` the prevote quorum a precommit locks on, against the
+    /// `stored` record. A newer epoch starts a fresh record.
+    #[must_use]
+    pub fn admit(
+        stored: Option<&Self>,
+        epoch: Epoch,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        block_hash: BeaconBlockHash,
+        polka: RatifyPolka,
+    ) -> RatifyVoteAdmission {
+        let mut record = match stored {
+            Some(stored) if stored.epoch > epoch => return RatifyVoteAdmission::Refuse,
+            Some(stored) if stored.epoch == epoch => stored.clone(),
+            _ => Self::new(epoch),
+        };
+        let held = match phase {
+            RatifyPhase::Prevote => record.prevoted.get(&round),
+            RatifyPhase::Precommit => record.precommitted.get(&round),
+        };
+        match held {
+            Some(held) if *held == block_hash => RatifyVoteAdmission::Repeat,
+            Some(_) => RatifyVoteAdmission::Refuse,
+            None => {
+                record.record(round, phase, block_hash, polka);
+                RatifyVoteAdmission::Record(record)
+            }
+        }
+    }
+
     /// Empty record for `epoch`.
     #[must_use]
     pub const fn new(epoch: Epoch) -> Self {

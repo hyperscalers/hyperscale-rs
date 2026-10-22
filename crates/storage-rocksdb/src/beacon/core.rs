@@ -35,8 +35,8 @@ pub struct RocksDbBeaconStorage {
     /// of the same `(epoch, hash, state_root)` no-op at the storage
     /// level.
     pub(super) commit_lock: Mutex<()>,
-    /// Serialises the read-modify-write in `record_ratify_vote` so
-    /// concurrent signers' writes stay monotone.
+    /// Serialises the read-decide-write in `admit_ratify_vote` so
+    /// concurrent signers cannot both admit at one slot.
     pub(super) ratify_lock: Mutex<()>,
     /// Serialises the check-and-write in `admit_beacon_vote`, fsync
     /// included, so a signer that reads a slot as held reads a durable
