@@ -3,7 +3,10 @@
 //! Routes each beacon-scoped [`ProtocolEvent`] to the matching method
 //! on [`BeaconCoordinator`]. Mirrors the shape of [`super::shard`] /
 //! [`super::execution`] / [`super::provisions`]: thin pass-through, no
-//! cross-coordinator orchestration.
+//! cross-coordinator orchestration. What the shard half tells the beacon
+//! travels as a [`BeaconInput`]. `handle` applies the event's inputs once
+//! its arm has run, then installs any schedule they or the arm published,
+//! then runs the closing shard work against it.
 //!
 //! Inline VRF verification on
 //! [`ProtocolEvent::UnverifiedBeaconProposalReceived`] lifts the wire
@@ -18,14 +21,72 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BeaconProposal, BeaconProposalVerifyContext, Epoch, ValidatorId, Verifiable, Verify,
+    BeaconProposal, BeaconProposalVerifyContext, CertifiedBlockHeader, Epoch, ShardForkProof,
+    ShardVoteEquivocation, ValidatorId, Verifiable, Verified, Verify,
 };
 use tracing::warn;
 
 use super::NodeStateMachine;
 use super::participation::ShardParticipation;
 
+/// What the shard half reports to the beacon from one event.
+pub(super) enum BeaconInput {
+    /// The local chain committed the block this certified header heads.
+    LocalCommit {
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// The local chain certified this header, ahead of its commit.
+    CertifiedHeader {
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// A remote source header was admitted.
+    SourceHeader {
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// A remote source header's commit is proven.
+    CommitProven {
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// A shard fork is proven, for the next beacon proposal.
+    ForkProof(Box<ShardForkProof>),
+    /// A shard double-vote pair is proven, for the next beacon proposal.
+    VoteEquivocation {
+        evidence: Box<ShardVoteEquivocation>,
+    },
+}
+
 impl NodeStateMachine {
+    pub(super) fn apply_beacon_input(&mut self, input: BeaconInput) -> Vec<Action> {
+        match input {
+            BeaconInput::LocalCommit { header } => {
+                self.beacon_coordinator.on_local_block_committed(&header)
+            }
+            BeaconInput::CertifiedHeader { header } => {
+                self.beacon_coordinator.on_certified_local_header(&header)
+            }
+            BeaconInput::SourceHeader { header } => {
+                self.beacon_coordinator.on_verified_source_header(&header)
+            }
+            BeaconInput::CommitProven { header } => self
+                .beacon_coordinator
+                .on_commit_proven_source_header(&header),
+            BeaconInput::ForkProof(proof) => {
+                self.beacon_coordinator.observe_fork_proof(*proof);
+                Vec::new()
+            }
+            BeaconInput::VoteEquivocation { evidence } => {
+                if self
+                    .beacon_coordinator
+                    .observe_vote_equivocation((*evidence).clone())
+                {
+                    vec![Action::BroadcastShardVoteEquivocation { evidence }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // single dispatch over beacon ProtocolEvent variants
     pub(super) fn handle_beacon(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {

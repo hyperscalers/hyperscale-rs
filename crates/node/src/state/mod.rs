@@ -12,8 +12,8 @@
 //!
 //! [`handle`](StateMachine::handle) is a thin router: beacon events go to
 //! [`beacon`] unconditionally; the shard categories are guarded on the option
-//! and dispatched onto [`ShardParticipation`] with the beacon's
-//! [`TopologySchedule`] passed as a parameter; the few flows that mutate both
+//! and dispatched onto [`ShardParticipation`] with the held
+//! [`TopologySchedule`] passed as a parameter; the few flows that feed both
 //! halves stay here as orchestrators (see [`orchestration`]).
 
 mod beacon;
@@ -25,6 +25,7 @@ mod test_support;
 
 use std::sync::Arc;
 
+use beacon::BeaconInput;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_engine::CodeAvailability;
@@ -64,6 +65,11 @@ pub struct NodeStateMachine {
     ///
     /// [`ProcessIo`]: crate::process::ProcessIo
     beacon_coordinator: BeaconCoordinator,
+
+    /// The schedule the shard half reads. A step whose actions carry
+    /// `Action::TopologyChanged` replaces it once its handlers and beacon
+    /// inputs have run, so no handler sees it move under it.
+    schedule: Arc<TopologySchedule>,
 
     /// Current time.
     now: LocalTimestamp,
@@ -128,11 +134,11 @@ impl NodeStateMachine {
             finalization_store,
             crossing_index,
         );
-        shard
-            .shard_coordinator
-            .latch_dissolution(beacon_coordinator.topology_schedule());
+        let schedule = Arc::new(beacon_coordinator.topology_schedule().clone());
+        shard.shard_coordinator.latch_dissolution(&schedule);
         Self {
             beacon_coordinator,
+            schedule,
             now: LocalTimestamp::ZERO,
             me,
             shard: Some(shard),
@@ -143,8 +149,9 @@ impl NodeStateMachine {
     /// consensus (`shard: None`). It folds the beacon, tracks topology, and is
     /// drawable/seatable; the shard half is attached only when it is seated.
     #[must_use]
-    pub const fn follower(me: ValidatorId, beacon_coordinator: BeaconCoordinator) -> Self {
+    pub fn follower(me: ValidatorId, beacon_coordinator: BeaconCoordinator) -> Self {
         Self {
+            schedule: Arc::new(beacon_coordinator.topology_schedule().clone()),
             beacon_coordinator,
             now: LocalTimestamp::ZERO,
             me,
@@ -186,7 +193,7 @@ impl NodeStateMachine {
     /// Get the current topology snapshot.
     #[must_use]
     pub(crate) fn topology_snapshot(&self) -> &TopologySnapshot {
-        self.beacon_coordinator.current_topology_snapshot()
+        self.schedule.head()
     }
 
     /// Get the current topology snapshot as an `Arc`, for sites that
@@ -195,8 +202,8 @@ impl NodeStateMachine {
     /// every vnode on a host; per-vnode identity travels alongside it
     /// on [`ActionContext`](hyperscale_core::ActionContext).
     #[must_use]
-    pub(crate) const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
-        self.beacon_coordinator.current_topology_snapshot()
+    pub(crate) fn topology_arc(&self) -> &Arc<TopologySnapshot> {
+        self.schedule.head()
     }
 
     /// Get a reference to the mempool coordinator.
@@ -309,20 +316,18 @@ impl NodeStateMachine {
     /// Seed the answer count at a chain's genesis. See
     /// [`hyperscale_shard::ShardCoordinator::seed_standing_answers`].
     pub(crate) fn seed_standing_answers(&mut self, height: BlockHeight, count: StandingAnswers) {
-        let schedule = self.beacon_coordinator.topology_schedule();
         if let Some(s) = self.shard.as_mut() {
             s.shard_coordinator
-                .seed_standing_answers(schedule, height, count);
+                .seed_standing_answers(&self.schedule, height, count);
         }
     }
 
     /// Whether this vnode is seated on a shard and sits in its committee.
     /// See [`hyperscale_shard::ShardCoordinator::seated_to_vote`].
     pub(crate) fn seated_to_vote(&self) -> bool {
-        self.shard.as_ref().is_some_and(|s| {
-            s.shard_coordinator
-                .seated_to_vote(self.beacon_coordinator.topology_schedule())
-        })
+        self.shard
+            .as_ref()
+            .is_some_and(|s| s.shard_coordinator.seated_to_vote(&self.schedule))
     }
 
     /// Tell execution how far the store this seat reads is written, as
@@ -334,11 +339,9 @@ impl NodeStateMachine {
         }
     }
 
-    /// Run `f` against the seated shard half with the beacon's current
+    /// Run `f` against the seated shard half with the held
     /// [`TopologySchedule`] passed in. Returns an empty action list for a vnode
-    /// that only follows the beacon. `self.shard` and `beacon_coordinator` are
-    /// disjoint fields, so the schedule borrow and the `&mut` shard borrow
-    /// coexist.
+    /// that only follows the beacon.
     fn with_shard<F>(&mut self, f: F) -> Vec<Action>
     where
         F: FnOnce(&mut ShardParticipation, &TopologySchedule) -> Vec<Action>,
@@ -346,7 +349,25 @@ impl NodeStateMachine {
         let Some(s) = self.shard.as_mut() else {
             return Vec::new();
         };
-        f(s, self.beacon_coordinator.topology_schedule())
+        f(s, &self.schedule)
+    }
+
+    /// Hold the schedule the last `Action::TopologyChanged` in `actions`
+    /// carries. The replica latches its dissolution against the schedule
+    /// it gives up and then against the new one, so a reading either
+    /// showed survives the eviction of the windows it rested on.
+    fn install_schedule(&mut self, actions: &[Action]) {
+        let Some(schedule) = actions.iter().rev().find_map(|action| match action {
+            Action::TopologyChanged { schedule, .. } => Some(schedule),
+            _ => None,
+        }) else {
+            return;
+        };
+        if let Some(s) = self.shard.as_mut() {
+            s.shard_coordinator.latch_dissolution(&self.schedule);
+            s.shard_coordinator.latch_dissolution(schedule);
+        }
+        self.schedule = Arc::clone(schedule);
     }
 }
 
@@ -363,12 +384,9 @@ impl StateMachine for NodeStateMachine {
         self.beacon_coordinator.set_now(now);
         if let Some(s) = self.shard.as_mut() {
             s.set_time(now);
-            // Any beacon handler below may adopt a block and replace the
-            // schedule, so the replica reads the one it holds first.
-            s.shard_coordinator
-                .latch_dissolution(self.beacon_coordinator.topology_schedule());
         }
 
+        let mut inputs = Vec::new();
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.with_shard(ShardParticipation::on_cleanup_timer),
@@ -386,15 +404,18 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::BlockCommitted {
                 certified,
                 committee_anchor,
-            } => self.on_block_committed(&certified, committee_anchor),
-            ProtocolEvent::LocalBlockCertified { certified_header } => self
-                .beacon_coordinator
-                .on_certified_local_header(&certified_header),
+            } => self.on_block_committed(&certified, committee_anchor, &mut inputs),
+            ProtocolEvent::LocalBlockCertified { certified_header } => {
+                inputs.push(BeaconInput::CertifiedHeader {
+                    header: certified_header,
+                });
+                Vec::new()
+            }
             ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
-                self.on_remote_header_admitted(&certified_header)
+                self.on_remote_header_admitted(certified_header, &mut inputs)
             }
             ProtocolEvent::RemoteHeaderCommitted { certified_header } => {
-                self.on_remote_header_committed(&certified_header)
+                self.on_remote_header_committed(&certified_header, &mut inputs)
             }
 
             // ── Shard Consensus ────────────────────────────────────────────
@@ -423,18 +444,18 @@ impl StateMachine for NodeStateMachine {
             }
 
             // A fork is proven — locally assembled from verified headers, or
-            // a peer's proof that just verified. Feed the proof into the
-            // beacon observation buffer so the next beacon proposal funnels
-            // it into a fork-caused recovery, then let the shard layer engage
-            // its local provisional fence and re-gossip.
+            // a peer's proof that just verified. The shard layer engages its
+            // local provisional fence and re-gossips, and the proof goes into
+            // the beacon observation buffer once the arm has run, so the next
+            // beacon proposal funnels it into a fork-caused recovery.
             ProtocolEvent::ShardForkDetected { proof } => {
-                self.beacon_coordinator.observe_fork_proof((*proof).clone());
+                inputs.push(BeaconInput::ForkProof(proof.clone()));
                 let evt = ProtocolEvent::ShardForkDetected { proof };
                 self.with_shard(move |s, sched| s.handle_shard(sched, evt))
             }
             ProtocolEvent::ShardForkProofVerified { proof, verified } => {
                 if verified {
-                    self.beacon_coordinator.observe_fork_proof((*proof).clone());
+                    inputs.push(BeaconInput::ForkProof(proof.clone()));
                 }
                 let evt = ProtocolEvent::ShardForkProofVerified { proof, verified };
                 self.with_shard(move |s, sched| s.handle_shard(sched, evt))
@@ -451,14 +472,8 @@ impl StateMachine for NodeStateMachine {
                 evidence,
                 verified: true,
             } => {
-                if self
-                    .beacon_coordinator
-                    .observe_vote_equivocation((*evidence).clone())
-                {
-                    vec![Action::BroadcastShardVoteEquivocation { evidence }]
-                } else {
-                    Vec::new()
-                }
+                inputs.push(BeaconInput::VoteEquivocation { evidence });
+                Vec::new()
             }
             ProtocolEvent::ShardVoteEquivocationVerified {
                 verified: false, ..
@@ -573,11 +588,16 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BeaconBlockSyncReadyToApply { .. }) => self.handle_beacon(evt),
         };
 
+        for input in inputs {
+            actions.extend(self.apply_beacon_input(input));
+        }
+        self.install_schedule(&actions);
+
         // Drain any state root verifications that became ready during this
         // event, then re-enter `try_propose` once if a proposal-retry latched.
         // Both touch shard state, so they only run on a seated vnode.
         if let Some(s) = self.shard.as_mut() {
-            let topology_schedule = self.beacon_coordinator.topology_schedule();
+            let topology_schedule = &self.schedule;
             for ready in s.shard_coordinator.drain_ready_state_root_verifications() {
                 actions.push(Action::VerifyStateRoot {
                     block_hash: ready.block_hash,
@@ -609,9 +629,7 @@ impl StateMachine for NodeStateMachine {
             // proposal), re-enter `try_propose` once with fresh transaction
             // selection — avoids stale txs from the original deferral.
             if s.shard_coordinator.take_ready_proposal() {
-                let proposal =
-                    s.try_event_driven_proposal(self.beacon_coordinator.topology_schedule());
-                actions.extend(proposal);
+                actions.extend(s.try_event_driven_proposal(topology_schedule));
             }
 
             // Whatever this dispatch wrote into the evidence the vote
