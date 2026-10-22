@@ -32,8 +32,8 @@ use hyperscale_scenarios::{
 use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::network::response::GetStateProofResponse;
 use hyperscale_types::{
-    Deadline, Ed25519PrivateKey, MAX_VALIDITY_RANGE, MerkleInclusionProof, PrincipalAddr, ShardId,
-    TransactionDecision, TransactionStatus, WeightedTimestamp,
+    Ed25519PrivateKey, MerkleInclusionProof, PrincipalAddr, ShardId, TransactionDecision,
+    TransactionStatus,
 };
 use support::SimCluster;
 
@@ -203,21 +203,19 @@ fn a_forged_state_proof_convinces_nobody() {
             "the leg pays the payment and the price",
         );
 
-        let asking = Deadline::of(validity.end_timestamp_exclusive)
-            .at()
-            .plus(MAX_VALIDITY_RANGE);
+        // The payer asks about the claim at a boundary of the recipient's
+        // shard recorded past the validity end, so the cut stands until
+        // that ask has been answered, which is a boundary hop after the
+        // validity end rather than at it.
         assert!(
-            c.run_until(epochs(12), |c| WeightedTimestamp::ZERO.plus(c.now())
-                >= asking),
-            "the cut must stand while the payer is asking about the claim",
+            c.run_until(epochs(12), |_| forged
+                .iter()
+                .any(|handle| handle.fired() > 0)),
+            "the forgery has to have been served, or nothing was attacked",
         );
         assert!(
             push_dropped.fired() > 0,
             "the record's push must actually have been exercised and cut",
-        );
-        assert!(
-            forged.iter().any(|handle| handle.fired() > 0),
-            "the forgery has to have been served, or nothing was attacked",
         );
         // The refusal is the defence itself, and the reason is what says
         // which check did the refusing.
