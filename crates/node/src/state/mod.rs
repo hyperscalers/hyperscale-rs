@@ -112,26 +112,30 @@ impl NodeStateMachine {
         crossing_index: Arc<CrossingIndexSlot>,
     ) -> Self {
         let verifier = Arc::clone(beacon_coordinator.verifier());
+        let mut shard = ShardParticipation::new(
+            verifier,
+            derivation,
+            code,
+            me,
+            local_shard,
+            shard_config,
+            recovered,
+            mempool_config,
+            provision_config,
+            provision_store,
+            tx_store,
+            exec_cert_store,
+            finalization_store,
+            crossing_index,
+        );
+        shard
+            .shard_coordinator
+            .latch_dissolution(beacon_coordinator.topology_schedule());
         Self {
             beacon_coordinator,
             now: LocalTimestamp::ZERO,
             me,
-            shard: Some(ShardParticipation::new(
-                verifier,
-                derivation,
-                code,
-                me,
-                local_shard,
-                shard_config,
-                recovered,
-                mempool_config,
-                provision_config,
-                provision_store,
-                tx_store,
-                exec_cert_store,
-                finalization_store,
-                crossing_index,
-            )),
+            shard: Some(shard),
         }
     }
 
@@ -359,6 +363,10 @@ impl StateMachine for NodeStateMachine {
         self.beacon_coordinator.set_now(now);
         if let Some(s) = self.shard.as_mut() {
             s.set_time(now);
+            // Any beacon handler below may adopt a block and replace the
+            // schedule, so the replica reads the one it holds first.
+            s.shard_coordinator
+                .latch_dissolution(self.beacon_coordinator.topology_schedule());
         }
 
         let mut actions = match event {

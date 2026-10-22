@@ -163,7 +163,7 @@ mod tests {
     }
 
     impl RatifyRegisterStore for BlockingBeaconStorage {
-        fn record_ratify_vote(
+        fn admit_ratify_vote(
             &self,
             validator: ValidatorId,
             epoch: Epoch,
@@ -171,9 +171,9 @@ mod tests {
             phase: RatifyPhase,
             block_hash: BeaconBlockHash,
             polka: RatifyPolka,
-        ) {
+        ) -> bool {
             self.inner
-                .record_ratify_vote(validator, epoch, round, phase, block_hash, polka);
+                .admit_ratify_vote(validator, epoch, round, phase, block_hash, polka)
         }
 
         fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {

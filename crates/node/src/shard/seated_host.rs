@@ -106,7 +106,7 @@ impl Fixture {
             vec![self.genesis_state.clone()],
             me,
             SHARD,
-            Some(LocalChainAnchors::GENESIS),
+            Some((LocalChainAnchors::GENESIS, BlockHeight::GENESIS)),
             NetworkDefinition::simulator(),
             self.config_hash,
         );

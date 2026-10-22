@@ -493,6 +493,16 @@ pub struct ShardCoordinator {
     /// the tip could not otherwise be resolved when verifying the QC over it.
     committed_committee_anchor_wt: WeightedTimestamp,
 
+    /// Set, never cleared, once a schedule this replica held reads it
+    /// quiescent. The fold lets a terminated chain's windows leave the
+    /// schedule, after which `past_terminal` reads false again, so the
+    /// reading is kept rather than re-derived.
+    quiescent_latched: bool,
+
+    /// Set, never cleared, once a schedule this replica held reads it
+    /// dissolved, for the same reason as `quiescent_latched`.
+    dissolved_latched: bool,
+
     /// State root from the latest committed block header.
     /// Updated synchronously at commit time (not dependent on async JMT).
     committed_state_root: StateRoot,
@@ -939,6 +949,8 @@ impl ShardCoordinator {
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
             clock: CommittedClock::seeded(committed_block_anchor_wt),
             committed_block_anchor_wt,
+            quiescent_latched: false,
+            dissolved_latched: false,
             committed_committee_anchor_wt,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
@@ -1482,9 +1494,14 @@ impl ShardCoordinator {
     /// `terminal_commit_evidenced`), and the committee stays seated, serving
     /// the terminal, until its reshape successors are live, which
     /// [`Self::dissolved`] is the test for.
+    ///
+    /// Once read true against a schedule this replica held, the reading is
+    /// latched and stays true after the windows it rested on are evicted
+    /// (see [`Self::latch_dissolution`]).
     #[must_use]
     pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
-        topology_schedule.past_terminal(self.local_shard, self.committed_block_anchor_wt)
+        self.quiescent_latched
+            || topology_schedule.past_terminal(self.local_shard, self.committed_block_anchor_wt)
     }
 
     /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
@@ -1504,9 +1521,23 @@ impl ShardCoordinator {
     /// further; the committee serves the terminal until the successors are
     /// live. By then the handoff has demonstrably succeeded, so dropping out —
     /// even a co-located pair in lockstep — loses nothing.
+    ///
+    /// Latched like [`Self::quiescent`]: once read true against a held
+    /// schedule, it stays true after the windows that showed it leave.
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
-        self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
+        self.dissolved_latched
+            || (self.quiescent(topology_schedule)
+                && topology_schedule.successors_live(self.local_shard))
+    }
+
+    /// Latch [`Self::quiescent`] and [`Self::dissolved`] as
+    /// `topology_schedule` reads them. Run against every schedule this
+    /// replica holds before another replaces it, so a reading true there
+    /// stays true once the windows it rests on are evicted.
+    pub fn latch_dissolution(&mut self, topology_schedule: &TopologySchedule) {
+        self.quiescent_latched = self.quiescent(topology_schedule);
+        self.dissolved_latched = self.dissolved(topology_schedule);
     }
 
     /// Whether the committed chain proves its terminal committed to a
@@ -7199,6 +7230,7 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
+        self.latch_dissolution(topology_schedule);
         self.retire_proven_anchors(topology_schedule);
         self.record_committed_claims(block);
 
@@ -7895,6 +7927,7 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
+        self.latch_dissolution(topology_schedule);
         // A commit parked for want of its committee window resumes the
         // chain first, so the synced blocks drained next see its height.
         let mut actions = self.retry_parked_commit(topology_schedule);

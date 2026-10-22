@@ -41,6 +41,9 @@ pub enum BeaconVoteKind {
     PcVote3,
     /// Empty-view attestation, over its skip target.
     EmptyView,
+    /// The epoch's beacon proposal, over its body. Held at view 0, which
+    /// precedes every SPC view.
+    Proposal,
 }
 
 /// One signing slot within an epoch's SPC instance.
@@ -91,6 +94,21 @@ impl BeaconVote {
     #[must_use]
     pub fn empty_view(epoch: Epoch, view: SpcView, reported: &SpcHighTriple) -> Self {
         Self::skip(epoch, view, reported.view, &reported.value)
+    }
+
+    /// The member's beacon proposal for `epoch`, whose body digests to
+    /// `body`.
+    #[must_use]
+    pub const fn proposal(epoch: Epoch, body: Hash) -> Self {
+        Self {
+            epoch,
+            slot: BeaconVoteSlot {
+                view: SpcView::new(0),
+                kind: BeaconVoteKind::Proposal,
+            },
+            content: body,
+            reported: None,
+        }
     }
 
     fn skip(epoch: Epoch, view: SpcView, reported_view: SpcView, reported: &PcVector) -> Self {
