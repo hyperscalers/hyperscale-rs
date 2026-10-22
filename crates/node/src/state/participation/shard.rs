@@ -1044,11 +1044,7 @@ mod tests {
             ..Default::default()
         });
         let block_hash = header.hash();
-        let proposer = node
-            .beacon_coordinator()
-            .topology_schedule()
-            .head()
-            .proposer_for(ShardId::ROOT, round);
+        let proposer = node.schedule.head().proposer_for(ShardId::ROOT, round);
         let voter = (1..4)
             .map(|idx| committee.validator_id(idx))
             .find(|v| *v != proposer)

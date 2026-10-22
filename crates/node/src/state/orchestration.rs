@@ -1,12 +1,13 @@
-//! Cross-coordinator orchestration: the flows that drive **both** the shard
-//! half and the beacon coordinator from one event.
+//! Cross-coordinator orchestration: the flows that feed **both** the shard
+//! half and the beacon from one event.
 //!
 //! These stay on [`NodeStateMachine`] rather than [`ShardParticipation`] because
-//! they mutate `beacon_coordinator` — feeding it the local shard's committed
-//! certified headers and advancing its committee anchor. Each destructures both
-//! halves explicitly: the shard fields through `self.shard` and the beacon
-//! coordinator through `self.beacon_coordinator`, disjoint field borrows the
-//! borrow checker keeps separate.
+//! they report to the beacon — the local shard's committed certified headers,
+//! which advance its committee anchor, and the remote headers it admits and
+//! proves. They push a [`BeaconInput`] for each, which
+//! [`handle`](hyperscale_core::StateMachine::handle) applies once the event's
+//! arm has run and before it installs any published schedule and runs the
+//! closing shard work.
 //!
 //! [`ShardParticipation`]: super::participation::ShardParticipation
 
@@ -19,6 +20,7 @@ use hyperscale_types::{
 };
 
 use super::NodeStateMachine;
+use super::beacon::BeaconInput;
 
 impl NodeStateMachine {
     /// Block committed: fold it into execution and notify every
@@ -40,6 +42,7 @@ impl NodeStateMachine {
         &mut self,
         certified: &Verified<CertifiedBlock>,
         committee_anchor: WeightedTimestamp,
+        inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
         let Some(s) = self.shard.as_mut() else {
             return Vec::new();
@@ -54,26 +57,19 @@ impl NodeStateMachine {
         // The node's one fork fence clears here, before any coordinator
         // reads it for this commit, once the attested recovery for a
         // fenced shard completes; a later re-fork can then re-engage.
-        let head = self.beacon_coordinator.topology_schedule().head();
+        let head = self.schedule.head();
         let cleared = s
             .fork_fence
             .clear_completed(|shard| head.latest_completed_recovery(shard));
 
-        actions.extend(s.mempool_coordinator.on_block_committed(
-            self.beacon_coordinator.current_topology_snapshot(),
-            certified,
-        ));
+        actions.extend(s.mempool_coordinator.on_block_committed(head, certified));
         // Committed engagements are engagement evidence: promote any
         // parked cross-shard transaction whose payer bundle just
         // committed. Covers the case where another proposer paired the
         // bundle before this node's provisions pipeline verified it, and
         // reads the list the engagement tier folds, so a block that
         // arrives sealed promotes what a live one does.
-        let trie = self
-            .beacon_coordinator
-            .current_topology_snapshot()
-            .shard_trie()
-            .clone();
+        let trie = head.shard_trie().clone();
         let engagements = certified.block().engagements();
         // Ascending, so each source's entries are one run.
         for run in engagements.chunk_by(|a, b| a.source == b.source) {
@@ -85,14 +81,14 @@ impl NodeStateMachine {
         }
 
         actions.extend(s.remote_headers_coordinator.on_block_committed(
-            self.beacon_coordinator.topology_schedule(),
+            &self.schedule,
             certified,
             &cleared,
         ));
 
         actions.extend(
             s.provisions_coordinator
-                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
+                .on_block_committed(&self.schedule, certified),
         );
 
         // Both take the block's own anchor and not a deadline clock's
@@ -105,27 +101,23 @@ impl NodeStateMachine {
         s.outbound_provisions
             .on_block_committed(certified.block().header().parent_qc().weighted_timestamp());
 
-        let certified_header = Arc::new(certified.certified_header());
-        actions.extend(
-            self.beacon_coordinator
-                .on_local_block_committed(&certified_header),
-        );
+        inputs.push(BeaconInput::LocalCommit {
+            header: Arc::new(certified.certified_header()),
+        });
 
-        let effects = s.execution_coordinator.commit_block(
-            self.beacon_coordinator.topology_schedule(),
-            certified,
-            committee_anchor,
-        );
+        let effects =
+            s.execution_coordinator
+                .commit_block(&self.schedule, certified, committee_anchor);
         s.shard_coordinator
             .retire_carried(s.execution_coordinator.committed_height());
         actions.extend(s.apply_commit_effects(effects));
-        actions.extend(s.settle_tip(self.beacon_coordinator.topology_schedule()));
+        actions.extend(s.settle_tip(&self.schedule));
 
         actions
     }
 
-    /// Fan a verified remote header to provisions, then feed it to the
-    /// beacon coordinator. Shard consensus already received the header in
+    /// Fan a verified remote header to provisions, then report it to the
+    /// beacon. Shard consensus already received the header in
     /// `RemoteHeaderQcVerified` (early insertion for deferral proof validation).
     ///
     /// Admission arms expectations only — the header's exports (provisions,
@@ -133,38 +125,40 @@ impl NodeStateMachine {
     /// once its commit proof is held.
     pub(super) fn on_remote_header_admitted(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
         let Some(s) = self.shard.as_mut() else {
             return Vec::new();
         };
 
-        let mut actions = s
+        let actions = s
             .provisions_coordinator
-            .on_verified_remote_header(certified_header);
-        actions.extend(
-            self.beacon_coordinator
-                .on_verified_source_header(certified_header),
-        );
+            .on_verified_remote_header(&certified_header);
+        inputs.push(BeaconInput::SourceHeader {
+            header: certified_header,
+        });
         actions
     }
 
     /// Fan a commit-proven remote header to the cross-shard consumers: the
-    /// beacon coordinator takes a boundary block it asked for; the
-    /// provisions coordinator opens the header for provision verification
-    /// and drains bundles parked on it; the execution coordinator marks the
-    /// source block proven and drains execution certificates deferred on the
-    /// proof.
+    /// shard coordinator records the proven anchor; the provisions
+    /// coordinator opens the header for provision verification and drains
+    /// bundles parked on it; the execution coordinator marks the source
+    /// block proven and drains execution certificates deferred on the
+    /// proof. The beacon takes a boundary block it asked for from the
+    /// pushed input, after all of them.
     pub(super) fn on_remote_header_committed(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
-        let mut actions = self
-            .beacon_coordinator
-            .on_commit_proven_source_header(certified_header);
-        let topology_schedule = self.beacon_coordinator.topology_schedule();
+        inputs.push(BeaconInput::CommitProven {
+            header: Arc::clone(certified_header),
+        });
+        let topology_schedule = &self.schedule;
         let Some(s) = self.shard.as_mut() else {
-            return actions;
+            return Vec::new();
         };
 
         // The anchor lands first and in one place: the vote fence holds a
@@ -177,12 +171,11 @@ impl NodeStateMachine {
             .shard_coordinator
             .record_proven_anchor(topology_schedule, Anchor::of(certified_header))
         {
-            return actions;
+            return Vec::new();
         }
-        actions.extend(
-            s.provisions_coordinator
-                .on_committed_remote_header(topology_schedule, certified_header),
-        );
+        let mut actions = s
+            .provisions_coordinator
+            .on_committed_remote_header(topology_schedule, certified_header);
         actions.extend(
             s.execution_coordinator
                 .on_committed_remote_header(topology_schedule, Anchor::of(certified_header)),
@@ -202,10 +195,10 @@ mod tests {
     use hyperscale_storage::RecoveredState;
     use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
     use hyperscale_types::{
-        AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconState, BlockHeight,
-        CertifiedBeaconBlock, Epoch, LocalTimestamp, NetworkDefinition, PcQc2, PcQc3,
-        PcSignerLengths, PcVector, PcXpProof, RatifyCert, RatifyRound, ShardId, SignerBitfield,
-        SpcCert, SpcView, ValidatorId, Verifiable, beacon_reveal_sign,
+        AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Block,
+        BlockHeight, CertifiedBeaconBlock, ChainOrigin, Epoch, LocalTimestamp, NetworkDefinition,
+        PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RatifyCert, RatifyRound, ShardId,
+        SignerBitfield, SpcCert, SpcView, StateRoot, ValidatorId, Verifiable, beacon_reveal_sign,
     };
 
     use super::*;
@@ -301,7 +294,8 @@ mod tests {
         child_replica_over(anchor_epoch, merged)
     }
 
-    /// The node's beacon adopts the skip block for the epoch after its tip.
+    /// The node's beacon adopts the skip block for the epoch after its
+    /// tip.
     fn adopt_skip(node: &mut NodeStateMachine) {
         let tip = node.beacon_coordinator().latest_block().block_hash();
         let epoch = node.beacon_coordinator().current_epoch().next();
@@ -393,8 +387,7 @@ mod tests {
     }
 
     fn holds_window(node: &NodeStateMachine, epoch: u64) -> bool {
-        node.beacon_coordinator()
-            .topology_schedule()
+        node.schedule
             .at(WeightedTimestamp::from_millis(epoch * epoch_ms(node)))
             .is_some()
     }
@@ -430,10 +423,7 @@ mod tests {
             },
         );
         assert!(
-            !node
-                .beacon_coordinator()
-                .topology_schedule()
-                .past_terminal(child, past_lookahead),
+            !node.schedule.past_terminal(child, past_lookahead),
             "the window past the cut is not folded yet",
         );
 
@@ -444,6 +434,76 @@ mod tests {
         );
     }
 
+    /// A cleanup tick hands the pending pool back for the last time only
+    /// once the held schedule shows the replica dissolved. The adoption
+    /// that folds the terminal installs that schedule, so the tick before
+    /// it and the tick after it read differently.
+    #[test]
+    fn a_shard_event_reads_the_schedule_the_last_adoption_left() {
+        let mut node = child_replica_over(1002, merged_with_terminal_record);
+        let cleanup = |node: &mut NodeStateMachine| {
+            let now = node.beacon_coordinator().now();
+            let _ = node.handle(now, ProtocolEvent::CleanupTimer);
+            node.participation().pending_pool_handed_back
+        };
+        assert!(!cleanup(&mut node), "no schedule shows the terminal yet");
+
+        adopt_skip(&mut node);
+        assert!(
+            cleanup(&mut node),
+            "the adoption's schedule shows it dissolved"
+        );
+    }
+
+    /// A replica that an adoption shows dissolved, with no commit after
+    /// it, stays dissolved once the windows that showed it are evicted.
+    #[test]
+    fn a_replica_an_adoption_dissolves_stays_dissolved_after_its_windows_are_evicted() {
+        let (child, _) = ShardId::ROOT.children();
+        let mut node = child_replica_over(1002, merged_with_terminal_record);
+        let anchor = in_window(&node, 1002);
+        assert!(!node.shard_coordinator().quiescent(&node.schedule));
+
+        adopt_skip(&mut node);
+        assert!(node.schedule.past_terminal(child, anchor));
+
+        adopt_normal(&mut node);
+        adopt_normal(&mut node);
+        assert!(!holds_window(&node, 1), "the terminal window is evicted");
+        assert!(!node.schedule.past_terminal(child, anchor));
+        assert!(node.shard_coordinator().quiescent(&node.schedule));
+        assert!(node.shard_coordinator().dissolved(&node.schedule));
+    }
+
+    /// A replica seated at a genesis anchored past its terminal reads
+    /// itself dissolved with no commit to latch the reading, and the next
+    /// adoption evicts the windows that showed it, since the beacon holds
+    /// the chain past them. The schedule the replica gives up at that
+    /// adoption is the last one that can latch it.
+    #[test]
+    fn a_genesis_replica_stays_dissolved_once_the_next_adoption_evicts_its_windows() {
+        let (child, _) = ShardId::ROOT.children();
+        let mut node = child_replica(1002);
+        let anchor = in_window(&node, 1000);
+        let genesis = Block::genesis(
+            child,
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            ChainOrigin {
+                genesis_height: BlockHeight::new(5),
+                anchor_wt: anchor,
+            },
+        );
+        let now = node.beacon_coordinator().now();
+        let _ = node.initialize_genesis(now, &genesis);
+        assert!(node.shard_coordinator().dissolved(&node.schedule));
+
+        adopt_skip(&mut node);
+        assert!(!holds_window(&node, 1), "the terminal window is evicted");
+        assert!(!node.schedule.past_terminal(child, anchor));
+        assert!(node.shard_coordinator().dissolved(&node.schedule));
+    }
+
     /// A retained replica that read itself dissolved stays dissolved once
     /// the beacon collects its terminal record and the windows that
     /// showed it are evicted, so the schedule can no longer say so.
@@ -452,7 +512,7 @@ mod tests {
         let (child, _) = ShardId::ROOT.children();
         let mut node = child_replica_over(1000, merged_with_terminal_record);
         let anchor = in_window(&node, 1000);
-        let schedule = node.beacon_coordinator().topology_schedule();
+        let schedule = &node.schedule;
         assert!(schedule.past_terminal(child, anchor));
         assert!(node.shard_coordinator().dissolved(schedule));
         let held_record = |node: &NodeStateMachine| {
@@ -472,7 +532,7 @@ mod tests {
         adopt_normal(&mut node);
         assert!(!held_record(&node), "the terminal record is collected");
         assert!(!holds_window(&node, 1), "the terminal window is evicted");
-        let schedule = node.beacon_coordinator().topology_schedule();
+        let schedule = &node.schedule;
         assert!(
             !schedule.past_terminal(child, anchor),
             "the schedule no longer reads the chain past its terminal",

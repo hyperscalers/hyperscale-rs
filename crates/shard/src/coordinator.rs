@@ -7927,7 +7927,6 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        self.latch_dissolution(topology_schedule);
         // A commit parked for want of its committee window resumes the
         // chain first, so the synced blocks drained next see its height.
         let mut actions = self.retry_parked_commit(topology_schedule);
