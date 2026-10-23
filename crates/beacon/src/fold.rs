@@ -644,7 +644,8 @@ impl BeaconFold {
         self.shard_source.clear_proven_boundaries();
 
         // TopologyChanged emits on every commit, whether or not the
-        // committee actually changed.
+        // committee actually changed. The commit precedes it so a shard
+        // never hears of an epoch that is not yet durable.
         let mut actions = vec![
             Action::CommitBeaconBlock {
                 block,

@@ -96,6 +96,17 @@ pub struct PendingRequest {
         Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
 }
 
+impl PendingRequest {
+    /// The request this entry carries, when it is an `R`.
+    #[must_use]
+    pub fn request<R: Request>(&self) -> Option<R> {
+        if self.type_id != R::message_type_id() {
+            return None;
+        }
+        hbor_from_slice(&self.request_bytes).ok()
+    }
+}
+
 /// Network implementation for simulation.
 ///
 /// Buffers outgoing messages in an outbox rather than delivering them immediately.

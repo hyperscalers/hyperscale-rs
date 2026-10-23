@@ -2,8 +2,8 @@
 //!
 //! The beacon `RocksDB` instance lives in its own directory and is
 //! independent of the per-shard tier. One handle is shared via `Arc`
-//! across the host's beacon fold and participants; the `commit_lock`
-//! serialises writes from concurrent emits without blocking reads.
+//! across the host's beacon fold, which writes the chain rows, and its
+//! participants, which write the vote and ratify registers.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -30,11 +30,6 @@ use crate::typed_cf::{TypedCf, batch_put, get};
 /// secondary index and the state row never lag the primary block row.
 pub struct RocksDbBeaconStorage {
     pub(super) db: Arc<DB>,
-    /// Serialises commits so concurrent multi-vnode emits land in a
-    /// deterministic order. Reads run lock-free; idempotent commits
-    /// of the same `(epoch, hash, state_root)` no-op at the storage
-    /// level.
-    pub(super) commit_lock: Mutex<()>,
     /// Serialises the read-decide-write in `admit_ratify_vote` so
     /// concurrent signers cannot both admit at one slot.
     pub(super) ratify_lock: Mutex<()>,
@@ -89,7 +84,6 @@ impl RocksDbBeaconStorage {
 
         Ok(Self {
             db: Arc::new(db),
-            commit_lock: Mutex::new(()),
             ratify_lock: Mutex::new(()),
             beacon_vote_lock: Mutex::new(()),
         })
@@ -118,12 +112,8 @@ impl RocksDbBeaconStorage {
 
     /// Convenience for committing one (block, state) pair atomically:
     /// typed writes for all three CFs in a single `WriteBatch`, flushed
-    /// sync under `commit_lock`.
+    /// sync.
     pub(super) fn commit_block_inner(&self, block: &CertifiedBeaconBlock, state: &BeaconState) {
-        let _guard = self
-            .commit_lock
-            .lock()
-            .expect("beacon commit_lock poisoned");
         let epoch = block.epoch().inner();
         let mut batch = WriteBatch::default();
         self.cf_batch_put::<BeaconBlocksByEpochCf>(&mut batch, &epoch, block);

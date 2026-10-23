@@ -52,17 +52,18 @@ use hyperscale_types::{
 use tracing::warn;
 
 use crate::beacon::{
-    self, BeaconBlockSync, BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding,
-    BeaconReply, BeaconSyncSink, ShardWitnessBinding, beacon_block_sync_config,
+    self, BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, BeaconCandidateBinding,
+    BeaconFetchState, BeaconProposalBinding, BeaconReply, ShardWitnessBinding,
 };
 use crate::config::NodeConfig;
 use crate::event::{
-    Attachment, BeaconInput, BeaconOwner, BeaconScopedInput, HostEvent, Registration,
-    classify_fetch_error,
+    Attachment, BeaconInput, BeaconOwner, BeaconScopedInput, FetchFailureKind, HostEvent,
+    Registration, classify_fetch_error,
 };
 use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Release};
 use crate::process::ProcessIo;
 use crate::shard::{FetchTicker, StepOutput, TimerOp, TimerOwner};
+use crate::sync::SyncOutput;
 
 /// The host's beacon driver.
 pub struct BeaconLoop<S, N, D>
@@ -147,6 +148,7 @@ where
         config: &NodeConfig,
     ) -> Self {
         let now = fold.now();
+        let beacon_block = beacon::resumed_at(fold.latest_block().epoch());
         Self {
             reply: BeaconReply(process.beacon_event_sender.clone()),
             process,
@@ -158,7 +160,7 @@ where
             pending_participation_changes: Vec::new(),
             pending_timer_ops: Vec::new(),
             actions_generated: 0,
-            beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
+            beacon_block,
             fetches: BeaconFetchState::new(config),
             interest: Interest::default(),
             fetch_tick: FetchTicker::default(),
@@ -373,10 +375,10 @@ where
                 }
             }
             BeaconScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
-                beacon::on_response(self, epoch, block);
+                self.on_sync_response(epoch, block);
             }
             BeaconScopedInput::BeaconBlockSyncFetchFailed { epoch, kind } => {
-                beacon::on_fetch_failed(self, epoch, kind);
+                self.on_sync_fetch_failed(epoch, kind);
             }
             BeaconScopedInput::FetchFailed(ids) => self.release(ids, Release::Failed),
             BeaconScopedInput::FetchUnroutable(ids) => self.release(ids, Release::Unroutable),
@@ -386,7 +388,7 @@ where
                 self.drive_fetch::<ShardWitnessBinding>(FetchInput::Tick);
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Tick);
                 self.drive_fetch::<BeaconCandidateBinding>(FetchInput::Tick);
-                beacon::on_tick(self);
+                self.on_sync_tick();
             }
             BeaconScopedInput::Shard { chain, input } => self.on_shard_input(chain, input),
             BeaconScopedInput::Register {
@@ -901,15 +903,15 @@ where
         match action {
             Action::CommitBeaconBlock { block, state } => {
                 self.process
-                    .beacon_commit
-                    .commit(&self.process.beacon_storage, &block, &state);
+                    .beacon_storage
+                    .commit_beacon_block(&block, &state);
                 // Advance the sync FSM's committed watermark on every commit
                 // (gossip or sync) so a serial catch-up unblocks the next
                 // epoch's fetch.
-                beacon::on_admitted(self);
+                self.on_sync_admitted(block.epoch());
             }
             Action::TopologyChanged { epoch, schedule } => {
-                self.process.apply_topology(epoch, Arc::clone(&schedule));
+                self.process.apply_topology(Arc::clone(&schedule));
                 for (shard, sender) in self.shard_senders.values() {
                     let _ = sender.send(HostEvent::protocol(
                         *shard,
@@ -943,7 +945,7 @@ where
                 BeaconOwner::Fold => warn!(?id, "BeaconLoop: the fold arms no timer — dropping"),
             },
             Action::StartBeaconBlockSync { target } => {
-                beacon::start(self, target);
+                self.start_sync(target);
             }
             Action::Fetch(FetchRequest::Ask {
                 ids,
@@ -1333,28 +1335,121 @@ impl Asked for BeaconCandidateBinding {
     }
 }
 
-impl<S, N, D> BeaconSyncSink for BeaconLoop<S, N, D>
+/// The beacon-block catch-up sync: the loop feeds its FSM and turns the
+/// FSM's fetches into requests past the host.
+impl<S, N, D> BeaconLoop<S, N, D>
 where
     S: ShardStorage,
     N: Network,
     D: Dispatch,
 {
-    fn beacon_fsm(&mut self) -> &mut BeaconBlockSync {
-        &mut self.beacon_block
+    /// Begin (or extend) a catch-up sync toward `target`, fetching above
+    /// the committed watermark.
+    fn start_sync(&mut self, target: Epoch) {
+        let outputs = self
+            .beacon_block
+            .handle(BeaconBlockSyncInput::StartSync { scope: (), target });
+        self.drive_sync(outputs);
     }
 
-    fn deliver_block(&mut self, block: Arc<Verifiable<CertifiedBeaconBlock>>) {
+    /// A beacon-block sync response landed. `None` (the peer does not hold
+    /// the epoch) re-queues through the failure path. Otherwise the block
+    /// goes to the fold and the FSM learns the epoch's bytes arrived.
+    ///
+    /// `FetchSucceeded` means "the bytes arrived", not "the block is
+    /// valid": the fold verifies against the committee it owns. The FSM
+    /// parks the epoch in `pending_admission`; a valid block commits and
+    /// feeds `Admitted`, while one that fails verification is never
+    /// admitted, so the FSM re-fetches it from another peer after
+    /// `PENDING_ADMISSION_TIMEOUT` rather than this path duplicating
+    /// committee-aware verification.
+    fn on_sync_response(
+        &mut self,
+        epoch: Epoch,
+        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+    ) {
+        let Some(block) = block else {
+            // Back off rather than re-queue immediately: the sync target
+            // comes from an unverified gossip block, so a bogus far-future
+            // epoch would otherwise busy-loop the network fetching an epoch
+            // nobody has produced.
+            self.on_sync_fetch_failed(epoch, FetchFailureKind::NotFound);
+            return;
+        };
         let actions = self.fold.on_beacon_block_received(block);
         self.run_fold_actions(actions);
+        let outputs = self
+            .beacon_block
+            .handle(BeaconBlockSyncInput::FetchSucceeded {
+                scope: (),
+                from: epoch,
+                count: 1,
+                delivered_heights: vec![epoch],
+                now: self.now,
+            });
+        self.drive_sync(outputs);
     }
 
-    /// Ask past the host: its own beacon store is filled by the same
-    /// commits the sync is waiting on.
-    fn dispatch_fetch(&self, epoch: Epoch) {
+    /// Re-queue an epoch through `FetchFailed`, under the FSM's deferral
+    /// for `kind`.
+    fn on_sync_fetch_failed(&mut self, epoch: Epoch, kind: FetchFailureKind) {
+        let outputs = self.beacon_block.handle(BeaconBlockSyncInput::FetchFailed {
+            scope: (),
+            from: epoch,
+            count: 1,
+            kind,
+            now: self.now,
+        });
+        self.drive_sync(outputs);
+    }
+
+    /// Advance the FSM's committed watermark to `epoch` on a beacon commit
+    /// (gossip or sync), so a serial catch-up unblocks the next epoch's
+    /// fetch.
+    fn on_sync_admitted(&mut self, epoch: Epoch) {
+        let outputs = self.beacon_block.handle(BeaconBlockSyncInput::Admitted {
+            scope: (),
+            height: epoch,
+        });
+        self.drive_sync(outputs);
+    }
+
+    /// Re-dispatch any deferred fetch whose backoff has expired.
+    fn on_sync_tick(&mut self) {
+        let outputs = self
+            .beacon_block
+            .handle(BeaconBlockSyncInput::Tick { now: self.now });
+        self.drive_sync(outputs);
+    }
+
+    /// Turn the FSM's scheduling outputs into network fetches. A fetch no
+    /// live shard can answer goes back to the FSM as `NoPeers`, so its
+    /// slot frees and the backoff retries it on a later tick. The beacon
+    /// has no sync mode to exit (each adopted block already re-arms the
+    /// participants' timers), so completion is informational.
+    fn drive_sync(&mut self, outputs: Vec<BeaconBlockSyncOutput>) {
+        for output in outputs {
+            match output {
+                SyncOutput::Fetch { from, .. } => {
+                    if !self.dispatch_sync_fetch(from) {
+                        self.on_sync_fetch_failed(from, FetchFailureKind::NoPeers);
+                    }
+                }
+                SyncOutput::Complete { height, .. } => {
+                    tracing::info!(epoch = height.inner(), "Beacon block sync complete");
+                }
+            }
+        }
+    }
+
+    /// Ask past the host for `epoch`: its own beacon store is filled by
+    /// the same commits the sync is waiting on. Whether a live shard with
+    /// a committee took the ask.
+    fn dispatch_sync_fetch(&self, epoch: Epoch) -> bool {
         let lowest = self.validators().next();
         let Some(shard) = self.fetch_shard(lowest) else {
             warn!("BeaconLoop: no live shard to fetch beacon blocks from; deferring");
-            return;
+            return false;
         };
         let beacon_tx = self.process.beacon_event_sender.clone();
         self.process.network.request_from(
@@ -1382,14 +1477,7 @@ where
                 },
             ),
         );
-    }
-
-    fn now(&self) -> LocalTimestamp {
-        self.now
-    }
-
-    fn lowest_tip(&self) -> Option<Epoch> {
-        Some(self.fold.latest_block().epoch())
+        true
     }
 }
 
@@ -1425,7 +1513,7 @@ mod tests {
 
     type Loop = BeaconLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
-    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_storage_memory::{SimShardStorage, crash_point};
 
     const PROPOSAL: (Epoch, ValidatorId) = (Epoch::new(1), ValidatorId::new(1));
 
@@ -1567,7 +1655,7 @@ mod tests {
             "an answered fetch leaves nothing pending",
         );
 
-        beacon::start(&mut host.beacon, Epoch::new(5));
+        host.beacon.start_sync(Epoch::new(5));
         host.beacon.update_fetch_tick_timer();
         assert_eq!(
             fetch_ticks(&host.drain_pending_output().timer_ops),
@@ -1748,7 +1836,7 @@ mod tests {
         wire.peer
             .register_request_handler(SHARD, counter(&there, fix.genesis_block()));
 
-        beacon::start(&mut host.beacon, Epoch::new(1));
+        host.beacon.start_sync(Epoch::new(1));
         wire.pump(&mut host, &events);
         assert_eq!(
             here.load(Ordering::SeqCst),
@@ -2144,6 +2232,104 @@ mod tests {
             let _ = host.step(event);
         }
         assert_eq!(replica_epoch(&host), Epoch::new(3));
+    }
+
+    /// A block that reaches the loop again — a second verified copy off
+    /// gossip, then a sync delivery of it — is written to beacon storage
+    /// once, by the fold's one adoption.
+    #[test]
+    fn the_fold_commits_each_beacon_block_once() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_over_history(advanced_history(&fix, 0), far_future());
+        let block = skip_block(&fix.genesis_block(), Epoch::new(1));
+        let verified = || {
+            fold_outcome(ProtocolEvent::BeaconBlockVerified {
+                result: Ok(Arc::clone(&block)),
+            })
+        };
+        let (ran, left) = crash_point::armed(Some(u64::MAX), || {
+            let _ = host.step(verified());
+            let _ = host.step(verified());
+            host.beacon.on_sync_response(
+                Epoch::new(1),
+                Some(Arc::new(Verifiable::from((*block).clone()))),
+            );
+            for event in events.try_iter() {
+                let _ = host.step(event);
+            }
+        });
+        assert!(ran.is_ok());
+        assert_eq!(host.beacon.fold().state().current_epoch, Epoch::new(1));
+        assert_eq!(
+            left,
+            Some(u64::MAX - 1),
+            "one storage write across every copy of the block",
+        );
+        assert_eq!(
+            host.beacon_storage().latest_committed_epoch(),
+            Some(Epoch::new(1)),
+            "the one write is the block's commit",
+        );
+    }
+
+    /// A host restarted over beacon storage whose tip is epoch 8 syncs
+    /// from 9: its catch-up starts at the storage tip, with nothing
+    /// committed in this run.
+    #[test]
+    fn beacon_sync_resumes_from_the_storage_tip_after_a_restart() {
+        let fix = Fixture::new();
+        let (mut host, _events) = fix.host_resumed(
+            advanced_history(&fix, 8),
+            SimShardStorage::new(shard_prefix_path(SHARD)),
+            far_future(),
+        );
+        host.beacon.start_sync(Epoch::new(10));
+        let status = host.beacon.beacon_block.status(&());
+        assert_eq!(status.current_height, 8, "the watermark is the storage tip");
+        assert_eq!(status.blocks_behind, 2);
+        assert_eq!(
+            beacon_blocks_asked(&host),
+            vec![Epoch::new(9)],
+            "one epoch in flight, the one above the tip",
+        );
+    }
+
+    /// A sync started while no live leaf has a committee to ask holds its
+    /// epoch behind the backoff rather than in flight, so once a committee
+    /// appears the next tick asks it.
+    #[test]
+    fn a_beacon_sync_with_no_committee_to_ask_retries_once_one_appears() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let live = host.process.topology_snapshot.load_full();
+        host.process
+            .topology_snapshot
+            .store(Arc::new(fix.topology(BTreeMap::new())));
+
+        host.beacon.start_sync(Epoch::new(1));
+        assert!(beacon_blocks_asked(&host).is_empty(), "no committee to ask");
+
+        host.process.topology_snapshot.store(live);
+        let later = host.beacon.now.plus(Duration::from_secs(60));
+        host.set_time(later);
+        let _ = host.step(HostEvent::beacon_fetch_tick());
+        assert_eq!(
+            beacon_blocks_asked(&host),
+            vec![Epoch::new(1)],
+            "the tick asks the committee"
+        );
+    }
+
+    /// The epochs of the beacon blocks `host` has asked for since the
+    /// last call.
+    fn beacon_blocks_asked(host: &Host) -> Vec<Epoch> {
+        let mut asked = Vec::new();
+        for pending in host.network().drain_pending_requests() {
+            if let Some(request) = pending.request::<GetBeaconBlockRequest>() {
+                asked.push(request.epoch);
+            }
+        }
+        asked
     }
 
     /// The beacon loop's fold hands back `event` as its own outcome.
