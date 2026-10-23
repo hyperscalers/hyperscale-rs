@@ -43,7 +43,7 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    ConsensusReceipt, Derivation, Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds,
+    ConsensusReceipt, Derivation, Epoch, Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds,
     ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, Transaction,
     TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified,
     WeightedTimestamp, shard_prefix_path,
@@ -629,9 +629,9 @@ impl SimCluster {
         (0..self.runner.num_hosts())
             .filter(|&host| {
                 self.runner
-                    .shard_vnodes_in(host, shard)
+                    .seated_in(host, shard)
                     .iter()
-                    .any(|vnode| committee.contains(&vnode.validator_id()))
+                    .any(|validator| committee.contains(validator))
             })
             .collect()
     }
@@ -892,6 +892,17 @@ impl Cluster for SimCluster {
 
     fn serves_shard(&self, shard: ShardId) -> bool {
         !self.live_committee_hosts(shard).is_empty()
+    }
+
+    fn running_loops(&self, shard: ShardId) -> Vec<(Epoch, bool)> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| {
+                let replica = self.runner.vnode_state_in(host, shard)?;
+                let oldest = self.runner.oldest_retained_epoch(host)?;
+                let dissolved = replica.shard_coordinator().dissolved(replica.schedule());
+                Some((oldest, dissolved))
+            })
+            .collect()
     }
 
     fn beacon_state(&self) -> Option<Arc<BeaconState>> {

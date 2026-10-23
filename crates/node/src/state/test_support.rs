@@ -13,8 +13,10 @@
 
 use std::sync::Arc;
 
-use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
+use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
+use hyperscale_beacon::{BeaconFold, ChainRegistration};
+use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::AllCodeRuns;
 use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
@@ -25,19 +27,25 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, CertifiedBeaconBlock, GenesisPool,
-    GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, Randomness, RecoveryBinding, ShardId,
-    Stake, StakePoolId, ValidatorId, Verified, genesis_config_hash,
+    GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, Randomness,
+    RecoveryBinding, ShardId, Stake, StakePoolId, Verified, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
+use crate::event::BeaconInput;
 
-/// Real `NodeStateMachine` plus the committee that produced its topology.
-/// The committee stays alive so tests can mint signed messages targeting
-/// the same validator set the node sees.
+/// Real `NodeStateMachine` plus the committee that produced its topology
+/// and the fold its chain is registered with. The committee stays alive
+/// so tests can mint signed messages targeting the same validator set
+/// the node sees.
 pub struct TestNode {
     pub(crate) node: NodeStateMachine,
     #[allow(dead_code)] // exposed for tests that mint signed messages
     pub(crate) committee: TestCommittee,
+    /// The fold the node's chain is registered with, standing in for the
+    /// host's beacon loop.
+    pub(crate) fold: BeaconFold,
+    pub(crate) chain: ChainRegistration,
 }
 
 impl TestNode {
@@ -49,6 +57,51 @@ impl TestNode {
 
     pub(crate) fn builder() -> TestNodeBuilder {
         TestNodeBuilder::default()
+    }
+
+    /// Feed `event` to the node at `now`, then hand the fold what the
+    /// node reported to the beacon, as the host's beacon loop would.
+    pub(crate) fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
+        self.fold.set_now(now);
+        let actions = self.node.handle(now, event);
+        self.report_to_fold();
+        actions
+    }
+
+    /// Apply what the node reported to the beacon to the fold.
+    pub(crate) fn report_to_fold(&mut self) {
+        for input in self.node.take_beacon_inputs() {
+            match input {
+                BeaconInput::LocalCommit { header } => {
+                    let _ = self.fold.on_local_block_committed(self.chain, &header);
+                }
+                BeaconInput::CertifiedHeader { header } => {
+                    self.fold.on_certified_local_header(self.chain, &header);
+                }
+                BeaconInput::SourceHeader { header } => {
+                    let _ = self.fold.on_source_header(&header);
+                }
+                BeaconInput::CommitProven { .. }
+                | BeaconInput::ForkProof(_)
+                | BeaconInput::VoteEquivocation { .. } => {}
+            }
+        }
+    }
+
+    /// Adopt `block` into the fold at `now` and hand the node the schedule
+    /// it folded, as the host's beacon loop does after its commit.
+    pub(crate) fn adopt(
+        &mut self,
+        now: LocalTimestamp,
+        block: Arc<Verified<CertifiedBeaconBlock>>,
+    ) {
+        self.fold.set_now(now);
+        let adopted = self.fold.adopt(block).expect("the block extends the tip");
+        for action in adopted.actions {
+            if let Action::TopologyChanged { epoch, schedule } = action {
+                let _ = self.handle(now, ProtocolEvent::BeaconBlockPersisted { epoch, schedule });
+            }
+        }
     }
 }
 
@@ -106,23 +159,26 @@ impl TestNodeBuilder {
         // The beacon harness consolidates every validator onto the root shard.
         let local_shard = self.local_shard.unwrap_or(ShardId::ROOT);
         let provision_store = Arc::new(ProvisionStore::new());
-        let beacon_coordinator = test_beacon_coordinator(
-            &committee,
-            me,
+        let mut fold = test_fold(&committee, self.recoveries, self.beacon_history);
+        let chain = fold.register_chain(
             local_shard,
-            &self.recovered,
-            self.recoveries,
-            self.beacon_history,
+            LocalChainAnchors {
+                committee: self.recovered.committee_anchor_wt(),
+                block: self.recovered.block_anchor_wt(),
+            },
+            self.recovered.committed_height,
         );
 
         let node = NodeStateMachine::new(
             me,
+            Arc::new(BlsVerifier),
             Arc::new(StubVmStatics),
             Arc::new(AllCodeRuns),
             local_shard,
             &ShardConsensusConfig::default(),
             &self.recovered,
-            beacon_coordinator,
+            Arc::new(fold.schedule().clone()),
+            fold.state().current_epoch,
             MempoolConfig::default(),
             ProvisionConfig::default(),
             provision_store,
@@ -132,21 +188,23 @@ impl TestNodeBuilder {
             Arc::new(CrossingIndexSlot::default()),
         );
 
-        TestNode { node, committee }
+        TestNode {
+            node,
+            committee,
+            fold,
+            chain,
+        }
     }
 }
 
-/// Build a `BeaconCoordinator` for tests over the `TestCommittee` —
-/// every validator on a single pool, the first `BEACON_SIGNER_COUNT`
-/// on the beacon committee, every validator placed on the ROOT shard.
-fn test_beacon_coordinator(
+/// Build a `BeaconFold` for tests over the `TestCommittee` — every
+/// validator on a single pool, the first `BEACON_SIGNER_COUNT` on the
+/// beacon committee, every validator placed on the ROOT shard.
+fn test_fold(
     committee: &TestCommittee,
-    me: ValidatorId,
-    local_shard: ShardId,
-    recovered: &RecoveredState,
     recoveries: Vec<(ShardId, Vec<RecoveryBinding>)>,
     history: Option<BeaconHistory>,
-) -> BeaconCoordinator {
+) -> BeaconFold {
     let network = NetworkDefinition::simulator();
     let pool_id = StakePoolId::new(0);
     let n = committee.size();
@@ -184,20 +242,7 @@ fn test_beacon_coordinator(
         Some(history) => history(state),
         None => vec![state],
     };
-    let local_chain = LocalChainAnchors {
-        committee: recovered.committee_anchor_wt(),
-        block: recovered.block_anchor_wt(),
-    };
-    BeaconCoordinator::new(
-        Arc::new(BlsVerifier),
-        block,
-        history,
-        me,
-        local_shard,
-        Some((local_chain, recovered.committed_height)),
-        network,
-        config_hash,
-    )
+    BeaconFold::new(Arc::new(BlsVerifier), block, history, network, config_hash)
 }
 
 // ─── Action-stream assertions ─────────────────────────────────────────

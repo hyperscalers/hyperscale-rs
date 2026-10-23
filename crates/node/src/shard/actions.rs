@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
 use hyperscale_core::{
     Action, ActionContext, ActionOwner, CommitSource, FetchRequest, ProtocolEvent,
 };
@@ -15,16 +14,14 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    Anchor, BeaconProposal, BeaconWitnessCommit, BlockHash, BlockHeight, CandidateBeaconBlock,
-    CertifiedBlock, Epoch, ShardId, SubstateKey, TerminalEvidence, TopologySchedule,
-    TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
+    Anchor, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ShardId, SubstateKey,
+    TerminalEvidence, TransactionStatus, TxHash, Verified, WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
 use super::{
     ShardLoop, ShardScopedInput, TimerOp, TimerOwner, push_protocol_event, push_shard_input,
 };
-use crate::beacon;
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyPrep,
@@ -68,7 +65,6 @@ where
             | Action::VerifyTimeout { .. }
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyShardForkProof { .. }
-            | Action::VerifyShardVoteEquivocation { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyBeaconWitnessRoot { .. }
             | Action::VerifyBodyRoot { .. }
@@ -85,10 +81,13 @@ where
             | Action::SignAndBroadcastReadySignal { .. }
             | Action::BroadcastCertifiedBlockHeader { .. }
             | Action::BroadcastShardForkProof { .. }
-            | Action::BroadcastShardVoteEquivocation { .. }
             | Action::SignAndSendExecutionVote { .. }
-            | Action::BroadcastExecutionCertificate { .. }
-            | Action::SignAndBroadcastPcVote1 { .. }
+            | Action::BroadcastExecutionCertificate { .. } => {
+                self.dispatch_delegated_action(vnode_idx, action);
+            }
+
+            // ─── The beacon runs on the host's beacon loop ─────────────────
+            Action::SignAndBroadcastPcVote1 { .. }
             | Action::SignAndBroadcastPcVote2 { .. }
             | Action::SignAndBroadcastPcVote3 { .. }
             | Action::SignAndBroadcastEmptyView { .. }
@@ -106,8 +105,15 @@ where
             | Action::VerifyPcVote3 { .. }
             | Action::VerifySpcNewView { .. }
             | Action::VerifySpcNewCommit { .. }
-            | Action::VerifySpcEmptyView { .. } => {
-                self.dispatch_delegated_action(vnode_idx, action);
+            | Action::VerifySpcEmptyView { .. }
+            | Action::StartBeaconBlockSync { .. }
+            | Action::CommitBeaconBlock { .. }
+            | Action::TopologyChanged { .. }
+            | Action::ReconfigureParticipation(_) => {
+                warn!(
+                    action = action.type_name(),
+                    "a beacon action reached a shard loop — dropping"
+                );
             }
 
             // ─── Tick chain maintenance ────────────────────────────────────
@@ -146,9 +152,6 @@ where
             Action::SettleBlockSync => {
                 self.process_settle_block_sync();
             }
-            Action::StartBeaconBlockSync { target } => {
-                self.process_start_beacon_block_sync(target);
-            }
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
@@ -185,27 +188,6 @@ where
                 self.pending_timer_ops.push(TimerOp::Cancel { owner, id });
             }
 
-            // ─── Beacon-local effects ──────────────────────────────────────
-            Action::CommitBeaconBlock { block, state } => {
-                let epoch = block.epoch();
-                // Process-scoped dedup: only the first co-hosted vnode to
-                // reach this `(epoch, hash)` writes to storage. The
-                // per-vnode sync-advance and `BeaconBlockPersisted` below
-                // still run on every vnode regardless.
-                self.process
-                    .beacon_commit
-                    .commit(&self.process.beacon_storage, &block, &state);
-                // Advance the beacon sync FSM's committed watermark on
-                // every commit (gossip or sync) so a later
-                // StartBeaconBlockSync fetches above every hosted tip, and
-                // so serial sync unblocks the next epoch's fetch.
-                beacon::on_admitted(self);
-                push_protocol_event(
-                    self.event_sender(),
-                    self.shard,
-                    ProtocolEvent::BeaconBlockPersisted { epoch },
-                );
-            }
             Action::Continuation(pe) => self.handle_continuation(pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock {
@@ -266,12 +248,6 @@ where
             Action::RecordTxEcCreated { tx_hashes } => {
                 let now = self.now;
                 self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
-            }
-            Action::TopologyChanged { epoch, schedule } => {
-                self.handle_topology_changed(epoch, schedule);
-            }
-            Action::ReconfigureParticipation(change) => {
-                self.pending_participation_changes.push(change);
             }
         }
     }
@@ -669,59 +645,6 @@ where
 
     // ─── Delegated Work ─────────────────────────────────────────────────
 
-    /// Whether `me` may emit `action` from this shard's vnode.
-    ///
-    /// One beacon signature per validator per position: a co-hosted
-    /// vnode that hasn't claimed the current SPC view has its beacon
-    /// signing actions dropped here, before any signature exists.
-    /// The state machines stay single-node — passivity is purely a
-    /// driver decision at this funnel. A dissolved shard's vnode
-    /// stops emitting SPC traffic entirely: its successors are live,
-    /// so the validator's live vnode carries the duty, and a stale
-    /// coordinator claiming views it can't follow through starves
-    /// the beacon of this validator's signatures.
-    fn beacon_emission_allowed(&self, me: ValidatorId, action: &Action) -> bool {
-        let shard = self.shard;
-        if action.is_beacon_consensus_emission()
-            && self.process.topology_snapshot.load().successors_live(shard)
-        {
-            trace!(
-                validator = ?me,
-                shard = shard.inner(),
-                action = action.type_name(),
-                "Dropping beacon emission from a dissolved shard's vnode"
-            );
-            return false;
-        }
-        if let Some(position) = action.ratify_signing_position() {
-            if !self.process.allow_ratify_signing(me, position) {
-                trace!(
-                    validator = ?me,
-                    shard = shard.inner(),
-                    epoch = position.0.inner(),
-                    round = position.1.inner(),
-                    "Dropping already-covered ratify vote position"
-                );
-                return false;
-            }
-        } else if let Some((epoch, view)) = action.beacon_signing_position()
-            && !self
-                .process
-                .allow_beacon_signing(me, Some(shard), epoch, view)
-        {
-            trace!(
-                validator = ?me,
-                shard = shard.inner(),
-                epoch = epoch.inner(),
-                view = view.inner(),
-                action = action.type_name(),
-                "Dropping beacon signing action for an unclaimed view"
-            );
-            return false;
-        }
-        true
-    }
-
     /// Dispatch a delegated action to the appropriate thread pool.
     ///
     /// Spawns the work as a fire-and-forget closure. Results return via
@@ -739,13 +662,9 @@ where
         let vnode = self.vnode(vnode_idx);
         let me = vnode.validator_id;
 
-        if !self.beacon_emission_allowed(me, &action) {
-            return;
-        }
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
         let event_tx = self.event_sender().clone();
         let signer = Arc::clone(&vnode.signer);
-        let gate = Arc::clone(&vnode.gate);
         let verifier = Arc::clone(&self.process.verifier);
         let par = self.process.dispatch.parallelism();
         // Resolve the shard's handles here, on the shard's own thread,
@@ -789,13 +708,6 @@ where
                 Arc::clone(&shard_handles.pending_chain),
                 Arc::clone(&shard_handles.prepared_commits),
             );
-            let cache_beacon_proposal =
-                |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
-                    handles.beacon_proposal_cache.admit(from, epoch, proposal);
-                };
-            let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {
-                handles.beacon_candidate_cache.admit(candidate);
-            };
             let ctx = ActionContext {
                 executor: handles.executor.as_ref(),
                 topology_snapshot: &topology_snapshot,
@@ -804,69 +716,44 @@ where
                 pending_chain: &shard_handles.pending_chain,
                 tick_chain: &shard_handles.tick_chain,
                 vote_registers: shard_handles.storage.as_ref(),
-                ratify_registers: handles.beacon_storage.as_ref(),
-                beacon_vote_registers: handles.beacon_storage.as_ref(),
                 beacon_chain: handles.beacon_storage.as_ref(),
                 network: &handles.network,
                 signer: &signer,
                 verifier: verifier.as_ref(),
                 notify,
                 commit_prepared: &commit_prepared,
-                cache_beacon_proposal: &cache_beacon_proposal,
-                cache_beacon_candidate: &cache_beacon_candidate,
                 par,
             };
             match owner {
                 ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
-                ActionOwner::Beacon => handle_beacon_action(action, &ctx.beacon(&gate)),
-                ActionOwner::Local => unreachable!(
-                    "dispatch_delegated_action called with Local-owned action — \
-                     process_action's outer match should have routed inline"
+                ActionOwner::Beacon | ActionOwner::Local => unreachable!(
+                    "dispatch_delegated_action called with a beacon or Local-owned action — \
+                     process_action's outer match should have routed it"
                 ),
             }
         });
     }
 
-    /// Adopt a freshly folded schedule: publish its head through the
-    /// lock-free `ArcSwap` so off-thread closures pick it up on their
-    /// next `.load()`, and push it to the network adapter (which keys
-    /// validator pubkeys and shard committees off the snapshot). Every
-    /// hosted shard's `Action::TopologyChanged` lands here as it folds
-    /// the beacon at `epoch`; `apply_topology` gates the store
-    /// monotonically so a slower shard thread cannot regress the shared
-    /// schedule to an older epoch's view.
-    pub(in crate::shard) fn handle_topology_changed(
-        &self,
-        epoch: Epoch,
-        schedule: Arc<TopologySchedule>,
-    ) {
-        let committee_size = schedule.head().committee_for_shard(self.shard).len();
-        // The beacon attests a boundary off its child's header, and the
-        // commit path pins the boundary when that child commits. A shard
-        // that halts with the child certified but never committed leaves
-        // its attested anchor unpinned on every member, and nothing can
-        // seat against it — not a rotation's entrant, not the recovery's
-        // fresh committee. The committed tip is the anchor's exact state
-        // for as long as it stays the tip, so pin it the moment the
-        // attestation lands. A pin that already exists costs a stat. The
-        // pin follows the publish so its trim holds the anchor it pins.
-        let attested_tip = schedule
-            .head()
-            .boundary(self.shard)
-            .map(|anchor| anchor.height)
-            .filter(|height| *height == self.io.storage.committed_height());
-        self.process.apply_topology(epoch, schedule);
-        if let Some(height) = attested_tip {
-            self.io.boundary_pins.pin(height);
+    /// The beacon folded a schedule. The beacon attests a boundary off its
+    /// child's header, and the commit path pins the boundary when that
+    /// child commits. A shard that halts with the child certified but
+    /// never committed leaves its attested anchor unpinned on every
+    /// member, and nothing can seat against it — not a rotation's
+    /// entrant, not the recovery's fresh committee. The committed tip is
+    /// the anchor's exact state for as long as it stays the tip, so pin it
+    /// the moment the attestation lands. A pin that already exists costs a
+    /// stat. Then every vnode holds the schedule and replays what waited
+    /// on the epoch.
+    pub(in crate::shard) fn handle_beacon_block_persisted(&mut self, event: ProtocolEvent) {
+        if let ProtocolEvent::BeaconBlockPersisted { schedule, .. } = &event
+            && let Some(anchor) = schedule.head().boundary(self.shard)
+            && anchor.height == self.io.storage.committed_height()
+        {
+            self.io.boundary_pins.pin(anchor.height);
         }
-
-        tracing::info!(
-            local_shard = self.shard.inner(),
-            committee_size,
-            "Network topology updated"
-        );
+        self.dispatch_event(event);
     }
 }
 

@@ -4,8 +4,8 @@
 //! Sibling [`crate::shard`] hosts the per-shard tier;
 //! beacon traits live alongside but are independent — backends impl
 //! both (or just one) as needed. The process holds one
-//! `Arc<impl BeaconStorage>` shared across every vnode's
-//! `BeaconCoordinator`.
+//! `Arc<impl BeaconStorage>`, which its beacon loop's fold writes and
+//! everything else on the host reads.
 
 pub mod chain_reader;
 pub mod chain_writer;

@@ -938,8 +938,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .map_err(|e| format!("failed to open database at {}: {e:?}", shard_dir.display()))
     });
 
-    // Process-level beacon storage, shared across every hosted vnode's
-    // `BeaconCoordinator`. One DB under `{data_dir}/beacon/db`.
+    // Process-level beacon storage, shared across the beacon loop's fold
+    // and participants. One DB under `{data_dir}/beacon/db`.
     let beacon_db_path = config.node.data_dir.join("beacon").join("db");
     let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(
         RocksDbBeaconStorage::open_with_config(&beacon_db_path, &rocksdb_config)

@@ -96,7 +96,7 @@ fn commit_is_idempotent_on_same_epoch_block_and_state() {
 
 /// Persistence round-trip: reopening the directory recovers the
 /// committed (block, state) pairs byte-identical to what was
-/// committed. `BeaconCoordinator::new` reads `latest_committed()` on
+/// committed. A host's beacon fold resumes from `latest_committed()` on
 /// restart, so per-epoch fidelity here is what makes warm-restart
 /// indistinguishable from cold-start at the FSM layer.
 #[test]

@@ -27,9 +27,7 @@ use hyperscale_storage::{
     without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
-use hyperscale_types::network::gossip::{
-    CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
-};
+use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, QcAnnouncementNotification,
     ReadySignalNotification, TimeoutNotification,
@@ -55,7 +53,7 @@ use hyperscale_types::{
     absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
     shard_prefix_path, shard_reveal_sign, signed_bytes, tick_terms_admit_block,
-    verify_shard_vote_equivocation, vrf_output_from_proof,
+    vrf_output_from_proof,
 };
 
 use crate::parent_checks::{
@@ -1079,28 +1077,6 @@ where
             ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
         }
 
-        Action::VerifyShardVoteEquivocation { evidence, pubkey } => {
-            let start = Stopwatch::start();
-            let verified = verify_shard_vote_equivocation(
-                ctx.verifier,
-                &evidence,
-                ctx.topology_snapshot.network(),
-                &pubkey,
-            )
-            .is_ok();
-            record_signature_verification_latency(
-                "shard_vote_equivocation",
-                start.elapsed().as_secs_f64(),
-            );
-            if !verified {
-                record_signature_verification_failure("shard_vote_equivocation");
-            }
-            ctx.notify_protocol(ProtocolEvent::ShardVoteEquivocationVerified {
-                evidence,
-                verified,
-            });
-        }
-
         Action::VerifyBodyRoot {
             block,
             validity_anchor,
@@ -1945,15 +1921,6 @@ where
             // re-verifies it against its own topology.
             let gossip = ShardForkProofGossip {
                 proof: Arc::from(proof),
-            };
-            ctx.network.broadcast_global(&gossip);
-        }
-
-        Action::BroadcastShardVoteEquivocation { evidence } => {
-            // Self-authenticating: gossip the pair unsigned; every recipient
-            // re-verifies both signatures under the accused key.
-            let gossip = ShardVoteEquivocationGossip {
-                evidence: Arc::from(evidence),
             };
             ctx.network.broadcast_global(&gossip);
         }

@@ -39,12 +39,13 @@ use hyperscale_network::ValidatorKeyMap;
 use hyperscale_node::beacon_loop::BeaconLoop;
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::shard::{
-    BeaconScopedInput, HostEvent, ShardLoop, StepOutput, TimerOp, TimerOwner, timer_event,
+    BeaconScopedInput, HostEvent, ShardLoop, StepOutput, ThreadShardLoop, TimerOp, TimerOwner,
+    timer_event,
 };
 use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot,
-    TxStatusCache, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
+    NodeConfig, NodeHost, SeatConfig, SharedTopologySnapshot, StartupChain, TxStatusCache,
+    VnodeSeat,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -59,7 +60,7 @@ use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::rpc::state::{PreviewSender, RpcPublishers, VnodeMempoolSnapshot};
 use crate::rpc::{
@@ -84,6 +85,10 @@ pub enum RunnerError {
     /// Catch-all setup or send failure (e.g. missing builder field).
     #[error("Send error: {0}")]
     SendError(String),
+    /// The beacon thread ended while the node ran. Every chain the host
+    /// runs takes its schedule from it, so the node stops.
+    #[error("Beacon loop exited while the node ran")]
+    BeaconLoopExited,
     /// Underlying network backend error.
     #[error("Network error: {0}")]
     NetworkError(#[from] TransportError),
@@ -147,8 +152,9 @@ pub struct VnodeConfig {
 /// Shard participation is **not** named here — it is a projection of beacon
 /// state, so the runner derives it: a validator the committed beacon state
 /// places `OnShard` is seated on that shard (its storage opened via the
-/// factory); one that is `Pooled` (or otherwise unseated) follows the beacon
-/// in the host's pool until a placement delta seats it. `VnodeConfig` (which
+/// factory); one that is `Pooled` (or otherwise unseated) is seated nowhere
+/// until a placement delta seats it. Every one of them runs a beacon
+/// participant on the host's beacon loop. `VnodeConfig` (which
 /// does carry a shard) is the runtime-join shape the supervisor builds from a
 /// `ParticipationChange`, where the target shard is known.
 #[derive(Clone)]
@@ -442,7 +448,6 @@ impl ProductionRunnerBuilder {
             },
         )?;
         let placed = plan.placed_shards();
-        let pooled = plan.followers();
         let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
         let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
         for (shard, (store, vnodes)) in plan.resumed {
@@ -486,8 +491,8 @@ impl ProductionRunnerBuilder {
         ));
 
         // Seated validators boot from their own shard's recovered state;
-        // pooled validators boot as shard-less beacon followers.
-        let seat_config = || SeatConfig {
+        // every held key runs a beacon participant.
+        let seat_config = SeatConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: executor.derivation(),
             code: Arc::clone(&executor) as _,
@@ -497,30 +502,9 @@ impl ProductionRunnerBuilder {
             mempool_config: self.mempool_config.clone(),
             provision_config: self.provision_config,
         };
-        let mut vnode_inits: Vec<VnodeInit> = Vec::new();
         let mut resumed: BTreeMap<ShardId, RecoveredState> = BTreeMap::new();
-        for (shard, shard_vnodes) in &seated_by_shard {
-            let recovered = storages[shard].load_recovered_state(*shard);
-            vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                config: seat_config(),
-                beacon_storage: self.beacon_storage.as_ref(),
-                now,
-                shard: *shard,
-                recovered: &recovered,
-                vnodes: shard_vnodes.clone(),
-            }));
-            resumed.insert(*shard, recovered);
-        }
-        for (validator, signer) in pooled {
-            vnode_inits.push(seat_follower(SeatFollower {
-                verifier: Arc::new(BlsVerifier),
-                beacon_storage: self.beacon_storage.as_ref(),
-                beacon_network: beacon_network.clone(),
-                beacon_config_hash,
-                now,
-                validator,
-                signer,
-            }));
+        for shard in seated_by_shard.keys() {
+            resumed.insert(*shard, storages[shard].load_recovered_state(*shard));
         }
 
         let mut local_shards: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
@@ -553,16 +537,8 @@ impl ProductionRunnerBuilder {
             );
             let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
                 .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
-            let recovered = store.load_recovered_state(shard);
-            vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                config: seat_config(),
-                beacon_storage: self.beacon_storage.as_ref(),
-                now,
-                shard,
-                recovered: &recovered,
-                vnodes: serving,
-            }));
-            resumed.insert(shard, recovered);
+            resumed.insert(shard, store.load_recovered_state(shard));
+            seated_by_shard.insert(shard, serving);
             storages.insert(shard, store);
             local_shards.insert(shard);
         }
@@ -583,11 +559,18 @@ impl ProductionRunnerBuilder {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // A handle per shard for `NodeHost::new`; the runner keeps its own
-        // handles for GC and metrics.
-        let storage_handles: BTreeMap<ShardId, RocksDbShardStorage> = storages
-            .iter()
-            .map(|(shard, st)| (*shard, (**st).clone()))
+        // handles for GC and metrics, and the recovered states to resume
+        // each loop from.
+        let chains: Vec<StartupChain<'_, RocksDbShardStorage>> = seated_by_shard
+            .into_iter()
+            .map(|(shard, vnodes)| StartupChain {
+                shard,
+                storage: (*storages[&shard]).clone(),
+                recovered: &resumed[&shard],
+                vnodes,
+            })
             .collect();
+        let identities: Vec<(ValidatorId, Arc<dyn Signer>)> = bind_vnodes.clone();
         let network_definition = self
             .network_definition
             .unwrap_or_else(NetworkDefinition::simulator);
@@ -610,17 +593,16 @@ impl ProductionRunnerBuilder {
             .iter()
             .map(|(s, tx)| (*s, tx.clone()))
             .collect();
-        // Beacon channel for the host's beacon loop. The host-level gossip
-        // handler pushes committed beacon blocks onto the sender while the
-        // loop has followers, and the loop's own continuations and fetch
-        // answers arrive on it; the supervisor clones the receiver into each
-        // beacon thread it spawns.
+        // Beacon channel for the host's beacon loop: beacon gossip, what
+        // the replicas report, and the loop's own continuations and fetch
+        // answers arrive on it; the supervisor hands the receiver to the
+        // beacon thread.
         let (beacon_event_tx, beacon_event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            vnode_inits,
-            storage_handles,
+            seat_config,
+            chains,
+            identities,
             self.beacon_storage,
-            beacon_network.clone(),
             executor,
             network,
             (*dispatch).clone(),
@@ -628,6 +610,7 @@ impl ProductionRunnerBuilder {
             beacon_event_tx,
             topology_snapshot.clone(),
             NodeConfig::default(),
+            now,
         );
 
         let tx_status = Arc::clone(host.process().tx_status());
@@ -899,8 +882,9 @@ impl ProductionRunner {
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`; the signature exists so callers can
-    /// `?` it alongside other fallible startup steps without churn.
+    /// Returns [`RunnerError::BeaconLoopExited`] when the beacon thread
+    /// ends, by a panic, before the shutdown signal; the runner then shuts
+    /// down as it would on the signal.
     ///
     /// # Panics
     ///
@@ -916,44 +900,7 @@ impl ProductionRunner {
             "Starting production runner (per-shard thread architecture)"
         );
 
-        // ── 1. Wire the inbound handlers while NodeHost still owns the loops.
-        let mut host = self
-            .host
-            .take()
-            .expect("host already taken (run called twice?)");
-        host.register_inbound_handlers();
-
-        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
-        let (_process, shards, beacon) = host.into_parts();
-
-        let mut shard_channels = self
-            .shard_channels
-            .take()
-            .expect("shard_channels already taken");
-
-        // ── 3. Resume each hosted shard from its recovered state on its own
-        // pinned thread, recorded in the supervisor so runtime membership
-        // commands can stop them.
-        let mut supervisor = self.supervisor.take().expect("supervisor already taken");
-        let mut resumed = std::mem::take(&mut self.resumed);
-        for (shard, shard_loop) in shards {
-            let channels = shard_channels
-                .remove(&shard)
-                .expect("channels allocated for every hosted shard");
-            let recovered = resumed
-                .remove(&shard)
-                .expect("every hosted shard recovered its store at build");
-            supervisor.start_loop(shard_loop, channels, LoopStart::Resume(&recovered));
-        }
-
-        // Every host runs its beacon loop. A startup host's unseated
-        // validators — registered but unplaced, or placed on a shard whose
-        // store opened fresh — follow the beacon on it until a seat takes
-        // them.
-        supervisor.install_beacon_loop(beacon);
-        for (shard, vnodes) in std::mem::take(&mut self.fresh_seats) {
-            supervisor.handle(ShardCommand::Join { shard, vnodes });
-        }
+        let (mut supervisor, mut beacon_exited) = self.start_threads();
 
         // ── 4. Metrics + maintenance + reconfiguration + shutdown loop.
         let mut metrics_tick = interval(Duration::from_secs(1));
@@ -978,11 +925,17 @@ impl ProductionRunner {
             .take_events_rx()
             .expect("supervisor events_rx already taken");
 
+        let mut outcome = Ok(());
         loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => {
                     info!("Shutdown signal received");
+                    break;
+                }
+                _ = &mut beacon_exited => {
+                    error!("Beacon thread exited while the node ran; shutting down");
+                    outcome = Err(RunnerError::BeaconLoopExited);
                     break;
                 }
                 command = reconfigure_rx.recv() => {
@@ -1027,7 +980,51 @@ impl ProductionRunner {
         self.network.shutdown();
 
         info!("Production runner stopped");
-        Ok(())
+        outcome
+    }
+
+    /// Start the pinned threads: wire the inbound handlers, resume each
+    /// hosted shard on its own thread, start the beacon thread, and join
+    /// the seats whose store opened fresh. Returns the supervisor that
+    /// owns the threads and the receiver that hears the beacon thread end.
+    fn start_threads(&mut self) -> (ShardSupervisor, oneshot::Receiver<()>) {
+        // ── 1. Wire the inbound handlers while NodeHost still owns the loops.
+        let mut host = self
+            .host
+            .take()
+            .expect("host already taken (run called twice?)");
+        host.register_inbound_handlers();
+
+        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
+        let (_process, shards, beacon) = host.into_parts();
+
+        let mut shard_channels = self
+            .shard_channels
+            .take()
+            .expect("shard_channels already taken");
+
+        // ── 3. Resume each hosted shard from its recovered state on its own
+        // pinned thread, recorded in the supervisor so runtime membership
+        // commands can stop them.
+        let mut supervisor = self.supervisor.take().expect("supervisor already taken");
+        let mut resumed = std::mem::take(&mut self.resumed);
+        for (shard, shard_loop) in shards {
+            let channels = shard_channels
+                .remove(&shard)
+                .expect("channels allocated for every hosted shard");
+            let recovered = resumed
+                .remove(&shard)
+                .expect("every hosted shard recovered its store at build");
+            supervisor.start_loop(shard_loop, channels, LoopStart::Resume(&recovered));
+        }
+
+        // Every host runs its beacon loop, with a participant for every key
+        // it holds, seated or not.
+        let beacon_exited = supervisor.install_beacon_loop(beacon);
+        for (shard, vnodes) in std::mem::take(&mut self.fresh_seats) {
+            supervisor.handle(ShardCommand::Join { shard, vnodes });
+        }
+        (supervisor, beacon_exited)
     }
 
     /// Command channel into the shard supervisor. Send
@@ -1357,7 +1354,17 @@ pub struct ShardLoopConfig {
 /// blocks on `select!` with a timeout drawn from the shard's nearest
 /// batch deadline so the shard wakes precisely when its earliest
 /// expiring batch is due.
-fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
+///
+/// However the thread exits, a panic included, the loop releases its
+/// chain's registration with the host's beacon loop as it drops, before
+/// the supervisor's join of this thread lets anything read its store as
+/// replaced.
+fn run_shard_loop(shard_loop: ProdShardLoop, config: ShardLoopConfig) {
+    let mut shard_loop = ThreadShardLoop::from(shard_loop);
+    drive_shard_loop(&mut shard_loop, config);
+}
+
+fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig) {
     let shard = shard_loop.shard;
     info!(shard = ?shard, "Shard event loop starting");
 
@@ -1382,7 +1389,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                 break 'recv Some(e);
             }
             if let Ok(control) = config.control_rx.try_recv() {
-                apply_shard_control(&mut shard_loop, &config, &mut timer_mgr, control);
+                apply_shard_control(shard_loop, &config, &mut timer_mgr, control);
                 break 'recv None;
             }
             if let Ok(e) = config.callback_rx.try_recv() {
@@ -1401,7 +1408,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                 recv(config.timer_rx) -> e => e.ok(),
                 recv(config.control_rx) -> control => {
                     if let Ok(control) = control {
-                        apply_shard_control(&mut shard_loop, &config, &mut timer_mgr, control);
+                        apply_shard_control(shard_loop, &config, &mut timer_mgr, control);
                     }
                     None
                 }
@@ -1444,7 +1451,7 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                 config.callback_rx.len(),
                 config.timer_rx.len(),
             );
-            update_shard_rpc_state(&shard_loop, &config);
+            update_shard_rpc_state(shard_loop, &config);
         }
     }
 
@@ -1609,19 +1616,19 @@ pub fn spawn_shard_loop(
 /// Concrete `BeaconLoop` type for the production runner.
 pub type ProdBeaconLoop = BeaconLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
 
-/// Configuration for a host's pinned beacon thread — the lightweight
-/// sibling of [`ShardLoopConfig`]. The beacon loop runs no shard
-/// consensus, so there are no batches or callbacks: it drains beacon
-/// traffic and surfaces the seat triggers its followers raise.
+/// Configuration for a host's pinned beacon thread — the sibling of
+/// [`ShardLoopConfig`]. The beacon loop runs no shard consensus, so there
+/// are no batches: it drains beacon traffic, what the replicas report and
+/// the chains' registrations, and surfaces the seat triggers its
+/// participants raise.
 pub struct BeaconLoopConfig {
-    /// Beacon gossip routed here by the host-level gossip handler (see
-    /// `register_host_gossip_handler`), plus the loop's own continuations
-    /// and fetch answers.
+    /// Beacon gossip, what the replicas report, the chains' registrations,
+    /// and the loop's own continuations and fetch answers.
     pub(crate) beacon_rx: Receiver<HostEvent>,
     /// Stops the beacon thread on teardown.
     pub(crate) shutdown_rx: Receiver<()>,
-    /// Placement deltas the followers surface (their own seat triggers),
-    /// forwarded to the runner's reconfiguration loop.
+    /// Placement deltas the participants surface (their own seat
+    /// triggers), forwarded to the runner's reconfiguration loop.
     pub(crate) participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     /// Genesis instant the consensus clock is measured against.
     pub(crate) genesis_offset_ms: u64,
@@ -1667,13 +1674,12 @@ fn apply_beacon_step_output(
 
 /// Drive a host's [`BeaconLoop`] on its pinned thread, blocking until the
 /// shutdown signal fires. Dropping the loop on the way out, by a return or
-/// by a panic unwinding the thread, closes every follower's release gate. The
-/// loop only consumes beacon events ([`HostEvent::Beacon`]); shard /
+/// by a panic unwinding the thread, closes every participant's release
+/// gate. The loop only consumes beacon events ([`HostEvent::Beacon`]); shard /
 /// process envelopes never reach this channel and there is no batch
-/// flushing. Its timers live in a thread-local deadline table: a follower
-/// is a ratify-pool voter and can be drawn onto an SPC committee, so its
-/// timer chain must fire here exactly as a seated vnode's fires on a shard
-/// thread, and the loop's own fetch tick retries its held fetches.
+/// flushing. Its timers live in a thread-local deadline table: every
+/// participant's beacon timer chain fires here, and the loop's own fetch
+/// tick retries its held fetches.
 fn run_beacon_loop(mut beacon: ProdBeaconLoop, config: BeaconLoopConfig) {
     info!("Beacon event loop starting");
     drive_beacon_loop(&mut beacon, config);
@@ -1690,10 +1696,11 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
 
     let mut deadlines: BTreeMap<(TimerOwner, TimerId), LocalTimestamp> = BTreeMap::new();
 
-    // The followers armed their beacon startup timers at construction, but
-    // a genesis ceremony on this host may already have drained that scratch
-    // into ops this thread never sees. Re-arming is idempotent (replace at
-    // the table, identical durations), so arm-and-drain unconditionally.
+    // The participants armed their beacon startup timers at construction,
+    // but a genesis ceremony on this host may already have drained that
+    // scratch into ops this thread never sees. Re-arming is idempotent
+    // (replace at the table, identical durations), so arm-and-drain
+    // unconditionally.
     let now = consensus_clock(genesis_offset_ms);
     beacon.set_time(now);
     let startup = beacon.startup_output();
@@ -1769,14 +1776,20 @@ fn beacon_wake(
     })
 }
 
-/// Spawn the host's beacon thread, mirroring [`spawn_shard_loop`].
+/// Spawn the host's beacon thread, mirroring [`spawn_shard_loop`]. The
+/// thread holds `exited` until it ends, by a return or by a panic
+/// unwinding it, so its receiver hears of the end either way.
 pub fn spawn_beacon_loop(
     beacon: ProdBeaconLoop,
     config: BeaconLoopConfig,
+    exited: oneshot::Sender<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("beacon-loop".to_string())
-        .spawn(move || run_beacon_loop(beacon, config))
+        .spawn(move || {
+            let _exited = exited;
+            run_beacon_loop(beacon, config);
+        })
         .expect("failed to spawn beacon-loop thread")
 }
 

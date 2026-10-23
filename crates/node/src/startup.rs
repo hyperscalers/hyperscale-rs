@@ -51,33 +51,10 @@ impl<S> SeatPlan<S> {
             .copied()
             .collect()
     }
-
-    /// The validators that follow the beacon: every one seated nowhere,
-    /// unplaced or waiting on a join.
-    #[must_use]
-    pub fn followers(&self) -> ShardVnodes {
-        let seated: BTreeSet<ValidatorId> = self
-            .resumed
-            .values()
-            .flat_map(|(_, vnodes)| vnodes.iter().map(|(validator, _)| *validator))
-            .collect();
-        let mut followers = ShardVnodes::new();
-        for (validator, signer) in self.unplaced.iter().chain(self.joins.values().flatten()) {
-            if !seated.contains(validator)
-                && !followers
-                    .iter()
-                    .any(|(following, _)| following == validator)
-            {
-                followers.push((*validator, Arc::clone(signer)));
-            }
-        }
-        followers
-    }
 }
 
 /// The routing committees a host starting now on `beacon_storage` boots
-/// on: the schedule a beacon follower resumed over the committed chain
-/// holds.
+/// on: the schedule a fold resumed over the committed chain holds.
 ///
 /// No shard chain is open yet, so no local frontier holds the schedule's
 /// floor.
@@ -430,8 +407,8 @@ mod tests {
 
     /// A member jailed off a shard whose chain still signs under the
     /// committee it sat in keeps its seat across a restart, beside the
-    /// validator placed there; an observer routing names is never
-    /// seated, and a validator routing does not name follows the beacon.
+    /// validator placed there; neither an observer routing names nor a
+    /// validator routing does not name is seated.
     #[test]
     fn a_validator_routing_still_names_resumes_beside_the_placed_one() {
         let committee = TestCommittee::new(4, 7);
@@ -471,7 +448,6 @@ mod tests {
             ids(&plan.resumed[&ShardId::ROOT].1),
             vec![validator(0), validator(1)]
         );
-        assert_eq!(ids(&plan.followers()), vec![validator(2), validator(3)]);
     }
 
     /// A store on disk that routing still names a local validator on
@@ -499,14 +475,12 @@ mod tests {
 
         let plan = plan_under(BTreeMap::new(), true);
         assert_eq!(ids(&plan.resumed[&ShardId::ROOT].1), vec![validator(0)]);
-        assert!(plan.followers().is_empty());
 
         for plan in [
             plan_under(BTreeMap::new(), false),
             plan_under(BTreeMap::from([(ShardId::ROOT, boundary(Some(4)))]), true),
         ] {
             assert!(plan.resumed.is_empty());
-            assert_eq!(ids(&plan.followers()), vec![validator(0)]);
         }
     }
 
@@ -538,7 +512,6 @@ mod tests {
             plan.resumed.is_empty(),
             "the dissolved shard is not resumed"
         );
-        assert_eq!(ids(&plan.followers()), vec![validator(0)]);
     }
 
     /// A boundary record that is terminal or live; nothing else here

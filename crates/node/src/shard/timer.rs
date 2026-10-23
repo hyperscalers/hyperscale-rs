@@ -12,7 +12,6 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 
-use crate::beacon;
 use crate::shard::ShardLoop;
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -26,8 +25,6 @@ where
         let now = self.now;
         let outputs = self.io.consensus.block_tick(now);
         self.process_block_sync_outputs(outputs);
-
-        beacon::on_tick(self);
 
         let outputs = self.io.cross_shard.remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);

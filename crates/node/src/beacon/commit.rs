@@ -1,17 +1,11 @@
 //! Process-scoped dedup for beacon-block commits.
 //!
-//! Every co-hosted vnode runs its own `BeaconCoordinator`, and they all
-//! converge on the same committed beacon block — so each independently
-//! emits `Action::CommitBeaconBlock` for it. `BeaconCommitCoordinator`
-//! is the first leg of the three-layer dedup (this in-flight set +
-//! `RocksDbBeaconStorage::commit_lock` + idempotent `commit_beacon_block`):
-//! it lets only the first vnode to reach a given `(epoch, hash)` perform
-//! the storage write, so the rest skip before the round-trip rather than
-//! bottoming out as idempotent no-ops.
-//!
-//! Per-vnode `BeaconBlockPersisted` feedback is emitted by the shard loop
-//! independently of this dedup, so every vnode still learns the beacon
-//! advanced even when its own commit was deduped.
+//! The host's beacon loop commits each block its fold adopts through
+//! `BeaconCommitCoordinator`, the first leg of the three-layer dedup (this
+//! in-flight set + `RocksDbBeaconStorage::commit_lock` + idempotent
+//! `commit_beacon_block`): a block already written, or being written,
+//! skips before the round-trip rather than bottoming out as an idempotent
+//! no-op.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -19,9 +13,8 @@ use std::sync::{Arc, Mutex};
 use hyperscale_storage::BeaconStorage;
 use hyperscale_types::{BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, Verified};
 
-/// Serializes the redundant per-vnode beacon commits down to one storage
-/// write per `(epoch, hash)`. Process-scoped; one per host, shared across
-/// every co-hosted vnode's commit handler.
+/// Serializes beacon commits down to one storage write per
+/// `(epoch, hash)`. Process-scoped; one per host.
 pub struct BeaconCommitCoordinator {
     inner: Mutex<CommitDedup>,
 }
@@ -98,8 +91,8 @@ mod tests {
     };
     use hyperscale_storage_memory::SimBeaconStorage;
     use hyperscale_types::{
-        BeaconBlockHash, BeaconVote, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord,
-        ValidatorId,
+        BeaconBlockHash, BeaconVote, BeaconVoteRecord, RatifyPhase, RatifyPolka, RatifyRound,
+        RatifyVoteRecord, ValidatorId,
     };
 
     use super::*;
@@ -179,11 +172,23 @@ mod tests {
         fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {
             self.inner.ratify_record(validator)
         }
+
+        fn restore_ratify_record(&self, validator: ValidatorId, record: &RatifyVoteRecord) {
+            self.inner.restore_ratify_record(validator, record);
+        }
     }
 
     impl BeaconVoteRegisterStore for BlockingBeaconStorage {
         fn admit_beacon_vote(&self, validator: ValidatorId, vote: &BeaconVote) -> bool {
             self.inner.admit_beacon_vote(validator, vote)
+        }
+
+        fn beacon_vote_record(&self, validator: ValidatorId) -> Option<BeaconVoteRecord> {
+            self.inner.beacon_vote_record(validator)
+        }
+
+        fn restore_beacon_vote_record(&self, validator: ValidatorId, record: &BeaconVoteRecord) {
+            self.inner.restore_beacon_vote_record(validator, record);
         }
     }
 

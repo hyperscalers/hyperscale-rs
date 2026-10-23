@@ -1,6 +1,6 @@
 //! Durable beacon consensus registers.
 
-use hyperscale_types::{BeaconVote, ValidatorId};
+use hyperscale_types::{BeaconVote, BeaconVoteRecord, ValidatorId};
 
 /// Durable per-validator registers of the SPC consensus messages a
 /// beacon committee member signed.
@@ -26,4 +26,14 @@ pub trait BeaconVoteRegisterStore: Send + Sync {
     /// fresh (now durably recorded) or already holds the same content,
     /// `false` when signing would contradict the record.
     fn admit_beacon_vote(&self, validator: ValidatorId, vote: &BeaconVote) -> bool;
+
+    /// The durable record for `validator`, or `None` when it has never
+    /// signed a beacon consensus vote on this store.
+    fn beacon_vote_record(&self, validator: ValidatorId) -> Option<BeaconVoteRecord>;
+
+    /// Durably overwrite `validator`'s record with `record`, the record
+    /// of the store it signed on until now. Only an identity moving
+    /// between hosts writes through this, and only once it has stopped
+    /// signing on the store it carries the record from.
+    fn restore_beacon_vote_record(&self, validator: ValidatorId, record: &BeaconVoteRecord);
 }

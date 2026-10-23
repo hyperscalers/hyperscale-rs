@@ -14,7 +14,6 @@ use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{BlockHeight, LocalTimestamp};
 
-use crate::beacon::BeaconFetchState;
 use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
@@ -75,10 +74,6 @@ pub struct ShardIo<S: ShardStorage> {
     /// tracking sets + batch, outbound tx-gossip accumulators).
     pub(crate) mempool: MempoolState,
 
-    /// Per-shard beacon fetch instances (missing proposals, shard-witness
-    /// leaves) the beacon coordinator drives for this shard.
-    pub(crate) beacon_fetch: BeaconFetchState,
-
     /// Package artifact acquisition: the fetch for code an envelope
     /// names and this node cannot resolve.
     pub(crate) packages: PackagesState,
@@ -127,13 +122,11 @@ impl<S: ShardStorage> ShardIo<S> {
     }
 
     /// Snapshot per-binding fetch counts across the transaction fetch on
-    /// [`MempoolState`], the cross-shard fetch instances on
-    /// [`CrossShardState`], and the beacon fetch instances on
-    /// [`BeaconFetchState`]. The I/O loop flattens this into the larger
+    /// [`MempoolState`] and the cross-shard fetch instances on
+    /// [`CrossShardState`]. The I/O loop flattens this into the larger
     /// `MetricsSnapshot`.
     #[must_use]
     pub fn fetch_metrics(&self) -> FetchMetrics {
-        let b = &self.beacon_fetch;
         let x = &self.cross_shard;
         let m = &self.mempool;
         FetchMetrics {
@@ -149,21 +142,15 @@ impl<S: ShardStorage> ShardIo<S> {
             provision_in_flight: x.provision.in_flight_count(),
             provision_pending: x.provision.pending_count(),
             provision_oldest_in_flight_age_ms: x.provision.oldest_in_flight_age_ms(),
-            shard_witness_in_flight: b.shard_witness.in_flight_count(),
-            shard_witness_pending: b.shard_witness.pending_count(),
-            shard_witness_oldest_in_flight_age_ms: b.shard_witness.oldest_in_flight_age_ms(),
-            beacon_proposal_in_flight: b.beacon_proposal.in_flight_count(),
-            beacon_proposal_pending: b.beacon_proposal.pending_count(),
-            beacon_proposal_oldest_in_flight_age_ms: b.beacon_proposal.oldest_in_flight_age_ms(),
         }
     }
 }
 
 /// Cheap aggregate of per-binding fetch counts (all payloads). Built by
 /// [`ShardIo::fetch_metrics`] from the transaction fetch on
-/// [`MempoolState`], the cross-shard fetch instances on [`CrossShardState`],
-/// and the beacon fetch instances on [`BeaconFetchState`]; flattened into
-/// the broader `MetricsSnapshot` by the I/O loop.
+/// [`MempoolState`] and the cross-shard fetch instances on
+/// [`CrossShardState`]; flattened into the broader `MetricsSnapshot` by the
+/// I/O loop.
 ///
 /// `_oldest_in_flight_age_ms` is `0` when nothing is in flight; otherwise
 /// the age (in milliseconds) of the longest-running in-flight entry.
@@ -183,10 +170,4 @@ pub struct FetchMetrics {
     pub provision_in_flight: usize,
     pub provision_pending: usize,
     pub provision_oldest_in_flight_age_ms: u64,
-    pub shard_witness_in_flight: usize,
-    pub shard_witness_pending: usize,
-    pub shard_witness_oldest_in_flight_age_ms: u64,
-    pub beacon_proposal_in_flight: usize,
-    pub beacon_proposal_pending: usize,
-    pub beacon_proposal_oldest_in_flight_age_ms: u64,
 }

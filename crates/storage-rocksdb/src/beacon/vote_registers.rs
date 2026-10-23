@@ -35,4 +35,27 @@ impl BeaconVoteRegisterStore for RocksDbBeaconStorage {
             .expect("BFT CRITICAL: beacon vote register write failed");
         true
     }
+
+    fn beacon_vote_record(&self, validator: ValidatorId) -> Option<BeaconVoteRecord> {
+        self.cf_get::<BeaconVoteRegistersCf>(&validator)
+    }
+
+    fn restore_beacon_vote_record(&self, validator: ValidatorId, record: &BeaconVoteRecord) {
+        let _guard = self
+            .beacon_vote_lock
+            .lock()
+            .expect("beacon_vote_lock poisoned");
+        let mut batch = WriteBatch::default();
+        batch_put::<BeaconVoteRegistersCf>(
+            &mut batch,
+            BeaconVoteRegistersCf::handle(&self.cf()),
+            &validator,
+            record,
+        );
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .write_opt(batch, &write_opts)
+            .expect("BFT CRITICAL: beacon vote register write failed");
+    }
 }

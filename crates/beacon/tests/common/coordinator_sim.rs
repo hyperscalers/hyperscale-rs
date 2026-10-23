@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, BeaconFetchIds, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_types::{
@@ -1799,7 +1799,7 @@ impl CoordinatorSim {
                 self.absorb(emitter_idx, post);
             }
             Action::Fetch(FetchRequest::Ask {
-                ids: FetchIds::BeaconProposals(ref wanted),
+                ids: FetchIds::Beacon(BeaconFetchIds::Proposals(ref wanted)),
                 preferred,
                 ..
             }) if wanted.len() == 1 => {
@@ -1862,7 +1862,7 @@ impl CoordinatorSim {
                 }
             }
             Action::Fetch(FetchRequest::Ask {
-                ids: FetchIds::BeaconCandidates(ref wanted),
+                ids: FetchIds::Beacon(BeaconFetchIds::Candidates(ref wanted)),
                 preferred,
                 ..
             }) if wanted.len() == 1 => {

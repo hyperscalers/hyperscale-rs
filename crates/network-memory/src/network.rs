@@ -121,8 +121,8 @@ struct Carried {
 /// The per-host shard layout the simulated transport routes on, supplied by
 /// the harness that owns cluster placement.
 ///
-/// `hosted[h]` is host `h`'s shard set — empty for a shard-less
-/// beacon-follower host — and becomes that host's [`HandlerRegistry`] hosted
+/// `hosted[h]` is host `h`'s shard set — empty for a host whose
+/// validators are all pooled — and becomes that host's [`HandlerRegistry`] hosted
 /// set; `validator_to_host` maps each hosted validator to its host index. The
 /// transport holds these as its routing tables and never derives placement
 /// itself.

@@ -1,18 +1,20 @@
 //! A shard-less validator follows the beacon in the pool and re-seats from it.
 //!
-//! Exercises the follower model end to end on the deterministic sim — the same
-//! `BeaconLoop` / `seat_follower` path the production supervisor drives: a host
-//! keeps a beacon follower warm after losing a shard (`leave_shard` builds one,
-//! mirroring the supervisor's `on_torn_down`), and retires it when the
-//! validator is seated again (`join_shard` drops it, mirroring
-//! `unfollow_in_pool`).
+//! Exercises the participant model end to end on the deterministic sim: a
+//! host runs a beacon participant for every identity it holds from startup
+//! on, so a validator that loses its last shard keeps following and taking
+//! part in the beacon through it, and is seated again with the same
+//! participant. Seating and draining never touch it.
 
 use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{ShardId, ValidatorId, ValidatorStatus, shard_prefix_path};
+use hyperscale_types::{
+    BeaconBlockHash, Hash, RatifyPhase, RatifyPolka, ShardId, ValidatorId, ValidatorStatus,
+    shard_prefix_path,
+};
 use tracing_test::traced_test;
 
 mod support;
@@ -29,33 +31,34 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
     let runner = cluster.runner_mut();
     // Grow to two shards; the grow draws one cohort from the pool and leaves
-    // one surplus extra `Pooled` — a real shard-less beacon follower.
+    // one surplus extra `Pooled`, seated nowhere.
     runner.grow_to(2);
     let _ = runner.take_participation_changes();
 
-    // ── A surplus pooled follower keeps its host's beacon storage warm ──
+    // ── A surplus pooled participant keeps its host's beacon storage warm ──
     let pool_host = (0..runner.num_hosts())
         .find(|&n| runner.pooled_len(n) > 0)
-        .expect("the grow's surplus pool extra follows the beacon on its host");
+        .expect("the grow's surplus pool extra runs a participant on its host");
     let before = committed_beacon_epoch(&*runner, pool_host);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
     let after = committed_beacon_epoch(&*runner, pool_host);
     assert!(
         after > before,
-        "the pooled follower must fold committed beacon blocks and keep its \
-         host's beacon storage warm ({before} -> {after})"
+        "the host of a pooled participant must fold committed beacon blocks \
+         and keep its beacon storage warm ({before} -> {after})"
     );
 
     // ── Drain a committee member to the pool, then re-seat it ──
     // A grown host retains its terminated parent alongside its active child,
     // so the validator drains off its last shard only once every shard the
-    // host runs is gone; the follower appears on that final leave.
+    // host runs is gone. Its participant runs throughout.
     let leaf = ShardId::leaf(1, 0);
     let (node, validator) = committee_member_host(&*runner, leaf, None);
+    assert_eq!(runner.pooled_len(node), 0, "the member is seated");
     assert_eq!(
-        runner.pooled_len(node),
-        0,
-        "a seated member's host runs no follower"
+        runner.participants(node),
+        vec![validator],
+        "a seated member's host runs its participant"
     );
 
     let mut leaf_storage = None;
@@ -68,25 +71,29 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     assert_eq!(
         runner.pooled_len(node),
         1,
-        "draining the validator off its last shard makes it a beacon follower"
+        "the validator drained off its last shard"
+    );
+    assert_eq!(
+        runner.participants(node),
+        vec![validator],
+        "the drain keeps the participant"
     );
     assert!(
         runner.vnode_state_in(node, leaf).is_none(),
         "the drained shards are gone from the host"
     );
 
-    // ── The drained follower keeps folding the beacon while pooled ──
-    // The host started with a shard, so the only thing that can advance its
-    // beacon storage now is the beacon-loop follower folding gossiped blocks —
-    // no shard loop is left on the host. A rising committed tip proves a
-    // follower added at runtime is actually fed (a follower left unfed goes
-    // dark, never raising its own re-seat trigger).
+    // ── The drained host keeps folding the beacon ──
+    // No shard loop is left on the host, so the only thing that can advance
+    // its beacon storage now is its beacon loop folding gossiped blocks. A
+    // rising committed tip proves the loop is still fed (a host left unfed
+    // goes dark, and its participant never raises its own re-seat trigger).
     let before = committed_beacon_epoch(&*runner, node);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
     let after = committed_beacon_epoch(&*runner, node);
     assert!(
         after > before,
-        "the drained follower must keep folding committed beacon blocks \
+        "the drained host must keep folding committed beacon blocks \
          ({before} -> {after})"
     );
     let _ = runner.take_participation_changes();
@@ -101,10 +108,11 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
         matches!(kind, JoinKind::Retained { .. }),
         "the retained store re-seats without snap-sync, got {kind:?}"
     );
+    assert_eq!(runner.pooled_len(node), 0, "the validator is seated again");
     assert_eq!(
-        runner.pooled_len(node),
-        0,
-        "seating the validator retires its beacon-loop follower"
+        runner.participants(node),
+        vec![validator],
+        "seating keeps the one participant it ran all along"
     );
     assert!(
         runner.vnode_state_in(node, leaf).is_some(),
@@ -112,13 +120,15 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     );
 }
 
-/// A follower partitioned past the gossip horizon catches up via beacon sync.
+/// A shard-less host partitioned past the gossip horizon catches up via
+/// beacon sync.
 ///
-/// While partitioned the follower's tip freezes and the network advances
-/// several epochs. Those gap epochs are no longer gossiped once the partition
-/// heals — only the live tip is — so any advance past the frozen tip proves
-/// the follower fetched the gap via `GetBeaconBlockRequest`, since the
-/// coordinator commits serially and cannot skip the missing epochs.
+/// While partitioned the host's tip freezes and the network advances
+/// several epochs. Those gap epochs are no longer gossiped once the
+/// partition heals — only the live tip is — so any advance past the frozen
+/// tip proves the host's beacon loop fetched the gap via
+/// `GetBeaconBlockRequest`, since the fold commits serially and cannot
+/// skip the missing epochs.
 #[traced_test]
 #[test]
 fn partitioned_follower_catches_up_via_beacon_sync() {
@@ -129,43 +139,43 @@ fn partitioned_follower_catches_up_via_beacon_sync() {
 
     let pool_host = (0..runner.num_hosts())
         .find(|&n| runner.pooled_len(n) > 0)
-        .expect("the grow's surplus pool extra follows the beacon on its host");
+        .expect("the grow's surplus pool extra runs a participant on its host");
     let others: Vec<NodeIndex> = (0..runner.num_hosts())
         .filter(|&n| n != pool_host)
         .collect();
 
-    // Let the follower get current before isolating it.
+    // Let the shard-less host get current before isolating it.
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 2));
     let frozen_tip = committed_beacon_epoch(&*runner, pool_host);
 
-    // Isolate the follower: no beacon gossip in or out.
+    // Isolate the host: no beacon gossip in or out.
     runner.network_mut().partition_groups(&[pool_host], &others);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 6));
     assert_eq!(
         committed_beacon_epoch(&*runner, pool_host),
         frozen_tip,
-        "the isolated follower receives no gossip, so its tip is frozen"
+        "the isolated host receives no gossip, so its tip is frozen"
     );
     let network_tip = committed_beacon_epoch(&*runner, others[0]);
     assert!(
         network_tip > frozen_tip + 1,
-        "the network must advance past the follower by more than one epoch \
+        "the network must advance past the host by more than one epoch \
          ({frozen_tip} -> {network_tip})"
     );
 
-    // Heal: the live gossip tip is now several epochs ahead of the follower,
+    // Heal: the live gossip tip is now several epochs ahead of the host,
     // so its coordinator opens a catch-up sync to fill the gap.
     runner.network_mut().heal_all();
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 6));
     let caught_up = committed_beacon_epoch(&*runner, pool_host);
     assert!(
         caught_up > frozen_tip,
-        "the follower must fetch the gap epochs over beacon sync — gossip no \
+        "the host must fetch the gap epochs over beacon sync — gossip no \
          longer carries them ({frozen_tip} -> {caught_up})"
     );
     assert!(
         caught_up >= network_tip,
-        "the follower catches up to where the network was during the outage \
+        "the host catches up to where the network was during the outage \
          ({caught_up} >= {network_tip})"
     );
 }
@@ -212,6 +222,71 @@ fn a_join_before_the_first_crossing_seats_at_genesis() {
     );
 }
 
+/// A validator moved between hosts while it holds no seat carries the
+/// beacon records it signed where it ran. Its participant on the new host
+/// abstains at every slot it already signed: a vote for another value at
+/// a slot the old host's record holds is refused there.
+#[traced_test]
+#[test]
+fn a_rehomed_identity_abstains_at_beacon_slots_it_signed_on_its_old_host() {
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
+    let runner = cluster.runner_mut();
+    runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
+    // A seated member votes in every epoch's ratification; drained off
+    // every shard its host runs, it holds no seat and may move.
+    let (from, validator) = committee_member_host(&*runner, ShardId::ROOT, None);
+    let signed = runner
+        .beacon_storage(from)
+        .expect("the old host exists")
+        .ratify_record(validator)
+        .expect("a pool member signs its ratify votes");
+    let signed_votes = runner
+        .beacon_storage(from)
+        .expect("the old host exists")
+        .beacon_vote_record(validator)
+        .expect("a committee member signs its SPC votes");
+    for shard in runner.hosted_shards_of(from) {
+        let _ = runner.leave_shard(from, shard);
+    }
+    let to = (0..runner.num_hosts())
+        .find(|&host| host != from)
+        .expect("another host");
+
+    assert!(runner.rehome_validator(validator, to));
+    assert!(!runner.participants(from).contains(&validator));
+    assert!(runner.participants(to).contains(&validator));
+
+    let destination = runner.beacon_storage(to).expect("the new host exists");
+    assert_eq!(
+        destination.ratify_record(validator).as_ref(),
+        Some(&signed),
+        "the record moved with the identity",
+    );
+    assert_eq!(
+        destination.beacon_vote_record(validator).as_ref(),
+        Some(&signed_votes),
+        "the SPC vote record moved with the identity",
+    );
+    let (&round, &prevoted) = signed
+        .prevoted
+        .iter()
+        .next()
+        .expect("the record holds a prevote");
+    let other = BeaconBlockHash::from_raw(Hash::from_bytes(b"another value"));
+    assert_ne!(prevoted, other);
+    assert!(
+        !destination.admit_ratify_vote(
+            validator,
+            signed.epoch,
+            round,
+            RatifyPhase::Prevote,
+            other,
+            RatifyPolka::empty(),
+        ),
+        "the new host refuses a second value at a slot the old host signed",
+    );
+}
+
 /// A host carrying a `Pooled` validator, and that validator.
 fn pooled_validator(runner: &SimulationRunner) -> (NodeIndex, ValidatorId) {
     let (_, state) = runner
@@ -225,7 +300,7 @@ fn pooled_validator(runner: &SimulationRunner) -> (NodeIndex, ValidatorId) {
         .filter(|(_, record)| matches!(record.status, ValidatorStatus::Pooled))
         .map(|(&id, _)| (runner.network().validator_to_node(id), id))
         .find(|&(host, _)| runner.pooled_len(host) > 0)
-        .expect("a pooled validator follows the beacon on its host")
+        .expect("a pooled validator runs a participant on its host")
 }
 
 /// The host's committed beacon-chain tip epoch.

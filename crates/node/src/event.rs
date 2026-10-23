@@ -19,14 +19,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossbeam::channel::Sender;
+use hyperscale_beacon::ChainRegistration;
+use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
-    Address, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
-    Hash, HeaderFetchCount, ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Address, BeaconChainConfig, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock,
+    CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
+    ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, ShardForkProof, ShardId,
+    ShardVoteEquivocation, TopologySchedule, Transaction, TxHash, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -301,26 +305,6 @@ pub enum ShardScopedInput {
         kind: FetchFailureKind,
     },
 
-    /// Beacon-block sync response received from a network callback.
-    /// `block` is `None` when the peer couldn't serve the epoch. The
-    /// `NodeHost` hands the block to the beacon coordinator (cert
-    /// verification + adoption) and feeds the beacon `Sync` machine.
-    BeaconBlockSyncResponseReceived {
-        /// Epoch of the block being synced.
-        epoch: Epoch,
-        /// The fetched block, or `None` if the peer didn't have it.
-        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
-    },
-
-    /// Beacon-block sync fetch failed from a network callback.
-    BeaconBlockSyncFetchFailed {
-        /// Epoch that failed to fetch.
-        epoch: Epoch,
-        /// Why the fetch failed — drives the beacon `Sync` machine's
-        /// re-queue vs. deferral decision.
-        kind: FetchFailureKind,
-    },
-
     /// Sync block passed structural validation off-thread (Merkle roots,
     /// QC binding, per-tick shape). The pinned-thread `NodeHost` re-enters
     /// the post-validation delivery path on receipt.
@@ -442,11 +426,6 @@ pub enum ShardScopedInput {
         /// The fork evidence off the wire.
         proof: Arc<ShardForkProof>,
     },
-    /// A shard double-vote pair arrived over global gossip.
-    ShardVoteEquivocationGossipReceived {
-        /// The self-proving pair off the wire.
-        evidence: Arc<ShardVoteEquivocation>,
-    },
 
     /// JMT prep for a QC-only commit completed off-thread; the block's
     /// `PreparedCommit` and `PendingChain` entry have been inserted by
@@ -538,8 +517,7 @@ impl ShardScopedInput {
             | Self::InstanceRecordsFetched { .. }
             | Self::RecordsWanted { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. }
-            | Self::ShardForkProofGossipReceived { .. }
-            | Self::ShardVoteEquivocationGossipReceived { .. } => EventPriority::Network,
+            | Self::ShardForkProofGossipReceived { .. } => EventPriority::Network,
             Self::AdmitTransaction { .. }
             | Self::AdmitAndGossipTransaction { .. }
             | Self::GossipTransaction { .. } => EventPriority::Client,
@@ -548,8 +526,6 @@ impl ShardScopedInput {
             | Self::FetchUnroutable(..)
             | Self::BlockSyncFetchFailed { .. }
             | Self::BlockSyncBelowFloor { .. }
-            | Self::BeaconBlockSyncResponseReceived { .. }
-            | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::SyncBlockValidated { .. }
             | Self::SyncBlockValidationFailed { .. }
             | Self::RemoteHeadersResponseReceived { .. }
@@ -630,8 +606,66 @@ impl Attachment {
 /// Whose beacon work an input continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BeaconOwner {
+    /// The host's fold: its block checks and witness fetches.
+    Fold,
     /// One attached identity's beacon participation.
     Participant(Attachment),
+}
+
+/// What a replica reports to the host's beacon loop from one event.
+#[derive(Debug, Clone)]
+pub enum BeaconInput {
+    /// The replica committed the block this certified header heads.
+    LocalCommit {
+        /// The committed block's certified header.
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// The replica certified this header, ahead of its commit.
+    CertifiedHeader {
+        /// The replica's own certified header.
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// The replica admitted a remote source header.
+    SourceHeader {
+        /// The admitted header.
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// The replica proved a remote source header's commit.
+    CommitProven {
+        /// The proven header.
+        header: Arc<Verified<CertifiedBlockHeader>>,
+    },
+    /// A shard fork is proven, for the next beacon proposal.
+    ForkProof(Box<ShardForkProof>),
+    /// A shard double-vote pair is proven, for the next beacon proposal.
+    VoteEquivocation {
+        /// The proven pair.
+        evidence: Box<ShardVoteEquivocation>,
+    },
+}
+
+/// What a registration hands the loop that registered: its token, the
+/// schedule its replica starts from, and the chain config the fold runs.
+#[derive(Debug, Clone)]
+pub struct Registration {
+    /// The token every later input from the loop carries.
+    pub token: ChainRegistration,
+    /// The fold's schedule, widened for the chain.
+    pub schedule: Arc<TopologySchedule>,
+    /// The epoch the fold folded the schedule at.
+    pub epoch: Epoch,
+    /// The beacon chain's config.
+    pub chain_config: BeaconChainConfig,
+}
+
+/// Where a runtime registration's [`Registration`] goes.
+#[derive(Clone)]
+pub struct RegistrationReply(pub Arc<dyn Fn(Registration) + Send + Sync>);
+
+impl std::fmt::Debug for RegistrationReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RegistrationReply")
+    }
 }
 
 /// Inputs routed to the host's beacon loop
@@ -669,7 +703,7 @@ pub enum BeaconScopedInput {
 
     /// A beacon-block sync response landed for the loop's catch-up fetch.
     /// `block` is `None` when the peer couldn't serve the epoch. The loop
-    /// delivers the block to every participant and advances its sync FSM.
+    /// hands the block to its fold and advances its sync FSM.
     BeaconBlockSyncResponseReceived {
         /// Epoch of the block being synced.
         epoch: Epoch,
@@ -698,6 +732,33 @@ pub enum BeaconScopedInput {
     /// The loop's fetch tick: retries its held fetches and its catch-up
     /// sync's deferred epochs.
     FetchTick,
+
+    /// What the replica of the chain `chain` names reported.
+    Shard {
+        /// The reporting loop's registration.
+        chain: ChainRegistration,
+        /// The report.
+        input: BeaconInput,
+    },
+
+    /// Register a chain a loop is about to run, from its recovered
+    /// committed height and the anchors its tip carries. Beacon events
+    /// for the chain go to `sender` from then on.
+    Register {
+        /// The chain's shard.
+        shard: ShardId,
+        /// The anchors the chain's committed tip carries.
+        anchors: LocalChainAnchors,
+        /// The chain's recovered committed height.
+        height: BlockHeight,
+        /// The loop's channel.
+        sender: Sender<HostEvent>,
+        /// Where the registration goes.
+        reply: RegistrationReply,
+    },
+
+    /// Stop tracking a chain whose loop has closed.
+    Deregister(ChainRegistration),
 }
 
 impl BeaconScopedInput {
@@ -719,7 +780,10 @@ impl BeaconScopedInput {
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::FetchFailed(_)
             | Self::FetchUnroutable(_)
-            | Self::FetchFulfilled(_) => EventPriority::Internal,
+            | Self::FetchFulfilled(_)
+            | Self::Shard { .. }
+            | Self::Register { .. }
+            | Self::Deregister(_) => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,
         }
     }
@@ -752,8 +816,8 @@ pub enum HostEvent {
     Process(ProcessScopedInput),
     /// Beacon-scoped — routed to the host's
     /// [`BeaconLoop`](crate::beacon_loop::BeaconLoop). Carries a
-    /// [`BeaconScopedInput`] the loop folds; seated vnodes receive beacon
-    /// events through their per-shard channels instead.
+    /// [`BeaconScopedInput`]: beacon traffic, what the replicas report,
+    /// and the loop's own continuations and fetch answers.
     Beacon(BeaconScopedInput),
 }
 

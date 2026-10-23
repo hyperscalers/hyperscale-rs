@@ -8,9 +8,10 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_storage::RowState;
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, Heard, PriceTable, ShardId,
-    Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Epoch, Event, Heard, PriceTable,
+    ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
+    WeightedTimestamp,
 };
 
 use super::Budget;
@@ -126,6 +127,14 @@ pub trait Cluster {
 
     /// The latest committed beacon state across the cluster (highest epoch).
     fn beacon_state(&self) -> Option<Arc<BeaconState>>;
+
+    /// For each host still running `shard`'s loop: the oldest epoch whose
+    /// window the host's beacon fold retains, and whether the loop's
+    /// replica reads itself dissolved. Empty where the harness cannot
+    /// look inside a host.
+    fn running_loops(&self, _shard: ShardId) -> Vec<(Epoch, bool)> {
+        Vec::new()
+    }
 
     /// Upper bound on the wall-clock cost for a submitted governance vote to
     /// fold into the beacon: transaction inclusion, an epoch-boundary crossing

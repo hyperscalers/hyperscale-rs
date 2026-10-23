@@ -237,11 +237,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
         let shard = node.shard_id();
         let tick_id = TickId::new(shard, BlockHeight::new(1));
-        node.shard
-            .as_mut()
-            .expect("a seated vnode")
-            .execution_coordinator
-            .hold_vote_retry(tick_id);
+        node.shard.execution_coordinator.hold_vote_retry(tick_id);
         let interval = node.shard_coordinator().config().cleanup_interval;
         let ticks_per_retry =
             u32::try_from(VOTE_RETRY_TIMEOUT.as_nanos() / interval.as_nanos()).expect("fits");
@@ -257,25 +253,5 @@ mod tests {
                 .count();
         }
         assert_eq!(resent, 1);
-    }
-
-    /// `handle` must feed wall-clock into the beacon coordinator, not
-    /// only the shard coordinator. The beacon's epoch-pacing gate
-    /// (`committee_start_due` / `duration_until_next_epoch_boundary`)
-    /// reads this clock; left at `ZERO` the gate never fires and the
-    /// committee-start / skip timers arm against a frozen clock.
-    #[test]
-    fn handle_advances_beacon_coordinator_clock() {
-        let TestNode { mut node, .. } = TestNode::new();
-        assert_eq!(node.beacon_coordinator().now(), LocalTimestamp::ZERO);
-
-        let now = LocalTimestamp::from_millis(123_456);
-        let _ = node.handle(now, ProtocolEvent::CleanupTimer);
-
-        assert_eq!(
-            node.beacon_coordinator().now(),
-            now,
-            "handle must propagate wall-clock into the beacon coordinator",
-        );
     }
 }

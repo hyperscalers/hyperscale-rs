@@ -451,18 +451,6 @@ pub enum Action {
         proof: Box<ShardForkProof>,
     },
 
-    /// Broadcast shard double-vote evidence over global gossip. The pair
-    /// is already locally verified and self-authenticating (both
-    /// signatures verify under the accused key), so no signing is needed
-    /// — the handler wraps it in a `ShardVoteEquivocationGossip`; every
-    /// recipient re-verifies locally. This is the recovery lane that
-    /// keeps the evidence reachable after its holders leave the source
-    /// committee.
-    BroadcastShardVoteEquivocation {
-        /// The self-proving double-vote pair to gossip.
-        evidence: Box<ShardVoteEquivocation>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -702,16 +690,6 @@ pub enum Action {
         /// Committees resolved for the proof's QCs, positionally aligned to
         /// its canonical QC order.
         committees: Vec<ResolvedCommittee>,
-    },
-
-    /// Delegated to the consensus crypto pool. Returns
-    /// `ProtocolEvent::ShardVoteEquivocationVerified`.
-    VerifyShardVoteEquivocation {
-        /// The double-vote pair to verify.
-        evidence: Box<ShardVoteEquivocation>,
-        /// The accused validator's registered pubkey, resolved by the
-        /// state machine from its topology.
-        pubkey: ConsensusPublicKey,
     },
 
     /// Verify a block's state root against the JMT: apply the block's
@@ -1391,7 +1369,7 @@ pub enum Action {
     /// Request the runner to start (or raise the target of) beacon-chain
     /// gap-fill sync.
     ///
-    /// Emitted by `BeaconCoordinator` when it observes a committed beacon
+    /// Emitted by the beacon fold when it observes a committed beacon
     /// block more than one epoch ahead of its tip. The runner's beacon
     /// `Sync` machine fetches the missing blocks epoch by epoch and feeds
     /// each back as `ProtocolEvent::BeaconBlockSyncReadyToApply`.
@@ -1806,141 +1784,6 @@ impl Action {
         self.into()
     }
 
-    /// The SPC `(epoch, view)` position this action signs beacon
-    /// consensus for under the emitting validator's identity, or
-    /// `None` for everything else.
-    ///
-    /// A validator can host several vnodes at once (a split's parent
-    /// and child overlap through the drain; a relocation's old and new
-    /// shards likewise), and each runs the full beacon protocol under
-    /// the same identity — two of them emitting independently derived
-    /// SPC messages is equivocation, which the beacon fold jails. The
-    /// dispatch funnel consults this to let exactly one vnode per
-    /// validator sign within any one view. A proposal precedes the
-    /// first view, so it maps to view zero — the epoch's earliest
-    /// claimable position. The `SpcNewView`/`SpcNewCommit` relays are
-    /// deliberately absent: their wrapper signature attributes relay
-    /// of a self-authenticating cert, which cannot equivocate, and
-    /// fencing them would burn a view claim on a non-vote. Maintained
-    /// as a total match so a new signing action can't silently bypass
-    /// the filter.
-    #[must_use]
-    pub const fn beacon_signing_position(&self) -> Option<(Epoch, SpcView)> {
-        match self {
-            Self::BuildAndBroadcastBeaconProposal { epoch, .. } => Some((*epoch, SpcView::new(0))),
-            Self::SignAndBroadcastPcVote1 { epoch, view, .. }
-            | Self::SignAndBroadcastPcVote2 { epoch, view, .. }
-            | Self::SignAndBroadcastPcVote3 { epoch, view, .. }
-            | Self::SignAndBroadcastEmptyView { epoch, view, .. } => Some((*epoch, *view)),
-            Self::BroadcastSpcNewView { .. }
-            | Self::BroadcastSpcNewCommit { .. }
-            | Self::BroadcastBlockHeader { .. }
-            | Self::SignAndBroadcastBlockVote { .. }
-            | Self::SignAndBroadcastTimeout { .. }
-            | Self::SignAndBroadcastQcAnnouncement { .. }
-            | Self::SignAndBroadcastReadySignal { .. }
-            | Self::SignAndSendExecutionVote { .. }
-            | Self::BroadcastExecutionCertificate { .. }
-            | Self::FetchAndBroadcastProvisions { .. }
-            | Self::PushCrossingReadings { .. }
-            | Self::BroadcastCertifiedBlockHeader { .. }
-            | Self::BroadcastShardForkProof { .. }
-            | Self::BroadcastShardVoteEquivocation { .. }
-            | Self::SetTimer { .. }
-            | Self::CancelTimer { .. }
-            | Self::Continuation(_)
-            | Self::ReofferTransactions { .. }
-            | Self::VerifyAndBuildQuorumCertificate { .. }
-            | Self::VerifyProvisions { .. }
-            | Self::AggregateExecutionCertificate { .. }
-            | Self::VerifyAndAggregateExecutionVotes { .. }
-            | Self::VerifyExecutionCertificateSignature { .. }
-            | Self::VerifyFinalization { .. }
-            | Self::BuildLegsHalf { .. }
-            | Self::VerifyQcSignature { .. }
-            | Self::VerifyTimeout { .. }
-            | Self::VerifyRemoteHeaderQc { .. }
-            | Self::VerifyShardForkProof { .. }
-            | Self::VerifyShardVoteEquivocation { .. }
-            | Self::VerifyStateRoot { .. }
-            | Self::VerifyBeaconWitnessRoot { .. }
-            | Self::VerifyBodyRoot { .. }
-            | Self::VerifyProvisionTxRoots { .. }
-            | Self::VerifyResolutions { .. }
-            | Self::BuildProposal { .. }
-            | Self::ExecuteTransactions { .. }
-            | Self::ResolveTicks { .. }
-            | Self::ClearTickChain
-            | Self::RaiseTickFloor { .. }
-            | Self::CommitBlock { .. }
-            | Self::CommitBlockByQcOnly { .. }
-            | Self::EmitTransactionStatus { .. }
-            | Self::RecordTxEcCreated { .. }
-            | Self::TopologyChanged { .. }
-            | Self::ReconfigureParticipation(_)
-            | Self::StartBlockSync { .. }
-            | Self::SyncBlockApplied { .. }
-            | Self::ReopenSyncHeight { .. }
-            | Self::SettleBlockSync
-            | Self::StartBeaconBlockSync { .. }
-            | Self::StartRemoteHeaderSync { .. }
-            | Self::FetchCommitProof { .. }
-            | Self::RestoreCommittedState { .. }
-            | Self::Fetch(_)
-            | Self::AbandonFetch(_)
-            | Self::BroadcastBeaconBlock { .. }
-            | Self::SignAndBroadcastRatifyVote { .. }
-            | Self::BroadcastBeaconCandidate { .. }
-            | Self::VerifyBeaconBlock { .. }
-            | Self::VerifyRatifyVote { .. }
-            | Self::VerifyBeaconCandidate { .. }
-            | Self::VerifyPcVote1 { .. }
-            | Self::VerifyPcVote2 { .. }
-            | Self::VerifyPcVote3 { .. }
-            | Self::VerifySpcNewView { .. }
-            | Self::VerifySpcNewCommit { .. }
-            | Self::VerifySpcEmptyView { .. }
-            | Self::CommitBeaconBlock { .. }
-            | Self::AttachCertifiedUncommitted { .. } => None,
-        }
-    }
-
-    /// Whether this action emits SPC consensus traffic — signed votes,
-    /// proposals, or attributed relays. The set a dissolved shard's
-    /// vnode must stop emitting once its successors are live: its
-    /// validator's live vnode carries the duty from there.
-    #[must_use]
-    pub const fn is_beacon_consensus_emission(&self) -> bool {
-        self.beacon_signing_position().is_some()
-            || matches!(
-                self,
-                Self::BroadcastSpcNewView { .. } | Self::BroadcastSpcNewCommit { .. }
-            )
-    }
-
-    /// The ratify-vote position this action signs under the emitting
-    /// validator's identity, or `None` for everything else.
-    ///
-    /// Distinct from [`Self::beacon_signing_position`]: ratify votes
-    /// are fenced per `(epoch, round, phase)` — strictly monotone
-    /// across all of a validator's co-hosted vnodes — rather than by
-    /// view claim, so a vnode torn down mid-epoch (a reshape drain)
-    /// hands the *next vote position* to its successor instead of
-    /// fencing the validator out. A coarser fence than the vote
-    /// position would allow cross-vnode equivocation.
-    #[must_use]
-    pub const fn ratify_signing_position(&self) -> Option<(Epoch, RatifyRound, RatifyPhase)> {
-        match self {
-            Self::SignAndBroadcastRatifyVote {
-                epoch,
-                round,
-                phase,
-                ..
-            } => Some((*epoch, *round, *phase)),
-            _ => None,
-        }
-    }
-
     /// Which coordinator crate owns this action's delegated work.
     #[must_use]
     pub const fn owner(&self) -> ActionOwner {
@@ -1950,7 +1793,6 @@ impl Action {
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyShardForkProof { .. }
-            | Self::VerifyShardVoteEquivocation { .. }
             | Self::VerifyBodyRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyResolutions { .. }
@@ -1963,8 +1805,7 @@ impl Action {
             | Self::SignAndBroadcastQcAnnouncement { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
-            | Self::BroadcastShardForkProof { .. }
-            | Self::BroadcastShardVoteEquivocation { .. } => ActionOwner::Shard,
+            | Self::BroadcastShardForkProof { .. } => ActionOwner::Shard,
 
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }

@@ -1,10 +1,12 @@
 //! Top-level beacon FSM.
 //!
-//! [`BeaconCoordinator`] is the per-vnode state machine: a [`BeaconFold`]
-//! that follows the chain — the committed [`BeaconState`], the topology
-//! schedule and the wall-clock anchor that drives epoch-cadence timers —
-//! and the vnode's one [`BeaconParticipant`], which runs its SPC,
-//! ratification and proposal duty.
+//! [`BeaconCoordinator`] is one identity's beacon state machine: a
+//! [`BeaconFold`] that follows the chain — the committed [`BeaconState`],
+//! the topology schedule and the wall-clock anchor that drives
+//! epoch-cadence timers — and that identity's one [`BeaconParticipant`],
+//! which runs its SPC, ratification and proposal duty. A host drives one
+//! fold and a participant per identity on its beacon loop; this pairing is
+//! the single-identity shape the crate's harnesses drive.
 //!
 //! Constructor is pure synchronous data assembly — the runner is
 //! responsible for loading `(latest_block, latest_state)` from
@@ -241,8 +243,8 @@ impl LocalChainAnchors {
     };
 }
 
-/// Per-vnode beacon-chain coordinator: the vnode's own [`BeaconFold`] and
-/// its one [`BeaconParticipant`], driven together.
+/// One identity's beacon-chain coordinator: a [`BeaconFold`] and the
+/// identity's [`BeaconParticipant`], driven together.
 ///
 /// Synchronous event-driven FSM. Mirrors `ShardCoordinator`'s public
 /// shape: handlers take `&mut self` and return `Vec<Action>`. A block a
@@ -300,9 +302,12 @@ impl BeaconCoordinator {
         );
         let local_chain =
             local_chain.map(|(anchors, height)| fold.register_chain(local_shard, anchors, height));
-        let participant = BeaconParticipant::new(&fold, me, local_shard);
-        let released = fold.set_host_on_committee(participant.is_on_committee(&fold));
-        debug_assert!(released.is_empty(), "a fresh fold holds no witness fetch");
+        let participant = BeaconParticipant::new(&fold, me);
+        let fetches = fold.set_host_on_committee(participant.is_on_committee(&fold));
+        debug_assert!(
+            fetches.is_empty(),
+            "a fresh fold holds no crossing to fetch a witness for",
+        );
         Self {
             fold,
             participant,
@@ -588,12 +593,11 @@ impl BeaconCoordinator {
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
         if !self
-            .participant
-            .asked(certified_header.shard_id(), certified_header.height())
+            .fold
+            .admit_proven_for(certified_header, [&self.participant])
         {
             return Vec::new();
         }
-        self.fold.admit_proven(certified_header);
         self.drive(BeaconParticipant::on_source_header)
     }
 
@@ -838,7 +842,8 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_core::{
-        FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
+        BeaconFetchIds, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange,
+        TimerId,
     };
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
@@ -2375,11 +2380,151 @@ mod tests {
             !actions.iter().any(|action| matches!(
                 action,
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::ShardWitnesses(_),
+                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(_)),
                     ..
                 })
             )),
             "certification fetches no witness chunk: {actions:?}",
+        );
+    }
+
+    /// Two participants share a fold, and only one asked for the commit
+    /// proof a proposal it awaits needs. The proof is held for admission
+    /// because one participant asked, and the asker's awaiting proposal is
+    /// released into its pool once the proof lands. A proof no
+    /// participant asked for is not held.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one certified chain built and walked end to end
+    fn a_commit_proof_one_participant_asked_for_releases_its_awaiting_proposal() {
+        use hyperscale_core::ProtocolEvent;
+        use hyperscale_types::test_utils::TestCommittee;
+        use hyperscale_types::{BlockVote, ProposerTimestamp};
+
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = coord_seating([0, 1, 2, 3].map(|seat| *committee.public_key(seat)));
+        let shard = ShardId::ROOT;
+        let cut = coord.fold.state.chain_config.epoch_duration_ms;
+        let network = NetworkDefinition::simulator();
+
+        let header = |height: u64, parent_qc: &QuorumCertificate| {
+            BlockHeader::new(BlockHeaderParts {
+                shard_id: shard,
+                height: BlockHeight::new(height),
+                parent_block_hash: parent_qc.block_hash(),
+                parent_qc: parent_qc.clone().into(),
+                round: Round::new(height),
+                beacon_witness_root: BeaconWitnessRoot::from_raw(Hash::from_bytes(b"bw")),
+                beacon_witness_leaf_count: BeaconWitnessLeafCount::new(3),
+                ..Default::default()
+            })
+        };
+        let qc_over = |header: &BlockHeader, wt: u64| {
+            let votes: Vec<(usize, Verified<BlockVote>)> = (0..3)
+                .map(|seat| {
+                    let vote = BlockVote::new(
+                        &network,
+                        header.hash(),
+                        header.parent_block_hash(),
+                        shard,
+                        header.height(),
+                        header.round(),
+                        ValidatorId::new(seat as u64),
+                        committee.signer(seat).as_ref(),
+                        ProposerTimestamp::from_millis(wt),
+                    )
+                    .expect("vote signs");
+                    (seat, Verified::new_unchecked_for_test(vote))
+                })
+                .collect();
+            Verified::<QuorumCertificate>::from_verified_votes(
+                &BlsVerifier,
+                header.hash(),
+                shard,
+                header.height(),
+                header.round(),
+                header.parent_block_hash(),
+                header.parent_qc().weighted_timestamp(),
+                &votes,
+            )
+            .expect("aggregates over a quorum")
+            .into_inner()
+        };
+        let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
+            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+                header.clone(),
+                qc.clone(),
+            )))
+        };
+
+        // `B` anchors short of the cut and is certified past it; `C`
+        // embeds that certificate and `D` commits `C`.
+        let below = qc_naming(BlockHash::ZERO, shard, 3, cut - 2);
+        let a = header(4, &below);
+        let a_qc = qc_over(&a, cut - 1);
+        let b = header(5, &a_qc);
+        let b_qc = qc_over(&b, cut + 1);
+        let c = header(6, &b_qc);
+        let c_qc = qc_over(&c, cut + 2);
+        let d = header(7, &c_qc);
+        let d_qc = qc_over(&d, cut + 3);
+
+        let from = ValidatorId::new(1);
+        let proposal = Arc::new(Verified::new_unchecked_for_test(proposal_with_boundary(
+            shard,
+            b_qc.clone(),
+        )));
+        let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
+        actions.extend(coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal));
+        actions.extend(coord.on_certified_local_header(&certified(&b, &b_qc)));
+        actions.extend(coord.on_certified_local_header(&certified(&c, &c_qc)));
+        assert!(
+            coord.participant.awaiting_boundaries.contains_key(&from),
+            "the boundary's dating child is only certified, so the proposal awaits",
+        );
+        let asked: Vec<(ShardId, BlockHeight)> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard,
+                    block_height,
+                }) => Some((*source_shard, *block_height)),
+                _ => None,
+            })
+            .collect();
+        assert!(!asked.is_empty(), "the awaiting proposal asks for a proof");
+
+        let bystander = BeaconParticipant::new(&coord.fold, ValidatorId::new(2));
+        let proofs = [
+            certified(&b, &b_qc),
+            certified(&c, &c_qc),
+            certified(&d, &d_qc),
+        ];
+        let (asked_for, unasked): (Vec<_>, Vec<_>) = proofs
+            .iter()
+            .partition(|proof| asked.contains(&(proof.shard_id(), proof.height())));
+        assert!(
+            !coord
+                .fold
+                .admit_proven_for(unasked[0], [&bystander, &coord.participant]),
+            "a proof no participant asked for is not held",
+        );
+        assert!(
+            !coord.fold.admit_proven_for(asked_for[0], [&bystander]),
+            "the bystander asked for nothing",
+        );
+        for proof in asked_for {
+            assert!(
+                coord
+                    .fold
+                    .admit_proven_for(proof, [&bystander, &coord.participant]),
+                "one participant's ask holds the proof",
+            );
+        }
+        let _ = coord.participant.on_source_header(&coord.fold);
+        assert!(
+            coord.participant.awaiting_boundaries.is_empty()
+                && coord.participant.proposal_pool.contains(from),
+            "the proven commit releases the asker's proposal into its pool",
         );
     }
 
@@ -2741,7 +2886,7 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::BeaconProposals(ids),
+                    ids: FetchIds::Beacon(BeaconFetchIds::Proposals(ids)),
                     preferred,
                     ..
                 }) => Some((ids[0].1, *preferred)),
@@ -3323,7 +3468,7 @@ mod tests {
 
     /// A commit that rotates the local validator off the beacon
     /// committee drops the pooled witness chunks and releases in-flight
-    /// witness fetches as `FetchIds::ShardWitnesses`, so the
+    /// witness fetches as `BeaconFetchIds::Witnesses`, so the
     /// runner's fetch slots don't pin on payloads an off-committee vnode
     /// no longer wants.
     #[test]
@@ -3365,13 +3510,13 @@ mod tests {
         let abandoned = actions.iter().any(|a| {
             matches!(
                 a,
-                Action::AbandonFetch(FetchIds::ShardWitnesses(ids))
+                Action::AbandonFetch(FetchIds::Beacon(BeaconFetchIds::Witnesses(ids)))
                     if ids.contains(&(shard, height, anchor, LeafIndex::new(0), LeafIndex::new(2)))
             )
         });
         assert!(
             abandoned,
-            "expected FetchIds::ShardWitnesses naming the in-flight fetch, got {actions:?}",
+            "expected BeaconFetchIds::Witnesses naming the in-flight fetch, got {actions:?}",
         );
     }
 
@@ -3448,7 +3593,7 @@ mod tests {
             matches!(
                 a,
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::BeaconProposals(wanted),
+                    ids: FetchIds::Beacon(BeaconFetchIds::Proposals(wanted)),
                     ..
                 })
                     if wanted
@@ -4109,7 +4254,7 @@ mod tests {
             .iter()
             .find_map(|a| match a {
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::ShardWitnesses(runs),
+                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(runs)),
                     ..
                 }) => runs.first().map(|(_, _, _, lo, hi)| (*lo, *hi)),
                 _ => None,
@@ -4119,6 +4264,42 @@ mod tests {
         // cap binds, the remainder follows once the watermark advances.
         assert_eq!(lo, LeafIndex::new(0));
         assert_eq!(hi, LeafIndex::new(MAX_WITNESSES_PER_SHARD as u64));
+    }
+
+    /// A fold whose host gains its first committee participant mid-epoch
+    /// fetches the witness chunk of a crossing it already holds: no
+    /// further header need arrive to ask for it.
+    #[test]
+    fn a_participant_added_mid_epoch_on_the_committee_starts_witness_fetches() {
+        use hyperscale_types::ShardId;
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        coord
+            .fold
+            .state
+            .boundaries
+            .insert(shard, genesis_boundary());
+        let _ = coord.fold.set_host_on_committee(false);
+        let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, 3);
+        let c = linked_block_header(shard, 6, b.block_hash(), 300_001, 3);
+        let d = linked_block_header(shard, 7, c.block_hash(), 300_001, 3);
+        for header in [&b, &c, &d] {
+            assert!(
+                coord.fold.on_source_header(header).is_empty(),
+                "off the committee the fold asks for no witness",
+            );
+        }
+        let asked = coord.fold.set_host_on_committee(true);
+        assert!(
+            asked.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(runs)),
+                    ..
+                }) if runs.iter().any(|run| run.0 == shard)
+            )),
+            "joining the committee asks for the held crossing's chunk: {asked:?}",
+        );
     }
 
     /// A pooled run is not asked for again until the fold moves past it.
@@ -4143,7 +4324,7 @@ mod tests {
         let asked = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::ShardWitnesses(runs),
+                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(runs)),
                     ..
                 }) => runs.first().copied(),
                 _ => None,
@@ -4394,6 +4575,60 @@ mod tests {
                 .fold
                 .shard_source
                 .is_pending_fetch(live, BlockHash::ZERO, 0, 4)
+        );
+    }
+
+    /// A host's fold follows every chain the host runs. A hosted replica
+    /// still syncing far behind holds its own anchors back, and the
+    /// departed-source clock reads the newest anchor over the chains, so
+    /// the lagging one does not freeze the retirement of a departed
+    /// shard's source tracking.
+    #[test]
+    fn a_lagging_hosted_replica_does_not_freeze_its_shards_source_window() {
+        let departed = ShardId::leaf(1, 1);
+        let mut state = state_at(1, 4);
+        let mut terminal = boundary_live_at(1);
+        terminal.block_hash = BlockHash::from_raw(Hash::from_bytes(b"terminal"));
+        terminal.terminal_epoch = Some(Epoch::new(1));
+        terminal.handoff_complete = Some(Epoch::new(1));
+        state.boundaries.insert(departed, terminal);
+        let mut coord = coord_from_history(vec![state], Some(LocalChainAnchors::GENESIS));
+        let lagging = coord.fold.register_chain(
+            ShardId::leaf(1, 0),
+            LocalChainAnchors {
+                committee: WeightedTimestamp::from_millis(1),
+                block: WeightedTimestamp::from_millis(1),
+            },
+            BlockHeight::new(1),
+        );
+        coord
+            .fold
+            .shard_source
+            .on_verified_source_header(boundary_block_header(
+                departed,
+                5,
+                1_000,
+                StateRoot::ZERO,
+                4,
+            ));
+        let expiry = coord
+            .topology_schedule()
+            .handoff_evidence_expiry(departed)
+            .expect("the stamp fixes an expiry");
+
+        coord.commit_local(expiry.plus(Duration::from_millis(1)));
+        assert!(
+            coord.fold.hosted[&lagging].anchors.block < expiry,
+            "the lagging chain is still behind the expiry",
+        );
+        let _ = coord.retire_departed_sources();
+        assert!(
+            coord
+                .fold
+                .shard_source
+                .header(departed, BlockHeight::new(5))
+                .is_none(),
+            "the live chain's anchor retires the departed shard's tracking",
         );
     }
 

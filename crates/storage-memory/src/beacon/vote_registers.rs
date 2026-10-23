@@ -2,7 +2,7 @@
 //! [`SimBeaconStorage`].
 
 use hyperscale_storage::BeaconVoteRegisterStore;
-use hyperscale_storage::lock_recover::write_or_recover;
+use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_types::{BeaconVote, BeaconVoteAdmission, BeaconVoteRecord, ValidatorId};
 
 use super::core::SimBeaconStorage;
@@ -22,5 +22,20 @@ impl BeaconVoteRegisterStore for SimBeaconStorage {
         drop(inner);
         self.sync();
         true
+    }
+
+    fn beacon_vote_record(&self, validator: ValidatorId) -> Option<BeaconVoteRecord> {
+        read_or_recover(&self.inner)
+            .beacon_vote_records
+            .get(&validator)
+            .cloned()
+    }
+
+    fn restore_beacon_vote_record(&self, validator: ValidatorId, record: &BeaconVoteRecord) {
+        crash_point::write();
+        write_or_recover(&self.inner)
+            .beacon_vote_records
+            .insert(validator, record.clone());
+        self.sync();
     }
 }

@@ -15,7 +15,8 @@
 //! true`, and consensus participation. That readiness is what retires
 //! the victim: its seat drains, the shard keeps committing without it,
 //! and a rejoin with the retained storage takes the fast path with no
-//! snap-sync.
+//! snap-sync. Neither the seat nor the drain touches either validator's
+//! beacon participant, which its host runs from startup on.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -177,6 +178,11 @@ fn vnode_moves_through_a_committee_rotation() {
         anchor_height > BlockHeight::GENESIS,
         "the anchor must be a real epoch boundary, not genesis"
     );
+    assert_eq!(
+        runner.participants(node),
+        vec![validator],
+        "the entrant's host runs its participant, as it has from startup",
+    );
 
     // ── Ready: tail sync completes and the fold flips the flag ──────
     // The joiner's self-signed ReadySignal must flip `ready: true`
@@ -332,6 +338,11 @@ fn vnode_moves_through_a_committee_rotation() {
         "the victim's window on the shard has closed"
     );
     let retained = runner.leave_shard(victim_node, from);
+    assert_eq!(
+        runner.participants(victim_node),
+        vec![victim],
+        "the drain keeps the victim's participant",
+    );
     let (origin_peer, _) = committee_member_host(&*runner, from, Some(victim_node));
     let origin_before = runner
         .vnode_state_in(origin_peer, from)

@@ -38,11 +38,7 @@ fn seating(runner: &SimulationRunner) -> Seating {
     let mut seating = Seating::new();
     for host in 0..runner.num_hosts() {
         for shard in topology.shard_trie().leaves() {
-            let seated: BTreeSet<ValidatorId> = runner
-                .shard_vnodes_in(host, shard)
-                .iter()
-                .map(|v| v.validator_id())
-                .collect();
+            let seated: BTreeSet<ValidatorId> = runner.seated_in(host, shard).into_iter().collect();
             if !seated.is_empty() {
                 seating.insert((host, shard), seated);
             }

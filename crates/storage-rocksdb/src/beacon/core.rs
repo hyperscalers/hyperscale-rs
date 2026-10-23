@@ -1,9 +1,9 @@
 //! Core `RocksDbBeaconStorage` struct.
 //!
 //! The beacon `RocksDB` instance lives in its own directory and is
-//! independent of the per-shard tier. One handle is shared across every
-//! vnode's `BeaconCoordinator` via `Arc`; the `commit_lock` serialises
-//! writes from concurrent emits without blocking reads.
+//! independent of the per-shard tier. One handle is shared via `Arc`
+//! across the host's beacon fold and participants; the `commit_lock`
+//! serialises writes from concurrent emits without blocking reads.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

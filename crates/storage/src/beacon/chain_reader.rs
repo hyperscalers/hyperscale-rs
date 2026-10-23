@@ -8,8 +8,8 @@ use hyperscale_types::{BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch
 ///
 /// All methods are synchronous; backends may serialize internally
 /// (e.g., `RocksDB` snapshot reads) but expose a thread-safe interface
-/// so multiple `BeaconCoordinator`s (one per vnode) can read
-/// concurrently against a single `Arc<dyn BeaconChainReader>`.
+/// so many readers on a host can read concurrently against a single
+/// `Arc<dyn BeaconChainReader>`.
 ///
 /// Committed blocks come back as [`Verified<CertifiedBeaconBlock>`]: the
 /// write path admits only verified blocks, so the store lifts each
@@ -48,8 +48,8 @@ pub trait BeaconChainReader: Send + Sync {
     fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)>;
 
     /// Committed states from `floor` through the latest epoch, oldest first
-    /// — the boot-time topology history the runner threads into
-    /// `BeaconCoordinator::new` so the schedule resumes with every committee
+    /// — the boot-time topology history a host's fold resumes over, so the
+    /// schedule resumes with every committee
     /// a consumer frontier still reaches (the runner derives `floor` via
     /// `retention_floor`). Walks down from
     /// [`latest_committed_epoch`](Self::latest_committed_epoch) and stops at

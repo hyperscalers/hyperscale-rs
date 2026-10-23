@@ -59,7 +59,7 @@ use crate::support::wait::{
     await_split_admitted, await_tx_terminal, epoch_fraction,
 };
 use crate::support::{
-    Budget, Cluster, FaultHandle, FaultableCluster, committees_on_separate_hosts, epochs,
+    Budget, Cluster, FaultHandle, FaultableCluster, assume, committees_on_separate_hosts, epochs,
 };
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, caller_on_the_venues_shard,
@@ -5407,5 +5407,48 @@ fn swap_against_the_child<C: Cluster>(
         held_at(c, reserve_cell(&venue.meta, *PROTOCOL_RESOURCE)),
         claimed + SWAP_INPUT,
         "the venue's child claims the post-cut input",
+    );
+}
+
+/// A retained predecessor's loop stops holding its host's schedule.
+///
+/// A host keeps a split predecessor's terminated loop up to serve what
+/// its successors still read from it. Once the predecessor's terminal
+/// folds, the loop holds none of its host's schedule open: the oldest
+/// window the host's fold retains moves past where the loop held it
+/// while the loop still serves, and its replica stays dissolved once the
+/// windows that showed its terminal are gone.
+///
+/// # Panics
+///
+/// Panics if the floor never moves within `budget`, or the retained
+/// replica reads itself live.
+pub fn a_retained_terminated_loop_releases_its_hosts_schedule<C: Cluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let root = ShardId::ROOT;
+    split_lifecycle(c);
+    let held = c.running_loops(root);
+    assume(
+        !held.is_empty(),
+        "a host still serves the terminated predecessor after the split",
+    );
+    let floor = held
+        .iter()
+        .map(|(oldest, _)| *oldest)
+        .min()
+        .expect("checked non-empty");
+    assert!(
+        c.run_until(budget, |c| {
+            let running = c.running_loops(root);
+            !running.is_empty()
+                && running
+                    .iter()
+                    .all(|&(oldest, dissolved)| dissolved && oldest > floor)
+        }),
+        "a retained predecessor's loop kept its host's schedule at {floor:?}, or read \
+         itself live once its windows were gone: {:?}",
+        c.running_loops(root),
     );
 }

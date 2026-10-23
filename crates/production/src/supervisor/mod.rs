@@ -31,7 +31,7 @@ use hyperscale_node::process::ProcessIo;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator, ReshapeRequest};
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::{NodeConfig, TimerOp};
+use hyperscale_node::{NodeConfig, Registration, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
@@ -147,6 +147,16 @@ pub enum SupervisorEvent {
         /// Shard whose store fell behind.
         shard: ShardId,
     },
+    /// A chain's registration with the host's beacon loop came back.
+    Registered {
+        /// Shard the registration is for.
+        shard: ShardId,
+        /// Which seat of the shard registered, so a reply for one a later
+        /// seat superseded is released.
+        seat: u64,
+        /// The token, schedule and chain config the loop handed back.
+        registration: Registration,
+    },
     /// A departing shard's thread joined; the unwire can finish.
     TornDown {
         /// Shard whose thread exited.
@@ -163,6 +173,18 @@ pub enum LoopStart<'a> {
     Genesis(&'a Block),
     /// A store that committed a chain: restore from what it recovered.
     Resume(&'a RecoveredState),
+}
+
+/// A seat whose chain is registering with the host's beacon loop: what
+/// its loop is built from once the registration comes back.
+pub struct Registering {
+    shard: ShardId,
+    vnodes: Vec<VnodeConfig>,
+    storage: Arc<RocksDbShardStorage>,
+    recovered: RecoveredState,
+    genesis: Option<Block>,
+    channels: ShardChannels,
+    sender: Sender<HostEvent>,
 }
 
 /// One hosted shard's runtime: its pinned thread plus the handles the
@@ -269,16 +291,21 @@ pub struct ShardSupervisor {
     /// Receiver side, taken by the runner's `run()` loop.
     events_rx: Option<mpsc::UnboundedReceiver<SupervisorEvent>>,
     /// The host's pinned beacon thread. Every host runs one from startup
-    /// until shutdown; a change to its follower set rebuilds it.
+    /// until shutdown.
     beacon: Option<BeaconThread>,
-    /// The host's beacon-event channel receiver, cloned into each beacon
-    /// thread the supervisor spawns. The host-level gossip handler pushes
-    /// committed beacon blocks onto the paired sender.
+    /// The host's beacon-event channel receiver, handed to the beacon
+    /// thread.
     beacon_event_rx: Receiver<HostEvent>,
-    /// Signing keys for the host's local validators, used to build a
-    /// follower when a validator drains off its last shard. A follower
-    /// never signs, but the bundle carries the real key for the later seat.
+    /// Signing keys for the host's local validators.
     vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
+    /// Seats whose chain is registering with the beacon loop, by seat
+    /// number, built and spawned once the registration comes back. A
+    /// shard has at most one, and while it does its `bootstrapping` entry
+    /// holds the seat's pending vnodes.
+    registering: BTreeMap<u64, Registering>,
+    /// How many seats have registered, numbering each so its reply is
+    /// matched to the seat that sent it.
+    registrations: u64,
 }
 
 impl ShardSupervisor {
@@ -333,6 +360,8 @@ impl ShardSupervisor {
             pending_joins: HashMap::new(),
             awaiting_anchor: BTreeMap::new(),
             beacon: None,
+            registering: BTreeMap::new(),
+            registrations: 0,
             beacon_event_rx,
             vnode_keys,
             events_tx,
@@ -361,6 +390,11 @@ impl ShardSupervisor {
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
             SupervisorEvent::Seated { shard, validator } => self.on_seated(shard, validator),
             SupervisorEvent::Reseat { shard } => self.reseat(shard),
+            SupervisorEvent::Registered {
+                shard,
+                seat,
+                registration,
+            } => self.on_registered(shard, seat, &registration),
             SupervisorEvent::TornDown {
                 shard,
                 validator_ids,

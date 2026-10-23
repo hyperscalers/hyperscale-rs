@@ -59,4 +59,20 @@ impl RatifyRegisterStore for RocksDbBeaconStorage {
     fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {
         self.cf_get::<RatifyRegistersCf>(&validator)
     }
+
+    fn restore_ratify_record(&self, validator: ValidatorId, record: &RatifyVoteRecord) {
+        let _guard = self.ratify_lock.lock().expect("ratify_lock poisoned");
+        let mut batch = WriteBatch::default();
+        batch_put::<RatifyRegistersCf>(
+            &mut batch,
+            RatifyRegistersCf::handle(&self.cf()),
+            &validator,
+            record,
+        );
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .write_opt(batch, &write_opts)
+            .expect("BFT CRITICAL: ratify register write failed");
+    }
 }

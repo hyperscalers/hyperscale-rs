@@ -1,9 +1,7 @@
 //! Network handler registration (gossip, notifications, requests).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_execution::attesting_committee;
@@ -36,7 +34,7 @@ use tracing::warn;
 use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
-use crate::process::{ProcessIo, SharedShardSenders};
+use crate::process::ProcessIo;
 use crate::shard::cross_shard::crossing_push;
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
@@ -220,42 +218,39 @@ where
             );
 
         // Shard double-vote evidence: same self-authenticating global
-        // gossip shape as fork proofs — any hosted vnode carries it to
-        // the state machine for off-thread verification.
+        // gossip shape as fork proofs. A hosting host carries it to its
+        // beacon loop, which verifies it off-thread for the next beacon
+        // proposal.
         let senders = self.process.shard_event_senders.clone();
+        let beacon_tx = self.process.beacon_event_sender.clone();
         self.process
             .network
             .register_gossip_handler::<ShardVoteEquivocationGossip>(
                 move |gossip: ShardVoteEquivocationGossip, target_shard: ShardId| -> Verdict {
-                    let senders = senders.load();
-                    let Some(tx) = senders.get(&target_shard) else {
+                    if !senders.load().contains_key(&target_shard) {
                         warn!(
                             target_shard = target_shard.inner(),
                             "Dropping double-vote gossip: shard not hosted"
                         );
                         return Verdict::Ignore;
-                    };
-                    push_shard_input(
-                        tx,
-                        target_shard,
-                        ShardScopedInput::ShardVoteEquivocationGossipReceived {
-                            evidence: gossip.evidence,
+                    }
+                    let _ = beacon_tx.send(HostEvent::beacon(
+                        ProtocolEvent::UnverifiedShardVoteEquivocationReceived {
+                            evidence: Box::new((*gossip.evidence).clone()),
                         },
-                    );
+                    ));
                     Verdict::Accept
                 },
             );
 
-        // Beacon gossip (beacon.block per-shard + host-level beacon-loop route +
-        // beacon.candidate + beacon.ratify_vote) lives in `crate::beacon::gossip`
-        // — the closures capture only the senders, the beacon loop's channel,
-        // and the route gate.
-        let route_active = self.process.beacon_route_active();
+        // Beacon gossip (beacon.block, beacon.candidate and
+        // beacon.ratify_vote, per shard and host-level) lives in
+        // `crate::beacon::gossip` — the closures capture only the senders
+        // and the beacon loop's channel.
         register_beacon_gossip_handlers(
             &*self.process.network,
             &self.process.shard_event_senders,
             &self.process.beacon_event_sender,
-            &route_active,
         );
     }
 
@@ -716,26 +711,24 @@ where
 
         // ── beacon.proposal → Unverified/VerifiedBeaconProposalReceived ──
         //
-        // Beacon-committee unicast. Fan to every hosted shard's
-        // vnodes; each vnode's coordinator decides admission. Wire
+        // Beacon-committee unicast, to the host's beacon loop, whose
+        // participants each decide admission. Wire
         // decode lands the wrapper as `Unverified`; local-dispatched
         // sends preserve the `Verified` marker. The process-level
         // serve cache takes a copy (VRF-verified here when the wire
         // dropped the marker) so `GetBeaconProposalRequest` is
         // answered without reading any coordinator's pool.
-        let senders = self.process.shard_event_senders.clone();
         let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
         let beacon_tx = self.process.beacon_event_sender.clone();
-        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
                 move |gossip: BeaconProposalNotification| -> Verdict {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
-                    // The coordinators judge the proposal themselves, so it
+                    // The participants judge the proposal themselves, so it
                     // reaches them whatever the cache made of it.
                     let verdict = match topology_snapshot.load().public_key(from) {
                         Some(sender_pk) => proposal_cache.admit_wire(
@@ -752,7 +745,7 @@ where
                         epoch,
                         proposal: gossip.proposal,
                     };
-                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    let _ = beacon_tx.send(HostEvent::beacon(event));
                     verdict
                 },
             );
@@ -763,9 +756,7 @@ where
         // doesn't encode its SPC view; the receiver routes by view.
         macro_rules! register_pc_vote_handler {
             ($note_ty:ty, $unv:ident, $ver:ident, $vote_ty:ty $(, $box:tt)?) => {{
-                let senders = self.process.shard_event_senders.clone();
                 let beacon_tx = self.process.beacon_event_sender.clone();
-                let route_active = self.process.beacon_route_active();
                 self.process.network.register_notification_handler::<$note_ty>(
                     move |gossip: $note_ty| -> Verdict {
                         let view = gossip.view;
@@ -779,7 +770,7 @@ where
                                 vote: register_pc_vote_handler!(@wrap $($box)? unverified.into()),
                             },
                         };
-                        fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                        let _ = beacon_tx.send(HostEvent::beacon(event));
                         Verdict::Accept
                     },
                 );
@@ -817,11 +808,9 @@ where
         // We verify the sig under the sender's pubkey before fanning in;
         // signature check fails → drop (`verify_signed_by_proposer` already
         // warns).
-        let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
         let beacon_tx = self.process.beacon_event_sender.clone();
-        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
@@ -842,17 +831,15 @@ where
                         from,
                         proposal: gossip.proposal,
                     };
-                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    let _ = beacon_tx.send(HostEvent::beacon(event));
                     Verdict::Accept
                 },
             );
 
         // ── beacon.spc.new_commit → ProtocolEvent::SpcNewCommitReceived ──
-        let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
         let beacon_tx = self.process.beacon_event_sender.clone();
-        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
@@ -873,7 +860,7 @@ where
                         from,
                         msg: gossip.msg,
                     };
-                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    let _ = beacon_tx.send(HostEvent::beacon(event));
                     Verdict::Accept
                 },
             );
@@ -887,11 +874,9 @@ where
         // message. Locally-dispatched sends arrive with the `Verified`
         // marker and skip the check; the expensive embedded-QC3 verify
         // still runs async in the coordinator.
-        let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
         let beacon_tx = self.process.beacon_event_sender.clone();
-        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
@@ -917,30 +902,10 @@ where
                             msg: Arc::new(unverified.into()),
                         },
                     };
-                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
+                    let _ = beacon_tx.send(HostEvent::beacon(event));
                     Verdict::Accept
                 },
             );
-    }
-}
-
-/// Fan a beacon consensus event across every hosted shard's channel and —
-/// while the beacon loop holds a follower — to the beacon loop as well, so a
-/// pooled validator on beacon duty (a ratify-pool member or an
-/// SPC committee draw whose seat is still pending) hears its peers. A host
-/// running both a seated vnode and followers delivers to each coordinator
-/// once; the per-signer vote and verification slots keep that idempotent.
-fn fan_beacon_event(
-    senders: &SharedShardSenders,
-    beacon_tx: &Sender<HostEvent>,
-    route_active: &AtomicBool,
-    event: ProtocolEvent,
-) {
-    for (hosted_shard, tx) in senders.load().iter() {
-        push_protocol_event(tx, *hosted_shard, event.clone());
-    }
-    if route_active.load(Ordering::Acquire) {
-        let _ = beacon_tx.send(HostEvent::beacon(event));
     }
 }
 

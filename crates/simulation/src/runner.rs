@@ -30,8 +30,8 @@ use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
-    NodeConfig, NodeHost, NodeStateMachine, SeatConfig, SeatFollower, SeatVnodeGroup, ShardGenesis,
-    TimerOp, TimerOwner, VnodeInit, seat_follower, seat_vnode_group, timer_event,
+    NodeConfig, NodeHost, NodeStateMachine, SeatConfig, ShardGenesis, StartupChain, TimerOp,
+    TimerOwner, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
@@ -396,12 +396,10 @@ pub struct SimulationRunner {
     /// preview.
     engine: Arc<Executor>,
 
-    /// Beacon genesis config hash, retained for runtime-built
-    /// `BeaconCoordinator`s.
+    /// Beacon genesis config hash, retained for a restarted host's fold.
     beacon_config_hash: GenesisConfigHash,
 
-    /// Beacon network definition, retained for runtime-built
-    /// `BeaconCoordinator`s.
+    /// Beacon network definition, retained for a restarted host's fold.
     beacon_network: NetworkDefinition,
 
     /// Placement deltas the hosted vnodes emitted via
@@ -707,7 +705,7 @@ impl SimulationRunner {
         let chain_config = network_config.beacon_chain_config.unwrap_or_default();
 
         // Build the genesis beacon chain once, reused across every host's
-        // per-vnode `BeaconCoordinator`, and project the shared topology from
+        // fold, and project the shared topology from
         // its folded state — one allocation shared across every host and
         // vnode. Pool extras are absent from every committee, so they project
         // as `Pooled`; the seated ROOT validators, capped at the beacon
@@ -731,7 +729,8 @@ impl SimulationRunner {
             // Group this host's seated vnodes by shard. For cross-shard
             // hosting each group has one vnode; for same-shard hosting
             // there's one group per host with `vnodes_per_host` entries. A
-            // dedicated pool host has no seated vnodes — only followers.
+            // dedicated pool host seats no vnode; its identities run only
+            // their beacon participants.
             let mut by_shard: BTreeMap<ShardId, Vec<u32>> = BTreeMap::new();
             for &(validator_idx, shard) in &plan.seated {
                 by_shard.entry(shard).or_default().push(validator_idx);
@@ -758,55 +757,36 @@ impl SimulationRunner {
                 Arc::new(engine.peer(network_config.execution_mode))
             };
 
-            // Seat each host's vnodes. Same-shard vnodes share one store
-            // bundle, created inside `seat_vnode_group`; the host's pool
-            // extras follow the beacon shard-less. Genesis boots a fresh
-            // chain, so `recovered` is default and `now` is what this
-            // host's clock reads at simulated zero: a follower arms its
-            // beacon startup timers off it at construction.
+            // Every identity the host holds runs a beacon participant;
+            // the seated ones also seat on their shard's loop, whose
+            // vnodes share one store bundle. Genesis boots a fresh chain,
+            // so `recovered` is default and `now` is what this host's
+            // clock reads at simulated zero: the beacon loop arms its
+            // participants' startup timers off it at construction.
             let now = LocalTimestamp::from_millis(clocks[host_index].read(Duration::ZERO));
-            let mut vnode_inits: Vec<VnodeInit> =
-                Vec::with_capacity(plan.seated.len() + plan.followers.len());
-            for (shard, validator_idxs) in &by_shard {
-                let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> = validator_idxs
-                    .iter()
-                    .map(|&idx| {
-                        (
-                            ValidatorId::new(u64::from(idx)),
-                            Arc::clone(&signers[idx as usize]),
-                        )
-                    })
-                    .collect();
-                vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                    config: SeatConfig {
-                        verifier: Arc::clone(&verifier),
-                        derivation: executor.derivation(),
-                        code: Arc::clone(&executor) as _,
-                        beacon_network: beacon_network.clone(),
-                        beacon_config_hash,
-                        shard_config: ShardConsensusConfig::default(),
-                        mempool_config: MempoolConfig::default(),
-                        provision_config: ProvisionConfig::default(),
-                    },
-                    beacon_storage: beacon_storage.as_ref(),
-                    now,
-                    shard: *shard,
-                    recovered: &RecoveredState::default(),
-                    vnodes,
-                }));
-            }
-            for &validator_idx in &plan.followers {
-                let signer = Arc::clone(&signers[validator_idx as usize]);
-                vnode_inits.push(seat_follower(SeatFollower {
-                    verifier: Arc::clone(&verifier),
-                    beacon_storage: beacon_storage.as_ref(),
-                    beacon_network: beacon_network.clone(),
-                    beacon_config_hash,
-                    now,
-                    validator: ValidatorId::new(u64::from(validator_idx)),
-                    signer,
-                }));
-            }
+            let signer_of = |idx: u32| {
+                (
+                    ValidatorId::new(u64::from(idx)),
+                    Arc::clone(&signers[idx as usize]),
+                )
+            };
+            let seat_config = SeatConfig {
+                verifier: Arc::clone(&verifier),
+                derivation: executor.derivation(),
+                code: Arc::clone(&executor) as _,
+                beacon_network: beacon_network.clone(),
+                beacon_config_hash,
+                shard_config: ShardConsensusConfig::default(),
+                mempool_config: MempoolConfig::default(),
+                provision_config: ProvisionConfig::default(),
+            };
+            let identities: Vec<(ValidatorId, Arc<dyn Signer>)> = plan
+                .seated
+                .iter()
+                .map(|&(idx, _)| idx)
+                .chain(plan.followers.iter().copied())
+                .map(signer_of)
+                .collect();
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
             let (event_tx, event_rx) = unbounded();
@@ -822,9 +802,15 @@ impl SimulationRunner {
                 .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
 
             // One `SimShardStorage` per hosted shard on this host.
-            let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
-                .keys()
-                .map(|s| (*s, open_store(*s, network_config.power_loss)))
+            let fresh = RecoveredState::default();
+            let chains: Vec<StartupChain<'_, SimShardStorage>> = by_shard
+                .iter()
+                .map(|(shard, validator_idxs)| StartupChain {
+                    shard: *shard,
+                    storage: open_store(*shard, network_config.power_loss),
+                    recovered: &fresh,
+                    vnodes: validator_idxs.iter().copied().map(signer_of).collect(),
+                })
                 .collect();
             // Single receiver per host: every hosted shard's sender is a
             // clone of the same `event_tx`, and the harness drains all
@@ -832,10 +818,10 @@ impl SimulationRunner {
             let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> =
                 by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let host = NodeHost::new(
-                vnode_inits,
-                storages,
+                seat_config,
+                chains,
+                identities,
                 beacon_storage,
-                beacon_network.clone(),
                 executor,
                 network.create_adapter(
                     NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
@@ -845,6 +831,7 @@ impl SimulationRunner {
                 event_tx.clone(),
                 topology_arc_for_host,
                 network_config.node_config.clone(),
+                now,
             );
 
             hosts.push(host);
@@ -1005,12 +992,15 @@ impl SimulationRunner {
         self.hosts.get(host as usize).map(NodeHost::beacon_storage)
     }
 
-    /// Number of shard-less beacon-following vnodes in `host`'s pool.
+    /// Number of identities `host` runs a beacon participant for and
+    /// seats on none of its shards.
     #[must_use]
     pub fn pooled_len(&self, host: NodeIndex) -> usize {
-        self.hosts
-            .get(host as usize)
-            .map_or(0, NodeHost::pooled_len)
+        self.hosts.get(host as usize).map_or(0, |h| {
+            h.participants()
+                .filter(|&validator| !h.hosts_validator(validator))
+                .count()
+        })
     }
 
     /// The shards `host` currently hosts. A grown host retains its
@@ -1179,6 +1169,38 @@ impl SimulationRunner {
         (0..host.vnodes_len(shard))
             .map(|v| host.vnode_state(shard, v))
             .collect()
+    }
+
+    /// The validators seated on `host`'s loop for `shard`, in vnode order;
+    /// empty if `host` doesn't host `shard`.
+    #[must_use]
+    pub fn seated_in(&self, host: NodeIndex, shard: ShardId) -> Vec<ValidatorId> {
+        self.hosts
+            .get(host as usize)
+            .map_or_else(Vec::new, |h| h.seated_validators(shard))
+    }
+
+    /// The shard of every chain registered with `host`'s fold, one entry
+    /// per registration.
+    #[must_use]
+    pub fn registered_chains(&self, host: NodeIndex) -> Vec<ShardId> {
+        self.hosts
+            .get(host as usize)
+            .map_or_else(Vec::new, NodeHost::registered_chains)
+    }
+
+    /// The oldest epoch whose window `host`'s fold retains.
+    #[must_use]
+    pub fn oldest_retained_epoch(&self, host: NodeIndex) -> Option<Epoch> {
+        self.hosts.get(host as usize)?.oldest_retained_epoch()
+    }
+
+    /// The identities `host` runs a beacon participant for.
+    #[must_use]
+    pub fn participants(&self, host: NodeIndex) -> Vec<ValidatorId> {
+        self.hosts
+            .get(host as usize)
+            .map_or_else(Vec::new, |h| h.participants().collect())
     }
 
     /// Host `host`'s current topology snapshot, or `None` if `host` is out of
@@ -1354,8 +1376,8 @@ impl SimulationRunner {
         }
 
         // Drain every host's construction-time output: the beacon loop arms
-        // its followers' beacon startup timers at construction, and a follower-only
-        // host runs no genesis ceremony to sweep them up.
+        // its participants' beacon startup timers at construction, and a
+        // host seating no vnode runs no genesis ceremony to sweep them up.
         for host_index in 0..num_hosts {
             let output = self.hosts[host_index as usize].drain_pending_output();
             self.process_step_output(host_index, output);
@@ -2062,7 +2084,7 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 }
 
 /// Project the host plans into the [`HostLayout`] the simulated transport
-/// routes on: each host's hosted-shard set (empty for a follower-only host)
+/// routes on: each host's hosted-shard set (empty for a pool host)
 /// and the validator→host map.
 fn network_layout(plans: &[HostPlan]) -> HostLayout {
     let mut hosted = Vec::with_capacity(plans.len());
@@ -2090,8 +2112,8 @@ fn network_layout(plans: &[HostPlan]) -> HostLayout {
 /// `vnodes_per_host` consecutive ROOT validators starting at
 /// `h * vnodes_per_host`.
 ///
-/// Every pool extra follows the beacon shard-less from boot. When
-/// [`SimConfig::dedicated_pool_hosts`] is set, each runs on a follower host
+/// Every pool extra runs only its beacon participant from boot. When
+/// [`SimConfig::dedicated_pool_hosts`] is set, each runs on a pool host
 /// of its own appended past the committee hosts; otherwise the extras
 /// co-host round-robin across the committee hosts.
 fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
@@ -2121,11 +2143,12 @@ fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
 }
 
 /// One host's construction plan: seated `(validator_idx, shard)` vnodes plus
-/// any shard-less beacon-follower validator ids.
+/// the shard-less validator ids it runs only a beacon participant for.
 struct HostPlan {
     /// Seated vnodes the host runs shard consensus for.
     seated: Vec<(u32, ShardId)>,
-    /// Shard-less validators the host follows the beacon for (the pool).
+    /// Shard-less validators the host runs a beacon participant for (the
+    /// pool).
     followers: Vec<u32>,
 }
 

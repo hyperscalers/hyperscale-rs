@@ -121,7 +121,7 @@ fn resolve_parent(
 
 /// What [`SpcInstance::handle`] tells its parent.
 ///
-/// Sub-machine-local — the parent (the `BeaconCoordinator`) drains
+/// Sub-machine-local — the parent (the `BeaconParticipant`) drains
 /// these and lifts them into either internal state mutations or
 /// further effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,7 +322,7 @@ impl ViewState {
 /// up via state-sync is the right move.
 ///
 /// Also the forward edge of the coordinator's pre-verification view
-/// window (see `BeaconCoordinator::spc_admission_ctx`): a message for a
+/// window (see `SpcDriver::admission_ctx`): a message for a
 /// view beyond `current + MAX_PENDING_EMPTY_VIEW_AHEAD` is one the FSM
 /// wouldn't act on, so it's dropped before the verify dispatch.
 pub(crate) const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
@@ -336,7 +336,7 @@ const MAX_PENDING_COMMITS: usize = 64;
 /// One SPC FSM instance, scoped to a single epoch.
 ///
 /// Owns one inner PC instance per view it enters. The
-/// `BeaconCoordinator` drives one `SpcInstance` per epoch. Handles
+/// `BeaconParticipant` drives one `SpcInstance` per epoch. Handles
 /// both the happy path (view 1 input → view 2 cert → commit) and
 /// view-change (empty-view attestations → indirect cert → skip
 /// ahead).
@@ -387,7 +387,7 @@ impl SpcInstance {
     /// `PcInstance` eagerly.
     ///
     /// `view_timeout` is the duration the parent (the
-    /// `BeaconCoordinator`) is asked to wait between `SetTimer { view }`
+    /// `BeaconParticipant`) is asked to wait between `SetTimer { view }`
     /// and `TimerExpired { view }` firing — the `2Δ` cap on a view's
     /// leader-proposal grace period before participants exchange
     /// empty-views and skip ahead.

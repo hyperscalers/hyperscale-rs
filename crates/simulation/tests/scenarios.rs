@@ -65,6 +65,7 @@ use hyperscale_scenarios::{
     a_recovered_venue_keeps_what_its_sibling_accepted,
     a_recovery_stalled_beside_a_cancelled_split_is_drawn_again,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_retained_terminated_loop_releases_its_hosts_schedule,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
@@ -2463,7 +2464,7 @@ fn shard_fork_drives_committee_recovery_sim() {
         let vnode = runner
             .first_vnode_state(member)
             .expect("committee host runs a vnode");
-        let schedule = vnode.beacon_coordinator().topology_schedule();
+        let schedule = vnode.schedule();
         let storage = runner
             .hosts_shard(member, shard)
             .expect("committee host serves the shard");
@@ -2736,6 +2737,40 @@ seeded!(request_loss_engages_at_seed: seed_42 = 42, seed_1337 = 1337, seed_2026 
 fn livelock_resolves_promptly_sim() {
     let mut cluster = SimCluster::with_accounts(&split_config(), 11, &livelock_accounts());
     livelock_resolves_promptly(&mut cluster);
+}
+
+/// A merge reforms the grow's terminated parent under the shard id it
+/// ran before. The host tears the terminated loop down, releasing its
+/// chain's registration, before it registers the reformed one: every
+/// host's fold then tracks exactly the chains its loops run.
+#[test]
+fn a_reshape_reform_deregisters_the_terminated_loop() {
+    let mut cluster = SimCluster::with_accounts(&split_config(), 11, &reshape_lifecycle_accounts());
+    merge_lifecycle(&mut cluster);
+    let runner = cluster.runner();
+    assert!(
+        (0..runner.num_hosts()).any(|host| runner.hosted_shards_of(host).contains(&ShardId::ROOT)),
+        "some host runs the reformed parent",
+    );
+    for host in 0..runner.num_hosts() {
+        let mut registered = runner.registered_chains(host);
+        registered.sort();
+        let mut running = runner.hosted_shards_of(host);
+        running.sort();
+        assert_eq!(
+            registered, running,
+            "host {host}'s fold tracks a chain no loop of it runs",
+        );
+    }
+}
+
+/// A split predecessor's loop a host keeps for serving stops holding the
+/// host's schedule once the predecessor's terminal folds, and its
+/// replica stays dissolved once the windows that showed it are gone.
+#[test]
+fn a_retained_terminated_loop_releases_its_hosts_schedule_sim() {
+    let mut cluster = SimCluster::with_accounts(&split_config(), 11, &genesis_accounts(1, 1));
+    a_retained_terminated_loop_releases_its_hosts_schedule(&mut cluster, epochs(40));
 }
 
 #[test]
