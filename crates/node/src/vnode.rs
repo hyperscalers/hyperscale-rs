@@ -15,16 +15,14 @@
 
 use std::sync::Arc;
 
-use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors, retention_floor};
-use hyperscale_core::SignerGate;
 use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconStorage, RecoveredState};
+use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconState, Derivation, GenesisConfigHash, LocalTimestamp, NetworkDefinition, ShardId, Signer,
+    Derivation, Epoch, GenesisConfigHash, NetworkDefinition, ShardId, Signer, TopologySchedule,
     ValidatorId, Verifier,
 };
 
@@ -34,9 +32,9 @@ use crate::NodeStateMachine;
 /// `NodeHost` constructor wraps each entry into a full [`Vnode`] and
 /// shares one `ShardIo` across same-shard entries.
 pub struct VnodeInit {
-    /// Per-validator state machine, already populated with its
-    /// `TopologyCoordinator` (the constructor reads `validator_id`
-    /// and `local_shard` from there).
+    /// The validator the vnode signs for.
+    pub validator: ValidatorId,
+    /// Per-validator state machine.
     pub state: NodeStateMachine,
     /// Signing identity for this validator's votes and proposals.
     /// Shared with the validator-bind service (production) by `Arc`
@@ -50,19 +48,18 @@ impl VnodeInit {
     #[must_use]
     pub fn into_vnode(self) -> Vnode {
         Vnode {
-            validator_id: self.state.validator_id(),
+            validator_id: self.validator,
             state: self.state,
             signer: self.signer,
-            gate: Arc::new(SignerGate::new()),
         }
     }
 }
 
 /// What every vnode a host seats is built with, whichever group it joins
-/// and whenever it joins it.
+/// and whenever it joins it, and what the host's fold is resumed with.
 #[derive(Clone)]
 pub struct SeatConfig {
-    /// Scheme verifier shared by every coordinator the seat builds.
+    /// Scheme verifier shared by every coordinator the host builds.
     pub verifier: Arc<dyn Verifier>,
     /// What this node derives envelopes through — its own caches, held
     /// by its own engine.
@@ -88,11 +85,10 @@ pub struct SeatConfig {
 pub struct SeatVnodeGroup<'a> {
     /// How each vnode is built.
     pub config: SeatConfig,
-    /// Host beacon storage; the group's coordinators resume from its
-    /// committed tip.
-    pub beacon_storage: &'a dyn BeaconStorage,
-    /// Wall clock (production) or sim time; bounds the resume floor.
-    pub now: LocalTimestamp,
+    /// The schedule the group's replicas start from, and the epoch the
+    /// beacon folded it at: the chain's registration reply, or the running
+    /// loop's held schedule for a vnode seated into it.
+    pub schedule: (Arc<TopologySchedule>, Epoch),
     /// Shard every vnode in the group targets.
     pub shard: ShardId,
     /// Boot state — loaded from retained storage, synthesized from a
@@ -157,19 +153,9 @@ impl GroupStores {
 /// Build one [`VnodeInit`] per vnode in a same-shard group, over one
 /// fresh set of [`GroupStores`].
 ///
-/// Each vnode is a beacon coordinator resumed from the host's committed
-/// beacon chain and a `NodeStateMachine` booted from `recovered`. The
-/// stores are shared across the group and into the `NodeHost`'s
-/// `SharedCaches`.
-///
-/// The coordinators' schedule history is bounded by [`retention_floor`]
-/// so every committee a consumer frontier still reaches stays
-/// resolvable.
-///
-/// # Panics
-///
-/// Panics if `beacon_storage` holds no committed beacon block — every
-/// host commits the genesis pair before seating vnodes.
+/// Each vnode is a `NodeStateMachine` booted from `recovered` over the
+/// group's schedule. The stores are shared across the group and into the
+/// `NodeHost`'s `SharedCaches`.
 #[must_use]
 pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
     let stores = GroupStores::fresh(args.recovered);
@@ -178,60 +164,22 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
 
 /// Build one [`VnodeInit`] per vnode over `stores`, the stores of the
 /// group the vnodes join.
-///
-/// # Panics
-///
-/// Panics if `beacon_storage` holds no committed beacon block.
 pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> Vec<VnodeInit> {
-    let (latest_block, latest_state) = args
-        .beacon_storage
-        .latest_committed()
-        .expect("beacon chain is non-empty after the genesis commit");
-    let local_chain = LocalChainAnchors {
-        committee: args.recovered.committee_anchor_wt(),
-        block: args.recovered.block_anchor_wt(),
-    };
-    let boot_floor = retention_floor(&latest_state, Some(local_chain.committee), args.now);
-    let beacon_history: Vec<BeaconState> = args
-        .beacon_storage
-        .states_since(boot_floor)
-        .into_iter()
-        .map(|state| state.as_ref().clone())
-        .collect();
     let config = &args.config;
-
+    let (schedule, epoch) = args.schedule;
     args.vnodes
         .into_iter()
         .map(|(validator, signer)| {
-            let mut beacon_coordinator = BeaconCoordinator::new(
-                Arc::clone(&config.verifier),
-                Arc::clone(&latest_block),
-                beacon_history.clone(),
-                validator,
-                args.shard,
-                Some((local_chain, args.recovered.committed_height)),
-                config.beacon_network.clone(),
-                config.beacon_config_hash,
-            );
-            // Seed the coordinator's clock from the seat instant so the
-            // startup-timer durations measure from now, not from a frozen
-            // zero that would arm the next epoch boundary a chain
-            // lifetime late.
-            beacon_coordinator.set_now(args.now);
-            // Resume the pending epoch's ratification registers from
-            // the durable record, so a restarted pool member abstains
-            // at spent rounds and keeps its lock.
-            if let Some(record) = args.beacon_storage.ratify_record(validator) {
-                beacon_coordinator.install_recovered_ratify_record(&record);
-            }
             let state = NodeStateMachine::new(
                 validator,
+                Arc::clone(&config.verifier),
                 Arc::clone(&config.derivation),
                 Arc::clone(&config.code),
                 args.shard,
                 &config.shard_config,
                 args.recovered,
-                beacon_coordinator,
+                Arc::clone(&schedule),
+                epoch,
                 config.mempool_config.clone(),
                 config.provision_config,
                 Arc::clone(&stores.provision_store),
@@ -240,85 +188,13 @@ pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> 
                 Arc::clone(&stores.finalization_store),
                 Arc::clone(&stores.crossing_index),
             );
-            VnodeInit { state, signer }
+            VnodeInit {
+                validator,
+                state,
+                signer,
+            }
         })
         .collect()
-}
-
-/// Caller-supplied bundle for constructing one shard-less beacon
-/// follower — the pooled counterpart of [`SeatVnodeGroup`].
-pub struct SeatFollower<'a> {
-    /// Scheme verifier for the follower's beacon coordinator.
-    pub verifier: Arc<dyn Verifier>,
-    /// Host beacon storage; the follower's coordinator resumes from its
-    /// committed tip and stays warm by committing every block it folds.
-    pub beacon_storage: &'a dyn BeaconStorage,
-    /// The network identity bound into beacon signatures.
-    pub beacon_network: NetworkDefinition,
-    /// Genesis config hash bound into beacon signatures alongside the
-    /// network.
-    pub beacon_config_hash: GenesisConfigHash,
-    /// Wall clock (production) or sim time; bounds the resume floor.
-    pub now: LocalTimestamp,
-    /// The validator this host follows the beacon for.
-    pub validator: ValidatorId,
-    /// Its signer. A follower signs only as a pending-anchor observer
-    /// drafted onto a short SPC committee; the bundle carries the real
-    /// signer for that and so a later seat does not have to thread one
-    /// in separately.
-    pub signer: Arc<dyn Signer>,
-}
-
-/// Build one shard-less beacon-follower [`VnodeInit`].
-///
-/// A beacon coordinator resumed from the host's committed beacon chain
-/// wrapped in a `shard: None` [`NodeStateMachine`]. The coordinator carries
-/// [`ShardId::ROOT`] as its placeholder home — it only routes the proposal
-/// fetches the coordinator dispatches and has no consensus effect for a
-/// follower — and no local chain, so no shard frontier holds its schedule's
-/// retention floor.
-///
-/// # Panics
-///
-/// Panics if `beacon_storage` holds no committed beacon block — every host
-/// commits the genesis pair before it follows or seats.
-#[must_use]
-pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
-    let (latest_block, latest_state) = args
-        .beacon_storage
-        .latest_committed()
-        .expect("beacon chain is non-empty after the genesis commit");
-    // A follower runs no shard chain, so no local frontier holds the floor.
-    let boot_floor = retention_floor(&latest_state, None, args.now);
-    let beacon_history: Vec<BeaconState> = args
-        .beacon_storage
-        .states_since(boot_floor)
-        .into_iter()
-        .map(|state| state.as_ref().clone())
-        .collect();
-    let mut beacon_coordinator = BeaconCoordinator::new(
-        args.verifier,
-        latest_block,
-        beacon_history,
-        args.validator,
-        ShardId::ROOT,
-        None,
-        args.beacon_network,
-        args.beacon_config_hash,
-    );
-    // Seed the coordinator's clock from the seat instant so the follower's
-    // startup-timer durations measure from now, not from a frozen zero.
-    beacon_coordinator.set_now(args.now);
-    // Resume the pending epoch's ratification registers from the
-    // durable record, so a restarted pool member abstains at spent
-    // rounds and keeps its lock.
-    if let Some(record) = args.beacon_storage.ratify_record(args.validator) {
-        beacon_coordinator.install_recovered_ratify_record(&record);
-    }
-    VnodeInit {
-        state: NodeStateMachine::follower(args.validator, beacon_coordinator),
-        signer: args.signer,
-    }
 }
 
 /// Per-validator bundle hosted by the `NodeHost`.
@@ -337,8 +213,4 @@ pub struct Vnode {
     /// `DispatchHandles` via `Arc` so delegated handlers running on
     /// thread pools can sign without re-entering the pinned thread.
     pub(crate) signer: Arc<dyn Signer>,
-
-    /// The release gate this vnode's beacon signatures pass through,
-    /// closed when the beacon loop removes it.
-    pub(crate) gate: Arc<SignerGate>,
 }

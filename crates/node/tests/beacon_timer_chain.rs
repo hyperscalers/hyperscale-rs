@@ -1,14 +1,14 @@
-//! Beacon timer-chain liveness at the vnode-seating seams.
+//! Beacon timer-chain liveness at the participant seam.
 //!
 //! Every ratify-eligible validator runs a live beacon timer chain: a
-//! beacon-loop follower's `BeaconRatifyTrigger` re-arm survives to the
-//! loop's timer seam instead of being discarded, and a vnode constructed mid-life —
-//! seated or pooled, no genesis ceremony — arms the beacon startup timers
-//! (`BeaconCommitteeStart` + `BeaconRatifyTrigger`) the way
-//! `initialize_genesis` arms them for a genesis-born vnode. Without the
-//! chain, a validator adopts beacon blocks by gossip but never proposes,
-//! never drives SPC rounds, and never casts ratify votes; enough of them
-//! in one ratify pool starves the pool quorum and parks the beacon.
+//! beacon participant's `BeaconRatifyTrigger` re-arm survives to the
+//! loop's timer seam instead of being discarded, and a participant arms
+//! the beacon startup timers (`BeaconCommitteeStart` +
+//! `BeaconRatifyTrigger`) the moment the host runs it. Without the chain,
+//! a validator adopts beacon blocks by gossip but never proposes, never
+//! drives SPC rounds, and never casts ratify votes; enough of them in one
+//! ratify pool starves the pool quorum and parks the beacon. A shard seat
+//! arms no beacon timer: its validator's chain runs on its participant.
 //!
 //! Vnodes co-hosted on one shard loop arm the same timers against their
 //! own deadlines, so each seat's timers are its own: a seat's arm never
@@ -28,10 +28,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::{
-    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, TimerOp, TimerOwner, VnodeInit,
-    seat_follower, seat_vnode_group, timer_event,
-};
+use hyperscale_node::{NodeConfig, NodeHost, SeatConfig, TimerOp, TimerOwner, timer_event};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -113,50 +110,48 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// A shard-less beacon follower for `committee[idx]`, built through the
-    /// real seating seam.
-    fn follower_init(&self, idx: usize) -> VnodeInit {
-        seat_follower(SeatFollower {
+    /// How the host builds its vnodes and its fold.
+    fn seat_config(&self) -> SeatConfig {
+        SeatConfig {
             verifier: Arc::new(BlsVerifier),
-            beacon_storage: self.beacon_storage.as_ref(),
+            derivation: Arc::new(StubVmStatics),
+            code: Arc::new(AllCodeRuns),
             beacon_network: NetworkDefinition::simulator(),
             beacon_config_hash: self.config_hash,
-            now: LocalTimestamp::ZERO,
-            validator: self.committee.validator_id(idx),
-            signer: self.committee.signer(idx),
-        })
+            shard_config: ShardConsensusConfig::default(),
+            mempool_config: MempoolConfig::default(),
+            provision_config: ProvisionConfig::default(),
+        }
     }
 
-    /// A shard-seated vnode group for `committee[idx]` for each of `idxs`
-    /// on `shard`, built through the real seating seam — the runtime-join
-    /// construction, not the genesis ceremony.
-    fn seated_inits(&self, idxs: &[usize], shard: ShardId) -> Vec<VnodeInit> {
-        let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> = idxs
-            .iter()
-            .map(|&idx| (self.committee.validator_id(idx), self.committee.signer(idx)))
-            .collect();
-        seat_vnode_group(SeatVnodeGroup {
-            config: SeatConfig {
-                verifier: Arc::new(BlsVerifier),
-                derivation: Arc::new(StubVmStatics),
-                code: Arc::new(AllCodeRuns),
-                beacon_network: NetworkDefinition::simulator(),
-                beacon_config_hash: self.config_hash,
-                shard_config: ShardConsensusConfig::default(),
-                mempool_config: MempoolConfig::default(),
-                provision_config: ProvisionConfig::default(),
-            },
-            beacon_storage: self.beacon_storage.as_ref(),
-            now: LocalTimestamp::ZERO,
+    /// `committee[idx]`'s identity and key.
+    fn identity(&self, idx: usize) -> (ValidatorId, Arc<dyn Signer>) {
+        (self.committee.validator_id(idx), self.committee.signer(idx))
+    }
+
+    /// Seat `committee[idx]` for each of `idxs` on `shard` at runtime,
+    /// through the real seating seam — the runtime-join construction, not
+    /// the genesis ceremony.
+    fn seat(
+        &self,
+        host: &mut NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>,
+        idxs: &[usize],
+        shard: ShardId,
+    ) {
+        let (event_tx, _event_rx) = unbounded::<HostEvent>();
+        host.add_shard(
             shard,
-            recovered: &RecoveredState::default(),
-            vnodes,
-        })
+            self.seat_config(),
+            &RecoveredState::default(),
+            idxs.iter().map(|&idx| self.identity(idx)).collect(),
+            SimShardStorage::new(shard_prefix_path(shard)),
+            event_tx,
+        );
     }
 
-    /// A follower-only host: no hosted shards, one pooled vnode. Returns
-    /// the network registry and the host's event receiver alongside so
-    /// tests can drive inbound gossip and observe routing.
+    /// A host with no hosted shard and one participant. Returns the
+    /// network registry and the host's event receiver alongside so tests
+    /// can drive inbound gossip and observe routing.
     fn follower_host(
         &self,
         idx: usize,
@@ -169,10 +164,10 @@ impl Fixture {
         let network = SimNetworkAdapter::new(Arc::clone(&registry));
         let (event_tx, event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            vec![self.follower_init(idx)],
-            BTreeMap::<ShardId, SimShardStorage>::new(),
+            self.seat_config(),
+            Vec::new(),
+            vec![self.identity(idx)],
             Arc::clone(&self.beacon_storage),
-            NetworkDefinition::simulator(),
             Arc::new(Executor::new(ExecutionMode::Serial)),
             network,
             SyncDispatch::new(),
@@ -180,6 +175,7 @@ impl Fixture {
             event_tx,
             Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
+            LocalTimestamp::ZERO,
         );
         (host, registry, event_rx)
     }
@@ -191,11 +187,11 @@ fn has_set(ops: &[TimerOp], want: &TimerId) -> bool {
         .any(|op| matches!(op, TimerOp::Set { id, .. } if id == want))
 }
 
-/// A beacon-loop follower's `BeaconRatifyTrigger` re-arm must reach the
-/// runner's timer seam. The ratify handler re-arms on every fire (early or
-/// due), so the chain stays alive only if the loop honors the `SetTimer` instead of
-/// discarding it — a follower is a ratify-pool voter, and the trigger is
-/// what starts its skip prevotes when an epoch stalls.
+/// A participant's `BeaconRatifyTrigger` re-arm must reach the runner's
+/// timer seam. The ratify handler re-arms on every fire (early or due), so
+/// the chain stays alive only if the loop honors the `SetTimer` instead of
+/// discarding it — a participant is a ratify-pool voter, and the trigger
+/// is what starts its skip prevotes when an epoch stalls.
 #[test]
 fn follower_ratify_rearm_survives_to_the_timer_seam() {
     let fix = fixture();
@@ -212,12 +208,10 @@ fn follower_ratify_rearm_survives_to_the_timer_seam() {
     );
 }
 
-/// A follower built mid-life (or at boot — it never runs the genesis
-/// ceremony either way) must arm the beacon startup timers when it enters
-/// the beacon loop, exactly as `initialize_genesis` arms them for a genesis-born
-/// vnode: `BeaconRatifyTrigger` because it votes in the ratify pool from
-/// the moment it is active, and `BeaconCommitteeStart` because any pool
-/// validator can be drawn onto the next epoch's SPC committee.
+/// A participant must arm the beacon startup timers when the host starts
+/// running it: `BeaconRatifyTrigger` because it votes in the ratify pool
+/// from the moment it is active, and `BeaconCommitteeStart` because any
+/// pool validator can be drawn onto the next epoch's SPC committee.
 #[test]
 fn follower_seat_arms_the_startup_timers() {
     let fix = fixture();
@@ -227,54 +221,42 @@ fn follower_seat_arms_the_startup_timers() {
 
     assert!(
         has_set(&out.timer_ops, &TimerId::BeaconRatifyTrigger),
-        "seating a follower must arm BeaconRatifyTrigger: got {:?}",
+        "a participant must arm BeaconRatifyTrigger: got {:?}",
         out.timer_ops
     );
     assert!(
         has_set(&out.timer_ops, &TimerId::BeaconCommitteeStart),
-        "seating a follower must arm BeaconCommitteeStart: got {:?}",
+        "a participant must arm BeaconCommitteeStart: got {:?}",
         out.timer_ops
     );
 }
 
-/// A vnode group seated mid-life — the runtime join both harnesses drive
-/// via `attach_shard` + committed-state resume, never `initialize_genesis`
-/// — must arm the beacon startup timers at its resume. Without them the
-/// vnode adopts beacon blocks by gossip but never bootstraps its own SPC
-/// participation or ratify voting.
+/// A vnode group seated mid-life arms no beacon timer at its resume: its
+/// validator's beacon chain runs on its participant, which the seat does
+/// not touch, so a second chain for the same identity never starts.
 #[test]
-fn midlife_seat_arms_the_startup_timers() {
+fn midlife_seat_arms_no_beacon_timer() {
     let fix = fixture();
-    // The host begins life with only a follower (validator 1); validator 0
-    // is then seated onto shard A at runtime, the grow-cohort shape.
-    let (mut host, _registry, _host_rx) = fix.follower_host(1);
-    let (event_tx, _event_rx) = unbounded::<HostEvent>();
-    host.add_shard(
-        fix.seated_inits(&[0], SHARD_A),
-        SimShardStorage::new(shard_prefix_path(SHARD_A)),
-        event_tx,
-    );
+    let (mut host, _registry, _host_rx) = fix.follower_host(0);
+    let _ = host.drain_pending_output();
+    fix.seat(&mut host, &[0], SHARD_A);
 
     let out = host.resume_shard_committed(SHARD_A, &RecoveredState::default());
 
     assert!(
-        has_set(&out.timer_ops, &TimerId::BeaconRatifyTrigger),
-        "a mid-life seat must arm BeaconRatifyTrigger at its resume: got {:?}",
-        out.timer_ops
-    );
-    assert!(
-        has_set(&out.timer_ops, &TimerId::BeaconCommitteeStart),
-        "a mid-life seat must arm BeaconCommitteeStart at its resume: got {:?}",
+        !has_set(&out.timer_ops, &TimerId::BeaconRatifyTrigger)
+            && !has_set(&out.timer_ops, &TimerId::BeaconCommitteeStart),
+        "a mid-life seat arms no beacon timer: got {:?}",
         out.timer_ops
     );
 }
 
-/// A pooled ratify-pool member's skip prevote must actually be signed —
+/// A ratify-pool member's skip prevote must actually be signed —
 /// persisted to the durable ratify register, then broadcast — not dropped
 /// as an unexpected action. The ratify fire lands past the epoch's skip
-/// deadline, so the tracker asks for a skip prevote; the beacon loop runs the
-/// same sign handler a seated vnode's dispatch runs, and the
-/// persist-before-sign register write is the observable proof it did.
+/// deadline, so the tracker asks for a skip prevote, and the
+/// persist-before-sign register write is the observable proof it was
+/// signed.
 #[test]
 fn pooled_ratify_voter_signs_its_skip_prevote() {
     let fix = fixture();
@@ -293,15 +275,15 @@ fn pooled_ratify_voter_signs_its_skip_prevote() {
 
     assert!(
         fix.beacon_storage.ratify_record(me).is_some(),
-        "the pooled voter's skip prevote must reach the durable ratify \
+        "the voter's skip prevote must reach the durable ratify \
          register (persist-before-sign), not be dropped"
     );
 }
 
-/// Ratify votes gossip globally, but the per-shard fan never reaches a
-/// host with no hosted shards — the additive host-level route must carry
-/// them to the beacon loop's channel, since a ratify voter precommits
-/// only when it observes a prevote quorum.
+/// Ratify votes gossip globally, but the per-shard handler never runs on
+/// a host with no hosted shards — the host-level route must carry them to
+/// the beacon loop's channel, since a ratify voter precommits only when
+/// it observes a prevote quorum.
 #[test]
 fn ratify_vote_gossip_routes_to_the_beacon_loop() {
     let fix = fixture();
@@ -346,44 +328,25 @@ fn set_owners(ops: &[TimerOp], want: &TimerId) -> Vec<TimerOwner> {
         .collect()
 }
 
-/// Two vnodes seated together on one shard loop each arm their own
-/// timers, and a fire reaches only the seat that armed it. Keyed by the
-/// loop alone, the later arm replaced the earlier one: a co-hosted
-/// proposer paced past a sibling's shorter deadline was woken early, found
-/// itself still paced, and was never woken again.
+/// Two vnodes seated together on one shard loop each own their timers:
+/// a fire reaches only the seat that armed it, and its re-arm is that
+/// seat's alone. Keyed by the loop alone, a later arm replaced an earlier
+/// one: a co-hosted proposer paced past a sibling's shorter deadline was
+/// woken early, found itself still paced, and was never woken again.
 #[test]
 fn co_hosted_seats_own_their_timers() {
     let fix = fixture();
     let (mut host, _registry, _host_rx) = fix.follower_host(2);
-    let (event_tx, _event_rx) = unbounded::<HostEvent>();
-    host.add_shard(
-        fix.seated_inits(&[0, 1], SHARD_A),
-        SimShardStorage::new(shard_prefix_path(SHARD_A)),
-        event_tx,
-    );
-    let first = TimerOwner::Seat(SHARD_A, fix.committee.validator_id(0));
-    let second = TimerOwner::Seat(SHARD_A, fix.committee.validator_id(1));
-
-    let out = host.resume_shard_committed(SHARD_A, &RecoveredState::default());
-    assert_eq!(
-        set_owners(&out.timer_ops, &TimerId::BeaconRatifyTrigger),
-        vec![first, second],
-        "each seat must arm its own ratify trigger",
-    );
-
+    fix.seat(&mut host, &[0, 1], SHARD_A);
     host.set_time(LocalTimestamp::from_millis(1_000));
-    let out = host.step(timer_event(&TimerId::BeaconRatifyTrigger, first));
-    let owners: Vec<TimerOwner> = out
-        .timer_ops
-        .iter()
-        .map(|op| match op {
-            TimerOp::Set { owner, .. } | TimerOp::Cancel { owner, .. } => *owner,
-        })
-        .filter(|owner| matches!(owner, TimerOwner::Seat(..)))
-        .collect();
-    assert!(
-        !owners.is_empty() && owners.iter().all(|owner| *owner == first),
-        "a seat's fire must reach that seat alone: got {:?}",
-        out.timer_ops,
-    );
+    for idx in [0, 1] {
+        let seat = TimerOwner::Seat(SHARD_A, fix.committee.validator_id(idx));
+        let out = host.step(timer_event(&TimerId::Cleanup, seat));
+        let owners = set_owners(&out.timer_ops, &TimerId::Cleanup);
+        assert!(
+            !owners.is_empty() && owners.iter().all(|owner| *owner == seat),
+            "a seat's fire must reach that seat alone: got {:?}",
+            out.timer_ops,
+        );
+    }
 }

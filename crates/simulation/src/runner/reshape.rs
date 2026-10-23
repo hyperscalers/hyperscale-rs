@@ -466,10 +466,10 @@ impl SimulationRunner {
         self.seat_shard_with_genesis(host, shard, &validators, storage, &genesis, &recovered);
     }
 
-    /// Install a prepared store on `host`: seat one vnode per `validator`,
-    /// commit the genesis through the normal pipeline, and retire any pool
-    /// follower the seated validator carried. Tears down a stale chain under
-    /// the same id first — a merge reforms the grow's terminated parent.
+    /// Install a prepared store on `host`: seat one vnode per `validator`
+    /// and commit the genesis through the normal pipeline. Tears down a
+    /// stale chain under the same id first — a merge reforms the grow's
+    /// terminated parent.
     fn seat_shard_with_genesis(
         &mut self,
         host: NodeIndex,
@@ -493,11 +493,10 @@ impl SimulationRunner {
             return;
         }
         let _ = self.hosts[host as usize].remove_shard(shard);
-        let inits = self.runtime_vnode_inits(host, validators, shard, recovered);
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
-        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
+        self.add_shard(host, shard, validators, storage, recovered);
         self.hosts[host as usize].initialize_shard_genesis(genesis);
         self.hosts[host as usize].flush_all_batches();
         let output = self.hosts[host as usize].drain_pending_output();
@@ -518,9 +517,6 @@ impl SimulationRunner {
                 },
             ),
         );
-        for &validator in validators {
-            self.hosts[host as usize].drop_pooled_vnode(validator);
-        }
     }
 
     /// Whether `validator`'s fixed home host is `host`.
@@ -591,9 +587,9 @@ impl SimulationRunner {
                         .is_some_and(|storage| storage.committed_height() > BlockHeight::GENESIS)
                 });
                 let seated: Vec<ValidatorId> = self
-                    .shard_vnodes(leaf)
+                    .hosts
                     .iter()
-                    .map(|vnode| vnode.validator_id())
+                    .flat_map(|host| host.seated_validators(leaf))
                     .collect();
                 let committee = topology_snapshot.committee_for_shard(leaf);
                 past_genesis

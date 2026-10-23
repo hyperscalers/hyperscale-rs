@@ -46,4 +46,12 @@ impl RatifyRegisterStore for SimBeaconStorage {
             .get(&validator)
             .cloned()
     }
+
+    fn restore_ratify_record(&self, validator: ValidatorId, record: &RatifyVoteRecord) {
+        crash_point::write();
+        write_or_recover(&self.inner)
+            .ratify_records
+            .insert(validator, record.clone());
+        self.sync();
+    }
 }

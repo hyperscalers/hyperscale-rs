@@ -24,8 +24,9 @@ use hyperscale_types::{
     ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
     SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
     SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StandingAnswers, StateClaim,
-    StoredReceipt, SubstateKey, TickId, Timeout, Transaction, TxHash, TxOutcome, TxResolution,
-    ValidatorId, VerdictCells, Verifiable, VerificationKind, Verified, WeightedTimestamp,
+    StoredReceipt, SubstateKey, TickId, Timeout, TopologySchedule, Transaction, TxHash, TxOutcome,
+    TxResolution, ValidatorId, VerdictCells, Verifiable, VerificationKind, Verified,
+    WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, QcSubject};
@@ -409,8 +410,8 @@ pub enum ProtocolEvent {
 
     /// A shard double-vote pair arrived over global gossip and still
     /// needs verification. Self-authenticating — no sender trust; the
-    /// state machine resolves the accused pubkey from its topology and
-    /// dispatches `VerifyShardVoteEquivocation`.
+    /// host's beacon loop resolves the accused pubkey from its fold and
+    /// checks the pair off-thread.
     UnverifiedShardVoteEquivocationReceived {
         /// The pair off the wire.
         evidence: Box<ShardVoteEquivocation>,
@@ -800,7 +801,7 @@ pub enum ProtocolEvent {
     },
 
     /// A synced beacon block is ready to apply. The runner's beacon
-    /// `Sync` machine fetched it from a peer; `BeaconCoordinator` runs it
+    /// `Sync` machine fetched it from a peer; the beacon fold runs it
     /// through the same cert verification + adoption path as a gossiped
     /// block. Serial delivery guarantees `block.epoch() == tip + 1`.
     BeaconBlockSyncReadyToApply {
@@ -1060,7 +1061,7 @@ pub enum ProtocolEvent {
         result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
     },
 
-    /// A shard-witness chunk landed. `BeaconCoordinator` recomputes the
+    /// A shard-witness chunk landed. The beacon fold recomputes the
     /// anchor block's witness-window root from the payloads plus the range
     /// proof and admits the run whole.
     ShardWitnessesReceived {
@@ -1232,12 +1233,15 @@ pub enum ProtocolEvent {
     /// from the pool if the fast path hasn't already.
     BeaconSpcInputDwellTimer,
 
-    /// A committed beacon block + its state have been persisted to
-    /// `BeaconStorage`. `BeaconCoordinator` can now drop in-memory
-    /// state tied to the pre-commit world.
+    /// The host's beacon loop committed a beacon block to
+    /// `BeaconStorage` and folded the schedule it carries. A replica
+    /// holds the schedule if it is newer than its own and replays what
+    /// waited on the epoch.
     BeaconBlockPersisted {
         /// Epoch that was persisted.
         epoch: Epoch,
+        /// The schedule the beacon folded at `epoch`.
+        schedule: Arc<TopologySchedule>,
     },
 }
 

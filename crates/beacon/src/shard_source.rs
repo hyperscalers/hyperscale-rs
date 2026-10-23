@@ -148,7 +148,7 @@ pub struct ShardSourceTracker {
 /// An anchor's outstanding chunk fetch. Carries the boundary block
 /// `height` alongside the in-flight run so an eviction can name the
 /// cancelled fetch as the [`ChunkFetchId`] the runner's
-/// `FetchIds::ShardWitnesses` handler matches against.
+/// `BeaconFetchIds::Witnesses` handler matches against.
 #[derive(Debug)]
 struct PendingFetch {
     height: BlockHeight,
@@ -427,7 +427,7 @@ impl ShardSourceTracker {
     /// Empty per-anchor maps are removed.
     ///
     /// Returns the in-flight fetch ids that were dropped, so the caller can
-    /// cancel them via `FetchIds::ShardWitnesses` — the witness is now
+    /// cancel them via `BeaconFetchIds::Witnesses` — the witness is now
     /// consumed on-chain and a future contribution can't include it, so the
     /// runner's in-flight slot should release rather than pin on a payload
     /// the tracker would only evict on arrival.
@@ -616,7 +616,7 @@ impl ShardSourceTracker {
     /// headers arrive.
     ///
     /// Returns the in-flight fetch ids that were dropped, so the caller
-    /// can cancel them via `FetchIds::ShardWitnesses` — same contract
+    /// can cancel them via `BeaconFetchIds::Witnesses` — same contract
     /// as [`Self::evict_consumed`], keeping the runner's fetch slots from
     /// pinning on payloads no longer wanted.
     pub fn evicted_from_committee(&mut self) -> Vec<ChunkFetchId> {
@@ -988,7 +988,7 @@ mod tests {
 
     /// Eviction hands back the in-flight fetches it dropped — full
     /// `(shard, height, anchor, lo, hi)` ids — so the coordinator can
-    /// cancel them via `FetchIds::ShardWitnesses`. A run starting at or
+    /// cancel them via `BeaconFetchIds::Witnesses`. A run starting at or
     /// above the watermark stays in flight.
     #[test]
     fn evict_consumed_returns_abandoned_in_flight_fetches() {

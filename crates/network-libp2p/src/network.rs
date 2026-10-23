@@ -143,8 +143,8 @@ impl Libp2pNetwork {
         // The validator address book is a transport concern, so the network
         // registers its own ingest handlers rather than the node layer: the
         // gossip handler brings up the Global topic subscription and covers
-        // shard-hosting nodes; the host handler covers a shard-less pool
-        // follower, whose warm book is exactly what a later committee draw
+        // shard-hosting nodes; the host handler covers a shard-less host,
+        // whose warm book is exactly what a later committee draw
         // depends on. Ingest is idempotent, so the overlap on multi-shard
         // hosts is harmless.
         let ingest = Arc::clone(&network.adapter);

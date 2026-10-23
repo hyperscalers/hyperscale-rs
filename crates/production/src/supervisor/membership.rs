@@ -15,17 +15,19 @@
 //! teardown asks "does this host hold any window role" (full membership,
 //! riders included).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use hyperscale_beacon::ChainRegistration;
 use hyperscale_crypto_bls::BlsVerifier;
-use hyperscale_node::host::{attach_shard, detach_shard};
+use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
+use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::startup::holds_window_role;
 use hyperscale_node::{
-    SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, installed_network_genesis_block,
-    network_genesis_block, seat_vnode_group,
+    Registration, RegistrationReply, SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat,
+    installed_network_genesis_block, network_genesis_block, seat_vnode_group,
 };
 use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, holds_state};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};
@@ -36,9 +38,9 @@ use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use super::{LoopStart, ShardSupervisor, SupervisorEvent};
+use super::{LoopStart, Registering, ShardSupervisor, SupervisorEvent};
 use crate::bootstrap::bootstrap_shard_state;
-use crate::runner::{ShardChannels, ShardControl, VnodeConfig, consensus_clock};
+use crate::runner::{ShardChannels, ShardControl, VnodeConfig};
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
 /// the imported storage verified against the attested anchor, plus the
@@ -80,14 +82,16 @@ impl ShardSupervisor {
     /// first, or park until the anchor reaches this host. A join for a
     /// shard still tearing down queues and replays once the teardown
     /// finishes; one for a shard already running seats into its loop,
-    /// and one for a shard parked on its anchor joins the parked vnodes.
+    /// one for a shard whose seat is registering seats with it, and one
+    /// for a shard parked on its anchor joins the parked vnodes.
     pub(super) fn join(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
-        if self.bootstrapping.contains_key(&shard) {
-            warn!(shard = ?shard, "Join rejected: shard still bootstrapping");
-            return;
-        }
         if vnodes.is_empty() || vnodes.iter().any(|v| v.local_shard != shard) {
             warn!(shard = ?shard, "Join rejected: vnodes must be non-empty and target the shard");
+            return;
+        }
+        let registering = self.registering.values().any(|r| r.shard == shard);
+        if self.bootstrapping.contains_key(&shard) && !registering {
+            warn!(shard = ?shard, "Join rejected: shard still bootstrapping");
             return;
         }
         if self.draining.contains(&shard) {
@@ -119,6 +123,16 @@ impl ShardSupervisor {
             || self.pending_reshape_prep.contains_key(&shard)
         {
             info!(shard = ?shard, "Join superseded by an active reshape duty; the orchestrator seats it");
+            return;
+        }
+        if let Some(pending) = self.registering.values_mut().find(|r| r.shard == shard) {
+            let ids = self.bootstrapping.entry(shard).or_default();
+            for vnode in vnodes {
+                if ids.insert(vnode.validator_id) {
+                    pending.vnodes.push(vnode.clone());
+                }
+            }
+            info!(shard = ?shard, "Join seats with the shard's in-flight registration");
             return;
         }
         if self.shards.contains_key(&shard) {
@@ -349,6 +363,11 @@ impl ShardSupervisor {
     /// committed through the freshly attached loop before the thread
     /// spawns: a split child's flip commits its derived genesis, and a
     /// fresh store on a never-crossed genesis shard the network's.
+    ///
+    /// The chain registers with the host's beacon loop first, and the
+    /// loop is built only once the registration comes back, from the
+    /// schedule it carries: the join stays pending across the reply,
+    /// as it does across a bootstrap, and a leave meanwhile releases it.
     pub(super) fn seat_shard_with_genesis(
         &mut self,
         shard: ShardId,
@@ -357,29 +376,108 @@ impl ShardSupervisor {
         recovered: &RecoveredState,
         genesis: Option<&Block>,
     ) {
-        let inits = self.build_vnode_inits(shard, vnodes, recovered);
-        let seated = inits.len();
         let (channels, callback_tx) = ShardChannels::new();
+        self.registering.retain(|_, pending| pending.shard != shard);
+        self.bootstrapping
+            .insert(shard, vnodes.iter().map(|v| v.validator_id).collect());
+        self.registrations += 1;
+        let seat = self.registrations;
+        let events = self.events_tx.clone();
+        let reply = RegistrationReply(Arc::new(move |registration| {
+            // Send failure means the runner is shutting down.
+            let _ = events.send(SupervisorEvent::Registered {
+                shard,
+                seat,
+                registration,
+            });
+        }));
+        let _ = self.process.beacon_event_sender().send(HostEvent::Beacon(
+            BeaconScopedInput::Register {
+                shard,
+                anchors: chain_anchors(recovered),
+                height: recovered.committed_height,
+                sender: callback_tx.clone(),
+                reply,
+            },
+        ));
+        self.registering.insert(
+            seat,
+            Registering {
+                shard,
+                vnodes: vnodes.to_vec(),
+                storage,
+                recovered: recovered.clone(),
+                genesis: genesis.cloned(),
+                channels,
+                sender: callback_tx,
+            },
+        );
+    }
+
+    /// A chain's registration came back: build its loop from the schedule
+    /// it carries, commit its genesis or restore its committed state, and
+    /// spawn it. A seat a later one superseded, or one every vnode left
+    /// meanwhile, is gone, and its registration is released. A reshape
+    /// store-prep held behind the seat runs once it settles.
+    pub(super) fn on_registered(&mut self, shard: ShardId, seat: u64, registration: &Registration) {
+        let pending = self.registering.remove(&seat);
+        let ids = pending
+            .as_ref()
+            .and_then(|_| self.bootstrapping.remove(&shard));
+        if let (Some(pending), Some(ids)) = (pending, ids) {
+            self.seat_registered(pending, &ids, registration);
+        } else {
+            info!(shard = ?shard, "Registration came back for an abandoned seat; released");
+            self.deregister(registration.token);
+        }
+        self.resume_pending_reshape_prep();
+    }
+
+    /// Build and spawn a registered seat's loop over the vnodes still
+    /// pending.
+    fn seat_registered(
+        &mut self,
+        pending: Registering,
+        ids: &BTreeSet<ValidatorId>,
+        registration: &Registration,
+    ) {
+        let Registering {
+            shard,
+            mut vnodes,
+            storage,
+            recovered,
+            genesis,
+            channels,
+            sender,
+        } = pending;
+        vnodes.retain(|vnode| ids.contains(&vnode.validator_id));
+        let inits = self.build_vnode_inits(shard, &vnodes, registration, &recovered);
+        let seated = inits.len();
         let shard_loop = attach_shard(
             &self.process,
             &self.node_config,
+            registration,
             inits,
             (*storage).clone(),
-            callback_tx,
+            sender,
         );
-        let start = genesis.map_or(LoopStart::Resume(recovered), LoopStart::Genesis);
+        let start = genesis
+            .as_ref()
+            .map_or(LoopStart::Resume(&recovered), LoopStart::Genesis);
         self.start_loop(shard_loop, channels, start);
         self.storages
             .lock()
             .expect("storages lock")
             .insert(shard, storage);
-        // A seated validator now drives its beacon from this shard's thread,
-        // so retire its beacon-loop follower if it had one (it drained here from a
-        // prior shard, or started pooled and was just drawn into a committee).
-        for cfg in vnodes {
-            self.unfollow_in_pool(cfg.validator_id);
-        }
         info!(shard = ?shard, vnodes = seated, "Shard joined at runtime");
+    }
+
+    /// Release a chain's registration with the host's beacon loop.
+    fn deregister(&self, token: ChainRegistration) {
+        let _ = self
+            .process
+            .beacon_event_sender()
+            .send(HostEvent::Beacon(BeaconScopedInput::Deregister(token)));
     }
 
     /// Seat `vnodes` on `shard`'s running loop, or rebuild the loop first
@@ -670,8 +768,7 @@ impl ShardSupervisor {
     }
 
     /// A running loop admitted a queued seat: count the validator among
-    /// the shard's, and retire its beacon-loop follower, since it drives its
-    /// beacon from this shard now.
+    /// the shard's.
     pub(super) fn on_seated(&mut self, shard: ShardId, validator: ValidatorId) {
         let Some(entry) = self.shards.get_mut(&shard) else {
             return;
@@ -681,7 +778,6 @@ impl ShardSupervisor {
         if !entry.validator_ids.contains(&id) {
             entry.validator_ids.push(id);
         }
-        self.unfollow_in_pool(validator);
         info!(shard = ?shard, validator = id, "Seat admitted on a running shard");
     }
 
@@ -694,7 +790,11 @@ impl ShardSupervisor {
             pending.remove(&validator);
             if pending.is_empty() {
                 self.bootstrapping.remove(&shard);
+                // A seat registering releases its store now; its reply,
+                // finding no seat, releases the registration.
+                self.registering.retain(|_, pending| pending.shard != shard);
                 info!(shard = ?shard, "Last pending vnode left during bootstrap; join abandoned");
+                self.resume_pending_reshape_prep();
             } else {
                 info!(
                     shard = ?shard,
@@ -739,9 +839,6 @@ impl ShardSupervisor {
             remaining = entry.validator_ids.len(),
             "Vnode left; shard stays up for remaining local vnodes"
         );
-        if !self.validator_on_any_shard(validator) {
-            self.follow_in_pool(validator);
-        }
     }
 
     /// Tear a hosted shard's thread down and unwire it off the loop:
@@ -804,7 +901,6 @@ impl ShardSupervisor {
         // A shard that stays up releases, by the same rule applied per
         // validator, each vnode that no longer holds a role in it, while
         // another seat keeps the loop running.
-        let mut released: Vec<ValidatorId> = Vec::new();
         for (&shard, entry) in &mut self.shards {
             for id in entry.validator_ids.clone() {
                 let validator = ValidatorId::new(id);
@@ -817,14 +913,8 @@ impl ShardSupervisor {
                         .is_ok()
                 {
                     entry.validator_ids.retain(|&kept| kept != id);
-                    released.push(validator);
                     info!(shard = ?shard, validator = id, "Vnode left a running shard");
                 }
-            }
-        }
-        for validator in released {
-            if !self.validator_on_any_shard(validator) {
-                self.follow_in_pool(validator);
             }
         }
     }
@@ -925,18 +1015,6 @@ impl ShardSupervisor {
         self.scrub_rpc_state(shard, validator_ids);
         self.draining.remove(&shard);
         info!(shard = ?shard, "Shard left and torn down");
-        // A departed validator that runs no other shard would go dark — no
-        // vnode to fold the beacon and raise its own re-seat trigger. Keep
-        // it following on the beacon loop instead; the host's beacon storage stays
-        // warm for the eventual re-seat. A relocation that already seated
-        // the destination leaves the validator on that shard, so it is not
-        // pooled; a race that pools it is undone when the seat lands.
-        for &id in validator_ids {
-            let validator = ValidatorId::new(id);
-            if !self.validator_on_any_shard(validator) {
-                self.follow_in_pool(validator);
-            }
-        }
         if let Some(Rebuild::Swapping(done, replaced)) = self.rebuilding.remove(&shard) {
             self.swap_rebuilt(*done, storage, replaced);
         } else {
@@ -1003,18 +1081,18 @@ impl ShardSupervisor {
     }
 
     /// Build one `VnodeInit` per joining vnode via [`seat_vnode_group`],
-    /// resuming from the host's committed beacon chain and booting from
+    /// over the schedule `registration` handed back and booting from
     /// `recovered`.
     fn build_vnode_inits(
         &self,
         shard: ShardId,
         vnodes: &[VnodeConfig],
+        registration: &Registration,
         recovered: &RecoveredState,
     ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
             config: self.seat_config(),
-            beacon_storage: self.process.beacon_storage().as_ref(),
-            now: consensus_clock(self.genesis_offset_ms),
+            schedule: (Arc::clone(&registration.schedule), registration.epoch),
             shard,
             recovered,
             vnodes: vnodes

@@ -178,8 +178,8 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 /// The genesis both runners boot from: the committed beacon chain — block,
 /// folded state, config hash — plus the topology projected from that state.
 pub struct GenesisBoot {
-    /// Genesis [`CertifiedBeaconBlock`], verified for each per-vnode
-    /// `BeaconCoordinator` to resume from.
+    /// Genesis [`CertifiedBeaconBlock`], verified for each host's beacon
+    /// fold to resume from.
     pub(crate) block: Arc<Verified<CertifiedBeaconBlock>>,
     /// Folded genesis [`BeaconState`].
     pub state: Arc<BeaconState>,

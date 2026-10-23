@@ -13,8 +13,8 @@ mod fan_out;
 mod network_handlers;
 mod tx_status;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -29,8 +29,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::{
-    Derivation, Epoch, MAX_TXS_PER_BLOCK, RatifyPhase, RatifyRound, ShardId, SpcView,
-    TopologySchedule, TopologySnapshot, Transaction, Unresolved, ValidatorId, Verifier,
+    Derivation, Epoch, MAX_TXS_PER_BLOCK, ShardId, TopologySchedule, TopologySnapshot, Transaction,
+    Unresolved, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -47,83 +47,6 @@ use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 /// every use; the map is swapped only when shard participation changes,
 /// and the reconfiguring thread is the sole writer.
 pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<HostEvent>>>>;
-
-/// Beacon-signing fence for one hosted validator: which shard's vnode
-/// signs SPC consensus within the current `(epoch, view)`, and the
-/// last ratify-vote position any vnode signed.
-struct BeaconSignerSeat {
-    /// The `(epoch, view)` most recently signed under this validator's
-    /// identity and the vnode that claimed it — the claimant's hosted
-    /// shard, or `None` for the beacon loop, which is a distinct
-    /// claimant even when a hosted shard is `ShardId::ROOT` (a
-    /// single-shard network's only leaf). A view belongs wholly to its
-    /// claimant — every phase of one view comes from one coordinator's
-    /// state — while any later view is claimable by whichever vnode
-    /// dispatches into it first. Recorded at the dispatch funnel before
-    /// the signature exists, so the fence is conservative even when the
-    /// dispatched action never sends.
-    claim: Option<(Epoch, SpcView, Option<ShardId>)>,
-    /// Last ratify-vote position any of this validator's vnodes was
-    /// allowed to sign, strictly monotone process-wide. Independent of
-    /// the view claim: a torn-down vnode's successor continues from
-    /// the next position rather than losing the epoch, and two live
-    /// co-hosted vnodes at the same tip dedup their identical intents
-    /// through the same monotonicity.
-    max_ratify: Option<(Epoch, RatifyRound, RatifyPhase)>,
-}
-
-impl BeaconSignerSeat {
-    const fn vacant() -> Self {
-        Self {
-            claim: None,
-            max_ratify: None,
-        }
-    }
-
-    /// Whether `my_shard`'s vnode may sign at `(epoch, view)` under
-    /// this validator's identity: the claimant of the current view
-    /// re-passes freely (phase progression, retries — its coordinator
-    /// state machine keeps the content consistent), a strictly later
-    /// view transfers the claim to the caller, and anything else is
-    /// denied. Two vnodes can therefore never both sign within one
-    /// `(epoch, view)` — no conflicting SPC signatures at one position
-    /// — while a claimant that dies or degrades costs exactly its one
-    /// view: the sibling's view-change dispatch claims the next.
-    fn allow(&mut self, my_shard: Option<ShardId>, epoch: Epoch, view: SpcView) -> bool {
-        match self.claim {
-            Some((e, v, claimant)) if (e, v) == (epoch, view) => claimant == my_shard,
-            Some((e, v, _)) if (epoch, view) > (e, v) => {
-                self.claim = Some((epoch, view, my_shard));
-                true
-            }
-            Some(_) => false,
-            None => {
-                self.claim = Some((epoch, view, my_shard));
-                true
-            }
-        }
-    }
-
-    /// Whether a vnode may sign the ratify vote at `position`: strictly
-    /// greater than every position already allowed, whichever vnode
-    /// emitted it. Never two signatures at one `(epoch, round, phase)`
-    /// — cross-vnode equivocation is impossible by construction — and
-    /// never a fenced-out epoch: a successor's first fresh position
-    /// passes.
-    ///
-    /// The ordering also drops the fast-forward re-prevote a
-    /// future-round polka schedules behind its precommit (same round,
-    /// lower phase). Benign: the polka is itself a prevote quorum for
-    /// the value, and the lock re-prevotes at the next round.
-    fn allow_ratify(&mut self, position: (Epoch, RatifyRound, RatifyPhase)) -> bool {
-        if Some(position) > self.max_ratify {
-            self.max_ratify = Some(position);
-            true
-        } else {
-            false
-        }
-    }
-}
 
 /// Process-scoped resources shared across every hosted shard.
 ///
@@ -165,19 +88,9 @@ where
 
     /// Per-host channel back to the runner for the beacon loop's events.
     /// In the sim this is the host's single event channel (shared with the
-    /// per-shard senders). The loop's own continuations and fetch answers
-    /// arrive here, and the host-level beacon handler, registered on every
-    /// host, pushes gossip here only while [`Self::beacon_route_active`] is
-    /// set.
+    /// per-shard senders). Beacon gossip, what the replicas report, and the
+    /// loop's own continuations and fetch answers arrive here.
     pub(crate) beacon_event_sender: Sender<HostEvent>,
-
-    /// Whether the beacon loop holds a follower to feed beacon gossip to.
-    /// The host-level beacon gossip handler is registered unconditionally,
-    /// so a follower added at runtime is fed, but routes gossip onto
-    /// [`Self::beacon_event_sender`] only while this is set: true while the
-    /// loop holds a follower, false while it holds none, so a loop with no
-    /// follower is not handed gossip it would fold for nobody.
-    beacon_route_active: Arc<AtomicBool>,
 
     /// The serial the next beacon-loop attachment takes. Process-wide, so
     /// an attachment made by a rebuilt loop never repeats one an earlier
@@ -233,26 +146,6 @@ where
     /// can hold it without capturing the whole `ProcessIo`.
     pub(crate) canonical_txs: Arc<CanonicalTxs>,
 
-    /// One beacon-signing seat per hosted validator. A validator's
-    /// vnodes overlap across a split flip or a relocation drain, and
-    /// every vnode runs the full beacon protocol under the same
-    /// identity — two of them emitting independently derived SPC
-    /// messages is equivocation, which the beacon fold jails
-    /// permanently. `ShardLoop::dispatch_delegated_action` drops any
-    /// beacon signing action [`Self::allow_beacon_signing`] denies, so
-    /// exactly one vnode per validator signs while the rest track
-    /// passively.
-    ///
-    /// The fence is in-memory and scoped to one process lifetime: a
-    /// restart clears every seat and the per-seat high-water epoch, so the
-    /// first post-restart emission per validator claims its seat freshly.
-    /// The fence guards concurrent vnodes; across a restart, the durable
-    /// [`BeaconVoteRegisterStore`](hyperscale_storage::BeaconVoteRegisterStore)
-    /// the sign handlers admit each PC vote and empty view through is
-    /// what keeps a fresh claimant from contradicting a pre-crash
-    /// signature.
-    beacon_signers: Mutex<HashMap<ValidatorId, BeaconSignerSeat>>,
-
     /// Submissions held while this host seats the reshape successor they
     /// route to, oldest first. Routing reads the shard map under this
     /// lock, and every change to that map or to the topology re-routes
@@ -302,7 +195,6 @@ where
             dispatch,
             shard_event_senders: Arc::new(ArcSwap::from_pointee(shard_event_senders)),
             beacon_event_sender,
-            beacon_route_active: Arc::new(AtomicBool::new(false)),
             next_attachment: AtomicU64::new(0),
             topology_snapshot,
             apply_topology_epoch: Mutex::new(Epoch::GENESIS),
@@ -312,20 +204,14 @@ where
             beacon_commit: BeaconCommitCoordinator::new(),
             tx_status: Arc::new(TxStatusCache::new()),
             canonical_txs: Arc::new(CanonicalTxs::new()),
-            beacon_signers: Mutex::new(HashMap::new()),
             parked_submissions: Mutex::new(VecDeque::new()),
         }
     }
 
-    /// Mark whether the beacon loop has followers draining the beacon
-    /// channel. Set true when it gains one (host construction with
-    /// followers, `add_pooled_vnode`, or the production supervisor's
-    /// beacon thread over a follower set) and false when it has none. The
-    /// host-level beacon gossip handler reads this before routing a
-    /// committed block, so a follower added after startup is fed and a
-    /// loop with none drops blocks rather than folding them for nobody.
-    pub fn set_beacon_route_active(&self, active: bool) {
-        self.beacon_route_active.store(active, Ordering::Release);
+    /// The host's beacon loop's channel.
+    #[must_use]
+    pub const fn beacon_event_sender(&self) -> &Sender<HostEvent> {
+        &self.beacon_event_sender
     }
 
     /// A fresh attachment of `validator` to the beacon loop.
@@ -334,66 +220,6 @@ where
             validator,
             self.next_attachment.fetch_add(1, Ordering::Relaxed),
         )
-    }
-
-    /// A clone of the route-active flag for the host-level beacon handler
-    /// closure to read per block, without capturing the whole `ProcessIo`.
-    pub(crate) fn beacon_route_active(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.beacon_route_active)
-    }
-
-    /// Whether `my_shard`'s vnode (`None` for the beacon loop) may emit
-    /// a beacon signing action at `(epoch, view)` under `validator`'s
-    /// identity — one lock for check-and-record, per
-    /// [`BeaconSignerSeat::allow`]. A validator with no fence on record
-    /// claims the view, so single-vnode hosts behave identically with or
-    /// without driver wiring.
-    ///
-    /// # Panics
-    /// Panics if the seat registry mutex is poisoned.
-    pub(crate) fn allow_beacon_signing(
-        &self,
-        validator: ValidatorId,
-        my_shard: Option<ShardId>,
-        epoch: Epoch,
-        view: SpcView,
-    ) -> bool {
-        self.beacon_signers
-            .lock()
-            .expect("beacon signer registry lock")
-            .entry(validator)
-            .or_insert(BeaconSignerSeat::vacant())
-            .allow(my_shard, epoch, view)
-    }
-
-    /// Whether `validator` may sign the ratify vote at `position` —
-    /// see [`BeaconSignerSeat::allow_ratify`].
-    ///
-    /// # Panics
-    /// Panics if the seat registry mutex is poisoned.
-    pub(crate) fn allow_ratify_signing(
-        &self,
-        validator: ValidatorId,
-        position: (Epoch, RatifyRound, RatifyPhase),
-    ) -> bool {
-        let mut seats = self
-            .beacon_signers
-            .lock()
-            .expect("beacon signer registry lock");
-        let seat = seats.entry(validator).or_insert(BeaconSignerSeat::vacant());
-        // A fresh fence resumes from the durable ratify record, so a
-        // restarted process agrees with its own pre-crash signatures —
-        // the coordinator's recovered registers refuse the same
-        // positions, and this keeps the two guards aligned.
-        if seat.max_ratify.is_none() {
-            seat.max_ratify = self
-                .beacon_storage
-                .ratify_record(validator)
-                .and_then(|record| record.max_position());
-        }
-        let allowed = seat.allow_ratify(position);
-        drop(seats);
-        allowed
     }
 
     /// Process-level beacon chain storage handle.
@@ -539,8 +365,8 @@ where
                 touched_shards,
             }
         } else {
-            // A pooled-only beacon follower hosts no shard at all — it runs
-            // no pipeline to admit or gossip through.
+            // A host seated nowhere runs no pipeline to admit or gossip
+            // through.
             SubmitFanout::NoHostedShard
         }
     }
@@ -869,9 +695,8 @@ pub(crate) enum SubmitFanout {
     /// reshape successor a touched shard is. The submission waits in
     /// [`ProcessIo`] until the host's shards or the topology change.
     Parked,
-    /// The host carries no shard at all — a pooled-only beacon follower.
-    /// It runs no shard pipeline to admit or gossip through, so a
-    /// locally-submitted tx is dropped.
+    /// The host carries no shard at all. It runs no shard pipeline to
+    /// admit or gossip through, so a locally-submitted tx is dropped.
     NoHostedShard,
     /// The envelope names components this node has not seen sealed, so
     /// it derives no routing yet and there is nothing to fan out to.
@@ -897,124 +722,9 @@ pub(crate) enum SubmitFanout {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Epoch, ShardId, SpcView};
+    use hyperscale_types::Epoch;
 
-    use super::{BeaconSignerSeat, admit_topology_epoch};
-
-    fn pos(epoch: u64, view: u32) -> (Epoch, SpcView) {
-        (Epoch::new(epoch), SpcView::new(view))
-    }
-
-    /// The view claimant re-passes freely (phase progression, retries)
-    /// while any other vnode is denied within the claimed view.
-    #[test]
-    fn view_claimant_re_passes_and_others_are_denied() {
-        let mut seat = BeaconSignerSeat::vacant();
-        let root = Some(ShardId::ROOT);
-        let (left, right) = ShardId::ROOT.children();
-        let (e, v) = pos(3, 1);
-
-        assert!(
-            seat.allow(root, e, v),
-            "vacant fence: first dispatch claims"
-        );
-        assert!(
-            seat.allow(root, e, v),
-            "claimant re-emission within its view"
-        );
-        assert!(!seat.allow(Some(left), e, v), "same view, other vnode");
-        assert!(!seat.allow(Some(right), e, v), "same view, third vnode");
-        assert!(
-            seat.allow(root, e, v),
-            "claimant still passes after denials"
-        );
-    }
-
-    /// The beacon loop claims as `None`, a claimant distinct from every
-    /// hosted shard — including `ShardId::ROOT`, a single-shard network's
-    /// only leaf. A beacon-loop follower and a `ROOT`-seated vnode of the
-    /// same validator can therefore never both sign within one view.
-    #[test]
-    fn beacon_loop_claimant_never_aliases_a_root_seated_vnode() {
-        let mut seat = BeaconSignerSeat::vacant();
-        let (e, v) = pos(3, 1);
-
-        assert!(seat.allow(Some(ShardId::ROOT), e, v), "seat claims");
-        assert!(
-            !seat.allow(None, e, v),
-            "beacon loop denied in the claimed view"
-        );
-
-        let (_, v2) = pos(3, 2);
-        assert!(seat.allow(None, e, v2), "beacon loop claims the next view");
-        assert!(
-            !seat.allow(Some(ShardId::ROOT), e, v2),
-            "seat denied in the beacon loop's view"
-        );
-    }
-
-    /// A strictly later view — same epoch or later epoch — transfers the
-    /// claim to whichever vnode dispatches into it first; the old claimant
-    /// is then denied at the transferred position.
-    #[test]
-    fn later_view_transfers_the_claim() {
-        let mut seat = BeaconSignerSeat::vacant();
-        let root = Some(ShardId::ROOT);
-        let (left, _) = ShardId::ROOT.children();
-
-        let (e, v1) = pos(3, 1);
-        assert!(seat.allow(root, e, v1));
-
-        // Next view within the epoch: the live sibling claims it.
-        let (_, v2) = pos(3, 2);
-        assert!(
-            seat.allow(Some(left), e, v2),
-            "sibling claims the next view"
-        );
-        assert!(
-            !seat.allow(root, e, v2),
-            "old claimant denied in the new view"
-        );
-
-        // Next epoch: claimable again by anyone.
-        let (e4, v0) = pos(4, 0);
-        assert!(seat.allow(root, e4, v0), "new epoch's proposal slot");
-    }
-
-    /// A dispatch for a view below the claimed one is regressive and denied
-    /// regardless of which vnode asks — including the claimant itself.
-    #[test]
-    fn regressive_view_is_denied() {
-        let mut seat = BeaconSignerSeat::vacant();
-        let root = Some(ShardId::ROOT);
-        let (left, _) = ShardId::ROOT.children();
-
-        let (e, v2) = pos(3, 2);
-        assert!(seat.allow(root, e, v2));
-
-        let (_, v1) = pos(3, 1);
-        assert!(!seat.allow(root, e, v1), "claimant regressing");
-        assert!(!seat.allow(Some(left), e, v1), "sibling regressing");
-
-        let (e2, v9) = pos(2, 9);
-        assert!(!seat.allow(Some(left), e2, v9), "older epoch, any view");
-    }
-
-    /// The proposal slot (view zero) precedes view one, so an epoch's
-    /// proposal is claimable before its first vote and a vote claim fences
-    /// a late proposal of the same epoch.
-    #[test]
-    fn proposal_slot_orders_before_the_first_view() {
-        let mut seat = BeaconSignerSeat::vacant();
-        let root = Some(ShardId::ROOT);
-        let (left, _) = ShardId::ROOT.children();
-
-        let (e, v0) = pos(5, 0);
-        let (_, v1) = pos(5, 1);
-        assert!(seat.allow(root, e, v0), "proposal claims view zero");
-        assert!(seat.allow(Some(left), e, v1), "vote view claimable after");
-        assert!(!seat.allow(root, e, v0), "proposal slot now regressive");
-    }
+    use super::admit_topology_epoch;
 
     /// The topology-epoch gate admits a strictly newer fold and drops a stale
     /// or duplicate one — including an older fold arriving after a newer one,

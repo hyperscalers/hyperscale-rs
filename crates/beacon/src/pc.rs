@@ -2,7 +2,7 @@
 //!
 //! One [`PcInstance`] drives one `(epoch, view)` of PC through three
 //! rounds of voting and emits effects the parent (SPC) drains into
-//! `BeaconCoordinator` actions. The vote / QC wire types and their
+//! `BeaconParticipant` actions. The vote / QC wire types and their
 //! verify / sign / build helpers live in `hyperscale_types::beacon::pc`.
 
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ use hyperscale_types::{
 ///
 /// Sub-machine-local — the parent (SPC) drains these and lifts them
 /// into either internal state mutations or further effects bubbling
-/// up to the `BeaconCoordinator`.
+/// up to the `BeaconParticipant`.
 ///
 /// Signing happens off the state-machine thread: the FSM emits
 /// `SignAndBroadcastVote*` carrying the unsigned input the signer
@@ -77,7 +77,7 @@ pub enum PcEvent {
 /// One inner-PC FSM instance, scoped to a single `(epoch, view)`.
 ///
 /// SPC owns one `PcInstance` per view it drives; the
-/// `BeaconCoordinator` owns one `SpcInstance` per epoch. The FSM is
+/// `BeaconParticipant` owns one `SpcInstance` per epoch. The FSM is
 /// synchronous — every event-handler invocation returns the full set
 /// of effects that follow, and the parent drains them.
 pub struct PcInstance {

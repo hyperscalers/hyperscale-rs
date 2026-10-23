@@ -145,6 +145,7 @@ pub use route_reshape::{
     a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
     a_record_whose_consumers_shard_departs_is_taken_before_the_cut,
     a_recovery_stalled_beside_a_cancelled_split_is_drawn_again,
+    a_retained_terminated_loop_releases_its_hosts_schedule,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_into_a_departing_venue_releases_the_survivors_hold,

@@ -46,16 +46,25 @@ pub enum FetchIds {
     /// Block proposals a committee member's vote named and this replica
     /// never received, by block hash.
     Proposals(Vec<BlockHash>),
-    /// Missing beacon proposals as `(epoch, validator)`.
-    BeaconProposals(Vec<(Epoch, ValidatorId)>),
-    /// Ratify candidates a pool prevoted and the local member never
-    /// received, as `(epoch, block_hash)`.
-    BeaconCandidates(Vec<(Epoch, BeaconBlockHash)>),
-    /// Beacon-witness leaf runs as `(source_shard, block_height,
-    /// committed_block_hash, lo, hi)`.
-    ShardWitnesses(Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>),
+    /// The beacon fetches the host's beacon loop drives. No replica
+    /// emits them.
+    Beacon(BeaconFetchIds),
     /// Package artifacts by content address.
     PackageArtifacts(Vec<Hash>),
     /// Component instance records by address.
     InstanceRecords(Vec<Address>),
+}
+
+/// The ids of the fetches the host's beacon loop drives, for its fold and
+/// its participants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeaconFetchIds {
+    /// Missing beacon proposals as `(epoch, validator)`.
+    Proposals(Vec<(Epoch, ValidatorId)>),
+    /// Ratify candidates a pool prevoted and the local member never
+    /// received, as `(epoch, block_hash)`.
+    Candidates(Vec<(Epoch, BeaconBlockHash)>),
+    /// Beacon-witness leaf runs as `(source_shard, block_height,
+    /// committed_block_hash, lo, hi)`.
+    Witnesses(Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>),
 }

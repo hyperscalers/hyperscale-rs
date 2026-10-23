@@ -52,14 +52,6 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// signature, so no signature can leave the process ahead of the
     /// registers that forbid re-signing its round after a crash.
     pub vote_registers: &'a dyn SafeVoteRegisterStore,
-    /// Durable ratification registers on the process's beacon store —
-    /// the same persist-before-sign contract as `vote_registers`, for
-    /// the ratify-vote sign handler.
-    pub ratify_registers: &'a dyn RatifyRegisterStore,
-    /// Durable beacon consensus registers on the process's beacon store
-    /// — the inner-PC vote and empty-view sign handlers admit each
-    /// signature through them before creating it.
-    pub beacon_vote_registers: &'a dyn BeaconVoteRegisterStore,
     /// The committed beacon chain, for handlers resolving a window the
     /// live schedule no longer carries. The schedule is a cache over
     /// this store, which holds one state per epoch contiguously from
@@ -82,16 +74,6 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// `PendingChain` + `prepared_commits`. Only `BuildProposal` and
     /// `VerifyStateRoot` produce these.
     pub commit_prepared: &'a (dyn Fn(PreparedBlock) + Send + Sync),
-    /// Hand the locally signed `BeaconProposal` to the process-level
-    /// cache that serves inbound `GetBeaconProposalRequest`s. Only
-    /// `BuildAndBroadcastBeaconProposal` produces these; the cache is
-    /// driver-owned, so coordinators never read or reset it.
-    pub cache_beacon_proposal:
-        &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
-    /// Hand a candidate this vnode assembled or verified to the
-    /// process-level cache that serves inbound
-    /// `GetBeaconCandidateRequest`s.
-    pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),
     /// Parallelism strategy for in-handler batch fan-out. Sourced from
     /// the dispatch backend at spawn time so handlers running on
     /// `PooledDispatch` use rayon `par_iter` (work-stealing across the
@@ -105,37 +87,14 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
     pub fn notify_protocol(&self, event: ProtocolEvent) {
         (self.notify)(event);
     }
-
-    /// Narrow this context to the beacon-sufficient subset, signing
-    /// through `gate`. The shard dispatch site hands this to beacon-owned
-    /// handlers; the beacon loop builds a [`BeaconActionContext`]
-    /// directly, since it has no shard storage to fill the full context
-    /// with.
-    #[must_use]
-    pub fn beacon<'b>(&'b self, gate: &'b SignerGate) -> BeaconActionContext<'b, N> {
-        BeaconActionContext {
-            topology_snapshot: self.topology_snapshot,
-            me: self.me,
-            ratify_registers: self.ratify_registers,
-            beacon_vote_registers: self.beacon_vote_registers,
-            network: self.network,
-            signer: self.signer,
-            verifier: self.verifier,
-            notify: Arc::clone(&self.notify),
-            cache_beacon_proposal: self.cache_beacon_proposal,
-            cache_beacon_candidate: self.cache_beacon_candidate,
-            gate,
-        }
-    }
 }
 
 /// Context for executing beacon-owned delegated actions.
 ///
-/// The subset of [`ActionContext`] the beacon coordinator's handlers
-/// need: signing, verification, broadcast, the durable ratify
-/// registers, the outcome sink and the release gate. Deliberately
-/// storage-free — beacon consensus reads no shard chain state — so the
-/// beacon loop can run the same handlers a seated vnode's dispatch runs.
+/// What a beacon participant's handlers need: signing, verification,
+/// broadcast, the durable ratify and beacon vote registers, the outcome
+/// sink and the release gate. Storage-free — beacon consensus reads no
+/// shard chain state.
 #[allow(missing_docs)] // bag of references; field names match ActionContext's
 pub struct BeaconActionContext<'a, N: Network> {
     pub topology_snapshot: &'a TopologySnapshot,
@@ -148,8 +107,8 @@ pub struct BeaconActionContext<'a, N: Network> {
     pub ratify_registers: &'a dyn RatifyRegisterStore,
     /// Durable beacon consensus registers on the process's beacon store
     /// — a signature that would contradict one the validator already
-    /// created, before a restart or on a co-hosted vnode, is never
-    /// created.
+    /// created, before a restart or under an earlier participant on the
+    /// host, is never created.
     pub beacon_vote_registers: &'a dyn BeaconVoteRegisterStore,
     pub network: &'a Arc<N>,
     pub signer: &'a Arc<dyn Signer>,

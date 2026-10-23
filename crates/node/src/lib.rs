@@ -49,8 +49,9 @@ mod vnode;
 pub use bootstrap::state_range_serve::serve_state_range_request;
 pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
+pub use event::{Registration, RegistrationReply};
 pub use fetch::FetchConfig;
-pub use host::{NodeHost, ShardGenesis};
+pub use host::{NodeHost, ShardGenesis, StartupChain};
 pub use process::TxStatusCache;
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
 pub use shard::cross_shard::{
@@ -61,7 +62,4 @@ pub use shard::{
     network_genesis_block, timer_event,
 };
 pub use state::NodeStateMachine;
-pub use vnode::{
-    SeatConfig, SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, VnodeSeat, seat_follower,
-    seat_vnode_group,
-};
+pub use vnode::{SeatConfig, SeatVnodeGroup, Vnode, VnodeInit, VnodeSeat, seat_vnode_group};

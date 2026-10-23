@@ -1,14 +1,12 @@
 //! Delegated-action handlers for beacon-owned [`Action`] variants.
 //!
 //! [`handle_action`] runs off the driving thread on the Consensus
-//! dispatch pool, for seated vnodes and the beacon loop's participants
-//! alike; results return to the state machine via
-//! `ctx.notify(ProtocolEvent::*)`. The node's dispatchers route any
-//! [`ActionOwner::Beacon`](hyperscale_core::ActionOwner) action here
-//! and unreachable-panic on non-beacon variants — mirrors
-//! `hyperscale_shard::action_handlers::handle_action`. The context is
-//! the storage-free [`BeaconActionContext`], so both dispatch sites can
-//! build it.
+//! dispatch pool for the beacon loop's participants; results return to
+//! the participant via `ctx.notify(ProtocolEvent::*)`. The beacon loop
+//! routes any [`ActionOwner::Beacon`](hyperscale_core::ActionOwner) action
+//! a participant emits here, and [`verify_beacon_block`] runs the fold's
+//! block checks. Mirrors `hyperscale_shard::action_handlers::handle_action`.
+//! The context is the storage-free [`BeaconActionContext`].
 
 use std::sync::Arc;
 
@@ -23,14 +21,15 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconProposalDraft, BeaconVote, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext,
-    PcScope, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka,
-    RatifyVerifyContext, RatifyVote, RatifyVoteVerifyError, SpcEmptyViewMsg, SpcRelayKind,
-    SpcRelayMessage, SpcVerifyContext, Verifiable, Verified, signed_bytes,
+    NetworkDefinition, PcScope, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase,
+    RatifyPolka, RatifyVerifyContext, RatifyVote, RatifyVoteVerifyError, SpcEmptyViewMsg,
+    SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable, Verified, Verifier, signed_bytes,
 };
 
 /// Admit `vote` through the durable beacon consensus register before
 /// its signature exists. A slot the validator already signed, before a
-/// restart or on a co-hosted vnode, re-signs only the content it holds;
+/// restart or under an earlier participant, re-signs only the content it
+/// holds;
 /// anything else abstains, which costs at most this one signature,
 /// never a double-sign.
 fn admit_signature<N: Network>(ctx: &BeaconActionContext<'_, N>, vote: &BeaconVote) -> bool {
@@ -387,29 +386,6 @@ where
                     Arc::unwrap_or_clone(candidate),
                 ))));
         }
-        Action::VerifyBeaconBlock {
-            block,
-            committee,
-            active_pool,
-            equivocation_signers,
-        } => {
-            // A gossip handler deferred its verdict on the block to this
-            // check; the coordinator dispatches it only for a block it can
-            // place, so a failure is the block's own.
-            let key = VerdictKey::of(block.as_unverified());
-            let result = Arc::unwrap_or_clone(block)
-                .upgrade(&CertifiedBeaconBlockVerifyContext {
-                    verifier: ctx.verifier,
-                    network,
-                    committee: &committee,
-                    active_pool: &active_pool,
-                    equivocation_signers: &equivocation_signers,
-                })
-                .map(Arc::new)
-                .map_err(|(_, e)| e);
-            ctx.network.settle(key, checked(result.is_ok()));
-            ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { result });
-        }
         Action::VerifyRatifyVote { vote, signers } => {
             let anchor = vote.anchor_hash();
             let epoch = vote.epoch();
@@ -587,8 +563,53 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        _ => unreachable!("hyperscale_beacon::handle_action called with non-beacon action"),
+        _ => unreachable!(
+            "hyperscale_beacon::handle_action called with an action no participant emits"
+        ),
     }
+}
+
+/// Run the fold's [`Action::VerifyBeaconBlock`].
+///
+/// Checks the block's certificate, settles the gossip verdict deferred on
+/// it, and hands the outcome to `notify`. The fold signs nothing, so the
+/// check needs no participant's context.
+///
+/// # Panics
+///
+/// Panics on any other action.
+pub fn verify_beacon_block<N: Network>(
+    action: Action,
+    verifier: &dyn Verifier,
+    network: &NetworkDefinition,
+    transport: &N,
+    notify: &dyn Fn(ProtocolEvent),
+) {
+    let Action::VerifyBeaconBlock {
+        block,
+        committee,
+        active_pool,
+        equivocation_signers,
+    } = action
+    else {
+        unreachable!("verify_beacon_block called with another action");
+    };
+    // A gossip handler deferred its verdict on the block to this check;
+    // the fold dispatches it only for a block it can place, so a failure
+    // is the block's own.
+    let key = VerdictKey::of(block.as_unverified());
+    let result = Arc::unwrap_or_clone(block)
+        .upgrade(&CertifiedBeaconBlockVerifyContext {
+            verifier,
+            network,
+            committee: &committee,
+            active_pool: &active_pool,
+            equivocation_signers: &equivocation_signers,
+        })
+        .map(Arc::new)
+        .map_err(|(_, e)| e);
+    transport.settle(key, checked(result.is_ok()));
+    notify(ProtocolEvent::BeaconBlockVerified { result });
 }
 
 /// The gossip verdict of a check that either holds or fails on the item

@@ -22,9 +22,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
 use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
-use hyperscale_node::{
-    NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
-};
+use hyperscale_node::{NodeHost, SeatConfig, StartupChain};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
@@ -202,30 +200,34 @@ impl SimulationRunner {
             provision_config: ProvisionConfig::default(),
         };
         let now = self.local_now(host);
-        let seated = self.seat_from_disk(
-            host,
-            &beacon_state,
-            beacon_storage.as_ref(),
-            &topology,
-            &config,
-            now,
-        );
+        let seated =
+            self.seat_from_disk(host, &beacon_state, beacon_storage.as_ref(), &topology, now);
 
         self.network
-            .bring_up(host, seated.storages.keys().copied().collect());
+            .bring_up(host, seated.chains.iter().map(|chain| chain.0).collect());
         let dispatch = self.deferred[i]
             .clone()
             .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
         let shard_event_senders = seated
-            .storages
-            .keys()
-            .map(|&shard| (shard, self.event_txs[i].clone()))
+            .chains
+            .iter()
+            .map(|chain| (chain.0, self.event_txs[i].clone()))
+            .collect();
+        let chains = seated
+            .chains
+            .iter()
+            .map(|(shard, store, recovered, vnodes)| StartupChain {
+                shard: *shard,
+                storage: store.clone(),
+                recovered,
+                vnodes: vnodes.clone(),
+            })
             .collect();
         let restarted = NodeHost::new(
-            seated.vnodes,
-            seated.storages,
+            config,
+            chains,
+            seated.identities,
             beacon_storage,
-            self.beacon_network.clone(),
             Arc::clone(&executor),
             self.network.create_adapter(host),
             dispatch,
@@ -233,6 +235,7 @@ impl SimulationRunner {
             self.event_txs[i].clone(),
             Arc::new(ArcSwap::from(topology)),
             self.node_config.clone(),
+            now,
         );
         self.hosts.put(i, restarted);
         if i == 0 {
@@ -242,7 +245,7 @@ impl SimulationRunner {
         let output = self.hosts[i].drain_pending_output();
         self.process_step_output(host, output);
         self.hosts[i].register_inbound_handlers();
-        for (shard, recovered) in seated.resumed {
+        for (shard, _, recovered, _) in seated.chains {
             let output = self.hosts[i].resume_shard_committed(shard, &recovered);
             self.process_step_output(host, output);
         }
@@ -251,15 +254,14 @@ impl SimulationRunner {
 
     /// What `host` runs on the disk it left, as a production process
     /// starting on it decides: the groups it resumes or serves from a
-    /// store, and a follower for every other validator it runs. Stores
-    /// it does not open stay on disk.
+    /// store, and a beacon participant for every validator it holds.
+    /// Stores it does not open stay on disk.
     fn seat_from_disk(
         &mut self,
         host: NodeIndex,
         beacon_state: &BeaconState,
         beacon_storage: &dyn BeaconStorage,
         topology: &TopologySnapshot,
-        config: &SeatConfig,
         now: LocalTimestamp,
     ) -> Seated {
         let mut disk: BTreeMap<ShardId, SimShardStorage> = BTreeMap::new();
@@ -291,23 +293,14 @@ impl SimulationRunner {
         )
         .unwrap_or_else(|never| match never {});
         let placed = plan.placed_shards();
-        let followers = plan.followers();
 
-        let mut seated = Seated::default();
+        let mut seated = Seated {
+            chains: Vec::new(),
+            identities: local.clone(),
+        };
         for (shard, (store, vnodes)) in plan.resumed {
             disk.remove(&shard);
-            seated.restore(config, beacon_storage, now, shard, (*store).clone(), vnodes);
-        }
-        for (validator, signer) in followers {
-            seated.vnodes.push(seat_follower(SeatFollower {
-                verifier: Arc::clone(&self.verifier),
-                beacon_storage,
-                beacon_network: self.beacon_network.clone(),
-                beacon_config_hash: self.beacon_config_hash,
-                now,
-                validator,
-                signer,
-            }));
+            seated.restore(shard, (*store).clone(), vnodes);
         }
         let departed = departed_to_serve(
             &beacon_state.boundaries,
@@ -319,7 +312,7 @@ impl SimulationRunner {
         );
         for (shard, vnodes) in departed {
             let store = disk.remove(&shard).expect("served only from disk");
-            seated.restore(config, beacon_storage, now, shard, store, vnodes);
+            seated.restore(shard, store, vnodes);
         }
         for (shard, store) in disk {
             self.retained_storages.insert((host, shard), store);
@@ -339,35 +332,18 @@ impl SimulationRunner {
 }
 
 /// What a restarting host runs.
-#[derive(Default)]
 struct Seated {
-    vnodes: Vec<VnodeInit>,
-    storages: BTreeMap<ShardId, SimShardStorage>,
-    /// The state each store-backed shard resumes from.
-    resumed: Vec<(ShardId, RecoveredState)>,
+    /// Each store-backed chain: its shard, its store, the state the store
+    /// recovered, and the validators it seats.
+    chains: Vec<(ShardId, SimShardStorage, RecoveredState, ShardVnodes)>,
+    /// Every validator the host holds, each run as a beacon participant.
+    identities: ShardVnodes,
 }
 
 impl Seated {
-    /// Seat `vnodes`' group on `shard` from what `store` recovers.
-    fn restore(
-        &mut self,
-        config: &SeatConfig,
-        beacon_storage: &dyn BeaconStorage,
-        now: LocalTimestamp,
-        shard: ShardId,
-        store: SimShardStorage,
-        vnodes: ShardVnodes,
-    ) {
+    /// Seat `vnodes` on `shard` from what `store` recovers.
+    fn restore(&mut self, shard: ShardId, store: SimShardStorage, vnodes: ShardVnodes) {
         let recovered = store.load_recovered_state(shard);
-        self.vnodes.extend(seat_vnode_group(SeatVnodeGroup {
-            config: config.clone(),
-            beacon_storage,
-            now,
-            shard,
-            recovered: &recovered,
-            vnodes,
-        }));
-        self.storages.insert(shard, store);
-        self.resumed.push((shard, recovered));
+        self.chains.push((shard, store, recovered, vnodes));
     }
 }

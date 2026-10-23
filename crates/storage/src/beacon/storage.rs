@@ -13,7 +13,7 @@ use super::vote_registers::BeaconVoteRegisterStore;
 /// [`RatifyRegisterStore`] and [`BeaconVoteRegisterStore`] signing
 /// registers, and the [`FetchedPackageStore`] and [`FetchedInstanceStore`]
 /// copies of foreign records so a single `Arc<impl BeaconStorage>` can be
-/// shared across every vnode's `BeaconCoordinator`. Blanket-impl'd for
+/// shared across a host's beacon fold and participants. Blanket-impl'd for
 /// any type satisfying the components — concrete backends just
 /// implement the component traits.
 pub trait BeaconStorage:

@@ -1,17 +1,16 @@
-//! Beacon-chain coordinator crate.
+//! Beacon-chain state machines.
 //!
-//! Hosts the [`BeaconCoordinator`] state machine and its sub-machines:
-//! PC / SPC consensus (one SPC instance per epoch), `BeaconState`
-//! application via `apply_epoch`, pending-block tracking, verification
-//! dispatch, witness fetching, epoch ratification, and equivocation
-//! observation.
+//! A host follows the beacon chain with one [`BeaconFold`]: the committed
+//! `BeaconState` and its application via `apply_epoch`, the topology
+//! schedule, pending-block tracking, block verification and witness
+//! fetching for every shard chain the host runs. Each validator identity
+//! the host holds runs one [`BeaconParticipant`] against the fold: PC /
+//! SPC consensus (one SPC instance per epoch), proposals, epoch
+//! ratification, and equivocation observation.
 //!
-//! `BeaconCoordinator` is also the topology source — after each
-//! successful `apply_epoch` it derives a fresh
-//! [`TopologySnapshot`](hyperscale_types::TopologySnapshot) from
-//! `BeaconState` and exposes it via `current_topology_snapshot()`.
-//!
-//! [`BeaconCoordinator`]: crate::coordinator::BeaconCoordinator
+//! The fold is the topology source: each adoption derives a fresh
+//! [`TopologySnapshot`](hyperscale_types::TopologySnapshot) from the
+//! `BeaconState` it commits.
 
 pub mod action_handlers;
 pub mod boundary;
@@ -33,3 +32,6 @@ pub mod spc_driver;
 pub mod state;
 pub mod verification;
 pub mod vote_equivocation_observations;
+
+pub use fold::{Adopted, BeaconFold, ChainRegistration, HostedChain};
+pub use participant::{BeaconParticipant, ParticipantStep};

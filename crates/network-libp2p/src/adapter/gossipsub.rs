@@ -217,7 +217,7 @@ pub(super) fn handle_gossipsub_event(
                 let mut guard = VerdictGuard::new(message_id, propagation_source, vtx);
                 match decompress(&message.data) {
                     Ok(payload) => {
-                        // The host-level follower delivers fire and forget;
+                        // The host-level handler delivers fire and forget;
                         // the per-shard fan owns the forward verdict.
                         if let Some(host_handler) = host_handler {
                             host_handler(payload.clone());

@@ -4,18 +4,17 @@
 //! proposals (`beacon_proposal`), ratify candidates the pool prevoted and
 //! the local member never received (`beacon_candidate`), and
 //! shard-accumulator witness leaves (`shard_witness`, pulled to build the
-//! windowed beacon-witness commitment). A shard loop carries one
-//! [`BeaconFetchState`] for its seated vnodes on [`ShardIo`], and the
-//! beacon loop carries its own for its participants, whose proposal and
-//! candidate asks go past the host.
+//! windowed beacon-witness commitment). The host's beacon loop carries
+//! the one [`BeaconFetchState`]: its participants' proposal and candidate
+//! asks go past the host, and the fold's witness asks try the host's own
+//! stores first.
 //!
 //! The generic engine, the [`FetchBinding`] trait, and the shared
 //! `partition_solicited` helper live in [`crate::fetch`].
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{FetchIds, ProtocolEvent};
+use hyperscale_core::{BeaconFetchIds, FetchIds, ProtocolEvent};
 use hyperscale_network::{Network, RequestError};
-use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::beacon::{
     GetBeaconCandidateRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
@@ -30,9 +29,9 @@ use crate::config::NodeConfig;
 use crate::event::BeaconScopedInput;
 use crate::fetch::{
     Fetch, FetchBinding, FetchOwner, FetchReply, FetchedBy, Refusal, Route, ScopedAnswer,
-    ShardReply, defers_to_the_tick, dispatch_scoped,
+    defers_to_the_tick, dispatch_scoped,
 };
-use crate::shard::{HostEvent, ShardIo};
+use crate::shard::HostEvent;
 
 /// Cross-shard beacon-witness fetch keyed by
 /// `(source_shard, block_height, committed_block_hash, lo, hi)`.
@@ -47,8 +46,8 @@ pub type BeaconProposalFetch = Fetch<(Epoch, ValidatorId)>;
 /// candidate hash the pool prevoted that the local member never held.
 pub type BeaconCandidateFetch = Fetch<(Epoch, BeaconBlockHash)>;
 
-/// Beacon fetch state: the id-keyed fetches the beacon coordinator
-/// drives.
+/// Beacon fetch state: the id-keyed fetches the host's beacon loop
+/// drives for its fold and its participants.
 pub struct BeaconFetchState {
     /// Cross-shard beacon-witness fetch (rotates through source committee).
     pub(crate) shard_witness: ShardWitnessFetch,
@@ -59,7 +58,12 @@ pub struct BeaconFetchState {
 }
 
 impl BeaconFetchState {
-    /// Build beacon fetch state for a freshly hosted shard.
+    /// Build the beacon loop's fetch state. Its proposal and candidate
+    /// fetches ask past the host: the host's own beacon store and serve
+    /// caches are filled by the same paths that left its participants
+    /// short, so a local answer is one its peers also hold. Witness
+    /// asks try the host first, which answers a shard it serves from its
+    /// own store.
     #[must_use]
     pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
@@ -67,24 +71,6 @@ impl BeaconFetchState {
                 "shard_witness",
                 config.shard_witness_fetch.clone(),
             ),
-            beacon_proposal: BeaconProposalFetch::new(
-                "beacon_proposal",
-                config.beacon_proposal_fetch.clone(),
-            ),
-            beacon_candidate: BeaconCandidateFetch::new(
-                "beacon_candidate",
-                config.beacon_proposal_fetch.clone(),
-            ),
-        }
-    }
-
-    /// Build the beacon loop's fetch state. Its proposal and candidate
-    /// fetches ask past the host: the host's own beacon store and serve
-    /// caches are filled by the same paths that left its participants
-    /// short, so a local answer is one its peers also hold.
-    #[must_use]
-    pub(crate) fn past_the_host(config: &NodeConfig) -> Self {
-        Self {
             beacon_proposal: BeaconProposalFetch::peers_only(
                 "beacon_proposal",
                 config.beacon_proposal_fetch.clone(),
@@ -93,7 +79,6 @@ impl BeaconFetchState {
                 "beacon_candidate",
                 config.beacon_proposal_fetch.clone(),
             ),
-            ..Self::new(config)
         }
     }
 
@@ -150,20 +135,20 @@ impl FetchBinding for ShardWitnessBinding {
     const NAME: &'static str = "shard_witness";
 
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::ShardWitnesses(ids)
+        FetchIds::Beacon(BeaconFetchIds::Witnesses(ids))
     }
 }
 
-impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ShardWitnessBinding {
-    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.beacon_fetch.shard_witness
+impl FetchedBy<BeaconFetchState> for ShardWitnessBinding {
+    fn fetch_mut(state: &mut BeaconFetchState) -> &mut Fetch<Self::Id> {
+        &mut state.shard_witness
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         route: Route,
         network: &N,
-        reply: &ShardReply,
+        reply: &BeaconReply,
     ) {
         dispatch_scoped::<Self, N, _>(ids, route, network, reply);
     }
@@ -217,22 +202,7 @@ impl FetchBinding for BeaconProposalBinding {
     const NAME: &'static str = "beacon_proposal";
 
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::BeaconProposals(ids)
-    }
-}
-
-impl<S: ShardStorage> FetchedBy<ShardIo<S>> for BeaconProposalBinding {
-    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.beacon_fetch.beacon_proposal
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        route: Route,
-        network: &N,
-        reply: &ShardReply,
-    ) {
-        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
+        FetchIds::Beacon(BeaconFetchIds::Proposals(ids))
     }
 }
 
@@ -298,22 +268,7 @@ impl FetchBinding for BeaconCandidateBinding {
     const NAME: &'static str = "beacon_candidate";
 
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::BeaconCandidates(ids)
-    }
-}
-
-impl<S: ShardStorage> FetchedBy<ShardIo<S>> for BeaconCandidateBinding {
-    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
-        &mut shard.beacon_fetch.beacon_candidate
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        route: Route,
-        network: &N,
-        reply: &ShardReply,
-    ) {
-        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
+        FetchIds::Beacon(BeaconFetchIds::Candidates(ids))
     }
 }
 

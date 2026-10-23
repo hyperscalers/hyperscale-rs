@@ -31,9 +31,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
-use hyperscale_node::{
-    SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
-};
+use hyperscale_node::{SeatConfig, VnodeSeat};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, history_floor};
@@ -227,15 +225,11 @@ impl SimulationRunner {
         storage: SimShardStorage,
     ) {
         let recovered = storage.load_recovered_state(shard);
-        let inits = self.runtime_vnode_inits(host, validators, shard, &recovered);
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
-        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
+        self.add_shard(host, shard, validators, storage, &recovered);
         self.install_shard_genesis(host, shard, &self.genesis_config());
-        for &validator in validators {
-            self.hosts[host as usize].drop_pooled_vnode(validator);
-        }
     }
 
     /// Mount `shard` on `host` over `storage`, seating `validators` from the
@@ -248,20 +242,13 @@ impl SimulationRunner {
         storage: SimShardStorage,
         recovered: &RecoveredState,
     ) {
-        let inits = self.runtime_vnode_inits(host, validators, shard, recovered);
         // Bind each seated validator to this host in the transport's layout,
         // as the reshape seat does, so every notification addressed to it —
         // headers, votes, ready-signal traffic — reaches the seat.
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
-        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
-        // Parity with the production supervisor's `unfollow_in_pool`: each
-        // seated validator now drives its beacon from this shard, so retire any
-        // beacon-loop follower it carried (it drained here earlier).
-        for &validator in validators {
-            self.hosts[host as usize].drop_pooled_vnode(validator);
-        }
+        self.add_shard(host, shard, validators, storage, recovered);
         // Resume consensus from the recovered committed state, as the
         // production supervisor does pre-spawn: this arms the pacemaker and
         // cleanup timers, so a committee seated onto a quiet chain (a halt
@@ -478,7 +465,6 @@ impl SimulationRunner {
                             .is_some_and(|entry| entry.contains(&validator));
                     if !retained && self.hosts[host as usize].vnodes_len(shard) > 1 {
                         self.hosts[host as usize].remove_vnode(shard, validator);
-                        self.follow_in_pool(host, validator);
                     }
                 }
             }
@@ -509,8 +495,8 @@ impl SimulationRunner {
     /// holds, so hosts rebuilding at once still source each other. Only then
     /// does the old loop come down with its store, and a store that fell
     /// behind hands the rounds signed on it to the staging store; a
-    /// validator the old loop carried that is not placed here follows the
-    /// beacon on the beacon loop. A staging
+    /// validator the old loop carried that is not placed here keeps its
+    /// beacon participant. A staging
     /// store that cannot complete is dropped and the rebuild retries next
     /// slice, as a join does.
     fn rebuild_shard(
@@ -544,14 +530,15 @@ impl SimulationRunner {
     }
 
     /// Run `validator` on `host` from here on, as an operator moving a
-    /// validator between machines while it holds no seat: its pool
-    /// follower leaves the host it ran on and follows the beacon from
-    /// `host`, and its next seat lands there. Both hosts rescan their
-    /// placement on the next [`Self::topology_step`], so a placement the
-    /// beacon already committed seats on `host`.
+    /// validator between machines while it holds no seat: its beacon
+    /// participant leaves the host it ran on, the beacon records it
+    /// signed there go with it, and it participates from `host`, where
+    /// its next seat lands. Both hosts rescan their placement on the next
+    /// [`Self::topology_step`], so a placement the beacon already
+    /// committed seats on `host`.
     ///
-    /// Returns whether it moved: a validator still seated on any host,
-    /// a terminated chain it serves included, stays where it runs.
+    /// Returns whether it moved: a validator any host's loop carries,
+    /// a retained terminated loop's included, stays where it runs.
     ///
     /// # Panics
     ///
@@ -562,10 +549,21 @@ impl SimulationRunner {
         }
         let index = usize::try_from(validator.inner()).expect("id fits usize");
         let from = self.validator_home[index];
-        self.hosts[from as usize].drop_pooled_vnode(validator);
+        self.hosts[from as usize].remove_participant(validator);
+        let source = Arc::clone(self.hosts[from as usize].beacon_storage());
+        let destination = Arc::clone(self.hosts[host as usize].beacon_storage());
+        if let Some(record) = source.beacon_vote_record(validator) {
+            destination.restore_beacon_vote_record(validator, &record);
+        }
+        if let Some(record) = source.ratify_record(validator) {
+            destination.restore_ratify_record(validator, &record);
+        }
         self.validator_home[index] = host;
         self.network.bind_validator(validator, host);
-        self.follow_in_pool(host, validator);
+        let signer = self.signer_of(validator);
+        self.hosts[host as usize].add_participant(validator, signer);
+        let output = self.hosts[host as usize].drain_pending_output();
+        self.process_step_output(host, output);
         self.placement_epoch[from as usize] = None;
         self.placement_epoch[host as usize] = None;
         true
@@ -573,7 +571,8 @@ impl SimulationRunner {
 
     /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
-    /// retained-storage fast path.
+    /// retained-storage fast path. The validators the loop seated keep
+    /// their beacon participants.
     ///
     /// # Panics
     ///
@@ -582,41 +581,7 @@ impl SimulationRunner {
         let shard_loop = self.hosts[host as usize]
             .remove_shard(shard)
             .expect("leave of an unhosted shard");
-        let departed: Vec<ValidatorId> = shard_loop.vnodes.iter().map(|v| v.validator_id).collect();
-        let storage = (**shard_loop.io.storage()).clone();
-
-        // Parity with the production supervisor's `on_torn_down`: a validator
-        // that drains off its last shard keeps following the beacon in the
-        // pool (its storage stays warm and it raises its own re-seat trigger)
-        // rather than going dark. One still on another shard keeps that
-        // coordinator and needs no follower.
-        for validator in departed {
-            self.follow_in_pool(host, validator);
-        }
-        storage
-    }
-
-    /// Keep `validator` following the beacon in `host`'s pool once it has
-    /// drained off a shard, unless it still runs on another: that shard's
-    /// coordinator drives its beacon and it needs no follower.
-    fn follow_in_pool(&mut self, host: NodeIndex, validator: ValidatorId) {
-        if self.hosts[host as usize].hosts_validator(validator) {
-            return;
-        }
-        let init = seat_follower(SeatFollower {
-            verifier: Arc::clone(&self.verifier),
-            beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
-            beacon_network: self.beacon_network.clone(),
-            beacon_config_hash: self.beacon_config_hash,
-            now: self.local_now(host),
-            validator,
-            signer: self.signer_of(validator),
-        });
-        self.hosts[host as usize].add_pooled_vnode(init);
-        // The follower armed its beacon startup timers into the beacon loop's
-        // scratch; sweep them into the runner's timer table.
-        let output = self.hosts[host as usize].drain_pending_output();
-        self.process_step_output(host, output);
+        (**shard_loop.io.storage()).clone()
     }
 
     /// Drive the [`ShardBootstrap`] sequencer to completion against the
@@ -769,28 +734,26 @@ impl SimulationRunner {
         Some(bootstrap.into_recovered_state(storage))
     }
 
-    /// Build the `VnodeInit`s for `validators` joining `shard` together via
-    /// [`seat_vnode_group`] — the same construction the production
-    /// supervisor runs at seat time. One call, so the group shares the one
-    /// store bundle the loop's request handlers serve from.
-    pub(super) fn runtime_vnode_inits(
-        &self,
+    /// Mount `shard` on `host` over `storage`, seating `validators` from
+    /// `recovered` as one group: the chain registers with the host's
+    /// beacon loop and its replicas are built from the schedule the
+    /// registration hands back — the same construction the production
+    /// supervisor runs at seat time.
+    pub(super) fn add_shard(
+        &mut self,
         host: NodeIndex,
-        validators: &[ValidatorId],
         shard: ShardId,
+        validators: &[ValidatorId],
+        storage: SimShardStorage,
         recovered: &RecoveredState,
-    ) -> Vec<VnodeInit> {
-        seat_vnode_group(SeatVnodeGroup {
-            config: self.seat_config(host),
-            beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
-            now: self.local_now(host),
-            shard,
-            recovered,
-            vnodes: validators
-                .iter()
-                .map(|&validator| (validator, self.signer_of(validator)))
-                .collect(),
-        })
+    ) {
+        let config = self.seat_config(host);
+        let vnodes = validators
+            .iter()
+            .map(|&validator| (validator, self.signer_of(validator)))
+            .collect();
+        let sender = self.event_txs[host as usize].clone();
+        self.hosts[host as usize].add_shard(shard, config, recovered, vnodes, storage, sender);
     }
 
     /// How `host` builds every vnode it seats at runtime.

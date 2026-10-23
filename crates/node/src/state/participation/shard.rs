@@ -668,11 +668,15 @@ mod tests {
         // Rounds increase per block, so height 1 is round 1:
         // proposer_for(r=1) = committee[1 % 4] = committee[1]
         // = ValidatorId::new(1). Pick local_idx=1 to be the leader.
-        let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
+        let TestNode {
+            mut node,
+            committee,
+            ..
+        } = TestNode::builder().local_idx(1).build();
         assert!(
             node.topology_snapshot()
                 .proposer_for(node.shard_id(), Round::new(1))
-                == node.validator_id(),
+                == committee.validator_id(1),
             "local must be the height-1 proposer for this test",
         );
 
@@ -699,11 +703,15 @@ mod tests {
         // local_idx=0 → ValidatorId::new(0); a fresh node proposes height 1 in
         // round 1, whose proposer is committee[1] = ValidatorId::new(1), so we
         // are not the leader.
-        let TestNode { mut node, .. } = TestNode::new();
+        let TestNode {
+            mut node,
+            committee,
+            ..
+        } = TestNode::new();
         assert!(
             node.topology_snapshot()
                 .proposer_for(node.shard_id(), Round::new(1))
-                != node.validator_id(),
+                != committee.validator_id(0),
             "local must NOT be the height-1 proposer for this test",
         );
 
@@ -1033,6 +1041,7 @@ mod tests {
         let TestNode {
             mut node,
             committee,
+            ..
         } = TestNode::new();
         let round = node.shard_coordinator().view();
         let header = BlockHeader::new(BlockHeaderParts {
@@ -1227,7 +1236,7 @@ mod tests {
         let raw_tx = Arc::new(test_transaction(1));
         let tx_hash = raw_tx.hash();
         let _ = commit_in_flight(&mut node, &raw_tx);
-        let participation = node.shard.as_mut().expect("a shard node");
+        let participation = &mut node.shard;
 
         let aborted = participation.apply_commit_effects(CommitEffects {
             terminal: true,

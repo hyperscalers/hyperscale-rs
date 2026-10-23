@@ -72,8 +72,7 @@ pub trait BeaconSyncSink {
     /// This driver's beacon-block-sync FSM instance.
     fn beacon_fsm(&mut self) -> &mut BeaconBlockSync;
 
-    /// Fan a synced block to this driver's vnodes — the shard posts it to
-    /// its event channel; the beacon loop feeds it to its followers.
+    /// Hand a synced block to the fold this driver feeds.
     fn deliver_block(&mut self, block: Arc<Verifiable<CertifiedBeaconBlock>>);
 
     /// Dispatch a single-epoch fetch over this driver's routing, wrapping

@@ -18,10 +18,8 @@ pub trait BeaconChainWriter: Send + Sync {
     /// `block.epoch()`, so the (block, state) pair on disk can never
     /// diverge for a given epoch. Idempotent on
     /// `(epoch, block_hash, state_root)` — committing the same pair
-    /// twice is a no-op. Multiple per-vnode `BeaconCoordinator`s
-    /// converging on the same committed block independently emit
-    /// `Action::CommitBeaconBlock`; this idempotency is the storage
-    /// layer's contribution to the three-layer dedup pattern
+    /// twice is a no-op; this idempotency is the storage layer's
+    /// contribution to the three-layer dedup pattern
     /// (state machine + `io_loop` `BeaconCommitCoordinator` + storage).
     ///
     /// Behavior under epoch-collision with a *different* block or

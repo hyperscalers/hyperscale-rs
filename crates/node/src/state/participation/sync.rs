@@ -128,8 +128,8 @@ impl ShardParticipation {
     /// Beacon advanced an epoch — replay any cross-shard artifacts buffered
     /// because their committee epoch wasn't yet in the schedule (remote headers,
     /// ECs, finalized txs), and re-derive the settled sets the fence still
-    /// wants. Dispatched from `handle_beacon`'s `BeaconBlockPersisted`
-    /// arm via the option guard, so a vnode that only follows the beacon no-ops.
+    /// wants. Dispatched from the `BeaconBlockPersisted` arm, once the
+    /// schedule it carries is held.
     pub(in crate::state) fn on_beacon_block_persisted(
         &mut self,
         sched: &TopologySchedule,
@@ -208,7 +208,9 @@ impl ShardParticipation {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
+    use hyperscale_core::{
+        Action, BeaconFetchIds, FetchIds, FetchRequest, ProtocolEvent, StateMachine,
+    };
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{RecoveredState, ReplayWindow};
     use hyperscale_types::test_utils::{
@@ -411,7 +413,7 @@ mod tests {
                     Action::EmitTransactionStatus { .. }
                         | Action::StartRemoteHeaderSync { .. }
                         | Action::Fetch(FetchRequest::Ask {
-                            ids: FetchIds::ShardWitnesses(_),
+                            ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(_)),
                             ..
                         })
                 ),

@@ -1398,16 +1398,12 @@ impl ShardCoordinatorSim {
             pending_chain: &self.pending_chains[emitter_idx],
             tick_chain: &Arc::new(TickChain::new(Arc::clone(&self.storages[emitter_idx]))),
             vote_registers: self.storages[emitter_idx].as_ref(),
-            ratify_registers: &production.beacon,
-            beacon_vote_registers: &production.beacon,
             beacon_chain: &production.beacon,
             network: &production.network,
             signer: &self.sks[emitter_idx],
             verifier: &BlsVerifier,
             notify: Arc::new(move |event| sink.lock().expect("reported lock").push(event)),
             commit_prepared: &commit_prepared,
-            cache_beacon_proposal: &|_, _, _| {},
-            cache_beacon_candidate: &|_| {},
             par: Parallelism::Sequential,
         };
         handle_action(action, &ctx);

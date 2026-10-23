@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, ProtocolEvent,
-    TimerId,
+    Action, BeaconFetchIds, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange,
+    ProtocolEvent, TimerId,
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BlockHeight, CandidateBeaconBlock,
@@ -75,6 +75,7 @@ const MAX_EARLY_CANDIDATES: usize = 4;
 /// driver adopts into the fold.
 #[derive(Default)]
 #[must_use]
+#[allow(missing_docs)] // the struct doc names both fields
 pub struct ParticipantStep {
     pub actions: Vec<Action>,
     pub certified: Option<Arc<Verified<CertifiedBeaconBlock>>>,
@@ -93,27 +94,21 @@ impl From<Vec<Action>> for ParticipantStep {
 pub struct BeaconParticipant {
     me: ValidatorId,
 
-    /// Shard the host vnode belongs to. Beacon is process-wide
-    /// consensus, but the participant stamps proposal fetches with the
-    /// dispatching vnode's shard so the runner's network adapter has a
-    /// committee handle for peer selection.
-    local_shard: ShardId,
-
     /// SPC consensus-plane driver: the optional current-epoch instance
     /// plus the PC-vote and SPC-message verification slot pools. Bare
     /// between bootstrap and the first epoch-boundary trigger, and again
     /// briefly between an epoch's commit and the next bootstrap.
-    pub spc: SpcDriver,
+    pub(crate) spc: SpcDriver,
 
     /// In-flight candidate and ratify-vote signature checks. Dedup-only,
     /// as the fold's block slots are.
-    pub verification: BeaconVerificationPipeline,
+    pub(crate) verification: BeaconVerificationPipeline,
 
     /// Ratification state for the pending epoch at the current tip:
     /// rounds, own-vote registers, locks, pooled votes, and
     /// commit-cert assembly. Rebuilt on every adoption for the new
     /// `(anchor, epoch)`.
-    pub ratify: RatifyTracker,
+    pub(crate) ratify: RatifyTracker,
 
     /// The verified SPC candidate awaiting ratification, held so the
     /// commit certificate can pair with the block it names. First
@@ -141,13 +136,13 @@ pub struct BeaconParticipant {
 
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
-    pub equivocations: EquivocationObservations,
+    pub(crate) equivocations: EquivocationObservations,
 
     /// Shard fork proofs the local vnode has verified but not yet
     /// carried into a proposal. Fed from the shard layer's fork
     /// detection; drained into the next proposal so the fold can stamp a
     /// fork-caused `ShardRecovery`.
-    pub fork_proofs: ForkProofObservations,
+    pub(crate) fork_proofs: ForkProofObservations,
     /// Locally verified shard double-vote pairs awaiting a proposal
     /// slot — the gossip-fed recovery lane for evidence whose holders
     /// left the source committee.
@@ -157,7 +152,7 @@ pub struct BeaconParticipant {
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
     /// reset on commit. Vnode-local — inbound fetch serving reads the
     /// driver's process-level cache, never this pool.
-    pub proposal_pool: BeaconProposalPool,
+    pub(crate) proposal_pool: BeaconProposalPool,
 
     /// The pool epoch this participant last emitted its own proposal
     /// build for. The signed proposal pools only once its build returns,
@@ -197,7 +192,7 @@ pub struct BeaconParticipant {
     /// it completes. Asked and re-evaluated only until the view-1 input
     /// is fed, the window the input dwell holds open; cleared on epoch
     /// advance.
-    pub awaiting_boundaries: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
+    pub(crate) awaiting_boundaries: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
 
     /// Blocks asked for this epoch, as `(shard, height)`: one ask per
     /// block. A chain commits one block per height, so the proven answer
@@ -209,7 +204,7 @@ pub struct BeaconParticipant {
     /// hasn't observed, tracks the fetches that resolve them, and decides
     /// when assembly is ready. An adoption advancing `current_epoch`
     /// past a stash evicts it via `prune_stale`, whose returned ids the
-    /// participant turns into [`FetchIds::BeaconProposals`].
+    /// participant turns into [`BeaconFetchIds::Proposals`].
     commit_assembly: CommitAssembler,
 
     /// How many times the view-1 input dwell has re-armed for the
@@ -233,7 +228,8 @@ pub struct BeaconParticipant {
 impl BeaconParticipant {
     /// A participant for `me` at `fold`'s tip, with no proposal, vote or
     /// candidate in hand.
-    pub fn new(fold: &BeaconFold, me: ValidatorId, local_shard: ShardId) -> Self {
+    #[must_use]
+    pub fn new(fold: &BeaconFold, me: ValidatorId) -> Self {
         // The pending epoch's ratification runs over the pool the live
         // (post-fold) state derives — the signer base every candidate
         // outcome at this tip shares.
@@ -245,7 +241,6 @@ impl BeaconParticipant {
         );
         Self {
             me,
-            local_shard,
             spc: SpcDriver::new(Arc::clone(&fold.verifier), me),
             verification: BeaconVerificationPipeline::new(),
             ratify,
@@ -268,7 +263,7 @@ impl BeaconParticipant {
     }
 
     #[must_use]
-    pub const fn me(&self) -> ValidatorId {
+    pub(crate) const fn me(&self) -> ValidatorId {
         self.me
     }
 
@@ -296,7 +291,7 @@ impl BeaconParticipant {
     /// Hash of the verified candidate held for the pending epoch, if
     /// any.
     #[must_use]
-    pub fn pending_candidate_hash(&self) -> Option<BeaconBlockHash> {
+    pub(crate) fn pending_candidate_hash(&self) -> Option<BeaconBlockHash> {
         self.pending_candidate.as_ref().map(|c| c.block_hash())
     }
 
@@ -813,7 +808,8 @@ impl BeaconParticipant {
             .filter(|validator| !self.commit_assembly.is_awaiting(epoch, *validator))
             .map(|validator| (epoch, validator))
             .collect();
-        (!released.is_empty()).then(|| Action::AbandonFetch(FetchIds::BeaconProposals(released)))
+        (!released.is_empty())
+            .then(|| Action::AbandonFetch(FetchIds::Beacon(BeaconFetchIds::Proposals(released))))
     }
 
     /// Build the PC input vector for view 1: one `PcValueElement` per
@@ -854,7 +850,7 @@ impl BeaconParticipant {
     ///   re-recorded for the next epoch — each permanently revokes its
     ///   target. Shard witnesses ride the boundary contributions, not the
     ///   proposal.
-    pub fn try_propose(&mut self, fold: &BeaconFold) -> Vec<Action> {
+    pub(crate) fn try_propose(&mut self, fold: &BeaconFold) -> Vec<Action> {
         if !self.spc.is_bootstrapped() {
             trace!("try_propose: no SPC instance — deferring");
             return Vec::new();
@@ -955,7 +951,7 @@ impl BeaconParticipant {
 
     /// Stand up a fresh SPC instance for the upcoming epoch under the
     /// current beacon committee, derived from `state`.
-    pub fn bootstrap_spc_for_next_epoch(&mut self, fold: &BeaconFold) -> Vec<Action> {
+    pub(crate) fn bootstrap_spc_for_next_epoch(&mut self, fold: &BeaconFold) -> Vec<Action> {
         let committee = fold.state.derive_beacon_committee();
         self.bootstrap_spc_with_committee(fold, committee)
     }
@@ -973,7 +969,7 @@ impl BeaconParticipant {
     /// feeds the instant every proposal is pooled; the dwell re-arms to
     /// give a laggard time and only feeds a partial vector once
     /// [`MAX_INPUT_DWELL_REARMS`] elapse.
-    pub fn bootstrap_spc_with_committee(
+    pub(crate) fn bootstrap_spc_with_committee(
         &mut self,
         fold: &BeaconFold,
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
@@ -1132,7 +1128,7 @@ impl BeaconParticipant {
                 self.evaluated_proposers.remove(member);
             }
             self.dwell_fetches.extend(missing.iter().copied());
-            let mut actions = self.fetch_missing_proposals(epoch, &missing);
+            let mut actions = Self::fetch_missing_proposals(fold, epoch, &missing);
             actions.push(Action::SetTimer {
                 id: TimerId::BeaconSpcInputDwell,
                 duration: SPC_INPUT_DWELL,
@@ -1399,7 +1395,7 @@ impl BeaconParticipant {
             };
             self.candidate_asks.insert((epoch, block_hash));
             actions.push(Action::Fetch(FetchRequest::Ask {
-                ids: FetchIds::BeaconCandidates(vec![(epoch, block_hash)]),
+                ids: FetchIds::Beacon(BeaconFetchIds::Candidates(vec![(epoch, block_hash)])),
                 shard,
                 preferred: Some(voter),
                 class: None,
@@ -1435,7 +1431,7 @@ impl BeaconParticipant {
     /// All three buffers, because a drain is not a delivery for any of
     /// them: evidence taken for a proposal that never folds and not
     /// restored is gone from this node for good.
-    pub fn prune_folded_evidence(&mut self, fold: &BeaconFold) {
+    pub(crate) fn prune_folded_evidence(&mut self, fold: &BeaconFold) {
         let validators = &fold.state.validators;
         self.equivocations.prune(|v| {
             matches!(
@@ -1507,14 +1503,14 @@ impl BeaconParticipant {
 
         let abandoned_proposals = self.commit_assembly.prune_stale(fold.state.current_epoch);
         if !abandoned_proposals.is_empty() {
-            actions.push(Action::AbandonFetch(FetchIds::BeaconProposals(
-                abandoned_proposals,
+            actions.push(Action::AbandonFetch(FetchIds::Beacon(
+                BeaconFetchIds::Proposals(abandoned_proposals),
             )));
         }
         actions.extend(released_dwell_fetches);
         if !abandoned_candidates.is_empty() {
-            actions.push(Action::AbandonFetch(FetchIds::BeaconCandidates(
-                abandoned_candidates,
+            actions.push(Action::AbandonFetch(FetchIds::Beacon(
+                BeaconFetchIds::Candidates(abandoned_candidates),
             )));
         }
 
@@ -1574,7 +1570,7 @@ impl BeaconParticipant {
     /// observer as a regular member). A split's execution moves the
     /// observer's lookahead membership onto its child, surfacing as the
     /// ordinary join/leave pair.
-    pub fn participation_delta(
+    pub(crate) fn participation_delta(
         &self,
         fold: &BeaconFold,
         effects: &SlotEffects,
@@ -1660,7 +1656,7 @@ impl BeaconParticipant {
     /// lands. Concurrent stashes for different epochs are allowed —
     /// stale entries get evicted on adoption once
     /// `current_epoch` advances past them.
-    pub fn on_spc_output_high(
+    pub(crate) fn on_spc_output_high(
         &mut self,
         fold: &BeaconFold,
         epoch: Epoch,
@@ -1679,30 +1675,36 @@ impl BeaconParticipant {
                 committed, cert, ..
             } => self.assemble_and_broadcast_candidate(fold, epoch, committed, *cert),
             AssemblyDecision::AwaitFetch { missing, .. } => {
-                self.fetch_missing_proposals(epoch, &missing)
+                Self::fetch_missing_proposals(fold, epoch, &missing)
             }
             AssemblyDecision::Idle => Vec::new(),
         }
     }
 
     /// Emit one [`FetchRequest::Ask`] of beacon proposals per missing committed
-    /// proposal. The routing `shard` is the dispatching vnode's
-    /// `local_shard` (peer selection rides the local committee), and
-    /// each ask prefers the proposal's author: it caches what it signs
-    /// before gossiping it, so an honest author holds the proposal
-    /// whoever else missed it. The author is only the first ask: a failed
-    /// answer drops the preference, so an author that answers some
-    /// members "not held" cannot keep them from the peers its gossip did
-    /// reach. An author outside the local committee is no peer of this
-    /// route, and every ask then picks a local peer.
-    fn fetch_missing_proposals(&self, epoch: Epoch, missing: &[ValidatorId]) -> Vec<Action> {
-        let local_shard = self.local_shard;
+    /// proposal, routed to the shard `fold` places its author on. Each ask
+    /// prefers the author: it caches what it signs before gossiping it,
+    /// so an honest author holds the proposal whoever else missed it. The
+    /// author is only the first ask: a failed answer drops the
+    /// preference, so an author that answers some members "not held"
+    /// cannot keep them from the peers its gossip did reach. An author on
+    /// no shard names the root, and the asker's driver picks a live
+    /// committee for it.
+    fn fetch_missing_proposals(
+        fold: &BeaconFold,
+        epoch: Epoch,
+        missing: &[ValidatorId],
+    ) -> Vec<Action> {
         missing
             .iter()
             .map(|&validator| {
+                let shard = match fold.state.validators.get(&validator).map(|v| v.status) {
+                    Some(ValidatorStatus::OnShard { shard, .. }) => shard,
+                    _ => ShardId::ROOT,
+                };
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::BeaconProposals(vec![(epoch, validator)]),
-                    shard: local_shard,
+                    ids: FetchIds::Beacon(BeaconFetchIds::Proposals(vec![(epoch, validator)])),
+                    shard,
                     preferred: Some(validator),
                     class: None,
                 })
@@ -1930,7 +1932,7 @@ impl BeaconParticipant {
 
     /// Beacon-committee members excluding the local validator —
     /// recipient list for outbound SPC traffic.
-    pub fn spc_recipients(&self, fold: &BeaconFold) -> Vec<ValidatorId> {
+    pub(crate) fn spc_recipients(&self, fold: &BeaconFold) -> Vec<ValidatorId> {
         fold.state
             .committee
             .iter()

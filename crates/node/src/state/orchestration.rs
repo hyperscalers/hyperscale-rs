@@ -4,10 +4,8 @@
 //! These stay on [`NodeStateMachine`] rather than [`ShardParticipation`] because
 //! they report to the beacon — the local shard's committed certified headers,
 //! which advance its committee anchor, and the remote headers it admits and
-//! proves. They push a [`BeaconInput`] for each, which
-//! [`handle`](hyperscale_core::StateMachine::handle) applies once the event's
-//! arm has run and before it installs any published schedule and runs the
-//! closing shard work.
+//! proves. They push a [`BeaconInput`] for each, which the replica's loop
+//! sends to the host's beacon loop once the event has run.
 //!
 //! [`ShardParticipation`]: super::participation::ShardParticipation
 
@@ -20,7 +18,7 @@ use hyperscale_types::{
 };
 
 use super::NodeStateMachine;
-use super::beacon::BeaconInput;
+use crate::event::BeaconInput;
 
 impl NodeStateMachine {
     /// Block committed: fold it into execution and notify every
@@ -44,9 +42,7 @@ impl NodeStateMachine {
         committee_anchor: WeightedTimestamp,
         inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
-        let Some(s) = self.shard.as_mut() else {
-            return Vec::new();
-        };
+        let s = &mut self.shard;
         let mut actions = Vec::new();
         let block_hash = certified.block().hash();
         derive_block_transactions(certified.block(), s.derivation.as_ref());
@@ -128,11 +124,8 @@ impl NodeStateMachine {
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
         inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
-        let Some(s) = self.shard.as_mut() else {
-            return Vec::new();
-        };
-
-        let actions = s
+        let actions = self
+            .shard
             .provisions_coordinator
             .on_verified_remote_header(&certified_header);
         inputs.push(BeaconInput::SourceHeader {
@@ -157,9 +150,7 @@ impl NodeStateMachine {
             header: Arc::clone(certified_header),
         });
         let topology_schedule = &self.schedule;
-        let Some(s) = self.shard.as_mut() else {
-            return Vec::new();
-        };
+        let s = &mut self.shard;
 
         // The anchor lands first and in one place: the vote fence holds a
         // block's state proofs to what this validator has commit-proven,
@@ -197,8 +188,9 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Block,
         BlockHeight, CertifiedBeaconBlock, ChainOrigin, Epoch, LocalTimestamp, NetworkDefinition,
-        PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RatifyCert, RatifyRound, ShardId,
-        SignerBitfield, SpcCert, SpcView, StateRoot, ValidatorId, Verifiable, beacon_reveal_sign,
+        PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RatifyCert, RatifyRound, Round,
+        ShardId, SignerBitfield, SpcCert, SpcView, StateRoot, TopologySchedule, ValidatorId,
+        Verifiable, beacon_reveal_sign,
     };
 
     use super::*;
@@ -228,14 +220,11 @@ mod tests {
         vec![before, after]
     }
 
-    fn epoch_ms(node: &NodeStateMachine) -> u64 {
-        node.beacon_coordinator()
-            .current_state()
-            .chain_config
-            .epoch_duration_ms
+    fn epoch_ms(node: &TestNode) -> u64 {
+        node.fold.state().chain_config.epoch_duration_ms
     }
 
-    fn in_window(node: &NodeStateMachine, epoch: u64) -> WeightedTimestamp {
+    fn in_window(node: &TestNode, epoch: u64) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(epoch * epoch_ms(node) + 1)
     }
 
@@ -267,14 +256,9 @@ mod tests {
     fn child_replica_over(
         anchor_epoch: u64,
         history: fn(BeaconState) -> Vec<BeaconState>,
-    ) -> NodeStateMachine {
+    ) -> TestNode {
         let (child, _) = ShardId::ROOT.children();
-        let ed = TestNode::new()
-            .node
-            .beacon_coordinator()
-            .current_state()
-            .chain_config
-            .epoch_duration_ms;
+        let ed = epoch_ms(&TestNode::new());
         let anchor = WeightedTimestamp::from_millis(anchor_epoch * ed + 1);
         let recovered = RecoveredState {
             committed_height: BlockHeight::new(5),
@@ -287,18 +271,17 @@ mod tests {
             .recovered(recovered)
             .beacon_history(history)
             .build()
-            .node
     }
 
-    fn child_replica(anchor_epoch: u64) -> NodeStateMachine {
+    fn child_replica(anchor_epoch: u64) -> TestNode {
         child_replica_over(anchor_epoch, merged)
     }
 
     /// The node's beacon adopts the skip block for the epoch after its
     /// tip.
-    fn adopt_skip(node: &mut NodeStateMachine) {
-        let tip = node.beacon_coordinator().latest_block().block_hash();
-        let epoch = node.beacon_coordinator().current_epoch().next();
+    fn adopt_skip(node: &mut TestNode) {
+        let tip = node.fold.latest_block().block_hash();
+        let epoch = node.fold.state().current_epoch.next();
         let block = BeaconBlock::skip(epoch, tip);
         let cert = RatifyCert::new(
             tip,
@@ -312,19 +295,16 @@ mod tests {
             CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert)),
         ));
         let now = LocalTimestamp::from_millis((epoch.inner() + 1) * epoch_ms(node));
-        let _ = node.handle(
-            now,
-            ProtocolEvent::BeaconBlockVerified { result: Ok(block) },
-        );
-        assert_eq!(node.beacon_coordinator().current_epoch(), epoch);
+        node.adopt(now, block);
+        assert_eq!(node.fold.state().current_epoch, epoch);
     }
 
     /// The node's beacon adopts a normal block for the epoch after its
     /// tip, carrying one bare proposal from the first committee member,
     /// so the epoch runs the boundary fold and its terminal-record GC.
-    fn adopt_normal(node: &mut NodeStateMachine) {
-        let tip = node.beacon_coordinator().latest_block().block_hash();
-        let epoch = node.beacon_coordinator().current_epoch().next();
+    fn adopt_normal(node: &mut TestNode) {
+        let tip = node.fold.latest_block().block_hash();
+        let epoch = node.fold.state().current_epoch.next();
         let network = NetworkDefinition::simulator();
         let committee = TestCommittee::new(4, 7);
         let reveal = beacon_reveal_sign(committee.signer(0).as_ref(), &network, epoch)
@@ -379,15 +359,13 @@ mod tests {
             ),
         ));
         let now = LocalTimestamp::from_millis((epoch.inner() + 1) * epoch_ms(node));
-        let _ = node.handle(
-            now,
-            ProtocolEvent::BeaconBlockVerified { result: Ok(block) },
-        );
-        assert_eq!(node.beacon_coordinator().current_epoch(), epoch);
+        node.adopt(now, block);
+        assert_eq!(node.fold.state().current_epoch, epoch);
     }
 
-    fn holds_window(node: &NodeStateMachine, epoch: u64) -> bool {
-        node.schedule
+    fn holds_window(node: &TestNode, epoch: u64) -> bool {
+        node.node
+            .schedule
             .at(WeightedTimestamp::from_millis(epoch * epoch_ms(node)))
             .is_some()
     }
@@ -423,7 +401,7 @@ mod tests {
             },
         );
         assert!(
-            !node.schedule.past_terminal(child, past_lookahead),
+            !node.node.schedule.past_terminal(child, past_lookahead),
             "the window past the cut is not folded yet",
         );
 
@@ -441,10 +419,10 @@ mod tests {
     #[test]
     fn a_shard_event_reads_the_schedule_the_last_adoption_left() {
         let mut node = child_replica_over(1002, merged_with_terminal_record);
-        let cleanup = |node: &mut NodeStateMachine| {
-            let now = node.beacon_coordinator().now();
+        let cleanup = |node: &mut TestNode| {
+            let now = node.fold.now();
             let _ = node.handle(now, ProtocolEvent::CleanupTimer);
-            node.participation().pending_pool_handed_back
+            node.node.shard.pending_pool_handed_back
         };
         assert!(!cleanup(&mut node), "no schedule shows the terminal yet");
 
@@ -462,17 +440,17 @@ mod tests {
         let (child, _) = ShardId::ROOT.children();
         let mut node = child_replica_over(1002, merged_with_terminal_record);
         let anchor = in_window(&node, 1002);
-        assert!(!node.shard_coordinator().quiescent(&node.schedule));
+        assert!(!node.node.shard_coordinator().quiescent(&node.node.schedule));
 
         adopt_skip(&mut node);
-        assert!(node.schedule.past_terminal(child, anchor));
+        assert!(node.node.schedule.past_terminal(child, anchor));
 
         adopt_normal(&mut node);
         adopt_normal(&mut node);
         assert!(!holds_window(&node, 1), "the terminal window is evicted");
-        assert!(!node.schedule.past_terminal(child, anchor));
-        assert!(node.shard_coordinator().quiescent(&node.schedule));
-        assert!(node.shard_coordinator().dissolved(&node.schedule));
+        assert!(!node.node.schedule.past_terminal(child, anchor));
+        assert!(node.node.shard_coordinator().quiescent(&node.node.schedule));
+        assert!(node.node.shard_coordinator().dissolved(&node.node.schedule));
     }
 
     /// A replica seated at a genesis anchored past its terminal reads
@@ -494,14 +472,14 @@ mod tests {
                 anchor_wt: anchor,
             },
         );
-        let now = node.beacon_coordinator().now();
-        let _ = node.initialize_genesis(now, &genesis);
-        assert!(node.shard_coordinator().dissolved(&node.schedule));
+        let now = node.fold.now();
+        let _ = node.node.initialize_genesis(now, &genesis);
+        assert!(node.node.shard_coordinator().dissolved(&node.node.schedule));
 
         adopt_skip(&mut node);
         assert!(!holds_window(&node, 1), "the terminal window is evicted");
-        assert!(!node.schedule.past_terminal(child, anchor));
-        assert!(node.shard_coordinator().dissolved(&node.schedule));
+        assert!(!node.node.schedule.past_terminal(child, anchor));
+        assert!(node.node.shard_coordinator().dissolved(&node.node.schedule));
     }
 
     /// A retained replica that read itself dissolved stays dissolved once
@@ -512,15 +490,10 @@ mod tests {
         let (child, _) = ShardId::ROOT.children();
         let mut node = child_replica_over(1000, merged_with_terminal_record);
         let anchor = in_window(&node, 1000);
-        let schedule = &node.schedule;
+        let schedule = &node.node.schedule;
         assert!(schedule.past_terminal(child, anchor));
-        assert!(node.shard_coordinator().dissolved(schedule));
-        let held_record = |node: &NodeStateMachine| {
-            node.beacon_coordinator()
-                .current_state()
-                .boundaries
-                .contains_key(&child)
-        };
+        assert!(node.node.shard_coordinator().dissolved(schedule));
+        let held_record = |node: &TestNode| node.fold.state().boundaries.contains_key(&child);
 
         adopt_normal(&mut node);
         assert!(held_record(&node), "the evidence window is still open");
@@ -532,12 +505,73 @@ mod tests {
         adopt_normal(&mut node);
         assert!(!held_record(&node), "the terminal record is collected");
         assert!(!holds_window(&node, 1), "the terminal window is evicted");
-        let schedule = &node.schedule;
+        let schedule = &node.node.schedule;
         assert!(
             !schedule.past_terminal(child, anchor),
             "the schedule no longer reads the chain past its terminal",
         );
-        assert!(node.shard_coordinator().quiescent(schedule));
-        assert!(node.shard_coordinator().dissolved(schedule));
+        assert!(node.node.shard_coordinator().quiescent(schedule));
+        assert!(node.node.shard_coordinator().dissolved(schedule));
+    }
+
+    /// A proposer whose committee lookup stalls on a not-yet-committed epoch
+    /// has no retry signal other than the beacon adopting that epoch, so
+    /// `BeaconBlockPersisted` must latch a proposal retry for the
+    /// post-dispatch hook to turn into `try_propose`. Without it the
+    /// view-change timer fires first, the height moves to a later round, and
+    /// the round-contiguous commit rule never sees consecutive rounds while
+    /// the beacon trails. End-to-end on a leader, the event must surface a
+    /// `BuildProposal` action.
+    #[test]
+    fn beacon_block_persisted_drives_proposal_through_post_dispatch_hook() {
+        // Rounds increase per block, so height 1 is round 1:
+        // proposer_for(r=1) = committee[1 % 4] = ValidatorId::new(1).
+        let mut test = TestNode::builder().local_idx(1).build();
+        assert!(
+            test.node
+                .topology_snapshot()
+                .proposer_for(test.node.shard_id(), Round::new(1))
+                == test.committee.validator_id(1),
+            "local must be the height-1 proposer for this test",
+        );
+
+        let schedule = Arc::new(test.fold.schedule().clone());
+        let actions = test.node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BeaconBlockPersisted {
+                epoch: Epoch::GENESIS,
+                schedule,
+            },
+        );
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "expected BuildProposal after BeaconBlockPersisted on a leader; got {actions:?}",
+        );
+    }
+
+    /// A replica restored past its terminal from a store that commits
+    /// nothing more latches its dissolution against its first schedule,
+    /// at construction: a schedule that has since evicted the windows
+    /// that showed it reads nothing, and the replica still reads itself
+    /// dissolved.
+    #[test]
+    fn a_departed_shard_restored_after_a_restart_stays_dissolved_once_its_windows_are_evicted() {
+        let (child, _) = ShardId::ROOT.children();
+        let node = child_replica_over(1000, merged_with_terminal_record);
+        let anchor = in_window(&node, 1000);
+        let evicted = TopologySchedule::new(
+            epoch_ms(&node),
+            Epoch::new(1001),
+            Arc::clone(node.node.schedule.head()),
+        );
+        assert!(
+            !evicted.past_terminal(child, anchor),
+            "a schedule without the terminal's windows reads nothing",
+        );
+        assert!(node.node.shard_coordinator().quiescent(&evicted));
+        assert!(node.node.shard_coordinator().dissolved(&evicted));
     }
 }

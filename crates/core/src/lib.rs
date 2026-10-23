@@ -45,7 +45,7 @@ pub use action::{
     ParticipationChange, ProvisionsRequest, QcSubject, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
-pub use fetch_ids::FetchIds;
+pub use fetch_ids::{BeaconFetchIds, FetchIds};
 pub use fetch_request::FetchRequest;
 pub use hyperscale_dispatch::Parallelism;
 pub use protocol_event::{CommitSource, ProtocolEvent, TickBatchOutcome};

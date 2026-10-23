@@ -17,28 +17,29 @@
 //! `clear_scratch` / `take_output` scratch lifecycle, so the two drivers
 //! cannot drift.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
+use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{CodeAvailability, Executor};
 use hyperscale_network::Network;
 use hyperscale_shard::ShardStats;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage, PendingChain, ShardStorage, TickChain};
+use hyperscale_storage::{
+    BeaconChainReader, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
+};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, Derivation, LocalTimestamp, NetworkDefinition, ShardId,
+    Block, BlockHeight, CertifiedBlock, Derivation, Epoch, LocalTimestamp, ShardId, Signer,
     TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
 use crate::NodeStateMachine;
-use crate::beacon::{
-    BeaconBlockSync, BeaconCandidateCache, BeaconFetchState, BeaconProposalCache,
-    beacon_block_sync_config,
-};
-use crate::beacon_loop::BeaconLoop;
+use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
+use crate::beacon_loop::{BeaconLoop, resume_fold};
 use crate::config::NodeConfig;
+use crate::event::Registration;
 use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
@@ -54,7 +55,9 @@ use crate::shard::{
     DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
     ShardDispatchHandles, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
 };
-use crate::vnode::{GroupStores, Vnode, VnodeInit, VnodeSeat};
+use crate::vnode::{
+    GroupStores, SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_vnode_group,
+};
 
 /// Output of [`NodeHost::into_parts`].
 ///
@@ -121,40 +124,52 @@ where
     config: NodeConfig,
 }
 
+/// One chain a host runs from startup: the shard, its opened store and
+/// the state it recovered, and the validators it seats.
+pub struct StartupChain<'a, S> {
+    /// The chain's shard.
+    pub shard: ShardId,
+    /// The chain's opened store.
+    pub storage: S,
+    /// The state the store recovered; the caller keeps it to resume the
+    /// loop from.
+    pub recovered: &'a RecoveredState,
+    /// `(validator, signer)` per seated vnode.
+    pub vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
+}
+
 impl<S, N, D> NodeHost<S, N, D>
 where
     S: ShardStorage,
     N: Network,
     D: Dispatch,
 {
-    /// Create a new `NodeHost` hosting one or more `Vnode`s, possibly
-    /// across multiple shards.
+    /// Create a `NodeHost` over its beacon storage, running `chains` from
+    /// startup and a beacon participant for each of `identities`.
     ///
-    /// `storages` carries one storage handle per hosted shard. The set
-    /// of hosted shards is derived from `vnodes` (each vnode's
-    /// `local_shard()`); `storages` must cover all of them.
+    /// The beacon loop and its fold are built first, from beacon storage,
+    /// with `now` as their clock. Each startup chain then registers with
+    /// the fold, and its replicas are built from the schedule the
+    /// registration hands back, so a chain anchored below the fold's floor
+    /// widens the schedule before its first event.
     ///
-    /// `beacon_event_sender` is the beacon loop's channel: beacon gossip
-    /// for its followers, and the outcomes of its own dispatched actions
-    /// and fetches.
+    /// `beacon_event_sender` is the beacon loop's channel: beacon gossip,
+    /// what the replicas report, and the outcomes of its own dispatched
+    /// actions and fetches.
     ///
     /// # Panics
     ///
-    /// Panics if `vnodes` is empty, or if any hosted shard lacks a
-    /// matching entry in `storages`.
+    /// Panics if `shard_event_senders` names a shard other than `chains`',
+    /// or if beacon storage holds no committed block.
     // `config: NodeConfig` is taken by value: every caller hands over a fresh
     // config and we destructure sub-configs via `.clone()`, so a `&NodeConfig`
     // would just force the body to clone each subfield.
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::needless_pass_by_value,
-        clippy::too_many_lines
-    )] // two-pass construction: build shard io, then process, then assemble
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)] // every process-scoped resource threads through one constructor
     pub fn new(
-        vnodes: Vec<VnodeInit>,
-        mut storages: BTreeMap<ShardId, S>,
+        seat_config: SeatConfig,
+        chains: Vec<StartupChain<'_, S>>,
+        identities: Vec<(ValidatorId, Arc<dyn Signer>)>,
         beacon_storage: Arc<dyn BeaconStorage>,
-        beacon_network: NetworkDefinition,
         executor: Arc<Executor>,
         network: N,
         dispatch: D,
@@ -162,24 +177,29 @@ where
         beacon_event_sender: Sender<HostEvent>,
         topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
+        now: LocalTimestamp,
     ) -> Self {
-        assert!(!vnodes.is_empty(), "NodeHost requires at least one Vnode");
-        let process_verifier = Arc::clone(vnodes[0].state.beacon_coordinator().verifier());
-        let topology_schedule = Arc::new(
-            vnodes[0]
-                .state
-                .beacon_coordinator()
-                .topology_schedule()
-                .clone(),
+        assert!(
+            shard_event_senders.keys().copied().eq(chains
+                .iter()
+                .map(|chain| chain.shard)
+                .collect::<BTreeSet<_>>()),
+            "shard_event_senders must have exactly one entry per startup chain"
         );
-
+        let fold = resume_fold(
+            beacon_storage.as_ref(),
+            Arc::clone(&seat_config.verifier),
+            seat_config.beacon_network.clone(),
+            seat_config.beacon_config_hash,
+            now,
+        );
         let network = Arc::new(network);
 
         // Reseed published code from each store's package index — the
         // boot half of commit-time absorption, so a restarted host
         // executes calls to packages published before the restart.
-        for storage in storages.values() {
-            for artifact in storage.package_artifacts() {
+        for chain in &chains {
+            for artifact in chain.storage.package_artifacts() {
                 executor.install_artifact(&artifact);
             }
         }
@@ -189,45 +209,12 @@ where
             executor.install_artifact(&artifact);
         }
 
-        // First pass: build ShardIo + Vec<Vnode> for each shard, plus the
-        // per-shard dispatch handles map. ShardLoop construction is deferred
-        // to a second pass because each ShardLoop needs an Arc<ProcessIo>
-        // that can only be built after dispatch_handles is finalized.
-        let mut shard_builds: BTreeMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = BTreeMap::new();
-        let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
-
-        // Split the vnodes into per-shard groups (seated) and the beacon
-        // loop's followers (`shard: None`). The hosted-shard set — one
-        // `ShardIo` apiece — is exactly the seated groups' keys.
-        let mut by_shard: BTreeMap<ShardId, Vec<VnodeInit>> = BTreeMap::new();
-        let mut follower_inits: Vec<VnodeInit> = Vec::new();
-        for init in vnodes {
-            match init.state.seated_shard() {
-                Some(shard) => by_shard.entry(shard).or_default().push(init),
-                None => follower_inits.push(init),
-            }
-        }
-        assert!(
-            shard_event_senders.keys().eq(by_shard.keys()),
-            "shard_event_senders must have exactly one entry per hosted shard"
-        );
-
-        for (shard, mut inits) in by_shard {
-            let storage = storages
-                .remove(&shard)
-                .unwrap_or_else(|| panic!("NodeHost: missing storage for hosted shard {shard:?}"));
-            let (io, handles) =
-                build_shard_io(shard, &mut inits, storage, &topology_snapshot, &config);
-            per_shard_dispatch.insert(shard, handles);
-            let vnodes: Vec<Vnode> = inits.into_iter().map(VnodeInit::into_vnode).collect();
-            shard_builds.insert(shard, (io, vnodes));
-        }
-
         // The stores this host has open, shared with the engine so a
         // record its caches dropped — or a restart never seated — is read
         // back from disk rather than asked of a peer that would answer
-        // with what is already on this node's own disk.
-        let per_shard = Arc::new(ArcSwap::from_pointee(per_shard_dispatch));
+        // with what is already on this node's own disk. Filled once the
+        // startup chains' stores are wired below.
+        let per_shard = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         executor.install_store(Arc::new(HostedRecords::new(
             Arc::clone(&per_shard),
             Arc::clone(&beacon_storage),
@@ -236,116 +223,128 @@ where
             executor,
             network: Arc::clone(&network),
             beacon_proposal_cache: Arc::new(BeaconProposalCache::new(
-                beacon_network,
+                seat_config.beacon_network.clone(),
                 Arc::clone(&beacon_storage) as Arc<dyn BeaconChainReader>,
             )),
             beacon_candidate_cache: Arc::new(BeaconCandidateCache::new()),
             beacon_storage: Arc::clone(&beacon_storage),
-            per_shard,
+            per_shard: Arc::clone(&per_shard),
         });
         let process = Arc::new(ProcessIo::new(
             network,
-            process_verifier,
+            Arc::clone(&seat_config.verifier),
             dispatch,
-            shard_event_senders,
+            shard_event_senders.clone(),
             beacon_event_sender,
             topology_snapshot,
-            topology_schedule,
+            Arc::new(fold.schedule().clone()),
             dispatch_handles,
             beacon_storage,
         ));
 
-        // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.
-        let shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = shard_builds
-            .into_iter()
-            .map(|(shard, (io, vnodes))| {
-                let mut shard_loop = ShardLoop {
-                    shard,
-                    event_tx: process.shard_sender(shard),
-                    process: Arc::clone(&process),
-                    io,
-                    beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
-                    vnodes,
-                    now: LocalTimestamp::ZERO,
-                    fetch_tick: FetchTicker::default(),
-                    pending_timer_ops: Vec::new(),
-                    emitted_statuses: Vec::new(),
-                    pending_participation_changes: Vec::new(),
-                    actions_generated: 0,
-                    seated: Vec::new(),
-                    reseat: false,
-                    pending_seats: Vec::new(),
-                    answer_follow: None,
-                };
-                shard_loop.share_host_seats();
-                (shard, shard_loop)
-            })
-            .collect();
+        let mut beacon = BeaconLoop::new(Arc::clone(&process), fold, &config);
+        for (validator, signer) in identities {
+            beacon.add_participant(validator, signer);
+        }
 
-        let beacon = BeaconLoop::new(
-            Arc::clone(&process),
-            follower_inits
-                .into_iter()
-                .map(VnodeInit::into_vnode)
-                .collect(),
-            &config,
-        );
-        // Route committed beacon blocks to the beacon loop only while it has
-        // followers to fold them; the sim drives the loop through this
-        // channel directly, and the production runner re-asserts the flag
-        // when it (re)spawns the beacon thread after `into_parts`.
-        process.set_beacon_route_active(!beacon.is_empty());
+        let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
+        let mut shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = BTreeMap::new();
+        for chain in chains {
+            let sender = shard_event_senders[&chain.shard].clone();
+            let registration = beacon.register(
+                chain.shard,
+                chain_anchors(chain.recovered),
+                chain.recovered.committed_height,
+                sender.clone(),
+            );
+            let mut inits = seat_vnode_group(SeatVnodeGroup {
+                config: seat_config.clone(),
+                schedule: (Arc::clone(&registration.schedule), registration.epoch),
+                shard: chain.shard,
+                recovered: chain.recovered,
+                vnodes: chain.vnodes,
+            });
+            let (io, handles) = build_shard_io(
+                chain.shard,
+                &mut inits,
+                chain.storage,
+                &process.topology_snapshot,
+                &config,
+                &registration,
+            );
+            per_shard_dispatch.insert(chain.shard, handles);
+            let shard_loop = assemble_loop(&process, chain.shard, sender, io, inits, &registration);
+            shards.insert(chain.shard, shard_loop);
+        }
+        per_shard.store(Arc::new(per_shard_dispatch));
 
         Self {
             shards,
             beacon,
             process,
-            now: LocalTimestamp::ZERO,
+            now,
             config,
         }
     }
 
-    /// Begin hosting `shard` at runtime: install its event sender,
-    /// build its `ShardIo` + dispatch handles, include it in the
-    /// network's hosted set, seat its `ShardLoop`, and register its
-    /// request handlers. The caller supplies the shard's vnodes (state
-    /// machines constructed for that shard), its opened storage, and
-    /// the event sender whose receiver the runner drains.
+    /// Begin hosting `shard` at runtime: register its chain with the
+    /// beacon loop, build its replicas from the schedule the registration
+    /// hands back, and wire its `ShardLoop` in (see [`attach_shard`]).
     ///
     /// Events for the shard may queue on the channel from the moment
     /// the sender is installed; they're processed once the loop steps.
     ///
     /// # Panics
     ///
-    /// Panics if `vnodes` is empty, targets mixed shards, or names a
-    /// shard this host already serves.
-    pub fn add_shard(&mut self, vnodes: Vec<VnodeInit>, storage: S, sender: Sender<HostEvent>) {
-        let shard = vnodes
-            .first()
-            .expect("add_shard requires at least one vnode")
-            .state
-            .shard_id();
+    /// Panics if `vnodes` is empty or names a shard this host already
+    /// serves.
+    pub fn add_shard(
+        &mut self,
+        shard: ShardId,
+        config: SeatConfig,
+        recovered: &RecoveredState,
+        vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
+        storage: S,
+        sender: Sender<HostEvent>,
+    ) {
         assert!(
             !self.shards.contains_key(&shard),
             "shard {shard:?} already hosted"
         );
-        let mut shard_loop = attach_shard(&self.process, &self.config, vnodes, storage, sender);
+        let registration = self.beacon.register(
+            shard,
+            chain_anchors(recovered),
+            recovered.committed_height,
+            sender.clone(),
+        );
+        let inits = seat_vnode_group(SeatVnodeGroup {
+            config,
+            schedule: (Arc::clone(&registration.schedule), registration.epoch),
+            shard,
+            recovered,
+            vnodes,
+        });
+        let mut shard_loop = attach_shard(
+            &self.process,
+            &self.config,
+            &registration,
+            inits,
+            storage,
+            sender,
+        );
         shard_loop.set_time(self.now);
         self.shards.insert(shard, shard_loop);
     }
 
     /// Queue `seat` on `shard`'s running loop, a validator drawn onto a
     /// shard this host already serves. The loop admits it once its store
-    /// is at rest (see [`ShardLoop::seat_vnode`]); its beacon-loop follower,
-    /// if any, retires when it is.
+    /// is at rest (see [`ShardLoop::seat_vnode`]).
     ///
     /// # Panics
     ///
     /// Panics if `shard` isn't hosted.
     pub fn seat_vnode(&mut self, shard: ShardId, seat: VnodeSeat) -> StepOutput {
-        let out = self.shard_loop_mut(shard).seat_vnode(seat);
-        self.retire_seated_followers(&out.seated);
-        out
+        self.shard_loop_mut(shard).seat_vnode(seat)
     }
 
     /// Take `validator` off `shard`'s loop while another seat keeps the
@@ -360,17 +359,59 @@ where
         self.shard_loop_mut(shard).remove_vnode(validator)
     }
 
-    /// Stop hosting `shard`: exclude it from the network's hosted set,
-    /// drop its request handlers, event sender, and dispatch handles,
-    /// and return its `ShardLoop` for the caller to drain or drop.
-    /// Inbound traffic for the shard is rejected from the moment the
-    /// maps swap; events already queued die with the channel receiver.
+    /// Stop hosting `shard`: deregister its chain from the beacon loop,
+    /// exclude it from the network's hosted set, drop its request
+    /// handlers, event sender, and dispatch handles, and return its
+    /// `ShardLoop` for the caller to drain or drop. Inbound traffic for
+    /// the shard is rejected from the moment the maps swap; events already
+    /// queued die with the channel receiver.
     ///
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {
         let shard_loop = self.shards.remove(&shard)?;
+        self.beacon.deregister(shard_loop.chain);
         detach_shard(&self.process, shard);
         Some(shard_loop)
+    }
+
+    /// Run `validator`'s beacon participation on this host from now on.
+    /// Its startup timers land in the beacon loop's timer scratch; the
+    /// caller drains them via [`Self::drain_pending_output`].
+    pub fn add_participant(&mut self, validator: ValidatorId, signer: Arc<dyn Signer>) {
+        self.beacon.add_participant(validator, signer);
+    }
+
+    /// Stop running `validator`'s beacon participation on this host. Its
+    /// release gate is closed when this returns. Returns whether the host
+    /// ran it.
+    pub fn remove_participant(&mut self, validator: ValidatorId) -> bool {
+        self.beacon.remove_participant(validator)
+    }
+
+    /// The identities this host runs a beacon participant for.
+    pub fn participants(&self) -> impl Iterator<Item = ValidatorId> + '_ {
+        self.beacon.validators()
+    }
+
+    /// The shard of every chain registered with this host's fold, one
+    /// entry per registration.
+    #[must_use]
+    pub fn registered_chains(&self) -> Vec<ShardId> {
+        self.beacon
+            .fold()
+            .chains()
+            .map(|(_, chain)| chain.shard)
+            .collect()
+    }
+
+    /// The oldest epoch whose window this host's fold retains.
+    #[must_use]
+    pub fn oldest_retained_epoch(&self) -> Option<Epoch> {
+        self.beacon
+            .fold()
+            .schedule()
+            .retained_epochs()
+            .map(|(oldest, _)| oldest)
     }
 
     /// Consume the host and yield its constituent parts: the shared
@@ -438,40 +479,9 @@ where
         })
     }
 
-    /// Number of shard-less, beacon-following vnodes on the host's beacon
-    /// loop.
-    #[must_use]
-    pub const fn pooled_len(&self) -> usize {
-        self.beacon.len()
-    }
-
-    /// Remove `validator`'s shard-less follower vnode from the beacon loop,
-    /// once it has been seated onto a shard (the seat rebuilt its
-    /// `BeaconCoordinator` from the host's warm beacon storage). Its release
-    /// gate is closed when this returns. No-op if the loop holds no such
-    /// follower.
-    pub fn drop_pooled_vnode(&mut self, validator: ValidatorId) {
-        self.beacon.remove_vnode(validator);
-        // A loop with no followers no longer needs the beacon channel; stop
-        // routing so the host doesn't fold blocks into it.
-        self.process
-            .set_beacon_route_active(!self.beacon.is_empty());
-    }
-
-    /// Add a shard-less beacon follower to the host's beacon loop. Used when
-    /// a validator drains off its last shard and keeps following the beacon
-    /// (see [`seat_follower`](crate::seat_follower)). The follower's beacon
-    /// startup timers land in the loop's timer scratch; the caller drains
-    /// them via [`Self::drain_pending_output`].
-    pub fn add_pooled_vnode(&mut self, init: VnodeInit) {
-        self.beacon.add_vnode(init.into_vnode());
-        // The loop now has a follower; route committed beacon blocks to it.
-        self.process.set_beacon_route_active(true);
-    }
-
-    /// Whether this host runs a vnode for `validator` on any hosted shard.
-    /// Drives the drain-to-pool decision: a departing validator still on
-    /// another shard keeps that shard's coordinator and needs no follower.
+    /// Whether any loop this host runs carries `validator`'s vnode, a
+    /// retained terminated loop's included. An identity no loop carries
+    /// may move between hosts.
     #[must_use]
     pub fn hosts_validator(&self, validator: ValidatorId) -> bool {
         self.shards
@@ -636,16 +646,7 @@ where
             out.merge(sl.take_output());
         }
         out.merge(self.beacon.take_output());
-        self.retire_seated_followers(&out.seated);
         out
-    }
-
-    /// Retire the beacon-loop follower of every validator a loop just seated:
-    /// it drives its beacon from the shard now.
-    fn retire_seated_followers(&mut self, seated: &[ValidatorId]) {
-        for &validator in seated {
-            self.drop_pooled_vnode(validator);
-        }
     }
 
     /// Flush any batch accumulators whose deadlines have expired across
@@ -681,15 +682,60 @@ where
     }
 }
 
+/// The anchors a recovered chain's committed tip carries.
+#[must_use]
+pub fn chain_anchors(recovered: &RecoveredState) -> LocalChainAnchors {
+    LocalChainAnchors {
+        committee: recovered.committee_anchor_wt(),
+        block: recovered.block_anchor_wt(),
+    }
+}
+
+/// Assemble a shard's loop over its built `io` and vnodes.
+fn assemble_loop<S, N, D>(
+    process: &Arc<ProcessIo<S, N, D>>,
+    shard: ShardId,
+    event_tx: Sender<HostEvent>,
+    io: ShardIo<S>,
+    vnodes: Vec<VnodeInit>,
+    registration: &Registration,
+) -> ShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    let mut shard_loop = ShardLoop {
+        shard,
+        chain: registration.token,
+        event_tx,
+        process: Arc::clone(process),
+        io,
+        vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
+        now: LocalTimestamp::ZERO,
+        fetch_tick: FetchTicker::default(),
+        pending_timer_ops: Vec::new(),
+        emitted_statuses: Vec::new(),
+        actions_generated: 0,
+        seated: Vec::new(),
+        reseat: false,
+        pending_seats: Vec::new(),
+        answer_follow: None,
+    };
+    shard_loop.share_host_seats();
+    shard_loop
+}
+
 /// Wire a runtime-joined shard into the process-scoped maps and build
 /// its `ShardLoop`.
 ///
-/// Installs the event sender, builds the `ShardIo` + dispatch handles,
-/// grows the execution cache and network hosted sets, seats each
-/// vnode's beacon-signing claim, and registers the shard's request
-/// handlers. Returns the loop for the caller to drive —
-/// `NodeHost::add_shard` seats it in the host's map (the sim step
-/// path); the production supervisor moves it onto a pinned thread.
+/// The chain is already registered with the beacon loop, and `vnodes`
+/// are built from the schedule `registration` handed back. Installs the
+/// event sender, builds the `ShardIo` + dispatch handles, grows the
+/// network hosted sets, and registers the shard's request handlers.
+/// Returns the loop for the caller to drive — `NodeHost::add_shard`
+/// seats it in the host's map (the sim step path); the production
+/// supervisor moves it onto a pinned thread.
 ///
 /// # Panics
 ///
@@ -697,6 +743,7 @@ where
 pub fn attach_shard<S, N, D>(
     process: &Arc<ProcessIo<S, N, D>>,
     config: &NodeConfig,
+    registration: &Registration,
     mut vnodes: Vec<VnodeInit>,
     storage: S,
     sender: Sender<HostEvent>,
@@ -723,29 +770,12 @@ where
         storage,
         &process.topology_snapshot,
         config,
+        registration,
     );
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
-    let mut shard_loop = ShardLoop {
-        shard,
-        event_tx: sender,
-        process: Arc::clone(process),
-        io,
-        beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
-        vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
-        now: LocalTimestamp::ZERO,
-        fetch_tick: FetchTicker::default(),
-        pending_timer_ops: Vec::new(),
-        emitted_statuses: Vec::new(),
-        pending_participation_changes: Vec::new(),
-        actions_generated: 0,
-        seated: Vec::new(),
-        reseat: false,
-        pending_seats: Vec::new(),
-        answer_follow: None,
-    };
-    shard_loop.share_host_seats();
+    let shard_loop = assemble_loop(process, shard, sender, io, vnodes, registration);
     register_shard_request_handlers(process, &shard_loop.io, shard);
     process.release_parked_submissions();
     shard_loop
@@ -755,10 +785,7 @@ where
 ///
 /// Call once the shard's loop has stopped stepping (the sim path drops
 /// the loop; the production supervisor joins the thread first). Inbound
-/// traffic for the shard is rejected from the moment the maps swap. The
-/// dead vnodes' beacon signing needs no hand-off — the view-claim fence
-/// lets each validator's surviving vnode claim the next SPC view on its
-/// own dispatch.
+/// traffic for the shard is rejected from the moment the maps swap.
 pub fn detach_shard<S, N, D>(process: &Arc<ProcessIo<S, N, D>>, shard: ShardId)
 where
     S: ShardStorage,
@@ -781,6 +808,7 @@ fn build_shard_io<S: ShardStorage>(
     storage: S,
     topology: &SharedTopologySnapshot,
     config: &NodeConfig,
+    registration: &Registration,
 ) -> (ShardIo<S>, ShardDispatchHandles<S>) {
     let rep = inits.first().expect("shard group has at least one vnode");
     let initial_persisted_height = rep.state.shard_coordinator().committed_height();
@@ -836,7 +864,7 @@ fn build_shard_io<S: ShardStorage>(
     let boundary_pins = Arc::new(BoundaryPins::new(
         Arc::clone(&storage),
         shard,
-        &rep.state.beacon_coordinator().current_state().chain_config,
+        &registration.chain_config,
         Arc::clone(topology),
     ));
     {
@@ -858,11 +886,7 @@ fn build_shard_io<S: ShardStorage>(
         // config) — never from node-local configuration, which
         // could silently diverge from the chain the beacon fold
         // actually runs.
-        let epoch_duration_ms = rep
-            .state
-            .beacon_coordinator()
-            .topology_schedule()
-            .epoch_duration_ms();
+        let epoch_duration_ms = rep.state.schedule().epoch_duration_ms();
         let pins = Arc::clone(&boundary_pins);
         block_commit.set_boundary_trigger(
             epoch_duration_ms,
@@ -886,7 +910,6 @@ fn build_shard_io<S: ShardStorage>(
         consensus: ConsensusState::new(config),
         cross_shard: CrossShardState::new(config),
         mempool: MempoolState::new(config),
-        beacon_fetch: BeaconFetchState::new(config),
         packages: PackagesState::new(config),
         instances: InstancesState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),

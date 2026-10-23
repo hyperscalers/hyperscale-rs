@@ -4,16 +4,15 @@
 //! [`ShardParticipation`] bundles [`ShardCoordinator`], [`ExecutionCoordinator`],
 //! [`MempoolCoordinator`], [`ProvisionCoordinator`], [`OutboundProvisionTracker`],
 //! and [`RemoteHeaderCoordinator`]. [`NodeStateMachine`](super::NodeStateMachine)
-//! holds it behind an `Option`: present while seated, absent for a vnode that
-//! only follows the beacon.
+//! holds one for its shard.
 //!
 //! The per-domain dispatch (the [`shard`], [`execution`], [`provisions`],
 //! [`transactions`], [`sync`], [`timers`], [`proposal`] submodules) lives here as
 //! methods on `ShardParticipation`. Each takes the per-epoch
 //! [`TopologySchedule`] as a parameter — the beacon projection these handlers
 //! verify against — rather than reaching back into the enclosing machine. The
-//! few flows that also mutate the beacon coordinator stay on `NodeStateMachine`
-//! as orchestrators (see [`super::orchestration`]).
+//! few flows that also report to the beacon stay on `NodeStateMachine` as
+//! orchestrators (see [`super::orchestration`]).
 
 mod execution;
 mod proposal;

@@ -7,8 +7,8 @@
 //! reads observe a consistent (block, state) pair for any committed
 //! epoch.
 //!
-//! Used by `SimulationRunner`; one `Arc<SimBeaconStorage>` per process
-//! is shared across every vnode's `BeaconCoordinator`.
+//! Used by `SimulationRunner`; one `Arc<SimBeaconStorage>` per host
+//! is shared across its beacon loop's fold and participants.
 
 use std::sync::{Arc, RwLock};
 
@@ -24,8 +24,8 @@ use crate::durability::Durability;
 /// In-memory implementation of the beacon storage tier.
 ///
 /// Backs `SimulationRunner`'s process-level beacon chain. One
-/// `Arc<SimBeaconStorage>` is shared across every vnode's
-/// `BeaconCoordinator`.
+/// `Arc<SimBeaconStorage>` is shared across a host's beacon fold and
+/// participants.
 #[derive(Debug)]
 pub struct SimBeaconStorage {
     pub(super) inner: RwLock<Inner>,

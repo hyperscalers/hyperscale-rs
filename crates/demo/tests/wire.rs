@@ -204,7 +204,7 @@ fn the_network_view_payloads_read_as_the_page_expects() {
     assert!(host["shards"].is_array(), "a host lists what it serves");
     assert!(
         host["pooled"].is_u64(),
-        "a host counts its shard-less followers",
+        "a host counts its pooled validators",
     );
 
     let delivered = events

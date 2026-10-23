@@ -2,8 +2,7 @@
 //! ([`ShardLoop`]) for one hosted shard.
 //!
 //! [`ShardIo`] ([`io`]) composes one shard's per-subsystem state —
-//! [`consensus`], [`cross_shard`], [`mempool`], and the beacon fetches in
-//! [`crate::beacon`] — over shared infra (storage, the [`commit`] pipeline,
+//! [`consensus`], [`cross_shard`] and [`mempool`] — over shared infra (storage, the [`commit`] pipeline,
 //! request-serving [`caches`]). [`ShardLoop`] is the active driver: it owns the
 //! `ShardIo`, its `Vec<Vnode>`, per-step scratch, and a cloned
 //! `Arc<ProcessIo>`. `ShardLoop::step(input)` dispatches one
@@ -36,9 +35,8 @@ pub(crate) mod phase_times;
 pub(crate) mod verify;
 
 // The driver shell: dispatch, lifecycle, metrics, the generic
-// fetch/timer plumbing, and the consensus/beacon-sink driver glue.
+// fetch/timer plumbing, and the consensus driver glue.
 mod actions;
-mod beacon_sink;
 mod fetch_dispatch;
 mod lifecycle;
 pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
@@ -56,6 +54,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 pub(crate) use fetch_dispatch::FetchTicker;
+use hyperscale_beacon::ChainRegistration;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
@@ -70,7 +69,7 @@ use hyperscale_types::{
 pub use io::ShardIo;
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{BeaconBlockSync, BeaconCandidateCache, BeaconProposalCache};
+use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
 use crate::event::Attachment;
 pub use crate::event::{
     BeaconScopedInput, EventPriority, FetchFailureKind, HostEvent, ProcessScopedInput,
@@ -348,8 +347,6 @@ pub struct StepOutput {
     /// not state-machine state.
     pub participation_changes: Vec<ParticipationChange>,
     /// Validators whose queued seat the loop admitted during this step.
-    /// Each now drives its beacon from the shard, so any beacon-loop
-    /// follower it carried retires.
     pub seated: Vec<ValidatorId>,
     /// Shards whose store needs a height beneath every serving peer's
     /// chain floor. Block sync can never carry such a store forward; the
@@ -394,6 +391,10 @@ where
     /// held inline so methods on `ShardLoop` can self-identify without a
     /// parent-map lookup.
     pub shard: ShardId,
+    /// The loop's registration with the host's beacon loop, carried by
+    /// everything the loop reports to it and released when the loop
+    /// closes.
+    pub(crate) chain: ChainRegistration,
     /// Sender for this shard's own event channel. The channel is created
     /// with the loop and torn down with it, so the handle is cached here
     /// rather than looked up through `ProcessIo`'s swappable map on
@@ -406,12 +407,6 @@ where
     pub(crate) process: Arc<ProcessIo<S, N, D>>,
     /// Per-shard I/O state shared by every vnode in `vnodes`.
     pub io: ShardIo<S>,
-    /// Beacon-block catch-up sync FSM. The beacon chain is host-global, but
-    /// each driver keeps its own instance (a lock-free per-thread
-    /// trade-off); the driving logic lives in [`crate::beacon`]. Fed
-    /// `Admitted` on every beacon commit and `StartBeaconBlockSync` when a
-    /// gossiped block sits more than one epoch ahead of the local tip.
-    pub(crate) beacon_block: BeaconBlockSync,
     /// Vnodes participating in this shard's consensus. Driven in order
     /// during each `step()` iteration; same-shard vnodes see identical
     /// inbound events and produce per-validator votes.
@@ -431,9 +426,6 @@ where
     /// Per-step scratch: `(tx_hash, status)` pairs emitted via
     /// `Action::EmitTransactionStatus`. Drained into [`StepOutput`].
     pub(crate) emitted_statuses: Vec<(TxHash, TransactionStatus)>,
-    /// Per-step scratch: placement deltas emitted via
-    /// `Action::ReconfigureParticipation`. Drained into [`StepOutput`].
-    pub(crate) pending_participation_changes: Vec<ParticipationChange>,
     /// Per-step scratch: count of actions this shard's vnodes produced
     /// during the step. Drained into [`StepOutput`] for the runner's
     /// metrics; reset at step entry.
@@ -452,6 +444,60 @@ where
     /// followed while a seat on the loop votes and dropped while none
     /// does. One per store, whatever the seats on it.
     pub(crate) answer_follow: Option<AnswerFollow>,
+}
+
+/// A [`ShardLoop`] driven on a thread of its own.
+///
+/// Dropping it, as the thread returns or as a panic unwinds it, releases the chain's
+/// registration with the host's beacon loop, so the fold stops holding
+/// the chain's windows and its commit-proof asks go to another loop.
+pub struct ThreadShardLoop<S, N, D>(ShardLoop<S, N, D>)
+where
+    S: ShardStorage,
+    D: Dispatch;
+
+impl<S, N, D> From<ShardLoop<S, N, D>> for ThreadShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    D: Dispatch,
+{
+    fn from(shard_loop: ShardLoop<S, N, D>) -> Self {
+        Self(shard_loop)
+    }
+}
+
+impl<S, N, D> std::ops::Deref for ThreadShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    D: Dispatch,
+{
+    type Target = ShardLoop<S, N, D>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<S, N, D> std::ops::DerefMut for ThreadShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    D: Dispatch,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<S, N, D> Drop for ThreadShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    D: Dispatch,
+{
+    fn drop(&mut self) {
+        let _ = self.0.process.beacon_event_sender.send(HostEvent::Beacon(
+            BeaconScopedInput::Deregister(self.0.chain),
+        ));
+    }
 }
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -607,13 +653,15 @@ where
     fn seat_at_rest(&mut self) {
         let recovered = self.io.storage.load_recovered_state(self.shard);
         let stores = self.io.caches.group_stores();
-        let beacon_storage = Arc::clone(&self.process.beacon_storage);
         for seat in std::mem::take(&mut self.pending_seats) {
+            // The loop's own schedule: every vnode on it holds the one the
+            // last `BeaconBlockPersisted` carried.
+            let replica = &self.vnodes[0].state;
+            let schedule = (Arc::clone(replica.schedule()), replica.schedule_epoch());
             let init = seat_vnode_into_group(
                 SeatVnodeGroup {
                     config: seat.config,
-                    beacon_storage: beacon_storage.as_ref(),
-                    now: self.now,
+                    schedule,
                     shard: self.shard,
                     recovered: &recovered,
                     vnodes: vec![(seat.validator, seat.signer)],
@@ -675,6 +723,9 @@ where
             }
             ShardScopedInput::Protocol(event) => match *event {
                 ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),
+                persisted @ ProtocolEvent::BeaconBlockPersisted { .. } => {
+                    self.handle_beacon_block_persisted(persisted);
+                }
                 restored @ ProtocolEvent::CommittedStateRestored { .. } => {
                     self.handle_committed_state_restored(restored);
                 }
@@ -694,12 +745,6 @@ where
             }
             ShardScopedInput::BlockSyncBelowFloor { height, floor } => {
                 self.handle_block_sync_below_floor(height, floor);
-            }
-            ShardScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
-                self.handle_beacon_block_sync_response_received(epoch, block);
-            }
-            ShardScopedInput::BeaconBlockSyncFetchFailed { epoch, kind } => {
-                self.handle_beacon_block_sync_fetch_failed(epoch, kind);
             }
             ShardScopedInput::SyncBlockValidated { height, certified } => {
                 self.handle_sync_block_validated(height, *certified);
@@ -780,11 +825,6 @@ where
             // ── Shard fork proof (self-authenticating gossip → verify) ──
             ShardScopedInput::ShardForkProofGossipReceived { proof } => {
                 self.handle_shard_fork_proof_gossip_received(&proof);
-            }
-
-            // ── Shard double-vote pair (self-authenticating gossip → verify) ──
-            ShardScopedInput::ShardVoteEquivocationGossipReceived { evidence } => {
-                self.handle_shard_vote_equivocation_gossip_received(&evidence);
             }
 
             // ── Periodic fetch / sync tick ─────────────────────────────
@@ -883,11 +923,24 @@ where
     /// emitting vnode's signing context, and flushes pending block
     /// commits at the tail.
     pub(crate) fn drain_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
+        self.report_to_beacon(vnode_idx);
         self.actions_generated += actions.len();
         for action in actions {
             self.process_action(vnode_idx, action);
         }
         self.flush_block_commits();
+    }
+
+    /// Send what the vnode's last events reported to the beacon to the
+    /// host's beacon loop, under this loop's registration.
+    fn report_to_beacon(&mut self, vnode_idx: usize) {
+        let chain = self.chain;
+        for input in self.vnodes[vnode_idx].state.take_beacon_inputs() {
+            let _ = self
+                .process
+                .beacon_event_sender
+                .send(HostEvent::Beacon(BeaconScopedInput::Shard { chain, input }));
+        }
     }
 
     /// Set this shard's cached wall-clock time. Production calls this
@@ -1020,7 +1073,6 @@ where
     pub(crate) fn clear_scratch(&mut self) {
         self.pending_timer_ops.clear();
         self.emitted_statuses.clear();
-        self.pending_participation_changes.clear();
         self.actions_generated = 0;
         self.seated.clear();
         self.reseat = false;
@@ -1034,7 +1086,7 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
-            participation_changes: std::mem::take(&mut self.pending_participation_changes),
+            participation_changes: Vec::new(),
             seated: std::mem::take(&mut self.seated),
             reseats: std::mem::take(&mut self.reseat)
                 .then_some(self.shard)

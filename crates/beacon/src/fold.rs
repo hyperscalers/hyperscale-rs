@@ -3,16 +3,17 @@
 //! [`BeaconFold`] receives, verifies and adopts committed beacon blocks,
 //! folds each into the [`BeaconState`] and the topology schedule, and
 //! tracks the source-shard headers and witness chunks every proposal and
-//! commit reads. It signs nothing and holds no validator identity: the
-//! [`BeaconCoordinator`](crate::coordinator::BeaconCoordinator) that owns
-//! it drives its one participant against it.
+//! commit reads. It signs nothing and holds no validator identity: its
+//! host drives one [`BeaconParticipant`](crate::participant::BeaconParticipant)
+//! per hosted identity against it.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchIds, FetchRequest, TimerId};
+use hyperscale_core::{Action, BeaconFetchIds, FetchIds, FetchRequest, TimerId};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
@@ -25,7 +26,8 @@ use hyperscale_types::{
 };
 use tracing::{trace, warn};
 
-use crate::coordinator::{LocalChainAnchors, resumed_schedule, retention_floor};
+use crate::coordinator::{LocalChainAnchors, resumed_schedule, retention_floor, widen_schedule};
+use crate::participant::BeaconParticipant;
 use crate::shard_source::{ChunkFetchId, ShardSourceTracker};
 use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::BeaconVerificationPipeline;
@@ -49,10 +51,12 @@ pub struct ChainRegistration(u64);
 /// One shard chain registered with the fold, as the fold tracks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostedChain {
+    /// The shard the chain runs.
     pub shard: ShardId,
     /// Highest committed height whose anchors are folded in. A report at
     /// or below it shifts nothing.
     pub height: BlockHeight,
+    /// The anchors the chain's committed tip carries.
     pub anchors: LocalChainAnchors,
     /// Set, never cleared, once the fold's own schedule reads the chain's
     /// committed block anchor past its shard's terminal. A latched chain
@@ -65,21 +69,24 @@ pub struct HostedChain {
 /// What one adoption produced: the slot effects the fold returned, for
 /// the participants' own reading, and the fold's own actions.
 pub struct Adopted {
+    /// What the epoch's fold settled, for each participant to read.
     pub effects: SlotEffects,
+    /// The fold's own actions: the commit, the topology and the witness
+    /// fetches the adoption released.
     pub actions: Vec<Action>,
 }
 
 /// A follower of the beacon chain.
 pub struct BeaconFold {
     /// Scheme verifier for proposal, cert, and equivocation checks.
-    pub verifier: Arc<dyn Verifier>,
+    pub(crate) verifier: Arc<dyn Verifier>,
 
-    pub state: BeaconState,
+    pub(crate) state: BeaconState,
 
     /// Latest committed beacon block paired with its authenticating
     /// cert. Carried so SPC instance bootstrap and ratify anchor
     /// checks read `prev_block_hash` without a storage roundtrip.
-    pub latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub(crate) latest_block: Arc<Verified<CertifiedBeaconBlock>>,
 
     /// Beacon committee that governed the tip epoch, captured before
     /// its fold advanced the state. A competing block for the adopted
@@ -97,16 +104,16 @@ pub struct BeaconFold {
     /// In-flight block-certificate verifications. Dedup-only — the
     /// payload rides through the dispatch/result round-trip in the
     /// action and event themselves, not stashed here.
-    pub verification: BeaconVerificationPipeline,
+    pub(crate) verification: BeaconVerificationPipeline,
 
     /// Per-shard header records, validated-witness pool, and
     /// in-flight fetches; drives proposal-readiness and the
     /// witness drain.
-    pub shard_source: ShardSourceTracker,
+    pub(crate) shard_source: ShardSourceTracker,
 
-    /// Whether the validator the fold's owner signs for sits on the
-    /// beacon committee, as the owner reports it. Witness chunks are
-    /// fetched and pooled only while it holds.
+    /// Whether any identity the fold's host runs a participant for sits
+    /// on the beacon committee, as the host reports it. Witness chunks
+    /// are fetched and pooled only while it holds.
     host_on_committee: bool,
 
     /// Per-epoch committee schedule. Its head is the current epoch's
@@ -116,22 +123,22 @@ pub struct BeaconFold {
     /// timestamp over the window from [`retention_floor`] through
     /// `current_epoch + 1`. The `+1` lookahead entry is finalized an epoch
     /// before its window opens. A node-local cache, not consensus-critical.
-    pub topology_schedule: TopologySchedule,
+    pub(crate) topology_schedule: TopologySchedule,
 
     /// The shard chains registered with the fold, each with its committed
     /// frontier.
-    pub hosted: BTreeMap<ChainRegistration, HostedChain>,
+    pub(crate) hosted: BTreeMap<ChainRegistration, HostedChain>,
     next_registration: u64,
 
     /// Mixed into every signing helper's domain bytes; carried so
     /// per-epoch SPC instances and outbound canonical-bytes
     /// encoders don't re-thread it from the runner.
-    pub network: NetworkDefinition,
+    pub(crate) network: NetworkDefinition,
 
     /// Local wall-clock time. Drives the epoch-cadence timers; never
     /// fed into deterministic consensus computations — use
     /// `state.current_epoch` or weighted timestamps for that.
-    pub now: LocalTimestamp,
+    pub(crate) now: LocalTimestamp,
 }
 
 impl BeaconFold {
@@ -224,16 +231,34 @@ impl BeaconFold {
         token
     }
 
-    /// Whether the validator the fold's owner signs for sits on the
-    /// beacon committee. Leaving drops the pooled witness chunks and
+    /// Stop tracking the chain `token` names. A later input that carries
+    /// it is ignored, so a rebuilt chain's old loop cannot touch the
+    /// entry its successor registered.
+    pub fn deregister_chain(&mut self, token: ChainRegistration) {
+        self.hosted.remove(&token);
+    }
+
+    /// Whether any identity the fold's host runs a participant for sits
+    /// on the beacon committee. Joining fetches the witness chunk of
+    /// every crossing the fold already holds, which no further header
+    /// may arrive to ask for; leaving drops the pooled witness chunks and
     /// releases the in-flight witness fetches.
     pub fn set_host_on_committee(&mut self, on: bool) -> Vec<Action> {
-        let left = self.host_on_committee && !on;
-        self.host_on_committee = on;
-        if !left {
-            return Vec::new();
+        let was = mem::replace(&mut self.host_on_committee, on);
+        match (was, on) {
+            (false, true) => {
+                // Collected up front: `fetch_witness_chunk` borrows `self`
+                // mutably, so the loop can't hold the `boundaries` iterator.
+                let shards: Vec<ShardId> = self.state.boundaries.keys().copied().collect();
+                let mut actions = Vec::new();
+                for shard in shards {
+                    actions.extend(self.fetch_witness_chunk(shard));
+                }
+                actions
+            }
+            (true, false) => abandon_witnesses(self.shard_source.evicted_from_committee()),
+            _ => Vec::new(),
         }
-        abandon_witnesses(self.shard_source.evicted_from_committee())
     }
 
     /// The registered pubkey for `validator`, from the fold's permanent
@@ -244,9 +269,74 @@ impl BeaconFold {
         self.state.validators.get(&validator).map(|r| r.pubkey)
     }
 
+    /// The committed state at the tip.
+    #[must_use]
+    pub const fn state(&self) -> &BeaconState {
+        &self.state
+    }
+
+    /// The tip: the latest adopted block.
+    #[must_use]
+    pub const fn latest_block(&self) -> &Arc<Verified<CertifiedBeaconBlock>> {
+        &self.latest_block
+    }
+
+    /// The topology schedule the fold keeps, from the retention floor
+    /// through the lookahead.
+    #[must_use]
+    pub const fn schedule(&self) -> &TopologySchedule {
+        &self.topology_schedule
+    }
+
+    /// Insert the windows `history` carries below the schedule's oldest
+    /// retained epoch — see [`widen_schedule`](crate::coordinator::widen_schedule).
+    pub fn widen<B: Borrow<BeaconState>>(&mut self, history: &[B]) {
+        widen_schedule(&mut self.topology_schedule, history, &self.network);
+    }
+
+    /// The source-shard headers and witness chunks the fold holds.
+    #[must_use]
+    pub const fn shard_source(&self) -> &ShardSourceTracker {
+        &self.shard_source
+    }
+
+    /// The chain `token` names, while it is registered.
+    #[must_use]
+    pub fn chain(&self, token: ChainRegistration) -> Option<&HostedChain> {
+        self.hosted.get(&token)
+    }
+
+    /// Every registered chain, by token.
+    pub fn chains(&self) -> impl Iterator<Item = (ChainRegistration, &HostedChain)> {
+        self.hosted.iter().map(|(token, chain)| (*token, chain))
+    }
+
+    /// The scheme verifier the fold checks certificates with.
+    #[must_use]
+    pub const fn verifier(&self) -> &Arc<dyn Verifier> {
+        &self.verifier
+    }
+
+    /// The network identity bound into every beacon signature.
+    #[must_use]
+    pub const fn network(&self) -> &NetworkDefinition {
+        &self.network
+    }
+
+    /// The clock the epoch-cadence timers read.
+    #[must_use]
+    pub const fn now(&self) -> LocalTimestamp {
+        self.now
+    }
+
+    /// Set the clock every handler in the next batch reads.
+    pub const fn set_now(&mut self, now: LocalTimestamp) {
+        self.now = now;
+    }
+
     /// The live topology snapshot: the schedule's head.
     #[must_use]
-    pub const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
+    pub(crate) const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         self.topology_schedule.head()
     }
 
@@ -364,7 +454,7 @@ impl BeaconFold {
     /// the common path. Validators referenced by evidence but missing
     /// from `state.validators` are silently elided; the verifier rejects
     /// such evidence at admission via the pubkey-lookup miss.
-    pub fn equivocation_signers_for(
+    pub(crate) fn equivocation_signers_for(
         &self,
         block: &BeaconBlock,
     ) -> Vec<(ValidatorId, ConsensusPublicKey)> {
@@ -599,7 +689,9 @@ impl BeaconFold {
             return Vec::new();
         }
         let actions = self.on_source_header(certified_header);
-        let chain = self.hosted.get_mut(&token).expect("checked above");
+        let Some(chain) = self.hosted.get_mut(&token) else {
+            return actions;
+        };
         if certified_header.height() <= chain.height {
             return actions;
         }
@@ -649,11 +741,25 @@ impl BeaconFold {
         self.fetch_witness_chunk(certified_header.header().shard_id())
     }
 
-    /// Hold a commit-proven boundary block a participant asked for, so
-    /// proposal admission reads it until the next adoption clears it.
-    pub fn admit_proven(&mut self, certified_header: &Arc<Verified<CertifiedBlockHeader>>) {
+    /// Hold a commit-proven boundary block if any of `participants`
+    /// asked for it, so proposal admission reads it until the next
+    /// adoption clears it. Returns whether it is held, and so whether the
+    /// askers' awaiting proposals want re-evaluating.
+    pub fn admit_proven_for<'a>(
+        &mut self,
+        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        participants: impl IntoIterator<Item = &'a BeaconParticipant>,
+    ) -> bool {
+        let (shard, height) = (certified_header.shard_id(), certified_header.height());
+        if !participants
+            .into_iter()
+            .any(|participant| participant.asked(shard, height))
+        {
+            return false;
+        }
         self.shard_source
             .admit_proven_boundary(Arc::clone(certified_header));
+        true
     }
 
     /// Hold `certified_header` in the shard's window and note any
@@ -740,7 +846,7 @@ impl BeaconFold {
     /// gap-filling to do across responses. `chunk_bounds` already caps the
     /// run at the fold's per-epoch budget, which bounds the work one
     /// header can trigger.
-    pub fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
+    pub(crate) fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
         let (anchor, block_height, prior, chunk_end) = {
             let Some(crossing) =
                 boundary::crossing_to_source(&self.state, &self.shard_source, shard)
@@ -775,13 +881,13 @@ impl BeaconFold {
         self.shard_source
             .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
         vec![Action::Fetch(FetchRequest::Ask {
-            ids: FetchIds::ShardWitnesses(vec![(
+            ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(vec![(
                 shard,
                 block_height,
                 anchor,
                 LeafIndex::new(prior),
                 LeafIndex::new(chunk_end),
-            )]),
+            )])),
             shard,
             preferred: None,
             class: None,
@@ -845,7 +951,7 @@ impl BeaconFold {
     /// retired — the same bound the sibling sweep in the remote-header
     /// store accepts. A fold hosting no chain has no such clock and
     /// retires nothing.
-    pub fn retire_departed_sources(&mut self) -> Vec<ChunkFetchId> {
+    pub(crate) fn retire_departed_sources(&mut self) -> Vec<ChunkFetchId> {
         let Some(now) = self
             .hosted
             .values()
@@ -892,7 +998,7 @@ impl BeaconFold {
     /// instead of racing ahead at SPC-round speed. The window's weighted-time
     /// cut is the same instant on this validator's local clock — the synthetic
     /// beacon clock is anchored to `epoch × epoch_duration_ms`.
-    pub const fn next_epoch_boundary(&self) -> LocalTimestamp {
+    pub(crate) const fn next_epoch_boundary(&self) -> LocalTimestamp {
         let cut = self
             .state
             .chain_config
@@ -904,7 +1010,7 @@ impl BeaconFold {
 
     /// Wall-clock duration from `now` to [`Self::next_epoch_boundary`].
     /// Saturates to zero if `now` is already past the boundary.
-    pub const fn duration_until_next_epoch_boundary(&self) -> Duration {
+    pub(crate) const fn duration_until_next_epoch_boundary(&self) -> Duration {
         Duration::from_millis(
             self.next_epoch_boundary()
                 .as_millis()
@@ -919,7 +1025,7 @@ impl BeaconFold {
     /// the beacon catches up to wall-clock and then paces to it rather than
     /// cascading ahead.
     #[must_use]
-    pub const fn committee_start_due(&self, epoch_boundary: LocalTimestamp) -> bool {
+    pub(crate) const fn committee_start_due(&self, epoch_boundary: LocalTimestamp) -> bool {
         self.now.as_millis() >= epoch_boundary.as_millis()
     }
 
@@ -942,7 +1048,7 @@ impl BeaconFold {
     ///
     /// Consensus-critical, but `epoch_duration_ms` rides in the shared genesis
     /// config, so every validator derives the same instant.
-    pub fn skip_timeout(&self) -> Duration {
+    pub(crate) fn skip_timeout(&self) -> Duration {
         Duration::from_millis(self.state.chain_config.epoch_duration_ms)
             .clamp(SPC_VIEW_TIMEOUT, SKIP_TIMEOUT)
     }
@@ -953,7 +1059,7 @@ impl BeaconFold {
     /// arrived" + "local on active pool" checks before actually
     /// prevoting the skip hash.
     #[must_use]
-    pub fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
+    pub(crate) fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
         self.now.as_millis() >= expected_block_time.plus(self.skip_timeout()).as_millis()
     }
 
@@ -962,7 +1068,7 @@ impl BeaconFold {
     /// timeout, starting from the round after [`RatifyRound::INITIAL`].
     /// Every pool member reads the same deadline off its own beacon
     /// fold, so members converge on one round despite timer jitter.
-    pub fn wall_clock_ratify_round(&self) -> RatifyRound {
+    pub(crate) fn wall_clock_ratify_round(&self) -> RatifyRound {
         let deadline = self
             .next_epoch_boundary()
             .plus(self.skip_timeout())
@@ -983,7 +1089,7 @@ impl BeaconFold {
     /// the window casts votes that complete its peers' polkas one round
     /// behind, where they are no longer precommittable — at exact pool
     /// quorum, one such member starves certificate assembly entirely.
-    pub fn duration_until_next_ratify_fire(&self) -> Duration {
+    pub(crate) fn duration_until_next_ratify_fire(&self) -> Duration {
         let now = self.now.as_millis();
         let deadline = self
             .next_epoch_boundary()
@@ -1005,7 +1111,7 @@ impl BeaconFold {
     /// is unverifiable. A forged sig can't be made to pass, so an honest
     /// node never votes for it. The upgraded markers ride the pooled
     /// proposal through to `apply_epoch`.
-    pub fn upgrade_proposal_equivocations(
+    pub(crate) fn upgrade_proposal_equivocations(
         &self,
         proposal: &Verified<BeaconProposal>,
     ) -> Option<Verified<BeaconProposal>> {
@@ -1034,7 +1140,7 @@ impl BeaconFold {
     /// signature verification under the registered key. The registry
     /// resolves ex-members and revoked keys alike, so evidence about a
     /// rotated-out signer still admits.
-    pub fn upgrade_proposal_vote_equivocations(
+    pub(crate) fn upgrade_proposal_vote_equivocations(
         &self,
         proposal: &Verified<BeaconProposal>,
     ) -> Option<Verified<BeaconProposal>> {
@@ -1080,7 +1186,7 @@ impl BeaconFold {
     /// before left, so all read the same seating, and a proposer prunes
     /// its own buffer by the same rule
     /// ([`prune_folded_evidence`](crate::participant::BeaconParticipant::prune_folded_evidence)).
-    pub fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
+    pub(crate) fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
         proposal.fork_proofs().iter().all(|(shard, proof)| {
             let proof = proof.as_unverified();
             *shard == proof.shard()
@@ -1094,7 +1200,7 @@ impl BeaconFold {
     /// VRF-verify a fetched proposal under `validator`'s registered
     /// pubkey, or `None` with a warn when the validator is unknown or
     /// the reveal fails.
-    pub fn verify_fetched_proposal(
+    pub(crate) fn verify_fetched_proposal(
         &self,
         epoch: Epoch,
         validator: ValidatorId,
@@ -1140,5 +1246,7 @@ fn abandon_witnesses(ids: Vec<ChunkFetchId>) -> Vec<Action> {
     if ids.is_empty() {
         return Vec::new();
     }
-    vec![Action::AbandonFetch(FetchIds::ShardWitnesses(ids))]
+    vec![Action::AbandonFetch(FetchIds::Beacon(
+        BeaconFetchIds::Witnesses(ids),
+    ))]
 }

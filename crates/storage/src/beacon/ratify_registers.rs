@@ -52,4 +52,10 @@ pub trait RatifyRegisterStore: Send + Sync {
     /// The durable record for `validator`, or `None` when it has never
     /// signed a ratify vote on this store.
     fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord>;
+
+    /// Durably overwrite `validator`'s record with `record`, the record
+    /// of the store it signed on until now. Only an identity moving
+    /// between hosts writes through this, and only once it has stopped
+    /// signing on the store it carries the record from.
+    fn restore_ratify_record(&self, validator: ValidatorId, record: &RatifyVoteRecord);
 }
