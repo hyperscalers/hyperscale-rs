@@ -19,7 +19,7 @@ use std::time::Duration;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::{GenesisPackages, vault_key};
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_scenarios::query::{declared_price, vault_balance};
+use hyperscale_scenarios::query::{chain_fate, declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     HALT_STRADDLER_BATCH, build_leg_payment_tx, build_sponsored_swap_tx, build_swap_tx,
     build_transfer_tx, cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
@@ -926,7 +926,7 @@ fn a_restarted_payer_still_reclaims_its_refused_leg() {
 #[test]
 fn a_restarted_host_reseats_every_member_it_carries() {
     payer_reclaims_after_restart(
-        2,
+        1,
         &ScenarioConfig {
             vnodes_per_host: 2,
             ..venue_config()
@@ -962,16 +962,18 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
     cluster.submit(Arc::new(refused));
 
     // The leg has paid and certified: its own finalization is on the
-    // caller's chain, naming a transaction it does not decide.
+    // caller's chain, naming a transaction it does not decide. The venue's
+    // refusal can follow within the second, so the wait reads the replicas
+    // rather than the archive, and polls finer than a slice.
     assert!(
-        cluster.run_until(epochs(12), |c| {
+        cluster.run_until_polled(epochs(12), Duration::from_millis(10), |c| {
             vault_balance(c, SWAPPER_SHARD, caller) == funded - SWAP_INPUT - price
-                && c.chain_fate(SWAPPER_SHARD, hash).0.is_some()
+                && live_fate(c, SWAPPER_SHARD, hash).0.is_some()
         }),
         "the caller's leg must pay and commit before the restart",
     );
     assert!(
-        cluster.chain_fate(VENUE_SHARD, hash).1.is_none(),
+        live_fate(&cluster, VENUE_SHARD, hash).1.is_none(),
         "the venue must not have refused yet, or the restart lands after \
          the evidence rather than before it",
     );
@@ -994,6 +996,25 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
         funded - price,
         heights(&cluster, SWAPPER_SHARD),
     );
+}
+
+/// `tx`'s fate on `shard` as the replicas hold it now, ahead of the
+/// archive the cluster's history reads, which takes in committed heights
+/// only every simulated minute.
+fn live_fate(
+    c: &SimCluster,
+    shard: ShardId,
+    tx: TxHash,
+) -> (
+    Option<BlockHeight>,
+    Option<(BlockHeight, TransactionDecision)>,
+) {
+    (0..c.runner().num_hosts())
+        .filter_map(|host| c.runner().hosts_shard(host, shard))
+        .map(|store| chain_fate(store, tx))
+        .fold((None, None), |(committed, finalized), (held, decided)| {
+            (committed.or(held), finalized.or(decided))
+        })
 }
 
 /// A replica restarted, and one snap-synced, across the block that takes

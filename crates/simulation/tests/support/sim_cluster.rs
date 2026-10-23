@@ -562,6 +562,32 @@ impl SimCluster {
         &mut self.runner
     }
 
+    /// [`Cluster::run_until`] polling `cond` every `poll` rather than every
+    /// [`SLICE`], for a state that holds only for a moment: one a slice
+    /// can step over whole.
+    pub fn run_until_polled(
+        &mut self,
+        budget: Budget,
+        poll: Duration,
+        cond: impl Fn(&Self) -> bool,
+    ) -> bool {
+        if cond(self) {
+            return true;
+        }
+        let deadline = self.runner.now() + Self::span(budget);
+        while self.runner.now() < deadline {
+            self.topology_step();
+            let next = (self.runner.now() + poll).min(deadline);
+            self.runner.run_until(next);
+            self.assert_beacon_cadence();
+            self.assert_one_identity_per_host();
+            if cond(self) {
+                return true;
+            }
+        }
+        cond(self)
+    }
+
     /// Run a fault `scenario` with the in-memory recorder scoped, so
     /// [`FaultableCluster::metric`] reads host-emitted counters. The sim is
     /// single-threaded, so the thread-local scoped recorder captures every
@@ -890,21 +916,7 @@ impl Cluster for SimCluster {
     }
 
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
-        if cond(self) {
-            return true;
-        }
-        let deadline = self.runner.now() + Self::span(budget);
-        while self.runner.now() < deadline {
-            self.topology_step();
-            let next = (self.runner.now() + SLICE).min(deadline);
-            self.runner.run_until(next);
-            self.assert_beacon_cadence();
-            self.assert_one_identity_per_host();
-            if cond(self) {
-                return true;
-            }
-        }
-        cond(self)
+        self.run_until_polled(budget, SLICE, cond)
     }
 
     fn now(&self) -> Duration {
