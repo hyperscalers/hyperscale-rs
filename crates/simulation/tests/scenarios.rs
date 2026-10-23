@@ -904,7 +904,6 @@ fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
 /// Submit the second of a payer's pair once `shard` has committed the
 /// first, stepping finer than a block so the second is pooled in the
 /// blocks right after that commit.
-#[cfg(not(feature = "production-epochs"))]
 fn behind_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
     move |c, first| {
         let limit = c.now() + Duration::from_millis(EPOCH_MS) * 16;
@@ -1065,8 +1064,8 @@ fn a_sponsor_spends_its_balance_beside_its_routes_pending_core_sim() {
 /// The payer routes everything its vault covers beside the route's
 /// ceiling and the spend's, and spends one unit beside it. The member
 /// runs a dozen blocks above the route's commit and settles three above
-/// that, and the spend is submitted three seconds after the route so its
-/// block falls between the two.
+/// that, and the spend is submitted once the payer's shard has committed
+/// the route so its block falls between the two.
 #[test]
 fn a_payer_spends_dust_beside_its_own_routes_pending_core_sim() {
     let mut cluster = route_cluster();
@@ -1075,7 +1074,7 @@ fn a_payer_spends_dust_beside_its_own_routes_pending_core_sim() {
         epochs(40),
         RoutePayer::Trader { past: 0 },
         Spend::Dust,
-        after(3_000),
+        behind_on(FIRST_VENUE_SHARD),
     );
     assert_eq!(assert_committed_while_pending(&pair), (ACCEPT, ACCEPT));
     assert_pair_rule(&pair);
@@ -1099,7 +1098,8 @@ fn a_payer_spends_dust_beside_its_own_route_one_unit_past_its_cover_sim() {
 }
 
 /// The route one unit past its cover again, with the spend submitted
-/// three seconds after it: the moment at which the covered spend of
+/// once the payer's shard has committed it, the moment from which the
+/// covered spend of
 /// `a_payer_spends_dust_beside_its_own_routes_pending_core_sim` reaches
 /// a block below the route's settlement. One unit less cover keeps this
 /// spend out of every block until the route's row is gone.
@@ -1111,7 +1111,7 @@ fn a_spend_one_unit_past_its_payers_cover_waits_out_the_route_sim() {
         epochs(40),
         RoutePayer::Trader { past: 1 },
         Spend::Dust,
-        after(3_000),
+        behind_on(FIRST_VENUE_SHARD),
     );
     assert_pooled_while_pending(&pair);
     assert_kept_out_while_pending(&pair);
