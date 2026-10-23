@@ -4451,7 +4451,7 @@ impl ShardCoordinator {
                 .filter(|cached| cached.as_ref() == header.parent_qc())
                 .cloned();
             if let Some(cached) = cached {
-                actions.extend(self.try_adopt_verified_qc(&cached));
+                actions.extend(self.try_adopt_verified_qc(topology_schedule, &cached));
             }
         }
 
@@ -4740,7 +4740,9 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         qc: &QuorumCertificate,
     ) -> Vec<Action> {
-        if self.fork_refuses_retained_suffix(topology_schedule, qc) {
+        if self.fork_refuses_retained_suffix(topology_schedule, qc)
+            || self.halt_refuses_left_bridge(topology_schedule, qc)
+        {
             return Vec::new();
         }
         info!(
@@ -4845,7 +4847,7 @@ impl ShardCoordinator {
             "Adopted the snap-synced anchor QC"
         );
         self.anchor_qc = None;
-        self.try_adopt_verified_qc(&verified)
+        self.try_adopt_verified_qc(topology_schedule, &verified)
     }
 
     /// Adopt `qc` as the new `high_qc` (`latest_qc`) if it sits in a higher
@@ -4858,12 +4860,16 @@ impl ShardCoordinator {
     /// Adoption compares by **round**, not height: along a chain round and
     /// height move together, but across a fork the higher-round QC is the one
     /// HotStuff-2 keeps as `high_qc`.
-    fn try_adopt_verified_qc(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
+    fn try_adopt_verified_qc(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        qc: &Verified<QuorumCertificate>,
+    ) -> Vec<Action> {
         let advances = self
             .latest_qc
             .as_ref()
             .is_none_or(|existing| qc.round() > existing.round());
-        if !advances {
+        if !advances || self.halt_refuses_left_bridge(topology_schedule, qc) {
             return Vec::new();
         }
         debug!(
@@ -6313,7 +6319,7 @@ impl ShardCoordinator {
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
         if self.holds_complete_block(verified_qc.height(), parent_block_hash) {
-            actions.extend(self.try_adopt_verified_qc(&verified_qc));
+            actions.extend(self.try_adopt_verified_qc(topology_schedule, &verified_qc));
         }
 
         // QC is valid - proceed to vote on the block
@@ -7171,7 +7177,7 @@ impl ShardCoordinator {
         // later no longer raises `latest_qc`, so would not cache it.
         self.verification.cache_verified_qc(verified.clone());
         let view = self.view_change.view;
-        let mut actions = self.try_adopt_verified_qc(&verified);
+        let mut actions = self.try_adopt_verified_qc(topology_schedule, &verified);
         if self.view_change.view > view {
             actions.push(Action::SetTimer {
                 id: TimerId::ViewChange,
@@ -8734,6 +8740,42 @@ impl ShardCoordinator {
             })
     }
 
+    /// Whether a pending halt recovery refuses `qc` because the fresh
+    /// chain has left the bridge: `qc` was certified below the bridge, on
+    /// the halted chain, and `latest_qc` is one the fresh committee formed
+    /// past it. The halted tail is abandoned from then on, as the harvest
+    /// abandons it, and adopting it by round would switch this replica
+    /// onto the halted branch over blocks the fresh chain certified. A
+    /// refused QC is never needed: the fresh chain's own QCs name every
+    /// height it extends. While `latest_qc` still rides the bridge a
+    /// halted QC passes, since taking the halted tip over the anchor is
+    /// the harvest's own outcome.
+    fn halt_refuses_left_bridge(
+        &self,
+        topology_schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .is_some_and(|recovery| recovery.cause == RecoveryCause::Halt)
+            && self.recovery_bridging(topology_schedule, qc.weighted_timestamp())
+            && self.qc_past_bridge(topology_schedule).is_some()
+    }
+
+    /// `latest_qc` once it no longer rides the recovery bridge: the fresh
+    /// committee formed it, so the fresh chain has certified past the
+    /// anchor or the harvested suffix on its own authority.
+    fn qc_past_bridge(
+        &self,
+        topology_schedule: &TopologySchedule,
+    ) -> Option<&Verified<QuorumCertificate>> {
+        self.latest_qc.as_ref().filter(|latest| {
+            !self.recovery_bridging(topology_schedule, latest.weighted_timestamp())
+        })
+    }
+
     /// Harvest the halted tip from a retained ex-member's timeout while a
     /// recovery is pending on this shard, or `None` when the sender holds
     /// no retained seat (the ordinary outsider drop applies).
@@ -8797,9 +8839,7 @@ impl ShardCoordinator {
             );
             return Some(Vec::new());
         }
-        if let Some(latest) = self.latest_qc.as_ref()
-            && !self.recovery_bridging(topology_schedule, latest.weighted_timestamp())
-        {
+        if let Some(latest) = self.qc_past_bridge(topology_schedule) {
             warn!(
                 signers = ?self.signers.keys(),
                 voter = ?timeout.voter(),
@@ -8908,7 +8948,7 @@ impl ShardCoordinator {
             && !qc_weighted_timestamp_too_far_ahead(&carried_high_qc, self.now)
         {
             if let Some(verified) = self.verify_qc_sync(topology_schedule, &carried_high_qc) {
-                actions.extend(self.try_adopt_verified_qc(&verified));
+                actions.extend(self.try_adopt_verified_qc(topology_schedule, &verified));
             } else if !self
                 .holds_complete_block(carried_high_qc.height(), carried_high_qc.block_hash())
             {
@@ -9277,7 +9317,7 @@ impl ShardCoordinator {
             && !qc_weighted_timestamp_too_far_ahead(timeout.high_qc(), self.now)
             && let Some(verified) = self.verify_qc_sync(topology_schedule, timeout.high_qc())
         {
-            actions.extend(self.try_adopt_verified_qc(&verified));
+            actions.extend(self.try_adopt_verified_qc(topology_schedule, &verified));
         }
         if let Some(tc) = timeout.high_tc() {
             actions.extend(self.absorb_timeout_certificate(topology_schedule, tc));
@@ -9329,7 +9369,7 @@ impl ShardCoordinator {
                 );
                 continue;
             };
-            return self.try_adopt_verified_qc(&verified);
+            return self.try_adopt_verified_qc(topology_schedule, &verified);
         }
         Vec::new()
     }
@@ -18377,7 +18417,7 @@ mod tests {
         fn land_q(&mut self) -> Vec<Action> {
             install_complete_block(&mut self.state, &self.q.clone());
             let qc_q = self.qc_q.clone();
-            self.state.try_adopt_verified_qc(&qc_q)
+            self.state.try_adopt_verified_qc(&self.schedule, &qc_q)
         }
 
         fn high_tc_round(&self) -> Option<Round> {
@@ -20282,6 +20322,156 @@ mod tests {
             state.retained_tip,
             Some(RetainedTip::Offered(BlockHeight::new(5)))
         );
+    }
+
+    /// A schedule with one-second windows whose epochs 0 to 3 seat the
+    /// same four members, under a halt recovery seated at epoch 2 that
+    /// retains validator 1, now a member: the bridge window opens at
+    /// 3000ms, and a QC stamped below it is the halted chain's.
+    fn bridged_halt_schedule(schedule: &TopologySchedule) -> TopologySchedule {
+        let head = with_pending_halt_recovery(schedule, vec![ValidatorId::new(1)], Epoch::new(2));
+        let mut bridged = TopologySchedule::new(1_000, Epoch::new(3), Arc::clone(&head));
+        for epoch in 0..3 {
+            bridged.insert(Epoch::new(epoch), Arc::clone(&head));
+        }
+        bridged
+    }
+
+    /// A 3-of-4 QC over `block` at its own height and round, its votes
+    /// stamped at `stamp_ms`.
+    fn quorum_stamped(
+        state: &ShardCoordinator,
+        keys: &[BlsSigner],
+        block: &Block,
+        stamp_ms: u64,
+    ) -> Verified<QuorumCertificate> {
+        let net = NetworkDefinition::simulator();
+        let header = block.header();
+        let votes: Vec<(usize, Verified<BlockVote>)> = [1usize, 2, 3]
+            .into_iter()
+            .map(|idx| {
+                let vote = Verified::<BlockVote>::sign_local(
+                    &net,
+                    block.hash(),
+                    state.committed_hash,
+                    ShardId::ROOT,
+                    header.height(),
+                    header.round(),
+                    ValidatorId::new(idx as u64),
+                    &keys[idx],
+                    ProposerTimestamp::from_millis(stamp_ms),
+                )
+                .expect("sign");
+                (idx, vote)
+            })
+            .collect();
+        Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
+            block.hash(),
+            ShardId::ROOT,
+            header.height(),
+            header.round(),
+            state.committed_hash,
+            WeightedTimestamp::ZERO,
+            &votes,
+        )
+        .expect("vote aggregation succeeds")
+    }
+
+    /// Validator 1's timeout at `round`, carrying `high_qc`.
+    fn member_timeout(keys: &[BlsSigner], round: Round, high_qc: &QuorumCertificate) -> Timeout {
+        Timeout::new(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            round,
+            high_qc.clone(),
+            ValidatorId::new(1),
+            &keys[1],
+        )
+        .expect("sign")
+    }
+
+    /// A fresh member whose `latest_qc` is the fresh committee's QC at
+    /// round 3, stamped past the bridge, beside the halted chain's QC at
+    /// round 7, stamped below it. Returns the halted block and its QC.
+    fn fresh_chain_past_the_bridge() -> (
+        ShardCoordinator,
+        TopologySchedule,
+        Vec<BlsSigner>,
+        Block,
+        Verified<QuorumCertificate>,
+    ) {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        let schedule = bridged_halt_schedule(&schedule);
+        state.set_time(LocalTimestamp::from_millis(5_000));
+        let fresh = empty_block_at_round(state.committed_hash, 3);
+        install_complete_block(&mut state, &fresh);
+        let fresh_qc = quorum_stamped(&state, &keys, &fresh, 3_500);
+        let _ = state.try_adopt_verified_qc(&schedule, &fresh_qc);
+        assert_eq!(state.high_qc_round(), Round::new(3));
+        let halted = empty_block_at_round(state.committed_hash, 7);
+        let halted_qc = quorum_stamped(&state, &keys, &halted, 1_000);
+        (state, schedule, keys, halted, halted_qc)
+    }
+
+    /// Once the fresh chain has certified past the bridge, a QC the halted
+    /// chain certified below it is neither adopted nor synced toward,
+    /// though its round is above the fresh chain's: a retained member the
+    /// re-draw seated in the fresh committee carries it in its timeouts,
+    /// which reach the adoption paths rather than the harvest.
+    #[test]
+    fn a_halted_qc_above_the_fresh_round_is_refused_once_the_fresh_chain_left_the_bridge() {
+        // Through `absorb_carried`: the halted block is held, so its QC
+        // verifies against the halted committee.
+        let (mut state, schedule, keys, halted, halted_qc) = fresh_chain_past_the_bridge();
+        install_complete_block(&mut state, &halted);
+        let below_view = member_timeout(&keys, Round::new(1), &halted_qc);
+        let _ = state.on_unverified_timeout(&schedule, &below_view);
+        assert_eq!(
+            state.high_qc_round(),
+            Round::new(3),
+            "a carried halted QC is not adopted"
+        );
+
+        // Through `on_verified_timeout`'s sync: the halted block is not
+        // held, and its QC already verified.
+        let (mut state, schedule, keys, _, halted_qc) = fresh_chain_past_the_bridge();
+        state.verification.cache_verified_qc(halted_qc.clone());
+        let at_view = member_timeout(&keys, state.view(), &halted_qc);
+        let actions = state.on_verified_timeout(
+            &schedule,
+            Verified::<Timeout>::new_unchecked_for_test(at_view),
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. })),
+            "no sync toward a halted QC; got {actions:?}"
+        );
+        assert!(!state.is_block_syncing());
+        assert_eq!(state.high_qc_round(), Round::new(3));
+    }
+
+    /// While `latest_qc` still rides the bridge, a carried halted QC of a
+    /// higher round is adopted over it, as the harvest takes the halted
+    /// tip over the anchor.
+    #[test]
+    fn a_halted_qc_is_adopted_over_the_anchor_while_latest_qc_rides_the_bridge() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        let schedule = bridged_halt_schedule(&schedule);
+        state.set_time(LocalTimestamp::from_millis(5_000));
+        let anchor = empty_block_at_round(state.committed_hash, 3);
+        install_complete_block(&mut state, &anchor);
+        let anchor_qc = quorum_stamped(&state, &keys, &anchor, 500);
+        let _ = state.try_adopt_verified_qc(&schedule, &anchor_qc);
+        assert_eq!(state.high_qc_round(), Round::new(3));
+
+        let halted = empty_block_at_round(state.committed_hash, 7);
+        install_complete_block(&mut state, &halted);
+        let halted_qc = quorum_stamped(&state, &keys, &halted, 1_000);
+        let below_view = member_timeout(&keys, Round::new(1), &halted_qc);
+        let _ = state.on_unverified_timeout(&schedule, &below_view);
+        assert_eq!(state.high_qc_round(), Round::new(7));
     }
 
     /// A state that builds a proposal at height 4 on a persisted tip at 3,
