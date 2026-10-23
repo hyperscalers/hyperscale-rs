@@ -1,7 +1,7 @@
 //! Beacon gossip handler registration.
 //!
 //! A free function rather than a `ProcessIo` method: the handler closures
-//! capture only the shard senders, the pool's beacon channel, and the
+//! capture only the shard senders, the beacon loop's channel, and the
 //! route-active gate — never the single `Network` owner — so they register
 //! without fighting that ownership. `process::network_handlers` calls this
 //! from `register_gossip_handlers`.
@@ -27,9 +27,8 @@ use crate::shard::push_protocol_event;
 /// - `beacon.block` fans out per hosted shard (the framework's Global topic
 ///   reaches every hosted shard), each routed to that shard's vnodes.
 /// - An additive host-level `beacon.block` handler routes the committed block
-///   to the follower pool's beacon channel, but only while a pool is draining
-///   it (`route_active`) — so a host with no live pool neither drops the
-///   registration nor backs the channel up.
+///   to the beacon loop's channel, but only while the loop holds a follower
+///   (`route_active`), so a loop with no follower is handed no gossip.
 /// - `beacon.candidate` and `beacon.ratify_vote` route to the named
 ///   shard's consensus.
 ///
@@ -72,11 +71,11 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         },
     );
 
-    // ── beacon.block → pool follower (additive, shard-less hosts) ──
+    // ── beacon.block → beacon-loop followers (additive) ──
     //
-    // The per-hosted-shard Global fan above never reaches a host with no
-    // hosted shards. This additive host-level handler routes the committed
-    // block to the pool's beacon channel while a pool drains it.
+    // The per-hosted-shard Global fan above reaches only seated vnodes. This
+    // additive host-level handler routes the committed block to the beacon
+    // loop's channel while the loop holds a follower.
     let bs = beacon_sender.clone();
     let ra = Arc::clone(route_active);
     network.register_host_gossip_handler::<BeaconBlockGossip>(move |gossip: BeaconBlockGossip| {
@@ -108,7 +107,7 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         },
     );
 
-    // ── beacon.candidate → pool follower (additive) ────────────────
+    // ── beacon.candidate → beacon-loop followers (additive) ────────
     //
     // A pooled validator can sit in the epoch's ratify pool (its seat
     // pending — a placement onto a halted shard, a draw not yet
@@ -158,10 +157,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         },
     );
 
-    // ── beacon.ratify_vote → pool follower (additive) ──────────────
+    // ── beacon.ratify_vote → beacon-loop followers (additive) ──────
     //
     // A ratify voter precommits only when it observes a prevote quorum,
-    // so a pooled pool member must see its peers' votes or its weight
+    // so a follower in the ratify pool must see its peers' votes or its weight
     // can never reach a commit certificate.
     let bs = beacon_sender.clone();
     let ra = Arc::clone(route_active);

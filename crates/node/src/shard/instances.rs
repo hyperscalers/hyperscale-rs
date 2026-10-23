@@ -17,7 +17,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::instance_of_record;
@@ -30,10 +29,13 @@ use hyperscale_types::network::request::{
 use hyperscale_types::{Address, Hash, LocalTimestamp, ShardId, Transaction, TxHash, Unresolved};
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, FetchInput, Route, failed_chunk, partition_solicited};
+use crate::fetch::{
+    Fetch, FetchBinding, FetchInput, FetchedBy, Route, ShardReply, failed_chunk,
+    partition_solicited,
+};
 use crate::shard::mempool::{DeferredOrigin, DeferredTransaction, Orphaned};
 use crate::shard::packages::PackageArtifactBinding;
-use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Per-component record fetch, keyed by the address the record derives.
 pub type InstanceRecordFetch = Fetch<Address>;
@@ -72,18 +74,21 @@ impl FetchBinding for InstanceRecordBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::InstanceRecords(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Address> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for InstanceRecordBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Address> {
         &mut shard.instances.fetch
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Address>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         let es = sender.clone();
         let requested = ids.clone();
         route.request(

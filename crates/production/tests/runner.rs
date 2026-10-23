@@ -171,7 +171,7 @@ async fn a_leave_releases_the_vnode_it_names() {
 /// A validator the beacon genesis leaves `Pooled` — registered in the global
 /// set but in no shard committee — boots as a follower-only host. The runner
 /// reads the committed beacon state, derives no seat, and brings the host up
-/// hosting no shard with its beacon-follower pool thread running. A later
+/// hosting no shard with the validator following on its beacon thread. A later
 /// `ShardCommand::Join` seats it onto a shard, draining it from the pool —
 /// the startup half of the drain/pool/reseat cycle the sim covers end to end.
 #[tokio::test(flavor = "multi_thread")]
@@ -197,14 +197,14 @@ async fn pooled_validator_boots_as_follower_only_host() {
     let handle = spawn(runner.run());
     sleep(Duration::from_millis(200)).await;
 
-    // Still hosts no shard while the follower pool thread runs.
+    // Still hosts no shard while the beacon thread runs its follower.
     assert!(
         adapter.local_shards().is_empty(),
         "follower-only host hosts no shard"
     );
 
     // Seat the pooled validator onto ROOT: the supervisor opens the store,
-    // brings the shard up, and retires the validator's pool follower.
+    // brings the shard up, and retires the validator's beacon-loop follower.
     reconfigure
         .send(ShardCommand::Join {
             shard: ShardId::ROOT,

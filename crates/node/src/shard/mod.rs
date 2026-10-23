@@ -45,7 +45,7 @@ pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
 #[cfg(test)]
-mod seated_host;
+pub(crate) mod seated_host;
 mod slowest_seat;
 mod timer;
 
@@ -71,8 +71,9 @@ pub use io::ShardIo;
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{BeaconBlockSync, BeaconCandidateCache, BeaconProposalCache};
+use crate::event::Attachment;
 pub use crate::event::{
-    EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
+    BeaconScopedInput, EventPriority, FetchFailureKind, HostEvent, ProcessScopedInput,
     ShardScopedInput,
 };
 use crate::fetch::Release;
@@ -223,8 +224,11 @@ pub enum TimerOwner {
     Loop(ShardId),
     /// One vnode seated on a hosted shard's loop.
     Seat(ShardId, ValidatorId),
-    /// One shard-less follower in the host's pool.
-    Follower(ValidatorId),
+    /// One attached identity's beacon participation on the host's beacon
+    /// loop.
+    Participant(Attachment),
+    /// The host's beacon loop itself: its fetch tick.
+    Beacon,
 }
 
 /// A timer operation buffered by a loop driver for the runner to process.
@@ -255,8 +259,8 @@ pub enum TimerOp {
 /// pushes onto its event channel.
 ///
 /// The envelope is addressed to the timer's owner: a loop's fetch tick to
-/// its shard, a seat's timer to that vnode alone, a follower's to that
-/// follower alone.
+/// its shard, a seat's timer to that vnode alone, a participant's to that
+/// participant alone, and the beacon loop's fetch tick to the beacon loop.
 #[must_use]
 pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
     let event = match id {
@@ -269,7 +273,7 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
                 TimerOwner::Loop(shard) | TimerOwner::Seat(shard, _) => {
                     HostEvent::shard(shard, ShardScopedInput::FetchTick)
                 }
-                TimerOwner::Follower(_) => HostEvent::beacon_fetch_tick(),
+                TimerOwner::Participant(_) | TimerOwner::Beacon => HostEvent::beacon_fetch_tick(),
             };
         }
         TimerId::BeaconCommitteeStart => ProtocolEvent::BeaconCommitteeStartTimer,
@@ -286,10 +290,13 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
                 event: Box::new(event),
             },
         ),
-        TimerOwner::Follower(validator) => HostEvent::Beacon(PoolScopedInput::FollowerTimer {
-            validator,
-            event: Box::new(event),
-        }),
+        TimerOwner::Participant(participant) => {
+            HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
+                participant,
+                event: Box::new(event),
+            })
+        }
+        TimerOwner::Beacon => HostEvent::beacon(event),
     }
 }
 
@@ -341,8 +348,8 @@ pub struct StepOutput {
     /// not state-machine state.
     pub participation_changes: Vec<ParticipationChange>,
     /// Validators whose queued seat the loop admitted during this step.
-    /// Each now drives its beacon from the shard, so any pool follower
-    /// it carried retires.
+    /// Each now drives its beacon from the shard, so any beacon-loop
+    /// follower it carried retires.
     pub seated: Vec<ValidatorId>,
     /// Shards whose store needs a height beneath every serving peer's
     /// chain floor. Block sync can never carry such a store forward; the
@@ -353,7 +360,7 @@ pub struct StepOutput {
 impl StepOutput {
     /// Fold another step's output into this one. The whole-host driver
     /// ([`NodeHost::step`](crate::host::NodeHost::step)) uses this to
-    /// aggregate the per-driver outputs of every shard and the pool a
+    /// aggregate the per-driver outputs of every shard and the beacon loop a
     /// single event touched.
     pub(crate) fn merge(&mut self, other: Self) {
         self.emitted_statuses.extend(other.emitted_statuses);

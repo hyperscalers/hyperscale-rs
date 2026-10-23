@@ -26,7 +26,6 @@ use hyperscale_network_memory::{
     BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
     NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
@@ -477,12 +476,6 @@ pub struct SimulationRunner {
     /// merge keeper's flip can recompute the cut the children crossed.
     epoch_duration_ms: u64,
 
-    /// Per-host flag: whether a beacon-sync retry tick is already queued for
-    /// the host's follower pool. Keeps the harness from scheduling duplicate
-    /// ticks while a catch-up sync runs; production's pool thread self-ticks
-    /// off its `select!` timeout instead.
-    pool_tick_pending: Vec<bool>,
-
     /// Each host's pending wake at its nearest batch deadline, re-armed
     /// after every step it takes.
     batch_wakes: Vec<Option<EventKey>>,
@@ -928,7 +921,6 @@ impl SimulationRunner {
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
-            pool_tick_pending: vec![false; num_hosts],
             batch_wakes: vec![None; num_hosts],
             reshape,
             reshape_stores: HashMap::new(),
@@ -1361,8 +1353,8 @@ impl SimulationRunner {
             }
         }
 
-        // Drain every host's construction-time output: a follower pool arms
-        // its beacon startup timers at construction, and a follower-only
+        // Drain every host's construction-time output: the beacon loop arms
+        // its followers' beacon startup timers at construction, and a follower-only
         // host runs no genesis ceremony to sweep them up.
         for host_index in 0..num_hosts {
             let output = self.hosts[host_index as usize].drain_pending_output();
@@ -1634,26 +1626,6 @@ impl SimulationRunner {
         }
     }
 
-    /// Re-arm the follower pool's catch-up retry tick. Called after every host
-    /// step: while the pool is syncing, keep exactly one tick queued so a
-    /// deferred fetch eventually retries; once the pool catches up, stop. The
-    /// production pool thread self-ticks off its `select!` timeout instead.
-    fn refresh_pool_tick(&mut self, host: NodeIndex, fired_tick: bool) {
-        let i = host as usize;
-        if fired_tick {
-            self.pool_tick_pending[i] = false;
-        }
-        if !self.hosts[i].pool_is_syncing() {
-            self.pool_tick_pending[i] = false;
-            return;
-        }
-        if !self.pool_tick_pending[i] {
-            self.pool_tick_pending[i] = true;
-            let fire = self.clocks[i].fire_after(self.now, POOL_FETCH_TICK_INTERVAL);
-            self.schedule_event(host, fire, HostEvent::beacon_fetch_tick());
-        }
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Timer Handling
     // ═══════════════════════════════════════════════════════════════════════
@@ -1787,10 +1759,6 @@ impl SimulationRunner {
             _ if !self.hosts.is_up(host as usize) => return,
             SimEvent::Host(event) => {
                 let now = self.wake(host);
-                // A fired pool tick clears its pending slot so the post-step
-                // refresh can re-arm the next one if the sync is still
-                // running.
-                let fired_pool_tick = event.is_pool_fetch_tick();
                 let Some(output) = self.armed(host, |h| {
                     let output = h.step(event);
                     h.flush_expired_batches(now);
@@ -1800,7 +1768,6 @@ impl SimulationRunner {
                 };
                 self.drain_host_io(host);
                 self.process_step_output(host, output);
-                self.refresh_pool_tick(host, fired_pool_tick);
             }
             SimEvent::BatchDeadline => {
                 let now = self.wake(host);

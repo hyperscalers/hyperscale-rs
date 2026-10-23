@@ -469,8 +469,8 @@ impl HandlerRegistry {
     /// [`source_shard`](GossipMessage::source_shard) `None` gossip message
     /// of type `M`, independent of the hosted-shard set.
     ///
-    /// A shard-less host (the beacon-follower pool) registers this so a
-    /// committed beacon block reaches it even though it hosts no shards and
+    /// A host's beacon loop registers this so a committed beacon block
+    /// reaches it whatever shards the host serves, including none, where
     /// the per-hosted-shard Global fan from
     /// [`TypedGossipDispatcher::target_shards`] is empty. Additive: the
     /// per-shard fan is unchanged, and only the source-`None` Global path

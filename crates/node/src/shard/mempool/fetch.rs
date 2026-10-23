@@ -6,16 +6,17 @@
 //! `FetchBinding` trait, and the shared `partition_solicited` helper live in
 //! [`crate::fetch`].
 
-use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
 use hyperscale_hbor::Capped;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::TxHash;
 use hyperscale_types::network::request::GetTransactionsRequest;
-use hyperscale_types::{ShardId, TxHash};
 
-use crate::fetch::{Fetch, FetchBinding, Route, failed_chunk, partition_solicited};
-use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_shard_input};
+use crate::fetch::{
+    Fetch, FetchBinding, FetchedBy, Route, ShardReply, failed_chunk, partition_solicited,
+};
+use crate::shard::{ShardIo, ShardScopedInput, push_shard_input};
 
 /// Per-tx fetch keyed by [`TxHash`].
 pub type TransactionFetch = Fetch<TxHash>;
@@ -31,18 +32,16 @@ impl FetchBinding for TransactionBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::Transactions(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TxHash> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for TransactionBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<TxHash> {
         &mut shard.mempool.transaction
     }
 
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<TxHash>,
-        local_shard: ShardId,
-        route: Route,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
+    fn dispatch_chunk<N: Network>(ids: Vec<TxHash>, route: Route, network: &N, reply: &ShardReply) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         let es = sender.clone();
         let hs = ids.clone();
         route.request(

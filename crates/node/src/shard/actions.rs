@@ -745,6 +745,7 @@ where
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
         let event_tx = self.event_sender().clone();
         let signer = Arc::clone(&vnode.signer);
+        let gate = Arc::clone(&vnode.gate);
         let verifier = Arc::clone(&self.process.verifier);
         let par = self.process.dispatch.parallelism();
         // Resolve the shard's handles here, on the shard's own thread,
@@ -819,7 +820,7 @@ where
                 ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
-                ActionOwner::Beacon => handle_beacon_action(action, &ctx.beacon()),
+                ActionOwner::Beacon => handle_beacon_action(action, &ctx.beacon(&gate)),
                 ActionOwner::Local => unreachable!(
                     "dispatch_delegated_action called with Local-owned action — \
                      process_action's outer match should have routed inline"

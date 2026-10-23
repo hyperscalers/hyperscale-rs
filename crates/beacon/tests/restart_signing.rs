@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use hyperscale_beacon::action_handlers::handle_action;
 use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
+use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent, SignerGate};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::{
     Answerers, GossipHandler, Network, NotificationHandler, RequestError, RequestHandler,
@@ -118,6 +118,7 @@ impl Member {
             notify,
             cache_beacon_proposal: &|_, _, _| {},
             cache_beacon_candidate: &|_| {},
+            gate: &SignerGate::new(),
         };
         handle_action(action, &ctx);
     }
@@ -251,6 +252,7 @@ impl Member {
             notify,
             cache_beacon_proposal: &|_, _, _| {},
             cache_beacon_candidate: &|_| {},
+            gate: &SignerGate::new(),
         };
         handle_action(
             Action::SignAndBroadcastPcVote1 {

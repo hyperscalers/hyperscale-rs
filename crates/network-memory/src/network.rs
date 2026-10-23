@@ -1947,8 +1947,9 @@ impl SimulatedNetwork {
                 return false;
             };
             let gossip = registry.get_gossip(message_type);
-            // A Global broadcast (no topic shard) also reaches a shard-less
-            // host's beacon follower pool; shard-scoped deliveries never do.
+            // A Global broadcast (no topic shard) also reaches its type's
+            // host-level handler, such as the beacon loop's beacon gossip
+            // route; shard-scoped deliveries never do.
             let host_handler = if shard.is_none() {
                 registry.get_host_gossip(message_type)
             } else {

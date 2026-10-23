@@ -4,8 +4,8 @@
 //! channel. It is a typed sum over the three drivers a
 //! [`NodeHost`](crate::host::NodeHost) routes to:
 //!
-//! - [`HostEvent::Beacon`] carries a [`PoolScopedInput`] routed to the
-//!   host's pool of shard-less followers.
+//! - [`HostEvent::Beacon`] carries a [`BeaconScopedInput`] routed to the
+//!   host's beacon loop.
 //! - [`HostEvent::Process`] carries a [`ProcessScopedInput`] with no
 //!   shard tag — inputs that fan out across every hosted shard.
 //! - [`HostEvent::Shard`] carries a [`ShardScopedInput`] tagged with
@@ -609,33 +609,67 @@ impl ProcessScopedInput {
     }
 }
 
-/// Inputs routed to the host's shard-less beacon-follower pool
-/// ([`PoolLoop`](crate::pool_loop::PoolLoop)).
+/// One attachment of a validator identity to the host's beacon loop.
 ///
-/// A follower folds the beacon and tracks topology but runs no shard
-/// consensus, so its input set is small: gossiped beacon blocks — and the
-/// self-driven verify/adopt continuations they spawn — arrive as
-/// [`Self::Protocol`], and the catch-up sync the pool drives when a follower
-/// falls behind delivers its fetch results through the remaining variants.
+/// Every attach takes a fresh serial from the host's process, so an
+/// identity removed and attached again is a different attachment, and
+/// what the earlier one left in flight never reaches the later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Attachment {
+    /// The attached identity.
+    pub(crate) validator: ValidatorId,
+    serial: u64,
+}
+
+impl Attachment {
+    pub(crate) const fn new(validator: ValidatorId, serial: u64) -> Self {
+        Self { validator, serial }
+    }
+}
+
+/// Whose beacon work an input continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BeaconOwner {
+    /// One attached identity's beacon participation.
+    Participant(Attachment),
+}
+
+/// Inputs routed to the host's beacon loop
+/// ([`BeaconLoop`](crate::beacon_loop::BeaconLoop)).
+///
+/// Gossiped beacon blocks and votes arrive as [`Self::Protocol`]; the
+/// outcomes of the loop's own dispatched actions return as
+/// [`Self::Continuation`], and its fetches and catch-up sync deliver their
+/// results through the remaining variants.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
-pub enum PoolScopedInput {
-    /// Pass-through to every pooled vnode's state machine. Boxed because
+pub enum BeaconScopedInput {
+    /// Pass-through to every participant's state machine. Boxed because
     /// `ProtocolEvent` dwarfs every other variant and would inflate the
     /// event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
-    /// A timer one follower armed, fired: fed to that follower alone.
-    /// Dropped if the follower has left the pool since.
-    FollowerTimer {
-        /// The follower that armed the timer.
-        validator: ValidatorId,
+    /// The outcome of an action `owner` emitted, run on the dispatch pool:
+    /// fed to that owner alone, and dropped once that attachment has left
+    /// the loop, even when its identity has been attached again.
+    Continuation {
+        /// Who emitted the action.
+        owner: BeaconOwner,
+        /// The handler's outcome.
+        event: Box<ProtocolEvent>,
+    },
+
+    /// A timer one participant armed, fired: fed to that participant
+    /// alone, and dropped once that attachment has left the loop.
+    ParticipantTimer {
+        /// The participant that armed the timer.
+        participant: Attachment,
         /// The timer's protocol event.
         event: Box<ProtocolEvent>,
     },
 
-    /// A beacon-block sync response landed for the pool's catch-up fetch.
-    /// `block` is `None` when the peer couldn't serve the epoch. The pool
-    /// delivers the block to every follower and advances its sync FSM.
+    /// A beacon-block sync response landed for the loop's catch-up fetch.
+    /// `block` is `None` when the peer couldn't serve the epoch. The loop
+    /// delivers the block to every participant and advances its sync FSM.
     BeaconBlockSyncResponseReceived {
         /// Epoch of the block being synced.
         epoch: Epoch,
@@ -651,12 +685,22 @@ pub enum PoolScopedInput {
         kind: FetchFailureKind,
     },
 
-    /// Periodic tick driving the catch-up sync FSM's deferred-fetch retries.
-    /// The pool driver fires it while a sync is in flight.
+    /// A fetch attempt for these ids failed or was refused; retry at
+    /// once the first time since the tick, and on the tick after that.
+    FetchFailed(FetchIds),
+    /// A fetch request for these ids never reached a peer; retry on the
+    /// tick.
+    FetchUnroutable(FetchIds),
+    /// A fetch for these ids was answered; the answer follows as
+    /// [`Self::Protocol`].
+    FetchFulfilled(FetchIds),
+
+    /// The loop's fetch tick: retries its held fetches and its catch-up
+    /// sync's deferred epochs.
     FetchTick,
 }
 
-impl PoolScopedInput {
+impl BeaconScopedInput {
     /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
     pub(crate) fn priority(&self) -> EventPriority {
@@ -667,11 +711,15 @@ impl PoolScopedInput {
                 ProtocolEvent::BeaconBlockReceived { .. } => EventPriority::Network,
                 _ => EventPriority::Internal,
             },
-            // A follower's timers order as its beacon continuations do;
-            // sync-fetch callbacks are processed consequences, not raw inputs.
-            Self::FollowerTimer { .. }
+            // A participant's timers order as its beacon continuations do;
+            // fetch callbacks are processed consequences, not raw inputs.
+            Self::Continuation { .. }
+            | Self::ParticipantTimer { .. }
             | Self::BeaconBlockSyncResponseReceived { .. }
-            | Self::BeaconBlockSyncFetchFailed { .. } => EventPriority::Internal,
+            | Self::BeaconBlockSyncFetchFailed { .. }
+            | Self::FetchFailed(_)
+            | Self::FetchUnroutable(_)
+            | Self::FetchFulfilled(_) => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,
         }
     }
@@ -681,7 +729,9 @@ impl PoolScopedInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol(event) | Self::FollowerTimer { event, .. } => event.type_name(),
+            Self::Protocol(event)
+            | Self::Continuation { event, .. }
+            | Self::ParticipantTimer { event, .. } => event.type_name(),
             other => other.into(),
         }
     }
@@ -691,7 +741,7 @@ impl PoolScopedInput {
 ///
 /// The shard variant carries the hosted-shard tag inline; the process and
 /// beacon variants have no tag — the process fan is host-wide, and a host runs
-/// at most one follower pool.
+/// one beacon loop.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
     /// Routed to the hosted shard identified by [`ShardId`]. Fans
@@ -700,11 +750,11 @@ pub enum HostEvent {
     Shard(ShardId, ShardScopedInput),
     /// Process-scoped — not anchored to a single shard.
     Process(ProcessScopedInput),
-    /// Beacon-scoped — routed to the host's pool of shard-less
-    /// followers (the [`PoolLoop`](crate::pool_loop::PoolLoop)). Carries
-    /// a [`PoolScopedInput`] the pool folds; shard hosts receive beacon
+    /// Beacon-scoped — routed to the host's
+    /// [`BeaconLoop`](crate::beacon_loop::BeaconLoop). Carries a
+    /// [`BeaconScopedInput`] the loop folds; seated vnodes receive beacon
     /// events through their per-shard channels instead.
-    Beacon(PoolScopedInput),
+    Beacon(BeaconScopedInput),
 }
 
 impl HostEvent {
@@ -727,23 +777,16 @@ impl HostEvent {
     }
 
     /// Construct a beacon-scoped envelope carrying a protocol event for the
-    /// host's pool.
+    /// host's beacon loop.
     #[must_use]
     pub fn beacon(event: ProtocolEvent) -> Self {
-        Self::Beacon(PoolScopedInput::Protocol(Box::new(event)))
+        Self::Beacon(BeaconScopedInput::Protocol(Box::new(event)))
     }
 
-    /// Construct the pool's catch-up sync retry tick.
+    /// Construct the beacon loop's fetch tick.
     #[must_use]
     pub const fn beacon_fetch_tick() -> Self {
-        Self::Beacon(PoolScopedInput::FetchTick)
-    }
-
-    /// Whether this is the pool's catch-up sync retry tick. The simulation
-    /// harness uses it to re-arm the next tick while a pool sync is in flight.
-    #[must_use]
-    pub const fn is_pool_fetch_tick(&self) -> bool {
-        matches!(self, Self::Beacon(PoolScopedInput::FetchTick))
+        Self::Beacon(BeaconScopedInput::FetchTick)
     }
 
     /// Priority for ordering events at the same simulation timestamp.

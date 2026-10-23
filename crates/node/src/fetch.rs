@@ -205,7 +205,8 @@ struct Entry {
     /// failure flips it, so the local seats and the committee's other
     /// members take turns and neither is asked twice running between
     /// ticks; the tick resets it to [`Answerers::LocalFirst`] on every
-    /// entry it may send.
+    /// entry it may send. A peers-only instance keeps it at
+    /// [`Answerers::PeersOnly`] throughout.
     answerers: Answerers,
     /// Failures since the last tick. The first retries at once; past it
     /// the id waits for the tick, since the same answer is coming back. A
@@ -231,6 +232,9 @@ pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
     kind: &'static str,
     /// `BTreeMap` for deterministic iteration order during chunk assembly.
     pending: BTreeMap<Id, Entry>,
+    /// Every attempt asks past the local seats: an answer this host could
+    /// give itself is one its own consumer already lacks.
+    peers_only: bool,
 }
 
 impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
@@ -243,6 +247,28 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             config,
             kind,
             pending: BTreeMap::new(),
+            peers_only: false,
+        }
+    }
+
+    /// A protocol instance whose every attempt, first, retried or
+    /// ticked, asks only the committee's members this host does not run.
+    #[must_use]
+    pub(crate) const fn peers_only(kind: &'static str, config: FetchConfig) -> Self {
+        Self {
+            config,
+            kind,
+            pending: BTreeMap::new(),
+            peers_only: true,
+        }
+    }
+
+    /// Who a new entry, or one the tick resets, asks first.
+    const fn first_answerers(&self) -> Answerers {
+        if self.peers_only {
+            Answerers::PeersOnly
+        } else {
+            Answerers::LocalFirst
         }
     }
 
@@ -260,10 +286,11 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             FetchInput::Admitted { ids } => self.handle_drop(&ids, DropKind::Admitted),
             FetchInput::Abandoned { ids } => self.handle_drop(&ids, DropKind::Abandoned),
             FetchInput::Tick => {
+                let answerers = self.first_answerers();
                 for entry in self.pending.values_mut() {
                     entry.failures_since_tick = 0;
                     if !entry.in_flight {
-                        entry.answerers = Answerers::LocalFirst;
+                        entry.answerers = answerers;
                     }
                 }
                 self.spawn_pending_fetches()
@@ -323,6 +350,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             return vec![];
         }
         let mut added = 0usize;
+        let answerers = self.first_answerers();
         for id in ids {
             // Where an id is answerable from is what the asker just
             // said, not what the first asker once said. Two owners of
@@ -346,7 +374,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                         in_flight: false,
                         asked: None,
                         dispatched_at: None,
-                        answerers: Answerers::LocalFirst,
+                        answerers,
                         failures_since_tick: 0,
                     },
                 );
@@ -382,6 +410,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// than it would by asking again at once.
     fn handle_failed(&mut self, ids: &[Id], respawn: Respawn) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
+        let peers_only = self.peers_only;
         for id in ids {
             if let Some(entry) = self.pending.get_mut(id)
                 && entry.in_flight
@@ -392,6 +421,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 if matches!(respawn, Respawn::Now) {
                     entry.failures_since_tick = entry.failures_since_tick.saturating_add(1);
                     entry.answerers = match entry.answerers {
+                        _ if peers_only => Answerers::PeersOnly,
                         Answerers::LocalFirst => Answerers::PeersOnly,
                         Answerers::PeersOnly => Answerers::LocalFirst,
                     };
@@ -510,8 +540,9 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 ///
 /// Each fetch payload (transactions, provisions, headers, …) gets one impl —
 /// living with its subsystem state in `shard/{consensus,cross_shard,mempool}`
-/// or `beacon` — that owns the `Id` type, which `Fetch<Id>` instance backs it
-/// (via [`fetch_mut`](Self::fetch_mut)), and the wire request/response shape.
+/// or `beacon` — that owns the `Id` type and the [`FetchIds`] arm it rides
+/// in. Which `Fetch<Id>` instance backs it and the wire shape of its
+/// requests are [`FetchedBy`], per loop that drives it.
 pub trait FetchBinding: 'static {
     /// Id used to address payloads of this kind.
     type Id: Clone + Ord + Hash + std::fmt::Debug + Send + Sync + 'static;
@@ -528,28 +559,75 @@ pub trait FetchBinding: 'static {
     /// response boundary names the ids it failed or fulfilled, and the
     /// inverse of the one dispatcher that routes a batch back here.
     fn ids(ids: Vec<Self::Id>) -> FetchIds;
+}
 
-    /// Locate the `Fetch<Id>` instance for this binding inside `ShardIo` —
-    /// each impl navigates to its own subsystem's state.
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id>;
+/// A loop that owns fetch state: the shard loop's [`ShardIo`] or the
+/// beacon loop's fetches.
+pub trait FetchOwner {
+    /// How an answer finds its way back to this loop.
+    type Reply: FetchReply;
+}
+
+/// A binding as the fetch-state owner `O` drives it.
+pub trait FetchedBy<O: FetchOwner>: FetchBinding {
+    /// Locate this binding's `Fetch<Id>` instance inside `O`.
+    fn fetch_mut(owner: &mut O) -> &mut Fetch<Self::Id>;
 
     /// Send one request covering `ids` along `route` and route the
-    /// response back through the event sender. For
-    /// [`PER_ID`](Self::PER_ID) bindings the dispatcher pre-splits into
-    /// single-element chunks before calling this.
-    ///
-    /// `local_shard` is the hosted shard that produced this request — it's
-    /// threaded into the response callback so the resulting
-    /// `ShardScopedInput::Protocol` and `*FetchFailed` events route to the right
-    /// hosted shard under cross-shard hosting (distinct from
-    /// `route.shard`, which selects the *target* committee).
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Self::Id>,
-        local_shard: ShardId,
-        route: Route,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    );
+    /// response back through `reply`. For [`PER_ID`](FetchBinding::PER_ID)
+    /// bindings the dispatcher pre-splits into single-element chunks
+    /// before calling this.
+    fn dispatch_chunk<N: Network>(ids: Vec<Self::Id>, route: Route, network: &N, reply: &O::Reply);
+}
+
+/// Where a fetch's outcome goes: the loop whose fetch state asked, so a
+/// failure releases what it asked for and an answer reaches what wanted
+/// it.
+pub trait FetchReply: Clone + Send + 'static {
+    /// Release `ids` after a request that failed with `error`: on the
+    /// tick when it never reached a peer, at once otherwise.
+    fn failed(&self, ids: FetchIds, error: &RequestError);
+
+    /// Release `ids` for retry after an answer that was refused.
+    fn refused(&self, ids: FetchIds);
+
+    /// Retire `ids` and hand over the event their answer carries. The
+    /// ids are released first, so the freed capacity is available if
+    /// handling the event re-drives the fetch.
+    fn answered(&self, ids: FetchIds, event: ProtocolEvent);
+}
+
+/// A shard loop's reply handle: its event channel, with the hosted shard
+/// that asked so the outcome reaches that shard's loop under
+/// cross-shard hosting (distinct from `route.shard`, which selects the
+/// target committee).
+#[derive(Clone)]
+pub struct ShardReply {
+    pub(crate) shard: ShardId,
+    pub(crate) sender: Sender<HostEvent>,
+}
+
+impl FetchReply for ShardReply {
+    fn failed(&self, ids: FetchIds, error: &RequestError) {
+        push_shard_input(&self.sender, self.shard, failed_chunk(error, ids));
+    }
+
+    fn refused(&self, ids: FetchIds) {
+        push_shard_input(&self.sender, self.shard, ShardScopedInput::FetchFailed(ids));
+    }
+
+    fn answered(&self, ids: FetchIds, event: ProtocolEvent) {
+        push_shard_input(
+            &self.sender,
+            self.shard,
+            ShardScopedInput::FetchFulfilled(ids),
+        );
+        push_protocol_event(&self.sender, self.shard, event);
+    }
+}
+
+impl<S: ShardStorage> FetchOwner for ShardIo<S> {
+    type Reply = ShardReply;
 }
 
 // ─── Scoped answers ────────────────────────────────────────────────────
@@ -580,13 +658,8 @@ pub trait ScopedAnswer: FetchBinding {
     /// The id a scope and key name.
     fn join(scope: Self::Scope, key: Self::Key) -> Self::Id;
 
-    /// One request for `keys` under `scope`, asked by `asker`.
-    ///
-    /// Most answers do not depend on who is asking, and those ignore it.
-    /// A bundle does: it is built for one target and carries that target
-    /// in its own body, so a request that did not name the asker would
-    /// be answered with something the asker must then refuse.
-    fn request(scope: Self::Scope, keys: &[Self::Key], asker: ShardId) -> Self::Request;
+    /// One request for `keys` under `scope`.
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request;
 
     /// Check a peer's answer against the scope and turn it into the
     /// event that carries it, or say why it is refused. The event is
@@ -660,17 +733,14 @@ pub const fn failed_chunk(error: &RequestError, ids: FetchIds) -> ShardScopedInp
 }
 
 /// Issue one request per scope in `ids` and route each answer through
-/// [`ScopedAnswer::answer`]. The ids are released before the event goes
-/// out, so the freed capacity is available if handling the delivery
-/// re-drives the fetch. A transport error releases the ids without
-/// rejecting the response — the network already recorded it — while an
-/// answer that is not an answer counts as a refusal.
-pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
+/// [`ScopedAnswer::answer`] to `reply`. A transport error releases the
+/// ids without rejecting the response — the network already recorded
+/// it — while an answer that is not an answer counts as a refusal.
+pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
     ids: Vec<B::Id>,
-    local_shard: ShardId,
     route: Route,
     network: &N,
-    sender: &Sender<HostEvent>,
+    reply: &R,
 ) {
     let mut by_scope: BTreeMap<B::Scope, Vec<B::Key>> = BTreeMap::new();
     for id in ids {
@@ -679,10 +749,10 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
     }
     for (scope, keys) in by_scope {
         let requested: Vec<B::Id> = keys.iter().map(|key| B::join(scope, *key)).collect();
-        let es = sender.clone();
+        let reply = reply.clone();
         route.request(
             network,
-            B::request(scope, &keys, local_shard),
+            B::request(scope, &keys),
             Box::new(move |result| {
                 let response = match result {
                     Ok(response) => response,
@@ -690,18 +760,13 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
                         if matches!(error, RequestError::PeerError(_)) {
                             record_fetch_response_refused(B::NAME, "unusable_answer");
                         }
-                        push_shard_input(&es, local_shard, failed_chunk(&error, B::ids(requested)));
+                        reply.failed(B::ids(requested), &error);
                         return ResponseVerdict::Accept;
                     }
                 };
                 match B::answer(scope, keys, response) {
                     Ok(event) => {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFulfilled(B::ids(requested)),
-                        );
-                        push_protocol_event(&es, local_shard, event);
+                        reply.answered(B::ids(requested), event);
                         ResponseVerdict::Accept
                     }
                     Err(refusal) => {
@@ -714,11 +779,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
                             );
                             record_fetch_response_refused(B::NAME, reason);
                         }
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(B::ids(requested)),
-                        );
+                        reply.refused(B::ids(requested));
                         scored(refusal)
                     }
                 }
@@ -1201,6 +1262,23 @@ mod tests {
         assert!(p.handle(FetchInput::Failed { ids: vec![tx(1)] }).is_empty());
         let out = p.handle(FetchInput::Tick);
         assert_eq!(answerers(&out), [Answerers::LocalFirst]);
+    }
+
+    /// A peers-only instance asks past the host on the first attempt, on
+    /// the retry after a failure, and after the tick, whose hold and
+    /// release it keeps as any instance does.
+    #[test]
+    fn a_peers_only_fetch_never_asks_the_host_on_failure_or_tick() {
+        let mut p = Fetch::<TxHash>::peers_only("test", config());
+        let out = ask_out(&mut p, tx(1));
+        assert_eq!(answerers(&out), [Answerers::PeersOnly]);
+        let out = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(answerers(&out), [Answerers::PeersOnly]);
+        assert!(p.handle(FetchInput::Failed { ids: vec![tx(1)] }).is_empty());
+        let out = p.handle(FetchInput::Tick);
+        assert_eq!(answerers(&out), [Answerers::PeersOnly]);
+        let out = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(answerers(&out), [Answerers::PeersOnly]);
     }
 
     /// A peer round that outlasts the tick fails back to the local seats:

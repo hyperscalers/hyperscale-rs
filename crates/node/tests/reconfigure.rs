@@ -169,8 +169,8 @@ impl Fixture {
         }
     }
 
-    /// A host running shard A with `committee[0]` seated, plus a pool
-    /// follower for each of `followers`.
+    /// A host running shard A with `committee[0]` seated, plus a
+    /// beacon-loop follower for each of `followers`.
     fn shard_a_host(
         &self,
         followers: &[usize],
@@ -320,11 +320,11 @@ fn add_and_remove_shard_at_runtime() {
     );
 }
 
-/// A host built with only shard-less vnodes hosts no shards but drives a
-/// beacon-follower pool. A `BeaconBlockGossip` delivered through the network
+/// A host built with only shard-less vnodes hosts no shards, and its beacon
+/// loop drives them. A `BeaconBlockGossip` delivered through the network
 /// registry — Global scope, no source shard, no hosted shards — reaches the
-/// pool's beacon channel via the additive global follower (the per-shard fan
-/// is empty), and the host folds it. The genesis block is at the tip, so the
+/// beacon loop's channel via the additive host-level handler (the per-shard
+/// fan is empty), and the host folds it. The genesis block is at the tip, so the
 /// fold raises no seat trigger.
 #[test]
 fn pooled_vnode_follows_the_beacon_via_the_network_path() {
@@ -355,16 +355,20 @@ fn pooled_vnode_follows_the_beacon_via_the_network_path() {
         0,
         "a host of only followers carries no shards"
     );
-    assert_eq!(host.pooled_len(), 1, "the follower built into the pool");
+    assert_eq!(
+        host.pooled_len(),
+        1,
+        "the follower built into the beacon loop"
+    );
 
     // Deliver a beacon block through the registry's Global-scope dispatch
     // (`shard == None`). With no hosted shards the per-shard fan is empty;
-    // the global follower routes the block to the pool's beacon channel.
+    // the host-level handler routes the block to the beacon loop's channel.
     let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
     let _ = registry.local_dispatch_gossip(&gossip, None);
     let event = event_rx
         .try_recv()
-        .expect("the global follower routes the beacon block to the pool channel");
+        .expect("the host-level handler routes the beacon block to the beacon loop");
     assert!(
         matches!(event, HostEvent::Beacon(_)),
         "the follower delivers a beacon-scoped envelope"
@@ -380,15 +384,14 @@ fn pooled_vnode_follows_the_beacon_via_the_network_path() {
     );
 }
 
-/// A host that starts with a shard runs no pool, so a Global beacon block
-/// fans to the seated shard's channel but routes no pool envelope. When a
-/// validator later drains onto a pool via `add_pooled_vnode`, the same block
-/// reaches the pool's beacon channel — the host-level handler is registered
-/// unconditionally and gated on the live-pool flag, so a pool built after
-/// startup is fed. Regression for the routing gap where the handler was only
-/// registered when a pool existed at construction time.
+/// A host that starts with a shard has no beacon-loop follower, so a Global
+/// beacon block fans to the seated shard's channel but routes no beacon
+/// envelope. When a validator later drains onto the beacon loop via
+/// `add_pooled_vnode`, the same block reaches the beacon loop's channel: the
+/// host-level handler is registered unconditionally and gated on whether the
+/// loop holds a follower, so a follower added after startup is fed.
 #[test]
-fn runtime_built_pool_is_fed_beacon_blocks() {
+fn a_follower_added_at_runtime_is_fed_beacon_blocks() {
     let fix = fixture();
     let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD_A).collect()));
     let network = SimNetworkAdapter::new(Arc::clone(&registry));
@@ -414,31 +417,31 @@ fn runtime_built_pool_is_fed_beacon_blocks() {
 
     let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
 
-    // No pool yet: the seated shard receives the block, but the inactive
-    // route emits no beacon envelope.
+    // No follower yet: the seated shard receives the block, but the
+    // inactive route emits no beacon envelope.
     let _ = registry.local_dispatch_gossip(&gossip, None);
     let (saw_shard, mut saw_beacon) = drain_routing(&event_rx);
     assert!(saw_shard, "the seated shard receives the beacon block");
     assert!(
         !saw_beacon,
-        "with no live pool the host routes no beacon envelope"
+        "with no follower the host routes no beacon envelope"
     );
 
-    // A validator drains onto the pool at runtime (mirrors the supervisor's
-    // `follow_in_pool` / the sim's `leave_shard`).
+    // A validator drains onto the beacon loop at runtime (mirrors the
+    // supervisor's `follow_in_pool` / the sim's `leave_shard`).
     host.add_pooled_vnode(fix.pooled_vnode_init(1));
     assert_eq!(
         host.pooled_len(),
         1,
-        "the drained validator follows in the pool"
+        "the drained validator follows on the beacon loop"
     );
 
-    // The same block now reaches the pool's beacon channel.
+    // The same block now reaches the beacon loop's channel.
     let _ = registry.local_dispatch_gossip(&gossip, None);
     (_, saw_beacon) = drain_routing(&event_rx);
     assert!(
         saw_beacon,
-        "the runtime-built pool follower is fed a beacon block"
+        "the follower added at runtime is fed a beacon block"
     );
 
     // Dropping the follower retires the route again.

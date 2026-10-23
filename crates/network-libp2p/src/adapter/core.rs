@@ -617,10 +617,10 @@ impl Libp2pAdapter {
     /// Replace the set of validators this host must hold unicast
     /// connectivity to, and immediately dial the unbound ones whose
     /// addresses the book already knows. A freshly seated committee's
-    /// members were announcing as pool followers, so this seat-time pass
-    /// usually connects them at once; the event loop's maintenance sweep
-    /// covers the ones whose announcements arrive later and any dial that
-    /// fails.
+    /// members were announcing while they followed the beacon unseated, so
+    /// this seat-time pass usually connects them at once; the event loop's
+    /// maintenance sweep covers the ones whose announcements arrive later
+    /// and any dial that fails.
     pub(crate) fn update_wanted_validators(&self, wanted: BTreeSet<ValidatorId>) {
         let candidates = self
             .address_book

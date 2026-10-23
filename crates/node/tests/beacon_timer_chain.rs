@@ -1,8 +1,8 @@
 //! Beacon timer-chain liveness at the vnode-seating seams.
 //!
-//! Every ratify-eligible validator runs a live beacon timer chain: a pool
-//! follower's `BeaconRatifyTrigger` re-arm survives to the pool's timer
-//! seam instead of being discarded, and a vnode constructed mid-life —
+//! Every ratify-eligible validator runs a live beacon timer chain: a
+//! beacon-loop follower's `BeaconRatifyTrigger` re-arm survives to the
+//! loop's timer seam instead of being discarded, and a vnode constructed mid-life —
 //! seated or pooled, no genesis ceremony — arms the beacon startup timers
 //! (`BeaconCommitteeStart` + `BeaconRatifyTrigger`) the way
 //! `initialize_genesis` arms them for a genesis-born vnode. Without the
@@ -191,9 +191,9 @@ fn has_set(ops: &[TimerOp], want: &TimerId) -> bool {
         .any(|op| matches!(op, TimerOp::Set { id, .. } if id == want))
 }
 
-/// A pool follower's `BeaconRatifyTrigger` re-arm must reach the runner's
-/// timer seam. The ratify handler re-arms on every fire (early or due), so
-/// the chain stays alive only if the pool honors the `SetTimer` instead of
+/// A beacon-loop follower's `BeaconRatifyTrigger` re-arm must reach the
+/// runner's timer seam. The ratify handler re-arms on every fire (early or
+/// due), so the chain stays alive only if the loop honors the `SetTimer` instead of
 /// discarding it — a follower is a ratify-pool voter, and the trigger is
 /// what starts its skip prevotes when an epoch stalls.
 #[test]
@@ -206,7 +206,7 @@ fn follower_ratify_rearm_survives_to_the_timer_seam() {
 
     assert!(
         has_set(&out.timer_ops, &TimerId::BeaconRatifyTrigger),
-        "the follower's BeaconRatifyTrigger re-arm must survive to the pool's \
+        "the follower's BeaconRatifyTrigger re-arm must survive to the loop's \
          timer seam, not be dropped: got {:?}",
         out.timer_ops
     );
@@ -214,7 +214,7 @@ fn follower_ratify_rearm_survives_to_the_timer_seam() {
 
 /// A follower built mid-life (or at boot — it never runs the genesis
 /// ceremony either way) must arm the beacon startup timers when it enters
-/// the pool, exactly as `initialize_genesis` arms them for a genesis-born
+/// the beacon loop, exactly as `initialize_genesis` arms them for a genesis-born
 /// vnode: `BeaconRatifyTrigger` because it votes in the ratify pool from
 /// the moment it is active, and `BeaconCommitteeStart` because any pool
 /// validator can be drawn onto the next epoch's SPC committee.
@@ -272,7 +272,7 @@ fn midlife_seat_arms_the_startup_timers() {
 /// A pooled ratify-pool member's skip prevote must actually be signed —
 /// persisted to the durable ratify register, then broadcast — not dropped
 /// as an unexpected action. The ratify fire lands past the epoch's skip
-/// deadline, so the tracker asks for a skip prevote; the pool runs the
+/// deadline, so the tracker asks for a skip prevote; the beacon loop runs the
 /// same sign handler a seated vnode's dispatch runs, and the
 /// persist-before-sign register write is the observable proof it did.
 #[test]
@@ -300,10 +300,10 @@ fn pooled_ratify_voter_signs_its_skip_prevote() {
 
 /// Ratify votes gossip globally, but the per-shard fan never reaches a
 /// host with no hosted shards — the additive host-level route must carry
-/// them to the pool's beacon channel, since a ratify voter precommits
+/// them to the beacon loop's channel, since a ratify voter precommits
 /// only when it observes a prevote quorum.
 #[test]
-fn ratify_vote_gossip_routes_to_the_pool() {
+fn ratify_vote_gossip_routes_to_the_beacon_loop() {
     let fix = fixture();
     let (mut host, registry, event_rx) = fix.follower_host(0);
     host.register_inbound_handlers();
@@ -327,12 +327,12 @@ fn ratify_vote_gossip_routes_to_the_pool() {
 
     let event = event_rx
         .try_recv()
-        .expect("the host-level route must carry the ratify vote to the pool channel");
+        .expect("the host-level route must carry the ratify vote to the beacon loop");
     assert!(
         matches!(event, HostEvent::Beacon(_)),
         "the ratify vote arrives as a beacon-scoped envelope"
     );
-    // The pool folds it without treating it as unexpected.
+    // The beacon loop folds it without treating it as unexpected.
     let _ = host.step(event);
 }
 

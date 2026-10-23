@@ -178,7 +178,7 @@ impl NodeStateMachine {
 
     /// This vnode's seated shard, or `None` when it only follows the beacon.
     /// Used by [`NodeHost::new`](crate::host::NodeHost::new) to split vnodes
-    /// into per-shard groups and the beacon-follower pool.
+    /// into per-shard groups and the beacon loop's followers.
     #[must_use]
     pub(crate) fn seated_shard(&self) -> Option<ShardId> {
         self.shard.as_ref().map(|s| s.local_shard)
@@ -191,6 +191,7 @@ impl NodeStateMachine {
     }
 
     /// Get the current topology snapshot.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn topology_snapshot(&self) -> &TopologySnapshot {
         self.schedule.head()
@@ -295,7 +296,7 @@ impl NodeStateMachine {
     /// every ratify-eligible validator must run. Every constructed
     /// coordinator arms through here exactly once — genesis initialization,
     /// the committed-state resume of a seated vnode, or a
-    /// follower's entry into the pool. Durations are measured from the
+    /// follower's entry into the beacon loop. Durations are measured from the
     /// coordinator's clock, so the caller (or the seat constructor) must
     /// have set `now` first.
     #[must_use]

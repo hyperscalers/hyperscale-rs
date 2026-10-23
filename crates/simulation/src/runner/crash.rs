@@ -164,7 +164,6 @@ impl SimulationRunner {
         self.timers
             .retain(|(timer_host, ..), _| *timer_host != host);
         self.batch_wakes[i] = None;
-        self.pool_tick_pending[i] = false;
         while self.event_rxs[i].try_recv().is_ok() {}
         if let Some(jobs) = &self.deferred[i] {
             drop(jobs.take());

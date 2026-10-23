@@ -8,7 +8,7 @@
 //! per-host metrics + JMT GC ticks.
 //!
 //! Runtime shard membership — beacon-driven joins and leaves, reshape
-//! duties, and the shard-less follower pool — is executed by the
+//! duties, and the beacon loop's shard-less followers — is executed by the
 //! `ShardSupervisor` on the runner's tokio loop, never on a shard thread.
 //!
 //! Crypto verification and transaction execution are delegated through a

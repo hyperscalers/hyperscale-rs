@@ -246,10 +246,10 @@ where
                 },
             );
 
-        // Beacon gossip (beacon.block per-shard + host-level pool route +
+        // Beacon gossip (beacon.block per-shard + host-level beacon-loop route +
         // beacon.candidate + beacon.ratify_vote) lives in `crate::beacon::gossip`
-        // — the closures capture only the senders, the pool channel, and the
-        // route gate.
+        // — the closures capture only the senders, the beacon loop's channel,
+        // and the route gate.
         let route_active = self.process.beacon_route_active();
         register_beacon_gossip_handlers(
             &*self.process.network,
@@ -925,8 +925,8 @@ where
 }
 
 /// Fan a beacon consensus event across every hosted shard's channel and —
-/// while a follower pool is draining the beacon channel — to the pool as
-/// well, so a pooled validator on beacon duty (a ratify-pool member or an
+/// while the beacon loop holds a follower — to the beacon loop as well, so a
+/// pooled validator on beacon duty (a ratify-pool member or an
 /// SPC committee draw whose seat is still pending) hears its peers. A host
 /// running both a seated vnode and followers delivers to each coordinator
 /// once; the per-signer vote and verification slots keep that idempotent.

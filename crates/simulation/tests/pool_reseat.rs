@@ -1,7 +1,7 @@
 //! A shard-less validator follows the beacon in the pool and re-seats from it.
 //!
 //! Exercises the follower model end to end on the deterministic sim — the same
-//! `PoolLoop` / `seat_follower` path the production supervisor drives: a host
+//! `BeaconLoop` / `seat_follower` path the production supervisor drives: a host
 //! keeps a beacon follower warm after losing a shard (`leave_shard` builds one,
 //! mirroring the supervisor's `on_torn_down`), and retires it when the
 //! validator is seated again (`join_shard` drops it, mirroring
@@ -33,7 +33,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     runner.grow_to(2);
     let _ = runner.take_participation_changes();
 
-    // ── A surplus pool follower keeps its host's beacon storage warm ──
+    // ── A surplus pooled follower keeps its host's beacon storage warm ──
     let pool_host = (0..runner.num_hosts())
         .find(|&n| runner.pooled_len(n) > 0)
         .expect("the grow's surplus pool extra follows the beacon on its host");
@@ -42,7 +42,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     let after = committed_beacon_epoch(&*runner, pool_host);
     assert!(
         after > before,
-        "the pool follower must fold committed beacon blocks and keep its \
+        "the pooled follower must fold committed beacon blocks and keep its \
          host's beacon storage warm ({before} -> {after})"
     );
 
@@ -55,7 +55,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     assert_eq!(
         runner.pooled_len(node),
         0,
-        "a seated member's host runs no pool"
+        "a seated member's host runs no follower"
     );
 
     let mut leaf_storage = None;
@@ -77,16 +77,16 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
 
     // ── The drained follower keeps folding the beacon while pooled ──
     // The host started with a shard, so the only thing that can advance its
-    // beacon storage now is the pool follower folding gossiped blocks — no
-    // shard loop is left on the host. A rising committed tip proves the
-    // runtime-built pool is actually fed (the routing gap this guards against
-    // left such a follower dark, never raising its own re-seat trigger).
+    // beacon storage now is the beacon-loop follower folding gossiped blocks —
+    // no shard loop is left on the host. A rising committed tip proves a
+    // follower added at runtime is actually fed (a follower left unfed goes
+    // dark, never raising its own re-seat trigger).
     let before = committed_beacon_epoch(&*runner, node);
     runner.run_until(runner.now() + Duration::from_millis(EPOCH_MS * 4));
     let after = committed_beacon_epoch(&*runner, node);
     assert!(
         after > before,
-        "the drained pool follower must keep folding committed beacon blocks \
+        "the drained follower must keep folding committed beacon blocks \
          ({before} -> {after})"
     );
     let _ = runner.take_participation_changes();
@@ -104,7 +104,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     assert_eq!(
         runner.pooled_len(node),
         0,
-        "seating the validator retires its pool follower"
+        "seating the validator retires its beacon-loop follower"
     );
     assert!(
         runner.vnode_state_in(node, leaf).is_some(),
