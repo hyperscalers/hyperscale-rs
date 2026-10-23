@@ -571,7 +571,8 @@ pub struct ShardCoordinator {
     recent_headers: Vec<BlockHeader>,
 
     /// Net substate delta per uncommitted block. Entries retire into
-    /// the byte frontier at commit and are pruned with their blocks.
+    /// the byte frontier at commit and otherwise live while the
+    /// verification pipeline holds their block's state-root stage.
     pending_bytes_deltas: HashMap<BlockHash, i64>,
 
     /// The answers the chain holds, as this voter can rebuild them: a
@@ -1679,7 +1680,7 @@ impl ShardCoordinator {
             actions.extend(self.remove_pending_block(block_hash));
             self.votes.forget(block_hash);
         }
-        self.retain_pending_judgements();
+        self.retain_held_judgements();
         actions
     }
 
@@ -7551,9 +7552,9 @@ impl ShardCoordinator {
         self.record_committed_claims(block);
 
         // Retire the committed block's substate delta into the count
-        // frontier. Sync commits carry no delta (QC-trusted, never
-        // verified locally); `BlockPersisted` reconciles the frontier
-        // from storage for those.
+        // frontier. A block that commits before its state-root check
+        // lands carries no delta; `BlockPersisted` reconciles the
+        // frontier from storage for those.
         if let Some(delta) = self.pending_bytes_deltas.remove(&block_hash)
             && self.substate_bytes_frontier.0 + 1 == height
         {
@@ -9674,29 +9675,25 @@ impl ShardCoordinator {
         // local committed height (remote shards have independent heights).
 
         self.block_sync.cleanup(committed_height);
-        self.retain_pending_judgements();
+        self.retain_held_judgements();
 
         orphaned.into_abandon_actions()
     }
 
     /// Drop what was judged of blocks this replica no longer holds: their
-    /// verification state, substate deltas and answer deltas.
-    ///
-    /// A sync-admitted block is never pending, and keeps its judgements
-    /// while the certified cache holds it above the committed tip: its
-    /// state-root stage stays checked, so a delta dropped here is never
-    /// measured again, and a child's substate count waits on it for good.
-    fn retain_pending_judgements(&mut self) {
+    /// verification state, substate deltas and answer deltas. A delta and
+    /// its answers live exactly as long as the state-root stage that
+    /// measured them, so a held stage that never runs again never leaves
+    /// a child's substate count waiting on a delta that cannot land.
+    fn retain_held_judgements(&mut self) {
         self.verification
             .cleanup(&self.pending_blocks, self.committed_height);
-        let pending_blocks = &self.pending_blocks;
-        let verification = &self.verification;
-        let judged = |hash: BlockHash| {
-            pending_blocks.get(hash).is_some()
-                || verification.cached_verified_certified_block(hash).is_some()
+        let held = |hash: BlockHash| {
+            self.verification
+                .holds_state_root(&self.pending_blocks, self.committed_height, hash)
         };
-        self.pending_bytes_deltas.retain(|hash, _| judged(*hash));
-        self.answers.retain_pending(judged);
+        self.pending_bytes_deltas.retain(|hash, _| held(*hash));
+        self.answers.retain(held);
     }
 
     /// Drive the verification of the blocks the store handed back at
@@ -20952,28 +20949,77 @@ mod tests {
         }
     }
 
-    /// A sync-admitted block above the committed tip keeps its substate
-    /// delta through a commit's cleanup, which drops the delta of a block
-    /// held nowhere: the synced block is never pending, and its checked
-    /// state-root stage is never run again to measure the delta anew.
+    /// A sync-admitted block whose state-root check has landed keeps what
+    /// the check measured through a commit's cleanup below it, as long as
+    /// the certified cache holds it: the block is never pending, and its
+    /// checked stage never runs again, so a delta dropped there would
+    /// leave its child's substate count waiting for good.
     #[test]
-    fn a_synced_block_above_the_tip_keeps_its_substate_delta_through_a_cleanup() {
-        let (mut state, _, _, five) = harvested_unexecuted_suffix();
-        assert!(state.pending_blocks.get(five.hash()).is_none());
-        assert!(
-            state
-                .verification
-                .cached_verified_certified_block(five.hash())
-                .is_some()
+    fn a_checked_synced_block_keeps_its_delta_and_answers_through_a_cleanup() {
+        let (mut state, schedule) = make_test_state();
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_3"));
+        state.seed_substate_bytes_frontier(BlockHeight::new(3), 4_096);
+        state.verification.on_block_persisted(BlockHeight::new(3));
+        state.set_block_syncing(true);
+        let unclaimed = block_chained_on(BlockHeight::new(4), state.committed_hash, 100);
+        let four = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                load: ShardLoad {
+                    substate_bytes: Some(4_096),
+                    ..ShardLoad::ZERO
+                },
+                ..unclaimed.header().clone().into_parts()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let (four_hash, _) = deliver_synced(&mut state, &schedule, four);
+        let _ = state.on_qc_signature_verified(
+            &schedule,
+            QcSubject::SyncedBlock(four_hash),
+            Ok(make_test_qc(four_hash, BlockHeight::new(4))),
         );
-        let gone = BlockHash::from_raw(Hash::from_bytes(b"held_nowhere"));
-        state.pending_bytes_deltas.insert(five.hash(), 64);
-        state.pending_bytes_deltas.insert(gone, 32);
+        assert_eq!(state.committed_height, BlockHeight::new(3));
+        assert!(state.pending_blocks.get(four_hash).is_none());
+        let anchor = state.block_anchor(four_hash).expect("four is held");
+        let qc = make_test_qc(four_hash, BlockHeight::new(4));
+        assert!(!schedule.recovery_suffix_band(state.local_shard, anchor, qc.weighted_timestamp()));
 
+        let _ = state.on_block_check_completed(
+            &schedule,
+            four_hash,
+            VerificationKind::StateRoot,
+            CheckOutcome::Checked {
+                bytes_delta: 64,
+                answers: AnswerDelta::default(),
+                additions: adding(1),
+            },
+        );
         let _ = state.cleanup_old_state(state.committed_height);
 
-        assert_eq!(state.pending_bytes_deltas.get(&five.hash()), Some(&64));
-        assert_eq!(state.pending_bytes_deltas.get(&gone), None);
+        let count_source = SubstateCountSource {
+            thresholds: ReshapeThresholds::DISABLED,
+            frontier: state.substate_bytes_frontier,
+            committed_height: state.committed_height,
+            deltas: &state.pending_bytes_deltas,
+        };
+        assert_eq!(
+            count_source.count_behind(
+                state.committed_hash,
+                four_hash,
+                &state.pending_blocks,
+                state.verification.verified_certified_blocks(),
+            ),
+            Ok(Some(4_160)),
+        );
+        assert_eq!(state.answers.additions(four_hash), Some(&adding(1)));
     }
 
     /// A harvested certified tip whose tree is not held stays the parent

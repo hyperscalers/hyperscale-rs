@@ -611,14 +611,33 @@ impl VerificationPipeline {
     /// if assembly has completed. The commit path Arc-clones from this
     /// borrow to thread the typed handle through
     /// [`Action::CommitBlock`](hyperscale_core::Action::CommitBlock).
-    /// Entries are evicted from the cache by [`Self::cleanup`] once the
-    /// block leaves `pending_blocks`, so callers don't need to take by
-    /// value.
+    /// An entry lives while [`Self::holds_state_root`] holds its block,
+    /// so callers don't need to take by value.
     pub(crate) fn cached_verified_certified_block(
         &self,
         block_hash: BlockHash,
     ) -> Option<&Arc<Verified<CertifiedBlock>>> {
         self.verified_certified_blocks.get(&block_hash)
+    }
+
+    /// Whether this replica holds `block_hash`'s state-root stage, and
+    /// with it what the stage measured: while the block is pending, or
+    /// while the certified cache holds it above `committed_height`. A
+    /// sync-admitted block is never pending, so only the second arm keeps
+    /// it; once checked, its stage never runs again, and what it measured
+    /// is gone for good if dropped while the stage is held.
+    pub(crate) fn holds_state_root(
+        &self,
+        pending_blocks: &PendingBlocks,
+        committed_height: BlockHeight,
+        block_hash: BlockHash,
+    ) -> bool {
+        state_root_held(
+            pending_blocks,
+            committed_height,
+            block_hash,
+            self.verified_certified_blocks.get(&block_hash),
+        )
     }
 
     /// Insert a `Verified<CertifiedBlock>` keyed by `block_hash`. Used
@@ -1450,10 +1469,10 @@ impl SubstateCountSource<'_> {
     /// `Err` names the block whose progress unblocks the resolution, the
     /// hash callers park on: the parent whose delta is still outstanding
     /// (or, for a frontier lagging the tip, the tip awaiting its
-    /// persistence reconcile). A sync-admitted parent is never executed
-    /// here, so its delta never lands; only its commit, reconciling the
-    /// frontier from storage, resolves it. Inside a recovery's suffix band
-    /// the callers answer `None` before walking at all.
+    /// persistence reconcile). A sync-admitted parent's delta lands when
+    /// its state-root fold completes; one that commits first is resolved
+    /// by the frontier reconciled from storage. Inside a recovery's
+    /// suffix band the callers answer `None` before walking at all.
     pub(crate) fn count_behind(
         &self,
         committed_hash: BlockHash,
@@ -2044,9 +2063,8 @@ impl VerificationPipeline {
     ///
     /// Most verification state is keyed by block hash and cleaned up based on
     /// `pending_blocks` membership (if the block is gone, its verification state
-    /// is stale). State-root state also lives for a sync-admitted block,
-    /// which is never pending: it is retained with the certified cache,
-    /// whose entries outlive their commit. The `verified_qcs` cache is the
+    /// is stale). The certified cache and the state-root stage live by
+    /// [`Self::holds_state_root`] instead. The `verified_qcs` cache is the
     /// other exception: it's keyed by the QC's certified block hash (not
     /// the proposing block), so it uses height-based retention with a
     /// 2-block buffer to support view-change scenarios where multiple
@@ -2059,14 +2077,13 @@ impl VerificationPipeline {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(*hash));
 
-        // The certified cache prunes first, so what it keeps is what a
-        // state-root entry may still serve.
         self.verified_certified_blocks.retain(|hash, certified| {
-            pending_blocks.contains_key(*hash) || certified.block().height() > committed_height
+            state_root_held(pending_blocks, committed_height, *hash, Some(certified))
         });
         let certified = &self.verified_certified_blocks;
-        let tracked =
-            |hash: BlockHash| pending_blocks.contains_key(hash) || certified.contains_key(&hash);
+        let tracked = |hash: BlockHash| {
+            state_root_held(pending_blocks, committed_height, hash, certified.get(&hash))
+        };
 
         self.ready_state_root_verifications
             .retain(|r| tracked(r.block_hash));
@@ -2086,8 +2103,6 @@ impl VerificationPipeline {
             self.deferred_proposal = None;
         }
 
-        // A state-root stage also lives for a sync-admitted block, which
-        // is never pending: it is retained with the certified cache.
         self.roots.retain(|(hash, kind), _| {
             if *kind == VerificationKind::StateRoot {
                 tracked(*hash)
@@ -2141,6 +2156,18 @@ impl VerificationPipeline {
             .map(Vec::len)
             .sum()
     }
+}
+
+/// [`VerificationPipeline::holds_state_root`] over `certified`, the
+/// block's certified cache entry where it has one.
+fn state_root_held(
+    pending_blocks: &PendingBlocks,
+    committed_height: BlockHeight,
+    block_hash: BlockHash,
+    certified: Option<&Arc<Verified<CertifiedBlock>>>,
+) -> bool {
+    pending_blocks.contains_key(block_hash)
+        || certified.is_some_and(|certified| certified.block().height() > committed_height)
 }
 
 #[cfg(test)]
@@ -2702,13 +2729,6 @@ mod tests {
 
     // ─── substate count walk ────────────────────────────────────────────
 
-    /// The walk classifies its blockers: an ancestor held nowhere (or a
-    /// pending ancestor missing its execution delta) is `Outstanding` —
-    /// the caller parks and the ancestor's completion re-drives the walk
-    /// — while an ancestor found only in the verified-certified cache is
-    /// `SyncAdmitted`: QC-attested, never locally executed, so no delta
-    /// ever lands for it. A fully delta'd pending chain resolves to the
-    /// frontier count plus the deltas.
     /// A block naming a committed base counts from it: every replica
     /// whose committed tip sits between the base and the parent derives
     /// the proposer's total, one below the base parks on the ancestor
