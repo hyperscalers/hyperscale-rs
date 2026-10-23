@@ -218,12 +218,13 @@ fn a_forged_state_proof_convinces_nobody() {
             "the record's push must actually have been exercised and cut",
         );
         // The refusal is the defence itself, and the reason is what says
-        // which check did the refusing.
+        // which check did the refusing. It is counted once the forged
+        // answer reaches the asker, which can be after the serve is seen.
         assert!(
-            c.metric(
+            c.run_until(epochs(1), |c| c.metric(
                 "fetch_responses_refused",
-                Some("state_proof:unusable_proof")
-            ) > refused_before,
+                Some("state_proof:unusable_proof"),
+            ) > refused_before),
             "no state-proof answer was refused on its proof, so the reconstruction never ran",
         );
 
