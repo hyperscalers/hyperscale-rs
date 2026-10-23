@@ -9,7 +9,7 @@
 //!
 //! Two runners drive a `NodeHost`, each built via [`NodeHost::new`].
 //! Production decomposes it with [`NodeHost::into_parts`] and runs each
-//! [`ShardLoop`] (and the host's pool) on its own pinned thread via
+//! [`ShardLoop`] (and the host's beacon loop) on its own pinned thread via
 //! [`ShardLoop::run_step`]; simulation keeps the whole host and drives it
 //! single-threaded over a global event queue through [`NodeHost::step`],
 //! which fans a `HostEvent::Process` out across every hosted shard.
@@ -37,8 +37,8 @@ use crate::beacon::{
     BeaconBlockSync, BeaconCandidateCache, BeaconFetchState, BeaconProposalCache,
     beacon_block_sync_config,
 };
+use crate::beacon_loop::BeaconLoop;
 use crate::config::NodeConfig;
-use crate::pool_loop::PoolLoop;
 use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
@@ -59,12 +59,11 @@ use crate::vnode::{GroupStores, Vnode, VnodeInit, VnodeSeat};
 /// Output of [`NodeHost::into_parts`].
 ///
 /// The shared process-scoped resources, the per-shard drivers keyed by
-/// hosted shard id, and the host's shard-less beacon-follower pool (present
-/// only when the host carries followers).
+/// hosted shard id, and the host's beacon loop.
 pub(crate) type NodeHostParts<S, N, D> = (
     Arc<ProcessIo<S, N, D>>,
     BTreeMap<ShardId, ShardLoop<S, N, D>>,
-    Option<PoolLoop<S, N, D>>,
+    BeaconLoop<S, N, D>,
 );
 
 /// The deterministic product of one shard's genesis ceremony, returned by
@@ -101,10 +100,9 @@ where
     /// visit shards deterministically regardless of join order.
     pub(crate) shards: BTreeMap<ShardId, ShardLoop<S, N, D>>,
 
-    /// The host's shard-less, beacon-following vnodes, present only when the
-    /// host carries any. Driven for beacon events routed via
+    /// The host's beacon loop, driven for beacon events routed via
     /// [`HostEvent::Beacon`](crate::event::HostEvent::Beacon).
-    pub(crate) pool: Option<PoolLoop<S, N, D>>,
+    pub(crate) beacon: BeaconLoop<S, N, D>,
 
     /// Process-scoped shared resources: network adapter, dispatch pool,
     /// tx validator, topology snapshot, dispatch handles, event sender.
@@ -136,9 +134,9 @@ where
     /// of hosted shards is derived from `vnodes` (each vnode's
     /// `local_shard()`); `storages` must cover all of them.
     ///
-    /// `beacon_event_sender` is the channel a shard-less host's beacon
-    /// follower routes committed-block gossip to; it carries no traffic on
-    /// a host that runs no follower pool.
+    /// `beacon_event_sender` is the beacon loop's channel: beacon gossip
+    /// for its followers, and the outcomes of its own dispatched actions
+    /// and fetches.
     ///
     /// # Panics
     ///
@@ -198,15 +196,15 @@ where
         let mut shard_builds: BTreeMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = BTreeMap::new();
         let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
 
-        // Split the vnodes into per-shard groups (seated) and the
-        // beacon-follower pool (`shard: None`). The hosted-shard set — one
+        // Split the vnodes into per-shard groups (seated) and the beacon
+        // loop's followers (`shard: None`). The hosted-shard set — one
         // `ShardIo` apiece — is exactly the seated groups' keys.
         let mut by_shard: BTreeMap<ShardId, Vec<VnodeInit>> = BTreeMap::new();
-        let mut pool_inits: Vec<VnodeInit> = Vec::new();
+        let mut follower_inits: Vec<VnodeInit> = Vec::new();
         for init in vnodes {
             match init.state.seated_shard() {
                 Some(shard) => by_shard.entry(shard).or_default().push(init),
-                None => pool_inits.push(init),
+                None => follower_inits.push(init),
             }
         }
         assert!(
@@ -284,23 +282,23 @@ where
             })
             .collect();
 
-        // The beacon-follower pool, present only when the host carries
-        // shard-less vnodes.
-        let pool = (!pool_inits.is_empty()).then(|| {
-            PoolLoop::new(
-                Arc::clone(&process),
-                pool_inits.into_iter().map(VnodeInit::into_vnode).collect(),
-            )
-        });
-        // Route committed beacon blocks to the pool only while one exists to
-        // fold them; the sim drives the pool through this channel directly,
-        // and the production runner re-asserts the flag when it (re)spawns
-        // the pool thread after `into_parts`.
-        process.set_beacon_route_active(pool.is_some());
+        let beacon = BeaconLoop::new(
+            Arc::clone(&process),
+            follower_inits
+                .into_iter()
+                .map(VnodeInit::into_vnode)
+                .collect(),
+            &config,
+        );
+        // Route committed beacon blocks to the beacon loop only while it has
+        // followers to fold them; the sim drives the loop through this
+        // channel directly, and the production runner re-asserts the flag
+        // when it (re)spawns the beacon thread after `into_parts`.
+        process.set_beacon_route_active(!beacon.is_empty());
 
         Self {
             shards,
-            pool,
+            beacon,
             process,
             now: LocalTimestamp::ZERO,
             config,
@@ -338,8 +336,8 @@ where
 
     /// Queue `seat` on `shard`'s running loop, a validator drawn onto a
     /// shard this host already serves. The loop admits it once its store
-    /// is at rest (see [`ShardLoop::seat_vnode`]); its pool follower, if
-    /// any, retires when it is.
+    /// is at rest (see [`ShardLoop::seat_vnode`]); its beacon-loop follower,
+    /// if any, retires when it is.
     ///
     /// # Panics
     ///
@@ -377,16 +375,16 @@ where
 
     /// Consume the host and yield its constituent parts: the shared
     /// process-scoped resources, one [`ShardLoop`] per hosted shard, and the
-    /// shard-less beacon-follower pool (if any).
+    /// beacon loop.
     ///
     /// The production runner uses this to move each `ShardLoop` (and the
-    /// `PoolLoop`) onto its own pinned thread while keeping the
+    /// `BeaconLoop`) onto its own pinned thread while keeping the
     /// `Arc<ProcessIo>` shared across them. Simulation drives the whole
     /// host single-threaded via [`Self::step`], and takes it apart only
     /// when its process crashes, to keep the stores it leaves on disk.
     #[must_use]
     pub fn into_parts(self) -> NodeHostParts<S, N, D> {
-        (self.process, self.shards, self.pool)
+        (self.process, self.shards, self.beacon)
     }
 
     /// Borrow the shared process-scoped resources. Callers `Arc::clone`
@@ -408,9 +406,7 @@ where
         for sl in self.shards.values_mut() {
             sl.set_time(now);
         }
-        if let Some(pool) = &mut self.pool {
-            pool.set_time(now);
-        }
+        self.beacon.set_time(now);
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
@@ -442,54 +438,35 @@ where
         })
     }
 
-    /// Number of shard-less, beacon-following vnodes in the host's pool.
+    /// Number of shard-less, beacon-following vnodes on the host's beacon
+    /// loop.
     #[must_use]
-    pub fn pooled_len(&self) -> usize {
-        self.pool.as_ref().map_or(0, PoolLoop::len)
+    pub const fn pooled_len(&self) -> usize {
+        self.beacon.len()
     }
 
-    /// Whether the host's pool is running a beacon-block catch-up sync. The
-    /// simulation harness polls this to keep the pool's retry tick armed;
-    /// production's pool thread reads it directly off its `PoolLoop`.
-    #[must_use]
-    pub fn pool_is_syncing(&self) -> bool {
-        self.pool.as_ref().is_some_and(PoolLoop::is_beacon_syncing)
-    }
-
-    /// Remove `validator`'s shard-less follower vnode from the host's pool,
+    /// Remove `validator`'s shard-less follower vnode from the beacon loop,
     /// once it has been seated onto a shard (the seat rebuilt its
-    /// `BeaconCoordinator` from the host's warm beacon storage). No-op if
-    /// the host runs no pool or holds no such follower. Leaves an empty pool
-    /// in place — its beacon channel simply carries no further work.
+    /// `BeaconCoordinator` from the host's warm beacon storage). Its release
+    /// gate is closed when this returns. No-op if the loop holds no such
+    /// follower.
     pub fn drop_pooled_vnode(&mut self, validator: ValidatorId) {
-        if let Some(pool) = &mut self.pool {
-            pool.vnodes.retain(|v| v.validator_id != validator);
-        }
-        // An emptied pool no longer needs the beacon channel; stop routing so
-        // the host doesn't fold blocks into a pool with no followers.
-        self.process.set_beacon_route_active(self.has_active_pool());
+        self.beacon.remove_vnode(validator);
+        // A loop with no followers no longer needs the beacon channel; stop
+        // routing so the host doesn't fold blocks into it.
+        self.process
+            .set_beacon_route_active(!self.beacon.is_empty());
     }
 
-    /// Add a shard-less beacon follower to the host's pool, creating the
-    /// pool if the host had none. Used when a validator drains off its last
-    /// shard and keeps following the beacon (see
-    /// [`seat_follower`](crate::seat_follower)). The follower's beacon
-    /// startup timers land in the pool's timer scratch; the caller drains
+    /// Add a shard-less beacon follower to the host's beacon loop. Used when
+    /// a validator drains off its last shard and keeps following the beacon
+    /// (see [`seat_follower`](crate::seat_follower)). The follower's beacon
+    /// startup timers land in the loop's timer scratch; the caller drains
     /// them via [`Self::drain_pending_output`].
     pub fn add_pooled_vnode(&mut self, init: VnodeInit) {
-        let vnode = init.into_vnode();
-        match &mut self.pool {
-            Some(pool) => pool.add_vnode(vnode),
-            None => self.pool = Some(PoolLoop::new(Arc::clone(&self.process), vec![vnode])),
-        }
-        // The host now drives a pool; route committed beacon blocks to it.
+        self.beacon.add_vnode(init.into_vnode());
+        // The loop now has a follower; route committed beacon blocks to it.
         self.process.set_beacon_route_active(true);
-    }
-
-    /// Whether the host holds a pool with at least one follower — the
-    /// condition under which committed beacon blocks should route to it.
-    fn has_active_pool(&self) -> bool {
-        self.pool.as_ref().is_some_and(|p| !p.is_empty())
     }
 
     /// Whether this host runs a vnode for `validator` on any hosted shard.
@@ -621,9 +598,7 @@ where
         for sl in self.shards.values_mut() {
             sl.clear_scratch();
         }
-        if let Some(pool) = &mut self.pool {
-            pool.clear_scratch();
-        }
+        self.beacon.clear_scratch();
 
         match event {
             HostEvent::Shard(shard, input) => {
@@ -633,12 +608,7 @@ where
                 }
             }
             HostEvent::Process(input) => self.step_process_input(input),
-            HostEvent::Beacon(input) => {
-                // Drop beacon events on a host with no pooled vnodes.
-                if let Some(pool) = &mut self.pool {
-                    pool.dispatch_event(input);
-                }
-            }
+            HostEvent::Beacon(input) => self.beacon.dispatch_event(input),
         }
 
         self.drain_pending_output()
@@ -665,14 +635,12 @@ where
         for sl in self.shards.values_mut() {
             out.merge(sl.take_output());
         }
-        if let Some(pool) = &mut self.pool {
-            out.merge(pool.take_output());
-        }
+        out.merge(self.beacon.take_output());
         self.retire_seated_followers(&out.seated);
         out
     }
 
-    /// Retire the pool follower of every validator a loop just seated:
+    /// Retire the beacon-loop follower of every validator a loop just seated:
     /// it drives its beacon from the shard now.
     fn retire_seated_followers(&mut self, seated: &[ValidatorId]) {
         for &validator in seated {

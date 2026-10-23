@@ -9,9 +9,9 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
 
-use super::{ShardLoop, TimerOp, TimerOwner};
+use super::{ShardIo, ShardLoop, TimerOp, TimerOwner};
 use crate::beacon::{self, BeaconCandidateBinding, BeaconProposalBinding, ShardWitnessBinding};
-use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
+use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Intent, Release, ShardReply};
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
     FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
@@ -54,34 +54,23 @@ where
 {
     /// Dispatch outputs from a [`FetchBinding`]'s state machine on this
     /// shard: emit one network request per chunk (or per id, for `PER_ID`
-    /// bindings) and route the response through the binding's callback.
-    ///
-    /// The shard's id is threaded through to per-binding callbacks so the
-    /// response can be routed back to this shard.
-    pub(in crate::shard) fn process_fetch_outputs<B: FetchBinding>(
+    /// bindings) and route the response back to this shard's loop.
+    pub(in crate::shard) fn process_fetch_outputs<B: FetchedBy<ShardIo<S>>>(
         &self,
         outputs: Vec<FetchOutput<B::Id>>,
     ) {
-        let local_shard = self.shard;
+        let reply = ShardReply {
+            shard: self.shard,
+            sender: self.event_sender().clone(),
+        };
+        let network = &*self.process.network;
         for FetchOutput::Send { ids, route } in outputs {
             if B::PER_ID {
                 for id in ids {
-                    B::dispatch_chunk(
-                        vec![id],
-                        local_shard,
-                        route,
-                        &*self.process.network,
-                        self.event_sender(),
-                    );
+                    B::dispatch_chunk(vec![id], route, network, &reply);
                 }
             } else {
-                B::dispatch_chunk(
-                    ids,
-                    local_shard,
-                    route,
-                    &*self.process.network,
-                    self.event_sender(),
-                );
+                B::dispatch_chunk(ids, route, network, &reply);
             }
         }
     }
@@ -91,7 +80,7 @@ where
     /// `spawn_pending_fetches` so freed slots are filled in the same
     /// event-loop turn — this wrapper just routes the FSM-emitted Sends
     /// to the network.
-    pub(crate) fn drive_fetch<B: FetchBinding>(&mut self, input: FetchInput<B::Id>) {
+    pub(crate) fn drive_fetch<B: FetchedBy<ShardIo<S>>>(&mut self, input: FetchInput<B::Id>) {
         if let FetchInput::Request {
             ids,
             shard,
@@ -169,7 +158,7 @@ where
     /// `wanted` no longer names. For a fetch whose consumer re-derives
     /// its whole wanted set each pass, this is the only retirement:
     /// nothing answers for an id the consumer stopped asking about.
-    pub(in crate::shard) fn abandon_unwanted<B: FetchBinding>(
+    pub(in crate::shard) fn abandon_unwanted<B: FetchedBy<ShardIo<S>>>(
         &mut self,
         wanted: &BTreeSet<B::Id>,
         within: impl Fn(&B::Id) -> bool,
@@ -237,19 +226,22 @@ where
             || self.io.consensus.has_pending()
             || beacon::has_pending(&self.beacon_block)
             || self.io.cross_shard.has_pending();
-        if let Some(op) = self.fetch_tick.refresh(self.shard, self.now, any_pending) {
+        if let Some(op) =
+            self.fetch_tick
+                .refresh(TimerOwner::Loop(self.shard), self.now, any_pending)
+        {
             self.pending_timer_ops.push(op);
         }
     }
 }
 
-/// A shard's `FetchTick`, armed once and left to fire.
+/// A loop's `FetchTick`, armed once and left to fire.
 ///
 /// Setting a timer replaces the one pending, so a tick set again on every
-/// step would fire only after a step-free interval, and a shard stepping
+/// step would fire only after a step-free interval, and a loop stepping
 /// more often than that would never tick. The tick is set when nothing is
 /// armed, or when the armed one is overdue, so a fire lost on its way
-/// cannot leave the shard unticked.
+/// cannot leave the loop unticked.
 #[derive(Debug, Default)]
 pub struct FetchTicker {
     /// When the armed tick is due, or `None` while none is armed.
@@ -260,13 +252,18 @@ impl FetchTicker {
     /// Interval for the periodic fetch tick timer.
     const INTERVAL: Duration = Duration::from_millis(200);
 
-    /// The timer op `shard`'s tick needs at `now`, given whether any of its
-    /// fetches has pending work: a set when it is due one, a cancel when
-    /// it is armed with nothing left to do.
-    fn refresh(&mut self, shard: ShardId, now: LocalTimestamp, pending: bool) -> Option<TimerOp> {
+    /// The timer op `owner`'s tick needs at `now`, given whether any of
+    /// its fetches has pending work: a set when it is due one, a cancel
+    /// when it is armed with nothing left to do.
+    pub(crate) fn refresh(
+        &mut self,
+        owner: TimerOwner,
+        now: LocalTimestamp,
+        pending: bool,
+    ) -> Option<TimerOp> {
         if !pending {
             return self.due.take().map(|_| TimerOp::Cancel {
-                owner: TimerOwner::Loop(shard),
+                owner,
                 id: TimerId::FetchTick,
             });
         }
@@ -275,20 +272,21 @@ impl FetchTicker {
         }
         self.due = Some(now.plus(Self::INTERVAL));
         Some(TimerOp::Set {
-            owner: TimerOwner::Loop(shard),
+            owner,
             id: TimerId::FetchTick,
             duration: Self::INTERVAL,
         })
     }
 
     /// The armed tick fired.
-    pub(super) const fn fired(&mut self) {
+    pub(crate) const fn fired(&mut self) {
         self.due = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash};
 
     use super::*;
@@ -298,7 +296,10 @@ mod tests {
 
     /// Fail `id` on `B`'s fetch twice before a tick, so it is held, and
     /// return whether the loop's fetch tick sent it again.
-    fn tick_resends_a_held<B: FetchBinding>(shard_loop: &mut Loop, id: &B::Id) -> bool {
+    fn tick_resends_a_held<B: FetchedBy<ShardIo<SimShardStorage>>>(
+        shard_loop: &mut Loop,
+        id: &B::Id,
+    ) -> bool {
         let ids = || B::ids(vec![id.clone()]);
         shard_loop.request_fetch(ids(), SHARD, None, None);
         shard_loop.release_fetch(ids(), Release::Failed);
@@ -350,17 +351,23 @@ mod tests {
     fn a_busy_shard_leaves_its_armed_tick_to_fire() {
         let mut ticker = FetchTicker::default();
         let t0 = LocalTimestamp::from_millis(1_000);
-        assert!(is_set(ticker.refresh(SHARD, t0, true).as_ref()));
+        assert!(is_set(
+            ticker.refresh(TimerOwner::Loop(SHARD), t0, true).as_ref()
+        ));
         for step in 1..FetchTicker::INTERVAL.as_millis() {
             let now = t0.plus(Duration::from_millis(u64::try_from(step).unwrap()));
             assert!(
-                ticker.refresh(SHARD, now, true).is_none(),
+                ticker.refresh(TimerOwner::Loop(SHARD), now, true).is_none(),
                 "a step {step}ms after arming pushed the tick back",
             );
         }
         ticker.fired();
         let fired_at = t0.plus(FetchTicker::INTERVAL);
-        assert!(is_set(ticker.refresh(SHARD, fired_at, true).as_ref()));
+        assert!(is_set(
+            ticker
+                .refresh(TimerOwner::Loop(SHARD), fired_at, true)
+                .as_ref()
+        ));
     }
 
     /// An armed tick whose fire never arrived is set again once overdue,
@@ -369,16 +376,26 @@ mod tests {
     fn an_overdue_tick_is_set_again_and_an_idle_one_cancelled() {
         let mut ticker = FetchTicker::default();
         let t0 = LocalTimestamp::from_millis(1_000);
-        assert!(is_set(ticker.refresh(SHARD, t0, true).as_ref()));
+        assert!(is_set(
+            ticker.refresh(TimerOwner::Loop(SHARD), t0, true).as_ref()
+        ));
         let overdue = t0.plus(FetchTicker::INTERVAL);
-        assert!(is_set(ticker.refresh(SHARD, overdue, true).as_ref()));
+        assert!(is_set(
+            ticker
+                .refresh(TimerOwner::Loop(SHARD), overdue, true)
+                .as_ref()
+        ));
         assert!(matches!(
-            ticker.refresh(SHARD, overdue, false),
+            ticker.refresh(TimerOwner::Loop(SHARD), overdue, false),
             Some(TimerOp::Cancel {
                 id: TimerId::FetchTick,
                 ..
             })
         ));
-        assert!(ticker.refresh(SHARD, overdue, false).is_none());
+        assert!(
+            ticker
+                .refresh(TimerOwner::Loop(SHARD), overdue, false)
+                .is_none()
+        );
     }
 }

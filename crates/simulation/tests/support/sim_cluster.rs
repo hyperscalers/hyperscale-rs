@@ -248,7 +248,8 @@ impl SimCluster {
     /// follower host rather than riding a committee host. This is a sim-only
     /// layout the shuffle-relocation tests (`vnode_relocation`, `pool_reseat`)
     /// need: they follow a vnode onto a host not already serving the
-    /// destination shard, and a host whose only occupant is a pool follower.
+    /// destination shard, and a host whose only occupant is a beacon-loop
+    /// follower.
     /// A vnode drawn onto a host already serving its shard seats into the
     /// running loop instead, which `co_hosted_seat` covers. Portable
     /// scenarios never need it — they express host packing through

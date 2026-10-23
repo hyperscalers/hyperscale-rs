@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use crossbeam::channel::Sender;
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_refused;
@@ -28,10 +27,10 @@ use hyperscale_types::{
 };
 
 use crate::fetch::{
-    Fetch, FetchBinding, Refusal, Route, ScopedAnswer, dispatch_scoped, failed_chunk,
-    partition_solicited,
+    Fetch, FetchBinding, FetchedBy, Refusal, Route, ScopedAnswer, ShardReply, dispatch_scoped,
+    failed_chunk, partition_solicited,
 };
-use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].
@@ -65,18 +64,21 @@ impl FetchBinding for LocalProvisionBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::LocalProvisions(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<ProvisionHash> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for LocalProvisionBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<ProvisionHash> {
         &mut shard.cross_shard.local_provision
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<ProvisionHash>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         let es = sender.clone();
         let hs = ids.clone();
         route.request(
@@ -149,18 +151,21 @@ impl FetchBinding for FinalizationBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::Finalizations(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<FinalizationHash> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for FinalizationBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<FinalizationHash> {
         &mut shard.cross_shard.finalization
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<FinalizationHash>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         let es = sender.clone();
         let requested_ids = ids.clone();
         route.request(
@@ -234,19 +239,20 @@ impl FetchBinding for StateProofBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::StateProofs(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for StateProofBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.state_proof
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
+        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
     }
 }
 
@@ -263,7 +269,7 @@ impl ScopedAnswer for StateProofBinding {
         (scope, key)
     }
 
-    fn request(scope: Self::Scope, keys: &[Self::Key], _asker: ShardId) -> Self::Request {
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
         GetStateProofRequest::new(
             scope.height,
             Capped::new(keys.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
@@ -320,19 +326,20 @@ impl FetchBinding for VerdictProofBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::VerdictProofs(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for VerdictProofBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.verdict_proof
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
+        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
     }
 }
 
@@ -349,8 +356,8 @@ impl ScopedAnswer for VerdictProofBinding {
         (scope, key)
     }
 
-    fn request(scope: Self::Scope, keys: &[Self::Key], asker: ShardId) -> Self::Request {
-        StateProofBinding::request(scope, &cells_of(keys), asker)
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        StateProofBinding::request(scope, &cells_of(keys))
     }
 
     /// Checked as a state proof is, over every cell of the questions
@@ -392,19 +399,20 @@ impl FetchBinding for SettledTxsBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::SettledTxs(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for SettledTxsBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.settled_txs
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
-        dispatch_scoped::<Self, N>(ids, local_shard, route, network, sender);
+        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
     }
 }
 
@@ -423,7 +431,7 @@ impl ScopedAnswer for SettledTxsBinding {
         scope
     }
 
-    fn request(scope: Self::Scope, _keys: &[Self::Key], _asker: ShardId) -> Self::Request {
+    fn request(scope: Self::Scope, _keys: &[Self::Key]) -> Self::Request {
         GetSettledTxsRequest::new(scope.height, scope.block_hash)
     }
 
@@ -462,18 +470,21 @@ impl FetchBinding for ProvisionBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::RemoteProvisions(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ProvisionBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.cross_shard.provision
     }
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<(ShardId, ShardId, BlockHeight)>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         // PER_ID means the dispatcher hands us exactly one id at a time.
         debug_assert_eq!(ids.len(), 1);
         let (source_shard, target_shard, block_height) = ids[0];
@@ -741,7 +752,7 @@ mod settled_txs_tests {
             &pending_chain,
             &SettledTxsCache::default(),
             None,
-            &SettledTxsBinding::request(scope, &[], ShardId::ROOT),
+            &SettledTxsBinding::request(scope, &[]),
         );
         match SettledTxsBinding::answer(scope, vec![()], response) {
             Ok(ProtocolEvent::SettledTxsReconstructed {
@@ -771,7 +782,7 @@ mod settled_txs_tests {
             &pending_chain,
             &SettledTxsCache::default(),
             None,
-            &SettledTxsBinding::request(scope, &[], ShardId::ROOT),
+            &SettledTxsBinding::request(scope, &[]),
         );
         assert_eq!(
             SettledTxsBinding::answer(scope, vec![()], response).err(),

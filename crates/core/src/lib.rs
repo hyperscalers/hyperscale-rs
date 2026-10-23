@@ -36,6 +36,7 @@ mod action_context;
 mod fetch_ids;
 mod fetch_request;
 mod protocol_event;
+mod signer_gate;
 mod timer;
 mod traits;
 
@@ -48,5 +49,6 @@ pub use fetch_ids::FetchIds;
 pub use fetch_request::FetchRequest;
 pub use hyperscale_dispatch::Parallelism;
 pub use protocol_event::{CommitSource, ProtocolEvent, TickBatchOutcome};
+pub use signer_gate::{GateEntry, SignerGate};
 pub use timer::TimerId;
 pub use traits::StateMachine;

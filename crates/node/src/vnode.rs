@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors, retention_floor};
+use hyperscale_core::SignerGate;
 use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
@@ -52,6 +53,7 @@ impl VnodeInit {
             validator_id: self.state.validator_id(),
             state: self.state,
             signer: self.signer,
+            gate: Arc::new(SignerGate::new()),
         }
     }
 }
@@ -304,7 +306,7 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         args.beacon_network,
         args.beacon_config_hash,
     );
-    // Seed the coordinator's clock from the seat instant so the pool's
+    // Seed the coordinator's clock from the seat instant so the follower's
     // startup-timer durations measure from now, not from a frozen zero.
     beacon_coordinator.set_now(args.now);
     // Resume the pending epoch's ratification registers from the
@@ -335,4 +337,8 @@ pub struct Vnode {
     /// `DispatchHandles` via `Arc` so delegated handlers running on
     /// thread pools can sign without re-entering the pinned thread.
     pub(crate) signer: Arc<dyn Signer>,
+
+    /// The release gate this vnode's beacon signatures pass through,
+    /// closed when the beacon loop removes it.
+    pub(crate) gate: Arc<SignerGate>,
 }

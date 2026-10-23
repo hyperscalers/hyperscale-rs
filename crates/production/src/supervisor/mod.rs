@@ -55,7 +55,7 @@ mod pool;
 mod reshape;
 
 use membership::{CompletedBootstrap, Rebuild, Replaced};
-use pool::PoolThread;
+use pool::BeaconThread;
 use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
@@ -268,11 +268,10 @@ pub struct ShardSupervisor {
     events_tx: mpsc::UnboundedSender<SupervisorEvent>,
     /// Receiver side, taken by the runner's `run()` loop.
     events_rx: Option<mpsc::UnboundedReceiver<SupervisorEvent>>,
-    /// The host's pinned beacon-follower pool thread, present only while the
-    /// host carries shard-less followers. A drain off the last shard builds
-    /// one; seating its last follower tears it down.
-    pool: Option<PoolThread>,
-    /// The host's beacon-event channel receiver, cloned into each pool
+    /// The host's pinned beacon thread. Every host runs one from startup
+    /// until shutdown; a change to its follower set rebuilds it.
+    beacon: Option<BeaconThread>,
+    /// The host's beacon-event channel receiver, cloned into each beacon
     /// thread the supervisor spawns. The host-level gossip handler pushes
     /// committed beacon blocks onto the paired sender.
     beacon_event_rx: Receiver<HostEvent>,
@@ -333,7 +332,7 @@ impl ShardSupervisor {
             deferred_reshape_events: Vec::new(),
             pending_joins: HashMap::new(),
             awaiting_anchor: BTreeMap::new(),
-            pool: None,
+            beacon: None,
             beacon_event_rx,
             vnode_keys,
             events_tx,
@@ -421,10 +420,10 @@ impl ShardSupervisor {
     }
 
     /// Stop every shard thread: fan the shutdown signals first so the
-    /// threads wind down in parallel, then join them all. The pool thread,
-    /// if any, is stopped alongside them.
+    /// threads wind down in parallel, then join them all. The beacon
+    /// thread is stopped alongside them.
     pub(crate) fn shutdown_all(&mut self) {
-        self.teardown_pool();
+        self.teardown_beacon_loop();
         for (shard, entry) in &self.shards {
             if entry.shutdown_tx.send(()).is_err() {
                 tracing::debug!(shard = ?shard, "Shard already exited");

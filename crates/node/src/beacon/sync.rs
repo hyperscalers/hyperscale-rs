@@ -3,7 +3,7 @@
 //! The beacon chain is host-global — one chain per host, `Scope = ()` — so
 //! the catch-up logic has one home here rather than a copy per driver. Both
 //! the per-shard [`ShardLoop`](crate::shard::ShardLoop) and the
-//! shard-less [`PoolLoop`](crate::pool_loop::PoolLoop) drive the same FSM
+//! shard-less [`BeaconLoop`](crate::beacon_loop::BeaconLoop) drive the same FSM
 //! through [`BeaconSyncSink`]; only block delivery, fetch routing, and the
 //! FSM instance differ per driver. The FSM *instance* stays per-driver
 //! (a deliberate lock-free per-thread trade-off); only the driving *logic*
@@ -73,8 +73,7 @@ pub trait BeaconSyncSink {
     fn beacon_fsm(&mut self) -> &mut BeaconBlockSync;
 
     /// Fan a synced block to this driver's vnodes — the shard posts it to
-    /// its event channel; the pool runs the verify/adopt/commit cascade
-    /// inline.
+    /// its event channel; the beacon loop feeds it to its followers.
     fn deliver_block(&mut self, block: Arc<Verifiable<CertifiedBeaconBlock>>);
 
     /// Dispatch a single-epoch fetch over this driver's routing, wrapping

@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crossbeam::channel::Sender;
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{record_fetch_response_refused, record_fetch_response_sent};
@@ -21,12 +20,12 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::network::request::GetProposalRequest;
 use hyperscale_types::network::response::GetProposalResponse;
-use hyperscale_types::{BlockHash, BlockHeight, ShardId};
+use hyperscale_types::{BlockHash, BlockHeight};
 use tracing::warn;
 
-use crate::fetch::{Fetch, FetchBinding, Route, defers_to_the_tick};
+use crate::fetch::{Fetch, FetchBinding, FetchedBy, Route, ShardReply, defers_to_the_tick};
 use crate::shard::verify::verify_signed_by_proposer;
-use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Proposals held for serving at once. The coordinator admits proposals
 /// only within its own window above the committed tip, and commits prune
@@ -97,8 +96,10 @@ impl FetchBinding for ProposalBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::Proposals(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ProposalBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
         &mut shard.consensus.proposal
     }
 
@@ -107,11 +108,12 @@ impl FetchBinding for ProposalBinding {
     /// loop, as a gossiped header's is at intake.
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        local_shard: ShardId,
         route: Route,
         network: &N,
-        sender: &Sender<HostEvent>,
+        reply: &ShardReply,
     ) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         for block_hash in ids {
             let es = sender.clone();
             route.request(
@@ -224,13 +226,15 @@ mod tests {
 
     use crossbeam::channel::unbounded;
     use hyperscale_network_memory::{HostLayout, LinkStreams, NetworkConfig, SimulatedNetwork};
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         BlockHeader, BlockHeaderParts, BlockManifest, ChainOrigin, ConsensusSignature, Hash,
-        QuorumCertificate, ValidatorId,
+        QuorumCertificate, ShardId, ValidatorId,
     };
 
     use super::*;
     use crate::fetch::{FetchConfig, FetchInput, FetchOutput};
+    use crate::shard::HostEvent;
 
     fn proposal_at(height: u64, tag: &[u8]) -> BlockHeaderNotification {
         let header = BlockHeader::new(BlockHeaderParts {
@@ -334,7 +338,15 @@ mod tests {
         let mut fetched = None;
         while !outputs.is_empty() {
             for FetchOutput::Send { ids, route } in std::mem::take(&mut outputs) {
-                ProposalBinding::dispatch_chunk(ids, SHARD, route, &here, &sender);
+                <ProposalBinding as FetchedBy<ShardIo<SimShardStorage>>>::dispatch_chunk(
+                    ids,
+                    route,
+                    &here,
+                    &ShardReply {
+                        shard: SHARD,
+                        sender: sender.clone(),
+                    },
+                );
             }
             network.accept_requests(
                 0,

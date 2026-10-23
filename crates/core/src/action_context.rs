@@ -19,7 +19,7 @@ use hyperscale_types::{
     Signer, TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
 };
 
-use crate::ProtocolEvent;
+use crate::{ProtocolEvent, SignerGate};
 
 /// Context for executing delegated actions.
 ///
@@ -106,12 +106,13 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
         (self.notify)(event);
     }
 
-    /// Narrow this context to the beacon-sufficient subset. The shard
-    /// dispatch site hands this to beacon-owned handlers; the follower
-    /// pool builds a [`BeaconActionContext`] directly, since it has no
-    /// shard storage to fill the full context with.
+    /// Narrow this context to the beacon-sufficient subset, signing
+    /// through `gate`. The shard dispatch site hands this to beacon-owned
+    /// handlers; the beacon loop builds a [`BeaconActionContext`]
+    /// directly, since it has no shard storage to fill the full context
+    /// with.
     #[must_use]
-    pub fn beacon(&self) -> BeaconActionContext<'_, N> {
+    pub fn beacon<'b>(&'b self, gate: &'b SignerGate) -> BeaconActionContext<'b, N> {
         BeaconActionContext {
             topology_snapshot: self.topology_snapshot,
             me: self.me,
@@ -123,6 +124,7 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
             notify: Arc::clone(&self.notify),
             cache_beacon_proposal: self.cache_beacon_proposal,
             cache_beacon_candidate: self.cache_beacon_candidate,
+            gate,
         }
     }
 }
@@ -131,10 +133,9 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
 ///
 /// The subset of [`ActionContext`] the beacon coordinator's handlers
 /// need: signing, verification, broadcast, the durable ratify
-/// registers, and the outcome sink. Deliberately storage-free — beacon
-/// consensus reads no shard chain state — so a shard-less host (a
-/// beacon-follower pool) can run the same handlers a seated vnode's
-/// dispatch runs.
+/// registers, the outcome sink and the release gate. Deliberately
+/// storage-free — beacon consensus reads no shard chain state — so the
+/// beacon loop can run the same handlers a seated vnode's dispatch runs.
 #[allow(missing_docs)] // bag of references; field names match ActionContext's
 pub struct BeaconActionContext<'a, N: Network> {
     pub topology_snapshot: &'a TopologySnapshot,
@@ -164,6 +165,9 @@ pub struct BeaconActionContext<'a, N: Network> {
     /// process-level cache that serves inbound
     /// `GetBeaconCandidateRequest`s.
     pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),
+    /// The release gate of the identity that emitted the action. Every
+    /// signing handler enters it around its persist, sign and notify.
+    pub gate: &'a SignerGate,
 }
 
 impl<N: Network> BeaconActionContext<'_, N> {

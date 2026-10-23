@@ -300,12 +300,9 @@ pub trait Network: Send + Sync + 'static {
 
     /// Register a handler invoked once per host for a [`TopicScope::Global`],
     /// [`source_shard`](GossipMessage::source_shard) `None` gossip message,
-    /// regardless of the hosted-shard set, so a shard-less host (the
-    /// beacon-follower pool) still receives committed beacon blocks.
+    /// regardless of the hosted-shard set, so a host's beacon loop receives
+    /// committed beacon blocks even on a host serving no shard.
     /// Additive: the per-hosted-shard Global fan is unchanged.
-    ///
-    /// Invoked only on a host that runs a follower pool. A backend that
-    /// doesn't serve shard-less hosts may leave it unimplemented.
     fn register_host_gossip_handler<M: GossipMessage + 'static>(
         &self,
         handler: impl Fn(M) + Send + Sync + 'static,

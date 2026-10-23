@@ -32,12 +32,12 @@
 
 mod batch_accumulator;
 mod beacon;
+pub mod beacon_loop;
 pub mod bootstrap;
 mod config;
 pub mod event;
 mod fetch;
 pub mod host;
-pub mod pool_loop;
 pub mod process;
 pub mod reshape;
 pub mod shard;

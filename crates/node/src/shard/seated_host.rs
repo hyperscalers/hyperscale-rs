@@ -22,13 +22,16 @@ use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
-    GenesisConfigHash, GenesisPool, GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, ShardAnchor, ShardId, Stake, StakePoolId, TopologySnapshot, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
+    GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
+    NetworkDefinition, Randomness, ShardAnchor, ShardId, Stake, StakePoolId, TopologySnapshot,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
 };
 
 use crate::shard::{HostEvent, ShardLoop};
-use crate::{NodeConfig, NodeHost, NodeStateMachine, SeatConfig, VnodeInit, VnodeSeat};
+use crate::{
+    NodeConfig, NodeHost, NodeStateMachine, SeatConfig, SeatFollower, VnodeInit, VnodeSeat,
+    seat_follower,
+};
 
 pub const SHARD: ShardId = ShardId::leaf(1, 0);
 
@@ -41,6 +44,7 @@ pub struct Fixture {
     genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
+    validator_set: ValidatorSet,
     topology_snapshot: Arc<TopologySnapshot>,
 }
 
@@ -93,8 +97,24 @@ impl Fixture {
             genesis_block,
             genesis_state,
             config_hash,
+            validator_set,
             topology_snapshot,
         }
+    }
+
+    /// A two-leaf topology over this committee with `committees` seated.
+    pub fn topology(&self, committees: BTreeMap<ShardId, Vec<ValidatorId>>) -> TopologySnapshot {
+        TopologySnapshot::with_shard_committees(
+            NetworkDefinition::simulator(),
+            2,
+            &self.validator_set,
+            committees,
+        )
+    }
+
+    /// The beacon state every host here starts from.
+    pub const fn genesis_state(&self) -> &BeaconState {
+        &self.genesis_state
     }
 
     /// A vnode for `committee[idx]` on `SHARD`, restored at `recovered`.
@@ -130,6 +150,11 @@ impl Fixture {
             state,
             signer: self.committee.signer(idx),
         }
+    }
+
+    /// The genesis beacon block every host here starts from.
+    pub fn genesis_block(&self) -> Arc<Verified<CertifiedBeaconBlock>> {
+        Arc::clone(&self.genesis_block)
     }
 
     /// A queued seat for `committee[idx]`.
@@ -192,6 +217,60 @@ impl Fixture {
         topology: Arc<TopologySnapshot>,
     ) -> (Host, Receiver<HostEvent>) {
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        self.host_through(
+            storage,
+            committed,
+            topology,
+            SimNetworkAdapter::new(registry),
+            SyncDispatch::new(),
+        )
+    }
+
+    /// A host running `SHARD` with `committee[0]` seated at genesis, whose
+    /// requests go out through `network` and whose delegated work runs on
+    /// `dispatch`, beside the channel its loops push their own events into.
+    pub fn host_through_network(
+        &self,
+        network: SimNetworkAdapter,
+        dispatch: SyncDispatch,
+    ) -> (Host, Receiver<HostEvent>) {
+        self.host_through(
+            SimShardStorage::new(shard_prefix_path(SHARD)),
+            BlockHeight::GENESIS,
+            Arc::clone(&self.topology_snapshot),
+            network,
+            dispatch,
+        )
+    }
+
+    /// A shard-less beacon follower for `committee[idx]`, resumed from
+    /// `host`'s beacon storage.
+    pub fn follower(&self, host: &Host, idx: usize) -> VnodeInit {
+        self.follower_over(host.beacon_storage().as_ref(), idx)
+    }
+
+    /// A shard-less beacon follower for `committee[idx]`, resumed from
+    /// `beacon_storage`.
+    pub fn follower_over(&self, beacon_storage: &dyn BeaconStorage, idx: usize) -> VnodeInit {
+        seat_follower(SeatFollower {
+            verifier: Arc::new(BlsVerifier),
+            beacon_storage,
+            beacon_network: NetworkDefinition::simulator(),
+            beacon_config_hash: self.config_hash,
+            now: LocalTimestamp::ZERO,
+            validator: self.committee.validator_id(idx),
+            signer: self.committee.signer(idx),
+        })
+    }
+
+    fn host_through(
+        &self,
+        storage: SimShardStorage,
+        committed: BlockHeight,
+        topology: Arc<TopologySnapshot>,
+        network: SimNetworkAdapter,
+        dispatch: SyncDispatch,
+    ) -> (Host, Receiver<HostEvent>) {
         let (event_tx, events) = unbounded();
         let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
         beacon_storage
@@ -206,8 +285,8 @@ impl Fixture {
             beacon_storage,
             NetworkDefinition::simulator(),
             Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
+            network,
+            dispatch,
             std::iter::once((SHARD, event_tx.clone())).collect(),
             event_tx,
             Arc::new(ArcSwap::from(topology)),

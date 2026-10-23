@@ -374,7 +374,7 @@ impl ShardSupervisor {
             .expect("storages lock")
             .insert(shard, storage);
         // A seated validator now drives its beacon from this shard's thread,
-        // so retire its pool follower if it had one (it drained here from a
+        // so retire its beacon-loop follower if it had one (it drained here from a
         // prior shard, or started pooled and was just drawn into a committee).
         for cfg in vnodes {
             self.unfollow_in_pool(cfg.validator_id);
@@ -535,7 +535,7 @@ impl ShardSupervisor {
     /// joiner that triggered the rebuild included, once
     /// [`Self::on_torn_down`] has renamed it into place. A validator the
     /// old loop carried and the shard no longer places follows the beacon
-    /// in the pool, as any drained validator does.
+    /// on the beacon loop, as any drained validator does.
     pub(super) fn on_rebuilt(
         &mut self,
         done: Result<CompletedBootstrap, ShardId>,
@@ -670,7 +670,7 @@ impl ShardSupervisor {
     }
 
     /// A running loop admitted a queued seat: count the validator among
-    /// the shard's, and retire its pool follower, since it drives its
+    /// the shard's, and retire its beacon-loop follower, since it drives its
     /// beacon from this shard now.
     pub(super) fn on_seated(&mut self, shard: ShardId, validator: ValidatorId) {
         let Some(entry) = self.shards.get_mut(&shard) else {
@@ -927,7 +927,7 @@ impl ShardSupervisor {
         info!(shard = ?shard, "Shard left and torn down");
         // A departed validator that runs no other shard would go dark — no
         // vnode to fold the beacon and raise its own re-seat trigger. Keep
-        // it following in the pool instead; the host's beacon storage stays
+        // it following on the beacon loop instead; the host's beacon storage stays
         // warm for the eventual re-seat. A relocation that already seated
         // the destination leaves the validator on that shard, so it is not
         // pooled; a race that pools it is undone when the seat lands.

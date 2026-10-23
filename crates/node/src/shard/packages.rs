@@ -21,7 +21,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crossbeam::channel::Sender;
 use hyperscale_core::FetchIds;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Executor, artifact_package};
@@ -34,8 +33,11 @@ use hyperscale_types::network::request::{
 use hyperscale_types::{Address, Hash, ShardId};
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, FetchInput, Route, failed_chunk, partition_solicited};
-use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::fetch::{
+    Fetch, FetchBinding, FetchInput, FetchedBy, Route, ShardReply, failed_chunk,
+    partition_solicited,
+};
+use crate::shard::{ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Per-package artifact fetch keyed by content address.
 pub type PackageArtifactFetch = Fetch<Hash>;
@@ -83,18 +85,16 @@ impl FetchBinding for PackageArtifactBinding {
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::PackageArtifacts(ids)
     }
+}
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Hash> {
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for PackageArtifactBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Hash> {
         &mut shard.packages.fetch
     }
 
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Hash>,
-        local_shard: ShardId,
-        route: Route,
-        network: &N,
-        sender: &Sender<HostEvent>,
-    ) {
+    fn dispatch_chunk<N: Network>(ids: Vec<Hash>, route: Route, network: &N, reply: &ShardReply) {
+        let local_shard = reply.shard;
+        let sender = &reply.sender;
         let es = sender.clone();
         let requested = ids.clone();
         route.request(

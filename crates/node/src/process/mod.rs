@@ -14,7 +14,7 @@ mod network_handlers;
 mod tx_status;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -36,7 +36,7 @@ pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
 use crate::beacon::BeaconCommitCoordinator;
-use crate::event::{HostEvent, ShardScopedInput};
+use crate::event::{Attachment, HostEvent, ShardScopedInput};
 use crate::shard::cross_shard::serve_cells_request;
 use crate::shard::mempool::{DeferredOrigin, DeferredTransaction};
 use crate::shard::{DispatchHandles, SharedTopologySnapshot};
@@ -54,7 +54,7 @@ pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<HostEv
 struct BeaconSignerSeat {
     /// The `(epoch, view)` most recently signed under this validator's
     /// identity and the vnode that claimed it — the claimant's hosted
-    /// shard, or `None` for the follower pool, which is a distinct
+    /// shard, or `None` for the beacon loop, which is a distinct
     /// claimant even when a hosted shard is `ShardId::ROOT` (a
     /// single-shard network's only leaf). A view belongs wholly to its
     /// claimant — every phase of one view comes from one coordinator's
@@ -163,24 +163,26 @@ where
     /// runtime is observed immediately.
     pub(crate) shard_event_senders: SharedShardSenders,
 
-    /// Per-host channel back to the runner for beacon events routed to the
-    /// shard-less follower pool. In the sim this is the host's single event
-    /// channel (shared with the per-shard senders); the beacon-block gossip
-    /// follower pushes [`HostEvent::Beacon`] here for the pool to fold.
-    /// The host-level beacon handler is registered on every host but only
-    /// pushes when [`Self::beacon_route_active`] is set, so the channel
-    /// carries no traffic until a pool is draining it.
+    /// Per-host channel back to the runner for the beacon loop's events.
+    /// In the sim this is the host's single event channel (shared with the
+    /// per-shard senders). The loop's own continuations and fetch answers
+    /// arrive here, and the host-level beacon handler, registered on every
+    /// host, pushes gossip here only while [`Self::beacon_route_active`] is
+    /// set.
     pub(crate) beacon_event_sender: Sender<HostEvent>,
 
-    /// Whether a follower pool is currently draining
-    /// [`Self::beacon_event_sender`]. The host-level beacon gossip handler
-    /// is registered unconditionally (so a pool built at runtime is fed),
-    /// but routes a block only while this is set — toggled true when a pool
-    /// is built and false when it is torn down. Without the gate, a host
-    /// with no live pool would either silently swallow blocks (handler
-    /// missing) or back the channel up unbounded (handler pushing into a
-    /// drained-by-no-one channel).
+    /// Whether the beacon loop holds a follower to feed beacon gossip to.
+    /// The host-level beacon gossip handler is registered unconditionally,
+    /// so a follower added at runtime is fed, but routes gossip onto
+    /// [`Self::beacon_event_sender`] only while this is set: true while the
+    /// loop holds a follower, false while it holds none, so a loop with no
+    /// follower is not handed gossip it would fold for nobody.
     beacon_route_active: Arc<AtomicBool>,
+
+    /// The serial the next beacon-loop attachment takes. Process-wide, so
+    /// an attachment made by a rebuilt loop never repeats one an earlier
+    /// loop on the same beacon channel made.
+    next_attachment: AtomicU64,
 
     /// Lock-free topology snapshot shared with network handler closures
     /// and delegated dispatch jobs: the head of [`Self::topology_schedule`],
@@ -301,6 +303,7 @@ where
             shard_event_senders: Arc::new(ArcSwap::from_pointee(shard_event_senders)),
             beacon_event_sender,
             beacon_route_active: Arc::new(AtomicBool::new(false)),
+            next_attachment: AtomicU64::new(0),
             topology_snapshot,
             apply_topology_epoch: Mutex::new(Epoch::GENESIS),
             topology_schedule: ArcSwap::new(topology_schedule),
@@ -314,15 +317,23 @@ where
         }
     }
 
-    /// Mark whether a follower pool is draining the beacon channel. Set
-    /// true when a pool is built (host construction with followers,
-    /// `add_pooled_vnode`, or the production supervisor's pool thread) and
-    /// false when it is torn down. The host-level beacon gossip handler
-    /// reads this before routing a committed block, so a pool built after
-    /// startup is fed and a host with no live pool drops blocks rather than
-    /// backing the channel up.
+    /// Mark whether the beacon loop has followers draining the beacon
+    /// channel. Set true when it gains one (host construction with
+    /// followers, `add_pooled_vnode`, or the production supervisor's
+    /// beacon thread over a follower set) and false when it has none. The
+    /// host-level beacon gossip handler reads this before routing a
+    /// committed block, so a follower added after startup is fed and a
+    /// loop with none drops blocks rather than folding them for nobody.
     pub fn set_beacon_route_active(&self, active: bool) {
         self.beacon_route_active.store(active, Ordering::Release);
+    }
+
+    /// A fresh attachment of `validator` to the beacon loop.
+    pub(crate) fn attach(&self, validator: ValidatorId) -> Attachment {
+        Attachment::new(
+            validator,
+            self.next_attachment.fetch_add(1, Ordering::Relaxed),
+        )
     }
 
     /// A clone of the route-active flag for the host-level beacon handler
@@ -331,7 +342,7 @@ where
         Arc::clone(&self.beacon_route_active)
     }
 
-    /// Whether `my_shard`'s vnode (`None` for the follower pool) may emit
+    /// Whether `my_shard`'s vnode (`None` for the beacon loop) may emit
     /// a beacon signing action at `(epoch, view)` under `validator`'s
     /// identity — one lock for check-and-record, per
     /// [`BeaconSignerSeat::allow`]. A validator with no fence on record
@@ -786,7 +797,7 @@ where
     /// validator pubkeys and shard committees off the head, and fetch
     /// routing off the schedule's terminal-clamped committees).
     ///
-    /// Every hosted shard (and the pool) calls this as it folds the beacon,
+    /// Every hosted shard (and the beacon loop) calls this as it folds the beacon,
     /// concurrently across pinned threads. The store is gated monotonically on
     /// `epoch`: a fold for an epoch at or below the highest already applied is
     /// dropped, so a slower thread cannot regress the shared snapshot to an
@@ -919,23 +930,26 @@ mod tests {
         );
     }
 
-    /// The follower pool claims as `None`, a claimant distinct from every
+    /// The beacon loop claims as `None`, a claimant distinct from every
     /// hosted shard — including `ShardId::ROOT`, a single-shard network's
-    /// only leaf. A pooled follower and a `ROOT`-seated vnode of the same
-    /// validator can therefore never both sign within one view.
+    /// only leaf. A beacon-loop follower and a `ROOT`-seated vnode of the
+    /// same validator can therefore never both sign within one view.
     #[test]
-    fn pool_claimant_never_aliases_a_root_seated_vnode() {
+    fn beacon_loop_claimant_never_aliases_a_root_seated_vnode() {
         let mut seat = BeaconSignerSeat::vacant();
         let (e, v) = pos(3, 1);
 
         assert!(seat.allow(Some(ShardId::ROOT), e, v), "seat claims");
-        assert!(!seat.allow(None, e, v), "pool denied in the claimed view");
+        assert!(
+            !seat.allow(None, e, v),
+            "beacon loop denied in the claimed view"
+        );
 
         let (_, v2) = pos(3, 2);
-        assert!(seat.allow(None, e, v2), "pool claims the next view");
+        assert!(seat.allow(None, e, v2), "beacon loop claims the next view");
         assert!(
             !seat.allow(Some(ShardId::ROOT), e, v2),
-            "seat denied in the pool's view"
+            "seat denied in the beacon loop's view"
         );
     }
 

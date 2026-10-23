@@ -197,11 +197,10 @@ pub(super) fn handle_gossipsub_event(
                 return;
             };
 
-            // A Global-topic message (no shard in the topic) also reaches a
-            // shard-less host's beacon-follower pool through the host-level
-            // handler, additively to the per-hosted-shard fan above. Only
-            // beacon-block gossip registers one; everything else resolves to
-            // `None` and runs exactly as before.
+            // A Global-topic message (no shard in the topic) also reaches its
+            // type's host-level handler, such as the beacon loop's beacon
+            // gossip route, additively to the per-hosted-shard fan above. A
+            // type with none resolves to `None` and takes the shard fan alone.
             let topic_shard = parsed.shard_id;
             let host_handler = topic_shard
                 .is_none()

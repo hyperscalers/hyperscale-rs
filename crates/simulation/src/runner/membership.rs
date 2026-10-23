@@ -258,7 +258,7 @@ impl SimulationRunner {
         self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
         // Parity with the production supervisor's `unfollow_in_pool`: each
         // seated validator now drives its beacon from this shard, so retire any
-        // pool follower it carried (it drained here earlier).
+        // beacon-loop follower it carried (it drained here earlier).
         for &validator in validators {
             self.hosts[host as usize].drop_pooled_vnode(validator);
         }
@@ -510,7 +510,7 @@ impl SimulationRunner {
     /// does the old loop come down with its store, and a store that fell
     /// behind hands the rounds signed on it to the staging store; a
     /// validator the old loop carried that is not placed here follows the
-    /// beacon in the pool. A staging
+    /// beacon on the beacon loop. A staging
     /// store that cannot complete is dropped and the rebuild retries next
     /// slice, as a join does.
     fn rebuild_shard(
@@ -613,7 +613,7 @@ impl SimulationRunner {
             signer: self.signer_of(validator),
         });
         self.hosts[host as usize].add_pooled_vnode(init);
-        // The follower armed its beacon startup timers into the pool's
+        // The follower armed its beacon startup timers into the beacon loop's
         // scratch; sweep them into the runner's timer table.
         let output = self.hosts[host as usize].drain_pending_output();
         self.process_step_output(host, output);

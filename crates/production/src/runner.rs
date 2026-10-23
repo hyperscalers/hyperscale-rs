@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Receiver, Sender, unbounded};
+use crossbeam::channel::{Receiver, Sender, after, never, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, TimerId};
@@ -36,10 +36,10 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths, set_shard_channel_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::ValidatorKeyMap;
+use hyperscale_node::beacon_loop::BeaconLoop;
 use hyperscale_node::bootstrap::EngineBootstrap;
-use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
 use hyperscale_node::shard::{
-    HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, TimerOwner, timer_event,
+    BeaconScopedInput, HostEvent, ShardLoop, StepOutput, TimerOp, TimerOwner, timer_event,
 };
 use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
@@ -426,7 +426,7 @@ impl ProductionRunnerBuilder {
         // network genesis it installed, installs that genesis on a fresh
         // store of a never-crossed genesis shard, snap-syncs against an
         // attested anchor, or parks until one is seatable — so its
-        // validators follow the beacon in the pool until that join seats
+        // validators follow the beacon on the beacon loop until that join seats
         // them. A validator routing still names on a live shard resumes
         // there too, as a running host keeps it seated.
         let now = consensus_clock(chain_config.genesis_timestamp_ms);
@@ -610,10 +610,11 @@ impl ProductionRunnerBuilder {
             .iter()
             .map(|(s, tx)| (*s, tx.clone()))
             .collect();
-        // Beacon channel for a host's shard-less follower pool. The host-level
-        // gossip handler pushes committed beacon blocks onto the sender; the
-        // supervisor clones the receiver into each pool thread it spawns. The
-        // channel stays idle on a host that runs no follower pool.
+        // Beacon channel for the host's beacon loop. The host-level gossip
+        // handler pushes committed beacon blocks onto the sender while the
+        // loop has followers, and the loop's own continuations and fetch
+        // answers arrive on it; the supervisor clones the receiver into each
+        // beacon thread it spawns.
         let (beacon_event_tx, beacon_event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
             vnode_inits,
@@ -891,7 +892,7 @@ impl ProductionRunner {
     ///
     /// 1. Registers the host's inbound network handlers
     /// 2. Extracts the `NodeHost` and channel receivers for the pinned threads
-    /// 3. Spawns a pinned thread per resumed shard, the follower pool, and
+    /// 3. Spawns a pinned thread per resumed shard, the beacon loop, and
     ///    the supervisor joins for the seats whose store opened fresh
     /// 4. Runs a minimal loop for metrics collection and shutdown handling
     /// 5. On shutdown, signals the pinned threads and joins them
@@ -923,7 +924,7 @@ impl ProductionRunner {
         host.register_inbound_handlers();
 
         // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
-        let (_process, shards, pool) = host.into_parts();
+        let (_process, shards, beacon) = host.into_parts();
 
         let mut shard_channels = self
             .shard_channels
@@ -945,13 +946,11 @@ impl ProductionRunner {
             supervisor.start_loop(shard_loop, channels, LoopStart::Resume(&recovered));
         }
 
-        // A startup host's unseated validators — registered but unplaced, or
-        // placed on a shard whose store opened fresh — follow the beacon in
-        // its pool until a seat takes them. A host whose every validator
-        // resumed a store carries no pool.
-        if let Some(pool) = pool {
-            supervisor.install_pool(pool);
-        }
+        // Every host runs its beacon loop. A startup host's unseated
+        // validators — registered but unplaced, or placed on a shard whose
+        // store opened fresh — follow the beacon on it until a seat takes
+        // them.
+        supervisor.install_beacon_loop(beacon);
         for (shard, vnodes) in std::mem::take(&mut self.fresh_seats) {
             supervisor.handle(ShardCommand::Join { shard, vnodes });
         }
@@ -1423,9 +1422,9 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
                     continue;
                 }
                 HostEvent::Beacon(_) => {
-                    // Pooled followers run on their own driver (deferred to the
-                    // production pool path); never on a shard's thread.
-                    warn!(shard = ?shard, "Dropping beacon-pool event on shard channel");
+                    // Beacon-loop traffic runs on the beacon thread, never on
+                    // a shard's thread.
+                    warn!(shard = ?shard, "Dropping beacon-loop event on shard channel");
                     continue;
                 }
             };
@@ -1607,20 +1606,19 @@ pub fn spawn_shard_loop(
         .expect("failed to spawn shard-loop thread")
 }
 
-/// Concrete `PoolLoop` type for the production runner: the host's
-/// shard-less beacon followers.
-pub type ProdPoolLoop = PoolLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
+/// Concrete `BeaconLoop` type for the production runner.
+pub type ProdBeaconLoop = BeaconLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
 
-/// Configuration for a host's pinned pool thread — the lightweight sibling
-/// of [`ShardLoopConfig`]. A follower runs no shard consensus, so there are
-/// no timers, batches, or callbacks: it drains beacon gossip and surfaces
-/// the seat triggers its fold raises.
-pub struct PoolLoopConfig {
-    /// Beacon-block gossip routed here by the host-level gossip handler
-    /// (see `register_host_gossip_handler`), plus any self-driven beacon
-    /// continuations.
+/// Configuration for a host's pinned beacon thread — the lightweight
+/// sibling of [`ShardLoopConfig`]. The beacon loop runs no shard
+/// consensus, so there are no batches or callbacks: it drains beacon
+/// traffic and surfaces the seat triggers its followers raise.
+pub struct BeaconLoopConfig {
+    /// Beacon gossip routed here by the host-level gossip handler (see
+    /// `register_host_gossip_handler`), plus the loop's own continuations
+    /// and fetch answers.
     pub(crate) beacon_rx: Receiver<HostEvent>,
-    /// Stops the pool thread on teardown.
+    /// Stops the beacon thread on teardown.
     pub(crate) shutdown_rx: Receiver<()>,
     /// Placement deltas the followers surface (their own seat triggers),
     /// forwarded to the runner's reconfiguration loop.
@@ -1629,12 +1627,11 @@ pub struct PoolLoopConfig {
     pub(crate) genesis_offset_ms: u64,
 }
 
-/// Apply one pool step's output: fold its timer ops into the pool's
-/// deadline table (keyed by the follower that armed each and its
-/// [`TimerId`]) and forward its placement deltas to the runner's
-/// reconfiguration loop.
-fn apply_pool_step_output(
-    deadlines: &mut BTreeMap<(ValidatorId, TimerId), LocalTimestamp>,
+/// Apply one beacon step's output: fold its timer ops into the loop's
+/// deadline table (keyed by the timer's owner and its [`TimerId`]) and
+/// forward its placement deltas to the runner's reconfiguration loop.
+fn apply_beacon_step_output(
+    deadlines: &mut BTreeMap<(TimerOwner, TimerId), LocalTimestamp>,
     participation_tx: &mpsc::UnboundedSender<ParticipationChange>,
     now: LocalTimestamp,
     output: StepOutput,
@@ -1642,23 +1639,23 @@ fn apply_pool_step_output(
     for op in output.timer_ops {
         match op {
             TimerOp::Set {
-                owner: TimerOwner::Follower(validator),
+                owner: owner @ (TimerOwner::Participant(_) | TimerOwner::Beacon),
                 id,
                 duration,
             } => {
                 let fire = now
                     .as_millis()
                     .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
-                deadlines.insert((validator, id), LocalTimestamp::from_millis(fire));
+                deadlines.insert((owner, id), LocalTimestamp::from_millis(fire));
             }
             TimerOp::Cancel {
-                owner: TimerOwner::Follower(validator),
+                owner: owner @ (TimerOwner::Participant(_) | TimerOwner::Beacon),
                 id,
             } => {
-                deadlines.remove(&(validator, id));
+                deadlines.remove(&(owner, id));
             }
             TimerOp::Set { .. } | TimerOp::Cancel { .. } => {
-                warn!("Pool loop emitted a shard-owned timer op; dropping");
+                warn!("Beacon loop emitted a shard-owned timer op; dropping");
             }
         }
     }
@@ -1668,97 +1665,161 @@ fn apply_pool_step_output(
     }
 }
 
-/// Drive a host's [`PoolLoop`] on its pinned thread, blocking until the
-/// shutdown signal fires. A follower only consumes beacon events
-/// ([`HostEvent::Beacon`]); shard / process envelopes never reach this
-/// channel and there is no batch flushing. The followers' beacon timers
-/// live in a thread-local deadline table: a follower is a ratify-pool
-/// voter and can be drawn onto an SPC committee, so its timer chain must
-/// fire here exactly as a seated vnode's fires on a shard thread.
-fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
-    let PoolLoopConfig {
+/// Drive a host's [`BeaconLoop`] on its pinned thread, blocking until the
+/// shutdown signal fires. Dropping the loop on the way out, by a return or
+/// by a panic unwinding the thread, closes every follower's release gate. The
+/// loop only consumes beacon events ([`HostEvent::Beacon`]); shard /
+/// process envelopes never reach this channel and there is no batch
+/// flushing. Its timers live in a thread-local deadline table: a follower
+/// is a ratify-pool voter and can be drawn onto an SPC committee, so its
+/// timer chain must fire here exactly as a seated vnode's fires on a shard
+/// thread, and the loop's own fetch tick retries its held fetches.
+fn run_beacon_loop(mut beacon: ProdBeaconLoop, config: BeaconLoopConfig) {
+    info!("Beacon event loop starting");
+    drive_beacon_loop(&mut beacon, config);
+    info!("Beacon event loop exiting");
+}
+
+fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
+    let BeaconLoopConfig {
         beacon_rx,
         shutdown_rx,
         participation_tx,
         genesis_offset_ms,
     } = config;
-    info!("Pool event loop starting");
 
-    let mut deadlines: BTreeMap<(ValidatorId, TimerId), LocalTimestamp> = BTreeMap::new();
+    let mut deadlines: BTreeMap<(TimerOwner, TimerId), LocalTimestamp> = BTreeMap::new();
 
     // The followers armed their beacon startup timers at construction, but
     // a genesis ceremony on this host may already have drained that scratch
     // into ops this thread never sees. Re-arming is idempotent (replace at
     // the table, identical durations), so arm-and-drain unconditionally.
     let now = consensus_clock(genesis_offset_ms);
-    pool.set_time(now);
-    let startup = pool.startup_output();
-    apply_pool_step_output(&mut deadlines, &participation_tx, now, startup);
+    beacon.set_time(now);
+    let startup = beacon.startup_output();
+    apply_beacon_step_output(&mut deadlines, &participation_tx, now, startup);
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
-            info!("Pool event loop received shutdown signal");
-            break;
+            info!("Beacon event loop received shutdown signal");
+            return;
         }
         let now = consensus_clock(genesis_offset_ms);
-        pool.set_time(now);
+        beacon.set_time(now);
 
-        // Fire due pool timers: each fire re-enters the followers as the
-        // timer's protocol event, and its re-arms fold back into the table.
-        let due: Vec<(ValidatorId, TimerId)> = deadlines
-            .iter()
-            .filter(|(_, fire)| fire.as_millis() <= now.as_millis())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for (validator, id) in due {
-            deadlines.remove(&(validator, id.clone()));
-            let HostEvent::Beacon(input) = timer_event(&id, TimerOwner::Follower(validator)) else {
-                continue;
-            };
-            let output = pool.run_step(input);
-            apply_pool_step_output(&mut deadlines, &participation_tx, now, output);
+        // Fire due timers: each fire re-enters the loop as its owner's
+        // input, and its re-arms fold back into the table.
+        for input in take_due_beacon_timers(&mut deadlines, now) {
+            let output = beacon.run_step(input);
+            apply_beacon_step_output(&mut deadlines, &participation_tx, now, output);
         }
 
-        // Wake on a beacon block, the nearest timer deadline, or — while a
-        // catch-up sync is in flight — the retry tick so a deferred fetch
-        // eventually rotates to another peer.
-        let timeout = deadlines
-            .values()
-            .map(|fire| Duration::from_millis(fire.as_millis().saturating_sub(now.as_millis())))
-            .min()
-            .map_or(POOL_FETCH_TICK_INTERVAL, |until| {
-                until.min(POOL_FETCH_TICK_INTERVAL)
-            });
+        let wake = beacon_wake(&deadlines, now);
         let event = crossbeam::channel::select! {
             recv(shutdown_rx) -> _ => {
-                info!("Pool event loop received shutdown signal (select)");
+                info!("Beacon event loop received shutdown signal (select)");
                 return;
             }
             recv(beacon_rx) -> e => e.ok(),
-            default(timeout) => None,
+            recv(wake) -> _ => None,
         };
-        // The select blocks up to `timeout`; re-read the clock so the step
+        // The select blocks until the wake; re-read the clock so the step
         // and the deadlines its re-arms produce measure from the wake, not
         // the pre-sleep instant.
         let now = consensus_clock(genesis_offset_ms);
-        pool.set_time(now);
-        let output = match event {
-            Some(HostEvent::Beacon(input)) => pool.run_step(input),
-            // A timeout with a sync in flight retries deferred fetches; an
-            // idle timeout (a timer wake included — the loop top fires it),
-            // or a stray non-beacon envelope, is a no-op.
-            None if pool.is_beacon_syncing() => pool.run_step(PoolScopedInput::FetchTick),
-            _ => continue,
+        beacon.set_time(now);
+        // A timer wake fires at the loop top; a stray non-beacon envelope
+        // is dropped.
+        let Some(HostEvent::Beacon(input)) = event else {
+            continue;
         };
-        apply_pool_step_output(&mut deadlines, &participation_tx, now, output);
+        let output = beacon.run_step(input);
+        apply_beacon_step_output(&mut deadlines, &participation_tx, now, output);
     }
-    info!("Pool event loop exiting");
 }
 
-/// Spawn the host's pool thread, mirroring [`spawn_shard_loop`].
-pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::thread::JoinHandle<()> {
+/// Remove every beacon timer due at `now` from the table, returning the
+/// input each fire feeds the loop.
+fn take_due_beacon_timers(
+    deadlines: &mut BTreeMap<(TimerOwner, TimerId), LocalTimestamp>,
+    now: LocalTimestamp,
+) -> Vec<BeaconScopedInput> {
+    let (due, pending): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(deadlines)
+        .into_iter()
+        .partition(|(_, fire)| fire.as_millis() <= now.as_millis());
+    *deadlines = pending;
+    due.into_keys()
+        .filter_map(|(owner, id)| match timer_event(&id, owner) {
+            HostEvent::Beacon(input) => Some(input),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the beacon thread's select wakes on besides an event: the nearest
+/// deadline in the table, or nothing at all while the table is empty.
+fn beacon_wake(
+    deadlines: &BTreeMap<(TimerOwner, TimerId), LocalTimestamp>,
+    now: LocalTimestamp,
+) -> Receiver<Instant> {
+    deadlines.values().min().map_or_else(never, |fire| {
+        after(Duration::from_millis(
+            fire.as_millis().saturating_sub(now.as_millis()),
+        ))
+    })
+}
+
+/// Spawn the host's beacon thread, mirroring [`spawn_shard_loop`].
+pub fn spawn_beacon_loop(
+    beacon: ProdBeaconLoop,
+    config: BeaconLoopConfig,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("pool-loop".to_string())
-        .spawn(move || run_pool_loop(pool, config))
-        .expect("failed to spawn pool-loop thread")
+        .name("beacon-loop".to_string())
+        .spawn(move || run_beacon_loop(beacon, config))
+        .expect("failed to spawn beacon-loop thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With nothing armed the beacon thread waits on events alone; the
+    /// loop's fetch tick, once armed, wakes it when due and fires as the
+    /// loop's own tick.
+    #[test]
+    fn the_beacon_fetch_tick_arms_the_threads_wake_and_fires_on_the_loop() {
+        let mut deadlines = BTreeMap::new();
+        let (participation_tx, _participation_rx) = mpsc::unbounded_channel();
+        let now = LocalTimestamp::from_millis(1_000);
+        assert!(
+            beacon_wake(&deadlines, now).try_recv().is_err(),
+            "nothing armed: no wake",
+        );
+
+        let interval = Duration::from_secs(3_600);
+        let mut armed = StepOutput::default();
+        armed.timer_ops.push(TimerOp::Set {
+            owner: TimerOwner::Beacon,
+            id: TimerId::FetchTick,
+            duration: interval,
+        });
+        apply_beacon_step_output(&mut deadlines, &participation_tx, now, armed);
+        assert!(
+            beacon_wake(&deadlines, now).try_recv().is_err(),
+            "an armed tick not yet due does not wake the thread",
+        );
+        assert!(take_due_beacon_timers(&mut deadlines, now).is_empty());
+
+        let due = LocalTimestamp::from_millis(1_000 + 3_600_000);
+        assert!(
+            beacon_wake(&deadlines, due).try_recv().is_ok(),
+            "a due tick wakes the thread at once",
+        );
+        assert!(matches!(
+            take_due_beacon_timers(&mut deadlines, due).as_slice(),
+            [BeaconScopedInput::FetchTick],
+        ));
+        assert!(deadlines.is_empty(), "a fired tick leaves the table");
+    }
 }

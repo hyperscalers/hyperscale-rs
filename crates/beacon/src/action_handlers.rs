@@ -1,8 +1,8 @@
 //! Delegated-action handlers for beacon-owned [`Action`] variants.
 //!
-//! [`handle_action`] runs off the `io_loop` thread on the Consensus
-//! dispatch pool for seated vnodes, and inline on the follower pool's
-//! driver for shard-less ones; results return to the state machine via
+//! [`handle_action`] runs off the driving thread on the Consensus
+//! dispatch pool, for seated vnodes and the beacon loop's participants
+//! alike; results return to the state machine via
 //! `ctx.notify(ProtocolEvent::*)`. The node's dispatchers route any
 //! [`ActionOwner::Beacon`](hyperscale_core::ActionOwner) action here
 //! and unreachable-panic on non-beacon variants — mirrors
@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
+use hyperscale_core::{Action, BeaconActionContext, GateEntry, ProtocolEvent};
 use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyProof, RatifyVoteGossip,
@@ -45,6 +45,19 @@ fn admit_signature<N: Network>(ctx: &BeaconActionContext<'_, N>, vote: &BeaconVo
     false
 }
 
+/// Enter the participant's release gate for one signature, or `None`
+/// once the participant is removed, and the action is dropped unsigned.
+fn enter_gate<'c, N: Network>(
+    ctx: &'c BeaconActionContext<'_, N>,
+    action: &'static str,
+) -> Option<GateEntry<'c>> {
+    let entry = ctx.gate.enter();
+    if entry.is_none() {
+        tracing::trace!(action, "participant removed; dropping its signature");
+    }
+    entry
+}
+
 /// Dispatch a beacon-owned [`Action`]. Panics on non-beacon variants —
 /// the node's owner-keyed dispatch is the gate.
 #[allow(clippy::too_many_lines)] // single dispatch over beacon-owned Action variants
@@ -61,6 +74,9 @@ where
             v_in,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "SignAndBroadcastPcVote1") else {
+                return;
+            };
             if !admit_signature(ctx, &BeaconVote::pc_vote1(epoch, view, &v_in)) {
                 return;
             }
@@ -86,6 +102,9 @@ where
             qc1,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "SignAndBroadcastPcVote2") else {
+                return;
+            };
             if !admit_signature(ctx, &BeaconVote::pc_vote2(epoch, view, &qc1)) {
                 return;
             }
@@ -111,6 +130,9 @@ where
             qc2,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "SignAndBroadcastPcVote3") else {
+                return;
+            };
             if !admit_signature(ctx, &BeaconVote::pc_vote3(epoch, view, &qc2)) {
                 return;
             }
@@ -136,6 +158,9 @@ where
             reported,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "SignAndBroadcastEmptyView") else {
+                return;
+            };
             if !admit_signature(ctx, &BeaconVote::empty_view(epoch, view, &reported)) {
                 return;
             }
@@ -166,6 +191,9 @@ where
             proposal,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "BroadcastSpcNewView") else {
+                return;
+            };
             let view = proposal.view;
             let proposal_hash = proposal.hash();
             let signing_msg = signed_bytes(
@@ -191,6 +219,9 @@ where
             msg,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "BroadcastSpcNewCommit") else {
+                return;
+            };
             let view = msg.view;
             let msg_hash = msg.hash();
             let signing_msg = signed_bytes(
@@ -219,6 +250,9 @@ where
             vote_equivocations,
             recipients,
         } => {
+            let Some(_entry) = enter_gate(ctx, "BuildAndBroadcastBeaconProposal") else {
+                return;
+            };
             // The epoch's one proposal slot must be durable before the
             // body signature exists: a rebuilt participant whose evidence
             // buffers drained differently would otherwise sign a second
@@ -292,6 +326,9 @@ where
                             RatifyPolka::empty()
                         })
                 }
+            };
+            let Some(_entry) = enter_gate(ctx, "SignAndBroadcastRatifyVote") else {
+                return;
             };
             // The (round, phase) slot this vote consumes — and a
             // precommit's polka — must be durable before the signature
