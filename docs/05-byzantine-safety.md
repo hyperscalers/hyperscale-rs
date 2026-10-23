@@ -132,7 +132,7 @@ The inter-shard trust surface is minimal and uniform: **quorums and proofs, neve
 | Remote state values (provisions) | JMT multiproof into the remote header's QC-attested state root |
 | Remote execution outcomes | ExecutionCertificates: 2f+1 aggregated signatures of the remote committee, outcome vector bound to the receipt root at decode |
 | A terminated shard's final word | Terminal header + beacon-attested settled-transaction root ([02-dynamic-sharding.md](02-dynamic-sharding.md) §4) |
-| The topology itself | Each node's own fold of the beacon chain — never a peer's claim |
+| The topology itself | Each host's own fold of the beacon chain — never a peer's claim |
 
 Two of these rows carry an extra gate at *consumption*, not just verification. A remote provision or execution certificate is consumed only against a **commit proof** of its source block: the block's committing round-contiguous two-chain, plus the parent-hash link down to a prefix-committed block — never a bare QC. A QC certifies availability, not canonicality: a middle-tier committee can certify two blocks at one height without breaking the safe-vote rule (INV-SHARD-1 forbids two *commits*, not two QCs), so consuming a bare certification would let it export from a branch that never commits. The commit proof closes that gap — the certified-but-uncommitted sibling is unconsumable — and forces any committee that means to serve two victims to double-commit, which is itself a self-proving fork (§1.4). It costs the consumer nothing: the source broadcasts provisions on commit and already holds the committing two-chain, so the proof rides the same header gossip one commit behind, well inside the finalization deadline.
 

@@ -20,7 +20,7 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 
 | Crate | Purpose |
 |-------|---------|
-| [`beacon`](crates/beacon) | Beacon-chain coordinator (PC/SPC/MSC consensus, validator-set + topology source) |
+| [`beacon`](crates/beacon) | Beacon chain: the host's fold (validator-set and topology source) and a per-identity participant (PC/SPC/MSC consensus) |
 | [`core`](crates/core) | The `StateMachine` and `SubStateMachine` traits that everything implements |
 | [`crypto`](crates/crypto) | Consensus crypto interface: `Signer`/`Verifier` traits and related abstractions |
 | [`crypto-bls`](crates/crypto-bls) | Production BLS12-381 signing, verification, and certificate aggregation |
@@ -40,7 +40,7 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 | [`network`](crates/network) | Shared network protocol logic: Network trait, handler registry, wire framing |
 | [`network-libp2p`](crates/network-libp2p) | Production libp2p transport with gossipsub broadcast and QUIC/TCP streams |
 | [`network-memory`](crates/network-memory) | Deterministic in-memory network for simulation with configurable latency and partitions |
-| [`node`](crates/node) | Composes all sub-state machines into the main `NodeStateMachine` |
+| [`node`](crates/node) | The host: one shard replica (`NodeStateMachine`) per hosted shard and the beacon loop |
 | [`production`](crates/production) | Production runner: async event loop, RPC server, telemetry |
 | [`provisions`](crates/provisions) | Centralized provision coordination for cross-shard transactions |
 | [`remote-headers`](crates/remote-headers) | Centralized remote block header coordination for cross-shard verification |
