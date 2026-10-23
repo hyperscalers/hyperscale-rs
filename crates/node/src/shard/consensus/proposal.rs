@@ -5,7 +5,7 @@
 //! carries it until a quorum certifies it, so a member it missed cannot
 //! vote on it. The shard coordinator asks for it by hash when a committee
 //! member's vote names a block it does not hold. A peer answers from the
-//! proposals its vnodes admitted, held here as their proposer signed them,
+//! proposals its replica admitted, held here as their proposer signed them,
 //! and the answer enters through the same signature check and header
 //! admission as a gossiped one.
 
@@ -36,7 +36,7 @@ const MAX_HELD_PROPOSALS: usize = 256;
 /// Proposal fetch keyed by block hash.
 pub type ProposalFetch = Fetch<BlockHash>;
 
-/// The proposals this shard's vnodes admitted, as their proposer signed
+/// The proposals this shard's replica admitted, as their proposer signed
 /// them, by block hash.
 #[derive(Default)]
 pub struct ProposalStore {
@@ -180,8 +180,7 @@ where
     D: Dispatch,
 {
     /// A proposal whose proposer signature has been checked: feed its
-    /// header to every vnode, and hold it for serving once one of them
-    /// admitted it.
+    /// header to the replica, and hold it for serving once it admitted it.
     pub(in crate::shard) fn handle_proposal_received(&mut self, proposal: BlockHeaderNotification) {
         let block_hash = proposal.header.hash();
         let (header, manifest, signature) = proposal.into_parts();
@@ -189,11 +188,7 @@ where
             header: std::sync::Arc::clone(&header),
             manifest: manifest.clone(),
         });
-        if self
-            .vnodes
-            .iter()
-            .any(|vnode| vnode.state.shard_coordinator().holds_proposal(block_hash))
-        {
+        if self.replica.shard_coordinator().holds_proposal(block_hash) {
             self.io
                 .consensus
                 .proposals
@@ -296,7 +291,7 @@ mod tests {
         );
     }
 
-    /// A co-hosted seat that answers with a proposal other than the one
+    /// This host's replica answering with a proposal other than the one
     /// asked for does not hold the fetch: the retry is asked past it, and
     /// the peer that holds the proposal answers it before any tick.
     #[test]

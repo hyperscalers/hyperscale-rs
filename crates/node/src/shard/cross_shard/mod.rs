@@ -20,8 +20,6 @@ mod remote_header_sync;
 mod settled_txs_serve;
 mod state_proof_serve;
 
-use std::collections::{BTreeMap, BTreeSet};
-
 pub use fetch::{
     FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
     ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
@@ -29,7 +27,7 @@ pub use fetch::{
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
-use hyperscale_types::{Anchor, LocalTimestamp, SubstateKey, TerminalEvidence, ValidatorId};
+use hyperscale_types::LocalTimestamp;
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
 pub use remote_header::RemoteHeaderSyncInput;
@@ -65,60 +63,6 @@ pub struct CrossShardState {
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
-    /// The pre-cut proofs each seat last named, by terminal.
-    pub(crate) precut_wants: SeatWants<(Anchor, SubstateKey)>,
-    /// The settled sets each seat last named.
-    pub(crate) settled_wants: SeatWants<TerminalEvidence>,
-}
-
-/// What each seat last named of a fetch whose consumer re-derives its
-/// whole wanted set each pass.
-///
-/// One fetch serves every seat on the loop, and each seat names its set
-/// from its own progress, so a seat behind its siblings still wants ids
-/// they have finished with. The fetch keeps every id any seat names: a
-/// pass from a caught-up sibling releases nothing a slower seat still
-/// asks for.
-#[derive(Debug)]
-pub struct SeatWants<Id> {
-    by_seat: BTreeMap<ValidatorId, BTreeSet<Id>>,
-}
-
-impl<Id> Default for SeatWants<Id> {
-    fn default() -> Self {
-        Self {
-            by_seat: BTreeMap::new(),
-        }
-    }
-}
-
-impl<Id: Ord + Clone> SeatWants<Id> {
-    /// `seat` now names exactly `wanted` among the ids `within` selects.
-    /// Returns every id there that any seat names.
-    pub(crate) fn replace(
-        &mut self,
-        seat: ValidatorId,
-        wanted: &BTreeSet<Id>,
-        within: impl Fn(&Id) -> bool,
-    ) -> BTreeSet<Id> {
-        let named = self.by_seat.entry(seat).or_default();
-        named.retain(|id| !within(id));
-        named.extend(wanted.iter().cloned());
-        if named.is_empty() {
-            self.by_seat.remove(&seat);
-        }
-        self.by_seat
-            .values()
-            .flatten()
-            .filter(|id| within(id))
-            .cloned()
-            .collect()
-    }
-
-    /// `seat` left the loop.
-    pub(crate) fn forget(&mut self, seat: ValidatorId) {
-        self.by_seat.remove(&seat);
-    }
 }
 
 /// What the state-proof fetch may hold in flight.
@@ -184,8 +128,6 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            precut_wants: SeatWants::default(),
-            settled_wants: SeatWants::default(),
         }
     }
 
@@ -218,24 +160,20 @@ impl CrossShardState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::fmt::Debug;
     use std::hash::Hash;
     use std::mem::take;
 
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        Anchor, BlockHeight, ShardId, StateRoot, ValidatorId, VerdictCells, WeightedTimestamp,
+        Anchor, BlockHeight, ShardId, StateRoot, VerdictCells, WeightedTimestamp,
     };
 
     use super::{
-        MAX_VERDICT_ASKS_PER_SIBLING, STATE_PROOF_FETCH, SeatWants, StateProofFetch,
-        VERDICT_PROOF_FETCH, VerdictProofFetch,
+        MAX_VERDICT_ASKS_PER_SIBLING, STATE_PROOF_FETCH, StateProofFetch, VERDICT_PROOF_FETCH,
+        VerdictProofFetch,
     };
     use crate::fetch::{Fetch, FetchInput, FetchOutput};
-
-    const A: ValidatorId = ValidatorId::new(1);
-    const B: ValidatorId = ValidatorId::new(2);
 
     /// `shard`'s header at `height`.
     fn header(shard: ShardId, height: u64) -> Anchor {
@@ -407,36 +345,5 @@ mod tests {
             .collect();
         assert_eq!(sizes, vec![21, 19], "cut into requests of 21: {sent:?}");
         assert!(3 * sizes[0] <= STATE_PROOF_FETCH.max_ids_per_request);
-    }
-
-    /// A caught-up seat naming nothing keeps what a slower seat still
-    /// names; once neither names an id, it goes.
-    #[test]
-    fn an_id_stays_wanted_while_any_seat_names_it() {
-        let mut wants: SeatWants<u64> = SeatWants::default();
-        assert_eq!(wants.replace(B, &BTreeSet::from([7]), |_| true), [7].into());
-        assert_eq!(wants.replace(A, &BTreeSet::new(), |_| true), [7].into());
-        assert!(wants.replace(B, &BTreeSet::new(), |_| true).is_empty());
-    }
-
-    /// A pass scoped to some ids leaves the seat's others named.
-    #[test]
-    fn a_scoped_pass_replaces_only_its_scope() {
-        let mut wants: SeatWants<u64> = SeatWants::default();
-        let _ = wants.replace(A, &BTreeSet::from([1, 12]), |_| true);
-        assert!(wants.replace(A, &BTreeSet::new(), |id| *id < 10).is_empty());
-        assert_eq!(
-            wants.replace(B, &BTreeSet::new(), |id| *id >= 10),
-            [12].into()
-        );
-    }
-
-    /// A seat that leaves stops holding its ids.
-    #[test]
-    fn a_seat_that_leaves_names_nothing() {
-        let mut wants: SeatWants<u64> = SeatWants::default();
-        let _ = wants.replace(B, &BTreeSet::from([7]), |_| true);
-        wants.forget(B);
-        assert!(wants.replace(A, &BTreeSet::new(), |_| true).is_empty());
     }
 }

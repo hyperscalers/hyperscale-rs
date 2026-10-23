@@ -39,9 +39,10 @@
 //! ```
 //!
 //! A host can run multiple validators in one process by listing additional
-//! `[[vnode]]` blocks. Same-shard vnodes share storage, fetch state, and
-//! gossipsub subscriptions; different-shard vnodes share only the libp2p
-//! peer and dispatch pools.
+//! `[[vnode]]` blocks. Validators on one shard attach as signers to that
+//! shard's one replica, which verifies, executes and commits the chain
+//! once for the host; validators on different shards share only the
+//! libp2p peer, the beacon loop and the dispatch pools.
 
 use std::fs;
 use std::io::Write;
@@ -151,9 +152,9 @@ pub(crate) struct ValidatorConfig {
 
     /// Hosted validators. One entry per validator this process runs. A
     /// single-validator deployment has exactly one block; multi-validator
-    /// hosts list one block per identity. Same-shard entries share
-    /// storage and gossipsub subscriptions; different-shard entries
-    /// additionally provision a per-shard `ShardIo`.
+    /// hosts list one block per identity. Entries on one shard attach as
+    /// signers to that shard's one replica and its storage; each shard
+    /// the host carries gets its own `ShardIo`.
     #[serde(rename = "vnode", default)]
     pub(crate) vnodes: Vec<VnodeEntry>,
 

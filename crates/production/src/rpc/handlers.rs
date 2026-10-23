@@ -5,9 +5,10 @@
 //!   to decide whether to route traffic.
 //! - **Status**: `/status`, `/sync`, `/metrics` — read-only snapshots
 //!   maintained by the running node, exposed via `ArcSwap` handles so
-//!   handlers never block on the consensus thread. Per-vnode mempool
-//!   counts ride on `/status.vnodes[].mempool` — there's no separate
-//!   `/mempool` endpoint because mempools are per-vnode, not per-host.
+//!   handlers never block on the consensus thread. Mempool counts ride
+//!   on `/status.vnodes[].mempool`, each attached signer reporting its
+//!   shard replica's mempool — there's no separate `/mempool` endpoint
+//!   because mempools are per shard, not per host.
 //! - **Submission**: `POST /transactions`, `GET /transactions/:hash` —
 //!   transaction ingress and lookup.
 //!
@@ -15,7 +16,7 @@
 //!
 //! The submission handler rejects with HTTP 503 when any hosted shard
 //! is syncing (it cannot validly admit new transactions) or when any
-//! hosted vnode's mempool has signalled an in-flight or pending limit
+//! hosted shard's mempool has signalled an in-flight or pending limit
 //! breach. Each rejection reason emits a Prometheus counter so
 //! operators can distinguish capacity from sync-state stalls.
 
@@ -341,10 +342,10 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
         ));
     }
 
-    // Threshold is 80% of `MAX_UNSETTLED_TXS`. Each hosted vnode tracks
-    // how many transactions every remote shard it verifies headers from
-    // holds unsettled; reject if any of them flags a congested remote
-    // shard.
+    // Threshold is 80% of `MAX_UNSETTLED_TXS`. Each hosted replica
+    // tracks how many transactions every remote shard it verifies headers
+    // from holds unsettled; reject if any of them flags a congested
+    // remote shard.
     for v in snapshot.vnodes.values() {
         let threshold = v.remote_congestion_threshold;
         if threshold <= TxsInFlight::ZERO {

@@ -4,10 +4,9 @@
 //! [`ShardIo`] ([`io`]) composes one shard's per-subsystem state —
 //! [`consensus`], [`cross_shard`] and [`mempool`] — over shared infra (storage, the [`commit`] pipeline,
 //! request-serving [`caches`]). [`ShardLoop`] is the active driver: it owns the
-//! `ShardIo`, its `Vec<Vnode>`, per-step scratch, and a cloned
-//! `Arc<ProcessIo>`. `ShardLoop::step(input)` dispatches one
-//! [`ShardScopedInput`] to its handler; same-shard vnodes see identical inbound
-//! events and produce per-validator votes.
+//! `ShardIo`, the shard's one replica and the signers attached to it,
+//! per-step scratch, and a cloned `Arc<ProcessIo>`. `ShardLoop::step(input)`
+//! dispatches one [`ShardScopedInput`] to its handler.
 //!
 //! The top-level [`NodeHost`] composes one `ShardLoop` per hosted shard plus
 //! the shared `ProcessIo`. Cross-shard concerns (transaction submission
@@ -43,11 +42,10 @@ pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
 #[cfg(test)]
-pub(crate) mod seated_host;
-mod slowest_seat;
+pub(crate) mod test_host;
 mod timer;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,7 +62,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Address, Block, CertifiedBlock, Hash, LocalTimestamp, QuorumCertificate, Round, ShardId,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
+    Signer, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
 };
 pub use io::ShardIo;
 
@@ -77,8 +75,9 @@ pub use crate::event::{
 };
 use crate::fetch::Release;
 use crate::process::ProcessIo;
+use crate::replica::AttachedSigner;
 use crate::shard::commit::PreparedCommitMap;
-use crate::vnode::{SeatVnodeGroup, Vnode, VnodeSeat, seat_vnode_into_group};
+use crate::state::NodeStateMachine;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -90,15 +89,13 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 ///
 /// Wrapped in a single `Arc` so each dispatch pays one atomic-RMW for
 /// the whole bundle. `topology_snapshot`, `event_sender`, and the
-/// emitting vnode's signing key are not bundled — the snapshot needs
-/// a fresh `load_full` per dispatch, the crossbeam `Sender` clone is
-/// independent of these handles, and the signing key is per-vnode
-/// (cloned separately at each dispatch site so the right validator
-/// signs).
+/// signing key are not bundled — the snapshot needs a fresh `load_full`
+/// per dispatch, the crossbeam `Sender` clone is independent of these
+/// handles, and the key is the attached signer's the action names.
 ///
 /// Shard-scoped handles (`pending_chain`, `prepared_commits`) live in
 /// `per_shard`, keyed by the hosted shard id. Delegated handlers select
-/// the right entry from the emitting vnode's shard, loading the map per
+/// the right entry from the emitting loop's shard, loading the map per
 /// dispatch so shards added or dropped at runtime are observed.
 pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: Arc<Executor>,
@@ -211,18 +208,14 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
 
 /// Whose timer a [`TimerOp`] names, and so whom its fire reaches.
 ///
-/// Every vnode arms its own pacemaker, proposal and beacon timers, and
-/// vnodes co-hosted on one loop arm the same [`TimerId`]s against their own
-/// deadlines. Keyed by its loop alone, one vnode's arm would replace
-/// another's pending fire: the other vnode, woken before its own deadline,
-/// finds nothing due and waits on a fire nobody set. A seat's timer is its
-/// own, and its fire reaches it alone.
+/// Each beacon participant arms the same [`TimerId`]s against its own
+/// deadlines, so a participant's timer is its own and its fire reaches it
+/// alone. A shard loop's timers, its replica's and its fetch tick, are the
+/// loop's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TimerOwner {
-    /// A hosted shard's loop itself: its fetch tick.
+    /// A hosted shard's loop: its replica's timers and its fetch tick.
     Loop(ShardId),
-    /// One vnode seated on a hosted shard's loop.
-    Seat(ShardId, ValidatorId),
     /// One attached identity's beacon participation on the host's beacon
     /// loop.
     Participant(Attachment),
@@ -257,9 +250,9 @@ pub enum TimerOp {
 /// Translate a fired [`TimerId`] back into the [`HostEvent`] the runner
 /// pushes onto its event channel.
 ///
-/// The envelope is addressed to the timer's owner: a loop's fetch tick to
-/// its shard, a seat's timer to that vnode alone, a participant's to that
-/// participant alone, and the beacon loop's fetch tick to the beacon loop.
+/// The envelope is addressed to the timer's owner: a loop's timer to its
+/// shard, a participant's to that participant alone, and the beacon loop's
+/// fetch tick to the beacon loop.
 #[must_use]
 pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
     let event = match id {
@@ -269,9 +262,7 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
         TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
         TimerId::FetchTick => {
             return match owner {
-                TimerOwner::Loop(shard) | TimerOwner::Seat(shard, _) => {
-                    HostEvent::shard(shard, ShardScopedInput::FetchTick)
-                }
+                TimerOwner::Loop(shard) => HostEvent::shard(shard, ShardScopedInput::FetchTick),
                 TimerOwner::Participant(_) | TimerOwner::Beacon => HostEvent::beacon_fetch_tick(),
             };
         }
@@ -282,13 +273,6 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
     };
     match owner {
         TimerOwner::Loop(shard) => HostEvent::protocol(shard, event),
-        TimerOwner::Seat(shard, validator) => HostEvent::shard(
-            shard,
-            ShardScopedInput::SeatTimer {
-                validator,
-                event: Box::new(event),
-            },
-        ),
         TimerOwner::Participant(participant) => {
             HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
                 participant,
@@ -315,8 +299,8 @@ pub(crate) fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: Sh
 }
 
 /// Push a [`ProtocolEvent`] (wrapped in
-/// [`ShardScopedInput::Protocol`]) into the event channel.
-/// The receiver fans the event across every hosted vnode in `shard`.
+/// [`ShardScopedInput::Protocol`]) into the event channel, for `shard`'s
+/// replica.
 /// See [`push_shard_input`] for the drop-on-shutdown convention.
 pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: ProtocolEvent) {
     let _ = tx.send(HostEvent::protocol(shard, event));
@@ -346,8 +330,8 @@ pub struct StepOutput {
     /// membership from these — they are requests to the process layer,
     /// not state-machine state.
     pub participation_changes: Vec<ParticipationChange>,
-    /// Validators whose queued seat the loop admitted during this step.
-    pub seated: Vec<ValidatorId>,
+    /// Validators the loop attached to its replica during this step.
+    pub attached: Vec<ValidatorId>,
     /// Shards whose store needs a height beneath every serving peer's
     /// chain floor. Block sync can never carry such a store forward; the
     /// runner rebuilds it at the shard's attested anchor.
@@ -365,23 +349,23 @@ impl StepOutput {
         self.timer_ops.extend(other.timer_ops);
         self.participation_changes
             .extend(other.participation_changes);
-        self.seated.extend(other.seated);
+        self.attached.extend(other.attached);
         self.reseats.extend(other.reseats);
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ShardLoop — per-shard I/O state plus the vnodes that share it
+// ShardLoop — per-shard I/O state plus the shard's replica
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Active per-shard driver: one hosted shard's [`ShardIo`] plus every
-/// [`Vnode`] that participates in this shard's consensus, plus per-step
-/// scratch and a shared `Arc<ProcessIo>`.
+/// Active per-shard driver: one hosted shard's [`ShardIo`], its one
+/// replica and the signers attached to it, plus per-step scratch and a
+/// shared `Arc<ProcessIo>`.
 ///
-/// Same-shard vnodes share the [`ShardIo`] (one storage, one set of fetch
-/// instances, one mempool body store, etc.); cross-shard vnodes live in
-/// different `ShardLoop`s. [`Self::step`] dispatches one [`ShardScopedInput`]
-/// to its handler.
+/// The replica verifies, executes and commits the shard's chain once for
+/// the host, and signs for each attached validator under that validator's
+/// own registers. [`Self::step`] dispatches one [`ShardScopedInput`] to its
+/// handler.
 pub struct ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -405,16 +389,20 @@ where
     /// dispatch handles, event sender. Cloned `Arc` so off-thread
     /// closures spawned from this loop's handlers can capture it cheaply.
     pub(crate) process: Arc<ProcessIo<S, N, D>>,
-    /// Per-shard I/O state shared by every vnode in `vnodes`.
+    /// Per-shard I/O state the replica runs over.
     pub io: ShardIo<S>,
-    /// Vnodes participating in this shard's consensus. Driven in order
-    /// during each `step()` iteration; same-shard vnodes see identical
-    /// inbound events and produce per-validator votes.
-    pub vnodes: Vec<Vnode>,
+    /// The shard's replica. Driven exclusively from this loop's thread;
+    /// off-thread closures never touch it.
+    pub(crate) replica: NodeStateMachine,
+    /// The validators the replica signs for. Each joins through
+    /// [`Self::attach_signer`] and leaves through [`Self::detach_signer`],
+    /// between events; with none attached the replica follows the chain
+    /// and signs nothing.
+    pub(crate) signers: BTreeMap<ValidatorId, AttachedSigner>,
     /// Cached wall-clock time for this shard. Set by the runner via
     /// `NodeHost::set_time` (which propagates to every hosted shard);
-    /// read by per-vnode `state.handle(now, _)` calls and by helpers
-    /// that need a single consistent stamp across an action burst.
+    /// read by the replica's `handle(now, _)` calls and by helpers that
+    /// need a single consistent stamp across an action burst.
     pub(crate) now: LocalTimestamp,
     /// This shard's `FetchTick` timer, armed while any fetch has work.
     pub(crate) fetch_tick: FetchTicker,
@@ -426,20 +414,17 @@ where
     /// Per-step scratch: `(tx_hash, status)` pairs emitted via
     /// `Action::EmitTransactionStatus`. Drained into [`StepOutput`].
     pub(crate) emitted_statuses: Vec<(TxHash, TransactionStatus)>,
-    /// Per-step scratch: count of actions this shard's vnodes produced
-    /// during the step. Drained into [`StepOutput`] for the runner's
-    /// metrics; reset at step entry.
+    /// Per-step scratch: count of actions the replica produced during
+    /// the step. Drained into [`StepOutput`] for the runner's metrics;
+    /// reset at step entry.
     pub(crate) actions_generated: usize,
-    /// Per-step scratch: validators whose seat was admitted during the
-    /// step. Drained into [`StepOutput`].
-    pub(crate) seated: Vec<ValidatorId>,
+    /// Per-step scratch: validators attached during the step. Drained
+    /// into [`StepOutput`].
+    pub(crate) attached: Vec<ValidatorId>,
     /// Per-step scratch: whether block sync found the next height it
     /// needs beneath every serving peer's chain floor. Drained into
     /// [`StepOutput::reseats`].
     pub(crate) reseat: bool,
-    /// Seats waiting for the store to come to rest at the last height
-    /// the loop fanned out. See [`Self::admit_seats`].
-    pub(crate) pending_seats: Vec<VnodeSeat>,
     /// The answers under this shard's prefix at the persisted head,
     /// followed whatever the loop's signers. One per store; `None` until
     /// the first step reads it whole.
@@ -512,9 +497,20 @@ where
     /// already started: once this returns, nothing a signer of this loop
     /// signs leaves the host, and an action still queued never signs.
     pub(crate) fn shut_down(&self) {
-        for vnode in &self.vnodes {
-            vnode.gate.close_and_wait();
+        for attached in self.signers.values() {
+            attached.gate.close_and_wait();
         }
+    }
+
+    /// The shard's replica.
+    #[must_use]
+    pub const fn replica(&self) -> &NodeStateMachine {
+        &self.replica
+    }
+
+    /// The validators attached to the replica, in id order.
+    pub fn signers(&self) -> impl Iterator<Item = ValidatorId> + '_ {
+        self.signers.keys().copied()
     }
 }
 
@@ -532,22 +528,6 @@ where
         &self.event_tx
     }
 
-    /// Access the vnode at `vnode_idx` within this shard's group.
-    ///
-    /// # Panics
-    /// Panics if `vnode_idx` is out of range.
-    pub(crate) fn vnode(&self, vnode_idx: usize) -> &Vnode {
-        &self.vnodes[vnode_idx]
-    }
-
-    /// Mutably access the vnode at `vnode_idx` within this shard's group.
-    ///
-    /// # Panics
-    /// Panics if `vnode_idx` is out of range.
-    pub(crate) fn vnode_mut(&mut self, vnode_idx: usize) -> &mut Vnode {
-        &mut self.vnodes[vnode_idx]
-    }
-
     /// Dispatch a [`ShardScopedInput`] to its handler. Does NOT clear or
     /// drain per-step scratch — the caller (typically [`NodeHost::step`])
     /// manages the scratch lifecycle. Refreshes this shard's `FetchTick`
@@ -558,70 +538,34 @@ where
     /// [`NodeHost::step`]: crate::host::NodeHost::step
     pub(crate) fn step(&mut self, input: ShardScopedInput) {
         self.dispatch_input(input);
-        self.admit_seats();
-        self.follow_slowest_seat();
         self.update_fetch_tick_timer();
     }
 
-    /// Queue `validator`'s seat on this running loop, admitting it at
-    /// once if the store is already at rest. A seat for a validator the
-    /// loop already carries or queues is dropped. Returns the output of
-    /// the admission under [`Self::run_step`]'s contract.
-    pub fn seat_vnode(&mut self, seat: VnodeSeat) -> StepOutput {
+    /// Attach `validator` to the replica, signing with `signer` behind a
+    /// fresh gate, and dispatch what it owes at once. Returns the output
+    /// under [`Self::run_step`]'s contract. A validator already attached
+    /// is left as it is.
+    pub fn attach_signer(&mut self, validator: ValidatorId, signer: Arc<dyn Signer>) -> StepOutput {
         self.clear_scratch();
-        let validator = seat.validator;
-        if !self.carries(validator) && !self.pending_seats.iter().any(|s| s.validator == validator)
-        {
-            self.pending_seats.push(seat);
-            self.admit_seats();
-            self.follow_slowest_seat();
-            self.update_fetch_tick_timer();
-        }
+        self.attach(validator, signer);
+        self.update_fetch_tick_timer();
         self.take_output()
     }
 
-    /// Take `validator` off this loop, whether seated or still queued.
-    /// Returns whether the loop carried it.
+    /// [`Self::attach_signer`], leaving what it emits in the step's
+    /// scratch.
     ///
-    /// # Panics
-    ///
-    /// Panics if `validator` is the loop's last seated vnode: the last
-    /// seat leaves with its loop.
-    pub fn remove_vnode(&mut self, validator: ValidatorId) -> bool {
-        let queued = self.pending_seats.len();
-        self.pending_seats.retain(|s| s.validator != validator);
-        if self.pending_seats.len() != queued {
-            if self.pending_seats.is_empty() {
-                self.resume_commits();
-            }
-            return true;
+    /// The attach carries the schedule the host's fold last published,
+    /// installed where it is newer than the one the replica holds. The
+    /// signer's record and the QC the store persisted for its committed
+    /// tip are read from the live store here: a previous attachment of
+    /// the validator has returned from its gate's close, so no persist of
+    /// it can land after the read.
+    pub(crate) fn attach(&mut self, validator: ValidatorId, signer: Arc<dyn Signer>) {
+        if self.signers.contains_key(&validator) {
+            return;
         }
-        let Some(index) = self.vnodes.iter().position(|v| v.validator_id == validator) else {
-            return false;
-        };
-        assert!(
-            self.vnodes.len() > 1,
-            "the last seat on shard {:?} leaves with its loop",
-            self.shard
-        );
-        let mut vnode = self.vnodes.remove(index);
-        vnode.gate.close_and_wait();
-        vnode.state.detach_signer(validator);
-        self.io.consensus.seat_frontiers.forget(validator);
-        self.io.cross_shard.precut_wants.forget(validator);
-        self.io.cross_shard.settled_wants.forget(validator);
-        self.share_host_seats();
-        true
-    }
-
-    /// Seat `vnode` on this loop and attach its validator to its replica,
-    /// dispatching what the attach owes at once.
-    pub(crate) fn attach_vnode(&mut self, vnode: Vnode) {
-        let validator = vnode.validator_id;
-        self.vnodes.push(vnode);
-        self.share_host_seats();
-        let vnode_idx = self.vnodes.len() - 1;
-        let now = self.now;
+        self.signers.insert(validator, AttachedSigner::new(signer));
         let record = self.io.storage.safe_vote_registers(validator);
         let persisted_qc_round = self
             .io
@@ -629,110 +573,30 @@ where
             .latest_qc()
             .as_deref()
             .map_or(Round::INITIAL, QuorumCertificate::round);
-        let state = &mut self.vnodes[vnode_idx].state;
-        let schedule = Arc::clone(state.schedule());
-        let epoch = state.schedule_epoch();
-        let actions =
-            state.attach_signer(now, validator, record, persisted_qc_round, schedule, epoch);
-        self.drain_actions(vnode_idx, actions);
+        let (epoch, schedule) = self.process.folded_schedule();
+        let actions = self.replica.attach_signer(
+            self.now,
+            validator,
+            record,
+            persisted_qc_round,
+            schedule,
+            epoch,
+        );
+        self.drain_actions(actions);
+        self.attached.push(validator);
     }
 
-    /// Tell every seated vnode which validators this loop seats, so each
-    /// knows a quorum among them forms without crossing the network.
-    pub(crate) fn share_host_seats(&mut self) {
-        let seats: Vec<ValidatorId> = self.vnodes.iter().map(|v| v.validator_id).collect();
-        for vnode in &mut self.vnodes {
-            vnode.state.set_host_seats(&seats);
-        }
-    }
-
-    /// Whether `validator` holds a seated vnode on this loop.
-    fn carries(&self, validator: ValidatorId) -> bool {
-        self.vnodes.iter().any(|v| v.validator_id == validator)
-    }
-
-    /// Admit every queued seat once the store is at rest at the last
-    /// height the loop fanned out, bringing it to rest if it is not.
-    ///
-    /// Each vnode's shard coordinator commits on its own, and the loop
-    /// fans every height's `BlockCommitted` out to all of them once. A
-    /// joiner restored at exactly that height has missed no fan-out and
-    /// receives every later one with its siblings, so it seats as a
-    /// restart does. Restored anywhere below, it would never hear the
-    /// heights between: their commits skip at the pipeline's flushed
-    /// frontier. The store is read only while no flush can move it.
-    ///
-    /// A chain that commits faster than its disk acknowledges never
-    /// leaves the store at rest by itself, so a queued seat makes the
-    /// pipeline settle: commits accepted from then on are held, and the
-    /// store comes level with the fan-out once the flush writing now and
-    /// one more, of the heights already fanned out, are acknowledged.
-    /// The held commits are neither written nor fanned out, so the
-    /// joiner hears them with its siblings. They flush at that rest
-    /// whether or not a seat could be admitted there, so a queued seat
-    /// holds no commit back for longer than those two flushes.
-    fn admit_seats(&mut self) {
-        if self.pending_seats.is_empty() {
-            return;
-        }
-        if !self.io.block_commit.is_at_rest() {
-            self.io.block_commit.settle();
-            return;
-        }
-        if self.io.storage.committed_height() == self.io.block_commit.broadcast_height() {
-            self.seat_at_rest();
-        }
-        self.resume_commits();
-    }
-
-    /// Stop holding commits for a queued seat and flush what was held.
-    fn resume_commits(&mut self) {
-        self.io.block_commit.resume();
-        self.flush_block_commits();
-    }
-
-    /// Seat every queued vnode over the store's committed tip, with the
-    /// store at rest at the last height the loop fanned out.
-    fn seat_at_rest(&mut self) {
-        let recovered = self.io.storage.load_recovered_state(self.shard);
-        let stores = self.io.caches.group_stores();
-        for seat in std::mem::take(&mut self.pending_seats) {
-            // The loop's own schedule: every vnode on it holds the one the
-            // last `BeaconBlockPersisted` carried.
-            let replica = &self.vnodes[0].state;
-            let schedule = (Arc::clone(replica.schedule()), replica.schedule_epoch());
-            let init = seat_vnode_into_group(
-                SeatVnodeGroup {
-                    config: seat.config,
-                    schedule,
-                    shard: self.shard,
-                    recovered: &recovered,
-                    vnodes: vec![(seat.validator, seat.signer)],
-                },
-                &stores,
-            )
-            .pop()
-            .expect("one seat in, one vnode out");
-            self.io.consensus.seat_frontiers.forget(seat.validator);
-            let mut vnode = init.into_vnode();
-            // Before the restore replays the seat's ticks, each of which
-            // waits on the base this chain is known to carry.
-            vnode
-                .state
-                .seat_on_persisted_base(self.io.tick_chain.persisted());
-            self.attach_vnode(vnode);
-            let vnode_idx = self.vnodes.len() - 1;
-            let now = self.now;
-            let actions = self
-                .vnode_mut(vnode_idx)
-                .state
-                .handle(now, committed_state_restored(&recovered));
-            self.drain_actions(vnode_idx, actions);
-            self.seated.push(seat.validator);
-        }
-        // Before the next commit dates a version: the seat replays from
-        // below where its siblings' execution has already released.
-        self.hold_execution_baselines(recovered.committed_height);
+    /// Detach `validator` from the replica: close its gate, waiting out a
+    /// signature already started, so nothing it queued signs after this
+    /// returns. The replica keeps following the chain. Returns whether
+    /// the validator was attached.
+    pub fn detach_signer(&mut self, validator: ValidatorId) -> bool {
+        let Some(attached) = self.signers.remove(&validator) else {
+            return false;
+        };
+        attached.gate.close_and_wait();
+        self.replica.detach_signer(validator);
+        true
     }
 
     #[allow(clippy::too_many_lines)] // single dispatch over ShardScopedInput variants
@@ -773,10 +637,6 @@ where
                 }
                 other => self.handle_protocol_passthrough(other),
             },
-            ShardScopedInput::SeatTimer { validator, event }
-            | ShardScopedInput::SeatResult { validator, event } => {
-                self.dispatch_to_seat(validator, *event);
-            }
 
             // ── Sync protocol ──────────────────────────────────────────
             ShardScopedInput::BlockSyncResponseReceived { height, block } => {
@@ -893,11 +753,8 @@ where
         }
     }
 
-    /// Fan a shard-scoped protocol event out to every hosted vnode in
-    /// this shard and dispatch each vnode's resulting actions.
-    ///
-    /// Every same-shard vnode independently applies the event at the
-    /// shard's cached `now` and produces its own signed actions.
+    /// Feed a shard-scoped protocol event to the replica at the shard's
+    /// cached `now` and dispatch what it emits.
     pub(crate) fn dispatch_event(&mut self, event: ProtocolEvent) {
         // A block this node commits is one it must run, so the code its
         // members name is wanted here. Admission asked for whatever it
@@ -932,52 +789,28 @@ where
                 self.fetch_wanted_packages(packages);
             }
         }
-        let count = self.vnodes.len();
-        if count == 0 {
-            return;
-        }
-        let now = self.now;
-        // Clone for every recipient except the last; move into the last
-        // so we don't pay a final clone whose result is immediately
-        // dropped.
-        for vnode_idx in 0..count - 1 {
-            let ev = event.clone();
-            let actions = self.vnode_mut(vnode_idx).state.handle(now, ev);
-            self.drain_actions(vnode_idx, actions);
-        }
-        let actions = self.vnode_mut(count - 1).state.handle(now, event);
-        self.drain_actions(count - 1, actions);
+        let actions = self.replica.handle(self.now, event);
+        self.forget_untracked_remote_header_scopes();
+        self.drain_actions(actions);
     }
 
-    /// Feed `event` to the one seated vnode `validator`, if it is still on
-    /// this loop.
-    fn dispatch_to_seat(&mut self, validator: ValidatorId, event: ProtocolEvent) {
-        let Some(vnode_idx) = self.vnodes.iter().position(|v| v.validator_id == validator) else {
-            return;
-        };
-        let now = self.now;
-        let actions = self.vnode_mut(vnode_idx).state.handle(now, event);
-        self.drain_actions(vnode_idx, actions);
-    }
-
-    /// Dispatch a `Vec<Action>` produced by a vnode's state machine.
-    /// Bumps the step's action counter, processes each action with the
-    /// emitting vnode's signing context, and flushes pending block
-    /// commits at the tail.
-    pub(crate) fn drain_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
-        self.report_to_beacon(vnode_idx);
+    /// Dispatch the actions the replica emitted: bump the step's action
+    /// counter, process each one, and flush pending block commits at the
+    /// tail.
+    pub(crate) fn drain_actions(&mut self, actions: Vec<Action>) {
+        self.report_to_beacon();
         self.actions_generated += actions.len();
         for action in actions {
-            self.process_action(vnode_idx, action);
+            self.process_action(action);
         }
         self.flush_block_commits();
     }
 
-    /// Send what the vnode's last events reported to the beacon to the
+    /// Send what the replica's last events reported to the beacon to the
     /// host's beacon loop, under this loop's registration.
-    fn report_to_beacon(&mut self, vnode_idx: usize) {
+    fn report_to_beacon(&mut self) {
         let chain = self.chain;
-        for input in self.vnodes[vnode_idx].state.take_beacon_inputs() {
+        for input in self.replica.take_beacon_inputs() {
             let _ = self
                 .process
                 .beacon_event_sender
@@ -994,7 +827,7 @@ where
         self.now = now;
     }
 
-    /// Install `genesis` on every hosted vnode and commit it through
+    /// Install `genesis` on the replica and commit it through
     /// the normal pipeline, pre-spawn: a split child's flip with the
     /// deterministic [`Block::split_child_genesis`], or a fresh store on
     /// a never-crossed genesis shard with its [`network_genesis_block`].
@@ -1010,14 +843,8 @@ where
         let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
             genesis.clone(),
         ));
-        let now = self.now;
-        for vnode_idx in 0..self.vnodes.len() {
-            let actions = self
-                .vnode_mut(vnode_idx)
-                .state
-                .initialize_genesis(now, genesis);
-            self.drain_actions(vnode_idx, actions);
-        }
+        let actions = self.replica.initialize_genesis(self.now, genesis);
+        self.drain_actions(actions);
         // A genesis block has no parent to anchor its committee on; its own
         // anchor is the chain origin's, the committee anchor of block one.
         let committee_anchor = genesis.header().parent_qc().weighted_timestamp();
@@ -1033,15 +860,15 @@ where
         std::mem::take(&mut self.pending_timer_ops)
     }
 
-    /// Resume a seated shard's consensus from its recovered committed
-    /// state — a store a restarted host kept, a retained rejoin or a
-    /// snap-synced join; the non-genesis counterpart of
-    /// [`Self::install_genesis`]. Feeds every vnode the committed-state
-    /// restore, which arms the pacemaker and cleanup timers and latches a
-    /// proposal attempt. A joiner seated onto a live shard would pick
-    /// those up from the committee's gossip, but a committee seated onto
-    /// a quiet chain — a halt recovery's fresh committee — hears nothing,
-    /// so without this its vnodes never propose or time out.
+    /// Resume a shard's consensus from its recovered committed state — a
+    /// store a restarted host kept, a retained rejoin or a snap-synced
+    /// join; the non-genesis counterpart of [`Self::install_genesis`].
+    /// Feeds the replica the committed-state restore, which arms the
+    /// pacemaker and cleanup timers and latches a proposal attempt. A
+    /// replica on a live shard would pick those up from the committee's
+    /// gossip, but one on a quiet chain — a halt recovery's fresh
+    /// committee — hears nothing, so without this it never proposes or
+    /// times out.
     ///
     /// Returns the timer ops under the same caller contract as
     /// [`Self::install_genesis`].
@@ -1052,7 +879,7 @@ where
         std::mem::take(&mut self.pending_timer_ops)
     }
 
-    /// Seed every vnode's answer count at `genesis` with one whole read
+    /// Seed the replica's answer count at `genesis` with one whole read
     /// of the genesis store, which nothing else writes yet, and start
     /// the follow from it.
     pub(crate) fn seed_genesis_standing_answers(&mut self, genesis: &Block) {
@@ -1061,14 +888,10 @@ where
         let follow = AnswerFollow::whole(&self.io.pending_chain, at, &under);
         let count = follow.count().clone();
         self.answer_follow = Some(follow);
-        for vnode_idx in 0..self.vnodes.len() {
-            self.vnode_mut(vnode_idx)
-                .state
-                .seed_standing_answers(genesis.height(), count.clone());
-        }
+        self.replica.seed_standing_answers(genesis.height(), count);
     }
 
-    /// Seed every vnode's reshape-trigger count frontier from the genesis
+    /// Seed the replica's reshape-trigger count frontier from the genesis
     /// store count. Genesis substates (engine bootstrap + funded accounts)
     /// never appear as a commit delta, so without this the frontier reads
     /// zero until the first delta-bearing block and a non-zero reshape
@@ -1081,11 +904,8 @@ where
             .storage
             .substate_bytes_at(genesis.height())
             .unwrap_or(0);
-        for vnode_idx in 0..self.vnodes.len() {
-            self.vnode_mut(vnode_idx)
-                .state
-                .seed_substate_bytes_frontier(genesis.height(), genesis_count);
-        }
+        self.replica
+            .seed_substate_bytes_frontier(genesis.height(), genesis_count);
     }
 
     /// Process one [`ShardScopedInput`] end-to-end: clear per-step
@@ -1111,7 +931,7 @@ where
         self.pending_timer_ops.clear();
         self.emitted_statuses.clear();
         self.actions_generated = 0;
-        self.seated.clear();
+        self.attached.clear();
         self.reseat = false;
     }
 
@@ -1124,7 +944,7 @@ where
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
             participation_changes: Vec::new(),
-            seated: std::mem::take(&mut self.seated),
+            attached: std::mem::take(&mut self.attached),
             reseats: std::mem::take(&mut self.reseat)
                 .then_some(self.shard)
                 .into_iter()
@@ -1210,28 +1030,31 @@ pub(crate) fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEv
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Arc;
 
     use crossbeam::channel::Receiver;
-    use hyperscale_core::{Action, CommitSource};
+    use hyperscale_core::{Action, CommitSource, ProtocolEvent, SignerGate, StateMachine};
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
     use hyperscale_network::HandlerRegistry;
-    use hyperscale_network_memory::SimNetworkAdapter;
+    use hyperscale_network_memory::{PendingRequest, SimNetworkAdapter};
     use hyperscale_storage::{
         ChainEntry, ChainWrites, MemberInputs, ParentAnchor, SafeVoteRegisterStore,
         ShardChainReader, ShardChainWriter, SubstateStore,
     };
+    use hyperscale_types::network::request::GetRemoteHeadersRequest;
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs,
-        ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SignerBitfield, StateRoot,
-        SweepFrontier, ValidatorId, Verified, VotePosition, WeightedTimestamp,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
+        ChainOrigin, Epoch, FrontierInputs, LocalTimestamp, ProposerTimestamp, QuorumCertificate,
+        Round, SafeVoteRegisters, ShardAnchor, ShardId, SignerBitfield, StateRoot, SweepFrontier,
+        TopologySchedule, ValidatorId, Verified, VotePosition, WeightedTimestamp,
     };
 
-    use crate::shard::HostEvent;
-    use crate::shard::seated_host::{Fixture, Host, Loop, SHARD, loop_of};
+    use crate::shard::cross_shard::RemoteHeaderSyncInput;
+    use crate::shard::test_host::{Fixture, Host, Loop, SHARD, loop_of};
+    use crate::shard::{BeaconScopedInput, HostEvent, ThreadShardLoop};
 
     /// A chain of empty blocks a loop commits one at a time, each
     /// prepared over the one before it.
@@ -1243,29 +1066,27 @@ mod tests {
 
     impl Chain {
         fn on(shard_loop: &Loop) -> Self {
+            let (height, tip) = shard_loop.io.storage.committed_head();
             Self {
-                tip: BlockHash::ZERO,
-                height: shard_loop.io.storage.committed_height(),
+                tip: tip.unwrap_or(BlockHash::ZERO),
+                height,
                 root: shard_loop.io.storage.state_root(),
             }
         }
 
-        /// Commit the next block through the loop's first seat, as its
+        /// Commit the next block through the loop's replica, as its
         /// coordinator does on a certified two-chain.
         fn commit_next(&mut self, shard_loop: &mut Loop) {
             let height = self.height.next();
             let stamp = WeightedTimestamp::from_millis(height.inner());
             let (certified, root) = self.prepare_next(shard_loop, Round::new(height.inner()));
             let hash = certified.block().hash();
-            shard_loop.drain_actions(
-                0,
-                vec![Action::CommitBlock {
-                    certified,
-                    source: CommitSource::Aggregator,
-                    witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
-                    committee_anchor: stamp,
-                }],
-            );
+            shard_loop.drain_actions(vec![Action::CommitBlock {
+                certified,
+                source: CommitSource::Aggregator,
+                witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+                committee_anchor: stamp,
+            }]);
             (self.tip, self.height, self.root) = (hash, height, root);
         }
 
@@ -1406,74 +1227,90 @@ mod tests {
         }
     }
 
-    /// The last height `seat`'s execution folded off the commit stream.
-    fn folded(host: &mut Host, seat: usize) -> BlockHeight {
-        loop_of(host).vnodes[seat]
-            .state
+    /// The last height the replica's execution folded off the commit
+    /// stream.
+    fn folded(host: &mut Host) -> BlockHeight {
+        loop_of(host)
+            .replica
             .execution_coordinator()
             .committed_height()
     }
 
-    /// A seat queued on a loop whose chain commits without pause, over a
-    /// disk that never catches up with it, is admitted within two rounds
-    /// of commits: the commit pipeline is never empty, so admission
-    /// cannot wait for it to be. The seat then hears every height above
-    /// the one it restored at.
+    /// A signer attached to an open loop whose chain commits without pause, over
+    /// a disk that never catches up with it, signs from the step that
+    /// attaches it: the timeout the replica asks of it when its round
+    /// times out in the next step is signed and persisted there, with the
+    /// disk still behind. The replica then folds every later height with
+    /// the signer attached.
     #[test]
-    fn a_seat_queued_under_continuous_commits_is_admitted_within_two_rounds() {
+    fn a_signer_attaches_to_a_loop_under_continuous_commits_at_once() {
         let fix = Fixture::new();
         let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
         let mut disk = LaggingDisk::new(events);
+        let shard_loop = loop_of(&mut host);
+        let genesis = Block::genesis(
+            SHARD,
+            fix.committee.validator_id(0),
+            shard_loop.io.storage.state_root(),
+            ChainOrigin::ROOT,
+        );
+        let _ = shard_loop.install_genesis(&genesis);
+        shard_loop.dispatch_event(ProtocolEvent::BeaconBlockPersisted {
+            epoch: Epoch::new(1),
+            schedule: Arc::new(TopologySchedule::single(Arc::new(fix.topology(
+                BTreeMap::from([(
+                    SHARD,
+                    vec![fix.committee.validator_id(0), fix.committee.validator_id(1)],
+                )]),
+            )))),
+        });
+        disk.settle(&mut host);
         let mut chain = Chain::on(loop_of(&mut host));
         for _ in 0..4 {
             chain.commit_next(loop_of(&mut host));
             disk.turn(&mut host);
         }
 
-        let joiner = fix.committee.validator_id(1);
-        let out = host.seat_vnode(SHARD, fix.seat(1));
-        assert!(out.seated.is_empty(), "a flush is unacknowledged");
+        let (joiner, signer) = fix.identity(1);
+        let _ = host.attach_signer(SHARD, joiner, signer);
+        let last_signed = |host: &mut Host| {
+            loop_of(host)
+                .io
+                .storage
+                .safe_vote_registers(joiner)
+                .map(|record| record.last_voted_round)
+        };
+        assert_eq!(last_signed(&mut host), None);
+        chain.commit_next(loop_of(&mut host));
 
-        let mut rounds = 0;
-        while !loop_of(&mut host).carries(joiner) {
-            assert!(
-                rounds < 2,
-                "the seat is still queued after {rounds} rounds, at height {}",
-                chain.height.inner(),
-            );
-            chain.commit_next(loop_of(&mut host));
-            disk.turn(&mut host);
-            rounds += 1;
-        }
-        let restored = folded(&mut host, 1);
-        let commits = &loop_of(&mut host).io.block_commit;
-        assert_eq!(
-            restored,
-            commits.broadcast_height(),
-            "the seat restores at the last height the loop fanned out",
-        );
-        assert!(
-            commits.accepted_height() > restored,
-            "a commit accepted while the seat waited is still to fan out",
-        );
+        let shard_loop = loop_of(&mut host);
+        let timed_out = LocalTimestamp::from_millis(600_000);
+        shard_loop.set_time(timed_out);
+        let actions = shard_loop
+            .replica
+            .handle(timed_out, ProtocolEvent::ViewChangeTimer);
+        let asked = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::SignAndBroadcastTimeout {
+                    signer, position, ..
+                } if *signer == joiner => Some(position.registers.last_voted_round),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the replica asks the joiner for a timeout: {actions:?}"));
+        shard_loop.drain_actions(actions);
+        assert_eq!(last_signed(&mut host), Some(asked), "signed at once");
+        disk.turn(&mut host);
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             chain.commit_next(loop_of(&mut host));
             disk.turn(&mut host);
         }
         disk.settle(&mut host);
-
-        let commits = &loop_of(&mut host).io.block_commit;
-        assert_eq!(commits.broadcast_height(), chain.height);
-        assert_eq!(folded(&mut host, 0), chain.height);
-        assert_eq!(
-            folded(&mut host, 1),
-            chain.height,
-            "the seat folds every height its sibling does",
-        );
+        assert_eq!(folded(&mut host), chain.height);
     }
 
-    /// A signer seated on a running loop locks at the QC the store
+    /// A signer attached to a running loop locks at the QC the store
     /// persisted for its committed tip, not at a higher one the pending
     /// chain shadows it with: a certified block not yet committed can
     /// belong to a branch a pending fork recovery abandons.
@@ -1504,17 +1341,52 @@ mod tests {
         assert_eq!(shadowed, Some(Round::new(50)));
         assert!(persisted < Round::new(50));
 
-        let joiner = fix.committee.validator_id(1);
-        let _ = host.seat_vnode(SHARD, fix.seat(1));
-        let shard_loop = loop_of(&mut host);
-        assert!(shard_loop.carries(joiner), "the store is at rest");
-        let position = shard_loop.vnodes[1]
-            .state
+        let (joiner, signer) = fix.identity(1);
+        let _ = host.attach_signer(SHARD, joiner, signer);
+        let position = host
+            .replica(SHARD)
             .shard_coordinator()
             .position(joiner)
             .expect("the joiner is attached");
         assert_eq!(position.locked_round, persisted);
         assert_eq!(position.last_voted_round, persisted);
+    }
+
+    /// A loop on a thread of its own closes the gate of every signer
+    /// attached to it as it drops, before it releases its chain, so
+    /// nothing it signs leaves the host once the supervisor's join of the
+    /// thread reports it torn down.
+    #[test]
+    fn a_loop_closes_every_gate_before_it_reports_torn_down() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let (joiner, signer) = fix.identity(1);
+        let _ = host.attach_signer(SHARD, joiner, signer);
+        while events.try_recv().is_ok() {}
+        let (_process, mut shards, _beacon) = host.into_parts();
+        let shard_loop = shards.remove(&SHARD).expect("the fixture hosts SHARD");
+        let chain = shard_loop.chain;
+        let gates: Vec<Arc<SignerGate>> = shard_loop
+            .signers
+            .values()
+            .map(|attached| Arc::clone(&attached.gate))
+            .collect();
+        assert_eq!(gates.len(), 2);
+
+        std::thread::spawn(move || drop(ThreadShardLoop::from(shard_loop)))
+            .join()
+            .expect("the loop's thread returns");
+
+        for gate in &gates {
+            assert!(gate.enter().is_none(), "every gate is closed");
+        }
+        assert!(
+            events.try_iter().any(|event| matches!(
+                event,
+                HostEvent::Beacon(BeaconScopedInput::Deregister(released)) if released == chain
+            )),
+            "the chain is released",
+        );
     }
 
     /// A timeout `signer` signs at `round`, its position advanced to it.
@@ -1535,10 +1407,10 @@ mod tests {
         }
     }
 
-    /// A signature queued on the pool under one seat of a validator, and
-    /// run after the loop removed that seat and seated the validator
+    /// A signature queued on the pool under one attachment of a
+    /// validator, and run after the loop detached it and attached it
     /// again, signs nothing and persists nothing: it holds the gate the
-    /// removal closed. The new seat's own signatures go out.
+    /// detach closed. The new attachment's own signatures go out.
     #[test]
     fn a_task_queued_before_a_detach_does_not_sign_after_a_reattach() {
         let fix = Fixture::new();
@@ -1553,26 +1425,17 @@ mod tests {
                 job();
             }
         };
-        let validator = fix.committee.validator_id(1);
-        let _ = host.seat_vnode(SHARD, fix.seat(1));
+        let (validator, signer) = fix.identity(1);
+        let _ = host.attach_signer(SHARD, validator, Arc::clone(&signer));
         run_queued();
-        let seat_of = |host: &mut Host| {
-            loop_of(host)
-                .vnodes
-                .iter()
-                .position(|vnode| vnode.validator_id == validator)
-                .expect("the validator is seated")
-        };
 
-        let first = seat_of(&mut host);
-        loop_of(&mut host).drain_actions(first, vec![timeout_at(validator, 5)]);
+        loop_of(&mut host).drain_actions(vec![timeout_at(validator, 5)]);
         let queued = jobs.take();
         assert!(!queued.is_empty(), "the timeout is queued on the pool");
 
-        assert!(host.remove_vnode(SHARD, validator));
-        let _ = host.seat_vnode(SHARD, fix.seat(1));
+        assert!(host.detach_signer(SHARD, validator));
+        let _ = host.attach_signer(SHARD, validator, signer);
         run_queued();
-        let second = seat_of(&mut host);
         for (_, job) in queued {
             job();
         }
@@ -1585,36 +1448,219 @@ mod tests {
         };
         assert_eq!(record(&mut host), None, "the queued timeout persisted");
 
-        loop_of(&mut host).drain_actions(second, vec![timeout_at(validator, 6)]);
+        loop_of(&mut host).drain_actions(vec![timeout_at(validator, 6)]);
         run_queued();
         assert_eq!(record(&mut host), Some(Round::new(6)));
     }
 
-    /// A queued seat taken off the loop releases the commits held for
-    /// it: nothing is left waiting on an admission that will not come.
+    /// The shard beside `SHARD` in the fixture's two-leaf trie, whose
+    /// headers the replica tracks.
+    const REMOTE: ShardId = ShardId::leaf(1, 1);
+
+    /// A one-window schedule tracking `REMOTE`, seated with the committee's
+    /// last two members, at an attested boundary of `boundary`.
+    fn tracking_remote(fix: &Fixture, boundary: BlockHeight) -> Arc<TopologySchedule> {
+        let snapshot = fix
+            .topology(BTreeMap::from([
+                (
+                    SHARD,
+                    vec![fix.committee.validator_id(0), fix.committee.validator_id(1)],
+                ),
+                (
+                    REMOTE,
+                    vec![fix.committee.validator_id(2), fix.committee.validator_id(3)],
+                ),
+            ]))
+            .with_boundaries(BTreeMap::from([(
+                REMOTE,
+                ShardAnchor {
+                    state_root: StateRoot::ZERO,
+                    block_hash: BlockHash::ZERO,
+                    height: boundary,
+                    weighted_timestamp: WeightedTimestamp::ZERO,
+                    witness_base: BeaconWitnessLeafCount::ZERO,
+                    terminal_settled_txs: None,
+                    handoff_complete: None,
+                    terminal_epoch: None,
+                },
+            )]));
+        Arc::new(TopologySchedule::single(Arc::new(snapshot)))
+    }
+
+    /// A one-window schedule in which `REMOTE` has split, so the replica
+    /// tracks it no longer.
+    fn untracking_remote(fix: &Fixture) -> Arc<TopologySchedule> {
+        let (left, right) = REMOTE.children();
+        let snapshot = fix.topology_over_leaves(BTreeMap::from([
+            (
+                SHARD,
+                vec![fix.committee.validator_id(0), fix.committee.validator_id(1)],
+            ),
+            (left, vec![fix.committee.validator_id(2)]),
+            (right, vec![fix.committee.validator_id(3)]),
+        ]));
+        Arc::new(TopologySchedule::single(Arc::new(snapshot)))
+    }
+
+    /// Install `schedule` on the loop at `epoch`, then have the replica
+    /// reconcile what it tracks against it and raise every tracked shard's
+    /// sync target, as a block sync completing does.
+    fn persist_and_flush(host: &mut Host, epoch: u64, schedule: Arc<TopologySchedule>) {
+        let shard_loop = loop_of(host);
+        shard_loop.dispatch_event(ProtocolEvent::BeaconBlockPersisted {
+            epoch: Epoch::new(epoch),
+            schedule,
+        });
+        shard_loop.dispatch_event(ProtocolEvent::BlockSyncComplete {
+            height: BlockHeight::GENESIS,
+        });
+    }
+
+    /// The heights the loop asked `REMOTE`'s committee for headers from.
+    fn remote_fetches(host: &Host) -> Vec<BlockHeight> {
+        host.network()
+            .drain_pending_requests()
+            .iter()
+            .filter_map(PendingRequest::request::<GetRemoteHeadersRequest>)
+            .filter(|request| request.source_shard == REMOTE)
+            .map(|request| request.from_height)
+            .collect()
+    }
+
+    /// A host on the fixture's network at the epoch-1 schedule, tracking
+    /// `REMOTE` from genesis with its requests drained, beside the channel
+    /// its loop pushes its own events into.
+    fn host_tracking_remote(fix: &Fixture) -> (Host, Receiver<HostEvent>) {
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (mut host, events) =
+            fix.host_through_network(SimNetworkAdapter::new(registry), SyncDispatch::new());
+        persist_and_flush(&mut host, 1, tracking_remote(fix, BlockHeight::GENESIS));
+        let _ = remote_fetches(&host);
+        (host, events)
+    }
+
+    /// A shard the replica stops tracking and tracks again from a lower
+    /// anchor syncs from that anchor: its scope went with the untrack, so
+    /// the scope the re-track starts is not held at the height the old one
+    /// reached.
     #[test]
-    fn removing_a_queued_seat_releases_the_commits_held_for_it() {
+    fn a_shard_tracked_again_syncs_from_its_new_anchor() {
         let fix = Fixture::new();
-        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
-        let mut disk = LaggingDisk::new(events);
+        let (mut host, _events) = host_tracking_remote(&fix);
+        let _ = loop_of(&mut host).io.cross_shard.remote_header_sync.handle(
+            RemoteHeaderSyncInput::Admitted {
+                scope: REMOTE,
+                height: BlockHeight::new(50),
+            },
+        );
+
+        persist_and_flush(&mut host, 2, untracking_remote(&fix));
+        assert!(remote_fetches(&host).is_empty());
+
+        persist_and_flush(&mut host, 3, tracking_remote(&fix, BlockHeight::new(10)));
+        let fetches = remote_fetches(&host);
+        assert_eq!(fetches.first(), Some(&BlockHeight::new(11)), "{fetches:?}");
+    }
+
+    /// A shard tracked again from its anchor starts its scope on the first
+    /// header it admits from the shard's live tip, and fetches the gap
+    /// between them at once rather than waiting out the liveness probe.
+    #[test]
+    fn a_shard_tracked_again_fetches_up_to_its_first_header_at_once() {
+        let fix = Fixture::new();
+        let (mut host, events) = host_tracking_remote(&fix);
+        persist_and_flush(&mut host, 2, untracking_remote(&fix));
+        let _ = remote_fetches(&host);
+
+        loop_of(&mut host).dispatch_event(ProtocolEvent::BeaconBlockPersisted {
+            epoch: Epoch::new(3),
+            schedule: tracking_remote(&fix, BlockHeight::new(10)),
+        });
         let mut chain = Chain::on(loop_of(&mut host));
         chain.commit_next(loop_of(&mut host));
-        disk.turn(&mut host);
-        let written = chain.height;
-
-        let out = host.seat_vnode(SHARD, fix.seat(1));
-        assert!(out.seated.is_empty(), "a flush is unacknowledged");
-        chain.commit_next(loop_of(&mut host));
+        for event in events.try_iter() {
+            let _ = host.step(event);
+        }
         assert_eq!(
-            loop_of(&mut host).io.storage.committed_height(),
-            written,
-            "the commit is held while the seat waits",
+            loop_of(&mut host)
+                .replica
+                .remote_headers_coordinator()
+                .verified_frontier(REMOTE),
+            Some(BlockHeight::new(10)),
+            "the commit tracks the shard again at its anchor",
         );
+        assert!(remote_fetches(&host).is_empty());
 
-        assert!(loop_of(&mut host).remove_vnode(fix.committee.validator_id(1)));
-        assert_eq!(
-            loop_of(&mut host).io.storage.committed_height(),
-            chain.height
+        let tip = BlockHeight::new(40);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: REMOTE,
+            height: tip,
+            round: Round::new(tip.inner()),
+            ..Default::default()
+        });
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            REMOTE,
+            tip,
+            BlockHash::ZERO,
+            Round::new(tip.inner()),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
         );
+        let certified = CertifiedBlockHeader::new(header, qc);
+        loop_of(&mut host).dispatch_event(ProtocolEvent::RemoteHeaderQcVerified {
+            certified_header: Arc::new(certified.clone()),
+            sender: fix.committee.validator_id(2),
+            result: Box::new(Ok(Verified::new_unchecked_for_test(certified))),
+        });
+        let fetches = remote_fetches(&host);
+        assert_eq!(fetches.first(), Some(&BlockHeight::new(11)), "{fetches:?}");
+    }
+
+    /// An execution vote for a tick leader attached to the same replica is
+    /// fed back to the replica and sent over no network, so no fault there
+    /// can drop it.
+    #[test]
+    fn an_execution_vote_for_a_co_hosted_leader_is_fed_back_not_sent() {
+        use hyperscale_types::{GlobalReceiptRoot, TickId};
+
+        use crate::shard::ShardScopedInput;
+
+        let fix = Fixture::new();
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (mut host, events) =
+            fix.host_through_network(SimNetworkAdapter::new(registry), SyncDispatch::new());
+        let (leader, signer) = fix.identity(1);
+        let _ = host.attach_signer(SHARD, leader, signer);
+        while events.try_recv().is_ok() {}
+        let _ = host.network().drain_outbox();
+        let _ = host.network().drain_pending_notifications();
+
+        let voter = fix.committee.validator_id(0);
+        loop_of(&mut host).drain_actions(vec![Action::SignAndSendExecutionVote {
+            block_hash: BlockHash::ZERO,
+            vote_anchor_ts: WeightedTimestamp::ZERO,
+            tick_id: TickId::new(SHARD, BlockHeight::new(1)),
+            global_receipt_root: GlobalReceiptRoot::ZERO,
+            tx_outcomes: Vec::new(),
+            recipients: Vec::new(),
+            local_recipient: true,
+            signer: voter,
+        }]);
+
+        assert!(
+            events.try_iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(shard, ShardScopedInput::Protocol(event))
+                    if shard == SHARD && matches!(
+                        &*event,
+                        ProtocolEvent::ExecutionVoteReceived { vote } if vote.validator() == voter
+                    )
+            )),
+            "the vote is fed back to the replica",
+        );
+        assert!(host.network().drain_outbox().is_empty());
+        assert!(host.network().drain_pending_notifications().is_empty());
     }
 }

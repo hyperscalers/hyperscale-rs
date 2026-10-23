@@ -30,7 +30,7 @@ use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
-    NodeConfig, NodeHost, NodeStateMachine, SeatConfig, ShardGenesis, StartupChain, TimerOp,
+    HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig, ShardGenesis, TimerOp,
     TimerOwner, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
@@ -355,9 +355,9 @@ pub struct SimulationRunner {
     event_txs: Vec<Sender<HostEvent>>,
 
     /// Signing keys for every hosted validator, retained so a
-    /// relocated vnode's state machine can be rebuilt on its new shard.
-    /// The same signers as [`Self::withholding`], shared with every vnode
-    /// a validator runs.
+    /// relocated validator can be attached as a signer on its new shard.
+    /// The same signers as [`Self::withholding`], shared with every
+    /// replica a validator is attached to.
     signers: Vec<Arc<dyn Signer>>,
 
     /// Every hosted validator's signer, able to withhold its shard
@@ -402,7 +402,7 @@ pub struct SimulationRunner {
     /// Beacon network definition, retained for a restarted host's fold.
     beacon_network: NetworkDefinition,
 
-    /// Placement deltas the hosted vnodes emitted via
+    /// Placement deltas the hosts emitted via
     /// `Action::ReconfigureParticipation`, in deterministic event
     /// order. Drained by the harness via
     /// [`Self::take_participation_changes`].
@@ -726,11 +726,12 @@ impl SimulationRunner {
         let mut beacon_stores = Vec::with_capacity(num_hosts);
 
         for (host_index, plan) in host_layout.iter().enumerate() {
-            // Group this host's seated vnodes by shard. For cross-shard
-            // hosting each group has one vnode; for same-shard hosting
-            // there's one group per host with `vnodes_per_host` entries. A
-            // dedicated pool host seats no vnode; its identities run only
-            // their beacon participants.
+            // Group this host's seated validators by shard: each shard's
+            // group signs through that shard's one replica. For
+            // cross-shard hosting each group has one validator; for
+            // same-shard hosting there's one group per host with
+            // `vnodes_per_host` entries. A dedicated pool host seats none;
+            // its identities run only their beacon participants.
             let mut by_shard: BTreeMap<ShardId, Vec<u32>> = BTreeMap::new();
             for &(validator_idx, shard) in &plan.seated {
                 by_shard.entry(shard).or_default().push(validator_idx);
@@ -758,8 +759,8 @@ impl SimulationRunner {
             };
 
             // Every identity the host holds runs a beacon participant;
-            // the seated ones also seat on their shard's loop, whose
-            // vnodes share one store bundle. Genesis boots a fresh chain,
+            // the seated ones also attach to their shard's replica.
+            // Genesis boots a fresh chain,
             // so `recovered` is default and `now` is what this host's
             // clock reads at simulated zero: the beacon loop arms its
             // participants' startup timers off it at construction.
@@ -770,7 +771,7 @@ impl SimulationRunner {
                     Arc::clone(&signers[idx as usize]),
                 )
             };
-            let seat_config = SeatConfig {
+            let replica_config = ReplicaConfig {
                 verifier: Arc::clone(&verifier),
                 derivation: executor.derivation(),
                 code: Arc::clone(&executor) as _,
@@ -803,13 +804,13 @@ impl SimulationRunner {
 
             // One `SimShardStorage` per hosted shard on this host.
             let fresh = RecoveredState::default();
-            let chains: Vec<StartupChain<'_, SimShardStorage>> = by_shard
+            let chains: Vec<HostedChain<'_, SimShardStorage>> = by_shard
                 .iter()
-                .map(|(shard, validator_idxs)| StartupChain {
+                .map(|(shard, validator_idxs)| HostedChain {
                     shard: *shard,
                     storage: open_store(*shard, network_config.power_loss),
                     recovered: &fresh,
-                    vnodes: validator_idxs.iter().copied().map(signer_of).collect(),
+                    signers: validator_idxs.iter().copied().map(signer_of).collect(),
                 })
                 .collect();
             // Single receiver per host: every hosted shard's sender is a
@@ -818,7 +819,7 @@ impl SimulationRunner {
             let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> =
                 by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let host = NodeHost::new(
-                seat_config,
+                replica_config,
                 chains,
                 identities,
                 beacon_storage,
@@ -986,7 +987,7 @@ impl SimulationRunner {
     }
 
     /// Process-shared beacon storage for a host. One handle per host,
-    /// shared across every vnode on that host.
+    /// shared across every loop on that host.
     #[must_use]
     pub fn beacon_storage(&self, host: NodeIndex) -> Option<&Arc<dyn BeaconStorage>> {
         self.hosts.get(host as usize).map(NodeHost::beacon_storage)
@@ -1013,13 +1014,13 @@ impl SimulationRunner {
             .map_or_default(|h| h.hosted_shards().collect())
     }
 
-    /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode
-    /// order; empty when the host doesn't carry it.
+    /// Shard consensus statistics of `host`'s replica of `shard`, or
+    /// `None` when the host doesn't carry it.
     #[must_use]
-    pub fn shard_stats(&self, host: NodeIndex, shard: ShardId) -> Vec<ShardStats> {
+    pub fn shard_stats(&self, host: NodeIndex, shard: ShardId) -> Option<ShardStats> {
         self.hosts
             .get(host as usize)
-            .map_or_else(Vec::new, |h| h.shard_stats(shard))
+            .and_then(|h| h.shard_stats(shard))
     }
 
     /// Get the last emitted transaction status for a host.
@@ -1091,93 +1092,63 @@ impl SimulationRunner {
         self.now
     }
 
-    /// Get a reference to a host's first-vnode state machine.
-    ///
-    /// With `vnodes_per_host == 1` (the default) this is the only
-    /// state machine on that host. For multi-vnode hosting, use
-    /// [`Self::vnode_state_in`] to pick a specific host's shard vnode.
+    /// The replica of the first shard `index` hosts.
     #[must_use]
-    pub fn first_vnode_state(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
+    pub fn first_replica(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
         let host = self.hosts.get(index as usize)?;
         let shard = host.hosted_shards().next()?;
-        Some(host.vnode_state(shard, 0))
+        Some(host.replica(shard))
     }
 
-    /// Every live vnode on `shard`, across all hosts.
+    /// Every host's replica of `shard`.
     ///
-    /// Walks each host, keeps those that carry `shard`, and collects every
-    /// matching vnode's state machine. Use this — not host-indexed
-    /// [`Self::first_vnode_state`] — to assert over a committee after a split: a flip
-    /// leaves the terminated parent vnodes lingering on their hosts under the
-    /// parent shard, and a host seated cross-shard carries a second vnode that
-    /// host-indexing hides.
+    /// Use this — not host-indexed [`Self::first_replica`] — to assert
+    /// over a committee after a split: a flip leaves the terminated
+    /// parent's replicas lingering on their hosts, and a host running two
+    /// shards holds a replica of each.
     #[must_use]
-    pub fn shard_vnodes(&self, shard: ShardId) -> Vec<&NodeStateMachine> {
-        let mut vnodes = Vec::new();
-        for host in self.hosts.iter() {
-            if host.hosted_shards().any(|s| s == shard) {
-                for v in 0..host.vnodes_len(shard) {
-                    vnodes.push(host.vnode_state(shard, v));
-                }
-            }
-        }
-        vnodes
-    }
-
-    /// Every live vnode state machine across every host and shard.
-    #[must_use]
-    pub fn all_vnode_states(&self) -> Vec<&NodeStateMachine> {
-        let mut vnodes = Vec::new();
-        for host in self.hosts.iter() {
-            let shards: Vec<ShardId> = host.hosted_shards().collect();
-            for shard in shards {
-                for v in 0..host.vnodes_len(shard) {
-                    vnodes.push(host.vnode_state(shard, v));
-                }
-            }
-        }
-        vnodes
-    }
-
-    /// The state machine of `host`'s vnode in `shard`, or `None` when
-    /// the host doesn't carry that shard. Relocation puts two vnodes
-    /// with one validator id on a host (the draining shard's and the
-    /// joined shard's), so lookups here are shard-scoped where a
-    /// validator-id walk would be ambiguous.
-    #[must_use]
-    pub fn vnode_state_in(&self, host: NodeIndex, shard: ShardId) -> Option<&NodeStateMachine> {
-        let host = self.hosts.get(host as usize)?;
-        host.hosted_shards()
-            .any(|s| s == shard)
-            .then(|| host.vnode_state(shard, 0))
-    }
-
-    /// Every vnode `host` carries on `shard`, or nothing when it carries
-    /// none.
-    ///
-    /// The whole group rather than its first member: a host seated
-    /// cross-shard carries a second vnode on the same store, and which of
-    /// the two sits in the shard's committee is not decided by its index.
-    #[must_use]
-    pub fn shard_vnodes_in(&self, host: NodeIndex, shard: ShardId) -> Vec<&NodeStateMachine> {
-        let Some(host) = self.hosts.get(host as usize) else {
-            return Vec::new();
-        };
-        if !host.hosted_shards().any(|s| s == shard) {
-            return Vec::new();
-        }
-        (0..host.vnodes_len(shard))
-            .map(|v| host.vnode_state(shard, v))
+    pub fn shard_replicas(&self, shard: ShardId) -> Vec<&NodeStateMachine> {
+        self.hosts
+            .iter()
+            .filter(|host| host.hosted_shards().any(|s| s == shard))
+            .map(|host| host.replica(shard))
             .collect()
     }
 
-    /// The validators seated on `host`'s loop for `shard`, in vnode order;
-    /// empty if `host` doesn't host `shard`.
+    /// `host`'s replica of `shard`, or `None` when the host doesn't carry
+    /// that shard.
     #[must_use]
-    pub fn seated_in(&self, host: NodeIndex, shard: ShardId) -> Vec<ValidatorId> {
+    pub fn replica_in(&self, host: NodeIndex, shard: ShardId) -> Option<&NodeStateMachine> {
+        let host = self.hosts.get(host as usize)?;
+        host.hosted_shards()
+            .any(|s| s == shard)
+            .then(|| host.replica(shard))
+    }
+
+    /// The validators attached to `host`'s replica of `shard`, in id
+    /// order; empty if `host` doesn't host `shard`.
+    #[must_use]
+    pub fn signers_in(&self, host: NodeIndex, shard: ShardId) -> Vec<ValidatorId> {
         self.hosts
             .get(host as usize)
-            .map_or_else(Vec::new, |h| h.seated_validators(shard))
+            .map_or_else(Vec::new, |h| h.signers(shard))
+    }
+
+    /// Detach `validator` from `host`'s replica of `shard`, which keeps
+    /// following the chain; the placement scan attaches it again at the
+    /// next committed epoch it still places it. Returns whether it was
+    /// attached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` doesn't host `shard`.
+    pub fn detach_signer(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        validator: ValidatorId,
+    ) -> bool {
+        self.hosts[host as usize].detach_signer(shard, validator)
     }
 
     /// The shard of every chain registered with `host`'s fold, one entry
@@ -1282,8 +1253,8 @@ impl SimulationRunner {
     }
 
     /// Make `validator` withhold exactly `withheld` of its shard consensus
-    /// from now on, on every vnode it runs, and return its signer to count
-    /// what it refuses. [`Withheld::Nothing`] lifts the fault.
+    /// from now on, on every replica it is attached to, and return its
+    /// signer to count what it refuses. [`Withheld::Nothing`] lifts the fault.
     ///
     /// # Panics
     ///

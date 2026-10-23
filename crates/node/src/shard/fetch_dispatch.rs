@@ -291,7 +291,7 @@ mod tests {
     use hyperscale_types::{BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash};
 
     use super::*;
-    use crate::shard::seated_host::{Fixture, Loop, loop_of};
+    use crate::shard::test_host::{Fixture, Loop, loop_of};
 
     const SHARD: ShardId = ShardId::leaf(1, 0);
 

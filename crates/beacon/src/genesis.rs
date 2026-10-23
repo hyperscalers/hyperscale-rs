@@ -188,7 +188,7 @@ pub struct GenesisBoot {
     pub config_hash: GenesisConfigHash,
     /// Topology projected from `state`, identical in shape to the snapshot
     /// the runtime `ArcSwap` update derives on every epoch commit. `Arc`ed
-    /// so a host shares one allocation across every vnode.
+    /// so a host shares one allocation across every loop.
     pub topology_snapshot: Arc<TopologySnapshot>,
 }
 

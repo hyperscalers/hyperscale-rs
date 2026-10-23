@@ -40,8 +40,9 @@ pub struct ReadyResponse {
 
 /// Response for `/api/v1/status` endpoint.
 ///
-/// Process-level fields sit at the top; one [`VnodeStatusEntry`] per hosted
-/// vnode lives in `vnodes`, sorted by `validator_id` for stable output.
+/// Process-level fields sit at the top; one [`VnodeStatusEntry`] per
+/// attached signer lives in `vnodes`, sorted by `validator_id` for stable
+/// output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatusResponse {
     /// The network's current shard count, from the host's live topology.
@@ -52,7 +53,7 @@ pub struct NodeStatusResponse {
     pub(crate) uptime_secs: u64,
     /// Version string.
     pub(crate) version: String,
-    /// Per-hosted-vnode status entries.
+    /// Per-signer status entries.
     pub(crate) vnodes: Vec<VnodeStatusEntry>,
 }
 

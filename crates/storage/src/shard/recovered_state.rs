@@ -80,7 +80,7 @@ pub struct RecoveredState {
     /// Set only on the flip, which is the delivery fast enough to matter:
     /// the rule these relax retires `MAX_VALIDITY_RANGE` past the origin,
     /// well before the beacon folds the same roots. Empty here is not a
-    /// gap — a seat that missed the flip reads them off its topology
+    /// gap — a replica that missed the flip reads them off its topology
     /// projection instead, via
     /// `TopologySchedule::predecessor_terminals`, and until either lands
     /// the strict rule stands.
@@ -183,7 +183,7 @@ pub struct RecoveredState {
     /// producer this shard has read, which bounds the record presences
     /// a block may carry. Read
     /// off the state on every path that builds one, since it is state
-    /// and every seat holds it; the execution coordinator advances its
+    /// and every replica holds it; the execution coordinator advances its
     /// copy from here with the same rule the fold writes it by.
     pub read_frontier: ReadFrontier,
 

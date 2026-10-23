@@ -159,9 +159,9 @@ pub struct Route {
     pub preferred: Option<ValidatorId>,
     /// Class override forwarded to the network layer.
     pub class: Option<MessageClass>,
-    /// Who may answer. A failed attempt's retry asks whichever of the
-    /// local seats and the committee's other members the attempt did not,
-    /// since a seat this host runs answers every retry the same way.
+    /// Who may answer. A failed attempt's retry asks whichever of this
+    /// host's replica and the committee's other members the attempt did
+    /// not, since this host's replica answers every retry the same way.
     pub answerers: Answerers,
 }
 
@@ -397,11 +397,11 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// do hold it.
     ///
     /// A failure's retry asks whoever the failed attempt did not: an
-    /// answer served from a co-hosted seat costs no round trip and comes
+    /// answer served from this host's replica costs no round trip and comes
     /// back the same each time it is asked, so a failure after asking the
-    /// local seats goes to the committee's other members, and one after
-    /// asking only them gives the local seats, which may have caught up
-    /// since, the next turn. Only the first failure since the tick retries
+    /// replica goes to the committee's other members, and one after asking
+    /// only them gives the replica, which may have caught up since, the
+    /// next turn. Only the first failure since the tick retries
     /// at once. One from a committee that all answers alike comes back the
     /// same too, so a second failure before the tick waits for it. Where a
     /// round trip is a few milliseconds, as on a LAN or within one region,

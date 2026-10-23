@@ -186,7 +186,7 @@ mod tests {
     use hyperscale_storage::RecoveredState;
     use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
     use hyperscale_types::{
-        AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Block,
+        AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Block, BlockHash,
         BlockHeight, CertifiedBeaconBlock, ChainOrigin, Epoch, LocalTimestamp, NetworkDefinition,
         PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RatifyCert, RatifyRound, Round,
         ShardId, SignerBitfield, SpcCert, SpcView, StateRoot, TopologySchedule, ValidatorId,
@@ -678,5 +678,285 @@ mod tests {
         );
         assert!(Arc::ptr_eq(test.node.schedule(), &held));
         assert_eq!(test.node.schedule_epoch(), epoch);
+    }
+
+    /// The root committee on one-second windows a halt recovery replaces,
+    /// and the one it seats: `test`'s four members govern every window of
+    /// the first schedule; the second is the fold that seated the recovery
+    /// at epoch 100, with validator 7 in place of member 3 from its bridge
+    /// at 101.
+    fn before_and_after_a_seated_halt_recovery(
+        test: &TestNode,
+    ) -> (TopologySchedule, TopologySchedule) {
+        use std::collections::{BTreeSet, HashMap};
+
+        use hyperscale_crypto_bls::BlsSigner;
+        use hyperscale_types::{
+            RecoveryCause, ShardRecovery, Signer, TopologySnapshot, ValidatorInfo, ValidatorSet,
+        };
+
+        let fresh_member = ValidatorInfo {
+            validator_id: ValidatorId::new(7),
+            public_key: BlsSigner::generate().public_key(),
+        };
+        let validators = ValidatorSet::new(
+            (0..test.committee.size())
+                .map(|i| ValidatorInfo {
+                    validator_id: test.committee.validator_id(i),
+                    public_key: *test.committee.public_key(i),
+                })
+                .chain(std::iter::once(fresh_member))
+                .collect(),
+        );
+        let committee = |members: Vec<ValidatorId>| {
+            TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &validators,
+                HashMap::from([(ShardId::ROOT, members.clone())]),
+                HashMap::from([(ShardId::ROOT, members)]),
+                BTreeMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )
+        };
+        let members: Vec<ValidatorId> = (0..test.committee.size())
+            .map(|i| test.committee.validator_id(i))
+            .collect();
+        let halted = Arc::new(committee(members.clone()));
+        let mut fresh_members = members;
+        fresh_members[3] = ValidatorId::new(7);
+        let fresh = Arc::new(
+            committee(fresh_members).with_pending_recoveries(
+                std::iter::once((
+                    ShardId::ROOT,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at: Epoch::new(100),
+                        retained: vec![test.committee.validator_id(3)],
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                ))
+                .collect(),
+            ),
+        );
+        let mut before = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
+        let mut after = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
+        for epoch in 1..=110 {
+            before.insert(Epoch::new(epoch), Arc::clone(&halted));
+            let seated = if epoch < 101 { &halted } else { &fresh };
+            after.insert(Epoch::new(epoch), Arc::clone(seated));
+        }
+        before.set_head(halted);
+        after.set_head(fresh);
+        (before, after)
+    }
+
+    /// An unsigned replica holding, under the halted schedule of
+    /// [`before_and_after_a_seated_halt_recovery`], the halted committee's
+    /// uncertified block at its view with every check passed; the schedule
+    /// that seats the recovery, the epoch it folds at, and the block.
+    fn holding_a_halted_pending_block() -> (TestNode, Arc<TopologySchedule>, Epoch, BlockHash) {
+        use hyperscale_types::{
+            BlockHeader, BlockHeaderParts, BlockManifest, CheckOutcome, ProposerTimestamp,
+            QuorumCertificate, ShardLoad, StandingAnswers, VerificationKind,
+        };
+
+        let mut test = TestNode::new();
+        let (halted, seated) = before_and_after_a_seated_halt_recovery(&test);
+        let held = test.node.schedule_epoch();
+        let at = LocalTimestamp::from_millis(2_000);
+        let _ = test.node.handle(
+            at,
+            ProtocolEvent::BeaconBlockPersisted {
+                epoch: Epoch::new(held.inner() + 1),
+                schedule: Arc::new(halted.clone()),
+            },
+        );
+        test.node.detach_signer(test.committee.validator_id(0));
+        let genesis = Block::genesis(
+            ShardId::ROOT,
+            test.committee.validator_id(0),
+            StateRoot::ZERO,
+            ChainOrigin::ROOT,
+        );
+        let _ = test.node.initialize_genesis(at, &genesis);
+        test.node
+            .seed_standing_answers(BlockHeight::GENESIS, StandingAnswers::default());
+
+        let round = Round::new(1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(1),
+            parent_block_hash: genesis.hash(),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            proposer: halted.head().proposer_for(ShardId::ROOT, round),
+            timestamp: ProposerTimestamp::from_millis(1_000),
+            round,
+            load: ShardLoad {
+                blocks: 1,
+                ..ShardLoad::ZERO
+            },
+            ..Default::default()
+        });
+        let block_hash = header.hash();
+        let coordinator = &mut test.node.shard.shard_coordinator;
+        let _ = coordinator.on_block_header(
+            &halted,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        for kind in [
+            VerificationKind::BodyRoot,
+            VerificationKind::BeaconWitnessRoot,
+            VerificationKind::StateRoot,
+        ] {
+            let _ = coordinator.on_block_check_completed(
+                &halted,
+                block_hash,
+                kind,
+                CheckOutcome::checked(),
+            );
+        }
+        assert!(coordinator.holds_proposal(block_hash), "the block is held");
+        (
+            test,
+            Arc::new(seated),
+            Epoch::new(held.inner() + 2),
+            block_hash,
+        )
+    }
+
+    fn votes_for(actions: &[Action], block_hash: BlockHash) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::SignAndBroadcastBlockVote { block_hash: voted, .. } if *voted == block_hash
+            )
+        })
+    }
+
+    /// The `BeaconBlockPersisted` that seats a halt recovery drops the
+    /// replica's uncertified block judged under the halted committee, so
+    /// a fresh signer attached after it does not vote the block.
+    #[test]
+    fn the_beacon_block_seating_a_recovery_drops_a_halted_pending_block_before_an_attach() {
+        let (mut test, seated, epoch, block_hash) = holding_a_halted_pending_block();
+        let now = LocalTimestamp::from_millis(101_500);
+        let _ = test.node.handle(
+            now,
+            ProtocolEvent::BeaconBlockPersisted {
+                epoch,
+                schedule: Arc::clone(&seated),
+            },
+        );
+        assert!(!test.node.shard_coordinator().holds_proposal(block_hash));
+
+        let attached = test.node.attach_signer(
+            now,
+            ValidatorId::new(7),
+            None,
+            Round::INITIAL,
+            seated,
+            epoch,
+        );
+        assert!(!votes_for(&attached, block_hash), "{attached:?}");
+    }
+
+    /// A batch for the halted committee's block, in flight when the
+    /// seating drops the block with its vote set, forms no QC when it
+    /// returns at quorum: its signer bitfield indexes a committee that no
+    /// longer governs the block.
+    #[test]
+    fn a_batch_in_flight_across_the_seating_drop_forms_no_qc() {
+        use hyperscale_types::{
+            BlockVote, ConsensusSignature, ProposerTimestamp, QuorumCertificate, Verified,
+            WeightedTimestamp,
+        };
+
+        let (mut test, seated, epoch, block_hash) = holding_a_halted_pending_block();
+        let at = LocalTimestamp::from_millis(2_000);
+        let height = BlockHeight::new(1);
+        let round = Round::new(1);
+        let mut batch = Vec::new();
+        for member in 0..3 {
+            let vote = BlockVote::from_parts(
+                block_hash,
+                ShardId::ROOT,
+                height,
+                round,
+                test.committee.validator_id(member),
+                ConsensusSignature::ZERO,
+                ProposerTimestamp::from_millis(1_000),
+            );
+            batch.extend(test.handle(at, ProtocolEvent::UnverifiedBlockVoteReceived { vote }));
+        }
+        let binding = batch
+            .iter()
+            .find_map(|action| match action {
+                Action::VerifyAndBuildQuorumCertificate { binding, .. } => Some(*binding),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the halted committee reaches a batch: {batch:?}"));
+
+        let now = LocalTimestamp::from_millis(101_500);
+        let _ = test.node.handle(
+            now,
+            ProtocolEvent::BeaconBlockPersisted {
+                epoch,
+                schedule: seated,
+            },
+        );
+        assert!(!test.node.shard_coordinator().holds_proposal(block_hash));
+
+        let qc = QuorumCertificate::new(
+            block_hash,
+            ShardId::ROOT,
+            height,
+            BlockHash::ZERO,
+            round,
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        let actions = test.node.handle(
+            now,
+            ProtocolEvent::QuorumCertificateResult {
+                block_hash,
+                qc: Some(Verified::new_unchecked_for_test(qc)),
+                verified_votes: Vec::new(),
+                binding,
+            },
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::QuorumCertificateFormed { .. })
+            )),
+            "{actions:?}"
+        );
+    }
+
+    /// An attach carrying the schedule that seats a halt recovery drops
+    /// the halted committee's uncertified block before the fresh signer
+    /// re-drives its votes.
+    #[test]
+    fn an_attach_carrying_the_seating_schedule_drops_a_halted_pending_block_first() {
+        let (mut test, seated, epoch, block_hash) = holding_a_halted_pending_block();
+        let now = LocalTimestamp::from_millis(101_500);
+        let attached = test.node.attach_signer(
+            now,
+            ValidatorId::new(7),
+            None,
+            Round::INITIAL,
+            seated,
+            epoch,
+        );
+        assert!(!votes_for(&attached, block_hash), "{attached:?}");
+        assert!(!test.node.shard_coordinator().holds_proposal(block_hash));
     }
 }

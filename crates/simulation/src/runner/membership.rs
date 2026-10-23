@@ -1,18 +1,18 @@
 //! The harness's membership half: bring shards up and tear them down
 //! against the committed beacon placement.
 //!
-//! Hosted vnodes surface [`ParticipationChange`]s through `StepOutput`;
+//! Hosted replicas surface [`ParticipationChange`]s through `StepOutput`;
 //! the committed projection drives the actual joins and leaves — a join
 //! runs the same sans-io [`ShardBootstrap`] sequencer production drives
 //! (state assembly with per-chunk staging → finalize + anchor
 //! verification → witness history → recovered state), served straight from the target committee's hosts'
-//! storages, then seats the vnode via `NodeHost::add_shard`; a leave
-//! tears the shard down via `NodeHost::remove_shard`, handing back a
-//! shared storage handle so a later rejoin exercises the
-//! retained-storage fast path. A validator drawn onto a shard its host
-//! already runs joins the running loop (`NodeHost::seat_vnode`), and one
-//! that loses its role there leaves it (`NodeHost::remove_vnode`) while
-//! another seat keeps the loop up.
+//! storages, then runs the shard via `NodeHost::add_shard` with the
+//! validator attached; a leave tears the shard down via
+//! `NodeHost::remove_shard`, handing back a shared storage handle so a
+//! later rejoin exercises the retained-storage fast path. A validator
+//! drawn onto a shard its host already runs attaches to the running
+//! replica (`NodeHost::attach_signer`), and one that loses its role there
+//! detaches from it (`NodeHost::detach_signer`) while the loop stays up.
 //!
 //! The join half reads the seatable committee view (split-observer riders
 //! excluded); the teardown half reads full membership — the same
@@ -31,7 +31,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
-use hyperscale_node::{SeatConfig, VnodeSeat};
+use hyperscale_node::{HostedChain, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{
@@ -111,7 +111,7 @@ enum Replaced {
 }
 
 impl SimulationRunner {
-    /// Drain the placement deltas hosted vnodes emitted since the last
+    /// Drain the placement deltas the hosts emitted since the last
     /// call, in deterministic event order.
     pub fn take_participation_changes(&mut self) -> Vec<(NodeIndex, ParticipationChange)> {
         std::mem::take(&mut self.pending_participation_changes)
@@ -298,7 +298,7 @@ impl SimulationRunner {
             if snapshot.boundary(shard).is_none() {
                 continue;
             }
-            let mut seats = self.hosts[host as usize].seated_validators(shard);
+            let mut seats = self.hosts[host as usize].signers(shard);
             for validator in snapshot.seatable_committee_for_shard(shard) {
                 if self.homes_validator(host, validator) && !seats.contains(&validator) {
                     seats.push(validator);
@@ -323,7 +323,7 @@ impl SimulationRunner {
     /// serving, gossip, and ready-signal admission but must not be seated as
     /// a consensus member. A terminated parent is an internal
     /// trie host, not a leaf, so it is never torn down here — it stays retained
-    /// for serving. The placement deltas the hosted vnodes emit are drained for
+    /// for serving. The placement deltas the hosts emit are drained for
     /// parity with production's delta-driven path, but the committed projection
     /// drives the actual join/leave: the snap-sync usually completes within the
     /// slice, and a join whose attested anchor has gone stale (a transient fold
@@ -364,7 +364,7 @@ impl SimulationRunner {
                     .filter(|&validator| self.homes_validator(host, validator))
                     .collect();
                 if hosted.contains(&shard) {
-                    let seated = self.hosts[host as usize].seated_validators(shard);
+                    let seated = self.hosts[host as usize].signers(shard);
                     // Under a fork recovery a loop committed past the
                     // attested frontier holds a suffix the fresh committee
                     // must not extend, and a store cannot un-commit it: the
@@ -384,11 +384,10 @@ impl SimulationRunner {
                         continue;
                     }
                     // A validator drawn onto a shard this host already
-                    // runs joins the running loop rather than a loop of
-                    // its own.
+                    // runs attaches to its running replica.
                     for validator in placed {
                         if !seated.contains(&validator) {
-                            self.seat_into_running_loop(host, shard, validator);
+                            self.attach_to_running_loop(host, shard, validator);
                         }
                     }
                     continue;
@@ -456,35 +455,30 @@ impl SimulationRunner {
                     self.retained_storages.insert((host, shard), storage);
                     continue;
                 }
-                // The loop stays; a validator it carries that no longer
-                // holds a role in the committee or the routing entry
-                // leaves it, by the same rule applied per validator,
-                // while another seat keeps the loop running.
-                for validator in self.hosts[host as usize].seated_validators(shard) {
+                // The loop stays; a validator attached to it that no
+                // longer holds a role in the committee or the routing
+                // entry detaches, by the same rule applied per validator.
+                // A replica left with no signer keeps following the chain.
+                for validator in self.hosts[host as usize].signers(shard) {
                     let retained = committee.contains(&validator)
                         || routing
                             .get(&shard)
                             .is_some_and(|entry| entry.contains(&validator));
-                    if !retained && self.hosts[host as usize].vnodes_len(shard) > 1 {
-                        self.hosts[host as usize].remove_vnode(shard, validator);
+                    if !retained {
+                        self.hosts[host as usize].detach_signer(shard, validator);
                     }
                 }
             }
         }
     }
 
-    /// Queue `validator`'s seat on `host`'s running loop for `shard`. The
-    /// loop admits it once its store is at rest; binding it into the
-    /// transport's layout first lets traffic addressed to it land from
-    /// the moment it is admitted.
-    fn seat_into_running_loop(&mut self, host: NodeIndex, shard: ShardId, validator: ValidatorId) {
+    /// Attach `validator` to `host`'s running replica of `shard`, binding
+    /// it into the transport's layout first so traffic addressed to it
+    /// lands from the moment it is attached.
+    fn attach_to_running_loop(&mut self, host: NodeIndex, shard: ShardId, validator: ValidatorId) {
         self.network.bind_validator(validator, host);
-        let seat = VnodeSeat {
-            config: self.seat_config(host),
-            validator,
-            signer: self.signer_of(validator),
-        };
-        let output = self.hosts[host as usize].seat_vnode(shard, seat);
+        let signer = self.signer_of(validator);
+        let output = self.hosts[host as usize].attach_signer(shard, validator, signer);
         self.process_step_output(host, output);
         self.drain_host_io(host);
     }
@@ -538,8 +532,10 @@ impl SimulationRunner {
     /// [`Self::topology_step`], so a placement the beacon already
     /// committed seats on `host`.
     ///
-    /// Returns whether it moved: a validator any host's loop carries,
-    /// a retained terminated loop's included, stays where it runs.
+    /// Returns whether it moved: a validator attached to any host's
+    /// replica, a retained terminated loop's included, stays where it
+    /// runs. One serving a terminated chain with no signer attached may
+    /// move.
     ///
     /// # Panics
     ///
@@ -572,8 +568,8 @@ impl SimulationRunner {
 
     /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
-    /// retained-storage fast path. The validators the loop seated keep
-    /// their beacon participants.
+    /// retained-storage fast path. The validators attached to its replica
+    /// keep their beacon participants.
     ///
     /// # Panics
     ///
@@ -587,7 +583,7 @@ impl SimulationRunner {
 
     /// Drive the [`ShardBootstrap`] sequencer to completion against the
     /// shard's serving hosts, importing into `storage`, and return the
-    /// recovered state the joining vnode boots from. Requests rotate
+    /// recovered state the joining replica boots from. Requests rotate
     /// across the serving hosts; a rejected chunk simply re-arms and
     /// the rotation retries it elsewhere. With `own_first`, the host's own
     /// running store answers each request before any peer is asked.
@@ -595,7 +591,7 @@ impl SimulationRunner {
     /// Returns `None` when the shard cannot be read from a peer yet, in
     /// one of three transient shapes. No serving host holds it at all: a
     /// freshly seeded split child is a trie leaf with a committee before
-    /// any of its members has mounted its vnode, so for a moment nobody
+    /// any of its members has mounted it, so for a moment nobody
     /// can serve it. Or a serving host holds it but no longer pins the
     /// attested boundary's state — a beacon-fold freeze at a reshape
     /// boundary can leave the anchor stale while the tip runs on, so every
@@ -735,9 +731,9 @@ impl SimulationRunner {
         Some(bootstrap.into_recovered_state(storage))
     }
 
-    /// Mount `shard` on `host` over `storage`, seating `validators` from
-    /// `recovered` as one group: the chain registers with the host's
-    /// beacon loop and its replicas are built from the schedule the
+    /// Mount `shard` on `host` over `storage`, booted from `recovered`
+    /// with `validators` attached: the chain registers with the host's
+    /// beacon loop and its replica is built from the schedule the
     /// registration hands back — the same construction the production
     /// supervisor runs at seat time.
     pub(super) fn add_shard(
@@ -748,19 +744,28 @@ impl SimulationRunner {
         storage: SimShardStorage,
         recovered: &RecoveredState,
     ) {
-        let config = self.seat_config(host);
-        let vnodes = validators
+        let config = self.replica_config(host);
+        let signers = validators
             .iter()
             .map(|&validator| (validator, self.signer_of(validator)))
             .collect();
         let sender = self.event_txs[host as usize].clone();
-        self.hosts[host as usize].add_shard(shard, config, recovered, vnodes, storage, sender);
+        self.hosts[host as usize].add_shard(
+            &config,
+            HostedChain {
+                shard,
+                storage,
+                recovered,
+                signers,
+            },
+            sender,
+        );
     }
 
-    /// How `host` builds every vnode it seats at runtime.
-    fn seat_config(&self, host: NodeIndex) -> SeatConfig {
+    /// How `host` builds every replica it runs at runtime.
+    fn replica_config(&self, host: NodeIndex) -> ReplicaConfig {
         let host = &self.hosts[host as usize];
-        SeatConfig {
+        ReplicaConfig {
             verifier: Arc::clone(&self.verifier),
             derivation: host.derivation(),
             code: host.code(),

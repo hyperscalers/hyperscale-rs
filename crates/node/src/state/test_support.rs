@@ -19,16 +19,16 @@ use hyperscale_beacon::{BeaconFold, ChainRegistration};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::AllCodeRuns;
-use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
-use hyperscale_mempool::{MempoolConfig, TxStore};
-use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
+use hyperscale_mempool::MempoolConfig;
+use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, BeaconState, CertifiedBeaconBlock, GenesisPool,
-    GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, QuorumCertificate,
-    Randomness, RecoveryBinding, Round, ShardId, Stake, StakePoolId, Verified, genesis_config_hash,
+    BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
+    GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition,
+    QuorumCertificate, Randomness, RecoveryBinding, Round, ShardId, Stake, StakePoolId, Verified,
+    genesis_config_hash,
 };
 
 use super::NodeStateMachine;
@@ -158,7 +158,6 @@ impl TestNodeBuilder {
         let me = committee.validator_id(self.local_idx);
         // The beacon harness consolidates every validator onto the root shard.
         let local_shard = self.local_shard.unwrap_or(ShardId::ROOT);
-        let provision_store = Arc::new(ProvisionStore::new());
         let mut fold = test_fold(&committee, self.recoveries, self.beacon_history);
         let chain = fold.register_chain(
             local_shard,
@@ -180,11 +179,7 @@ impl TestNodeBuilder {
             fold.state().current_epoch,
             MempoolConfig::default(),
             ProvisionConfig::default(),
-            provision_store,
-            Arc::new(TxStore::new()),
-            Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizationStore::new()),
-            Arc::new(CrossingIndexSlot::default()),
+            BlockHeight::GENESIS,
         );
         let persisted_qc_round = self
             .recovered

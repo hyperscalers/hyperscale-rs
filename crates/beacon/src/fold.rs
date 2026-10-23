@@ -777,15 +777,23 @@ impl BeaconFold {
     /// A shard-witness chunk arrived. Resolve the anchor block's header
     /// from the local [`ShardSourceTracker`],
     /// recompute the window root from the payloads plus the range proof,
-    /// and admit the run whole. A chunk that fails any check is dropped
-    /// silently; the fetch protocol retries on its own cadence.
+    /// and admit the run whole, re-driving the fetch for a newer
+    /// crossing's chunk if one has been observed since: a terminated
+    /// shard sends no further source header to trigger it.
+    ///
+    /// `None` refuses the chunk — empty, anchored on a header not held,
+    /// or failing the root check. The fetch that delivered it releases
+    /// its run as failed, which retries it at once the first time and
+    /// on the fetch tick after that: a run this host serves itself comes
+    /// back the same each time, with no round trip to let time pass
+    /// between asks.
     ///
     /// Admission is all-or-nothing because a range proof only verifies
     /// for the run it names — half a chunk proves nothing, so there is no
     /// partial progress to bank.
     ///
     /// A fold off the committee initiates no fetches, so this handler
-    /// no-ops there — the pool is empty by design for it.
+    /// takes nothing there — the pool is empty by design for it.
     pub fn on_shard_witnesses_received(
         &mut self,
         shard_id: ShardId,
@@ -793,12 +801,12 @@ impl BeaconFold {
         lo: LeafIndex,
         payloads: Vec<ShardWitnessPayload>,
         range_proof: Vec<Hash>,
-    ) -> Vec<Action> {
+    ) -> Option<Vec<Action>> {
         if !self.host_on_committee {
-            return Vec::new();
+            return Some(Vec::new());
         }
         if payloads.is_empty() {
-            return self.fetch_witness_chunk(shard_id);
+            return None;
         }
         let Some(header) = self
             .shard_source
@@ -808,31 +816,27 @@ impl BeaconFold {
                 shard = ?shard_id,
                 "Witness chunk anchor has no verified header yet — dropping",
             );
-            return self.fetch_witness_chunk(shard_id);
+            return None;
         };
         let chunk_end = lo.inner() + payloads.len() as u64;
-        if rules::contribution_chunk_valid(
+        if !rules::contribution_chunk_valid(
             header.header(),
             &payloads,
             &range_proof,
             lo.inner(),
             chunk_end,
         ) {
-            self.shard_source
-                .admit_chunk(shard_id, anchor, lo.inner(), payloads, range_proof);
-        } else {
             warn!(
                 shard = ?shard_id,
                 lo = lo.inner(),
                 chunk_end,
                 "Witness chunk failed root recomputation — dropping",
             );
+            return None;
         }
-        // Re-drive now that this response landed: on failure the same range
-        // against another peer, on success a newer crossing's chunk if one
-        // has been observed since. A terminated shard sends no further source
-        // header to trigger it.
-        self.fetch_witness_chunk(shard_id)
+        self.shard_source
+            .admit_chunk(shard_id, anchor, lo.inner(), payloads, range_proof);
+        Some(self.fetch_witness_chunk(shard_id))
     }
 
     /// Fetch `shard`'s current witness chunk, anchored to its latest
@@ -876,9 +880,9 @@ impl BeaconFold {
             return Vec::new();
         }
         // An unheld run goes out regardless of in-flight status: the
-        // runner's fetch dedups ids it already tracks, so a re-issue only
-        // revives a run whose earlier fetch was fulfilled without admission
-        // or abandoned. The tracker's record is for cancellation, not dedup.
+        // runner's fetch dedups ids it already tracks, a refused run among
+        // them, so a re-issue only revives a run the runner abandoned. The
+        // tracker's record is for cancellation, not dedup.
         self.shard_source
             .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
         vec![Action::Fetch(FetchRequest::Ask {

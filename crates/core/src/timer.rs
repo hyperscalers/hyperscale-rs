@@ -23,11 +23,11 @@ pub enum TimerId {
     /// Process-scoped — fans out across all hosted shards on fire.
     FetchTick,
     /// Beacon committee-start timer. Fires at the upcoming epoch's
-    /// wall-clock boundary if the local vnode is on the next
+    /// wall-clock boundary if a local participant is on the next
     /// committee and that block isn't committed yet. Process-scoped.
     BeaconCommitteeStart,
     /// Beacon ratify timer. First fires `SKIP_TIMEOUT` past the
-    /// expected block time when the local vnode hasn't observed the
+    /// expected block time when the local participant hasn't observed the
     /// expected commit (the coordinator's `skip_trigger_due` check
     /// reads against this), then re-arms as the ratify round timeout
     /// while the epoch is undecided. Process-scoped.

@@ -71,20 +71,10 @@ where
     }
 
     /// Hold the tick chain and the store's history at the lowest baseline
-    /// any seated vnode's execution still reads, with the base known to
-    /// carry `persisted`.
-    ///
-    /// Every vnode runs each tick itself, so one seated behind its
-    /// siblings — a seat admitted mid-chain replaying from where its
-    /// restore resumes — needs history they no longer do, and a hold that
-    /// followed the furthest of them would retire it.
+    /// the replica's execution still reads, with the base known to carry
+    /// `persisted`.
     pub(in crate::shard) fn hold_execution_baselines(&self, persisted: BlockHeight) {
-        let executed = self
-            .vnodes
-            .iter()
-            .map(|vnode| vnode.state.execution_coordinator().baseline_floor())
-            .min()
-            .unwrap_or(persisted);
+        let executed = self.replica.execution_coordinator().baseline_floor();
         self.io.tick_chain.prune_persisted(persisted, executed);
     }
 
@@ -135,13 +125,10 @@ where
     fn derive_chain_floor(&self) {
         let topology = self.process.topology_snapshot().load();
         let (oldest_pin, attested) = self.floor_pins();
-        let Some(vnode) = self.vnodes.first() else {
-            return;
-        };
         let floor = chain_floor(
             &*self.io.storage,
             FloorInputs {
-                origin: vnode.state.shard_coordinator().chain_origin(),
+                origin: self.replica.shard_coordinator().chain_origin(),
                 oldest_pin: attested.and(oldest_pin),
                 settled_window_floor: topology.settled_window_floor(self.shard),
             },
@@ -176,7 +163,7 @@ mod tests {
     };
     use hyperscale_vm_effects::Answered;
 
-    use crate::shard::seated_host::{Fixture, SHARD, loop_of};
+    use crate::shard::test_host::{Fixture, SHARD, loop_of};
 
     /// `count` answers under [`SHARD`]'s prefix out of one producer, the
     /// `from`th onward.

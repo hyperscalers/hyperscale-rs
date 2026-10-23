@@ -51,7 +51,7 @@ pub(crate) enum SpcMsgKind {
 /// Slot key for a pending SPC message verification.
 pub(crate) type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
 
-/// Per-vnode SPC driver: the optional current-epoch [`SpcInstance`] plus
+/// Per-participant SPC driver: the optional current-epoch [`SpcInstance`] plus
 /// the PC-vote and SPC-message verification slot pools.
 pub(crate) struct SpcDriver {
     /// Scheme verifier handed to each bootstrapped [`SpcInstance`].

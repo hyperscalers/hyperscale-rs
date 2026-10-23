@@ -26,7 +26,7 @@ use hyperscale_types::{
 /// How many terminals' reconstructed windows are held at once — the same
 /// weight the committed-membership side keeps, for the same reason: a
 /// shard terminates once per reshape, and the slack covers a node hosting
-/// several vnodes through overlapping ones.
+/// several shards through overlapping ones.
 const CACHED_TERMINALS: usize = 4;
 
 /// Reconstructed settled windows, keyed by the terminal they end at and

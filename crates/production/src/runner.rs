@@ -42,10 +42,9 @@ use hyperscale_node::shard::{
     BeaconScopedInput, HostEvent, ShardLoop, StepOutput, ThreadShardLoop, TimerOp, TimerOwner,
     timer_event,
 };
-use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
+use hyperscale_node::startup::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatConfig, SharedTopologySnapshot, StartupChain, TxStatusCache,
-    VnodeSeat,
+    HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot, TxStatusCache,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -130,10 +129,10 @@ impl Drop for ShutdownHandle {
 /// One hosted validator's identity + per-validator state inputs.
 ///
 /// A [`ProductionRunner`] hosts a `Vec<VnodeConfig>` alongside a single
-/// `Arc<TopologySnapshot>` shared across every vnode. Same-shard hosting
-/// (V > 1 with every entry mapped to the same `local_shard`) collapses onto
-/// one `NodeHost`, one libp2p peer, and one `ShardIo`, with per-vnode signing
-/// keys and per-vnode `NodeStateMachine`s.
+/// `Arc<TopologySnapshot>` shared across every shard loop. Entries mapped to
+/// the same `local_shard` share one `NodeHost`, one libp2p peer, one
+/// `ShardIo` and one replica, each attached to it as a signer with its own
+/// signing key.
 #[derive(Clone)]
 pub struct VnodeConfig {
     /// This vnode's validator identity.
@@ -394,12 +393,11 @@ impl ProductionRunnerBuilder {
             .latest_committed()
             .expect("beacon chain is non-empty after the genesis commit above");
 
-        // The host starts on the topology its committed beacon state
-        // projects — the head every hosted vnode's beacon coordinator
-        // resumes on, derived in the same `BeaconState →
-        // derive_topology_snapshot` direction the runtime fold publishes.
-        // Routing, validator keys, and seating all read it before the
-        // first fold of this run.
+        // The host starts on the topology its committed beacon state projects
+        // — the head the host's beacon loop resumes on, derived in the same
+        // `BeaconState → derive_topology_snapshot` direction the runtime fold
+        // publishes. Routing, validator keys, and seating all read it before
+        // the first fold of this run.
         let shared_topology =
             Arc::new(beacon_state.derive_topology_snapshot(beacon_network.clone()));
         let topology_snapshot: SharedTopologySnapshot =
@@ -449,7 +447,7 @@ impl ProductionRunnerBuilder {
         )?;
         let placed = plan.placed_shards();
         let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
-        let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
+        let mut seated_by_shard: BTreeMap<ShardId, ShardSigners> = BTreeMap::new();
         for (shard, (store, vnodes)) in plan.resumed {
             storages.insert(shard, store);
             seated_by_shard.insert(shard, vnodes);
@@ -482,7 +480,7 @@ impl ProductionRunnerBuilder {
             config: bootstrap_config,
         };
         // The VM engine's world seats the same pools a genesis install
-        // writes, and holds the derivation this node's vnodes resolve
+        // writes, and holds the derivation this node's replicas resolve
         // envelopes through.
         let executor: Arc<Executor> = Arc::new(Executor::with_genesis(
             &engine_bootstrap.config.pools,
@@ -492,7 +490,7 @@ impl ProductionRunnerBuilder {
 
         // Seated validators boot from their own shard's recovered state;
         // every held key runs a beacon participant.
-        let seat_config = SeatConfig {
+        let replica_config = ReplicaConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: executor.derivation(),
             code: Arc::clone(&executor) as _,
@@ -512,8 +510,8 @@ impl ProductionRunnerBuilder {
         // counterparts read from it — the settled sets an abandonment record
         // is held to, the terminal evidence a successor derives from — and
         // routing names its ex-members for as long as the beacon keeps its
-        // boundary. A running host keeps such a shard's loop up, with the
-        // vnodes of every local validator still named in one of its window
+        // boundary. A running host keeps such a shard's loop up, with a
+        // signer for every local validator still named in one of its window
         // roles, until the supervisor's teardown reconcile retires it; a
         // restart resumes the same loop from the store on disk, under the
         // same rule and against the routing the process boots on. A store
@@ -561,13 +559,13 @@ impl ProductionRunnerBuilder {
         // A handle per shard for `NodeHost::new`; the runner keeps its own
         // handles for GC and metrics, and the recovered states to resume
         // each loop from.
-        let chains: Vec<StartupChain<'_, RocksDbShardStorage>> = seated_by_shard
+        let chains: Vec<HostedChain<'_, RocksDbShardStorage>> = seated_by_shard
             .into_iter()
-            .map(|(shard, vnodes)| StartupChain {
+            .map(|(shard, signers)| HostedChain {
                 shard,
                 storage: (*storages[&shard]).clone(),
                 recovered: &resumed[&shard],
-                vnodes,
+                signers,
             })
             .collect();
         let identities: Vec<(ValidatorId, Arc<dyn Signer>)> = bind_vnodes.clone();
@@ -599,7 +597,7 @@ impl ProductionRunnerBuilder {
         // beacon thread.
         let (beacon_event_tx, beacon_event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            seat_config,
+            replica_config,
             chains,
             identities,
             self.beacon_storage,
@@ -694,11 +692,11 @@ pub struct ProductionRunner {
     reconfigure_tx: mpsc::Sender<ShardCommand>,
     /// Receiver drained by `run()`'s select loop.
     reconfigure_rx: Option<mpsc::Receiver<ShardCommand>>,
-    /// Placement deltas emitted by the hosted vnodes' beacon
-    /// coordinators, forwarded off the shard threads. `run()`'s select
+    /// Placement deltas emitted by the hosted shard loops, forwarded off
+    /// their threads. `run()`'s select
     /// loop translates each into [`ShardCommand`]s for the supervisor.
     participation_rx: Option<mpsc::UnboundedReceiver<ParticipationChange>>,
-    /// Per-validator signing keys for every vnode this runner was built
+    /// Per-validator signing keys for every validator this runner was built
     /// with, keyed for the placement-delta translation.
     vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
 
@@ -713,7 +711,7 @@ pub struct ProductionRunner {
     storages: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<RocksDbShardStorage>>>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
-    /// Every shard this runner hosts vnodes for at startup.
+    /// Every shard this runner hosts at startup.
     local_shards: BTreeSet<ShardId>,
     /// What each hosted shard's store recovered at startup, which its
     /// loop resumes consensus from once it runs.
@@ -790,7 +788,7 @@ impl ProductionRunner {
         Arc::clone(&self.tx_status)
     }
 
-    /// The derivation this host's vnodes resolve envelopes through, held
+    /// The derivation this host's replicas resolve envelopes through, held
     /// by its engine, which learns every instance and package its chains
     /// commit.
     ///
@@ -1036,9 +1034,9 @@ impl ProductionRunner {
     }
 
     /// Translate a beacon-detected placement delta into supervisor
-    /// commands for the moved vnode. A join starts the shard's
+    /// commands for the moved validator. A join starts the shard's
     /// bootstrap immediately — the delta arrives a full epoch before
-    /// the window opens, and the vnode votes only once ready. A leave
+    /// the window opens, and the validator votes only once ready. A leave
     /// needs no command here: the reshape tick's
     /// [`ShardSupervisor::reconcile_teardown`] tears a shard down once it
     /// leaves both this host's active committee and its routing committee,
@@ -1187,14 +1185,14 @@ pub struct ShardChannels {
     pub(crate) control_rx: Receiver<ShardControl>,
 }
 
-/// A change to a running shard loop's seats, sent by the supervisor to
+/// A change to a running shard loop's signers, sent by the supervisor to
 /// the shard's thread.
 pub enum ShardControl {
-    /// Queue a validator's seat; the loop admits it once its store is at
-    /// rest and reports it as [`SupervisorEvent::Seated`].
-    Seat(Box<VnodeSeat>),
-    /// Take a validator off the loop while another seat keeps it running.
-    Remove(ValidatorId),
+    /// Attach a validator to the loop's replica, signing with its key; the
+    /// loop reports it as [`SupervisorEvent::Attached`].
+    Attach(ValidatorId, Arc<dyn Signer>),
+    /// Detach a validator from the loop's replica, which keeps running.
+    Detach(ValidatorId),
 }
 
 impl ShardChannels {
@@ -1225,8 +1223,8 @@ impl ShardChannels {
 /// Manages tokio-based timers for one shard's pinned event loop.
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
-/// into the crossbeam timer channel. Keys carry the op's owner as-is: the
-/// loop itself, or one vnode seated on it.
+/// into the crossbeam timer channel. Every op a shard loop emits is the
+/// loop's own.
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<HostEvent>,
@@ -1322,19 +1320,19 @@ pub struct ShardLoopConfig {
     pub(crate) timer_rx: Receiver<HostEvent>,
     pub(crate) callback_rx: Receiver<HostEvent>,
     pub(crate) shutdown_rx: Receiver<()>,
-    /// Seat changes from the supervisor.
+    /// Signer changes from the supervisor.
     pub(crate) control_rx: Receiver<ShardControl>,
     pub(crate) tokio_handle: TokioHandle,
     pub(crate) initial_timer_ops: Vec<TimerOp>,
-    /// Placement deltas emitted by this shard's vnodes, forwarded to
+    /// Placement deltas emitted by this shard's replica, forwarded to
     /// the runner's reconfiguration loop.
     pub(crate) participation_tx: mpsc::UnboundedSender<ParticipationChange>,
-    /// The supervisor's event channel, told of every seat the loop
-    /// admits.
+    /// The supervisor's event channel, told of every signer the loop
+    /// attaches.
     pub(crate) supervisor_tx: mpsc::UnboundedSender<SupervisorEvent>,
     /// Shared RPC publishers. Each shard's thread writes its own slots
-    /// on the metrics tick (per-vnode status entries, its sync-status
-    /// key, and its vnodes' mempool snapshots); concurrent shards
+    /// on the metrics tick (per-signer status entries, its sync-status
+    /// key, and its signers' mempool snapshots); concurrent shards
     /// racing on the same `ArcSwap` lose at most one second of
     /// staleness on their slot.
     pub(crate) publishers: RpcPublishers,
@@ -1348,7 +1346,7 @@ pub struct ShardLoopConfig {
 /// the shard's shutdown signal fires.
 ///
 /// Priority cascade: `timer_rx` (scheduled view-change / cleanup /
-/// fetch tick fires) before `control_rx` (seat changes) before
+/// fetch tick fires) before `control_rx` (signer changes) before
 /// `callback_rx` (off-thread results, inbound network deliveries, RPC
 /// fanout). When all are empty the cascade
 /// blocks on `select!` with a timeout drawn from the shard's nearest
@@ -1435,6 +1433,9 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
                     continue;
                 }
             };
+            // The wait may have outlasted the stamp taken before it: a
+            // timer due now is handled at now, not before its deadline.
+            shard_loop.set_time(consensus_clock(config.genesis_offset_ms));
             let output = shard_loop.run_step(input);
             apply_step_output(shard, output, &config, &mut timer_mgr);
         }
@@ -1458,20 +1459,22 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
     info!(shard = ?shard, "Shard event loop exiting");
 }
 
-/// Carry out one of the supervisor's seat changes on the shard's thread.
+/// Carry out one of the supervisor's signer changes on the shard's
+/// thread.
 fn apply_shard_control(
     shard_loop: &mut ProdShardLoop,
     config: &ShardLoopConfig,
     timer_mgr: &mut ProdTimerManager,
     control: ShardControl,
 ) {
+    shard_loop.set_time(consensus_clock(config.genesis_offset_ms));
     match control {
-        ShardControl::Seat(seat) => {
-            let output = shard_loop.seat_vnode(*seat);
+        ShardControl::Attach(validator, signer) => {
+            let output = shard_loop.attach_signer(validator, signer);
             apply_step_output(shard_loop.shard, output, config, timer_mgr);
         }
-        ShardControl::Remove(validator) => {
-            if shard_loop.remove_vnode(validator) {
+        ShardControl::Detach(validator) => {
+            if shard_loop.detach_signer(validator) {
                 scrub_mempool_slot(config, validator);
             }
         }
@@ -1492,21 +1495,21 @@ fn apply_step_output(
     for change in output.participation_changes {
         let _ = config.participation_tx.send(change);
     }
-    for validator in output.seated {
+    for validator in output.attached {
         let _ = config
             .supervisor_tx
-            .send(SupervisorEvent::Seated { shard, validator });
+            .send(SupervisorEvent::Attached { shard, validator });
     }
     for shard in output.reseats {
         let _ = config.supervisor_tx.send(SupervisorEvent::Reseat { shard });
     }
 }
 
-/// Drop a validator's mempool slot once its vnode leaves this shard. The
-/// slot is keyed by validator alone and written only by the threads that
-/// carry it, so a departed one would otherwise hold a stale snapshot, and
-/// a vnode still carried on another shard republishes it on that shard's
-/// next tick.
+/// Drop a validator's mempool slot once it detaches from this shard's
+/// replica. The slot is keyed by validator alone and written only by the
+/// threads whose replica it is attached to, so a departed one would
+/// otherwise hold a stale snapshot, and one still attached on another
+/// shard republishes it on that shard's next tick.
 fn scrub_mempool_slot(config: &ShardLoopConfig, validator: ValidatorId) {
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
         mempool_snapshot.rcu(|current| {
@@ -1519,24 +1522,24 @@ fn scrub_mempool_slot(config: &ShardLoopConfig, validator: ValidatorId) {
 
 /// Write this shard's contribution into the shared RPC state. Each slot is
 /// keyed by `shard_id.inner()`, and the writes go through `ArcSwap::rcu` so a
-/// co-hosted sibling shard thread (or the supervisor's `scrub_rpc_state`)
+/// co-hosted shard's thread (or the supervisor's `scrub_rpc_state`)
 /// interleaving on the same `ArcSwap` can't drop this shard's update — the
 /// compare-and-retry re-applies it against the concurrent winner.
 fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) {
     let shard_key = shard_loop.shard.inner();
 
-    // ── /status: per-vnode entries ─────────────────────────────────
+    // ── /status: one entry per attached signer ─────────────────────
+    let state = shard_loop.replica();
+    let mempool = state.mempool_coordinator();
+    let pending = mempool.pending_count();
+    let in_flight = state.shard_coordinator().committed_in_flight();
     if let Some(ref rpc_status) = config.publishers.node_status {
         rpc_status.rcu(|current| {
             let mut updated = (**current).clone();
             updated.vnodes.retain(|v| v.shard != shard_key);
-            for vnode in &shard_loop.vnodes {
-                let state = &vnode.state;
-                let mempool = state.mempool_coordinator();
-                let pending = mempool.pending_count();
-                let in_flight = state.shard_coordinator().committed_in_flight();
+            for validator in shard_loop.signers() {
                 updated.vnodes.push(VnodeStatusEntry {
-                    validator_id: vnode.validator_id.inner(),
+                    validator_id: validator.inner(),
                     shard: shard_key,
                     block_height: state.shard_coordinator().committed_height().inner(),
                     view: state.shard_coordinator().view().inner(),
@@ -1563,22 +1566,15 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
         });
     }
 
-    // ── Mempool: per-vnode snapshots feeding RPC submission backpressure.
-    // Each vnode owns its own `MempoolCoordinator`; same-shard vnodes
-    // converge by determinism but their instantaneous counts can
-    // differ, so the backpressure check iterates every entry rather
-    // than picking a per-shard representative.
+    // ── Mempool: the replica's snapshot under each attached signer,
+    // feeding RPC submission backpressure.
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
         let remote_congestion_threshold = TxsInFlight::new(MAX_UNSETTLED_TXS * 4 / 5);
         mempool_snapshot.rcu(|current| {
             let mut updated = (**current).clone();
-            for vnode in &shard_loop.vnodes {
-                let state = &vnode.state;
-                let mempool = state.mempool_coordinator();
-                let pending = mempool.pending_count();
-                let in_flight = state.shard_coordinator().committed_in_flight();
+            for validator in shard_loop.signers() {
                 updated.vnodes.insert(
-                    vnode.validator_id.inner(),
+                    validator.inner(),
                     VnodeMempoolSnapshot {
                         pending_count: pending,
                         in_flight_count: in_flight,

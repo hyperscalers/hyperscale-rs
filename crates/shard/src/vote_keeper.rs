@@ -92,6 +92,11 @@ pub struct VoteKeeper {
     /// the exact committee once the header arrives (see
     /// [`take_unanchored_votes`](Self::take_unanchored_votes)). Tightly capped.
     unanchored_votes: HashMap<BlockHash, Vec<BlockVote>>,
+
+    /// The binding the next vote set created or re-bound takes. Never
+    /// reused, so a batch names the one binding it was taken under even
+    /// across a set forgotten and created again.
+    next_binding: u64,
 }
 
 impl VoteKeeper {
@@ -100,6 +105,7 @@ impl VoteKeeper {
             vote_sets: HashMap::new(),
             received_votes_by_height: HashMap::new(),
             unanchored_votes: HashMap::new(),
+            next_binding: 0,
         }
     }
 
@@ -144,6 +150,12 @@ impl VoteKeeper {
         self.unanchored_votes
             .remove(&block_hash)
             .unwrap_or_default()
+    }
+
+    /// Drop the vote set of `block_hash`, whose block this replica no
+    /// longer holds.
+    pub(crate) fn forget(&mut self, block_hash: BlockHash) {
+        self.vote_sets.remove(&block_hash);
     }
 
     pub(crate) fn vote_sets_len(&self) -> usize {
@@ -196,13 +208,11 @@ impl VoteKeeper {
             return vec![];
         };
 
-        let committee_size = topology_snapshot
-            .consensus_committee_for_shard(local_shard)
-            .len();
-        let vote_set = self
-            .vote_sets
-            .entry(block_hash)
-            .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
+        let vote_set = self.bound_vote_set(
+            block_hash,
+            topology_snapshot.consensus_committee_for_shard(local_shard),
+            header_for_vote,
+        );
 
         if vote_set.has_seen_validator(prep.voter_index) {
             trace!("Already seen vote from validator {:?}", vote.voter());
@@ -244,13 +254,11 @@ impl VoteKeeper {
             return vec![];
         }
 
-        let committee_size = topology_snapshot
-            .consensus_committee_for_shard(local_shard)
-            .len();
-        let vote_set = self
-            .vote_sets
-            .entry(block_hash)
-            .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
+        let vote_set = self.bound_vote_set(
+            block_hash,
+            topology_snapshot.consensus_committee_for_shard(local_shard),
+            header_for_vote,
+        );
 
         if vote_set.has_seen_validator(prep.voter_index) {
             trace!("Already seen vote from validator {:?}", vote.voter());
@@ -267,6 +275,44 @@ impl VoteKeeper {
         );
 
         self.maybe_trigger_verification(local_shard, block_hash)
+    }
+
+    /// The vote set for `block_hash`, bound to `committee`, the committee
+    /// that governs the block now. A set bound to another committee is
+    /// re-bound, so every vote the set holds is indexed against the
+    /// committee the vote it admits next is indexed against.
+    fn bound_vote_set(
+        &mut self,
+        block_hash: BlockHash,
+        committee: &[ValidatorId],
+        header_for_vote: Option<&BlockHeader>,
+    ) -> &mut VoteSet {
+        let next_binding = &mut self.next_binding;
+        let mut take_binding = || {
+            let binding = *next_binding;
+            *next_binding += 1;
+            binding
+        };
+        let vote_set = self
+            .vote_sets
+            .entry(block_hash)
+            .or_insert_with(|| VoteSet::new(header_for_vote, committee, take_binding()));
+        if !vote_set.tallies_against(committee) {
+            info!(
+                ?block_hash,
+                "Block's committee changed; re-binding its vote set"
+            );
+            vote_set.rebind(committee, take_binding());
+        }
+        vote_set
+    }
+
+    /// The binding of `header`'s vote set, bound to `committee`: what a
+    /// batch for the block would be taken under.
+    #[cfg(test)]
+    pub(crate) fn bind(&mut self, header: &BlockHeader, committee: &[ValidatorId]) -> u64 {
+        self.bound_vote_set(header.hash(), committee, Some(header))
+            .binding()
     }
 
     /// Shared committee/power lookup for both vote-ingestion paths.
@@ -382,15 +428,30 @@ impl VoteKeeper {
             votes_to_verify,
             verified_votes,
             total_votes: total_power,
+            binding: vote_set.binding(),
         }]
     }
 
-    /// Mark the vote set for `block_hash` as having produced a QC, so
-    /// subsequent duplicates are ignored. No-op if the set is absent.
-    pub(crate) fn mark_qc_built(&mut self, block_hash: BlockHash) {
-        if let Some(vote_set) = self.vote_sets.get_mut(&block_hash) {
-            vote_set.on_qc_built();
+    /// Whether the QC a batch taken under `binding` formed for
+    /// `block_hash` stands, marking the set built when it does so later
+    /// duplicates are ignored.
+    ///
+    /// It stands only while the set still holds that binding. A set
+    /// re-bound since indexes its voters against another committee, under
+    /// which the QC's signer bitfield names other members; a set forgotten
+    /// since belongs to a block this replica no longer holds, judged under
+    /// a committee that no longer governs it. Either way the QC is dropped
+    /// and the batch settled, so the set can take a fresh one.
+    pub(crate) fn admit_formed_qc(&mut self, block_hash: BlockHash, binding: u64) -> bool {
+        let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
+            return false;
+        };
+        if vote_set.binding() != binding {
+            vote_set.on_stale_batch(binding);
+            return false;
         }
+        vote_set.on_qc_built();
+        true
     }
 
     /// Record a verified vote into the per-height equivocation log. On a
@@ -451,6 +512,7 @@ impl VoteKeeper {
     pub(crate) fn finalize_pending_batch(
         &mut self,
         block_hash: BlockHash,
+        binding: u64,
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
     ) {
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
@@ -466,9 +528,9 @@ impl VoteKeeper {
                 block_hash = ?block_hash,
                 "All votes failed verification"
             );
-            vote_set.on_votes_verified(vec![]);
+            vote_set.on_votes_verified(binding, vec![]);
         } else {
-            vote_set.on_votes_verified(verified_votes);
+            vote_set.on_votes_verified(binding, verified_votes);
             info!(
                 block_hash = ?block_hash,
                 verified_power = vote_set.verified_power().inner(),
@@ -556,7 +618,7 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeaderParts, ChainOrigin, Hash, NetworkDefinition, ProposerTimestamp,
-        QuorumCertificate, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet,
+        QuorumCertificate, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
         verify_shard_vote_equivocation,
     };
 
@@ -572,6 +634,10 @@ mod tests {
             round,
             signature: ConsensusSignature::new([0u8; 96]),
         }
+    }
+
+    fn four_members() -> Vec<ValidatorId> {
+        (0..4).map(ValidatorId::new).collect()
     }
 
     fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
@@ -591,10 +657,14 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let hdr_h1 = make_header_at_round(BlockHeight::new(1), Round::new(1));
         let hdr_h3 = make_header_at_round(BlockHeight::new(3), Round::new(3));
-        vk.vote_sets
-            .insert(hdr_h1.hash(), VoteSet::new(Some(&hdr_h1), 4));
-        vk.vote_sets
-            .insert(hdr_h3.hash(), VoteSet::new(Some(&hdr_h3), 4));
+        vk.vote_sets.insert(
+            hdr_h1.hash(),
+            VoteSet::new(Some(&hdr_h1), &four_members(), 0),
+        );
+        vk.vote_sets.insert(
+            hdr_h3.hash(),
+            VoteSet::new(Some(&hdr_h3), &four_members(), 0),
+        );
         vk.received_votes_by_height.insert(
             (BlockHeight::new(2), ValidatorId::new(7)),
             sv(BlockHash::from_raw(Hash::from_bytes(b"b2")), Round::new(0)),
@@ -812,7 +882,8 @@ mod tests {
             let hash = BlockHash::from_raw(Hash::from_bytes(
                 &u64::try_from(i).unwrap_or(u64::MAX).to_le_bytes(),
             ));
-            vk.vote_sets.insert(hash, VoteSet::new(None, 4));
+            vk.vote_sets
+                .insert(hash, VoteSet::new(None, &four_members(), 0));
         }
         assert_eq!(vk.vote_sets_len(), MAX_VOTE_SETS);
 
@@ -824,6 +895,105 @@ mod tests {
         // ...and adding to an already-tracked set is always admitted.
         let existing = BlockHash::from_raw(Hash::from_bytes(&0u64.to_le_bytes()));
         assert!(vk.admit_vote_set(existing, false));
+    }
+
+    /// A one-shard snapshot seating the validators `ids`, keyed by `keys`
+    /// at their own index.
+    fn committee_of(keys: &[BlsSigner], ids: &[u64]) -> TopologySnapshot {
+        let validators = ids
+            .iter()
+            .map(|&id| ValidatorInfo {
+                validator_id: ValidatorId::new(id),
+                public_key: keys[usize::try_from(id).expect("fits")].public_key(),
+            })
+            .collect();
+        TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators),
+        )
+    }
+
+    /// Votes indexed against one committee are dropped when the block's
+    /// committee resolves another, so no batch carries a vote whose index
+    /// names someone else in the committee it is aggregated under.
+    #[test]
+    fn a_vote_set_resets_when_its_block_resolves_another_committee() {
+        let keys: Vec<BlsSigner> = (0..8).map(|_| BlsSigner::generate()).collect();
+        let halted = committee_of(&keys, &[0, 1, 2, 3]);
+        let fresh = committee_of(&keys, &[4, 5, 6, 7]);
+        let shard = ShardId::ROOT;
+        let committed = BlockHeight::new(0);
+        let height = BlockHeight::new(1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            height,
+            parent_block_hash: BlockHash::ZERO,
+            round: Round::INITIAL,
+            ..Default::default()
+        });
+        let block_hash = header.hash();
+        let vote = |voter: u64| {
+            BlockVote::new(
+                &NetworkDefinition::simulator(),
+                block_hash,
+                BlockHash::ZERO,
+                shard,
+                height,
+                Round::INITIAL,
+                ValidatorId::new(voter),
+                &keys[usize::try_from(voter).expect("fits")],
+                ProposerTimestamp::from_millis(1_000),
+            )
+            .expect("sign")
+        };
+        let mut vk = VoteKeeper::new();
+        for voter in [0, 1] {
+            let actions =
+                vk.accept_unverified_vote(&halted, shard, vote(voter), committed, Some(&header));
+            assert!(actions.is_empty(), "{actions:?}");
+        }
+
+        let mut batches = Vec::new();
+        for voter in [4, 5, 6] {
+            batches.extend(vk.accept_unverified_vote(
+                &fresh,
+                shard,
+                vote(voter),
+                committed,
+                Some(&header),
+            ));
+        }
+        let [
+            Action::VerifyAndBuildQuorumCertificate {
+                votes_to_verify,
+                verified_votes,
+                total_votes,
+                ..
+            },
+        ] = batches.as_slice()
+        else {
+            panic!("one batch at the fresh quorum, got {batches:?}");
+        };
+        assert!(verified_votes.is_empty());
+        assert_eq!(*total_votes, VoteCount::of(4));
+        let seated = fresh.consensus_committee_for_shard(shard);
+        let indexed: Vec<(usize, ValidatorId)> = votes_to_verify
+            .iter()
+            .map(|(index, vote, _)| (*index, vote.voter()))
+            .collect();
+        assert_eq!(
+            indexed,
+            vec![
+                (0, ValidatorId::new(4)),
+                (1, ValidatorId::new(5)),
+                (2, ValidatorId::new(6)),
+            ],
+        );
+        assert!(
+            indexed
+                .iter()
+                .all(|(index, voter)| seated[*index] == *voter)
+        );
     }
 
     #[test]

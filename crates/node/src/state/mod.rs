@@ -28,13 +28,9 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_engine::CodeAvailability;
-use hyperscale_execution::{
-    CrossingIndexSlot, ExecCertStore, ExecutionCoordinator, FinalizationStore,
-};
-use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
-use hyperscale_provisions::{
-    OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
-};
+use hyperscale_execution::ExecutionCoordinator;
+use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
+use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
@@ -89,12 +85,11 @@ impl NodeStateMachine {
     /// over `schedule`, the schedule the beacon folded at `schedule_epoch`.
     /// Each validator it signs for joins through [`Self::attach_signer`].
     ///
-    /// `provision_store`, `tx_store`, `exec_cert_store`, and
-    /// `finalization_store` are scoped per shard so same-shard vnodes
-    /// converge on one canonical store. Use `RecoveredState::default()`
-    /// for a fresh start.
+    /// `persisted_base` is how far the store under the replica's tick
+    /// chain is written. Use `RecoveredState::default()` for a fresh
+    /// start.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
+    #[allow(clippy::too_many_arguments)] // a replica's whole construction context
     pub fn new(
         verifier: Arc<dyn Verifier>,
         derivation: Arc<dyn Derivation>,
@@ -106,11 +101,7 @@ impl NodeStateMachine {
         schedule_epoch: Epoch,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
-        provision_store: Arc<ProvisionStore>,
-        tx_store: Arc<TxStore>,
-        exec_cert_store: Arc<ExecCertStore>,
-        finalization_store: Arc<FinalizationStore>,
-        crossing_index: Arc<CrossingIndexSlot>,
+        persisted_base: BlockHeight,
     ) -> Self {
         let mut shard = ShardParticipation::new(
             verifier,
@@ -121,11 +112,7 @@ impl NodeStateMachine {
             recovered,
             mempool_config,
             provision_config,
-            provision_store,
-            tx_store,
-            exec_cert_store,
-            finalization_store,
-            crossing_index,
+            persisted_base,
         );
         shard.shard_coordinator.latch_dissolution(&schedule);
         Self {
@@ -152,6 +139,7 @@ impl NodeStateMachine {
     }
 
     /// The epoch the beacon folded the held schedule at.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn schedule_epoch(&self) -> Epoch {
         self.schedule_epoch
@@ -167,7 +155,7 @@ impl NodeStateMachine {
     /// Get the current topology snapshot as an `Arc`, for sites that
     /// need to clone it into off-thread closures (delegated action
     /// dispatch). The snapshot is identity-agnostic and shared across
-    /// every vnode on a host; per-vnode identity travels alongside it
+    /// every loop on a host; the signing identity travels alongside it
     /// on [`ActionContext`](hyperscale_core::ActionContext).
     #[must_use]
     pub(crate) fn topology_arc(&self) -> &Arc<TopologySnapshot> {
@@ -184,14 +172,6 @@ impl NodeStateMachine {
     #[must_use]
     pub const fn shard_coordinator(&self) -> &ShardCoordinator {
         &self.shard.shard_coordinator
-    }
-
-    /// Tell the shard coordinator which validators this host seats in its
-    /// shard.
-    pub(crate) fn set_host_seats(&mut self, seats: &[ValidatorId]) {
-        self.shard
-            .shard_coordinator
-            .set_host_seats(seats.iter().copied());
     }
 
     /// Get a reference to the execution coordinator.
@@ -262,15 +242,6 @@ impl NodeStateMachine {
             .seed_standing_answers(height, count);
     }
 
-    /// Tell execution how far the store this seat reads is written, as
-    /// the loop taking the seat finds it. See
-    /// [`ExecutionCoordinator::seat_on_persisted_base`].
-    pub(crate) fn seat_on_persisted_base(&mut self, height: BlockHeight) {
-        self.shard
-            .execution_coordinator
-            .seat_on_persisted_base(height);
-    }
-
     /// Run `f` against the shard half with the held [`TopologySchedule`]
     /// passed in.
     fn on_shard<F>(&mut self, f: F) -> Vec<Action>
@@ -283,16 +254,20 @@ impl NodeStateMachine {
     /// Hold `schedule`, folded at `epoch`, if it is newer than the one
     /// held. The replica latches its dissolution against the schedule it
     /// gives up and then against the new one, so a reading either showed
-    /// survives the eviction of the windows it rested on.
-    fn install_schedule(&mut self, epoch: Epoch, schedule: Arc<TopologySchedule>) {
+    /// survives the eviction of the windows it rested on, and drops the
+    /// pending blocks it judged under a committee the new one replaces
+    /// (see [`ShardCoordinator::on_schedule_replaced`]).
+    fn install_schedule(&mut self, epoch: Epoch, schedule: Arc<TopologySchedule>) -> Vec<Action> {
         if epoch <= self.schedule_epoch {
-            return;
+            return Vec::new();
         }
-        let coordinator = &mut self.shard.shard_coordinator;
-        coordinator.latch_dissolution(&self.schedule);
-        coordinator.latch_dissolution(&schedule);
+        let actions = self
+            .shard
+            .shard_coordinator
+            .on_schedule_replaced(&self.schedule, &schedule);
         self.schedule = schedule;
         self.schedule_epoch = epoch;
+        actions
     }
 
     /// Attach `validator` to this replica at `now`, and return what it owes
@@ -319,13 +294,13 @@ impl NodeStateMachine {
     ) -> Vec<Action> {
         self.now = now;
         self.shard.set_time(now);
-        self.install_schedule(epoch, schedule);
-        let mut actions = self.shard.shard_coordinator.attach_signer(
+        let mut actions = self.install_schedule(epoch, schedule);
+        actions.extend(self.shard.shard_coordinator.attach_signer(
             &self.schedule,
             validator,
             record,
             persisted_qc_round,
-        );
+        ));
         actions.extend(
             self.shard
                 .execution_coordinator
@@ -538,8 +513,9 @@ impl StateMachine for NodeStateMachine {
             // A schedule the beacon folded: held if newer, then the shard
             // coordinators replay what waited on the epoch.
             ProtocolEvent::BeaconBlockPersisted { epoch, schedule } => {
-                self.install_schedule(epoch, schedule);
-                self.on_shard(ShardParticipation::on_beacon_block_persisted)
+                let mut actions = self.install_schedule(epoch, schedule);
+                actions.extend(self.on_shard(ShardParticipation::on_beacon_block_persisted));
+                actions
             }
 
             // The beacon runs on the host's beacon loop, never on a replica.

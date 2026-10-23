@@ -654,7 +654,9 @@ where
     /// entry holds: a replica resuming on a store, or seated over one it
     /// imported, ran none of the ticks that stated them, and at a
     /// recovery's crossing a replica may hold no run of a tick at or below
-    /// the floor that stated a row the crossing keeps.
+    /// the floor that stated a row the crossing keeps. The loop seeds
+    /// from its replica's member rows when it builds and on each floor
+    /// raise.
     ///
     /// Rows read ahead of the chain's base are safe to seed from: a hold
     /// counts only against a view whose base holds its row stated in its
@@ -695,13 +697,12 @@ where
             .retain(|tx_hash, hold| hold.tick != height || !entry.holds_leg(*tx_hash));
     }
 
-    /// Append the output of the tick at `height`.
+    /// Append the output of the tick at `height`, as the shard's replica
+    /// ran it.
     ///
-    /// Same-shard vnodes share one chain and each executes the tick under
-    /// its own validator identity, so a height can be appended more than
-    /// once. A tick's output is a pure function of the committed chain
-    /// prefix, so every repeat carries byte-identical content and the
-    /// first append is the whole of it — which is why a repeat is
+    /// A tick's output is a pure function of the committed chain prefix,
+    /// so a repeat append of a height carries byte-identical content and
+    /// the first append is the whole of it — which is why a repeat is
     /// dropped rather than folded. Folding it would leave an exclusive
     /// write unchanged and apply every movement it carries a second
     /// time, and it would re-add ticks the chain has since resolved.
@@ -710,14 +711,13 @@ where
     /// recovery's crossing let go of, its run in flight when the floor
     /// rose.
     ///
-    /// `fates` are the resolutions its executor held for the tick when it
+    /// `fates` are the resolutions the replica held for the tick when it
     /// dispatched the run, applied under the acquisition that seats the
     /// output. A tick can run after its fate committed — a lagging tick
-    /// queue, or a seat admitted mid-chain re-running what its siblings
-    /// settled and evicted long ago — and the base then already carries
-    /// what the run leaves. Every other executor's reads range over this
-    /// entry, so one landing unstamped, to be resolved by a later call,
-    /// would be folded over that base by any read in between.
+    /// queue — and the base then already carries what the run leaves.
+    /// Every later read ranges over this entry, so one landing unstamped,
+    /// to be resolved by a later call, would be folded over that base by
+    /// any read in between.
     pub fn append(&self, height: BlockHeight, output: TickOutput, fates: &[TickResolution]) {
         let mut entries = write_or_recover(&self.entries);
         let floor = *read_or_recover(&self.floor);
@@ -751,8 +751,8 @@ where
     /// its row stated. A kept row whose leg no entry here held is
     /// [`seed_stated`](Self::seed_stated)'s to hold.
     ///
-    /// A floor at or below the current one does nothing, so every vnode
-    /// sharing the chain may raise it and it applies once.
+    /// A floor at or below the current one does nothing, so a repeated
+    /// raise applies once.
     pub fn raise_floor(&self, floor: BlockHeight, shard: ShardId) {
         let mut entries = write_or_recover(&self.entries);
         {
@@ -830,15 +830,13 @@ where
     }
 
     /// Record what the base now carries and drop every tick a future read
-    /// can no longer need. Called on `BlockPersisted`, and whenever the
-    /// set of executors over the chain changes.
+    /// can no longer need. Called on `BlockPersisted`, and once when the
+    /// loop opens the chain.
     ///
-    /// `executed` is the lowest baseline any executor over this chain
-    /// still reads: every vnode of the group runs each tick itself, so it
-    /// is the minimum over them, and a seat admitted mid-chain replays
-    /// from a height its siblings passed long ago. The chain cannot learn
-    /// it from its appends, which say only how far the furthest executor
-    /// has run.
+    /// `executed` is the lowest baseline the shard's replica still reads,
+    /// its execution coordinator's `baseline_floor()`. The chain cannot
+    /// learn it from its appends, which say only how far execution has
+    /// run, not which baselines queued ticks still read from.
     ///
     /// The eviction floor is the lower of what has persisted and
     /// `executed`, and the second half is load-bearing. A contribution
@@ -2075,9 +2073,8 @@ mod tests {
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
     }
 
-    /// Every vnode sharing the chain raises it, and it applies once: a
-    /// second raise at the same floor, or a lower one, drops nothing
-    /// appended above it.
+    /// A raise applies once: a second raise at the same floor, or a lower
+    /// one, drops nothing appended above it.
     #[test]
     fn raising_the_floor_twice_is_one_raise() {
         let floor = BlockHeight::new(3);
@@ -2360,10 +2357,9 @@ mod tests {
         assert_eq!(chain.len(), 0);
     }
 
-    /// Same-shard vnodes share one chain and each appends the tick it
-    /// executed. The outputs are byte-identical, so the second is
-    /// dropped: refolding it would leave an absolute unchanged and apply
-    /// every movement a second time.
+    /// A tick appended twice carries byte-identical outputs, so the
+    /// second is dropped: refolding it would leave an absolute unchanged
+    /// and apply every movement a second time.
     #[test]
     fn a_repeated_append_is_dropped_rather_than_refolded() {
         let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));

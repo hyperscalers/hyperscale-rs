@@ -3,17 +3,17 @@
 //!
 //! A join opens storage off the loop, snap-syncs a fresh store against the
 //! beacon-attested anchor (parking until this host's topology carries one,
-//! unless the shard's chain runs from network genesis), and seats the
-//! shard's vnodes on a new pinned thread; a leave refcounts memberships down and tears the thread, maps,
-//! and storage down at zero. The reconcile pair is the committed-state
-//! backstop: [`ShardSupervisor::reconcile_joins`] brings up any shard a
-//! local validator holds a consensus seat in that a lost delta never
-//! joined, and [`ShardSupervisor::reconcile_teardown`] retires a shard
-//! once no local validator holds a committee or routing role in it. The
-//! two read different committee views on purpose: joining asks "must this
-//! host run consensus" (the seatable view, observer riders excluded);
-//! teardown asks "does this host hold any window role" (full membership,
-//! riders included).
+//! unless the shard's chain runs from network genesis), and runs the shard's
+//! replica, with its local validators attached as signers, on a new pinned
+//! thread; a leave refcounts memberships down and tears the thread, maps, and
+//! storage down at zero. The reconcile pair is the committed-state backstop:
+//! [`ShardSupervisor::reconcile_joins`] brings up any shard a local validator
+//! holds a consensus seat in that a lost delta never joined, and
+//! [`ShardSupervisor::reconcile_teardown`] retires a shard once no local
+//! validator holds a committee or routing role in it. The two read different
+//! committee views on purpose: joining asks "must this host run consensus"
+//! (the seatable view, observer riders excluded); teardown asks "does this
+//! host hold any window role" (full membership, riders included).
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,8 +26,8 @@ use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::startup::holds_window_role;
 use hyperscale_node::{
-    Registration, RegistrationReply, SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat,
-    installed_network_genesis_block, network_genesis_block, seat_vnode_group,
+    HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
+    network_genesis_block,
 };
 use hyperscale_storage::{
     RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds, holds_state,
@@ -46,7 +46,7 @@ use crate::runner::{ShardChannels, ShardControl, VnodeConfig};
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
 /// the imported storage verified against the attested anchor, plus the
-/// recovered state the shard's state machines boot from.
+/// recovered state the shard's replica boots from.
 pub struct CompletedBootstrap {
     shard: ShardId,
     vnodes: Vec<VnodeConfig>,
@@ -349,8 +349,8 @@ impl ShardSupervisor {
         self.seat_shard(shard, &done.vnodes, done.storage, &done.recovered);
     }
 
-    /// Wire a shard's vnodes into the process maps and spawn its pinned
-    /// thread, booting the state machines from `recovered`.
+    /// Wire a shard's validators into the process maps and spawn its
+    /// pinned thread, booting the replica from `recovered`.
     fn seat_shard(
         &mut self,
         shard: ShardId,
@@ -453,14 +453,21 @@ impl ShardSupervisor {
             sender,
         } = pending;
         vnodes.retain(|vnode| ids.contains(&vnode.validator_id));
-        let inits = self.build_vnode_inits(shard, &vnodes, registration, &recovered);
-        let seated = inits.len();
+        let seated = vnodes.len();
         let shard_loop = attach_shard(
             &self.process,
             &self.node_config,
+            &self.replica_config(),
             registration,
-            inits,
-            (*storage).clone(),
+            HostedChain {
+                shard,
+                storage: (*storage).clone(),
+                recovered: &recovered,
+                signers: vnodes
+                    .iter()
+                    .map(|vnode| (vnode.validator_id, Arc::clone(&vnode.signer)))
+                    .collect(),
+            },
             sender,
         );
         let start = genesis
@@ -738,13 +745,12 @@ impl ShardSupervisor {
         });
     }
 
-    /// Queue each of `vnodes` the running loop of `shard` does not already
-    /// carry or queue: a validator drawn onto a shard this host serves
-    /// joins the loop rather than a thread of its own. The loop admits it
-    /// once its store is at rest and reports it back as
-    /// [`SupervisorEvent::Seated`].
+    /// Attach each of `vnodes` the running replica of `shard` does not
+    /// already carry or have queued: a validator drawn onto a shard this
+    /// host serves signs through its replica rather than a thread of its
+    /// own. The loop attaches it in the step that takes the control and
+    /// reports it back as [`SupervisorEvent::Attached`].
     fn seat_into_running(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
-        let config = self.seat_config();
         let Some(entry) = self.shards.get_mut(&shard) else {
             return;
         };
@@ -753,34 +759,30 @@ impl ShardSupervisor {
             if entry.validator_ids.contains(&id) || entry.queued.contains(&id) {
                 continue;
             }
-            let seat = VnodeSeat {
-                config: config.clone(),
-                validator: vnode.validator_id,
-                signer: Arc::clone(&vnode.signer),
-            };
-            if entry
-                .control_tx
-                .send(ShardControl::Seat(Box::new(seat)))
-                .is_ok()
-            {
+            let attach = ShardControl::Attach(vnode.validator_id, Arc::clone(&vnode.signer));
+            if entry.control_tx.send(attach).is_ok() {
                 entry.queued.push(id);
-                info!(shard = ?shard, validator = id, "Seat queued on a running shard");
+                info!(shard = ?shard, validator = id, "Attach sent to a running shard");
             }
         }
     }
 
-    /// A running loop admitted a queued seat: count the validator among
-    /// the shard's.
-    pub(super) fn on_seated(&mut self, shard: ShardId, validator: ValidatorId) {
+    /// A running loop attached a validator: count it among the shard's.
+    /// One that left while its attach was in flight is not counted: its
+    /// leave sent the loop a detach behind the attach.
+    pub(super) fn on_attached(&mut self, shard: ShardId, validator: ValidatorId) {
         let Some(entry) = self.shards.get_mut(&shard) else {
             return;
         };
         let id = validator.inner();
+        if !entry.queued.contains(&id) {
+            return;
+        }
         entry.queued.retain(|&queued| queued != id);
         if !entry.validator_ids.contains(&id) {
             entry.validator_ids.push(id);
         }
-        info!(shard = ?shard, validator = id, "Seat admitted on a running shard");
+        info!(shard = ?shard, validator = id, "Signer attached on a running shard");
     }
 
     /// Release `validator`'s membership in `shard`; tear the shard down
@@ -795,13 +797,13 @@ impl ShardSupervisor {
                 // A seat registering releases its store now; its reply,
                 // finding no seat, releases the registration.
                 self.registering.retain(|_, pending| pending.shard != shard);
-                info!(shard = ?shard, "Last pending vnode left during bootstrap; join abandoned");
+                info!(shard = ?shard, "Last pending signer left during bootstrap; join abandoned");
                 self.resume_pending_reshape_prep();
             } else {
                 info!(
                     shard = ?shard,
                     remaining = pending.len(),
-                    "Vnode left during bootstrap; join continues for remaining vnodes"
+                    "Signer left during bootstrap; join continues for the remaining signers"
                 );
             }
             return;
@@ -819,34 +821,42 @@ impl ShardSupervisor {
             return;
         };
         let id = validator.inner();
-        if !entry.validator_ids.contains(&id) {
-            warn!(shard = ?shard, validator = id, "Leave rejected: validator not seated on the shard");
+        if !entry.validator_ids.contains(&id) && !entry.queued.contains(&id) {
+            warn!(shard = ?shard, validator = id, "Leave rejected: validator not attached on the shard");
             return;
         }
-        if entry.validator_ids.len() == 1 {
+        let others = entry
+            .validator_ids
+            .iter()
+            .chain(&entry.queued)
+            .any(|&other| other != id);
+        if !others {
             self.tear_down(shard);
             return;
         }
+        // Behind any attach of it still on the same channel, so the loop
+        // detaches what it attached.
         if entry
             .control_tx
-            .send(ShardControl::Remove(validator))
+            .send(ShardControl::Detach(validator))
             .is_err()
         {
             return;
         }
         entry.validator_ids.retain(|&kept| kept != id);
+        entry.queued.retain(|&kept| kept != id);
         info!(
             shard = ?shard,
             validator = id,
             remaining = entry.validator_ids.len(),
-            "Vnode left; shard stays up for remaining local vnodes"
+            "Signer detached; shard stays up for its remaining signers"
         );
     }
 
     /// Tear a hosted shard's thread down and unwire it off the loop:
     /// signal shutdown, drop the entry, and join the thread off-loop,
     /// finishing the unwire in [`Self::on_torn_down`]. Shared by the
-    /// explicit per-vnode [`Self::leave`] at zero count and the
+    /// [`Self::leave`] of the last signer and the
     /// reshape-tick routable-expiry reconcile.
     fn tear_down(&mut self, shard: ShardId) {
         let Some(entry) = self.shards.remove(&shard) else {
@@ -900,9 +910,9 @@ impl ShardSupervisor {
             );
             self.tear_down(shard);
         }
-        // A shard that stays up releases, by the same rule applied per
-        // validator, each vnode that no longer holds a role in it, while
-        // another seat keeps the loop running.
+        // A shard that stays up detaches, by the same rule applied per
+        // validator, each signer that no longer holds a role in it, while
+        // another keeps the loop running.
         for (&shard, entry) in &mut self.shards {
             for id in entry.validator_ids.clone() {
                 let validator = ValidatorId::new(id);
@@ -911,11 +921,11 @@ impl ShardSupervisor {
                     && shard_retired(shard, &topology_snapshot, &routing, &alone)
                     && entry
                         .control_tx
-                        .send(ShardControl::Remove(validator))
+                        .send(ShardControl::Detach(validator))
                         .is_ok()
                 {
                     entry.validator_ids.retain(|&kept| kept != id);
-                    info!(shard = ?shard, validator = id, "Vnode left a running shard");
+                    info!(shard = ?shard, validator = id, "Signer detached from a running shard");
                 }
             }
         }
@@ -1061,9 +1071,9 @@ impl ShardSupervisor {
     }
 
     /// One [`VnodeConfig`] per seat-holding member of `shard`'s committee
-    /// whose signing key this host holds — the local vnodes a seat or
-    /// reconciled join brings up. Reads the seatable view, so a local
-    /// split observer riding the committee is never built into a vnode
+    /// whose signing key this host holds — the local validators a seat or
+    /// reconciled join attaches. Reads the seatable view, so a local split
+    /// observer riding the committee is never attached as a signer
     /// alongside co-hosted real members.
     pub(super) fn local_committee_vnodes(
         &self,
@@ -1082,31 +1092,9 @@ impl ShardSupervisor {
             .collect()
     }
 
-    /// Build one `VnodeInit` per joining vnode via [`seat_vnode_group`],
-    /// over the schedule `registration` handed back and booting from
-    /// `recovered`.
-    fn build_vnode_inits(
-        &self,
-        shard: ShardId,
-        vnodes: &[VnodeConfig],
-        registration: &Registration,
-        recovered: &RecoveredState,
-    ) -> Vec<VnodeInit> {
-        seat_vnode_group(SeatVnodeGroup {
-            config: self.seat_config(),
-            schedule: (Arc::clone(&registration.schedule), registration.epoch),
-            shard,
-            recovered,
-            vnodes: vnodes
-                .iter()
-                .map(|cfg| (cfg.validator_id, Arc::clone(&cfg.signer)))
-                .collect(),
-        })
-    }
-
-    /// How this host builds every vnode it seats at runtime.
-    fn seat_config(&self) -> SeatConfig {
-        SeatConfig {
+    /// How this host builds every replica it runs at runtime.
+    fn replica_config(&self) -> ReplicaConfig {
+        ReplicaConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: self.process.derivation(),
             code: self.process.code(),

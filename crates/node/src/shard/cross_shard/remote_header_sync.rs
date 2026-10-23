@@ -36,9 +36,10 @@ where
     /// dispatch any range fetches it emits. `source_shard` is the remote
     /// shard whose certified headers we're catching up on.
     ///
-    /// The scope is pointed at the slowest seat before the target moves.
-    /// A source shard that reshaped into existence begins its chain above
-    /// genesis, and a seat tracking it anchors at its attested boundary; a
+    /// The scope is pointed at the replica's verified frontier before the
+    /// target moves. A source shard that reshaped into existence begins
+    /// its chain above genesis, and the replica anchors it at its attested
+    /// boundary; a
     /// scope left below that anchor fetches from genesis, the
     /// contiguous-prefix responder returns empty (or, on a production split
     /// child whose store is a checkpoint of the parent, the parent's
@@ -49,7 +50,7 @@ where
         source_shard: ShardId,
         target: BlockHeight,
     ) {
-        self.follow_slowest_remote_header_seat(source_shard);
+        self.follow_remote_header_frontier(source_shard);
         let outputs =
             self.io
                 .cross_shard
@@ -61,6 +62,54 @@ where
         self.process_remote_header_sync_outputs(outputs);
     }
 
+    /// Admit `source_shard`'s scope up to the replica's contiguous verified
+    /// frontier for it, where the replica tracks the shard.
+    ///
+    /// The frontier only rises while the replica tracks the shard: a shard
+    /// it stops tracking loses its scope (see
+    /// [`Self::forget_untracked_remote_header_scopes`]), so one tracked
+    /// again from a lower anchor starts a fresh scope there.
+    ///
+    /// A scope this starts has no target of its own. When the replica
+    /// already holds a header verified above the frontier, as a shard
+    /// tracked again from its anchor does the moment it hears the live
+    /// tip, the scope syncs toward it at once rather than waiting out the
+    /// liveness probe.
+    pub(crate) fn follow_remote_header_frontier(&mut self, source_shard: ShardId) {
+        let coordinator = self.replica.remote_headers_coordinator();
+        let Some(height) = coordinator.verified_frontier(source_shard) else {
+            return;
+        };
+        let gap_target = coordinator.gap_sync_target(source_shard);
+        let sync = &mut self.io.cross_shard.remote_header_sync;
+        let held = sync.frontier(&source_shard);
+        if held.is_some_and(|held| held >= height) {
+            return;
+        }
+        let mut outputs = sync.handle(RemoteHeaderSyncInput::Admitted {
+            scope: source_shard,
+            height,
+        });
+        if held.is_none()
+            && let Some(target) = gap_target
+        {
+            outputs.extend(sync.handle(RemoteHeaderSyncInput::StartSync {
+                scope: source_shard,
+                target,
+            }));
+        }
+        self.process_remote_header_sync_outputs(outputs);
+    }
+
+    /// Forget the scope of every shard the replica no longer tracks.
+    pub(crate) fn forget_untracked_remote_header_scopes(&mut self) {
+        let coordinator = self.replica.remote_headers_coordinator();
+        self.io
+            .cross_shard
+            .remote_header_sync
+            .retain_scopes(|shard| coordinator.verified_frontier(*shard).is_some());
+    }
+
     // ─── step() handlers ────────────────────────────────────────────────
 
     /// Network callback: a range response arrived (possibly empty). Each
@@ -70,9 +119,9 @@ where
     /// it can defer the short-capped tail.
     ///
     /// An empty answer that names a floor above the range is the source
-    /// saying the range is gone for good: each seat re-anchors the source
-    /// at its attested boundary, and the scope follows the slowest seat
-    /// there, rather than asking for the range again.
+    /// saying the range is gone for good: the replica re-anchors the
+    /// source at its attested boundary, and the scope follows it there,
+    /// rather than asking for the range again.
     pub(crate) fn handle_remote_headers_response_received(
         &mut self,
         source_shard: ShardId,
@@ -86,7 +135,7 @@ where
                 source_shard,
                 floor,
             });
-            self.follow_slowest_remote_header_seat(source_shard);
+            self.follow_remote_header_frontier(source_shard);
         }
         let delivered_heights =
             self.deliver_fetched_headers(source_shard, from_height, count, headers);

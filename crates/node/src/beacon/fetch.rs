@@ -121,8 +121,10 @@ impl FetchReply for BeaconReply {
     }
 
     fn answered(&self, ids: FetchIds, event: ProtocolEvent) {
-        self.push(BeaconScopedInput::FetchFulfilled(ids));
-        self.push(BeaconScopedInput::Protocol(Box::new(event)));
+        self.push(BeaconScopedInput::Answered {
+            ids,
+            event: Box::new(event),
+        });
     }
 }
 

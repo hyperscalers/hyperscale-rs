@@ -926,7 +926,7 @@ fn a_restarted_payer_still_reclaims_its_refused_leg() {
 #[test]
 fn a_restarted_host_reseats_every_member_it_carries() {
     payer_reclaims_after_restart(
-        1,
+        2,
         &ScenarioConfig {
             vnodes_per_host: 2,
             ..venue_config()
@@ -1250,7 +1250,7 @@ fn voted_root(
 ) -> Option<GlobalReceiptRoot> {
     let execution = c
         .runner()
-        .vnode_state_in(u32::try_from(host).expect("a host index"), shard)?
+        .replica_in(u32::try_from(host).expect("a host index"), shard)?
         .execution_coordinator();
     execution.voted_receipt_root(&execution.tick_assignment_for(tx)?)
 }
@@ -1600,7 +1600,7 @@ fn staged_on(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> Option<
 /// Whether `host` offers a legs half accepting `tx` on `shard`.
 fn offers_legs(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool {
     c.runner()
-        .vnode_state_in(u32::try_from(host).expect("a host index"), shard)
+        .replica_in(u32::try_from(host).expect("a host index"), shard)
         .is_some_and(|state| {
             state
                 .execution_coordinator()
@@ -1656,7 +1656,7 @@ fn a_snap_synced_joiner_builds_the_legs_half_of_a_row_it_never_ran() {
     assert!(
         cluster
             .runner()
-            .vnode_state_in(joiner_index, shard)
+            .replica_in(joiner_index, shard)
             .is_some_and(|state| state
                 .execution_coordinator()
                 .voted_receipt_root(&TickId::new(shard, tick))
@@ -1756,7 +1756,7 @@ fn a_replica_restarted_past_replay_reach_accepts_a_stated_row() {
     assert!(
         cluster
             .runner()
-            .vnode_state_in(u32::try_from(restarted).expect("a host index"), shard)
+            .replica_in(u32::try_from(restarted).expect("a host index"), shard)
             .is_some_and(|state| state
                 .execution_coordinator()
                 .voted_receipt_root(&TickId::new(shard, tick))

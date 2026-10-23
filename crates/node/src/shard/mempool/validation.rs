@@ -208,14 +208,8 @@ where
         let tx_hash = tx.hash();
         // Already-vouched (in TxStore) or terminally-rejected (tombstoned)
         // are skipped. `pending_validation` blocks duplicate enqueues.
-        // Tombstones are identical across same-shard vnodes (deterministic
-        // mempool processing) — peek at vnode 0's set as representative.
         if !self.io.caches.tx_store.contains(&tx_hash)
-            && !self
-                .vnode(0)
-                .state
-                .mempool_coordinator()
-                .is_tombstoned(&tx_hash)
+            && !self.replica.mempool_coordinator().is_tombstoned(&tx_hash)
         {
             self.io.mempool.pending_validation.insert(tx_hash);
             self.queue_validation(tx);

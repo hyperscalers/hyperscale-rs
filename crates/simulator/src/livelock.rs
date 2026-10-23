@@ -188,7 +188,7 @@ impl LivelockAnalyzer {
         for shard_idx in 0..num_shards {
             let shard = ShardId::leaf(depth, shard_idx);
 
-            if let Some(node) = runner.shard_vnodes(shard).first() {
+            if let Some(node) = runner.shard_replicas(shard).first() {
                 let incomplete = node.mempool_coordinator().incomplete_transactions();
 
                 for (hash, status, tx) in incomplete {

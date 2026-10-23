@@ -60,7 +60,7 @@ where
     /// and committed block headers).
     ///
     /// Both handler closures see a single `(message, target_shard)` pair —
-    /// the network framework computes the per-vnode fan-out from each
+    /// the network framework computes the per-shard fan-out from each
     /// type's [`GossipMessage::SCOPE`] and [`GossipMessage::source_shard`].
     /// Closures here just translate into `ShardScopedInput`.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per gossip type
@@ -261,9 +261,9 @@ where
         // ── block.vote → ProtocolEvent::{Verified,Unverified}BlockVoteReceived ──
         //
         // `BlockVote.shard_id()` is the shard whose consensus the
-        // vote is for; with cross-shard hosting that selects which of
-        // this host's vnodes the event fans out to. Drop early if the
-        // vote targets a shard we don't host.
+        // vote is for; on a host carrying several shards that selects
+        // the loop the event goes to. Drop early if the vote targets a
+        // shard we don't host.
         //
         // Wire decode lands the wrapper as `Verifiable::Unverified`;
         // local-dispatched sends from a colocated voter arrive already

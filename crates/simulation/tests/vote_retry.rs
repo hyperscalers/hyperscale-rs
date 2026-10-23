@@ -162,7 +162,7 @@ fn settled_frontier(cluster: &SimCluster, host: usize, shard: ShardId) -> BlockH
 /// The validators `host` seats on `shard`.
 fn seated(cluster: &SimCluster, host: usize, shard: ShardId) -> Vec<ValidatorId> {
     let host = NodeIndex::try_from(host).expect("host index fits a NodeIndex");
-    cluster.runner().seated_in(host, shard)
+    cluster.runner().signers_in(host, shard)
 }
 
 /// The grown cluster under load, its shuffle run until it names a member

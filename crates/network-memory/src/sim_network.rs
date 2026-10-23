@@ -212,9 +212,9 @@ impl Network for SimNetworkAdapter {
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         // Tee to in-process subscribers — the harness's `accept_gossip`
         // skips the publisher's own node (matching gossipsub's no-loop
-        // semantics), so colocated vnodes would otherwise miss their
-        // own host's broadcasts. The registry computes the per-vnode
-        // fan-out from `hosted_shards`.
+        // semantics), so the host's own shard loops would otherwise miss
+        // its broadcasts. The registry computes the per-shard fan-out
+        // from `hosted_shards`.
         let _ = self.registry.local_dispatch_gossip(message, Some(shard));
         let data = compression::compress(
             &hbor_to_vec(message).expect("SimNetworkAdapter: failed to encode message"),
@@ -241,7 +241,7 @@ impl Network for SimNetworkAdapter {
     }
 
     fn register_gossip_handler<M: GossipMessage + 'static>(&self, handler: impl GossipHandler<M>) {
-        // Registry owns wire decode + per-vnode fan-out. Topic scope
+        // Registry owns wire decode + per-shard fan-out. Topic scope
         // is irrelevant in simulation (delivery controlled by harness).
         self.registry.register_gossip(handler);
     }

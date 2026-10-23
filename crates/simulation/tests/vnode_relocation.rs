@@ -227,7 +227,7 @@ fn vnode_moves_through_a_committee_rotation() {
 
     // ── Participation: the mover follows, votes, and proposes in B ──
     let watch_from = runner
-        .vnode_state_in(node, to)
+        .replica_in(node, to)
         .expect("joined shard is hosted")
         .shard_coordinator()
         .committed_height();
@@ -240,7 +240,7 @@ fn vnode_moves_through_a_committee_rotation() {
         // proposals commit.
         let (peer, _) = committee_member_host(r, to, Some(node));
         let tip = r
-            .vnode_state_in(peer, to)
+            .replica_in(peer, to)
             .expect("member host carries the shard")
             .shard_coordinator()
             .committed_height();
@@ -256,10 +256,10 @@ fn vnode_moves_through_a_committee_rotation() {
     if !proposed {
         let (peer, _) = committee_member_host(&*runner, to, Some(node));
         let peer_tip = runner
-            .vnode_state_in(peer, to)
+            .replica_in(peer, to)
             .map(|s| s.shard_coordinator().committed_height());
         let mover_tip = runner
-            .vnode_state_in(node, to)
+            .replica_in(node, to)
             .map(|s| s.shard_coordinator().committed_height());
         let mut per_member = String::new();
         if let Some((_, state)) = runner
@@ -269,7 +269,7 @@ fn vnode_moves_through_a_committee_rotation() {
             for m in state.shard_consensus_members.get(&to).into_iter().flatten() {
                 let h = runner.network().validator_to_node(*m);
                 let tip = runner
-                    .vnode_state_in(h, to)
+                    .replica_in(h, to)
                     .map(|s| s.shard_coordinator().committed_height());
                 let _ = write!(per_member, "\n  v{m:?} host{h} tip={tip:?}");
             }
@@ -281,7 +281,7 @@ fn vnode_moves_through_a_committee_rotation() {
         );
     }
     let mover_tip = runner
-        .vnode_state_in(node, to)
+        .replica_in(node, to)
         .expect("joined shard is hosted")
         .shard_coordinator()
         .committed_height();
@@ -345,14 +345,14 @@ fn vnode_moves_through_a_committee_rotation() {
     );
     let (origin_peer, _) = committee_member_host(&*runner, from, Some(victim_node));
     let origin_before = runner
-        .vnode_state_in(origin_peer, from)
+        .replica_in(origin_peer, from)
         .expect("origin member host")
         .shard_coordinator()
         .committed_height();
     let drain_deadline = runner.now() + Duration::from_millis(EPOCH_MS * DRAIN_BUDGET_EPOCHS);
     let origin_alive = run_until_or(&mut *runner, drain_deadline, &mut moves, |r| {
         assert_at_strength(r, from);
-        r.vnode_state_in(origin_peer, from)
+        r.replica_in(origin_peer, from)
             .expect("origin member host")
             .shard_coordinator()
             .committed_height()
@@ -375,7 +375,7 @@ fn vnode_moves_through_a_committee_rotation() {
     // participates; member-grade catch-up is the beacon-driven join
     // path asserted above.)
     let resumed = runner
-        .vnode_state_in(victim_node, from)
+        .replica_in(victim_node, from)
         .expect("rejoined shard is hosted")
         .shard_coordinator()
         .committed_height();

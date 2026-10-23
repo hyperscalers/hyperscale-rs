@@ -19,7 +19,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput, ShardScopedInput};
-use hyperscale_node::{NodeConfig, NodeHost, SeatConfig, StartupChain, VnodeSeat};
+use hyperscale_node::{HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -116,9 +116,9 @@ fn fixture() -> Fixture {
 type Host = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
 impl Fixture {
-    /// How every host here builds its vnodes and its fold.
-    fn seat_config(&self) -> SeatConfig {
-        SeatConfig {
+    /// How every host here builds its replicas and its fold.
+    fn replica_config(&self) -> ReplicaConfig {
+        ReplicaConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: Arc::new(StubVmStatics),
             code: Arc::new(AllCodeRuns),
@@ -135,17 +135,8 @@ impl Fixture {
         (self.committee.validator_id(idx), self.committee.signer(idx))
     }
 
-    /// A queued seat for `committee[idx]`.
-    fn seat(&self, idx: usize) -> VnodeSeat {
-        VnodeSeat {
-            config: self.seat_config(),
-            validator: self.committee.validator_id(idx),
-            signer: self.committee.signer(idx),
-        }
-    }
-
     /// A host over fresh genesis beacon storage running each of `chains`
-    /// at genesis with `committee[idx]` seated, and a beacon participant
+    /// at genesis with `committee[idx]` attached, and a beacon participant
     /// for each of `participants`.
     fn host(
         &self,
@@ -160,14 +151,14 @@ impl Fixture {
             .commit_beacon_block(&self.genesis_block, &Arc::new(self.genesis_state.clone()));
         let fresh = RecoveredState::default();
         NodeHost::new(
-            self.seat_config(),
+            self.replica_config(),
             chains
                 .iter()
-                .map(|&(shard, idx)| StartupChain {
+                .map(|&(shard, idx)| HostedChain {
                     shard,
                     storage: SimShardStorage::new(shard_prefix_path(shard)),
                     recovered: &fresh,
-                    vnodes: vec![self.identity(idx)],
+                    signers: vec![self.identity(idx)],
                 })
                 .collect(),
             participants.iter().map(|&idx| self.identity(idx)).collect(),
@@ -186,7 +177,7 @@ impl Fixture {
         )
     }
 
-    /// A host running shard A with `committee[0]` seated, plus a beacon
+    /// A host running shard A with `committee[0]` attached, plus a beacon
     /// participant for each of `participants`.
     fn shard_a_host(&self, participants: &[usize]) -> Host {
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD_A).collect()));
@@ -200,14 +191,16 @@ impl Fixture {
         )
     }
 
-    /// Run shard `shard` on `host` at runtime with `committee[idx]` seated.
+    /// Run shard `shard` on `host` at runtime with `committee[idx]` attached.
     fn add_shard(&self, host: &mut Host, shard: ShardId, idx: usize, event_tx: Sender<HostEvent>) {
         host.add_shard(
-            shard,
-            self.seat_config(),
-            &RecoveredState::default(),
-            vec![self.identity(idx)],
-            SimShardStorage::new(shard_prefix_path(shard)),
+            &self.replica_config(),
+            HostedChain {
+                shard,
+                storage: SimShardStorage::new(shard_prefix_path(shard)),
+                recovered: &RecoveredState::default(),
+                signers: vec![self.identity(idx)],
+            },
             event_tx,
         );
     }
@@ -251,7 +244,7 @@ fn add_and_remove_shard_at_runtime() {
     // Add shard B at runtime.
     fix.add_shard(&mut host, SHARD_B, 2, event_tx.clone());
     assert!(host.hosted_shards().any(|s| s == SHARD_B));
-    assert_eq!(host.vnodes_len(SHARD_B), 1);
+    assert_eq!(host.signers(SHARD_B), vec![fix.committee.validator_id(2)]);
     assert!(
         registry
             .local_dispatch_request(SHARD_B, block_request())
@@ -385,85 +378,69 @@ fn remove_unknown_shard_is_none() {
     assert!(host.hosted_shards().any(|s| s == SHARD_A));
 }
 
-/// A validator drawn onto a shard its host already runs joins the running
-/// loop, over the stores its first seat's group co-owns, and keeps its
-/// beacon participant.
+/// A validator drawn onto a shard its host already runs attaches to the
+/// running replica in the step that asks, and keeps its beacon
+/// participant.
 #[test]
-fn a_second_seat_joins_the_running_loop_over_its_stores() {
+fn a_second_signer_attaches_to_the_running_replica() {
     let fix = fixture();
     let mut host = fix.shard_a_host(&[1]);
 
-    let out = host.seat_vnode(SHARD_A, fix.seat(1));
+    let (validator, signer) = fix.identity(1);
+    let out = host.attach_signer(SHARD_A, validator, signer);
 
-    assert_eq!(out.seated, vec![fix.committee.validator_id(1)]);
-    assert_eq!(host.vnodes_len(SHARD_A), 2);
+    assert_eq!(out.attached, vec![validator]);
+    assert_eq!(
+        host.signers(SHARD_A),
+        vec![fix.committee.validator_id(0), validator]
+    );
     assert_eq!(
         host.participants().collect::<Vec<_>>(),
-        vec![fix.committee.validator_id(1)],
-        "seating does not touch the participant",
+        vec![validator],
+        "attaching does not touch the participant",
     );
-    assert_eq!(
-        host.seated_validators(SHARD_A)[1],
-        fix.committee.validator_id(1)
-    );
-    let first = host.vnode_state(SHARD_A, 0);
-    let joiner = host.vnode_state(SHARD_A, 1);
-    assert!(Arc::ptr_eq(
-        first.mempool_coordinator().tx_store(),
-        joiner.mempool_coordinator().tx_store()
-    ));
-    let (first, joiner) = (
-        first.execution_coordinator(),
-        joiner.execution_coordinator(),
-    );
-    assert!(Arc::ptr_eq(
-        first.exec_cert_store(),
-        joiner.exec_cert_store()
-    ));
-    assert!(Arc::ptr_eq(
-        first.finalization_store(),
-        joiner.finalization_store()
-    ));
-    assert!(Arc::ptr_eq(first.crossing_index(), joiner.crossing_index()));
 }
 
-/// A seat for a validator the loop already carries is dropped.
+/// Attaching a validator the replica already signs for changes nothing.
 #[test]
-fn a_seat_the_loop_already_carries_is_dropped() {
+fn attaching_an_attached_signer_changes_nothing() {
     let fix = fixture();
     let mut host = fix.shard_a_host(&[]);
 
-    let out = host.seat_vnode(SHARD_A, fix.seat(0));
+    let (validator, signer) = fix.identity(0);
+    let out = host.attach_signer(SHARD_A, validator, signer);
 
-    assert!(out.seated.is_empty());
-    assert_eq!(host.vnodes_len(SHARD_A), 1);
+    assert!(out.attached.is_empty());
+    assert_eq!(host.signers(SHARD_A), vec![validator]);
 }
 
-/// Removing one of two seats leaves the other running on the loop.
+/// Detaching one of two signers leaves the other attached, and detaching
+/// one never attached reports so.
 #[test]
-fn removing_one_seat_leaves_the_other_running() {
+fn detaching_one_signer_leaves_the_other_attached() {
     let fix = fixture();
     let mut host = fix.shard_a_host(&[]);
-    let _ = host.seat_vnode(SHARD_A, fix.seat(1));
+    let (validator, signer) = fix.identity(1);
+    let _ = host.attach_signer(SHARD_A, validator, signer);
 
-    assert!(host.remove_vnode(SHARD_A, fix.committee.validator_id(0)));
+    assert!(host.detach_signer(SHARD_A, fix.committee.validator_id(0)));
 
     assert!(host.hosted_shards().any(|s| s == SHARD_A));
-    assert_eq!(host.vnodes_len(SHARD_A), 1);
-    assert_eq!(
-        host.seated_validators(SHARD_A),
-        vec![fix.committee.validator_id(1)]
-    );
-    assert!(!host.remove_vnode(SHARD_A, fix.committee.validator_id(2)));
+    assert_eq!(host.signers(SHARD_A), vec![validator]);
+    assert!(!host.detach_signer(SHARD_A, fix.committee.validator_id(2)));
 }
 
-/// The last seat leaves with its loop, never through `remove_vnode`.
+/// Detaching the last signer leaves the shard hosted, its replica
+/// following the chain with no signer.
 #[test]
-#[should_panic(expected = "leaves with its loop")]
-fn the_last_seat_leaves_only_with_its_loop() {
+fn detaching_the_last_signer_keeps_the_shard_hosted() {
     let fix = fixture();
     let mut host = fix.shard_a_host(&[]);
-    host.remove_vnode(SHARD_A, fix.committee.validator_id(0));
+
+    assert!(host.detach_signer(SHARD_A, fix.committee.validator_id(0)));
+
+    assert!(host.hosted_shards().any(|s| s == SHARD_A));
+    assert!(host.signers(SHARD_A).is_empty());
 }
 
 /// The split predecessor a mid-handoff host still serves, its two

@@ -4,8 +4,7 @@
 //! on every event. The run-loop methods live in [`super`].
 //!
 //! - [`NodeHost::initialize_shard_genesis`] feeds the supplied genesis
-//!   block into every vnode of its shard and drains the resulting
-//!   actions via the common [`NodeHost::drain_actions`] path.
+//!   block into its shard's replica and drains the resulting actions.
 //! - [`network_genesis_block`] commits the network genesis substates into a
 //!   fresh store and builds the genesis block over their state root. Every
 //!   store that installs it builds the same block.
@@ -34,35 +33,29 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Initialize every vnode in `genesis_block`'s shard with the
-    /// supplied genesis block, dispatching the resulting actions
-    /// per-vnode. Vnodes in other hosted shards are untouched —
-    /// cross-shard hosts call this once per shard with that shard's
-    /// genesis block.
+    /// Initialize `genesis_block`'s shard's replica with the supplied
+    /// genesis block, dispatching the resulting actions. Other hosted
+    /// shards are untouched — cross-shard hosts call this once per shard
+    /// with that shard's genesis block.
     pub fn initialize_shard_genesis(&mut self, genesis_block: &Block) {
-        let shard = genesis_block.header().shard_id();
-        let count = self.vnodes_len(shard);
-        let now = self.shard_loop_mut(shard).now;
-        for vnode_idx in 0..count {
-            let actions = self
-                .vnode_state_mut(shard, vnode_idx)
-                .initialize_genesis(now, genesis_block);
-            self.shard_loop_mut(shard).drain_actions(vnode_idx, actions);
-        }
-        self.shard_loop_mut(shard)
-            .seed_genesis_substate_frontier(genesis_block);
-        self.shard_loop_mut(shard)
-            .seed_genesis_standing_answers(genesis_block);
+        let shard_loop = self.shard_loop_mut(genesis_block.header().shard_id());
+        let actions = shard_loop
+            .replica
+            .initialize_genesis(shard_loop.now, genesis_block);
+        shard_loop.drain_actions(actions);
+        shard_loop.seed_genesis_substate_frontier(genesis_block);
+        shard_loop.seed_genesis_standing_answers(genesis_block);
     }
 
-    /// Resume a seated shard's consensus from its recovered committed
+    /// Resume a hosted shard's consensus from its recovered committed
     /// state — [`ShardLoop::resume_committed`]'s counterpart for
     /// the simulation runner, which routes the restore through the host
     /// step so the resulting sends and timer arms flow through its
-    /// scheduler (production seats the pinned loop pre-spawn and captures
-    /// the timer ops directly). A committee seated onto a quiet chain — a
-    /// halt recovery's fresh committee — hears nothing from gossip, so
-    /// without the restore its vnodes never propose or time out.
+    /// scheduler (production resumes the pinned loop pre-spawn and
+    /// captures the timer ops directly). A committee seated onto a quiet
+    /// chain — a halt recovery's fresh committee — hears nothing from
+    /// gossip, so without the restore its replica never proposes or times
+    /// out.
     ///
     /// [`ShardLoop::resume_committed`]: crate::shard::ShardLoop::resume_committed
     pub fn resume_shard_committed(
@@ -79,7 +72,7 @@ where
     /// Run the deterministic part of one shard's genesis ceremony: install
     /// the network genesis into the shard's fresh store (see
     /// [`network_genesis_block`]), persist the block into the shard's
-    /// vnodes, and drain the resulting setup output.
+    /// replica, and drain the resulting setup output.
     ///
     /// Returns the block, its certified form, and the drained
     /// [`StepOutput`]. The caller commits the

@@ -459,10 +459,6 @@ pub enum SyncInput<B: SyncBinding> {
     /// the block it applied there exists. Re-queues the height if it is
     /// still open. Idempotent while a fetch for it is in flight.
     Reopen { scope: B::Scope, height: B::Key },
-    /// The consumer holds no more of `scope` than `height`: heights above
-    /// it the scope counted held, committed or applied, go back into the
-    /// fetch window. A no-op at or above the frontier.
-    Rewind { scope: B::Scope, height: B::Key },
     /// The consumer gave up on the target: nobody reachable serves the
     /// height above the frontier. The scope settles there and completes;
     /// a later `StartSync` raises the target again.
@@ -542,18 +538,17 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes.values().map(|s| s.in_flight_ranges).sum()
     }
 
-    /// The highest height admitted for `scope`, or `None` for a scope it
-    /// has never heard of.
-    #[must_use]
-    pub(crate) fn committed(&self, scope: &B::Scope) -> Option<B::Key> {
-        self.scopes.get(scope).map(|s| s.committed)
-    }
-
     /// The highest height `scope` holds without a gap, or `None` for a
     /// scope it has never heard of.
     #[must_use]
     pub(crate) fn frontier(&self, scope: &B::Scope) -> Option<B::Key> {
         self.scopes.get(scope).map(ScopeState::frontier)
+    }
+
+    /// Forget every scope `keep` refuses, with everything it tracked: a
+    /// later input for one starts it afresh.
+    pub(crate) fn retain_scopes(&mut self, mut keep: impl FnMut(&B::Scope) -> bool) {
+        self.scopes.retain(|scope, _| keep(scope));
     }
 
     /// Per-scope status snapshot.
@@ -589,7 +584,6 @@ impl<B: SyncBinding> Sync<B> {
             SyncInput::Admitted { scope, height } => self.handle_admitted(&scope, height),
             SyncInput::Applied { scope, height } => self.handle_applied(&scope, height),
             SyncInput::Reopen { scope, height } => self.handle_reopen(&scope, height),
-            SyncInput::Rewind { scope, height } => self.handle_rewind(&scope, height),
             SyncInput::Settle { scope } => self.handle_settle(&scope),
             SyncInput::Tick { now } => self.handle_tick(now),
         }
@@ -894,28 +888,6 @@ impl<B: SyncBinding> Sync<B> {
             );
             state.queue_height(height);
         }
-        self.emit_fetches()
-    }
-
-    fn handle_rewind(&mut self, scope: &B::Scope, height: B::Key) -> Vec<SyncOutput<B>> {
-        let Some(state) = self.scopes.get_mut(scope) else {
-            return vec![];
-        };
-        let frontier = state.frontier();
-        if height >= frontier {
-            return vec![];
-        }
-        info!(
-            binding = B::NAME,
-            ?scope,
-            frontier = frontier.as_u64(),
-            height = height.as_u64(),
-            "sync: rewound"
-        );
-        state.committed = state.committed.min(height);
-        state.applied.retain(|&h| h <= height);
-        state.not_found_streak = 0;
-        Self::queue_window(state, &self.config);
         self.emit_fetches()
     }
 
@@ -2754,89 +2726,38 @@ mod tests {
         assert!(s.is_syncing());
     }
 
-    /// A rewind below the committed height fetches the heights between
-    /// again, and the scope completes once they are admitted.
+    /// A forgotten scope starts afresh: admitted below where it stood, it
+    /// stands there and fetches from there, and the scopes kept are left
+    /// as they were.
     #[test]
-    fn a_rewind_below_committed_fetches_the_gap() {
-        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
-        let _ = s.handle(SyncInput::Admitted {
-            scope: (),
-            height: BlockHeight::new(6),
-        });
-        let _ = s.handle(SyncInput::StartSync {
-            scope: (),
-            target: BlockHeight::new(6),
-        });
-        assert!(!s.is_syncing());
-
-        let outputs = s.handle(SyncInput::Rewind {
-            scope: (),
-            height: BlockHeight::new(3),
-        });
-        assert_eq!(fetched_from(&outputs), vec![4, 5, 6]);
-        assert_eq!(s.frontier(&()), Some(BlockHeight::new(3)));
-        assert!(s.is_syncing());
-
-        let outputs = s.handle(SyncInput::Admitted {
-            scope: (),
-            height: BlockHeight::new(6),
-        });
-        assert_eq!(completed_at(&outputs), Some(6));
-    }
-
-    /// A rewind below applied heights gives them back to the window.
-    #[test]
-    fn a_rewind_below_applied_heights_fetches_them_again() {
-        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
-        let _ = s.handle(SyncInput::StartSync {
-            scope: (),
-            target: BlockHeight::new(4),
-        });
-        for h in 1..=4 {
-            let _ = s.handle(SyncInput::FetchSucceeded {
-                scope: (),
-                from: BlockHeight::new(h),
-                count: 1,
-                delivered_heights: vec![BlockHeight::new(h)],
-                now: LocalTimestamp::ZERO,
-            });
-            let _ = s.handle(SyncInput::Applied {
-                scope: (),
-                height: BlockHeight::new(h),
+    fn a_forgotten_scope_starts_afresh_below_where_it_stood() {
+        let mut s: Sync<ShardBinding> = Sync::new(cfg_per_id());
+        for scope in [1, 2] {
+            let _ = s.handle(SyncInput::Admitted {
+                scope,
+                height: BlockHeight::new(6),
             });
         }
-        assert!(!s.is_syncing());
+        s.retain_scopes(|scope| *scope != 1);
+        assert_eq!(s.frontier(&1), None);
+        assert_eq!(s.frontier(&2), Some(BlockHeight::new(6)));
 
-        let outputs = s.handle(SyncInput::Rewind {
-            scope: (),
+        let _ = s.handle(SyncInput::Admitted {
+            scope: 1,
             height: BlockHeight::new(2),
         });
-        assert_eq!(fetched_from(&outputs), vec![3, 4]);
-
-        let outputs = s.handle(SyncInput::Applied {
-            scope: (),
-            height: BlockHeight::new(4),
+        let outputs = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(4),
         });
-        assert_eq!(completed_at(&outputs), Some(4));
-    }
-
-    /// A rewind at or above the frontier changes nothing.
-    #[test]
-    fn a_rewind_at_the_frontier_is_a_no_op() {
-        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
-        let _ = s.handle(SyncInput::Admitted {
-            scope: (),
-            height: BlockHeight::new(5),
-        });
-        let _ = s.handle(SyncInput::StartSync {
-            scope: (),
-            target: BlockHeight::new(7),
-        });
-        let outputs = s.handle(SyncInput::Rewind {
-            scope: (),
-            height: BlockHeight::new(5),
-        });
-        assert!(outputs.is_empty());
-        assert_eq!(s.frontier(&()), Some(BlockHeight::new(5)));
+        assert_eq!(s.frontier(&1), Some(BlockHeight::new(2)));
+        let fetched: Vec<u64> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                SyncOutput::Fetch { scope: 1, from, .. } => Some(from.inner()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fetched, vec![3, 4]);
     }
 }

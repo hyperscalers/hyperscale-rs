@@ -339,20 +339,19 @@ impl ExecutionSim {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            height,
         );
         let _ = sim.coord.attach_signer(&sim.topology, ValidatorId::new(0));
         sim.seat_on_store_at(height);
         sim
     }
 
-    /// Seat the coordinator over a store already written through
+    /// Seat the tick chain over a store already written through
     /// `height`, as a host does when it opens a shard: the chain learns
-    /// what its base carries, and the coordinator learns it from the
-    /// chain.
-    fn seat_on_store_at(&mut self, height: BlockHeight) {
+    /// what its base carries, as the coordinator built over it did.
+    fn seat_on_store_at(&self, height: BlockHeight) {
         self.chain
             .prune_persisted(height, self.coord.baseline_floor());
-        self.coord.seat_on_persisted_base(self.chain.persisted());
     }
 
     /// Acknowledge the write of every block committed so far, in the
@@ -808,7 +807,7 @@ impl ExecutionSim {
     /// committed below `replay_from` is one this replica's ledger never
     /// hears of.
     pub fn restart_replaying(&mut self, replay_from: BlockHeight, dispatch_from: BlockHeight) {
-        self.coord = self.restored(replay_from, dispatch_from);
+        self.coord = self.restored(replay_from, dispatch_from, self.height);
         self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
         self.seat_on_store_at(self.height);
         self.pending.clear();
@@ -819,76 +818,14 @@ impl ExecutionSim {
         self.drain();
     }
 
-    /// Seat a validator of the shard on the loop this replica runs with
-    /// no replay window: a coordinator restored at the tip over the tick
-    /// chain its sibling has been running on. The driver follows the
-    /// joiner from here.
-    pub fn seat_joiner_at_tip(&mut self) {
-        assert!(self.pending.is_empty(), "the sibling has a tick in flight");
-        let tip = self.committed.last().expect("a committed tip");
-        let recovered = RecoveredState {
-            committed_height: self.height,
-            committed_block_anchor_wt: Some(tip.block().header().parent_qc().weighted_timestamp()),
-            ..RecoveredState::default()
-        };
-        self.coord = ExecutionCoordinator::with_shared_stores(
-            self.local_shard,
-            Arc::new(AllCodeRuns),
-            Arc::new(CrossingIndexSlot::default()),
-            &recovered,
-            Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizationStore::new()),
-            Arc::new(ProvenAnchors::new()),
-            Arc::new(CounterpartMirror::new()),
-        );
-        let _ = self
-            .coord
-            .attach_signer(&self.topology, ValidatorId::new(0));
-        self.coord.seat_on_persisted_base(self.chain.persisted());
-    }
-
-    /// Seat a second validator of the shard on the loop this replica
-    /// runs, as a host does for one drawn onto a shard it already
-    /// serves: a coordinator restored from the store, replaying the whole
-    /// committed chain over the tick chain its sibling has been running
-    /// on. The driver follows the joiner from here.
-    ///
-    /// Returns what a tick at the tip reads at `key` — the baseline the
-    /// sibling's next tick takes — once for each tick the joiner re-runs,
-    /// taken after that run's append and before its result reaches the
-    /// joiner's coordinator. The two are different threads' work on a
-    /// host, so a sibling's read may fall anywhere between them.
-    pub fn seat_joiner_reading(&mut self, key: SubstateKey) -> Vec<Option<Vec<u8>>> {
-        assert!(self.pending.is_empty(), "the sibling has a tick in flight");
-        let sibling = self.coord.baseline_floor();
-        self.coord = self.restored(BlockHeight::new(1), BlockHeight::GENESIS);
-        self.coord.seat_on_persisted_base(self.chain.persisted());
-        let effects = self
-            .coord
-            .on_committed_state_restored(&self.topology, &StubVmStatics);
-        self.absorb(effects.actions);
-        self.chain
-            .prune_persisted(self.height, sibling.min(self.coord.baseline_floor()));
-
-        let mut read = Vec::new();
-        while let Some(batch) = self.pending.pop_front() {
-            let (tick, outcome) = self.execute(batch);
-            read.push(self.read(key));
-            let actions = self
-                .coord
-                .on_execution_batch_completed(&self.topology, tick, outcome);
-            self.absorb(actions);
-        }
-        read
-    }
-
     /// A coordinator restored over a store that hands back the committed
     /// blocks from `replay_from` up and answers for no baseline below
-    /// the one `dispatch_from` reads.
+    /// the one `dispatch_from` reads, written through `persisted_base`.
     fn restored(
         &self,
         replay_from: BlockHeight,
         dispatch_from: BlockHeight,
+        persisted_base: BlockHeight,
     ) -> ExecutionCoordinator {
         let blocks: Vec<Verified<CertifiedBlock>> = self
             .committed
@@ -920,6 +857,7 @@ impl ExecutionSim {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            persisted_base,
         );
         let _ = coord.attach_signer(&self.topology, ValidatorId::new(0));
         coord

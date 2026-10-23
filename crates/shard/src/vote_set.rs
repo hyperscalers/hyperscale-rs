@@ -10,8 +10,8 @@
 //! [`VoteSet::add_verified_vote`] since we just signed them.
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey, Round, Verified, VoteCount,
-    WeightedTimestamp,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey, Round, ValidatorId,
+    Verified, VoteCount, WeightedTimestamp,
 };
 
 /// Votes for a specific block.
@@ -59,14 +59,18 @@ pub struct VoteSet {
     /// Number of unverified votes buffered.
     unverified_power: VoteCount,
 
-    /// Committee votes this set tallies against — one per seat, latched from
-    /// the committee that governs the voted block when the set is created.
+    /// The consensus committee this set indexes its voters against, latched
+    /// from the committee that governs the voted block when the set is
+    /// bound. A vote is tallied only at the index its voter holds here, so
+    /// a QC's signer bitfield names the members whose signatures it
+    /// aggregates.
     ///
-    /// The quorum denominator is a property of the set, not something to
-    /// re-resolve later: by the time a verification batch returns, the block's
-    /// committee may no longer resolve (its parent pruned, or not yet
-    /// arrived), and re-deriving it there would strand the tally.
-    committee_votes: VoteCount,
+    /// Its size is the quorum denominator, a property of the set rather
+    /// than something to re-resolve later: by the time a verification batch
+    /// returns, the block's committee may no longer resolve (its parent
+    /// pruned, or not yet arrived), and re-deriving it there would strand
+    /// the tally.
+    committee: Vec<ValidatorId>,
 
     /// Voters counted into the verified set. Permanent for the life of the
     /// vote set: a verified voter is never tallied twice, across its own vote
@@ -80,16 +84,30 @@ pub struct VoteSet {
     /// sets `verified_voters`.
     buffered_voters: Vec<bool>,
 
-    /// Whether a verification batch is currently in flight.
-    pending_verification: bool,
+    /// Which of the keeper's bindings this set holds: fresh for every set
+    /// the keeper creates and every re-bind. A verification batch carries
+    /// the binding it was taken under, and only a batch taken under the
+    /// set's current binding may form its QC.
+    binding: u64,
+
+    /// The binding the verification batch in flight was taken under, if
+    /// one is. It outlives a re-bind, so a set never has two batches in
+    /// flight.
+    in_flight: Option<u64>,
 
     /// Whether QC has already been built from this vote set.
     qc_built: bool,
 }
 
 impl VoteSet {
-    /// Create a new vote set.
-    pub(crate) fn new(header: Option<&BlockHeader>, num_validators: usize) -> Self {
+    /// Create a new vote set indexing its voters against `committee`,
+    /// under `binding`.
+    pub(crate) fn new(
+        header: Option<&BlockHeader>,
+        committee: &[ValidatorId],
+        binding: u64,
+    ) -> Self {
+        let num_validators = committee.len();
         let (block_hash, height, round, parent_block_hash, parent_weighted_timestamp) = header
             .map_or((None, None, None, None, None), |h| {
                 (
@@ -111,17 +129,58 @@ impl VoteSet {
             verified_power: VoteCount::ZERO,
             unverified_votes: Vec::new(),
             unverified_power: VoteCount::ZERO,
-            committee_votes: VoteCount::of(num_validators),
+            committee: committee.to_vec(),
             verified_voters: vec![false; num_validators],
             buffered_voters: vec![false; num_validators],
-            pending_verification: false,
+            binding,
+            in_flight: None,
             qc_built: false,
         }
     }
 
-    /// Committee votes this set tallies against — see the field.
+    /// Committee votes this set tallies against: one per member of the
+    /// committee it is bound to.
     pub(crate) const fn committee_votes(&self) -> VoteCount {
-        self.committee_votes
+        VoteCount::of(self.committee.len())
+    }
+
+    /// Whether the set indexes its voters against `committee`.
+    pub(crate) fn tallies_against(&self, committee: &[ValidatorId]) -> bool {
+        self.committee == committee
+    }
+
+    /// Re-bind the set to `committee` under `binding`, dropping every vote
+    /// it holds and keeping the block's header readings, whether a QC was
+    /// built from it, and the batch in flight.
+    ///
+    /// A held block's governing committee changes when a recovery is
+    /// seated: anchored below the bridge, it resolves the committee the
+    /// recovery replaces until then and the fresh one after. A vote indexed
+    /// against one committee is no vote under the other, and aggregating
+    /// the two signs one set of members under another's bitfield. A batch
+    /// in flight across the re-bind still returns here: it forms no QC,
+    /// and the votes it verified are screened by index in
+    /// [`Self::on_votes_verified`].
+    pub(crate) fn rebind(&mut self, committee: &[ValidatorId], binding: u64) {
+        let mut rebound = Self::new(None, committee, binding);
+        rebound.block_hash = self.block_hash;
+        rebound.height = self.height;
+        rebound.round = self.round;
+        rebound.parent_block_hash = self.parent_block_hash;
+        rebound.parent_weighted_timestamp = self.parent_weighted_timestamp;
+        rebound.in_flight = self.in_flight;
+        rebound.qc_built = self.qc_built;
+        *self = rebound;
+    }
+
+    /// The binding this set holds.
+    pub(crate) const fn binding(&self) -> u64 {
+        self.binding
+    }
+
+    /// Whether the batch in flight was taken under `binding`.
+    pub(crate) fn has_in_flight(&self, binding: u64) -> bool {
+        self.in_flight == Some(binding)
     }
 
     /// Get the block height.
@@ -197,7 +256,7 @@ impl VoteSet {
     /// - We're not already waiting for a verification result
     /// - We have the header info needed to build a QC
     pub(crate) fn should_trigger_verification(&self, total_committee_power: VoteCount) -> bool {
-        !self.pending_verification
+        self.in_flight.is_none()
             && !self.qc_built
             && self.parent_block_hash.is_some()
             && VoteCount::has_quorum(
@@ -208,10 +267,10 @@ impl VoteSet {
 
     /// Take the unverified votes for batch verification.
     ///
-    /// Returns the votes and marks the vote set as pending verification.
-    /// Each tuple is (`committee_index`, vote, `public_key`).
+    /// Returns the votes and marks a batch in flight under the set's
+    /// binding. Each tuple is (`committee_index`, vote, `public_key`).
     pub(crate) fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, ConsensusPublicKey)> {
-        self.pending_verification = true;
+        self.in_flight = Some(self.binding);
         self.unverified_power = VoteCount::ZERO;
         // Reopen the buffered slots: these votes are now in the batch, and only
         // the ones whose signatures verify will mark `verified_voters`. A voter
@@ -255,20 +314,35 @@ impl VoteSet {
     /// Marks the vote set as built.
     pub(crate) const fn on_qc_built(&mut self) {
         self.qc_built = true;
-        self.pending_verification = false;
+        self.in_flight = None;
     }
 
-    /// Called when verification completes but quorum wasn't reached.
+    /// Settle the batch in flight under `binding` without forming its QC:
+    /// it was taken under a binding the set no longer holds.
+    pub(crate) fn on_stale_batch(&mut self, binding: u64) {
+        if self.has_in_flight(binding) {
+            self.in_flight = None;
+        }
+    }
+
+    /// Called when a batch taken under `binding` completes without a QC.
     ///
-    /// Adds the verified votes to the verified set and clears pending flag.
-    pub(crate) fn on_votes_verified(&mut self, verified_votes: Vec<(usize, Verified<BlockVote>)>) {
-        self.pending_verification = false;
+    /// Adds the verified votes to the verified set, and settles the batch
+    /// in flight when it is this one.
+    pub(crate) fn on_votes_verified(
+        &mut self,
+        binding: u64,
+        verified_votes: Vec<(usize, Verified<BlockVote>)>,
+    ) {
+        self.on_stale_batch(binding);
 
         for (committee_index, vote) in verified_votes {
             // Mark the voter counted only now that its signature verified, and
             // skip any already tallied (its own vote, or an overlapping batch)
-            // so votes are never double-counted.
-            if committee_index >= self.verified_voters.len()
+            // so votes are never double-counted. A batch taken before the set
+            // was re-bound indexes another committee, and its votes are no
+            // votes here.
+            if self.committee.get(committee_index) != Some(&vote.voter())
                 || self.verified_voters[committee_index]
             {
                 continue;
@@ -414,6 +488,10 @@ mod tests {
         ShardId::ROOT
     }
 
+    fn committee(size: u64) -> Vec<ValidatorId> {
+        (0..size).map(ValidatorId::new).collect()
+    }
+
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
             height,
@@ -449,7 +527,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
 
         // Buffer first vote
         let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
@@ -477,7 +555,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
 
         let total_power = VoteCount::new(4);
 
@@ -504,7 +582,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..1).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 1);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(1), 0);
 
         let own = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         assert!(vote_set.add_verified_vote(0, Verified::<BlockVote>::new_unchecked_for_test(own)));
@@ -516,7 +594,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
 
         // Add verified votes directly (e.g., own votes)
         for i in 0..3 {
@@ -552,7 +630,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
 
         // Attacker buffers a (would-be-forged) vote attributed to validator 0.
         let forged = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
@@ -562,7 +640,7 @@ mod tests {
 
         // The batch drains and every signature fails verification.
         let _ = vote_set.take_unverified_votes();
-        vote_set.on_votes_verified(vec![]);
+        vote_set.on_votes_verified(0, vec![]);
 
         // Validator 0's genuine vote is not blocked by the failed forgery.
         let genuine = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
@@ -577,7 +655,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
         let total_power = VoteCount::new(4);
 
         let wire = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
@@ -602,7 +680,7 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
 
         let first = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         assert!(vote_set.buffer_unverified_vote(0, first.clone(), keys[0].public_key()));
@@ -611,10 +689,10 @@ mod tests {
 
         let duplicate = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         assert!(vote_set.buffer_unverified_vote(0, duplicate, keys[0].public_key()));
-        vote_set.on_votes_verified(vec![(
+        vote_set.on_votes_verified(
             0,
-            Verified::<BlockVote>::new_unchecked_for_test(first),
-        )]);
+            vec![(0, Verified::<BlockVote>::new_unchecked_for_test(first))],
+        );
 
         assert_eq!(vote_set.verified_power(), VoteCount::new(1));
         assert_eq!(vote_set.unverified_power(), VoteCount::ZERO);
@@ -628,17 +706,17 @@ mod tests {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), &committee(4), 0);
 
         let own = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         assert!(vote_set.add_verified_vote(0, Verified::<BlockVote>::new_unchecked_for_test(own),));
         assert_eq!(vote_set.verified_power(), VoteCount::new(1));
 
         let echo = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
-        vote_set.on_votes_verified(vec![(
+        vote_set.on_votes_verified(
             0,
-            Verified::<BlockVote>::new_unchecked_for_test(echo),
-        )]);
+            vec![(0, Verified::<BlockVote>::new_unchecked_for_test(echo))],
+        );
         assert_eq!(vote_set.verified_power(), VoteCount::new(1));
     }
 }

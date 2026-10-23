@@ -116,7 +116,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<Verified<QuorumCertificate>>;
 
-    /// The state a vnode resumes consensus from, read at this store's
+    /// The state a replica resumes consensus from, read at this store's
     /// persisted tip. A fresh store reads back at genesis.
     ///
     /// `shard` is the shard this store is resumed as, which narrows the
@@ -186,11 +186,10 @@ pub trait ShardChainReader: Send + Sync + 'static {
 /// Whether a store whose tree has already reached `height` holds
 /// *this* block there.
 ///
-/// A prepared commit that finds the tree at or past its own height has
-/// one benign cause: the block went in already, through a sync commit
-/// that landed between prepare and flush or through a second vnode on
-/// the same store. Skipping it is right, and the caller returns the root
-/// the snapshot computed.
+/// A prepared commit that finds the tree at or past its own height has one
+/// benign cause: the block went in already, through a sync commit that landed
+/// between prepare and flush. Skipping it is right, and the caller returns
+/// the root the snapshot computed.
 ///
 /// A *different* block at that height is not that. Skipping it would
 /// hand back a root for a block the store never applied, and the caller

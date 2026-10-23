@@ -18,11 +18,11 @@ use crate::status::SyncStatus;
 /// `None` slot means no RPC server is attached (tests, tooling).
 #[derive(Clone, Default)]
 pub struct RpcPublishers {
-    /// `/status` per-vnode readouts.
+    /// `/status` per-signer readouts.
     pub node_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     /// `/sync` per-shard block-sync state.
     pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
-    /// Per-vnode mempool snapshots feeding RPC submission backpressure.
+    /// Per-signer mempool snapshots feeding RPC submission backpressure.
     pub mempool: Option<Arc<ArcSwap<MempoolSnapshot>>>,
 }
 
@@ -93,20 +93,18 @@ impl RpcState {
 
 /// Snapshot of mempool state for RPC queries.
 ///
-/// One [`VnodeMempoolSnapshot`] per hosted vnode, keyed by validator
-/// id. Each vnode owns its own [`hyperscale_mempool::MempoolCoordinator`];
-/// same-shard vnodes converge by determinism but their instantaneous
-/// counts diverge, so the backpressure check must inspect every entry
-/// individually (not pick a shard-level "representative"). Used only
-/// by RPC submission backpressure — per-vnode counts shown to clients
-/// live in [`NodeStatusState::vnodes`].
+/// One [`VnodeMempoolSnapshot`] per attached signer, keyed by validator
+/// id. Signers on one shard read that shard replica's
+/// [`hyperscale_mempool::MempoolCoordinator`], so their entries repeat
+/// its counts. Used only by RPC submission backpressure — the counts
+/// shown to clients live in [`NodeStatusState::vnodes`].
 #[derive(Debug, Clone, Default)]
 pub struct MempoolSnapshot {
-    /// Per-hosted-vnode mempool readouts, keyed by validator id.
+    /// Per-signer mempool readouts, keyed by validator id.
     pub vnodes: BTreeMap<u64, VnodeMempoolSnapshot>,
 }
 
-/// One hosted vnode's mempool readout.
+/// One attached signer's mempool readout: its shard replica's counts.
 #[derive(Debug, Clone)]
 pub struct VnodeMempoolSnapshot {
     /// Number of pending transactions (waiting to be included in a block).
@@ -154,12 +152,12 @@ impl Default for VnodeMempoolSnapshot {
 /// Mutable node status state updated by the runner.
 ///
 /// Process-level fields (`num_shards`, `connected_peers`) sit at the top;
-/// per-vnode readouts live in `vnodes`, sorted by `validator_id` for stable
+/// per-signer readouts live in `vnodes`, sorted by `validator_id` for stable
 /// output. `num_shards` is the network's current shard count, published from
 /// the host's live [`TopologySnapshot`] each tick — it tracks the topology as
-/// the network splits and merges, not a frozen genesis value. Multi-vnode
-/// hosts surface every hosted vnode; single-vnode hosts produce a one-element
-/// `vnodes` vec.
+/// the network splits and merges, not a frozen genesis value. A host
+/// surfaces every attached signer; a single-validator host produces a
+/// one-element `vnodes` vec.
 ///
 /// [`TopologySnapshot`]: hyperscale_types::TopologySnapshot
 #[allow(missing_docs)] // flat readouts; field names are the documentation
@@ -170,7 +168,7 @@ pub struct NodeStatusState {
     pub vnodes: Vec<VnodeStatusEntry>,
 }
 
-/// Per-hosted-vnode status entry. Mirrors the wire shape exposed under
+/// Per-signer status entry. Mirrors the wire shape exposed under
 /// `vnodes[]` in the `/api/v1/status` response.
 #[allow(missing_docs)] // flat readouts; field names are the documentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +182,7 @@ pub struct VnodeStatusEntry {
     pub mempool: VnodeMempoolStats,
 }
 
-/// Per-vnode mempool counts, embedded in each [`VnodeStatusEntry`].
+/// Per-signer mempool counts, embedded in each [`VnodeStatusEntry`].
 #[allow(missing_docs)] // flat readouts; field names are the documentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VnodeMempoolStats {

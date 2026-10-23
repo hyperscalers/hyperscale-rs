@@ -1,6 +1,6 @@
 //! Joiner-side snap-sync assembler.
 //!
-//! A vnode joining a shard bootstraps the shard's committed state
+//! A host joining a shard bootstraps the shard's committed state
 //! against its beacon-attested boundary anchor: the shard's key span is
 //! partitioned into disjoint sub-ranges fetched from serving peers in
 //! parallel, and every chunk is verified against the anchor's

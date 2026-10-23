@@ -1,12 +1,11 @@
 //! Per-shard I/O state hosted by the `NodeHost`.
 //!
-//! One [`ShardIo`] per hosted shard. Same-shard `Vnode`s share their
-//! `ShardIo`; cross-shard `Vnode`s live independently. Shard-scoped state
-//! is grouped by subsystem — [`ConsensusState`], [`CrossShardState`],
-//! [`MempoolState`], [`BeaconFetchState`] — over genuinely-shared infra
-//! (storage, pending chain, block-commit pipeline, request-serving caches),
-//! so multi-vnode hosting captures the natural sharing structure without
-//! leaking state across `NodeHost`s.
+//! One [`ShardIo`] per hosted shard, owned by that shard's loop and its
+//! one replica. Shard-scoped state is grouped by subsystem —
+//! [`ConsensusState`], [`CrossShardState`], [`MempoolState`],
+//! [`BeaconFetchState`] — over the shard's infra (storage, pending chain,
+//! block-commit pipeline, request-serving caches), and none of it leaks
+//! across `NodeHost`s.
 
 use std::sync::Arc;
 
@@ -81,7 +80,7 @@ pub struct ShardIo<S: ShardStorage> {
 
     /// Per-tx phase-time stamps for the slow-tx finalization log.
     /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`
-    /// actions emitted by this shard's vnodes; entries are dropped on
+    /// actions emitted by this shard's replica; entries are dropped on
     /// terminal status. Per-shard so each hosted shard logs its own
     /// locally-submitted finalization latencies independently.
     pub(crate) tx_phase_times: TxPhaseTimesCache,

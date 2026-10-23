@@ -21,7 +21,7 @@ pub use network::{
     ClassTally, DeliveryDrain, DeliveryRecord, FulfillmentStats, HostLayout, NetworkConfig,
     SimulatedNetwork,
 };
-pub use sim_network::{OutboxEntry, PendingNotification, SimNetworkAdapter};
+pub use sim_network::{OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter};
 pub use streams::LinkStreams;
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 

@@ -115,13 +115,13 @@ async fn runtime_shard_leave_tears_down() {
     assert!(result.unwrap().is_ok(), "runner returns Ok");
 }
 
-/// A leave names the vnode it releases. With two vnodes seated on the
-/// root, one leaving twice releases only itself — the second leave names
-/// a vnode no longer seated — and the shard stays up for the other, which
-/// tears it down when it leaves in turn.
+/// A leave names the signer it detaches. With two signers attached on the
+/// root, one leaving twice detaches only itself — the second leave names
+/// a signer no longer attached — and the shard stays up for the other,
+/// which tears it down when it leaves in turn.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn a_leave_releases_the_vnode_it_names() {
+async fn a_leave_detaches_the_signer_it_names() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(44, 2);
@@ -145,7 +145,7 @@ async fn a_leave_releases_the_vnode_it_names() {
     sleep(Duration::from_millis(500)).await;
     assert!(
         adapter.local_shards().contains(&ShardId::ROOT),
-        "the shard stays up for the vnode that did not leave"
+        "the shard stays up for the signer that did not leave"
     );
 
     reconfigure
@@ -161,7 +161,7 @@ async fn a_leave_releases_the_vnode_it_names() {
         }
     })
     .await
-    .expect("the last vnode leaving tears the shard down");
+    .expect("the last signer leaving tears the shard down");
 
     drop(shutdown);
     let result = timeout(Duration::from_secs(5), handle).await;
@@ -516,13 +516,13 @@ impl<S: Subscriber> Layer<S> for Messages {
     }
 }
 
-/// A validator joining a shard its host already runs is seated into the
-/// running loop rather than refused, and the committed-view reconcile
-/// releases it again — the committee never placed it — while the host's
-/// other seat keeps the shard up throughout.
+/// A validator joining a shard its host already runs attaches to the
+/// running replica rather than being refused, and the committed-view
+/// reconcile detaches it again — the committee never placed it — while
+/// the host's other signer keeps the shard up throughout.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn a_join_for_a_running_shard_seats_into_its_loop() {
+async fn a_join_for_a_running_shard_attaches_to_its_replica() {
     let messages = Messages::default();
     let _ = Registry::default()
         .with(messages.clone())
@@ -554,12 +554,12 @@ async fn a_join_for_a_running_shard_seats_into_its_loop() {
         .expect("supervisor accepts commands");
     for (needle, what) in [
         (
-            "Seat admitted on a running shard",
-            "the running loop admits the seat",
+            "Signer attached on a running shard",
+            "the running replica attaches the joiner",
         ),
         (
-            "Vnode left a running shard",
-            "the reconcile releases a seat the committee never placed",
+            "Signer detached from a running shard",
+            "the reconcile detaches a signer the committee never placed",
         ),
     ] {
         timeout(CONNECTION_TIMEOUT, async {
@@ -571,14 +571,89 @@ async fn a_join_for_a_running_shard_seats_into_its_loop() {
         .expect(what);
         assert!(
             adapter.local_shards().contains(&ShardId::ROOT),
-            "the shard stays up across its seat changes"
+            "the shard stays up across its signer changes"
         );
     }
 
     drop(shutdown);
     let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the seat changes");
+    assert!(result.is_ok(), "runner exits after the signer changes");
     assert!(result.unwrap().is_ok(), "runner returns Ok");
+}
+
+/// A leave for a validator whose attach is still on its way to the
+/// running loop detaches it rather than being refused: the shard stays up
+/// for the signer that did not leave, and the attach that lands after the
+/// leave counts for nothing, so that signer's own leave tears the shard
+/// down.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_leave_for_a_queued_validator_detaches_it() {
+    let messages = Messages::default();
+    let _ = Registry::default()
+        .with(messages.clone())
+        .with(fmt::layer().with_test_writer())
+        .try_init();
+
+    let fixtures = TestFixtures::with_surplus(47, 1, 1);
+    let surplus = ValidatorId::new(1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
+
+    let adapter = Arc::clone(runner.network());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    seated_on_root(&adapter).await;
+
+    // Both before the loop can report the attach back: the supervisor
+    // takes commands ahead of the events its loops send.
+    reconfigure
+        .try_send(ShardCommand::Join {
+            shard: ShardId::ROOT,
+            vnodes: vec![VnodeConfig {
+                validator_id: surplus,
+                local_shard: ShardId::ROOT,
+                signer: fixtures.signer(1),
+            }],
+        })
+        .expect("supervisor accepts commands");
+    reconfigure
+        .try_send(ShardCommand::Leave {
+            shard: ShardId::ROOT,
+            validator: surplus,
+        })
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while !messages.contains("Signer detached; shard stays up") {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the leave detaches the queued validator");
+    assert!(
+        !messages.contains("Leave rejected"),
+        "a leave for a queued validator is not refused"
+    );
+    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+
+    reconfigure
+        .send(ShardCommand::Leave {
+            shard: ShardId::ROOT,
+            validator: ValidatorId::new(0),
+        })
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the last signer leaving tears the shard down");
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after the leaves");
 }
 
 /// A join for a running shard under a fork recovery, whose store has

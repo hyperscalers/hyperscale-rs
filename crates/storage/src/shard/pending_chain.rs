@@ -154,8 +154,8 @@ pub struct PendingChain<S> {
     /// still verifying. Held apart from `entries` all the same, because
     /// certification is a fact about the block, not about the prep: a
     /// synced block is certified before its prep lands and turns
-    /// servable the moment it does, and a sibling seat's re-prepare
-    /// restates the entry without touching it.
+    /// servable the moment it does, and a re-prepare restates the entry
+    /// without touching it.
     certified_uncommitted: RwLock<HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>>,
     settled_window_memo: RwLock<Option<SettledWindowMemo>>,
 }
@@ -202,10 +202,9 @@ where
 
     /// Append an entry, or restate the prepared state of one already held.
     ///
-    /// Every seat on a host prepares the blocks it applies into this one
-    /// chain, so a block a sibling seat already holds is prepared again
-    /// when another seat applies it. The hash names the same block, so the
-    /// restated entry keeps the commit already attached to it.
+    /// A block the chain already holds can be prepared again. The hash
+    /// names the same block, so the restated entry keeps the commit
+    /// already attached to it.
     pub fn insert(&self, block_hash: BlockHash, mut entry: ChainEntry) {
         let mut entries = write_or_recover(&self.entries);
         if let Some(held) = entries.get_mut(&block_hash) {
@@ -1992,9 +1991,9 @@ mod tests {
 
     #[test]
     fn a_re_prepared_block_keeps_its_certification() {
-        // A second seat on the host applies a block the first already
-        // holds and prepares it again. The certified tip must stay
-        // servable, and a committed block must stay committed.
+        // A block the chain already holds is prepared again. The
+        // certified tip must stay servable, and a committed block must
+        // stay committed.
         let chain = empty_chain();
         let tip = insert_pending(&chain, BlockHeight::new(5), false);
         chain.attach_certified_uncommitted(Arc::clone(&tip));

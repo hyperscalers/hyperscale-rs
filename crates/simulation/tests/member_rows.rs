@@ -76,7 +76,7 @@ fn compare(cluster: &SimCluster, shards: [ShardId; 2], seen: &mut Seen) {
         for shard in shards {
             let (Some(storage), Some(state)) = (
                 runner.hosts_shard(host, shard),
-                runner.vnode_state_in(host, shard),
+                runner.replica_in(host, shard),
             ) else {
                 continue;
             };

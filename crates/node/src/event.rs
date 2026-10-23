@@ -127,33 +127,14 @@ pub(crate) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum ShardScopedInput {
     /// Pass-through to state machine. `NodeHost` extracts the `ProtocolEvent`
-    /// and feeds it to every vnode hosted in the envelope's shard. Boxed
-    /// because `ProtocolEvent` dwarfs every other variant and would inflate
-    /// the event queue otherwise.
+    /// and feeds it to the envelope's shard's replica. Boxed because
+    /// `ProtocolEvent` dwarfs every other variant and would inflate the
+    /// event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
-    /// A timer one seated vnode armed, fired: fed to that vnode alone.
-    /// Dropped if the vnode has left the loop since.
-    SeatTimer {
-        /// The vnode that armed the timer.
-        validator: ValidatorId,
-        /// The timer's protocol event.
-        event: Box<ProtocolEvent>,
-    },
-
-    /// What work one seated vnode dispatched came back with: fed to that
-    /// vnode alone, since no sibling asked for it. Dropped if the vnode
-    /// has left the loop since.
-    SeatResult {
-        /// The vnode that dispatched the work.
-        validator: ValidatorId,
-        /// The result's protocol event.
-        event: Box<ProtocolEvent>,
-    },
-
     /// A block proposal off the wire, its proposer's signature checked at
-    /// intake. `NodeHost` feeds its header to every vnode and holds it for
-    /// serving once one of them admits it.
+    /// intake. `NodeHost` feeds its header to the replica and holds it for
+    /// serving once the replica admits it.
     ProposalReceived {
         /// The proposal as its proposer signed it.
         proposal: Box<BlockHeaderNotification>,
@@ -507,8 +488,6 @@ impl ShardScopedInput {
                 // through to Internal.
                 _ => EventPriority::Internal,
             },
-            Self::SeatTimer { .. } => EventPriority::Timer,
-            Self::SeatResult { .. } => EventPriority::Internal,
             Self::ProposalReceived { .. }
             | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
@@ -548,9 +527,7 @@ impl ShardScopedInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol(event)
-            | Self::SeatTimer { event, .. }
-            | Self::SeatResult { event, .. } => event.type_name(),
+            Self::Protocol(event) => event.type_name(),
             other => other.into(),
         }
     }
@@ -725,9 +702,16 @@ pub enum BeaconScopedInput {
     /// A fetch request for these ids never reached a peer; retry on the
     /// tick.
     FetchUnroutable(FetchIds),
-    /// A fetch for these ids was answered; the answer follows as
-    /// [`Self::Protocol`].
-    FetchFulfilled(FetchIds),
+    /// A fetch for `ids` was answered with `event`. The ids retire once
+    /// the loop takes what the answer carries, and are released as
+    /// failed when its fold refuses a witness run.
+    Answered {
+        /// The ids the answered request asked for.
+        ids: FetchIds,
+        /// What the answer carries. Boxed for the reason
+        /// [`Self::Protocol`] is.
+        event: Box<ProtocolEvent>,
+    },
 
     /// The loop's fetch tick: retries its held fetches and its catch-up
     /// sync's deferred epochs.
@@ -766,9 +750,10 @@ impl BeaconScopedInput {
     #[must_use]
     pub(crate) fn priority(&self) -> EventPriority {
         match self {
-            // Inbound beacon gossip is a network input; the verify/adopt
-            // continuations it spawns are internal consequences.
-            Self::Protocol(event) => match event.as_ref() {
+            // Inbound beacon gossip is a network input, whether pushed or
+            // answering a fetch; the verify/adopt continuations it spawns
+            // are internal consequences.
+            Self::Protocol(event) | Self::Answered { event, .. } => match event.as_ref() {
                 ProtocolEvent::BeaconBlockReceived { .. } => EventPriority::Network,
                 _ => EventPriority::Internal,
             },
@@ -780,7 +765,6 @@ impl BeaconScopedInput {
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::FetchFailed(_)
             | Self::FetchUnroutable(_)
-            | Self::FetchFulfilled(_)
             | Self::Shard { .. }
             | Self::Register { .. }
             | Self::Deregister(_) => EventPriority::Internal,
@@ -795,7 +779,8 @@ impl BeaconScopedInput {
         match self {
             Self::Protocol(event)
             | Self::Continuation { event, .. }
-            | Self::ParticipantTimer { event, .. } => event.type_name(),
+            | Self::ParticipantTimer { event, .. }
+            | Self::Answered { event, .. } => event.type_name(),
             other => other.into(),
         }
     }
@@ -808,9 +793,9 @@ impl BeaconScopedInput {
 /// one beacon loop.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
-    /// Routed to the hosted shard identified by [`ShardId`]. Fans
-    /// to every vnode in that shard for state-machine events; handled
-    /// once for shard-scoped pipeline fixups.
+    /// Routed to the hosted shard identified by [`ShardId`]: its replica
+    /// for state-machine events, its loop for shard-scoped pipeline
+    /// fixups.
     Shard(ShardId, ShardScopedInput),
     /// Process-scoped — not anchored to a single shard.
     Process(ProcessScopedInput),

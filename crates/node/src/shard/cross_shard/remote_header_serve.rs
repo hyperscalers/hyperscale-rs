@@ -88,7 +88,7 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
 ///
 /// The reshape counterpart of [`serve_remote_headers_request`], for a host
 /// answering from a store it holds directly rather than through a live
-/// vnode's pending chain. A recognition walk reads the chain of a shard
+/// replica's pending chain. A recognition walk reads the chain of a shard
 /// that is terminating: its committee dissolves at the cut, so by the time
 /// the walk reaches the terminal there may be no committee left to ask —
 /// but every member still holds the chain.
@@ -96,7 +96,7 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
 /// The caller selects the store by the requested source shard, so the
 /// cross-shard gate [`serve_remote_headers_request`] applies is already
 /// satisfied by construction here. A range starting beneath the store's
-/// chain floor is answered with the floor, as a live vnode answers it.
+/// chain floor is answered with the floor, as a live replica answers it.
 /// Stops on the first missing height, so the response is a contiguous
 /// prefix of the requested range.
 pub fn serve_local_certified_headers<S: ShardChainReader>(
@@ -140,7 +140,7 @@ mod tests {
     use super::*;
 
     /// A store read directly answers a range beneath its chain floor as a
-    /// live vnode's does: with the floor, and no header a hold or a
+    /// live replica's does: with the floor, and no header a hold or a
     /// collection yet to run happens to have left there.
     #[test]
     fn a_store_read_directly_answers_beneath_its_floor_with_it() {

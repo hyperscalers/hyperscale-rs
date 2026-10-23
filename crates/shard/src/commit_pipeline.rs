@@ -5,7 +5,7 @@
 //! signature verification completed out of order), the commit is parked
 //! in [`CommitPipeline::out_of_order`] keyed by target height and
 //! drained in sequence once the predecessor commits. A commit at exactly
-//! the next height parks there too while this seat's schedule lacks the
+//! the next height parks there too while this replica's schedule lacks the
 //! window that certified it, and resumes when the beacon commits it.
 
 use std::collections::BTreeMap;

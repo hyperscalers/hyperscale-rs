@@ -466,7 +466,7 @@ impl SimulationRunner {
         self.seat_shard_with_genesis(host, shard, &validators, storage, &genesis, &recovered);
     }
 
-    /// Install a prepared store on `host`: seat one vnode per `validator`
+    /// Install a prepared store on `host`: attach one signer per `validator`
     /// and commit the genesis through the normal pipeline. Tears down a
     /// stale chain under the same id first — a merge reforms the grow's
     /// terminated parent.
@@ -589,7 +589,7 @@ impl SimulationRunner {
                 let seated: Vec<ValidatorId> = self
                     .hosts
                     .iter()
-                    .flat_map(|host| host.seated_validators(leaf))
+                    .flat_map(|host| host.signers(leaf))
                     .collect();
                 let committee = topology_snapshot.committee_for_shard(leaf);
                 past_genesis

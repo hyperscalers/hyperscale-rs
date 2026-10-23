@@ -1241,7 +1241,7 @@ impl ReshapeOrchestrator {
                 if anchor.block_hash != adopted.expect("checked above") {
                     // The local parent chain and the network disagree about a
                     // committed block. Nothing here can repair that: the store
-                    // may already be seated under a running vnode, so wiping it
+                    // may already be seated under a running replica, so wiping it
                     // would take the shard down to fix a fault it cannot fix.
                     // Surface it and stop — the duty is done either way, and
                     // the split's cohort projection has already released, so no
@@ -3968,7 +3968,7 @@ mod tests {
 
     /// A genuine disagreement against the seeded anchor: the followed parent
     /// chain is not the one the network committed. The duty stops without
-    /// touching the store, which a seated vnode is running on.
+    /// touching the store, which a seated replica is running on.
     #[test]
     fn a_disagreeing_seeded_anchor_stops_without_re_opening_the_store() {
         let parent = ShardId::ROOT;

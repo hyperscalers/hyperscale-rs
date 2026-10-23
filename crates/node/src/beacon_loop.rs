@@ -382,7 +382,7 @@ where
             }
             BeaconScopedInput::FetchFailed(ids) => self.release(ids, Release::Failed),
             BeaconScopedInput::FetchUnroutable(ids) => self.release(ids, Release::Unroutable),
-            BeaconScopedInput::FetchFulfilled(ids) => self.release(ids, Release::Admitted),
+            BeaconScopedInput::Answered { ids, event } => self.on_answer(ids, *event),
             BeaconScopedInput::FetchTick => {
                 self.fetch_tick.fired();
                 self.drive_fetch::<ShardWitnessBinding>(FetchInput::Tick);
@@ -416,22 +416,6 @@ where
                 let actions = self.fold.on_beacon_block_received(block);
                 self.run_fold_actions(actions);
             }
-            ProtocolEvent::ShardWitnessesReceived {
-                shard_id,
-                committed_block_hash,
-                lo,
-                payloads,
-                range_proof,
-            } => {
-                let actions = self.fold.on_shard_witnesses_received(
-                    shard_id,
-                    committed_block_hash,
-                    lo,
-                    payloads,
-                    range_proof,
-                );
-                self.run_fold_actions(actions);
-            }
             ProtocolEvent::UnverifiedShardVoteEquivocationReceived { evidence } => {
                 self.verify_vote_equivocation(evidence);
             }
@@ -454,6 +438,38 @@ where
                     self.on_participant_event(validator, other.clone());
                 }
             }
+        }
+    }
+
+    /// A fetch's answer. Its ids retire before what it carries is taken,
+    /// so the freed capacity is there for any fetch that re-drives. A
+    /// witness run the fold refuses releases its ids as failed instead,
+    /// which retries it at once the first time and on the tick after.
+    fn on_answer(&mut self, ids: FetchIds, event: ProtocolEvent) {
+        let ProtocolEvent::ShardWitnessesReceived {
+            shard_id,
+            committed_block_hash,
+            lo,
+            payloads,
+            range_proof,
+        } = event
+        else {
+            self.release(ids, Release::Admitted);
+            self.on_protocol(event);
+            return;
+        };
+        match self.fold.on_shard_witnesses_received(
+            shard_id,
+            committed_block_hash,
+            lo,
+            payloads,
+            range_proof,
+        ) {
+            Some(actions) => {
+                self.release(ids, Release::Admitted);
+                self.run_fold_actions(actions);
+            }
+            None => self.release(ids, Release::Failed),
         }
     }
 
@@ -911,7 +927,7 @@ where
                 self.on_sync_admitted(block.epoch());
             }
             Action::TopologyChanged { epoch, schedule } => {
-                self.process.apply_topology(Arc::clone(&schedule));
+                self.process.apply_topology(epoch, Arc::clone(&schedule));
                 for (shard, sender) in self.shard_senders.values() {
                     let _ = sender.send(HostEvent::protocol(
                         *shard,
@@ -1508,7 +1524,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::shard::seated_host::{Fixture, Host, SHARD, loop_of};
+    use crate::HostedChain;
+    use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
     use crate::shard::{ShardScopedInput, ThreadShardLoop};
 
     type Loop = BeaconLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
@@ -1616,6 +1633,52 @@ mod tests {
         assert_eq!(in_flight(beacon), 1, "the tick lifts it");
     }
 
+    /// A witness run the fold refuses is released as failed rather than
+    /// retired: it is asked again at once the first time and, refused
+    /// again, waits for the tick, so a run served the same way each time
+    /// costs one retry a tick instead of one per refusal.
+    #[test]
+    fn a_refused_witness_run_retries_once_and_then_on_the_tick() {
+        use hyperscale_types::{ShardWitnessPayload, Stake, StakePoolId};
+
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let _ = host.beacon.fold.set_host_on_committee(true);
+        let anchor = BlockHash::from_raw(Hash::from_bytes(b"unheld anchor"));
+        let run = (
+            SHARD,
+            BlockHeight::new(5),
+            anchor,
+            LeafIndex::new(0),
+            LeafIndex::new(1),
+        );
+        let ids = || FetchIds::Beacon(BeaconFetchIds::Witnesses(vec![run]));
+        host.beacon.ask(BeaconOwner::Fold, ids(), SHARD, None, None);
+        let in_flight = |beacon: &Loop| beacon.fetches.shard_witness.in_flight_count();
+        assert_eq!(in_flight(&host.beacon), 1);
+        let refused = || BeaconScopedInput::Answered {
+            ids: ids(),
+            event: Box::new(ProtocolEvent::ShardWitnessesReceived {
+                shard_id: SHARD,
+                committed_block_hash: anchor,
+                lo: LeafIndex::new(0),
+                payloads: vec![ShardWitnessPayload::StakeDeposit {
+                    pool_id: StakePoolId::new(0),
+                    amount: Stake::from_whole_tokens(1),
+                }],
+                range_proof: Vec::new(),
+            }),
+        };
+
+        host.beacon.dispatch_event(refused());
+        assert_eq!(in_flight(&host.beacon), 1, "the first refusal asks again");
+        host.beacon.dispatch_event(refused());
+        assert_eq!(in_flight(&host.beacon), 0, "the second waits for the tick");
+        assert_eq!(host.beacon.fetches.shard_witness.pending_count(), 1);
+        host.beacon.dispatch_event(BeaconScopedInput::FetchTick);
+        assert_eq!(in_flight(&host.beacon), 1, "the tick asks again");
+    }
+
     /// The loop's own tick retries a held proposal fetch whether or not a
     /// block sync runs.
     #[test]
@@ -1646,9 +1709,10 @@ mod tests {
             vec![true],
             "a pending fetch arms the tick",
         );
-        let out = host.step(HostEvent::Beacon(BeaconScopedInput::FetchFulfilled(
-            proposals(&[PROPOSAL]),
-        )));
+        let out = host.step(HostEvent::Beacon(BeaconScopedInput::Answered {
+            ids: proposals(&[PROPOSAL]),
+            event: Box::new(ProtocolEvent::BeaconRatifyTimer),
+        }));
         assert_eq!(
             fetch_ticks(&out.timer_ops),
             vec![false],
@@ -2014,11 +2078,11 @@ mod tests {
         let _ = host.step(HostEvent::Beacon(BeaconScopedInput::Shard { chain, input }));
     }
 
-    /// Two vnodes on one loop each report every commit. The fold shifts
-    /// the chain's anchors once per committed height, so the committee
-    /// anchor stays one hop behind the tip whoever reports it.
+    /// A commit reported twice shifts the chain's anchors once: the fold
+    /// shifts them once per committed height, so the committee anchor
+    /// stays one hop behind the tip.
     #[test]
-    fn two_vnodes_on_one_loop_keep_the_fold_anchors_one_hop_apart() {
+    fn a_commit_reported_twice_keeps_the_fold_anchors_one_hop_apart() {
         let fix = Fixture::new();
         let mut host = fix.host(BlockHeight::GENESIS);
         let chain = loop_of(&mut host).chain;
@@ -2046,10 +2110,10 @@ mod tests {
         assert_ne!(before, after.committee);
     }
 
-    /// Two vnodes on one loop each report the header their chain
-    /// certified; the fold holds it once.
+    /// A certified header reported twice is held once, as the copy first
+    /// held.
     #[test]
-    fn two_vnodes_on_one_loop_record_each_certified_header_once() {
+    fn a_certified_header_reported_twice_is_recorded_once() {
         let fix = Fixture::new();
         let mut host = fix.host(BlockHeight::GENESIS);
         let chain = loop_of(&mut host).chain;
@@ -2189,15 +2253,17 @@ mod tests {
         };
         let (sender, _receiver) = unbounded();
         host.add_shard(
-            SHARD,
-            fix.seat_config(),
-            &recovered,
-            vec![fix.identity(0)],
-            SimShardStorage::new(shard_prefix_path(SHARD)),
+            &fix.replica_config(),
+            HostedChain {
+                shard: SHARD,
+                storage: SimShardStorage::new(shard_prefix_path(SHARD)),
+                recovered: &recovered,
+                signers: vec![fix.identity(0)],
+            },
             sender,
         );
         drop(events);
-        let replica = host.vnode_state(SHARD, 0);
+        let replica = host.replica(SHARD);
         assert!(
             replica.schedule().at(anchor).is_some(),
             "the replica resolves its tip's committee from its first schedule",
@@ -2216,7 +2282,7 @@ mod tests {
         let storage = SimShardStorage::new(shard_prefix_path(SHARD));
         commit_one(&storage, 1);
         let (mut host, events) = fix.host_resumed(history, storage, far_future());
-        let replica_epoch = |host: &Host| host.vnode_state(SHARD, 0).schedule_epoch();
+        let replica_epoch = |host: &Host| host.replica(SHARD).schedule_epoch();
         assert_eq!(replica_epoch(&host), Epoch::new(2));
 
         let _ = host.step(fold_outcome(ProtocolEvent::BeaconBlockVerified {
@@ -2909,8 +2975,8 @@ mod tests {
         assert!(host.beacon.fold().chain(old).is_none());
     }
 
-    /// Seating a validator on another of its host's shards and leaving the
-    /// first touches neither its participant nor its attachment.
+    /// Attaching a validator to another of its host's shards and leaving
+    /// the first touches neither its participant nor its attachment.
     #[test]
     fn a_seat_moving_between_shards_keeps_its_participant() {
         let fix = Fixture::new();
@@ -2920,11 +2986,13 @@ mod tests {
         let other = ShardId::leaf(1, 1);
         let (sender, _receiver) = unbounded();
         host.add_shard(
-            other,
-            fix.seat_config(),
-            &RecoveredState::default(),
-            vec![fix.identity(0)],
-            SimShardStorage::new(shard_prefix_path(other)),
+            &fix.replica_config(),
+            HostedChain {
+                shard: other,
+                storage: SimShardStorage::new(shard_prefix_path(other)),
+                recovered: &RecoveredState::default(),
+                signers: vec![fix.identity(0)],
+            },
             sender,
         );
         assert!(host.remove_shard(SHARD).is_some());
