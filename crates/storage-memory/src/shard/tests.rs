@@ -168,9 +168,7 @@ fn witness_window_retention_and_recovery() {
 #[test]
 fn safe_vote_registers_are_monotone_and_recoverable() {
     let storage = SimShardStorage::default();
-    test_registers_are_monotone_and_recoverable(&storage, || {
-        storage.load_recovered_state(ShardId::ROOT)
-    });
+    test_registers_are_monotone_and_recoverable(&storage);
 }
 
 #[test]
@@ -583,11 +581,9 @@ fn safe_vote_registers_recover_their_justification() {
 
 #[test]
 fn a_rebuilt_store_carries_signed_rounds() {
-    let rebuilt = SimShardStorage::default();
     test_helpers::test_a_rebuilt_store_carries_signed_rounds(
         &SimShardStorage::default(),
-        &rebuilt,
-        rebuilt.load_recovered_state(ShardId::ROOT),
+        &SimShardStorage::default(),
     );
 }
 

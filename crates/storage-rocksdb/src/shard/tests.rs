@@ -1238,9 +1238,7 @@ fn safe_vote_registers_recover_their_justification() {
 #[test]
 fn safe_vote_registers_are_monotone_and_recoverable() {
     let (_dir, storage) = open_fresh();
-    test_registers_are_monotone_and_recoverable(&storage, || {
-        storage.load_recovered_state(ShardId::ROOT)
-    });
+    test_registers_are_monotone_and_recoverable(&storage);
 }
 
 #[test]
@@ -1266,11 +1264,7 @@ fn a_rebuilt_store_carries_signed_rounds() {
     let rebuilt_dir = TempDir::new().unwrap();
     {
         let rebuilt = RocksDbShardStorage::open(rebuilt_dir.path(), NibblePath::empty()).unwrap();
-        test_a_rebuilt_store_carries_signed_rounds(
-            &replaced,
-            &rebuilt,
-            rebuilt.load_recovered_state(ShardId::ROOT),
-        );
+        test_a_rebuilt_store_carries_signed_rounds(&replaced, &rebuilt);
     }
     let reopened = RocksDbShardStorage::open(rebuilt_dir.path(), NibblePath::empty()).unwrap();
     assert_eq!(
@@ -1279,8 +1273,8 @@ fn a_rebuilt_store_carries_signed_rounds() {
     );
 }
 
-/// Persisted registers read back, survive a reopen, and land in
-/// `load_recovered_state`.
+/// Persisted registers read back and survive a reopen, each under its
+/// own validator.
 #[test]
 fn safe_vote_registers_survive_reopen() {
     let temp_dir = TempDir::new().unwrap();
@@ -1295,15 +1289,9 @@ fn safe_vote_registers_survive_reopen() {
 
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     assert_eq!(reopened.safe_vote_registers(v1), Some(registers(3, 5)));
-    let recovered = reopened.load_recovered_state(ShardId::ROOT);
-    assert_eq!(
-        recovered.safe_vote_registers.get(&v1),
-        Some(&registers(3, 5))
-    );
-    assert_eq!(
-        recovered.safe_vote_registers.get(&v2),
-        Some(&registers(2, 2))
-    );
+    let all = reopened.all_safe_vote_registers();
+    assert_eq!(all.get(&v1), Some(&registers(3, 5)));
+    assert_eq!(all.get(&v2), Some(&registers(2, 2)));
 }
 
 /// The register merge holds on a cold write-path cache after a reopen,

@@ -479,6 +479,12 @@ pub struct ShardCoordinator {
     /// Hash of the latest committed block.
     committed_hash: BlockHash,
 
+    /// Whether the replica's chain is open: its genesis installed or its
+    /// committed state restored. Each of those queues the first proposal
+    /// and resumes the restored blocks, so an attach before it owes
+    /// neither.
+    opened: bool,
+
     /// The node's committed clock, which this coordinator's commit
     /// advances and the mempool, provisions and remote-header coordinators
     /// read. Pacing only; no admission rule reads it.
@@ -722,9 +728,8 @@ pub struct ShardCoordinator {
     /// speed. Local to the leader; no follower reads it.
     eager_through: BlockHeight,
 
-    /// Validators this host seats in this shard, this replica's signers
-    /// among them. Their votes reach each other without crossing the
-    /// network.
+    /// Validators this host seats in this shard. Their votes, and this
+    /// replica's signers', reach each other without crossing the network.
     host_seats: BTreeSet<ValidatorId>,
 
     /// This replica's shard.
@@ -877,81 +882,11 @@ impl SignerPosition {
     }
 }
 
-/// The QC a restarted validator resumes on: the higher of the committed
-/// tip's and the one its safe-vote registers justify.
-///
-/// The chain metadata only keeps the QC of a committed block, and a lock
-/// rises on QCs that certify blocks well above the commit tip. Restoring the
-/// higher of the two is what lets a validator satisfy its own lock again: a
-/// committee that restarts together holds no certificate above the lock
-/// anywhere else, and every proposal it can build extends whatever it
-/// recovers here.
-fn restored_high_qc(
-    committed: Option<Verified<QuorumCertificate>>,
-    justification: Option<QuorumCertificate>,
-) -> Option<Verified<QuorumCertificate>> {
-    match (committed, justification) {
-        (Some(committed), Some(justification)) if justification.round() > committed.round() => {
-            Some(Verified::<QuorumCertificate>::from_persisted(justification))
-        }
-        (Some(committed), _) => Some(committed),
-        (None, Some(justification)) => {
-            Some(Verified::<QuorumCertificate>::from_persisted(justification))
-        }
-        (None, None) => None,
-    }
-}
-
-/// The replica's high QC and restored high TC, and each signer's
-/// position, from the signers' durable records over the persisted QC.
-///
-/// Certificates are self-justifying, so the replica resumes at the
-/// highest any signer recorded. Each signer's registers are its own
-/// record, floored at the persisted QC's round (`floor`) so a lock cannot
-/// slip beneath a committed block even when no record survives (fresh
-/// store, new chain incarnation).
-fn restore_signers(
-    signers: impl IntoIterator<Item = ValidatorId>,
-    persisted_qc: Option<Verified<QuorumCertificate>>,
-    records: &BTreeMap<ValidatorId, SafeVoteRegisters>,
-    floor: Round,
-) -> (
-    Option<Verified<QuorumCertificate>>,
-    Option<TimeoutCertificate>,
-    BTreeMap<ValidatorId, SignerPosition>,
-) {
-    let records: Vec<(ValidatorId, SafeVoteRegisters)> = signers
-        .into_iter()
-        .map(|signer| (signer, records.get(&signer).cloned().unwrap_or_default()))
-        .collect();
-    let high_qc = records.iter().fold(persisted_qc, |held, (_, record)| {
-        restored_high_qc(held, record.high_qc.clone())
-    });
-    let restored_tc = records
-        .iter()
-        .filter_map(|(_, record)| record.high_tc.clone())
-        .max_by_key(TimeoutCertificate::round);
-    let positions = records
-        .into_iter()
-        .map(|(signer, record)| {
-            let position = SignerPosition {
-                locked_round: floor.max(record.locked_round),
-                last_voted_round: floor.max(record.last_voted_round),
-                last_timed_out_round: None,
-            };
-            (signer, position)
-        })
-        .collect();
-    (high_qc, restored_tc, positions)
-}
-
 impl ShardCoordinator {
-    /// Create a new shard consensus state machine.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Shard consensus configuration
-    /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
+    /// Create a replica over `recovered` with no signer. It follows the
+    /// chain as it stands, and each validator it signs for joins through
+    /// [`Self::attach_signer`]. Use `RecoveredState::default()` for a
+    /// fresh start.
     ///
     /// # Panics
     ///
@@ -962,7 +897,6 @@ impl ShardCoordinator {
     #[must_use]
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        signers: impl IntoIterator<Item = ValidatorId>,
         local_shard: ShardId,
         config: ShardConsensusConfig,
         recovered: RecoveredState,
@@ -987,13 +921,7 @@ impl ShardCoordinator {
         // to two blocks ahead.
         let committed_block_anchor_wt = recovered.block_anchor_wt();
         let committed_committee_anchor_wt = recovered.committee_anchor_wt();
-        let (high_qc, restored_high_tc, signers) = restore_signers(
-            signers,
-            recovered.latest_qc,
-            &recovered.safe_vote_registers,
-            high_qc_round,
-        );
-        let host_seats = signers.keys().copied().collect();
+        let high_qc = recovered.latest_qc;
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
         // chain without it re-admits everything the window still covers.
@@ -1021,6 +949,7 @@ impl ShardCoordinator {
             recent_headers: recovered.recent_headers,
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
+            opened: false,
             clock: CommittedClock::seeded(committed_block_anchor_wt),
             committed_block_anchor_wt,
             quiescent_latched: false,
@@ -1048,14 +977,14 @@ impl ShardCoordinator {
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             high_tc: None,
-            restored_high_tc,
+            restored_high_tc: None,
             carried_checks: BTreeMap::new(),
             qc_announcements: BTreeMap::new(),
             announced_round: None,
             proposal_fetches: BTreeMap::new(),
             retained_tip: None,
             halt_harvest_progress: None,
-            signers,
+            signers: BTreeMap::new(),
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(
                 recovered.committed_height,
@@ -1084,7 +1013,7 @@ impl ShardCoordinator {
             // A restored chain's next blocks go out at network speed, as a
             // fresh chain's first ones do.
             eager_through: recovered.committed_height.next(),
-            host_seats,
+            host_seats: BTreeSet::new(),
             local_shard,
             chain_origin: recovered.chain_origin,
             precut: Precut::adopted(local_shard, &recovered.predecessors),
@@ -1093,6 +1022,77 @@ impl ShardCoordinator {
             mirror: Arc::new(CounterpartMirror::new()),
             proven_anchors: Arc::new(ProvenAnchors::new()),
         }
+    }
+
+    /// Attach `signer` under `record`, its durable safe-vote record, and
+    /// re-drive what it owes at once: its vote on each pending block and,
+    /// as `view`'s proposer, its proposal, which the caller's post-dispatch
+    /// drain takes. On a replica not yet opened the attach seats the
+    /// signer and re-drives nothing: opening does that for every signer.
+    ///
+    /// The record's high QC is adopted as any carried certificate is, past
+    /// the same refusals, and its high TC is held for the first entry whose
+    /// tip committee resolves. Restoring the higher QC is what lets a
+    /// restarted signer satisfy its own lock: a committee that restarts
+    /// together holds no certificate above the lock anywhere else. The
+    /// signer's lock and vote round are its own record floored at
+    /// `persisted_qc_round`, the round of the QC the store holds for its
+    /// committed tip, so no lock slips beneath a committed block. The
+    /// replica's high QC is not the floor: while a fork recovery is
+    /// pending it can certify a block of the branch the recovery
+    /// abandons. No other signer's position moves.
+    pub fn attach_signer(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        signer: ValidatorId,
+        record: Option<SafeVoteRegisters>,
+        persisted_qc_round: Round,
+    ) -> Vec<Action> {
+        if self.signers.contains_key(&signer) {
+            return Vec::new();
+        }
+        let record = record.unwrap_or_default();
+        self.signers.insert(
+            signer,
+            SignerPosition {
+                locked_round: persisted_qc_round.max(record.locked_round),
+                last_voted_round: persisted_qc_round.max(record.last_voted_round),
+                last_timed_out_round: None,
+            },
+        );
+        if let Some(tc) = record.high_tc
+            && self
+                .restored_high_tc
+                .as_ref()
+                .is_none_or(|held| tc.round() > held.round())
+        {
+            self.restored_high_tc = Some(tc);
+        }
+        let adopted = record
+            .high_qc
+            .filter(|qc| !self.fork_refuses_retained_suffix(topology_schedule, qc))
+            .map(Verified::<QuorumCertificate>::from_persisted)
+            .filter(|qc| self.adopt_qc(topology_schedule, qc));
+        if !self.opened {
+            return Vec::new();
+        }
+        let mut actions = adopted.map_or_else(Vec::new, |qc| self.on_qc_adopted(&qc));
+        actions.extend(self.redrive_pending_votes(topology_schedule));
+        if self
+            .tip_committee(topology_schedule)
+            .is_some_and(|committee| {
+                committee.proposer_for(self.local_shard, self.view_change.view) == signer
+            })
+        {
+            self.queue_ready_proposal();
+        }
+        actions
+    }
+
+    /// Detach `signer`: it signs nothing further through this replica,
+    /// which keeps following the chain whatever signers remain.
+    pub fn detach_signer(&mut self, signer: ValidatorId) {
+        self.signers.remove(&signer);
     }
 
     /// QC-attested state root of the latest committed block. Updated
@@ -1477,8 +1477,13 @@ impl ShardCoordinator {
     /// answer, an answer count read off the store.
     /// The state machine asks once per dispatch and re-drives the
     /// pending votes on `true`, so no writer has to know which votes
-    /// were deferred on what it wrote.
+    /// were deferred on what it wrote. A replica not yet opened answers
+    /// `false` and keeps what it has seen for the first ask after it
+    /// opens.
     pub fn take_fence_evidence_advanced(&mut self) -> bool {
+        if !self.opened {
+            return false;
+        }
         let now = (
             self.mirror.generation(),
             self.proven_anchors.generation(),
@@ -2188,6 +2193,7 @@ impl ShardCoordinator {
         let hash = genesis.hash();
 
         self.committed_hash = hash;
+        self.opened = true;
         self.committed_state_root = genesis.header().state_root();
         self.committed_tip = Some(genesis.header().committed_tip());
         // A chain's genesis height and clock are per-chain properties: a
@@ -2243,26 +2249,8 @@ impl ShardCoordinator {
 
     /// Seed the answer count at a chain's genesis, read whole off the
     /// genesis store before anything else can write it.
-    pub fn seed_standing_answers(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        height: BlockHeight,
-        count: StandingAnswers,
-    ) {
-        let seated = self.seated_to_vote(topology_schedule);
-        self.answers.seeded(height, count, seated);
-    }
-
-    /// Whether any signer sits in its shard's committee, at the head or
-    /// for the block extending the committed tip, and so may vote on what
-    /// its chain proposes.
-    #[must_use]
-    pub fn seated_to_vote(&self, topology_schedule: &TopologySchedule) -> bool {
-        let seats = |snapshot: &TopologySnapshot| {
-            let committee = snapshot.committee_for_shard(self.local_shard);
-            self.signers.keys().any(|signer| committee.contains(signer))
-        };
-        seats(topology_schedule.head()) || self.tip_committee(topology_schedule).is_some_and(seats)
+    pub fn seed_standing_answers(&mut self, height: BlockHeight, count: StandingAnswers) {
+        self.answers.seeded(height, count);
     }
 
     /// The answers the chain holds behind `parent`, rebuilt from the
@@ -2413,12 +2401,13 @@ impl ShardCoordinator {
         if let Some(h) = hash {
             self.committed_hash = h;
         }
+        self.opened = true;
         let has_qc = qc.is_some();
         // Raise every signer's safe-vote lock to the QC's round without
-        // ever lowering it: `Self::new` already floored both registers at
-        // the max of the signer's durable record — every round it signed,
-        // persisted before the signature left the process — and the
-        // persisted QC's round. Assigning the QC round here would roll that
+        // ever lowering it: `Self::attach_signer` already floored both
+        // registers at the max of the signer's durable record — every round
+        // it signed, persisted before the signature left the process — and
+        // the persisted QC's round. Assigning the QC round here would roll that
         // floor back for a signer whose last vote or timeout outran the
         // highest committed QC, letting it vote twice in one round. `max`
         // keeps the durable floor.
@@ -2429,12 +2418,12 @@ impl ShardCoordinator {
             }
         }
         // The high QC only rises, for the same reason the lock does.
-        // `Self::new` restored the higher of the committed tip's
-        // certificate and the durable record's, and the record's is the
-        // one above the tip. Assigning the committed one here would drop
-        // back to a certificate beneath this node's own lock, which is
-        // what it reports in a timeout — and a bound understated is a
-        // bound another replica may vote beneath.
+        // The replica holds the higher of the committed tip's certificate
+        // and every one an attached signer's record carried in, and a
+        // record's is the one above the tip. Assigning the committed one
+        // here would drop back to a certificate beneath this node's own
+        // lock, which is what it reports in a timeout — and a bound
+        // understated is a bound another replica may vote beneath.
         let held = self.latest_qc.as_deref().map(QuorumCertificate::round);
         if qc.as_deref().map(QuorumCertificate::round) > held {
             self.latest_qc = qc;
@@ -4765,9 +4754,13 @@ impl ShardCoordinator {
     /// QC ahead of it would let the fresh committee certify a sibling of
     /// real committed history above the anchor and break commit linkage
     /// when the suffix then syncs in. So under a halt the anchor is taken
-    /// only once the cohort has had `HALT_HARVEST_WAIT` — several of the
-    /// re-offer ticks a retained member sends while the recovery names it
-    /// — to name a tip above it and named none. The wait counts from the
+    /// only once the cohort has had `HALT_HARVEST_WAIT` to name a tip above
+    /// it and named none: a retained signer outside this committee's
+    /// consensus subset offers on its replica's first tick with the window
+    /// open, and one a stalled re-draw seated inside it offers at its
+    /// replica's next timer fire, within one tick plus two capped progress
+    /// waits of the later of the window's opening and that replica's last
+    /// step along the halted chain. The wait counts from the
     /// first tick on which the seating window is open: while it is closed
     /// no committee resolves for the tip on either side, so nothing can
     /// be sent or received. A cohort that answers with nothing above
@@ -4865,12 +4858,26 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         qc: &Verified<QuorumCertificate>,
     ) -> Vec<Action> {
+        if !self.adopt_qc(topology_schedule, qc) {
+            return Vec::new();
+        }
+        self.on_qc_adopted(qc)
+    }
+
+    /// Take `qc` as `latest_qc` and advance the view past it, or `false`
+    /// when it is in no higher round than the one held or a pending halt
+    /// recovery refuses it.
+    fn adopt_qc(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        qc: &Verified<QuorumCertificate>,
+    ) -> bool {
         let advances = self
             .latest_qc
             .as_ref()
             .is_none_or(|existing| qc.round() > existing.round());
         if !advances || self.halt_refuses_left_bridge(topology_schedule, qc) {
-            return Vec::new();
+            return false;
         }
         debug!(
             signers = ?self.signers.keys(),
@@ -4880,9 +4887,15 @@ impl ShardCoordinator {
         );
         self.latest_qc = Some(qc.clone());
         self.advance_view_for_qc(qc);
-        // Every adoption path lands here — including timeout-carried
-        // high QCs and byte-equal cached QCs that skip the signature
-        // dispatch — so this is where the certified tip becomes
+        true
+    }
+
+    /// What adopting `qc` drives on an opened replica: its certified
+    /// block, the two-chain commit it completes, and a proposal attempt.
+    fn on_qc_adopted(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
+        // Every adoption on an opened replica lands here — including
+        // timeout-carried high QCs and byte-equal cached QCs that skip the
+        // signature dispatch — so this is where the certified tip becomes
         // servable to block sync ahead of its commit.
         let mut actions = self.populate_certified_for(qc);
         // Non-proposers learn about QCs via block headers rather than
@@ -6827,9 +6840,7 @@ impl ShardCoordinator {
         standing_answers: Option<(BlockHeight, BlockHash, StandingAnswers)>,
     ) -> Vec<Action> {
         self.verification.on_block_persisted(block_height);
-        let seated = self.seated_to_vote(topology_schedule);
-        self.answers
-            .persisted(block_height, standing_answers, seated);
+        self.answers.persisted(block_height, standing_answers);
 
         // Reconcile the byte frontier from storage. Strictly newer
         // heights only: live commits already advanced the frontier via
@@ -7033,9 +7044,9 @@ impl ShardCoordinator {
         let members = committee.consensus_committee_for_shard(self.local_shard);
         qc.signer_count() > 0
             && qc.signers().set_indices().all(|index| {
-                members
-                    .get(index)
-                    .is_some_and(|member| self.host_seats.contains(member))
+                members.get(index).is_some_and(|member| {
+                    self.host_seats.contains(member) || self.signers.contains_key(member)
+                })
             })
     }
 
@@ -7461,8 +7472,7 @@ impl ShardCoordinator {
             self.substate_bytes_frontier = (height, count);
         }
 
-        let seated = self.seated_to_vote(topology_schedule);
-        self.answers.committed(height, block_hash, seated);
+        self.answers.committed(height, block_hash);
 
         // Register committed artifacts synchronously. The retention maps
         // are populated here so the just-committed block's contents are
@@ -7653,9 +7663,13 @@ impl ShardCoordinator {
     }
 
     /// Gauge what the chain stands holding at its committed tip, per
-    /// lineage of the head's trie and in total, where this voter holds
-    /// the count.
+    /// lineage of the head's trie and in total. The gauge is one per
+    /// process, so only a replica that signs sets it: one that only
+    /// follows its chain would overwrite the live chain's reading.
     fn gauge_standing_answers(&self, topology_schedule: &TopologySchedule) {
+        if self.signers.is_empty() {
+            return;
+        }
         let Some(mut standing) = self.answers.at_tip(self.committed_height).cloned() else {
             return;
         };
@@ -9656,6 +9670,10 @@ impl ShardCoordinator {
         // peer signal ever supplies a higher one.
         let mut actions = self.release_stalled_harvest();
         actions.extend(self.try_adopt_anchor_qc(topology_schedule));
+        // Seat the keeper on the tip committee the anchor or the seating
+        // window may have just moved, so a fall-back's leader-activity
+        // reset lands at this tick rather than spending the next timer fire.
+        actions.extend(self.refresh_pacemaker_at_tip(topology_schedule));
         actions.extend(self.reoffer_retained_tip(topology_schedule));
         actions.extend(self.resume_recovered_blocks(topology_schedule));
         actions.extend(self.resume_restored_high_tc(topology_schedule));
@@ -9749,25 +9767,26 @@ impl ShardCoordinator {
     /// halt recovery names retained, on the periodic tick.
     ///
     /// The timeout carries `high_qc`, and it is the only signal that
-    /// carries the halted tip to the fresh committee, which
-    /// [`Self::harvest_retained_tip`] reads off it. The round timer
-    /// retransmits it too, but at its own cadence: the base while the
-    /// halted height is still on its first round, and up to the backoff
-    /// cap when rounds were abandoned before quorum was lost. The fresh
-    /// committee's `HALT_HARVEST_WAIT` is sized against this tick, not
-    /// against that timer.
+    /// carries the halted tip to the fresh committee.
     ///
     /// A signer outside the tip committee's consensus subset offers on
-    /// every tick. Its share is harvested, never tallied, since the
-    /// pacemaker counts only the subset, so it moves no quorum; raising its
-    /// own registers to the view discards nothing, because it owes no
-    /// proposal or vote there.
+    /// every tick, so its first offer lands at the first tick with the
+    /// seating window open, whenever it attached. Its share is harvested
+    /// ([`Self::harvest_retained_tip`]), never tallied, since the pacemaker
+    /// counts only the subset, so it moves no quorum; raising its own
+    /// registers to the view discards nothing, because it owes no proposal
+    /// or vote there.
     ///
     /// A signer inside the subset — a retained member a stalled recovery's
     /// re-draw seated in the fresh committee — offers only once the timer
     /// has fired for the current round. It can be the view's proposer or owe
     /// the pending block's vote, so it must not time out before the timer
-    /// does.
+    /// does. Its first offer is that fire, within one tick plus two capped
+    /// progress waits of the later of the window's opening and this
+    /// replica's last step along the halted chain, since the tick re-seats
+    /// the round clock before this runs; the fresh committee takes it by
+    /// round rather than through the harvest. `HALT_HARVEST_WAIT` is sized
+    /// to that bound.
     fn reoffer_retained_tip(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let view = self.view_change.view;
         let Some(committee) = self.tip_committee(topology_schedule) else {
@@ -9915,13 +9934,9 @@ impl ShardCoordinator {
         self.latest_qc.as_ref()
     }
 
-    /// Record the validators this host seats in this shard. This
-    /// replica's signers are always among them.
+    /// Record the validators this host seats in this shard.
     pub fn set_host_seats(&mut self, seats: impl IntoIterator<Item = ValidatorId>) {
-        self.host_seats = seats
-            .into_iter()
-            .chain(self.signers.keys().copied())
-            .collect();
+        self.host_seats = seats.into_iter().collect();
     }
 
     /// Get the current view/round.
@@ -10136,6 +10151,8 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::NibblePath;
     use hyperscale_mempool::MempoolCoordinator;
+    use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
+    use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_storage::test_helpers::{
         answer_leaf, commit_settled_at, commit_writes, make_test_block_with_anchor_wt,
         make_test_certified,
@@ -10161,16 +10178,17 @@ mod tests {
         MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
         MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
         MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, NetworkDefinition, NetworkId,
-        NetworkParams, Owes, PrincipalAddr, ProvisionEntry, ProvisionTxRoot, RETENTION_HORIZON,
-        ReadFence, ReadMark, Reading, RevealChain, Role, RoutePrefix, Routing, Said, SectionRoots,
-        SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad,
-        Signer, SignerBitfield, StateClaimsRoot, StateWrites, StatedTerms, SubstateClaim,
-        SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES, TICK_RESERVE_BYTES,
-        Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
-        Transaction, TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount,
-        VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, decide, encode_amount,
-        read_amount, receipt_hash_of, said_at, test_utils, tick_terms_admit_block, verdict_leaf,
+        NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, PrincipalAddr, ProvisionEntry,
+        ProvisionTxRoot, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role,
+        RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites,
+        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
+        StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS,
+        TICK_LINE_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxOutcome,
+        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId,
+        ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup,
+        WitnessSources, decide, encode_amount, read_amount, receipt_hash_of, said_at, test_utils,
+        tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -10183,6 +10201,23 @@ mod tests {
     use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent, within_the_cap};
 
     impl ShardCoordinator {
+        /// This replica, opened on the chain it was built over, with
+        /// `signer` seated as an attach with no durable record seats it,
+        /// before there is anything to re-drive.
+        fn signed_by(mut self, signer: ValidatorId) -> Self {
+            self.opened = true;
+            let floor = self.high_qc_round();
+            self.signers.insert(
+                signer,
+                SignerPosition {
+                    locked_round: floor,
+                    last_voted_round: floor,
+                    last_timed_out_round: None,
+                },
+            );
+            self
+        }
+
         /// The one signer a test replica is built with.
         fn sole_signer(&self) -> ValidatorId {
             let mut signers = self.signers.keys();
@@ -10291,11 +10326,11 @@ mod tests {
 
         let state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             config,
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         (state, TopologySchedule::single(Arc::new(topology_snapshot)))
     }
 
@@ -10349,11 +10384,11 @@ mod tests {
         )));
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             local_shard,
             ShardConsensusConfig::default(),
             recovered,
         )
+        .signed_by(ValidatorId::new(0))
     }
 
     fn precut_tx(seed: u8, opens_ms: u64) -> Arc<Transaction> {
@@ -13563,11 +13598,11 @@ mod tests {
     fn left_of_two() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
             RecoveredState::default(),
         )
+        .signed_by(ValidatorId::new(0))
     }
 
     /// Two shards under one four-validator committee.
@@ -13877,7 +13912,6 @@ mod tests {
 
         let restarted = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             local,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -13887,7 +13921,8 @@ mod tests {
                 members: Some(live.member_rows().clone()),
                 ..RecoveredState::default()
             },
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         let child = |anchor_ms: u64, lines: Vec<TickLine>| {
             carrying(
@@ -15150,11 +15185,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         // The tip: one block, anchored below the cut, that both replicas hold.
         let tip = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
@@ -15212,11 +15247,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         // A three-block run: `grandparent` has committed and been pruned,
         // `parent` is the committed tip, `child` is arriving now.
@@ -15262,11 +15297,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         // Parent sits below the cut, so its anchor is epoch 0.
         let parent = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
@@ -15332,11 +15367,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         state.committed_height = BlockHeight::new(4);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
 
@@ -15412,7 +15447,6 @@ mod tests {
         let tip = BlockHash::from_raw(Hash::from_bytes(b"restarted_tip"));
         let state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -15422,7 +15456,8 @@ mod tests {
                 committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(ED - 1)),
                 ..RecoveredState::default()
             },
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         assert_eq!(
             state
@@ -15518,7 +15553,6 @@ mod tests {
         let round = tip_qc.round().next();
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [split.proposer_for(local, round)],
             local,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -15530,7 +15564,8 @@ mod tests {
                 committed_tip: Some(CommittedTip::GENESIS),
                 ..RecoveredState::default()
             },
-        );
+        )
+        .signed_by(split.proposer_for(local, round));
         state.set_time(LocalTimestamp::from_millis(ED));
         state.view_change.view = round;
         state.verification.on_block_persisted(BlockHeight::new(9));
@@ -15813,11 +15848,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         // The committed tip anchors in epoch 0; so does `parent`. `child`
         // dates itself past the cut, but its committee still anchors on
@@ -18085,20 +18120,21 @@ mod tests {
     fn a_restored_certificate_resumes_the_view_it_shows() {
         let (_, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
         let tc = certificate_at(&keys, 5);
-        let mut recovered = RecoveredState::default();
-        recovered.safe_vote_registers.insert(
-            ValidatorId::new(0),
-            SafeVoteRegisters {
-                high_tc: Some(tc),
-                ..SafeVoteRegisters::default()
-            },
-        );
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
-            recovered,
+            RecoveredState::default(),
+        );
+        let record = SafeVoteRegisters {
+            high_tc: Some(tc),
+            ..SafeVoteRegisters::default()
+        };
+        let _ = state.attach_signer(
+            &topology_schedule,
+            ValidatorId::new(0),
+            Some(record),
+            Round::INITIAL,
         );
         state.set_time(LocalTimestamp::from_millis(100_000));
         let _ = state.check_sync_health(&topology_schedule);
@@ -18299,11 +18335,11 @@ mod tests {
             }
             let mut state = ShardCoordinator::new(
                 Arc::new(BlsVerifier),
-                [ValidatorId::new(4)],
                 shard,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
-            );
+            )
+            .signed_by(ValidatorId::new(4));
             state.set_time(LocalTimestamp::from_millis(100_000));
 
             let p = block_with_parent_qc_ts(BlockHeight::new(5), CUT_ED - 1);
@@ -19257,11 +19293,11 @@ mod tests {
         schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         state.set_time(LocalTimestamp::from_millis(3 * CLAIM_ED));
         (state, schedule, keys, epochs)
     }
@@ -19948,14 +19984,25 @@ mod tests {
         retained: Vec<ValidatorId>,
         rotated_at: Epoch,
     ) -> Arc<TopologySnapshot> {
-        use hyperscale_types::{RecoveryCause, ShardRecovery};
+        with_pending_recovery(schedule, RecoveryCause::Halt, retained, rotated_at)
+    }
+
+    /// A snapshot carrying a pending recovery of `cause` on the root shard
+    /// that names `retained`, seated at `rotated_at`.
+    fn with_pending_recovery(
+        schedule: &TopologySchedule,
+        cause: RecoveryCause,
+        retained: Vec<ValidatorId>,
+        rotated_at: Epoch,
+    ) -> Arc<TopologySnapshot> {
+        use hyperscale_types::ShardRecovery;
 
         Arc::new(
             schedule.head().as_ref().clone().with_pending_recoveries(
                 std::iter::once((
                     ShardId::ROOT,
                     ShardRecovery {
-                        cause: RecoveryCause::Halt,
+                        cause,
                         rotated_at,
                         retained,
                         attested_frontier: BlockHeight::GENESIS,
@@ -20474,6 +20521,28 @@ mod tests {
         assert_eq!(state.high_qc_round(), Round::new(7));
     }
 
+    /// Once the fresh chain has certified past the bridge, a signer
+    /// attached with a record holding the halted chain's QC, above the
+    /// fresh round, does not carry the replica onto the halted branch.
+    #[test]
+    fn a_signer_attached_after_the_fresh_chain_left_the_bridge_keeps_its_records_halted_qc_out() {
+        let (mut state, schedule, _, halted, halted_qc) = fresh_chain_past_the_bridge();
+        install_complete_block(&mut state, &halted);
+        let record = SafeVoteRegisters {
+            locked_round: Round::new(6),
+            last_voted_round: Round::new(7),
+            high_qc: Some((*halted_qc).clone()),
+            high_tc: None,
+        };
+        let _ = state.attach_signer(&schedule, ValidatorId::new(1), Some(record), Round::INITIAL);
+        assert_eq!(
+            state.high_qc_round(),
+            Round::new(3),
+            "a recorded halted QC is not adopted"
+        );
+        assert_eq!(position_of(&state, 1).last_voted_round, Round::new(7));
+    }
+
     /// A state that builds a proposal at height 4 on a persisted tip at 3,
     /// under a pending halt recovery.
     fn proposer_under_halt_recovery() -> (ShardCoordinator, TopologySchedule) {
@@ -20654,7 +20723,7 @@ mod tests {
             vec![ValidatorId::new(9)],
             Epoch::new(2),
         ));
-        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.set_time(LocalTimestamp::from_millis(300_000));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_3"));
         state.verification.on_block_persisted(BlockHeight::new(3));
@@ -20795,8 +20864,7 @@ mod tests {
     #[test]
     fn a_tip_without_its_tree_parks_the_build_until_the_tree_is_held() {
         let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
-        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
-        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
+        state.halt_harvest_progress = Some(state.now.minus(HALT_HARVEST_WAIT));
         // The earlier block's tree is held and the tip's is not.
         state.verification.mark_proposal_fully_verified(&four);
         assert!(
@@ -20871,8 +20939,7 @@ mod tests {
     #[test]
     fn a_timeout_reports_the_high_qc_over_a_tip_without_its_tree() {
         let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
-        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
-        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
+        state.halt_harvest_progress = Some(state.now.minus(HALT_HARVEST_WAIT));
         state.verification.mark_proposal_fully_verified(&four);
         assert!(!state.build_tree_held());
 
@@ -21134,11 +21201,11 @@ mod tests {
             TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set);
         let state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(u64::from(local_idx))],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(u64::from(local_idx)));
         (
             state,
             TopologySchedule::single(Arc::new(topology_snapshot)),
@@ -22788,11 +22855,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
@@ -22862,11 +22929,11 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         state.committed_height = BlockHeight::new(3);
         // The block's parent is the committed tip, so the witness-leaf walk
         // terminates immediately and verification can dispatch the moment the
@@ -23495,11 +23562,11 @@ mod tests {
         let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
@@ -24972,11 +25039,11 @@ mod tests {
         };
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             recovered,
         )
+        .signed_by(ValidatorId::new(0))
     }
 
     /// A block anchored past its shard's cut declines nothing. The fold
@@ -25235,11 +25302,11 @@ mod tests {
     fn fence_coordinator() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(0)],
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
             RecoveredState::default(),
         )
+        .signed_by(ValidatorId::new(0))
     }
 
     /// A block carrying boundary records, anchored at `anchor_ms` — the
@@ -26026,7 +26093,7 @@ mod tests {
                 unraced.land(&self.store);
             }
             self.events.extend(raced);
-            voter.persisted(height, count, true);
+            voter.persisted(height, count);
         }
     }
 
@@ -26052,7 +26119,7 @@ mod tests {
     impl Differential {
         fn new() -> Self {
             let mut voter = HeldAnswers::default();
-            voter.seeded(BlockHeight::GENESIS, StandingAnswers::default(), true);
+            voter.seeded(BlockHeight::GENESIS, StandingAnswers::default());
             Self {
                 writer: Writer(0x9E37_79B9_7F4A_7C15),
                 under: NibblePath::empty(),
@@ -26077,7 +26144,7 @@ mod tests {
             let follow = AnswerFollow::whole(&self.chain.source, head, &self.under);
             assert_eq!(follow.count(), &whole_read(&self.cells, &self.under));
             self.voter = HeldAnswers::default();
-            self.voter.seeded(head.0, follow.count().clone(), true);
+            self.voter.seeded(head.0, follow.count().clone());
             self.chain.follow = Some(follow);
         }
 
@@ -26119,7 +26186,7 @@ mod tests {
                 self.voter
                     .measured(block.hash(), delta, AnswerAdditions::default());
             }
-            self.voter.committed(at, block.hash(), true);
+            self.voter.committed(at, block.hash());
             apply(&mut self.cells, &creations, &removals);
             let flush = match self.fork.as_mut() {
                 Some(theirs) => {
@@ -26250,7 +26317,7 @@ mod tests {
         let (mut state, schedule) = make_test_state();
         state.committed_height = BlockHeight::GENESIS;
         state.committed_hash = blocks[0].header().parent_block_hash();
-        state.seed_standing_answers(&schedule, BlockHeight::GENESIS, StandingAnswers::default());
+        state.seed_standing_answers(BlockHeight::GENESIS, StandingAnswers::default());
         let state = measuring(state, &schedule, blocks, measured);
         assert_eq!(state.committed_height, blocks[blocks.len() - 1].height());
         (state, schedule)
@@ -26419,45 +26486,78 @@ mod tests {
         let from = BlockHash::from_raw(Hash::from_bytes(b"short tip"));
         let blocks = answer_chain(from, 3);
         let mut voter = HeldAnswers::default();
-        voter.seeded(BlockHeight::GENESIS, answers(0), true);
+        voter.seeded(BlockHeight::GENESIS, answers(0));
         for block in &blocks {
             voter.measured(block.hash(), one_more(), AnswerAdditions::default());
-            voter.committed(block.height(), block.hash(), true);
+            voter.committed(block.height(), block.hash());
         }
         let tip = BlockHeight::new(3);
         assert_eq!(voter.at_tip(tip), Some(&answers(3)));
         let short = Some((BlockHeight::new(1), blocks[0].hash(), answers(0)));
-        voter.persisted(BlockHeight::new(1), short, true);
+        voter.persisted(BlockHeight::new(1), short);
         assert_eq!(voter.at_tip(tip), Some(&answers(2)));
         let exact = Some((BlockHeight::new(2), blocks[1].hash(), answers(2)));
-        voter.persisted(BlockHeight::new(2), exact, true);
+        voter.persisted(BlockHeight::new(2), exact);
         assert_eq!(voter.at_tip(tip), Some(&answers(3)));
     }
 
-    /// A voter its shard's committee does not seat holds no count and no
-    /// committed delta, whatever it commits, measures or is handed.
+    /// A replica holds its count whatever its signers: one whose only
+    /// signer its shard's committee does not seat still folds every block
+    /// it commits, so a signer attached later votes under the cap at once.
     #[test]
-    fn an_unseated_vnode_holds_no_committed_deltas() {
+    fn a_replica_holds_its_count_whatever_its_signers() {
         let from = BlockHash::from_raw(Hash::from_bytes(b"unseated tip"));
         let blocks = answer_chain(from, 4);
         let (_, schedule) = make_test_state();
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [ValidatorId::new(99)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
-        );
-        assert!(!state.seated_to_vote(&schedule));
+        )
+        .signed_by(ValidatorId::new(99));
         state.committed_height = BlockHeight::GENESIS;
         state.committed_hash = from;
-        state.seed_standing_answers(&schedule, BlockHeight::GENESIS, StandingAnswers::default());
+        state.seed_standing_answers(BlockHeight::GENESIS, StandingAnswers::default());
         state = measuring(state, &schedule, &blocks, &[1, 2, 3, 4]);
-        assert_eq!(state.answers.committed_len(), 0);
-        let count = Some((BlockHeight::new(4), blocks[3].hash(), answers(4)));
-        let _ = state.on_block_persisted(&schedule, BlockHeight::new(2), 0, count);
-        assert_eq!(state.standing_answers_at(state.committed_hash), None);
-        assert_eq!(state.answers.committed_len(), 0);
+        assert_eq!(state.answers.committed_len(), 4);
+        assert_eq!(
+            state.standing_answers_at(state.committed_hash),
+            Some(answers(4))
+        );
+    }
+
+    /// Only a replica that signs sets the process-wide standing-answers
+    /// gauge: one that only follows its chain leaves the reading of the
+    /// chain that signs standing.
+    #[test]
+    fn only_a_signing_replica_gauges_its_standing_answers() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"gauged tip"));
+        let blocks = answer_chain(from, 4);
+        let (_, schedule) = make_test_state();
+        let gauged = |signer: Option<ValidatorId>| {
+            let mut state = ShardCoordinator::new(
+                Arc::new(BlsVerifier),
+                ShardId::ROOT,
+                ShardConsensusConfig::default(),
+                RecoveredState::default(),
+            );
+            if let Some(signer) = signer {
+                state = state.signed_by(signer);
+            }
+            state.committed_height = BlockHeight::GENESIS;
+            state.committed_hash = from;
+            state.seed_standing_answers(BlockHeight::GENESIS, StandingAnswers::default());
+            let recorder = MemoryRecorder::new();
+            let scoped: Arc<dyn MetricsRecorder> = Arc::new(recorder.clone());
+            let state = with_scoped_recorder(scoped, || {
+                measuring(state, &schedule, &blocks, &[1, 2, 3, 4])
+            });
+            assert_eq!(state.answers.committed_len(), 4, "every replica folds");
+            recorder.gauge("standing_answers_by_lineage", Some("total"))
+        };
+        assert!(gauged(Some(ValidatorId::new(0))) > 0.0);
+        assert_eq!(gauged(None), 0.0);
     }
 
     /// The producer route the cap tests count answers out of.
@@ -26571,11 +26671,9 @@ mod tests {
         state.committed_hash = parent.hash();
         install_complete_block(&mut state, &parent);
         state.verification.on_block_persisted(BlockHeight::new(1));
-        state
-            .answers
-            .committed(BlockHeight::new(1), parent.hash(), true);
+        state.answers.committed(BlockHeight::new(1), parent.hash());
         if let Some(count) = count {
-            state.seed_standing_answers(&schedule, BlockHeight::new(1), count);
+            state.seed_standing_answers(BlockHeight::new(1), count);
         }
         (state, schedule, parent)
     }
@@ -26773,7 +26871,7 @@ mod tests {
         let actions = state_root_checked(&mut state, &schedule, header.hash(), adding(1));
         assert!(!votes(&actions), "got {actions:?}");
         let _ = state.take_fence_evidence_advanced();
-        state.seed_standing_answers(&schedule, BlockHeight::new(1), StandingAnswers::default());
+        state.seed_standing_answers(BlockHeight::new(1), StandingAnswers::default());
         assert!(
             state.take_fence_evidence_advanced(),
             "the seeding re-drives"
@@ -27721,23 +27819,25 @@ mod tests {
     #[test]
     fn a_carried_lock_above_the_high_qc_binds_only_its_own_signer() {
         let (_, schedule) = make_multi_validator_state_at(2);
-        let mut recovered = RecoveredState::default();
-        recovered.safe_vote_registers.insert(
-            ValidatorId::new(2),
-            SafeVoteRegisters {
-                locked_round: Round::new(5),
-                last_voted_round: Round::new(5),
-                high_qc: None,
-                high_tc: None,
-            },
-        );
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ids(&[2, 3]),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
-            recovered,
+            RecoveredState::default(),
         );
+        let carried = SafeVoteRegisters {
+            locked_round: Round::new(5),
+            last_voted_round: Round::new(5),
+            high_qc: None,
+            high_tc: None,
+        };
+        let _ = state.attach_signer(
+            &schedule,
+            ValidatorId::new(2),
+            Some(carried),
+            Round::INITIAL,
+        );
+        let _ = state.attach_signer(&schedule, ValidatorId::new(3), None, Round::INITIAL);
         state.set_time(LocalTimestamp::from_millis(100_000));
         assert_eq!(position_of(&state, 2).locked_round, Round::new(5));
         assert_eq!(position_of(&state, 3).locked_round, Round::INITIAL);
@@ -27934,16 +28034,17 @@ mod tests {
 
         // Only the header's position reached the store: the self-vote was
         // dropped at a close, or the crash came first.
-        let mut recovered = RecoveredState::default();
-        recovered
-            .safe_vote_registers
-            .insert(ValidatorId::new(1), position.registers.clone());
         let mut restarted = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ids(&[1]),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
-            recovered,
+            RecoveredState::default(),
+        );
+        let _ = restarted.attach_signer(
+            &schedule,
+            ValidatorId::new(1),
+            Some(position.registers.clone()),
+            Round::INITIAL,
         );
         restarted.set_time(LocalTimestamp::from_millis(100_000));
         assert_eq!(restarted.view(), Round::new(1));
@@ -28007,10 +28108,11 @@ mod tests {
         );
     }
 
-    /// The replica resumes on the highest certificates any signer's record
-    /// holds, and seats each signer at its own record over the floor.
+    /// Two signers' records with different certificates leave the replica
+    /// on the higher of each, and each signer at its own record over the
+    /// persisted QC's floor; a signer with no record sits at the floor.
     #[test]
-    fn restored_signers_resume_on_the_highest_certificates_any_record_holds() {
+    fn two_records_with_different_high_qcs_resume_at_the_higher() {
         let qc_at = |round: u64| {
             QuorumCertificate::new(
                 BlockHash::from_raw(Hash::from_bytes(&round.to_le_bytes())),
@@ -28024,34 +28126,45 @@ mod tests {
             )
         };
         let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
-        let records = BTreeMap::from([
-            (
-                ValidatorId::new(1),
-                SafeVoteRegisters {
-                    locked_round: Round::new(5),
-                    last_voted_round: Round::new(5),
-                    high_qc: Some(qc_at(5)),
-                    high_tc: Some(certificate_over(Round::new(4), &genesis)),
-                },
-            ),
-            (
-                ValidatorId::new(2),
-                SafeVoteRegisters {
-                    locked_round: Round::new(3),
-                    last_voted_round: Round::new(7),
-                    high_qc: Some(qc_at(3)),
-                    high_tc: Some(certificate_over(Round::new(6), &genesis)),
-                },
-            ),
-        ]);
-        let persisted = Verified::<QuorumCertificate>::new_unchecked_for_test(qc_at(2));
+        let first = SafeVoteRegisters {
+            locked_round: Round::new(5),
+            last_voted_round: Round::new(5),
+            high_qc: Some(qc_at(5)),
+            high_tc: Some(certificate_over(Round::new(4), &genesis)),
+        };
+        let second = SafeVoteRegisters {
+            locked_round: Round::new(3),
+            last_voted_round: Round::new(7),
+            high_qc: Some(qc_at(3)),
+            high_tc: Some(certificate_over(Round::new(6), &genesis)),
+        };
+        let (_, schedule) = make_multi_validator_state_at(0);
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                latest_qc: Some(Verified::<QuorumCertificate>::new_unchecked_for_test(
+                    qc_at(2),
+                )),
+                ..RecoveredState::default()
+            },
+        );
+        let floor = Round::new(2);
+        let _ = state.attach_signer(&schedule, ValidatorId::new(1), Some(first), floor);
+        let _ = state.attach_signer(&schedule, ValidatorId::new(2), Some(second), floor);
+        let _ = state.attach_signer(&schedule, ValidatorId::new(3), None, floor);
 
-        let (quorum, timeout, positions) =
-            restore_signers(ids(&[1, 2, 3]), Some(persisted), &records, Round::new(2));
-        assert_eq!(quorum.map(|qc| qc.round()), Some(Round::new(5)));
-        assert_eq!(timeout.map(|tc| tc.round()), Some(Round::new(6)));
+        assert_eq!(state.high_qc_round(), Round::new(5));
+        assert_eq!(
+            state
+                .restored_high_tc
+                .as_ref()
+                .map(TimeoutCertificate::round),
+            Some(Round::new(6))
+        );
         let seated = |signer: u64| {
-            let position = positions[&ValidatorId::new(signer)];
+            let position = position_of(&state, signer);
             (position.locked_round, position.last_voted_round)
         };
         assert_eq!(seated(1), (Round::new(5), Round::new(5)));
@@ -28061,6 +28174,115 @@ mod tests {
             (Round::new(2), Round::new(2)),
             "no record: the floor"
         );
+    }
+
+    /// A signer attached to a restored replica before its restore, as
+    /// startup and a seat on a running loop both attach, proposes nothing
+    /// until the restore opens the replica, though it leads the view, and
+    /// is driven once it does.
+    #[test]
+    fn a_proposer_attached_before_its_replicas_restore_builds_only_once_restored() {
+        let (_, schedule) = make_multi_validator_state_at(0);
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"restored tip"));
+        let qc = make_test_qc(tip, BlockHeight::new(3));
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                committed_height: BlockHeight::new(3),
+                committed_hash: Some(tip),
+                latest_qc: Some(qc.clone()),
+                ..RecoveredState::default()
+            },
+        );
+        let proposer = schedule.head().proposer_for(ShardId::ROOT, state.view());
+
+        let actions = state.attach_signer(&schedule, proposer, None, qc.round());
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(
+            !state.take_ready_proposal(),
+            "no proposal is queued before the restore"
+        );
+
+        let _ = state.on_committed_state_restored(BlockHeight::new(3), Some(tip), Some(qc));
+        assert!(state.take_ready_proposal(), "the restore drives the leader");
+    }
+
+    /// Evidence the vote fence reads that lands before the replica opens
+    /// re-drives nothing then, and re-drives at the first ask after the
+    /// restore opens it.
+    #[test]
+    fn fence_evidence_waits_for_the_replica_to_open() {
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"restored tip"));
+        let qc = make_test_qc(tip, BlockHeight::new(3));
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                committed_height: BlockHeight::new(3),
+                committed_hash: Some(tip),
+                latest_qc: Some(qc.clone()),
+                ..RecoveredState::default()
+            },
+        );
+        state.precut_generation += 1;
+        assert!(!state.take_fence_evidence_advanced());
+
+        let _ = state.on_committed_state_restored(BlockHeight::new(3), Some(tip), Some(qc));
+        assert!(state.take_fence_evidence_advanced());
+    }
+
+    /// The certificate an attach adopts from a record moves the view and
+    /// dates the adoption as a QC taken any other way does, so the leader
+    /// of the next round judges eagerness alike either way.
+    #[test]
+    fn a_records_certificate_is_adopted_as_any_certificate_is() {
+        let (_, schedule) = make_multi_validator_state_at(0);
+        let recorded = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"recorded")),
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Round::new(5),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100_000),
+        );
+        let replica = || {
+            let mut state = ShardCoordinator::new(
+                Arc::new(BlsVerifier),
+                ShardId::ROOT,
+                ShardConsensusConfig::default(),
+                RecoveredState {
+                    latest_qc: Some(make_test_qc(BlockHash::ZERO, BlockHeight::new(2))),
+                    ..RecoveredState::default()
+                },
+            );
+            state.set_time(LocalTimestamp::from_millis(40_000));
+            state
+        };
+        let mut adopted = replica();
+        let _ = adopted.try_adopt_verified_qc(
+            &schedule,
+            &Verified::<QuorumCertificate>::from_persisted(recorded.clone()),
+        );
+        let mut attached = replica();
+        let record = SafeVoteRegisters {
+            high_qc: Some(recorded.clone()),
+            ..SafeVoteRegisters::default()
+        };
+        let _ = attached.attach_signer(&schedule, ValidatorId::new(1), Some(record), Round::new(2));
+
+        assert_eq!(attached.high_qc_round(), Round::new(5));
+        assert_eq!(attached.view(), adopted.view());
+        assert_eq!(attached.qc_adopted_at, adopted.qc_adopted_at);
+        let eager = |state: &ShardCoordinator| {
+            state.eager_before_gather(&schedule, Round::new(6), recorded.block_hash(), &recorded)
+        };
+        assert_ne!(eager(&attached), Some(EagerReason::Round));
+        assert_eq!(eager(&attached), eager(&adopted));
     }
 
     /// A committed-state restore raises every signer to the restored QC's
@@ -28258,5 +28480,857 @@ mod tests {
         .expect("sign");
         state.on_ready_signal_received(&schedule, signal);
         assert_eq!(state.ready_signal_pool.len(), 1);
+    }
+
+    // ─── Attach ────────────────────────────────────────────────────────
+
+    /// Attach `signer` under `record` over a persisted QC at `floor`, and
+    /// take the proposal the attach queued, as the replica's post-dispatch
+    /// drain does.
+    fn attach_and_drain(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        signer: u64,
+        record: Option<SafeVoteRegisters>,
+        floor: Round,
+    ) -> Vec<Action> {
+        let mut actions = state.attach_signer(schedule, ValidatorId::new(signer), record, floor);
+        if state.take_ready_proposal() {
+            actions.extend(state.try_propose(schedule, |_| ProposalInputs::default()));
+        }
+        actions
+    }
+
+    fn ready_signallers(actions: &[Action]) -> Vec<ValidatorId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndBroadcastReadySignal { signer, .. } => Some(*signer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The committed-on-a-count voter with no signer attached: block 1
+    /// committed with `count` standing there, the view at the round its
+    /// QC opens, and that QC held.
+    fn unsigned_on_a_count(
+        count: Option<StandingAnswers>,
+    ) -> (ShardCoordinator, TopologySchedule, Block) {
+        let (mut state, schedule, parent) = committed_on_a_count(1, count);
+        state.detach_signer(ValidatorId::new(1));
+        (state, schedule, parent)
+    }
+
+    /// A signer attached while a fork recovery is pending, the replica's
+    /// high QC certifying a block of the branch the recovery abandons,
+    /// locks at the store's persisted QC: it may vote a fresh block over
+    /// a parent QC beneath that abandoned certificate.
+    #[test]
+    fn a_fresh_signer_attached_during_a_pending_fork_takes_no_lock_from_the_abandoned_branch() {
+        let (mut state, schedule, _) = unsigned_on_a_count(None);
+        let schedule = TopologySchedule::single(with_pending_recovery(
+            &schedule,
+            RecoveryCause::Fork,
+            Vec::new(),
+            Epoch::new(2),
+        ));
+        let abandoned = make_test_qc(
+            BlockHash::from_raw(Hash::from_bytes(b"abandoned branch")),
+            BlockHeight::new(3),
+        );
+        state.latest_qc = Some(abandoned);
+        assert_eq!(state.high_qc_round(), Round::new(3));
+
+        let _ = state.attach_signer(&schedule, ValidatorId::new(2), None, Round::new(1));
+        let position = position_of(&state, 2);
+        assert_eq!(position.locked_round, Round::new(1));
+        assert_eq!(position.last_voted_round, Round::new(1));
+        assert!(
+            position.admits(Round::new(4), Round::new(1)),
+            "a fresh block over the committed tip's QC is votable",
+        );
+    }
+
+    /// A signer attached to a view its replica's timer already fired on
+    /// times out at the timer's next fire, not at the attach; a timeout from
+    /// a voter not yet tallied for the view times it out sooner, and a
+    /// retransmit from one already tallied does not.
+    #[test]
+    fn a_signer_attached_after_its_replicas_timer_fired_times_out_at_the_next_fire() {
+        let share = |keys: &[BlsSigner], state: &ShardCoordinator, voter: usize| {
+            Verified::<Timeout>::sign_local(
+                &NetworkDefinition::simulator(),
+                ShardId::ROOT,
+                state.view(),
+                state.high_qc(),
+                ValidatorId::new(voter as u64),
+                &keys[voter],
+            )
+            .expect("sign")
+        };
+
+        // An empty replica whose timer fired before any signer attached.
+        let (mut state, schedule, _) = make_multi_validator_state_with_keys(2);
+        state.detach_signer(ValidatorId::new(2));
+        time_out_current_round(&mut state, &schedule);
+        let view = state.view();
+        let attached = state.attach_signer(&schedule, ValidatorId::new(2), None, Round::INITIAL);
+        assert!(timed_out_by(&attached, view).is_empty(), "{attached:?}");
+        let next_fire = state.now.plus(state.current_view_change_timeout());
+        state.set_time(next_fire.minus(Duration::from_millis(1)));
+        assert!(state.check_round_timeout(&schedule).is_none());
+        state.set_time(next_fire);
+        let fired = state
+            .check_round_timeout(&schedule)
+            .expect("the timer fires at the same view");
+        assert_eq!(timed_out_by(&fired, view), ids(&[2]), "{fired:?}");
+
+        // A timeout from a voter not yet tallied amplifies it first.
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(2);
+        state.detach_signer(ValidatorId::new(2));
+        time_out_current_round(&mut state, &schedule);
+        let view = state.view();
+        let _ = state.on_verified_timeout(&schedule, share(&keys, &state, 0));
+        let _ = state.attach_signer(&schedule, ValidatorId::new(2), None, Round::INITIAL);
+        let amplified = state.on_verified_timeout(&schedule, share(&keys, &state, 1));
+        assert_eq!(timed_out_by(&amplified, view), ids(&[2]), "{amplified:?}");
+
+        // A retransmit from a voter already tallied moves nothing.
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(2);
+        state.detach_signer(ValidatorId::new(2));
+        time_out_current_round(&mut state, &schedule);
+        let view = state.view();
+        for voter in [0, 1] {
+            let _ = state.on_verified_timeout(&schedule, share(&keys, &state, voter));
+        }
+        let _ = state.attach_signer(&schedule, ValidatorId::new(2), None, Round::INITIAL);
+        let retransmitted = state.on_verified_timeout(&schedule, share(&keys, &state, 0));
+        assert!(
+            timed_out_by(&retransmitted, view).is_empty(),
+            "{retransmitted:?}"
+        );
+        assert_eq!(position_of(&state, 2).last_timed_out_round, None);
+    }
+
+    /// The round's proposer attached after its replica's timer fired
+    /// builds at the attach and broadcasts what it built; on an empty
+    /// round too, whose idle deadline the fire has passed.
+    #[test]
+    fn a_fresh_proposer_attached_after_its_replicas_timer_fired_still_broadcasts_its_block() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let parent_qc = make_test_qc(parent.hash(), BlockHeight::new(1));
+        state.latest_qc = Some(parent_qc.clone());
+        let _ = state.view_change.advance_to(Round::new(2));
+        time_out_current_round(&mut state, &schedule);
+        let actions = attach_and_drain(&mut state, &schedule, 2, None, Round::new(1));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BuildProposal { proposer, round, .. }
+                    if *proposer == ValidatorId::new(2) && *round == Round::new(2)
+            )),
+            "{actions:?}"
+        );
+        let own = empty_block(BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(2),
+            parent_block_hash: parent.hash(),
+            parent_qc: (*parent_qc).clone().into(),
+            proposer: ValidatorId::new(2),
+            timestamp: ProposerTimestamp::from_millis(100_000),
+            round: Round::new(2),
+            ..Default::default()
+        }));
+        let actions = own_block_built(&mut state, &schedule, &own, AnswerAdditions::default());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BroadcastBlockHeader { header, .. } if header.hash() == own.hash()
+            )),
+            "{actions:?}"
+        );
+
+        let (mut state, schedule, qc) = about_to_certify(3, 7, &[]);
+        state.detach_signer(ValidatorId::new(0));
+        let _ = state.on_qc_formed(&schedule, qc.block_hash(), &qc, |_| {
+            ProposalInputs::default()
+        });
+        time_out_current_round(&mut state, &schedule);
+        let actions = attach_and_drain(&mut state, &schedule, 0, None, Round::new(2));
+        assert!(
+            builds(&actions),
+            "the idle deadline has passed: {actions:?}"
+        );
+        assert_eq!(pace_armed(&actions), None);
+    }
+
+    /// A signer attached while the block it owes a vote on is still
+    /// verifying votes it once the verification completes, whether the
+    /// verification started at the header or before the attach.
+    #[test]
+    fn a_signer_whose_vote_awaits_verification_at_attach_votes_once_it_verifies() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let header = header_on(parent.hash(), 2, 99_000);
+        let _ = state.on_block_header(
+            &schedule,
+            &header,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        let attached = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert!(!votes(&attached), "{attached:?}");
+        let verified =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
+        let _ = state.on_qc_signature_verified(
+            &schedule,
+            QcSubject::ParentOf(header.hash()),
+            Ok(verified),
+        );
+        for kind in [
+            VerificationKind::BodyRoot,
+            VerificationKind::BeaconWitnessRoot,
+        ] {
+            let _ = state.on_block_check_completed(
+                &schedule,
+                header.hash(),
+                kind,
+                CheckOutcome::checked(),
+            );
+        }
+        let actions = state_root_checked(
+            &mut state,
+            &schedule,
+            header.hash(),
+            AnswerAdditions::default(),
+        );
+        assert_eq!(voters(&actions), ids(&[1]), "{actions:?}");
+
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let attached = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert!(!votes(&attached), "{attached:?}");
+        let actions = state_root_checked(
+            &mut state,
+            &schedule,
+            header.hash(),
+            AnswerAdditions::default(),
+        );
+        assert_eq!(voters(&actions), ids(&[1]), "{actions:?}");
+    }
+
+    /// A signer attached while its vote waits on evidence the fence reads,
+    /// here a count of the answers its chain stands at, votes once the
+    /// evidence lands, through the re-drive its arrival raises.
+    #[test]
+    fn a_signer_whose_vote_is_fence_deferred_at_attach_votes_once_the_evidence_lands() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(None);
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let checked = state_root_checked(&mut state, &schedule, header.hash(), adding(1));
+        assert!(!votes(&checked), "{checked:?}");
+        let attached = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert!(!votes(&attached), "no count yet: {attached:?}");
+        let _ = state.take_fence_evidence_advanced();
+
+        state.seed_standing_answers(BlockHeight::new(1), StandingAnswers::default());
+        assert!(state.take_fence_evidence_advanced());
+        let actions = state.redrive_pending_votes(&schedule);
+        assert_eq!(voters(&actions), ids(&[1]), "{actions:?}");
+    }
+
+    /// A replica that held no signer while its count folded holds the
+    /// count all the same, so the first signer attached votes a block
+    /// adding answers at once rather than waiting at the cap.
+    #[test]
+    fn a_signer_attached_to_a_replica_with_no_voter_votes_an_additions_block_at_once() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(None);
+        state.seed_standing_answers(BlockHeight::new(1), StandingAnswers::default());
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let checked = state_root_checked(&mut state, &schedule, header.hash(), adding(1));
+        assert!(!votes(&checked), "no signer: {checked:?}");
+
+        let attached = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert_eq!(voters(&attached), ids(&[1]), "{attached:?}");
+    }
+
+    /// A signer attached mid-round votes the pending block it may and,
+    /// leading the round, proposes it: after a sibling has timed the round
+    /// out it builds at once and times nothing out, and on an empty round
+    /// within the idle interval of the QC's adoption it holds the block to
+    /// the deadline with the pace armed and builds at that fire, before
+    /// the round timer's.
+    #[test]
+    fn a_signer_attached_mid_round_votes_the_pending_block_and_proposes_its_round() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let _ = state_root_checked(
+            &mut state,
+            &schedule,
+            header.hash(),
+            AnswerAdditions::default(),
+        );
+        let attached = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert_eq!(voters(&attached), ids(&[1]), "{attached:?}");
+
+        // After a sibling's timeout, the round's proposer builds and times
+        // nothing out.
+        let (mut state, schedule, parent) =
+            committed_on_a_count(1, Some(StandingAnswers::default()));
+        state.latest_qc = Some(make_test_qc(parent.hash(), BlockHeight::new(1)));
+        let _ = state.view_change.advance_to(Round::new(2));
+        time_out_current_round(&mut state, &schedule);
+        assert_eq!(
+            position_of(&state, 1).last_timed_out_round,
+            Some(Round::new(2))
+        );
+        let actions = attach_and_drain(&mut state, &schedule, 2, None, Round::new(1));
+        assert!(
+            timed_out_by(&actions, Round::new(2)).is_empty(),
+            "{actions:?}"
+        );
+        assert!(
+            builds(&actions),
+            "the fire passed the idle deadline: {actions:?}"
+        );
+
+        // Within the idle interval of the adoption, the build waits for the
+        // pace timer, which fires before the round timer.
+        let (mut state, schedule, qc) = about_to_certify(3, 7, &[]);
+        state.detach_signer(ValidatorId::new(0));
+        let adopted = state.now;
+        let _ = state.on_qc_formed(&schedule, qc.block_hash(), &qc, |_| {
+            ProposalInputs::default()
+        });
+        state.set_time(adopted.plus(Duration::from_millis(400)));
+        let actions = attach_and_drain(&mut state, &schedule, 0, None, Round::new(2));
+        assert!(!builds(&actions), "{actions:?}");
+        assert_eq!(pace_armed(&actions), Some(Duration::from_millis(600)));
+        state.set_time(adopted.plus(IDLE_PROPOSAL_INTERVAL));
+        assert!(state.check_round_timeout(&schedule).is_none());
+        let actions = state.try_propose(&schedule, |_| ProposalInputs::default());
+        assert!(builds(&actions), "the pace fire builds: {actions:?}");
+    }
+
+    /// A signer attached to a replica that is not block syncing emits no
+    /// ready signal at the attach and signals at the next beacon block.
+    #[test]
+    fn a_signer_attached_to_a_synced_replica_signals_at_the_next_beacon_block() {
+        let (mut state, _) = make_test_state();
+        let schedule = not_ready_member_topology();
+        state.detach_signer(ValidatorId::new(0));
+
+        let attached = state.attach_signer(&schedule, ValidatorId::new(0), None, Round::INITIAL);
+        assert!(ready_signallers(&attached).is_empty(), "{attached:?}");
+        let persisted = state.on_beacon_block_persisted(&schedule);
+        assert_eq!(ready_signallers(&persisted), ids(&[0]), "{persisted:?}");
+    }
+
+    /// A signer attached while its replica block syncs signals neither at
+    /// the attach nor at a beacon block during the sync, and does at the
+    /// sync's completion.
+    #[test]
+    fn a_signer_attached_while_its_replica_block_syncs_signals_at_sync_completion() {
+        let (mut state, _) = make_test_state();
+        let schedule = not_ready_member_topology();
+        state.detach_signer(ValidatorId::new(0));
+        state.set_block_syncing(true);
+
+        let attached = state.attach_signer(&schedule, ValidatorId::new(0), None, Round::INITIAL);
+        assert!(ready_signallers(&attached).is_empty(), "{attached:?}");
+        let persisted = state.on_beacon_block_persisted(&schedule);
+        assert!(ready_signallers(&persisted).is_empty(), "{persisted:?}");
+        let completed = state.on_block_sync_complete(&schedule);
+        assert_eq!(ready_signallers(&completed), ids(&[0]), "{completed:?}");
+    }
+
+    /// A replica with no signer follows its chain and its answer count,
+    /// and signs nothing: no vote on a votable block, no timeout at a
+    /// timer fire, no proposal in a round it would lead.
+    #[test]
+    fn a_replica_with_no_signer_follows_and_signs_nothing() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let checked = state_root_checked(&mut state, &schedule, header.hash(), adding(1));
+        assert!(!votes(&checked), "{checked:?}");
+        assert!(
+            state.standing_answers_at(state.committed_hash).is_some(),
+            "the count is held"
+        );
+
+        time_out_current_round(&mut state, &schedule);
+        let fired = state.check_round_timeout(&schedule).unwrap_or_default();
+        assert!(
+            !fired
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastTimeout { .. })),
+            "{fired:?}"
+        );
+        state.queue_ready_proposal();
+        assert!(state.take_ready_proposal());
+        let proposed = state.try_propose(&schedule, |_| ProposalInputs::default());
+        assert!(!builds(&proposed), "{proposed:?}");
+        assert!(
+            state
+                .on_beacon_block_persisted(&schedule)
+                .iter()
+                .all(|a| a.signer().is_none())
+        );
+    }
+
+    /// `schedule` with every window carrying a pending recovery of `cause`
+    /// on the root shard, seated at epoch 2, naming `retained`.
+    fn under_recovery(
+        schedule: &TopologySchedule,
+        cause: RecoveryCause,
+        retained: &[u64],
+    ) -> TopologySchedule {
+        let snapshot = with_pending_recovery(schedule, cause, ids(retained), Epoch::new(2));
+        let mut recovering = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        recovering.set_head(Arc::clone(&snapshot));
+        for epoch in 1..=100 {
+            recovering.insert(Epoch::new(epoch), Arc::clone(&snapshot));
+        }
+        recovering
+    }
+
+    /// A fresh committee member attached to a retained replica, beside a
+    /// retained signer whose lock a losing branch raised, takes its own
+    /// position and votes the fresh committee's first block.
+    #[test]
+    fn a_fresh_signer_on_a_retained_replica_votes_in_the_fresh_committees_first_round() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let schedule = under_recovery(&schedule, RecoveryCause::Halt, &[9]);
+        let losing = SafeVoteRegisters {
+            locked_round: Round::new(50),
+            last_voted_round: Round::new(50),
+            high_qc: None,
+            high_tc: None,
+        };
+        let _ = state.attach_signer(&schedule, ValidatorId::new(9), Some(losing), Round::new(1));
+        let _ = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert_eq!(position_of(&state, 1).locked_round, Round::new(1));
+
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let actions = state_root_checked(
+            &mut state,
+            &schedule,
+            header.hash(),
+            AnswerAdditions::default(),
+        );
+        assert_eq!(voters(&actions), ids(&[1]), "{actions:?}");
+    }
+
+    /// A signer attached to a store a forked rebuild replaced, which
+    /// carries no record of it, sits at the store's persisted QC and votes
+    /// the fresh committee's first block.
+    #[test]
+    fn a_fresh_signer_on_a_fork_rebuilt_store_votes_in_the_fresh_committees_first_round() {
+        let (mut state, schedule, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let schedule = under_recovery(&schedule, RecoveryCause::Fork, &[]);
+        let _ = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
+        assert_eq!(position_of(&state, 1).last_voted_round, Round::new(1));
+
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &schedule, &header);
+        let actions = state_root_checked(
+            &mut state,
+            &schedule,
+            header.hash(),
+            AnswerAdditions::default(),
+        );
+        assert_eq!(voters(&actions), ids(&[1]), "{actions:?}");
+    }
+
+    // ─── Attach under a halt recovery ──────────────────────────────────
+
+    /// When the halt recovery [`halted_replica`] seats opens its bridge
+    /// window, on the replica's local clock.
+    const WINDOW_OPENS: u64 = 3_000;
+
+    /// Feed the round clock a committed rotation whose blocks each took
+    /// six seconds to certify, so its base sits at the cap.
+    fn cap_the_round_timer(state: &mut ShardCoordinator) {
+        let committee = ids(&[0, 1, 2, 3]);
+        for i in 1..=5_u64 {
+            let parent_qc = QuorumCertificate::new(
+                BlockHash::ZERO,
+                ShardId::ROOT,
+                BlockHeight::new(i - 1),
+                BlockHash::ZERO,
+                Round::new(i - 1),
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis((i - 1) * 1_000 + 6_000),
+            );
+            let header = BlockHeader::new(BlockHeaderParts {
+                round: Round::new(i),
+                timestamp: ProposerTimestamp::from_millis(i * 1_000),
+                parent_qc: parent_qc.into(),
+                ..Default::default()
+            });
+            state.view_change.observe_commit(&header, &committee);
+        }
+        assert_eq!(state.view_change.base_timeout(), VIEW_CHANGE_TIMEOUT_MAX);
+    }
+
+    /// A replica, no signer attached, of a shard whose halted committee a
+    /// recovery replaced, seated at epoch 2 on one-second windows so the
+    /// bridge window opens at [`WINDOW_OPENS`], naming `retained`. Its
+    /// high QC, `q`, certifies block 5 at round 5, anchored below the
+    /// bridge, on the committed tip at height 4. Its round clock last reset
+    /// at zero and runs at a capped base, and a parent QC check that never
+    /// completes holds every fire to the progress wait.
+    fn halted_replica(retained: &[u64]) -> (ShardCoordinator, TopologySchedule, Vec<BlsSigner>) {
+        let (mut state, single, keys) = make_multi_validator_state_with_keys(0);
+        state.detach_signer(ValidatorId::new(0));
+        let head = with_pending_halt_recovery(&single, ids(retained), Epoch::new(2));
+        let mut schedule = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&head));
+        schedule.set_head(Arc::clone(&head));
+        for epoch in 1..=300 {
+            schedule.insert(Epoch::new(epoch), Arc::clone(&head));
+        }
+        let p = block_with_parent_qc_ts(BlockHeight::new(5), 1_500);
+        install_complete_block(&mut state, &p);
+        state.verification.mark_proposal_fully_verified(&p);
+        state.committed_height = BlockHeight::new(4);
+        state.committed_hash = p.header().parent_block_hash();
+        state.latest_qc = Some(Verified::new_unchecked_for_test(QuorumCertificate::new(
+            p.hash(),
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            p.header().parent_block_hash(),
+            Round::new(5),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(1_600),
+        )));
+        let _ = state.view_change.advance_on_qc(Round::new(5));
+        state
+            .view_change
+            .record_leader_activity(LocalTimestamp::ZERO);
+        cap_the_round_timer(&mut state);
+        let stuck = make_header_at_height(BlockHeight::new(99), 0);
+        state.verification.track_pending_qc(stuck.hash(), stuck);
+        (state, schedule, keys)
+    }
+
+    /// `signer`'s record at the halted tip: locked and voted at `q`'s
+    /// round, holding `q`.
+    fn record_at_the_tip(state: &ShardCoordinator) -> SafeVoteRegisters {
+        SafeVoteRegisters {
+            locked_round: Round::new(5),
+            last_voted_round: Round::new(5),
+            high_qc: Some(state.high_qc()),
+            high_tc: None,
+        }
+    }
+
+    /// The first instant from `from`, stepping the clock a second at a
+    /// time and firing the round timer at each step as its arming would,
+    /// at which `signer` times out the view; with the actions of that
+    /// fire.
+    fn first_offer(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        signer: u64,
+        from: LocalTimestamp,
+    ) -> (LocalTimestamp, Vec<Action>) {
+        let mut at = from;
+        for _ in 0..1_000 {
+            state.set_time(at);
+            let view = state.view();
+            if let Some(fired) = state.check_round_timeout(schedule)
+                && timed_out_by(&fired, view).contains(&ValidatorId::new(signer))
+            {
+                return (at, fired);
+            }
+            at = at.plus(Duration::from_secs(1));
+        }
+        panic!("signer {signer} never timed its view out");
+    }
+
+    /// A retained signer attached after its replica's timer fired offers
+    /// within the harvest wait: off the fresh committee's consensus subset
+    /// at the next tick, attached a capped period after its window opened
+    /// at the next tick too, and seated by a stalled recovery's re-draw as
+    /// the view's proposer it builds at the attach, the fire having passed
+    /// the round's idle deadline, the tick leaves it be, and it offers at
+    /// the next fire once the round fails.
+    #[test]
+    fn a_retained_signer_attached_after_its_replicas_timer_fired_reoffers_within_the_harvest_wait()
+    {
+        let tick = tick();
+        let progress_wait = PROGRESS_WAIT;
+        let opens = LocalTimestamp::from_millis(WINDOW_OPENS);
+        let fired_at = opens.plus(progress_wait);
+
+        let (mut state, schedule, _) = halted_replica(&[9]);
+        state.set_time(opens);
+        let _ = state.check_sync_health(&schedule);
+        state.set_time(fired_at);
+        assert!(
+            state.check_round_timeout(&schedule).is_some(),
+            "the timer fires"
+        );
+        let view = state.view();
+        let attached = state.attach_signer(&schedule, ValidatorId::new(9), None, Round::new(5));
+        assert!(timed_out_by(&attached, view).is_empty(), "{attached:?}");
+        state.set_time(fired_at.plus(tick));
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(timed_out_by(&ticked, view), ids(&[9]), "{ticked:?}");
+
+        let (mut state, schedule, _) = halted_replica(&[9]);
+        state.set_time(opens);
+        let _ = state.check_sync_health(&schedule);
+        let late = opens.plus(VIEW_CHANGE_TIMEOUT_MAX);
+        state.set_time(late);
+        let view = state.view();
+        let _ = state.attach_signer(&schedule, ValidatorId::new(9), None, Round::new(5));
+        let offered_at = late.plus(tick);
+        state.set_time(offered_at);
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(timed_out_by(&ticked, view), ids(&[9]), "{ticked:?}");
+        assert!(offered_at.saturating_sub(opens) <= HALT_HARVEST_WAIT);
+
+        let (mut state, schedule, _) = halted_replica(&[2]);
+        let view = state.view();
+        assert_eq!(
+            schedule.head().proposer_for(ShardId::ROOT, view),
+            ValidatorId::new(2)
+        );
+        state.set_time(opens);
+        let _ = state.check_sync_health(&schedule);
+        state.set_time(fired_at);
+        assert!(
+            state.check_round_timeout(&schedule).is_some(),
+            "the timer fires"
+        );
+        let record = record_at_the_tip(&state);
+        let actions = attach_and_drain(&mut state, &schedule, 2, Some(record), Round::new(5));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BuildProposal { proposer, round, .. }
+                    if *proposer == ValidatorId::new(2) && *round == view
+            )),
+            "{actions:?}"
+        );
+        state.set_time(fired_at.plus(tick));
+        let ticked = state.check_sync_health(&schedule);
+        assert!(timed_out_by(&ticked, view).is_empty(), "{ticked:?}");
+        let (offered_at, _) = first_offer(&mut state, &schedule, 2, fired_at.plus(tick));
+        assert!(
+            offered_at <= fired_at.plus(progress_wait),
+            "offered at {offered_at:?}"
+        );
+        assert!(state.check_sync_health(&schedule).iter().any(|a| matches!(
+            a,
+            Action::SignAndBroadcastTimeout { signer, .. } if *signer == ValidatorId::new(2)
+        )));
+    }
+
+    /// A replica whose view the halted committee's certificates lifted
+    /// above `q`, holding the halted committee's certificate, with the
+    /// retained signer 1 attached at `q`'s round before the window opens;
+    /// its first open-window tick has fallen the view back to `q` + 1 and
+    /// reset the round clock there.
+    fn fallen_back_at_the_window() -> (ShardCoordinator, TopologySchedule, Vec<BlsSigner>) {
+        let (mut state, schedule, keys) = halted_replica(&[1, 7, 8]);
+        let q = state.high_qc();
+        let _ = state.hold_high_tc(Arc::new(Verified::new_unchecked_for_test(
+            certificate_over(Round::new(8), &q),
+        )));
+        let _ = state.view_change.advance_to(Round::new(9));
+        // The last fire before the window opened.
+        state.set_time(LocalTimestamp::from_millis(2_000));
+        state.view_change.record_leader_activity(state.now);
+        let record = record_at_the_tip(&state);
+        let _ = state.attach_signer(&schedule, ValidatorId::new(1), Some(record), Round::new(5));
+
+        state.set_time(LocalTimestamp::from_millis(2_500));
+        let _ = state.check_sync_health(&schedule);
+        assert_eq!(state.view(), Round::new(9), "the window is closed");
+        state.set_time(LocalTimestamp::from_millis(WINDOW_OPENS));
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(state.view(), Round::new(6), "{ticked:?}");
+        assert!(state.high_tc.is_none());
+        assert_eq!(
+            state.view_change.last_leader_activity,
+            Some(LocalTimestamp::from_millis(WINDOW_OPENS)),
+        );
+        assert!(
+            timed_out_by(&ticked, Round::new(6)).is_empty(),
+            "{ticked:?}"
+        );
+        (state, schedule, keys)
+    }
+
+    /// A retained signer the stalled re-draw seated in the fresh subset,
+    /// fresh at the round the first open-window tick falls back to, offers
+    /// within the harvest wait: within one tick plus one capped progress
+    /// wait of the window; within two when the view's leader resets the
+    /// clock once late in that wait with a header whose content is
+    /// missing; and within two of the replica's last step along the
+    /// halted chain when it adopts a halted QC by block sync late in the
+    /// window, whether or not a block sync's exit, latched once per view,
+    /// follows. The fresh side, which took that tip from the holder's
+    /// earlier offer, takes nothing from the late one.
+    #[test]
+    fn a_retained_signer_fresh_at_the_seating_fall_back_offers_within_the_harvest_wait() {
+        let opens = LocalTimestamp::from_millis(WINDOW_OPENS);
+        let (mut state, schedule, _) = fallen_back_at_the_window();
+        let (offered_at, _) = first_offer(&mut state, &schedule, 1, opens);
+        assert!(
+            offered_at <= opens.plus(tick() + PROGRESS_WAIT),
+            "{offered_at:?}"
+        );
+        assert!(offered_at <= opens.plus(HALT_HARVEST_WAIT));
+
+        offers_after_the_leaders_late_reset();
+        offers_after_a_late_halted_adoption(false);
+        offers_after_a_late_halted_adoption(true);
+    }
+
+    /// The progress wait at a capped base.
+    const PROGRESS_WAIT: Duration =
+        VIEW_CHANGE_TIMEOUT_MAX.saturating_mul(PROGRESS_WAIT_MULTIPLIER);
+
+    /// The cleanup tick.
+    fn tick() -> Duration {
+        ShardConsensusConfig::default().cleanup_interval
+    }
+
+    /// Late in the wait the window's fall-back opened, a moment before the
+    /// fire it would bring.
+    fn late_in_the_wait() -> LocalTimestamp {
+        LocalTimestamp::from_millis(WINDOW_OPENS)
+            .plus(PROGRESS_WAIT.saturating_sub(Duration::from_secs(10)))
+    }
+
+    /// The view's leader resets the clock once, late in the wait, with a
+    /// header at the next height whose content is missing: the offer
+    /// lands within one tick plus two capped progress waits of the window.
+    fn offers_after_the_leaders_late_reset() {
+        let opens = LocalTimestamp::from_millis(WINDOW_OPENS);
+        let late = late_in_the_wait();
+        let (mut state, schedule, _) = fallen_back_at_the_window();
+        let leader = schedule.head().proposer_for(ShardId::ROOT, state.view());
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(6),
+            parent_block_hash: state.high_qc().block_hash(),
+            parent_qc: state.high_qc().into(),
+            proposer: leader,
+            round: state.view(),
+            ..Default::default()
+        });
+        let manifest = BlockManifest::new(BlockManifestParts {
+            tx_hashes: Capped::new(vec![test_transaction(1).hash()]).expect("one hash"),
+            ..BlockManifestParts::default()
+        });
+        state.set_time(late);
+        state
+            .pending_blocks
+            .insert(PendingBlock::from_manifest(header.clone(), manifest, late));
+        state.record_header_activity(&schedule, &header);
+        assert_eq!(state.view_change.last_leader_activity, Some(late));
+        let (offered_at, _) = first_offer(&mut state, &schedule, 1, late);
+        assert!(
+            offered_at <= opens.plus(tick() + PROGRESS_WAIT * 2),
+            "{offered_at:?}"
+        );
+        assert!(offered_at <= opens.plus(HALT_HARVEST_WAIT));
+    }
+
+    /// The replica adopts a halted QC by block sync late in the window,
+    /// which moves the view and resets the clock, followed where `exits`
+    /// by a block sync's exit, which resets it once, and a second exit in
+    /// the view, which resets nothing: the offer lands within one tick
+    /// plus two capped progress waits of the adoption. The fresh side,
+    /// which took that tip from the holder's earlier offer, takes nothing
+    /// from the late one, whose QC is not above its own.
+    fn offers_after_a_late_halted_adoption(exits: bool) {
+        let late = late_in_the_wait();
+        let (mut state, schedule, keys) = fallen_back_at_the_window();
+        let p = state.high_qc().block_hash();
+        let six = block_chained_on(BlockHeight::new(6), p, 1_600);
+        let halted_qc = Verified::new_unchecked_for_test(QuorumCertificate::new(
+            six.hash(),
+            ShardId::ROOT,
+            BlockHeight::new(6),
+            p,
+            Round::new(7),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(1_700),
+        ));
+        state.set_time(late);
+        state.set_block_syncing(true);
+        let _ = state.apply_synced_block(&schedule, six.clone(), halted_qc.clone());
+        assert_eq!(state.view(), Round::new(8));
+        assert_eq!(state.view_change.last_leader_activity, Some(late));
+        let last_step = if exits {
+            let exit = late.plus(Duration::from_secs(10));
+            state.set_time(exit);
+            state.set_block_syncing(false);
+            state.set_time(exit.plus(Duration::from_secs(10)));
+            state.set_block_syncing(true);
+            state.set_block_syncing(false);
+            assert_eq!(
+                state.view_change.last_leader_activity,
+                Some(exit),
+                "the second exit in the view resets nothing"
+            );
+            exit
+        } else {
+            late
+        };
+        let (offered_at, fired) = first_offer(&mut state, &schedule, 1, last_step);
+        assert!(
+            offered_at <= late.plus(tick() + PROGRESS_WAIT * 2),
+            "{offered_at:?}"
+        );
+
+        let mut fresh = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        )
+        .signed_by(ValidatorId::new(0));
+        fresh.set_time(offered_at);
+        install_complete_block(&mut fresh, &six);
+        fresh.latest_qc = Some(halted_qc);
+        let _ = fresh.view_change.advance_on_qc(Round::new(7));
+        let Some(Action::SignAndBroadcastTimeout { round, high_qc, .. }) = fired.iter().find(|a| {
+            matches!(a, Action::SignAndBroadcastTimeout { signer, .. }
+                    if *signer == ValidatorId::new(1))
+        }) else {
+            panic!("the offer is in the fire: {fired:?}");
+        };
+        assert_eq!(high_qc.round(), Round::new(7));
+        let offer = Verified::<Timeout>::sign_local(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            *round,
+            high_qc.clone(),
+            ValidatorId::new(1),
+            &keys[1],
+        )
+        .expect("sign");
+        let taken = fresh.on_verified_timeout(&schedule, offer);
+        assert_eq!(fresh.high_qc_round(), Round::new(7));
+        assert!(
+            !taken
+                .iter()
+                .any(|a| matches!(a, Action::StartBlockSync { .. })),
+            "{taken:?}"
+        );
     }
 }

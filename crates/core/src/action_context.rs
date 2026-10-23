@@ -19,7 +19,7 @@ use hyperscale_types::{
     Signer, TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
 };
 
-use crate::{ProtocolEvent, SignerGate};
+use crate::{GateEntry, ProtocolEvent, SignerGate};
 
 /// Context for executing delegated actions.
 ///
@@ -96,6 +96,19 @@ pub struct Signing<'a> {
     pub key: &'a Arc<dyn Signer>,
     /// The release gate of the attachment that emitted the action.
     pub gate: &'a SignerGate,
+}
+
+impl Signing<'_> {
+    /// Enter the gate for one persist, sign and notify, or `None` once
+    /// the attachment that emitted `action` has ended, in which case the
+    /// handler drops it unsigned.
+    pub fn enter(&self, action: &'static str) -> Option<GateEntry<'_>> {
+        let entry = self.gate.enter();
+        if entry.is_none() {
+            tracing::trace!(action, signer = ?self.me, "signer detached; dropping its signature");
+        }
+        entry
+    }
 }
 
 /// Context for executing beacon-owned delegated actions.

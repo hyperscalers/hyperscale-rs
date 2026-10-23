@@ -13,13 +13,15 @@ use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{FinalizationHash, Hash, ShardId, TopologySchedule, TxHash, ValidatorId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
-    ExecutionCoordinator::new([ValidatorId::new(0)], ShardId::ROOT, Arc::new(AllCodeRuns))
+    fresh_coordinator_with_topology().0
 }
 
 fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySchedule) {
     let topology_schedule =
         TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(1)));
-    (fresh_coordinator(), topology_schedule)
+    let mut coord = ExecutionCoordinator::new(ShardId::ROOT, Arc::new(AllCodeRuns));
+    let _ = coord.attach_signer(&topology_schedule, ValidatorId::new(0));
+    (coord, topology_schedule)
 }
 
 #[test]

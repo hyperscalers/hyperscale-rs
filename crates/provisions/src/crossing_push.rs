@@ -192,6 +192,9 @@ pub fn push_crossing_readings<S, N>(
         tracing::error!("crossing readings push dispatched without a signer; skipping");
         return;
     };
+    let Some(_entry) = signing.enter("PushCrossingReadings") else {
+        return;
+    };
     for (target_shard, sections) in pushes {
         let recipients = shard_recipients
             .get(&target_shard)

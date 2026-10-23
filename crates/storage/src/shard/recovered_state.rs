@@ -1,20 +1,18 @@
 //! State recovered from storage on startup, used to restore the consensus
 //! state machine after a crash or restart.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
     Anchor, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin,
-    CommittedTip, Hash, Provisions, QuorumCertificate, ReadFrontier, SafeVoteRegisters,
-    ShardAnchor, StateRoot, ValidatorId, Verified, VotePosition, WeightedTimestamp,
+    CommittedTip, Hash, Provisions, QuorumCertificate, ReadFrontier, ShardAnchor, StateRoot,
+    Verified, WeightedTimestamp,
 };
 
 use super::boundary::BoundaryStore;
 use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
 use super::unresolved::{ReplayWindow, replay_window};
-use super::vote_registers::SafeVoteRegisterStore;
 use crate::MemberIndex;
 
 /// How many committed headers a restart replays into the delay estimate.
@@ -181,16 +179,6 @@ pub struct RecoveredState {
     /// chain's real genesis QC.
     pub chain_origin: ChainOrigin,
 
-    /// Durable safe-vote registers for each validator that has signed a
-    /// vote or timeout on this store's chain, excluding records from a
-    /// different chain incarnation. The coordinator floors its registers
-    /// at these values on restart, so it can never re-sign a round it
-    /// already consumed. Empty on a fresh start and after a snap-sync
-    /// onto a store that replaces none; a rebuilt store carries the rounds
-    /// signed on the one it replaces
-    /// ([`carry_signed_rounds`](Self::carry_signed_rounds)).
-    pub safe_vote_registers: BTreeMap<ValidatorId, SafeVoteRegisters>,
-
     /// The read frontier the committed state holds: how far along each
     /// producer this shard has read, which bounds the record presences
     /// a block may carry. Read
@@ -305,49 +293,11 @@ impl RecoveredState {
             beacon_witness_leaf_hashes: witness_leaf_hashes,
             substate_bytes,
             chain_origin,
-            safe_vote_registers: BTreeMap::new(),
             read_frontier: store.read_frontier(shard),
             members: Some(store.member_index(shard)),
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),
         }
-    }
-
-    /// Carry the rounds every validator signed in on `replaced` onto
-    /// `store`, rebuilt beneath the same chain to take its place, and
-    /// into this state, which that store's coordinators boot from.
-    ///
-    /// A rebuilt store holds the chain as its attested anchor left it and
-    /// none of what its host signed, while the rounds its validators
-    /// consumed on the replaced store are still theirs to refuse. Without
-    /// them a coordinator booted here signs a second time in a round the
-    /// chain may not have left, and votes beneath a lock it took.
-    ///
-    /// Only the two rounds travel. The certificate and the blocks beside a
-    /// record describe the replaced store's view of the chain, which the
-    /// anchor supersedes: the lock is satisfied by the certificates the
-    /// chain's live peers hold, as a snap-synced joiner's is.
-    ///
-    /// Durable on return, so call it before any coordinator booted from
-    /// this state can sign, and only once nothing signs against `replaced`.
-    pub fn carry_signed_rounds<R, S>(&mut self, replaced: &R, store: &S)
-    where
-        R: SafeVoteRegisterStore + ?Sized,
-        S: SafeVoteRegisterStore + ?Sized,
-    {
-        for (validator, signed) in replaced.all_safe_vote_registers() {
-            let position = VotePosition {
-                registers: SafeVoteRegisters {
-                    locked_round: signed.locked_round,
-                    last_voted_round: signed.last_voted_round,
-                    high_qc: None,
-                    high_tc: None,
-                },
-                justification: Vec::new(),
-            };
-            store.persist_vote_position(validator, &position);
-        }
-        self.safe_vote_registers = store.all_safe_vote_registers();
     }
 
     /// The recovered tip's own position on the weighted-time grid —

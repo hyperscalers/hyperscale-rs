@@ -295,13 +295,12 @@ impl ExecutionSim {
         let committee = TestCommittee::new(4, 42);
         let base = Arc::new(StubBase::default());
         let snapshot = Arc::new(committee.topology_snapshot(num_shards));
+        let topology = TopologySchedule::single(Arc::clone(&snapshot));
+        let mut coord = ExecutionCoordinator::new(local_shard, Arc::new(AllCodeRuns));
+        let _ = coord.attach_signer(&topology, ValidatorId::new(0));
         Self {
-            coord: ExecutionCoordinator::new(
-                [ValidatorId::new(0)],
-                local_shard,
-                Arc::new(AllCodeRuns),
-            ),
-            topology: TopologySchedule::single(Arc::clone(&snapshot)),
+            coord,
+            topology,
             snapshot,
             chain: Arc::new(TickChain::new(Arc::clone(&base))),
             schedule,
@@ -332,7 +331,6 @@ impl ExecutionSim {
             ..RecoveredState::default()
         };
         sim.coord = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             sim.local_shard,
             Arc::new(AllCodeRuns),
             Arc::new(CrossingIndexSlot::default()),
@@ -342,6 +340,7 @@ impl ExecutionSim {
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
         );
+        let _ = sim.coord.attach_signer(&sim.topology, ValidatorId::new(0));
         sim.seat_on_store_at(height);
         sim
     }
@@ -833,7 +832,6 @@ impl ExecutionSim {
             ..RecoveredState::default()
         };
         self.coord = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             self.local_shard,
             Arc::new(AllCodeRuns),
             Arc::new(CrossingIndexSlot::default()),
@@ -843,6 +841,9 @@ impl ExecutionSim {
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
         );
+        let _ = self
+            .coord
+            .attach_signer(&self.topology, ValidatorId::new(0));
         self.coord.seat_on_persisted_base(self.chain.persisted());
     }
 
@@ -910,8 +911,7 @@ impl ExecutionSim {
             },
             ..RecoveredState::default()
         };
-        ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
+        let mut coord = ExecutionCoordinator::with_shared_stores(
             self.local_shard,
             Arc::new(AllCodeRuns),
             Arc::new(CrossingIndexSlot::default()),
@@ -920,7 +920,9 @@ impl ExecutionSim {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        )
+        );
+        let _ = coord.attach_signer(&self.topology, ValidatorId::new(0));
+        coord
     }
 
     /// Hand a finalization to the coordinator as ready for inclusion,

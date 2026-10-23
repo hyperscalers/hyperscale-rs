@@ -27,8 +27,8 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, CertifiedBeaconBlock, GenesisPool,
-    GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, Randomness,
-    RecoveryBinding, ShardId, Stake, StakePoolId, Verified, genesis_config_hash,
+    GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, QuorumCertificate,
+    Randomness, RecoveryBinding, Round, ShardId, Stake, StakePoolId, Verified, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
@@ -169,8 +169,7 @@ impl TestNodeBuilder {
             self.recovered.committed_height,
         );
 
-        let node = NodeStateMachine::new(
-            me,
+        let mut node = NodeStateMachine::new(
             Arc::new(BlsVerifier),
             Arc::new(StubVmStatics),
             Arc::new(AllCodeRuns),
@@ -186,6 +185,21 @@ impl TestNodeBuilder {
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
             Arc::new(CrossingIndexSlot::default()),
+        );
+        let persisted_qc_round = self
+            .recovered
+            .latest_qc
+            .as_deref()
+            .map_or(Round::INITIAL, QuorumCertificate::round);
+        let schedule = Arc::clone(node.schedule());
+        let epoch = node.schedule_epoch();
+        let _ = node.attach_signer(
+            LocalTimestamp::ZERO,
+            me,
+            None,
+            persisted_qc_round,
+            schedule,
+            epoch,
         );
 
         TestNode {

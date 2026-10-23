@@ -51,6 +51,7 @@ use crate::shard::chain_floor::{FloorInputs, chain_floor};
 use crate::shard::members::{AnchorReadings, SettledHalf, VerdictLeaf, verdict_hash};
 use crate::shard::sweep::{sweep_for_block, sweep_through};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
+use crate::shard::vote_registers::carry_signed_rounds;
 use crate::tree::Jmt;
 use crate::tree::proofs::generate_proof;
 use crate::{
@@ -4567,11 +4568,9 @@ pub fn test_registers_recover_their_justification(
             justification: Vec::new(),
         },
     );
-    let merged = recovered()
-        .safe_vote_registers
-        .get(&validator)
-        .cloned()
-        .expect("the record survives into recovery");
+    let merged = storage
+        .safe_vote_registers(validator)
+        .expect("the record survives the later write");
     assert_eq!(merged.locked_round, Round::new(6));
     assert_eq!(merged.last_voted_round, Round::new(9));
     assert_eq!(
@@ -5787,15 +5786,12 @@ pub fn position(r: SafeVoteRegisters) -> VotePosition {
 }
 
 /// Register writes merge field-wise max, so a lower or mixed write can
-/// never regress either register, and recovery hands the merge back.
+/// never regress either register, and every read hands the merge back.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_registers_are_monotone_and_recoverable(
-    storage: &impl SafeVoteRegisterStore,
-    recovered: impl Fn() -> RecoveredState,
-) {
+pub fn test_registers_are_monotone_and_recoverable(storage: &impl SafeVoteRegisterStore) {
     let validator = ValidatorId::new(1);
     storage.persist_vote_position(validator, &position(registers(4, 6)));
     storage.persist_vote_position(validator, &position(registers(2, 9)));
@@ -5804,7 +5800,7 @@ pub fn test_registers_are_monotone_and_recoverable(
         Some(registers(4, 9))
     );
     assert_eq!(
-        recovered().safe_vote_registers.get(&validator),
+        storage.all_safe_vote_registers().get(&validator),
         Some(&registers(4, 9))
     );
 }
@@ -5834,10 +5830,9 @@ pub fn test_registers_ignore_a_stale_chain_incarnation(
     });
 
     assert_eq!(storage.safe_vote_registers(validator), None);
-    let recovered = recovered();
-    assert!(recovered.safe_vote_registers.is_empty());
+    assert!(storage.all_safe_vote_registers().is_empty());
     assert!(
-        recovered.voted_blocks.is_empty(),
+        recovered().voted_blocks.is_empty(),
         "a block justifying a lock on another chain justifies nothing here",
     );
 
@@ -5850,12 +5845,12 @@ pub fn test_registers_ignore_a_stale_chain_incarnation(
 }
 
 /// A store rebuilt in place of another takes over the rounds signed on
-/// it, durably and into the state its coordinators boot from.
+/// it, durably.
 ///
-/// A coordinator seated there then refuses the rounds the replaced store
+/// A signer attached there then refuses the rounds the replaced store
 /// consumed. The certificate and the blocks beside the record stay
 /// behind, and a validator the replaced store never recorded gains no
-/// record. `recovered` is the rebuilt store's state before the carry.
+/// record.
 ///
 /// # Panics
 ///
@@ -5863,14 +5858,13 @@ pub fn test_registers_ignore_a_stale_chain_incarnation(
 pub fn test_a_rebuilt_store_carries_signed_rounds(
     replaced: &impl SafeVoteRegisterStore,
     rebuilt: &impl SafeVoteRegisterStore,
-    mut recovered: RecoveredState,
 ) {
     let signer = ValidatorId::new(1);
     let silent = ValidatorId::new(2);
 
-    recovered.carry_signed_rounds(replaced, rebuilt);
+    carry_signed_rounds(replaced, rebuilt);
     assert!(
-        recovered.safe_vote_registers.is_empty() && rebuilt.all_safe_vote_registers().is_empty(),
+        rebuilt.all_safe_vote_registers().is_empty(),
         "a replaced store that recorded nothing hands nothing over",
     );
 
@@ -5887,29 +5881,24 @@ pub fn test_a_rebuilt_store_carries_signed_rounds(
             justification: vec![Arc::new(certified)],
         },
     );
-    recovered.carry_signed_rounds(replaced, rebuilt);
+    carry_signed_rounds(replaced, rebuilt);
 
     assert_eq!(
         rebuilt.safe_vote_registers(signer),
         Some(registers(6, 7)),
         "the rebuilt store holds the rounds signed on the one it replaces",
     );
-    assert_eq!(
-        recovered.safe_vote_registers.get(&signer),
-        Some(&registers(6, 7)),
-        "the state a coordinator boots from floors its registers at them",
-    );
     assert!(
         rebuilt.voted_blocks_above(BlockHeight::GENESIS).is_empty(),
         "the replaced store's uncommitted blocks are not the rebuilt chain's",
     );
     assert_eq!(rebuilt.safe_vote_registers(silent), None);
-    assert!(!recovered.safe_vote_registers.contains_key(&silent));
+    assert!(!rebuilt.all_safe_vote_registers().contains_key(&silent));
 
     // A signature on the rebuilt store ratchets the carried record like
     // any other, and a second carry never lowers it.
     rebuilt.persist_vote_position(signer, &position(registers(6, 9)));
-    recovered.carry_signed_rounds(replaced, rebuilt);
+    carry_signed_rounds(replaced, rebuilt);
     assert_eq!(rebuilt.safe_vote_registers(signer), Some(registers(6, 9)));
 }
 

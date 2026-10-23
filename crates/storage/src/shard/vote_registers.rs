@@ -50,3 +50,38 @@ pub trait SafeVoteRegisterStore: Send + Sync {
     /// store's chain incarnation.
     fn all_safe_vote_registers(&self) -> BTreeMap<ValidatorId, SafeVoteRegisters>;
 }
+
+/// Carry the rounds every validator signed in on `replaced` onto `store`,
+/// rebuilt beneath the same chain to take its place.
+///
+/// A rebuilt store holds the chain as its attested anchor left it and
+/// none of what its host signed, while the rounds its validators consumed
+/// on the replaced store are still theirs to refuse. Without them a
+/// signer attached here signs a second time in a round the chain may not
+/// have left, and votes beneath a lock it took.
+///
+/// Only the two rounds travel. The certificate and the blocks beside a
+/// record describe the replaced store's view of the chain, which the
+/// anchor supersedes: the lock is satisfied by the certificates the
+/// chain's live peers hold, as a snap-synced joiner's is.
+///
+/// Durable on return, so call it before any signer attached over `store`
+/// can sign, and only once nothing signs against `replaced`.
+pub fn carry_signed_rounds<R, S>(replaced: &R, store: &S)
+where
+    R: SafeVoteRegisterStore + ?Sized,
+    S: SafeVoteRegisterStore + ?Sized,
+{
+    for (validator, signed) in replaced.all_safe_vote_registers() {
+        let position = VotePosition {
+            registers: SafeVoteRegisters {
+                locked_round: signed.locked_round,
+                last_voted_round: signed.last_voted_round,
+                high_qc: None,
+                high_tc: None,
+            },
+            justification: Vec::new(),
+        };
+        store.persist_vote_position(validator, &position);
+    }
+}

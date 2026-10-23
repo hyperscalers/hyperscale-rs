@@ -574,4 +574,109 @@ mod tests {
         assert!(node.node.shard_coordinator().quiescent(&evicted));
         assert!(node.node.shard_coordinator().dissolved(&evicted));
     }
+
+    /// `node`'s committee on the root shard with validator 1 placed but
+    /// not yet ready: outside the consensus subset.
+    fn one_not_ready(test: &TestNode) -> TopologySchedule {
+        use std::collections::{BTreeSet, HashMap};
+
+        use hyperscale_types::{TopologySnapshot, ValidatorInfo, ValidatorSet};
+
+        let members: Vec<ValidatorId> = (0..test.committee.size())
+            .map(|i| test.committee.validator_id(i))
+            .collect();
+        let validators = ValidatorSet::new(
+            (0..test.committee.size())
+                .map(|i| ValidatorInfo {
+                    validator_id: test.committee.validator_id(i),
+                    public_key: *test.committee.public_key(i),
+                })
+                .collect(),
+        );
+        let ready: Vec<ValidatorId> = members
+            .iter()
+            .copied()
+            .filter(|member| *member != ValidatorId::new(1))
+            .collect();
+        let snapshot = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &validators,
+            HashMap::from([(ShardId::ROOT, members)]),
+            HashMap::from([(ShardId::ROOT, ready)]),
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        TopologySchedule::single(Arc::new(snapshot))
+    }
+
+    fn ready_signallers(actions: &[Action]) -> Vec<ValidatorId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndBroadcastReadySignal { signer, .. } => Some(*signer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An attach whose schedule a later epoch folded installs it, and the
+    /// signer it places but has not readied signals at that epoch's beacon
+    /// block, not at the attach.
+    #[test]
+    fn an_attach_carrying_a_newer_schedule_signals_at_that_epochs_beacon_block() {
+        let mut test = TestNode::builder().build();
+        let held = test.node.schedule_epoch();
+        let newer = Arc::new(one_not_ready(&test));
+        let epoch = Epoch::new(held.inner() + 1);
+
+        let attached = test.node.attach_signer(
+            LocalTimestamp::ZERO,
+            ValidatorId::new(1),
+            None,
+            Round::INITIAL,
+            Arc::clone(&newer),
+            epoch,
+        );
+        assert!(Arc::ptr_eq(test.node.schedule(), &newer));
+        assert_eq!(test.node.schedule_epoch(), epoch);
+        assert!(ready_signallers(&attached).is_empty(), "{attached:?}");
+
+        let persisted = test.node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BeaconBlockPersisted {
+                epoch,
+                schedule: newer,
+            },
+        );
+        assert_eq!(
+            ready_signallers(&persisted),
+            vec![ValidatorId::new(1)],
+            "{persisted:?}"
+        );
+    }
+
+    /// An attach carrying a schedule at the epoch the replica already
+    /// holds leaves the held one, whose windows its registration widened.
+    #[test]
+    fn an_attach_at_an_equal_epoch_keeps_the_widened_windows() {
+        let mut test = TestNode::builder().build();
+        let held = Arc::clone(test.node.schedule());
+        let epoch = test.node.schedule_epoch();
+        let narrow = Arc::new(TopologySchedule::single(Arc::clone(held.head())));
+
+        let _ = test.node.attach_signer(
+            LocalTimestamp::ZERO,
+            ValidatorId::new(1),
+            None,
+            Round::INITIAL,
+            narrow,
+            epoch,
+        );
+        assert!(Arc::ptr_eq(test.node.schedule(), &held));
+        assert_eq!(test.node.schedule_epoch(), epoch);
+    }
 }

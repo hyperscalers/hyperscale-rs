@@ -29,6 +29,7 @@ test-utils = []
 [dev-dependencies]
 hyperscale-crypto-bls.workspace = true
 hyperscale-mempool.workspace = true
+hyperscale-metrics-memory.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }

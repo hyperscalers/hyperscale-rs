@@ -2322,6 +2322,7 @@ dependencies = [
  "hyperscale-types",
  "hyperscale-vm-effects",
  "strum",
+ "tracing",
 ]
 
 [[package]]
@@ -2779,6 +2780,7 @@ dependencies = [
  "hyperscale-jmt",
  "hyperscale-mempool",
  "hyperscale-metrics",
+ "hyperscale-metrics-memory",
  "hyperscale-network",
  "hyperscale-storage",
  "hyperscale-storage-memory",

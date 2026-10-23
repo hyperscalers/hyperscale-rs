@@ -35,9 +35,7 @@ use hyperscale_provisions::{
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::{
-    BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, ValidatorId, Verifier,
-};
+use hyperscale_types::{BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, Verifier};
 
 /// The coordinators a vnode runs while seated on a shard.
 ///
@@ -114,7 +112,6 @@ impl ShardParticipation {
         verifier: Arc<dyn Verifier>,
         derivation: Arc<dyn Derivation>,
         code: Arc<dyn CodeAvailability>,
-        me: ValidatorId,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
         recovered: &RecoveredState,
@@ -132,7 +129,6 @@ impl ShardParticipation {
         // classifies its ticks exactly as a non-restarted peer's does.
         let shard_coordinator = ShardCoordinator::new(
             verifier,
-            [me],
             local_shard,
             shard_config.clone(),
             recovered.clone(),
@@ -159,7 +155,6 @@ impl ShardParticipation {
         // the vote fence and the execution coordinator ask the same
         // questions of them, and two copies could answer differently.
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
-            [me],
             local_shard,
             code,
             crossing_index,

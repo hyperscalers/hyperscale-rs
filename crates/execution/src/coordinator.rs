@@ -686,19 +686,14 @@ pub struct ExecutionCoordinator {
 }
 
 impl ExecutionCoordinator {
-    /// Create a new execution state machine with its own fresh stores and a
-    /// genesis commit frontier. For hosts running multiple same-shard
-    /// validators, prefer [`Self::with_shared_stores`] to share one set of
-    /// stores across every coordinator in the shard; for a recovered chain,
-    /// it also seeds the frontier from storage.
+    /// Create a new execution state machine with its own fresh stores, a
+    /// genesis commit frontier and no signer. For hosts running multiple
+    /// same-shard validators, prefer [`Self::with_shared_stores`] to share
+    /// one set of stores across every coordinator in the shard; for a
+    /// recovered chain, it also seeds the frontier from storage.
     #[must_use]
-    pub fn new(
-        signers: impl IntoIterator<Item = ValidatorId>,
-        local_shard: ShardId,
-        code: Arc<dyn CodeAvailability>,
-    ) -> Self {
+    pub fn new(local_shard: ShardId, code: Arc<dyn CodeAvailability>) -> Self {
         Self::with_shared_stores(
-            signers,
             local_shard,
             code,
             Arc::new(CrossingIndexSlot::default()),
@@ -734,7 +729,6 @@ impl ExecutionCoordinator {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn with_shared_stores(
-        signers: impl IntoIterator<Item = ValidatorId>,
         local_shard: ShardId,
         code: Arc<dyn CodeAvailability>,
         crossing_index: Arc<CrossingIndexSlot>,
@@ -812,9 +806,55 @@ impl ExecutionCoordinator {
             legs_offered: BTreeMap::new(),
             legs_asked: BTreeMap::new(),
             pending_push: None,
-            signers: signers.into_iter().collect(),
+            signers: BTreeSet::new(),
             local_shard,
         }
+    }
+
+    /// Attach `signer` and sign each vote it owes at once: every
+    /// unsettled tick whose held vote still stands, at the vote's current
+    /// anchor, where that anchor's attesting committee seats `signer`.
+    /// The retry the tick already keeps carries it on from there.
+    pub fn attach_signer(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        signer: ValidatorId,
+    ) -> Vec<Action> {
+        if !self.signers.insert(signer) {
+            return Vec::new();
+        }
+        let local_shard = self.local_shard;
+        let mut actions = Vec::new();
+        for (tick_id, tick) in self.ticks.ticks_iter() {
+            if !tick.unsettled() {
+                continue;
+            }
+            let Some((vote_anchor_ts, global_receipt_root, tx_outcomes)) = tick.held_vote() else {
+                continue;
+            };
+            let Some(committee) =
+                attesting_committee(topology_schedule, local_shard, vote_anchor_ts)
+                    .map(|snapshot| snapshot.consensus_committee_for_shard(local_shard).to_vec())
+                    .filter(|committee| committee.contains(&signer))
+            else {
+                continue;
+            };
+            actions.push(Action::SignAndSendExecutionVote {
+                block_hash: tick.block_hash(),
+                vote_anchor_ts,
+                tick_id: *tick_id,
+                global_receipt_root,
+                tx_outcomes,
+                recipients: vec![tick_leader(tick_id, &committee)],
+                signer,
+            });
+        }
+        actions
+    }
+
+    /// Detach `signer`: no vote is signed for it from here on.
+    pub fn detach_signer(&mut self, signer: ValidatorId) {
+        self.signers.remove(&signer);
     }
 
     /// The signer that signs an envelope-only broadcast of `certificate`:
@@ -4980,6 +5020,15 @@ mod tests {
     use super::*;
     use crate::counterparts::TestRows;
 
+    impl ExecutionCoordinator {
+        /// This coordinator with `signer` attached, before it holds any
+        /// tick a vote could be owed on.
+        fn signed_by(mut self, signer: ValidatorId) -> Self {
+            self.signers.insert(signer);
+            self
+        }
+    }
+
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
 
@@ -5145,11 +5194,27 @@ mod tests {
     }
 
     fn make_test_state_for(me: ValidatorId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new([me], ShardId::ROOT, Arc::new(TestCode::default()))
+        make_test_state_for_shard(me, ShardId::ROOT)
     }
 
     fn make_test_state_for_shard(me: ValidatorId, local_shard: ShardId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new([me], local_shard, Arc::new(TestCode::default()))
+        signed_by(
+            ExecutionCoordinator::new(local_shard, Arc::new(TestCode::default())),
+            [me],
+        )
+    }
+
+    /// `state` with each of `signers` attached, before it holds a tick to
+    /// sign for.
+    fn signed_by(
+        mut state: ExecutionCoordinator,
+        signers: impl IntoIterator<Item = ValidatorId>,
+    ) -> ExecutionCoordinator {
+        let topology_schedule = make_test_topology();
+        for signer in signers {
+            let _ = state.attach_signer(&topology_schedule, signer);
+        }
+        state
     }
 
     fn make_live_block(
@@ -5233,8 +5298,10 @@ mod tests {
     fn a_tick_waits_at_the_dispatch_head_for_code_this_node_lacks() {
         let package = Hash::from_bytes(b"a package this node has not fetched");
         let code = TestCode::withholding(package);
-        let mut state =
-            ExecutionCoordinator::new([ValidatorId::new(0)], ShardId::ROOT, Arc::clone(&code) as _);
+        let mut state = signed_by(
+            ExecutionCoordinator::new(ShardId::ROOT, Arc::clone(&code) as _),
+            [ValidatorId::new(0)],
+        );
         let topology_schedule = make_test_topology();
 
         let tx = test_transaction_running(1, &[package]);
@@ -5381,10 +5448,12 @@ mod tests {
     /// A package nothing in the queued tick runs never holds it.
     #[test]
     fn an_unrelated_missing_package_holds_no_tick() {
-        let mut state = ExecutionCoordinator::new(
+        let mut state = signed_by(
+            ExecutionCoordinator::new(
+                ShardId::ROOT,
+                TestCode::withholding(Hash::from_bytes(b"someone else's code")),
+            ),
             [ValidatorId::new(0)],
-            ShardId::ROOT,
-            TestCode::withholding(Hash::from_bytes(b"someone else's code")),
         );
         let topology_schedule = make_test_topology();
 
@@ -6767,10 +6836,9 @@ mod tests {
             SignerBitfield::new(4),
         )));
         let broadcast_signers = |signers: [u64; 2]| {
-            let mut state = ExecutionCoordinator::new(
+            let mut state = signed_by(
+                ExecutionCoordinator::new(ShardId::ROOT, Arc::new(TestCode::default())),
                 signers.map(ValidatorId::new),
-                ShardId::ROOT,
-                Arc::new(TestCode::default()),
             );
             let participating: BTreeSet<ShardId> =
                 [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
@@ -9528,7 +9596,6 @@ mod tests {
         let topo = make_test_topology();
         // The recovered tip: height 5, its own anchor at 900 ms.
         let mut state = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -9542,7 +9609,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         // The first post-restart commit extends the tip and dates itself
         // past it.
@@ -9992,7 +10060,6 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -10001,7 +10068,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
         assert_eq!(
@@ -11318,7 +11386,6 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11327,7 +11394,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
         let aborting = TickId::new(ShardId::ROOT, BlockHeight::new(3));
@@ -11394,7 +11462,6 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11403,7 +11470,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         assert_eq!(
             restarted.baseline_floor(),
             BlockHeight::new(2),
@@ -11482,7 +11550,6 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11491,7 +11558,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
 
         let actions = restarted
             .on_committed_state_restored(&schedule, &StubVmStatics)
@@ -11566,7 +11634,6 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11575,7 +11642,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
 
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
@@ -11834,7 +11902,6 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11843,7 +11910,8 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
+        )
+        .signed_by(ValidatorId::new(0));
         assert!(
             restarted.candidates.is_empty(),
             "construction has no topology to compose against, so it holds",
@@ -12215,7 +12283,6 @@ mod tests {
             ..RecoveredState::default()
         };
         ExecutionCoordinator::with_shared_stores(
-            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -12225,6 +12292,7 @@ mod tests {
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
         )
+        .signed_by(ValidatorId::new(0))
     }
 
     /// A replay that crosses the quiescence commit derives the latch in
@@ -13447,7 +13515,6 @@ mod tests {
                 ..RecoveredState::default()
             };
             let mut state = ExecutionCoordinator::with_shared_stores(
-                [ValidatorId::new(0)],
                 ShardId::ROOT,
                 Arc::new(TestCode::default()),
                 Arc::new(CrossingIndexSlot::default()),
@@ -13456,7 +13523,8 @@ mod tests {
                 Arc::new(FinalizationStore::new()),
                 Arc::new(ProvenAnchors::new()),
                 Arc::new(CounterpartMirror::new()),
-            );
+            )
+            .signed_by(ValidatorId::new(0));
             state.seat_on_persisted_base(BlockHeight::new(1));
             let actions = state
                 .on_committed_state_restored(&schedule, &StubVmStatics)
@@ -17429,10 +17497,9 @@ mod tests {
     // ─── A replica signing for a set of signers ──────────────────────────
 
     fn replica_signing_for(signers: &[ValidatorId]) -> ExecutionCoordinator {
-        ExecutionCoordinator::new(
+        signed_by(
+            ExecutionCoordinator::new(ShardId::ROOT, Arc::new(TestCode::default())),
             signers.iter().copied(),
-            ShardId::ROOT,
-            Arc::new(TestCode::default()),
         )
     }
 
@@ -17582,6 +17649,109 @@ mod tests {
                 pushed,
                 if pushes { vec![proposer] } else { vec![] },
                 "signing for {signers:?}",
+            );
+        }
+    }
+
+    /// The signers and anchors `actions` sign `tick_id`'s vote under,
+    /// each sent to one recipient, the leader at its anchor.
+    fn signed_at(actions: &[Action], tick_id: TickId) -> Vec<(ValidatorId, u64)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SignAndSendExecutionVote {
+                    tick_id: voted,
+                    vote_anchor_ts,
+                    recipients,
+                    signer,
+                    ..
+                } if *voted == tick_id => {
+                    assert_eq!(recipients.len(), 1, "the first send goes to the leader");
+                    Some((*signer, vote_anchor_ts.as_millis()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A signer attached after a tick voted signs the vote the tick holds,
+    /// at the anchor it was last signed at, and the attach moves no
+    /// anchor: the stalled re-sign still steps from where the tick stood.
+    #[test]
+    fn a_signer_attached_after_a_ticks_vote_signs_it_at_the_ticks_vote_anchor() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        state.detach_signer(ValidatorId::new(0));
+        let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+        assert!(
+            state.emit_vote_actions(&schedule).is_empty(),
+            "no signer signs the vote the tick casts",
+        );
+
+        let attached = state.attach_signer(&schedule, ValidatorId::new(1));
+        assert_eq!(
+            signed_at(&attached, tick_id),
+            vec![(ValidatorId::new(1), 1_000)]
+        );
+
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+        assert_eq!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + step),
+            vec![1_000 + step],
+            "the attach left the anchor where the tick stood",
+        );
+        let attached = state.attach_signer(&schedule, ValidatorId::new(2));
+        assert_eq!(
+            signed_at(&attached, tick_id),
+            vec![(ValidatorId::new(2), 1_000 + step)]
+        );
+    }
+
+    /// A tick that released a member after it voted keeps outcomes that
+    /// no longer hash to the root it voted, so a signer attached after
+    /// signs nothing for it; the same tick unreleased is signed.
+    #[test]
+    fn a_released_tick_is_not_signed_at_attach() {
+        for released in [false, true] {
+            let schedule = make_test_topology();
+            let mut state = make_test_state();
+            state.detach_signer(ValidatorId::new(0));
+            let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+            let shared = BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)]);
+            let txs: Vec<Arc<Verified<Transaction>>> = [7, 8]
+                .into_iter()
+                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(seed))))
+                .collect();
+            let mut tick = tick_holding(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                txs.iter()
+                    .map(|tx| (Arc::clone(tx), shared.clone()))
+                    .collect(),
+            );
+            for tx in &txs {
+                tick.record_execution_result(tx.hash(), ExecutionOutcome::Failed);
+            }
+            let _ = tick.build_vote_data().expect("a tick that ran votes");
+            if released {
+                let _ = tick.release(Some(txs[0].hash()));
+                assert!(tick.unsettled(), "the kept member still awaits its sibling");
+            }
+            state.ticks.insert_tick(tick_id, tick);
+            for tx in &txs {
+                state.ticks.assign_tx(tx.hash(), tick_id);
+            }
+
+            let attached = state.attach_signer(&schedule, ValidatorId::new(1));
+            let expected = if released {
+                Vec::new()
+            } else {
+                vec![(ValidatorId::new(1), 1_000)]
+            };
+            assert_eq!(
+                signed_at(&attached, tick_id),
+                expected,
+                "released {released}"
             );
         }
     }

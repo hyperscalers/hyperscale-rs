@@ -51,7 +51,7 @@ use hyperscale_shard::{
 use hyperscale_storage::{
     AnswerFollow, BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex,
     ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
-    SubstateStore, Substates, TerminalWindow, TickChain, answer_additions,
+    SubstateStore, Substates, TerminalWindow, TickChain, answer_additions, carry_signed_rounds,
     colliding_committed_cell, colliding_member_row, creations_of, filter_writes_to_prefix,
 };
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage, crash_point};
@@ -551,22 +551,17 @@ impl ShardCoordinatorSim {
 
             let mut coord = ShardCoordinator::new(
                 Arc::new(BlsVerifier),
-                [id],
                 shard,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
             );
+            let _ = coord.attach_signer(&topology_schedule, id, None, Round::INITIAL);
             // Genesis proposer is arbitrary but shared across
             // replicas so every genesis block is byte-identical.
             let genesis_proposer = members[0].0;
             let genesis = build_genesis_block(&storages[idx], genesis_proposer, shard);
             let actions = coord.initialize_genesis(&genesis);
-            seed_genesis_answers(
-                &mut coord,
-                &topology_schedule,
-                &pending_chains[idx],
-                &genesis,
-            );
+            seed_genesis_answers(&mut coord, &pending_chains[idx], &genesis);
             // `initialize_genesis` only emits `SetTimer`; tripwire
             // in case that ever changes.
             assert!(
@@ -662,8 +657,8 @@ impl ShardCoordinatorSim {
     pub fn reseat_on_rebuilt_store(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
         let rebuilt = fresh_store(self.shard);
-        let mut recovered = rebuilt.load_recovered_state(self.shard);
-        recovered.carry_signed_rounds(self.storages[idx].as_ref(), rebuilt.as_ref());
+        let recovered = rebuilt.load_recovered_state(self.shard);
+        carry_signed_rounds(self.storages[idx].as_ref(), rebuilt.as_ref());
         self.storages[idx] = rebuilt;
         self.boot(idx, recovered);
     }
@@ -672,13 +667,18 @@ impl ShardCoordinatorSim {
     /// over its store as it stands.
     fn boot(&mut self, idx: usize, recovered: RecoveredState) {
         let replica = self.members[idx].0;
+        let persisted_qc_round = recovered
+            .latest_qc
+            .as_deref()
+            .map_or(Round::INITIAL, QuorumCertificate::round);
         let mut coord = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            [replica],
             self.shard,
             ShardConsensusConfig::default(),
             recovered,
         );
+        let record = self.storages[idx].safe_vote_registers(replica);
+        let _ = coord.attach_signer(&self.topology_schedule, replica, record, persisted_qc_round);
         self.pending_chains[idx] = Arc::new(PendingChain::new(
             Arc::clone(&self.storages[idx]),
             ChainOrigin::ROOT,
@@ -2575,7 +2575,6 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
 /// store, as the node's shard loop seeds a seat at its chain's genesis.
 fn seed_genesis_answers(
     coord: &mut ShardCoordinator,
-    schedule: &TopologySchedule,
     pending_chain: &Arc<PendingChain<SimShardStorage>>,
     genesis: &Block,
 ) {
@@ -2586,5 +2585,5 @@ fn seed_genesis_answers(
     )
     .count()
     .clone();
-    coord.seed_standing_answers(schedule, genesis.height(), count);
+    coord.seed_standing_answers(genesis.height(), count);
 }

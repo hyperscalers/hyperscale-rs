@@ -13,6 +13,7 @@ hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 hyperscale-vm-effects.workspace = true
 strum.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

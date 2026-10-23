@@ -384,6 +384,9 @@ where
                 );
                 return;
             };
+            let Some(_entry) = signing.enter("SignAndSendExecutionVote") else {
+                return;
+            };
             let validator_id = signing.me;
             let network = ctx.topology_snapshot.network();
 
@@ -439,6 +442,9 @@ where
                 ),
                 ctx.topology_snapshot.network(),
             );
+            let Some(_entry) = signing.enter("BroadcastExecutionCertificate") else {
+                return;
+            };
             let Ok(sig) = signing.key.sign(&msg) else {
                 tracing::error!("cannot sign execution certificate batch; skipping broadcast");
                 return;

@@ -39,8 +39,8 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    Block, BlockHeight, Derivation, Epoch, LocalTimestamp, ShardId, StandingAnswers, StateRoot,
-    TopologySchedule, TopologySnapshot, ValidatorId, Verifier,
+    Block, BlockHeight, Derivation, Epoch, LocalTimestamp, Round, SafeVoteRegisters, ShardId,
+    StandingAnswers, StateRoot, TopologySchedule, TopologySnapshot, ValidatorId, Verifier,
 };
 use participation::ShardParticipation;
 use tracing::instrument;
@@ -85,8 +85,9 @@ impl std::fmt::Debug for NodeStateMachine {
 }
 
 impl NodeStateMachine {
-    /// Create a replica's state machine for `me` on `local_shard`, over
-    /// `schedule`, the schedule the beacon folded at `schedule_epoch`.
+    /// Create a replica's state machine on `local_shard` with no signer,
+    /// over `schedule`, the schedule the beacon folded at `schedule_epoch`.
+    /// Each validator it signs for joins through [`Self::attach_signer`].
     ///
     /// `provision_store`, `tx_store`, `exec_cert_store`, and
     /// `finalization_store` are scoped per shard so same-shard vnodes
@@ -95,7 +96,6 @@ impl NodeStateMachine {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn new(
-        me: ValidatorId,
         verifier: Arc<dyn Verifier>,
         derivation: Arc<dyn Derivation>,
         code: Arc<dyn CodeAvailability>,
@@ -116,7 +116,6 @@ impl NodeStateMachine {
             verifier,
             derivation,
             code,
-            me,
             local_shard,
             shard_config,
             recovered,
@@ -260,13 +259,7 @@ impl NodeStateMachine {
     pub(crate) fn seed_standing_answers(&mut self, height: BlockHeight, count: StandingAnswers) {
         self.shard
             .shard_coordinator
-            .seed_standing_answers(&self.schedule, height, count);
-    }
-
-    /// Whether this vnode sits in its shard's committee.
-    /// See [`hyperscale_shard::ShardCoordinator::seated_to_vote`].
-    pub(crate) fn seated_to_vote(&self) -> bool {
-        self.shard.shard_coordinator.seated_to_vote(&self.schedule)
+            .seed_standing_answers(height, count);
     }
 
     /// Tell execution how far the store this seat reads is written, as
@@ -300,6 +293,103 @@ impl NodeStateMachine {
         coordinator.latch_dissolution(&schedule);
         self.schedule = schedule;
         self.schedule_epoch = epoch;
+    }
+
+    /// Attach `validator` to this replica at `now`, and return what it owes
+    /// at once.
+    ///
+    /// `schedule`, folded at `epoch`, is installed first where it is newer
+    /// than the one held. `record` is the signer's durable record and
+    /// `persisted_qc_round` the round of the QC the store holds for its
+    /// committed tip, both read from the replica's live store in the same
+    /// step (see [`ShardCoordinator::attach_signer`]). On a replica already
+    /// open, the signer then votes each pending block it may, proposes the
+    /// round it leads, and signs each tick vote the replica holds for a
+    /// committee that seats it; one not yet open owes these from its
+    /// genesis or restore. The post-dispatch drain runs as after any
+    /// event, so a proposal the attach queued is taken here.
+    pub(crate) fn attach_signer(
+        &mut self,
+        now: LocalTimestamp,
+        validator: ValidatorId,
+        record: Option<SafeVoteRegisters>,
+        persisted_qc_round: Round,
+        schedule: Arc<TopologySchedule>,
+        epoch: Epoch,
+    ) -> Vec<Action> {
+        self.now = now;
+        self.shard.set_time(now);
+        self.install_schedule(epoch, schedule);
+        let mut actions = self.shard.shard_coordinator.attach_signer(
+            &self.schedule,
+            validator,
+            record,
+            persisted_qc_round,
+        );
+        actions.extend(
+            self.shard
+                .execution_coordinator
+                .attach_signer(&self.schedule, validator),
+        );
+        self.drain_dispatch(&mut actions);
+        actions
+    }
+
+    /// Detach `validator`: the replica signs nothing further for it and
+    /// keeps following the chain.
+    pub(crate) fn detach_signer(&mut self, validator: ValidatorId) {
+        self.shard.shard_coordinator.detach_signer(validator);
+        self.shard.execution_coordinator.detach_signer(validator);
+    }
+
+    /// What every dispatch ends with: the state-root verifications that
+    /// became ready, one proposal attempt if any emitter latched it, and a
+    /// re-drive of the votes the fence deferred if its evidence advanced.
+    fn drain_dispatch(&mut self, actions: &mut Vec<Action>) {
+        let s = &mut self.shard;
+        let topology_schedule = &self.schedule;
+        for ready in s.shard_coordinator.drain_ready_state_root_verifications() {
+            actions.push(Action::VerifyStateRoot {
+                block_hash: ready.block_hash,
+                parent_block_hash: ready.parent_block_hash,
+                parent_state_root: ready.parent_state_root,
+                parent_block_height: ready.parent_block_height,
+                expected_root: ready.expected_root,
+                finalizations: ready.finalizations,
+                creations: ready.creations,
+                block_height: ready.block_height,
+                claimed_split_child_roots: ready.claimed_split_child_roots,
+                split_child_roots_required: ready.split_child_roots_required,
+                terminal_settled_txs_required: ready.terminal_settled_txs_required,
+                claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
+                parent_weighted_timestamp: ready.parent_weighted_timestamp,
+                settled_txs_window_floor: ready.settled_txs_window_floor,
+                parent_sweep_frontier: ready.parent_sweep_frontier,
+                claimed_sweep_frontier: ready.claimed_sweep_frontier,
+                frontier: ready.frontier,
+                members: ready.members,
+                parent_judgement: ready.parent_judgement,
+                state_claims: ready.state_claims,
+                transactions: ready.transactions,
+            });
+        }
+
+        // If any emitter latched a proposal-retry during this dispatch (or
+        // the shard coordinator's verification path unblocked a deferred
+        // proposal), re-enter `try_propose` once with fresh transaction
+        // selection — avoids stale txs from the original deferral.
+        if s.shard_coordinator.take_ready_proposal() {
+            actions.extend(s.try_event_driven_proposal(topology_schedule));
+        }
+
+        // Whatever this dispatch wrote into the evidence the vote
+        // fence reads — a counterpart's word, a settled set, a proven
+        // anchor, a predecessor's answer — re-drives the votes that
+        // deferred for want of it, once, here, so no writer has to
+        // know which votes were waiting.
+        if s.shard_coordinator.take_fence_evidence_advanced() {
+            actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
+        }
     }
 }
 
@@ -496,54 +586,7 @@ impl StateMachine for NodeStateMachine {
 
         self.beacon_inputs.extend(inputs);
 
-        // Drain any state root verifications that became ready during this
-        // event, then re-enter `try_propose` once if a proposal-retry latched.
-        {
-            let s = &mut self.shard;
-            let topology_schedule = &self.schedule;
-            for ready in s.shard_coordinator.drain_ready_state_root_verifications() {
-                actions.push(Action::VerifyStateRoot {
-                    block_hash: ready.block_hash,
-                    parent_block_hash: ready.parent_block_hash,
-                    parent_state_root: ready.parent_state_root,
-                    parent_block_height: ready.parent_block_height,
-                    expected_root: ready.expected_root,
-                    finalizations: ready.finalizations,
-                    creations: ready.creations,
-                    block_height: ready.block_height,
-                    claimed_split_child_roots: ready.claimed_split_child_roots,
-                    split_child_roots_required: ready.split_child_roots_required,
-                    terminal_settled_txs_required: ready.terminal_settled_txs_required,
-                    claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
-                    parent_weighted_timestamp: ready.parent_weighted_timestamp,
-                    settled_txs_window_floor: ready.settled_txs_window_floor,
-                    parent_sweep_frontier: ready.parent_sweep_frontier,
-                    claimed_sweep_frontier: ready.claimed_sweep_frontier,
-                    frontier: ready.frontier,
-                    members: ready.members,
-                    parent_judgement: ready.parent_judgement,
-                    state_claims: ready.state_claims,
-                    transactions: ready.transactions,
-                });
-            }
-
-            // If any emitter latched a proposal-retry during this dispatch (or
-            // the shard coordinator's verification path unblocked a deferred
-            // proposal), re-enter `try_propose` once with fresh transaction
-            // selection — avoids stale txs from the original deferral.
-            if s.shard_coordinator.take_ready_proposal() {
-                actions.extend(s.try_event_driven_proposal(topology_schedule));
-            }
-
-            // Whatever this dispatch wrote into the evidence the vote
-            // fence reads — a counterpart's word, a settled set, a proven
-            // anchor, a predecessor's answer — re-drives the votes that
-            // deferred for want of it, once, here, so no writer has to
-            // know which votes were waiting.
-            if s.shard_coordinator.take_fence_evidence_advanced() {
-                actions.extend(s.shard_coordinator.redrive_pending_votes(topology_schedule));
-            }
-        }
+        self.drain_dispatch(&mut actions);
 
         actions
     }
