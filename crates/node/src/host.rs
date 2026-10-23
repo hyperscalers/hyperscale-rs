@@ -249,6 +249,7 @@ where
 
         let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
         let mut shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = BTreeMap::new();
+        let mut built = Vec::new();
         for chain in chains {
             let sender = shard_event_senders[&chain.shard].clone();
             let registration = beacon.register(
@@ -273,10 +274,15 @@ where
                 &registration,
             );
             per_shard_dispatch.insert(chain.shard, handles);
-            let shard_loop = assemble_loop(&process, chain.shard, sender, io, inits, &registration);
-            shards.insert(chain.shard, shard_loop);
+            built.push((chain.shard, sender, io, inits, registration));
         }
+        // Attaching a startup signer dispatches what it owes at once, which
+        // reads its shard's dispatch handles.
         per_shard.store(Arc::new(per_shard_dispatch));
+        for (shard, sender, io, inits, registration) in built {
+            let shard_loop = assemble_loop(&process, shard, sender, io, inits, &registration);
+            shards.insert(shard, shard_loop);
+        }
 
         Self {
             shards,
@@ -359,16 +365,17 @@ where
         self.shard_loop_mut(shard).remove_vnode(validator)
     }
 
-    /// Stop hosting `shard`: deregister its chain from the beacon loop,
-    /// exclude it from the network's hosted set, drop its request
-    /// handlers, event sender, and dispatch handles, and return its
-    /// `ShardLoop` for the caller to drain or drop. Inbound traffic for
-    /// the shard is rejected from the moment the maps swap; events already
-    /// queued die with the channel receiver.
+    /// Stop hosting `shard`: close every signer's gate, deregister its
+    /// chain from the beacon loop, exclude it from the network's hosted
+    /// set, drop its request handlers, event sender, and dispatch handles,
+    /// and return its `ShardLoop` for the caller to drain or drop. Inbound
+    /// traffic for the shard is rejected from the moment the maps swap;
+    /// events already queued die with the channel receiver.
     ///
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {
         let shard_loop = self.shards.remove(&shard)?;
+        shard_loop.shut_down();
         self.beacon.deregister(shard_loop.chain);
         detach_shard(&self.process, shard);
         Some(shard_loop)
@@ -711,7 +718,7 @@ where
         event_tx,
         process: Arc::clone(process),
         io,
-        vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
+        vnodes: Vec::new(),
         now: LocalTimestamp::ZERO,
         fetch_tick: FetchTicker::default(),
         pending_timer_ops: Vec::new(),
@@ -722,7 +729,9 @@ where
         pending_seats: Vec::new(),
         answer_follow: None,
     };
-    shard_loop.share_host_seats();
+    for init in vnodes {
+        shard_loop.attach_vnode(init.into_vnode());
+    }
     shard_loop
 }
 

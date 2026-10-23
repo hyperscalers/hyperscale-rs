@@ -156,8 +156,9 @@ impl GroupStores {
 /// fresh set of [`GroupStores`].
 ///
 /// Each vnode is a `NodeStateMachine` booted from `recovered` over the
-/// group's schedule. The stores are shared across the group and into the
-/// `NodeHost`'s `SharedCaches`.
+/// group's schedule, with no signer: the loop attaches each one's
+/// validator once it holds the store. The stores are shared across the
+/// group and into the `NodeHost`'s `SharedCaches`.
 #[must_use]
 pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
     let stores = GroupStores::fresh(args.recovered);
@@ -173,7 +174,6 @@ pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> 
         .into_iter()
         .map(|(validator, signer)| {
             let state = NodeStateMachine::new(
-                validator,
                 Arc::clone(&config.verifier),
                 Arc::clone(&config.derivation),
                 Arc::clone(&config.code),

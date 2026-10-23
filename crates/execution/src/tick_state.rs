@@ -717,6 +717,23 @@ impl TickState {
         Some((anchor, root, outcomes))
     }
 
+    /// The vote this tick holds, at the anchor it was last signed at,
+    /// without moving that anchor: what a signer attached after the vote
+    /// signs. `None` before the tick has voted, and once a released member
+    /// leaves outcomes that no longer hash to the voted root.
+    #[must_use]
+    pub(crate) fn held_vote(
+        &self,
+    ) -> Option<(WeightedTimestamp, GlobalReceiptRoot, Vec<TxOutcome>)> {
+        if !self.voted {
+            return None;
+        }
+        let outcomes = self.outcomes();
+        let root = compute_global_receipt_root(&outcomes);
+        (Some(root) == self.local_vote_global_receipt_root)
+            .then(|| (self.reanchored.unwrap_or(self.tick_ts), root, outcomes))
+    }
+
     /// The outcome each member's vote attests, in composition order.
     ///
     /// # Panics

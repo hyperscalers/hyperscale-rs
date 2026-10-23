@@ -34,7 +34,9 @@ use hyperscale_node::bootstrap::{
 use hyperscale_node::{SeatConfig, VnodeSeat};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, history_floor};
+use hyperscale_storage::{
+    BoundaryStore, RecoveredState, ShardChainReader, carry_signed_rounds, history_floor,
+};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId};
 
@@ -514,15 +516,14 @@ impl SimulationRunner {
             .expect("a recovering shard has an attested anchor");
         let staging = open_store(shard, self.power_loss);
         replicate_engine_bootstrap(&staging, &self.genesis_config());
-        let Some(mut recovered) =
-            self.bootstrap_from_committee(host, shard, anchor, &staging, true)
+        let Some(recovered) = self.bootstrap_from_committee(host, shard, anchor, &staging, true)
         else {
             return;
         };
         // The old loop is down, so its store holds every round it signed in.
         let old = self.leave_shard(host, shard);
         if replaced == Replaced::Behind {
-            recovered.carry_signed_rounds(&old, &staging);
+            carry_signed_rounds(&old, &staging);
         }
         drop(old);
         self.retained_storages.remove(&(host, shard));

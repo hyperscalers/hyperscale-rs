@@ -63,8 +63,8 @@ use hyperscale_storage::{
     AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
 };
 use hyperscale_types::{
-    Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, TopologySnapshot,
-    TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
+    Address, Block, CertifiedBlock, Hash, LocalTimestamp, QuorumCertificate, Round, ShardId,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
 };
 pub use io::ShardIo;
 
@@ -441,16 +441,18 @@ where
     /// the loop fanned out. See [`Self::admit_seats`].
     pub(crate) pending_seats: Vec<VnodeSeat>,
     /// The answers under this shard's prefix at the persisted head,
-    /// followed while a seat on the loop votes and dropped while none
-    /// does. One per store, whatever the seats on it.
+    /// followed whatever the loop's signers. One per store; `None` until
+    /// the first step reads it whole.
     pub(crate) answer_follow: Option<AnswerFollow>,
 }
 
 /// A [`ShardLoop`] driven on a thread of its own.
 ///
-/// Dropping it, as the thread returns or as a panic unwinds it, releases the chain's
-/// registration with the host's beacon loop, so the fold stops holding
-/// the chain's windows and its commit-proof asks go to another loop.
+/// Dropping it, as the thread returns or as a panic unwinds it, closes
+/// every attached signer's gate, so nothing it queued signs after, and
+/// then releases the chain's registration with the host's beacon loop,
+/// so the fold stops holding the chain's windows and its commit-proof
+/// asks go to another loop.
 pub struct ThreadShardLoop<S, N, D>(ShardLoop<S, N, D>)
 where
     S: ShardStorage,
@@ -494,9 +496,25 @@ where
     D: Dispatch,
 {
     fn drop(&mut self) {
+        self.0.shut_down();
         let _ = self.0.process.beacon_event_sender.send(HostEvent::Beacon(
             BeaconScopedInput::Deregister(self.0.chain),
         ));
+    }
+}
+
+impl<S, N, D> ShardLoop<S, N, D>
+where
+    S: ShardStorage,
+    D: Dispatch,
+{
+    /// Close every attached signer's gate and wait out the signatures
+    /// already started: once this returns, nothing a signer of this loop
+    /// signs leaves the host, and an action still queued never signs.
+    pub(crate) fn shut_down(&self) {
+        for vnode in &self.vnodes {
+            vnode.gate.close_and_wait();
+        }
     }
 }
 
@@ -586,12 +604,37 @@ where
             "the last seat on shard {:?} leaves with its loop",
             self.shard
         );
-        self.vnodes.remove(index);
+        let mut vnode = self.vnodes.remove(index);
+        vnode.gate.close_and_wait();
+        vnode.state.detach_signer(validator);
         self.io.consensus.seat_frontiers.forget(validator);
         self.io.cross_shard.precut_wants.forget(validator);
         self.io.cross_shard.settled_wants.forget(validator);
         self.share_host_seats();
         true
+    }
+
+    /// Seat `vnode` on this loop and attach its validator to its replica,
+    /// dispatching what the attach owes at once.
+    pub(crate) fn attach_vnode(&mut self, vnode: Vnode) {
+        let validator = vnode.validator_id;
+        self.vnodes.push(vnode);
+        self.share_host_seats();
+        let vnode_idx = self.vnodes.len() - 1;
+        let now = self.now;
+        let record = self.io.storage.safe_vote_registers(validator);
+        let persisted_qc_round = self
+            .io
+            .storage
+            .latest_qc()
+            .as_deref()
+            .map_or(Round::INITIAL, QuorumCertificate::round);
+        let state = &mut self.vnodes[vnode_idx].state;
+        let schedule = Arc::clone(state.schedule());
+        let epoch = state.schedule_epoch();
+        let actions =
+            state.attach_signer(now, validator, record, persisted_qc_round, schedule, epoch);
+        self.drain_actions(vnode_idx, actions);
     }
 
     /// Tell every seated vnode which validators this loop seats, so each
@@ -677,8 +720,7 @@ where
             vnode
                 .state
                 .seat_on_persisted_base(self.io.tick_chain.persisted());
-            self.vnodes.push(vnode);
-            self.share_host_seats();
+            self.attach_vnode(vnode);
             let vnode_idx = self.vnodes.len() - 1;
             let now = self.now;
             let actions = self
@@ -1018,17 +1060,12 @@ where
         let at = (genesis.height(), genesis.hash());
         let follow = AnswerFollow::whole(&self.io.pending_chain, at, &under);
         let count = follow.count().clone();
-        self.answer_follow = self.seats_a_voter().then_some(follow);
+        self.answer_follow = Some(follow);
         for vnode_idx in 0..self.vnodes.len() {
             self.vnode_mut(vnode_idx)
                 .state
                 .seed_standing_answers(genesis.height(), count.clone());
         }
-    }
-
-    /// Whether any vnode on the loop is seated to vote.
-    pub(crate) fn seats_a_voter(&self) -> bool {
-        self.vnodes.iter().any(|vnode| vnode.state.seated_to_vote())
     }
 
     /// Seed every vnode's reshape-trigger count frontier from the genesis
@@ -1178,16 +1215,19 @@ mod tests {
 
     use crossbeam::channel::Receiver;
     use hyperscale_core::{Action, CommitSource};
+    use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
+    use hyperscale_network::HandlerRegistry;
+    use hyperscale_network_memory::SimNetworkAdapter;
     use hyperscale_storage::{
-        ChainEntry, ChainWrites, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
-        SubstateStore,
+        ChainEntry, ChainWrites, MemberInputs, ParentAnchor, SafeVoteRegisterStore,
+        ShardChainReader, ShardChainWriter, SubstateStore,
     };
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, FrontierInputs,
-        ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, StateRoot, SweepFrontier,
-        ValidatorId, Verified, WeightedTimestamp,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs,
+        ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SignerBitfield, StateRoot,
+        SweepFrontier, ValidatorId, Verified, VotePosition, WeightedTimestamp,
     };
 
     use crate::shard::HostEvent;
@@ -1215,13 +1255,37 @@ mod tests {
         fn commit_next(&mut self, shard_loop: &mut Loop) {
             let height = self.height.next();
             let stamp = WeightedTimestamp::from_millis(height.inner());
-            let quorum_certificate = |hash, at: BlockHeight, parent| {
+            let (certified, root) = self.prepare_next(shard_loop, Round::new(height.inner()));
+            let hash = certified.block().hash();
+            shard_loop.drain_actions(
+                0,
+                vec![Action::CommitBlock {
+                    certified,
+                    source: CommitSource::Aggregator,
+                    witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+                    committee_anchor: stamp,
+                }],
+            );
+            (self.tip, self.height, self.root) = (hash, height, root);
+        }
+
+        /// Prepare the next block over the tip in the loop's pending chain,
+        /// certified at `round`, and hand it back with its state root,
+        /// without committing it.
+        fn prepare_next(
+            &self,
+            shard_loop: &Loop,
+            round: Round,
+        ) -> (Arc<Verified<CertifiedBlock>>, StateRoot) {
+            let height = self.height.next();
+            let stamp = WeightedTimestamp::from_millis(height.inner());
+            let quorum_certificate = |hash, at: BlockHeight, parent, round| {
                 QuorumCertificate::new(
                     hash,
                     SHARD,
                     at,
                     parent,
-                    Round::new(at.inner()),
+                    round,
                     SignerBitfield::empty(),
                     AggregateSignature::ZERO,
                     stamp,
@@ -1240,7 +1304,13 @@ mod tests {
                     shard_id: SHARD,
                     height,
                     parent_block_hash: self.tip,
-                    parent_qc: quorum_certificate(self.tip, self.height, BlockHash::ZERO).into(),
+                    parent_qc: quorum_certificate(
+                        self.tip,
+                        self.height,
+                        BlockHash::ZERO,
+                        Round::new(self.height.inner()),
+                    )
+                    .into(),
                     timestamp: ProposerTimestamp::from_millis(height.inner()),
                     round: Round::new(height.inner()),
                     ..Default::default()
@@ -1284,20 +1354,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(hash, (height, prepared));
-            let qc = Verified::new_unchecked_for_test(quorum_certificate(hash, height, self.tip));
+            let qc =
+                Verified::new_unchecked_for_test(quorum_certificate(hash, height, self.tip, round));
             let certified = Arc::new(Verified::new_unchecked_for_test(
                 CertifiedBlock::new_unchecked(block, qc),
             ));
-            shard_loop.drain_actions(
-                0,
-                vec![Action::CommitBlock {
-                    certified,
-                    source: CommitSource::Aggregator,
-                    witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
-                    committee_anchor: stamp,
-                }],
-            );
-            (self.tip, self.height, self.root) = (hash, height, root);
+            (certified, root)
         }
     }
 
@@ -1409,6 +1471,123 @@ mod tests {
             chain.height,
             "the seat folds every height its sibling does",
         );
+    }
+
+    /// A signer seated on a running loop locks at the QC the store
+    /// persisted for its committed tip, not at a higher one the pending
+    /// chain shadows it with: a certified block not yet committed can
+    /// belong to a branch a pending fork recovery abandons.
+    #[test]
+    fn an_attached_signer_locks_at_the_persisted_qc_not_the_pending_one() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let mut disk = LaggingDisk::new(events);
+        let mut chain = Chain::on(loop_of(&mut host));
+        for _ in 0..3 {
+            chain.commit_next(loop_of(&mut host));
+        }
+        disk.settle(&mut host);
+
+        let shard_loop = loop_of(&mut host);
+        let (pending, _) = chain.prepare_next(shard_loop, Round::new(50));
+        shard_loop
+            .io
+            .pending_chain
+            .attach_certified_block(pending.block().hash(), pending);
+        let persisted = shard_loop
+            .io
+            .storage
+            .latest_qc()
+            .map(|qc| qc.round())
+            .expect("the store persisted its tip's QC");
+        let shadowed = shard_loop.io.pending_chain.latest_qc().map(|qc| qc.round());
+        assert_eq!(shadowed, Some(Round::new(50)));
+        assert!(persisted < Round::new(50));
+
+        let joiner = fix.committee.validator_id(1);
+        let _ = host.seat_vnode(SHARD, fix.seat(1));
+        let shard_loop = loop_of(&mut host);
+        assert!(shard_loop.carries(joiner), "the store is at rest");
+        let position = shard_loop.vnodes[1]
+            .state
+            .shard_coordinator()
+            .position(joiner)
+            .expect("the joiner is attached");
+        assert_eq!(position.locked_round, persisted);
+        assert_eq!(position.last_voted_round, persisted);
+    }
+
+    /// A timeout `signer` signs at `round`, its position advanced to it.
+    fn timeout_at(signer: ValidatorId, round: u64) -> Action {
+        Action::SignAndBroadcastTimeout {
+            round: Round::new(round),
+            high_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
+            high_tc: None,
+            recipients: Vec::new(),
+            position: VotePosition {
+                registers: SafeVoteRegisters {
+                    last_voted_round: Round::new(round),
+                    ..SafeVoteRegisters::default()
+                },
+                justification: Vec::new(),
+            },
+            signer,
+        }
+    }
+
+    /// A signature queued on the pool under one seat of a validator, and
+    /// run after the loop removed that seat and seated the validator
+    /// again, signs nothing and persists nothing: it holds the gate the
+    /// removal closed. The new seat's own signatures go out.
+    #[test]
+    fn a_task_queued_before_a_detach_does_not_sign_after_a_reattach() {
+        let fix = Fixture::new();
+        let jobs = Arc::new(DeferredJobs::new(ProcessingTimes::INSTANT, 7));
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (mut host, _events) = fix.host_through_network(
+            SimNetworkAdapter::new(registry),
+            SyncDispatch::deferred(Arc::clone(&jobs)),
+        );
+        let run_queued = || {
+            for (_, job) in jobs.take() {
+                job();
+            }
+        };
+        let validator = fix.committee.validator_id(1);
+        let _ = host.seat_vnode(SHARD, fix.seat(1));
+        run_queued();
+        let seat_of = |host: &mut Host| {
+            loop_of(host)
+                .vnodes
+                .iter()
+                .position(|vnode| vnode.validator_id == validator)
+                .expect("the validator is seated")
+        };
+
+        let first = seat_of(&mut host);
+        loop_of(&mut host).drain_actions(first, vec![timeout_at(validator, 5)]);
+        let queued = jobs.take();
+        assert!(!queued.is_empty(), "the timeout is queued on the pool");
+
+        assert!(host.remove_vnode(SHARD, validator));
+        let _ = host.seat_vnode(SHARD, fix.seat(1));
+        run_queued();
+        let second = seat_of(&mut host);
+        for (_, job) in queued {
+            job();
+        }
+        let record = |host: &mut Host| {
+            loop_of(host)
+                .io
+                .storage
+                .safe_vote_registers(validator)
+                .map(|record| record.last_voted_round)
+        };
+        assert_eq!(record(&mut host), None, "the queued timeout persisted");
+
+        loop_of(&mut host).drain_actions(second, vec![timeout_at(validator, 6)]);
+        run_queued();
+        assert_eq!(record(&mut host), Some(Round::new(6)));
     }
 
     /// A queued seat taken off the loop releases the commits held for

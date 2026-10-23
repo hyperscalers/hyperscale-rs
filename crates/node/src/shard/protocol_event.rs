@@ -55,17 +55,14 @@ where
     }
 
     /// The answers under this shard's prefix at the store's persisted
-    /// head, tagged with the height and block they were read at, while a
-    /// seat on the loop votes. The head can stand above the persist that
-    /// asks: a flush the drain tail started can land before its event
-    /// is handled.
+    /// head, tagged with the height and block they were read at. The
+    /// replica follows them whatever its signers, so a signer attached
+    /// later votes under the cap at once. The head can stand above the
+    /// persist that asks: a flush the drain tail started can land before
+    /// its event is handled.
     pub(in crate::shard) fn follow_answers(
         &mut self,
     ) -> Option<(BlockHeight, BlockHash, StandingAnswers)> {
-        if !self.seats_a_voter() {
-            self.answer_follow = None;
-            return None;
-        }
         AnswerFollow::step(
             &mut self.answer_follow,
             &self.io.pending_chain,

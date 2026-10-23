@@ -140,6 +140,9 @@ where
                 tracing::error!("provisions broadcast dispatched without a signer; skipping");
                 return;
             };
+            let Some(_entry) = signing.enter("FetchAndBroadcastProvisions") else {
+                return;
+            };
             let validator_id = signing.me;
             for (provisions, recipients) in batches {
                 // Provisions built from the local JMT view satisfy their

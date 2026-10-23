@@ -91,7 +91,7 @@ pub use shard::tick_chain::{
     declared_reservations,
 };
 pub use shard::unresolved::{ReplayWindow, replay_cutoff, replay_window, unresolved_replay_floor};
-pub use shard::vote_registers::SafeVoteRegisterStore;
+pub use shard::vote_registers::{SafeVoteRegisterStore, carry_signed_rounds};
 pub use shard::writes::{
     CreditBurns, SettledBlock, entry_from_leaf, entry_leaf_rows, entry_leaf_value,
     entry_overlay_range, filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes,

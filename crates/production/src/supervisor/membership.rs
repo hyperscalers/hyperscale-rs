@@ -29,7 +29,9 @@ use hyperscale_node::{
     Registration, RegistrationReply, SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat,
     installed_network_genesis_block, network_genesis_block, seat_vnode_group,
 };
-use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, holds_state};
+use hyperscale_storage::{
+    RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds, holds_state,
+};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
@@ -688,7 +690,7 @@ impl ShardSupervisor {
             shard,
             vnodes,
             storage,
-            mut recovered,
+            recovered,
         } = done;
         self.bootstrapping
             .insert(shard, vnodes.iter().map(|v| v.validator_id).collect());
@@ -698,7 +700,7 @@ impl ShardSupervisor {
         self.tokio_handle.spawn_blocking(move || {
             let old = old.map(|old| {
                 if replaced == Replaced::Behind {
-                    recovered.carry_signed_rounds(old.as_ref(), storage.as_ref());
+                    carry_signed_rounds(old.as_ref(), storage.as_ref());
                 }
                 Arc::downgrade(&old)
             });

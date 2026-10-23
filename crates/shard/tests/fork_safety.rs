@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use common::{HoldFilter, ShardCoordinatorSim, build_genesis_block, perturb_header_timestamp};
 use hyperscale_core::Action;
+use hyperscale_storage::SafeVoteRegisterStore;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, ProposerTimestamp, Round,
     SafeVoteRegisters, ShardId, ValidatorId, VotePosition,
@@ -180,12 +181,14 @@ fn safe_vote_and_contiguous_commit_close_the_fork() {
 /// registers: a replica that voted at round 1, crashed, and restarted
 /// must refuse a sibling block at round 1 — even though its store
 /// recovered no QC (the harness never persists commits), so the durable
-/// safe-vote record alone carries the refusal. Re-initializing the
-/// registers from the recovered QC instead turns exactly this delivery
-/// into the second half of a dual commit: the restarted replica's view
-/// returns to round 1 with both registers at zero, every safe-vote
-/// guard passes for the sibling, and its vote completes a quorum on a
-/// branch conflicting with the one it already helped commit.
+/// safe-vote record alone carries the refusal: its registers, and the
+/// high QC it restores the view past. Re-initializing from the
+/// recovered QC instead turns exactly this delivery into the second
+/// half of a dual commit: the restarted replica's view returns to round
+/// 1 with both registers at zero, every safe-vote guard passes for the
+/// sibling, and its vote completes a quorum on a branch conflicting
+/// with the one it already helped commit. The re-seat witness below
+/// carries the registers without the certificate.
 #[test]
 fn crash_restarted_replica_refuses_revote_in_consumed_round() {
     let mut sim = ShardCoordinatorSim::new(4, 0xC4A5);
@@ -213,16 +216,21 @@ fn crash_restarted_replica_refuses_revote_in_consumed_round() {
     let pre_locked = sim.position(3).locked_round;
     let pre_last_voted = sim.position(3).last_voted_round;
     assert!(pre_last_voted >= r1);
+    let recorded_qc = sim.storages[3]
+        .safe_vote_registers(v3)
+        .and_then(|record| record.high_qc)
+        .map(|qc| qc.round())
+        .expect("V3's record holds a QC past round 1");
 
     sim.crash_and_restart(v3);
 
-    // The registers came back from the durable record: the store held
-    // no QC, so without the record both would re-initialize to round 0
-    // while the view returns to round 1 — and every safe-vote guard
-    // would pass for the sibling delivered below.
+    // The registers and the high QC came back from the durable record:
+    // the store held no QC, so without the record both registers would
+    // re-initialize to round 0 while the view returns to round 1 — and
+    // every safe-vote guard would pass for the sibling delivered below.
     assert_eq!(sim.position(3).locked_round, pre_locked);
     assert_eq!(sim.position(3).last_voted_round, pre_last_voted);
-    assert_eq!(sim.coordinators[3].view(), r1);
+    assert_eq!(sim.coordinators[3].view(), recorded_qc.next());
 
     // Mint the sibling: same height, round, parent, and content roots
     // as the block V3 voted — only the hash differs. Deliver it to the

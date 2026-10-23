@@ -1537,12 +1537,17 @@ where
             // the dispatch pool — so the sans-io coordinator holds no key. Its
             // digest is the link the block adds to its reveal chain; the proof
             // rides the block body and manifest for the verifier's re-check.
-            let Ok(randomness_reveal) = shard_reveal_sign(
+            let Some(entry) = signing.enter("BuildProposal") else {
+                return;
+            };
+            let revealed = shard_reveal_sign(
                 signing.key.as_ref(),
                 ctx.topology_snapshot.network(),
                 shard_id,
                 height,
-            ) else {
+            );
+            drop(entry);
+            let Ok(randomness_reveal) = revealed else {
                 tracing::error!(
                     ?shard_id,
                     height = height.inner(),
@@ -1765,6 +1770,9 @@ where
                 tracing::error!("block header dispatched without a signer; skipping");
                 return;
             };
+            let Some(_entry) = signing.enter("BroadcastBlockHeader") else {
+                return;
+            };
             // The proposer's spent round is durable before the header
             // signature exists, as the vote arm's position is.
             ctx.vote_registers
@@ -1804,6 +1812,9 @@ where
                 );
                 return;
             };
+            let Some(_entry) = signing.enter("SignAndBroadcastBlockVote") else {
+                return;
+            };
             // The position this vote ratcheted must be durable before
             // the signature exists — a crash between them costs at most
             // an abstention, never a second vote in a consumed round.
@@ -1841,6 +1852,9 @@ where
                 tracing::error!(?round, "timeout dispatched without a signer; abstaining");
                 return;
             };
+            let Some(_entry) = signing.enter("SignAndBroadcastTimeout") else {
+                return;
+            };
             // Same persistence rule as the vote arm: the abandoned round
             // is durable before the timeout signature exists.
             ctx.vote_registers
@@ -1872,6 +1886,9 @@ where
                 tracing::error!("QC announcement dispatched without a signer; skipping");
                 return;
             };
+            let Some(_entry) = signing.enter("SignAndBroadcastQcAnnouncement") else {
+                return;
+            };
             let mut announcement = QcAnnouncementNotification {
                 qc,
                 sender: signing.me,
@@ -1895,6 +1912,9 @@ where
         } => {
             let Some(signing) = &ctx.signing else {
                 tracing::error!(?shard, "ready signal dispatched without a signer; skipping");
+                return;
+            };
+            let Some(_entry) = signing.enter("SignAndBroadcastReadySignal") else {
                 return;
             };
             let Ok(signal) = ReadySignal::sign(
@@ -1937,6 +1957,9 @@ where
         Action::BroadcastCertifiedBlockHeader { certified_header } => {
             let Some(signing) = &ctx.signing else {
                 tracing::error!("certified header gossip dispatched without a signer; skipping");
+                return;
+            };
+            let Some(_entry) = signing.enter("BroadcastCertifiedBlockHeader") else {
                 return;
             };
             let msg = signed_bytes(

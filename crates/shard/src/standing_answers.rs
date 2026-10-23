@@ -61,15 +61,11 @@ impl HeldAnswers {
 
     /// `block` committed at `height`, with the delta held for it.
     ///
-    /// A voter not `seated` to vote holds nothing. A commit at or below
-    /// the newest persist is not recorded: that persist's count already
-    /// covers it, so a frontier standing below it can go no further.
-    pub fn committed(&mut self, height: BlockHeight, block: BlockHash, seated: bool) {
+    /// A commit at or below the newest persist is not recorded: that
+    /// persist's count already covers it, so a frontier standing below it
+    /// can go no further.
+    pub fn committed(&mut self, height: BlockHeight, block: BlockHash) {
         let delta = self.pending.remove(&block).map(|(delta, _)| delta);
-        if !seated {
-            self.unseat();
-            return;
-        }
         if height <= self.persisted {
             if self.frontier.as_ref().is_some_and(|(at, _)| *at < height) {
                 self.frontier = None;
@@ -94,13 +90,8 @@ impl HeldAnswers {
         &mut self,
         height: BlockHeight,
         count: Option<(BlockHeight, BlockHash, StandingAnswers)>,
-        seated: bool,
     ) {
         self.persisted = self.persisted.max(height);
-        if !seated {
-            self.unseat();
-            return;
-        }
         if let Some((at, block, count)) = count {
             let ours = self
                 .committed
@@ -131,11 +122,7 @@ impl HeldAnswers {
 
     /// The count at a chain's genesis `height`, read whole off a store
     /// nothing else writes yet.
-    pub fn seeded(&mut self, height: BlockHeight, count: StandingAnswers, seated: bool) {
-        if !seated {
-            self.unseat();
-            return;
-        }
+    pub fn seeded(&mut self, height: BlockHeight, count: StandingAnswers) {
         self.committed = self.committed.split_off(&height.next());
         self.frontier = Some((height, count));
         self.adopted += 1;
@@ -225,10 +212,5 @@ impl HeldAnswers {
         if below_zero {
             self.frontier = None;
         }
-    }
-
-    fn unseat(&mut self) {
-        self.frontier = None;
-        self.committed.clear();
     }
 }

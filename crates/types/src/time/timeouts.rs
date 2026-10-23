@@ -207,15 +207,24 @@ pub const PROGRESS_WAIT_MULTIPLIER: u32 = 3;
 /// ex-member to offer a tip above the snap-synced anchor before it adopts
 /// the anchor as the chain's frontier.
 ///
-/// The offer rides the retained member's timeout, re-sent on its cleanup
-/// tick for as long as the recovery names it retained, so the wait covers
-/// several ticks at the default interval with margin. It is measured from
-/// the first tick on which the seating window is open: before that neither
+/// The offer rides the retained member's timeout. A member outside the
+/// fresh committee's consensus subset re-sends it on every cleanup tick
+/// once the seating window is open. One a stalled recovery's re-draw
+/// seated inside the subset offers at its replica's round timer fire,
+/// which lands within one tick plus two capped progress waits of the later
+/// of the window's opening and the replica's last view-advancing QC
+/// adoption or commit along the halted chain: the tick re-seats the round
+/// clock, and at most one latched reset per view (the view leader's header
+/// or a block sync's exit) follows that step. The wait adds a capped
+/// period over that bound, for the tick, the fresh side's own tick offset,
+/// clock skew between the two hosts and delivery. It is measured from the
+/// first tick on which the seating window is open: before that neither
 /// side can send or receive an offer, and a wait counted from the seating
 /// fold would elapse with nothing measured. It is not derived from the
 /// cleanup interval, which is the retained member's local knob and not
 /// something the waiting member can read.
-pub const HALT_HARVEST_WAIT: Duration = Duration::from_secs(10);
+pub const HALT_HARVEST_WAIT: Duration =
+    VIEW_CHANGE_TIMEOUT_MAX.saturating_mul(2 * PROGRESS_WAIT_MULTIPLIER + 1);
 
 /// Beacon-chain epoch length, measured against committed beacon-slot
 /// `weighted_timestamp`.

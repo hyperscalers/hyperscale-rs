@@ -8,21 +8,16 @@ use std::sync::Arc;
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats, ShardStats};
-use hyperscale_storage::RecoveredState;
+use hyperscale_storage::{RecoveredState, SafeVoteRegisterStore};
+use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BlockHeight, IDLE_PROPOSAL_INTERVAL, LocalTimestamp, Round, SafeVoteRegisters, ShardId,
-    TopologySchedule, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId,
+    TopologySchedule, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, VotePosition, shard_prefix_path,
 };
 
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
-    ShardCoordinator::new(
-        Arc::new(BlsVerifier),
-        [ValidatorId::new(0)],
-        ShardId::ROOT,
-        config,
-        RecoveredState::default(),
-    )
+    fresh_coordinator_with_topology(config).0
 }
 
 fn fresh_coordinator_with_topology(
@@ -30,7 +25,24 @@ fn fresh_coordinator_with_topology(
 ) -> (ShardCoordinator, TopologySchedule) {
     let topology_schedule =
         TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(1)));
-    (fresh_coordinator(config), topology_schedule)
+    let coordinator = signed_by(&topology_schedule, ValidatorId::new(0), config);
+    (coordinator, topology_schedule)
+}
+
+/// A fresh replica with `me` attached and no durable record.
+fn signed_by(
+    topology_schedule: &TopologySchedule,
+    me: ValidatorId,
+    config: ShardConsensusConfig,
+) -> ShardCoordinator {
+    let mut coordinator = ShardCoordinator::new(
+        Arc::new(BlsVerifier),
+        ShardId::ROOT,
+        config,
+        RecoveredState::default(),
+    );
+    let _ = coordinator.attach_signer(topology_schedule, me, None, Round::INITIAL);
+    coordinator
 }
 
 #[test]
@@ -127,13 +139,7 @@ fn is_current_proposer_matches_topology() {
         let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let me = ValidatorId::new(u64::from(local_idx));
         let local_shard = ShardId::ROOT;
-        let coordinator = ShardCoordinator::new(
-            Arc::new(BlsVerifier),
-            [me],
-            local_shard,
-            ShardConsensusConfig::default(),
-            RecoveredState::default(),
-        );
+        let coordinator = signed_by(&topology_schedule, me, ShardConsensusConfig::default());
         // Fresh coordinator: latest_qc is None → next height = committed_height + 1 = 1.
         // Rounds increase per block, so the fresh view is round 1.
         let expected = topology_schedule
@@ -157,12 +163,10 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
     let mut proposers = 0usize;
     for local_idx in 0_u32..4 {
         let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
-        let coordinator = ShardCoordinator::new(
-            Arc::new(BlsVerifier),
-            [ValidatorId::new(u64::from(local_idx))],
-            ShardId::ROOT,
+        let coordinator = signed_by(
+            &topology_schedule,
+            ValidatorId::new(u64::from(local_idx)),
             ShardConsensusConfig::default(),
-            RecoveredState::default(),
         );
         if coordinator.will_propose_next(&topology_schedule) {
             proposers += 1;
@@ -200,65 +204,76 @@ fn check_round_timeout_does_not_fire_without_recorded_activity() {
     );
 }
 
-/// A recovered safe-vote register record floors the boot registers: the
-/// coordinator must never sign below a position the durable record says
-/// it already consumed.
+/// A signer's durable record floors the registers it attaches with: the
+/// coordinator must never sign below a position the record says it
+/// already consumed.
 #[test]
 fn recovered_registers_floor_boot_values() {
     let me = ValidatorId::new(0);
-    let mut recovered = RecoveredState::default();
-    recovered.safe_vote_registers.insert(
+    let store = SimShardStorage::new(shard_prefix_path(ShardId::ROOT));
+    store.persist_vote_position(me, &consumed(3, 7));
+    let (mut coordinator, topology_schedule) =
+        unsigned_coordinator_with_topology(ShardConsensusConfig::default());
+
+    let _ = coordinator.attach_signer(
+        &topology_schedule,
         me,
-        SafeVoteRegisters {
-            locked_round: Round::new(3),
-            last_voted_round: Round::new(7),
-            high_qc: None,
-            high_tc: None,
-        },
+        store.safe_vote_registers(me),
+        Round::INITIAL,
     );
 
-    let coordinator = ShardCoordinator::new(
-        Arc::new(BlsVerifier),
-        [me],
-        ShardId::ROOT,
-        ShardConsensusConfig::default(),
-        recovered,
-    );
-
-    let position = coordinator.position(me).expect("built with its signer");
+    let position = coordinator.position(me).expect("attached");
     assert_eq!(position.locked_round, Round::new(3));
     assert_eq!(position.last_voted_round, Round::new(7));
 }
 
-/// Register records are per-validator: another validator's record on the
-/// same (shared, co-hosted) store must not leak into this coordinator's
-/// boot values.
+/// Register records are per validator: another validator's record on the
+/// same (shared, co-hosted) store does not reach this signer's registers.
 #[test]
 fn recovered_registers_of_other_validators_are_ignored() {
-    let mut recovered = RecoveredState::default();
-    recovered.safe_vote_registers.insert(
-        ValidatorId::new(9),
-        SafeVoteRegisters {
-            locked_round: Round::new(3),
-            last_voted_round: Round::new(7),
-            high_qc: None,
-            high_tc: None,
-        },
-    );
+    let me = ValidatorId::new(0);
+    let store = SimShardStorage::new(shard_prefix_path(ShardId::ROOT));
+    store.persist_vote_position(ValidatorId::new(9), &consumed(3, 7));
+    let (mut coordinator, topology_schedule) =
+        unsigned_coordinator_with_topology(ShardConsensusConfig::default());
 
-    let coordinator = ShardCoordinator::new(
-        Arc::new(BlsVerifier),
-        [ValidatorId::new(0)],
-        ShardId::ROOT,
-        ShardConsensusConfig::default(),
-        recovered,
+    let _ = coordinator.attach_signer(
+        &topology_schedule,
+        me,
+        store.safe_vote_registers(me),
+        Round::INITIAL,
     );
 
     // No record for this validator and no recovered QC: both registers
     // boot at the genesis QC's round.
-    let position = coordinator
-        .position(ValidatorId::new(0))
-        .expect("built with its signer");
+    let position = coordinator.position(me).expect("attached");
     assert_eq!(position.locked_round, Round::INITIAL);
     assert_eq!(position.last_voted_round, Round::INITIAL);
+}
+
+fn unsigned_coordinator_with_topology(
+    config: ShardConsensusConfig,
+) -> (ShardCoordinator, TopologySchedule) {
+    let topology_schedule =
+        TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(1)));
+    let coordinator = ShardCoordinator::new(
+        Arc::new(BlsVerifier),
+        ShardId::ROOT,
+        config,
+        RecoveredState::default(),
+    );
+    (coordinator, topology_schedule)
+}
+
+/// A position whose signer locked at `locked` and voted through `voted`.
+const fn consumed(locked: u64, voted: u64) -> VotePosition {
+    VotePosition {
+        registers: SafeVoteRegisters {
+            locked_round: Round::new(locked),
+            last_voted_round: Round::new(voted),
+            high_qc: None,
+            high_tc: None,
+        },
+        justification: Vec::new(),
+    }
 }
