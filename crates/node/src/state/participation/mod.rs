@@ -132,7 +132,7 @@ impl ShardParticipation {
         // classifies its ticks exactly as a non-restarted peer's does.
         let shard_coordinator = ShardCoordinator::new(
             verifier,
-            me,
+            [me],
             local_shard,
             shard_config.clone(),
             recovered.clone(),
@@ -159,7 +159,7 @@ impl ShardParticipation {
         // the vote fence and the execution coordinator ask the same
         // questions of them, and two copies could answer differently.
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
-            me,
+            [me],
             local_shard,
             code,
             crossing_index,

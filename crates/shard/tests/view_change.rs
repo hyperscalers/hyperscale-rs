@@ -475,12 +475,12 @@ fn timeout_view_change_preserves_safe_vote_lock() {
     sim.run_for_at_most(500);
 
     assert_eq!(
-        sim.coordinators[0].last_voted_round(),
+        sim.position(0).last_voted_round,
         Round::new(1),
         "idx 0 should have voted at round 1",
     );
     assert_eq!(
-        sim.coordinators[0].locked_round(),
+        sim.position(0).locked_round,
         Round::INITIAL,
         "voting for a genesis-extending block leaves the lock at the genesis round",
     );
@@ -501,7 +501,7 @@ fn timeout_view_change_preserves_safe_vote_lock() {
         "idx 0 view_changes must have ticked",
     );
     assert_eq!(
-        sim.coordinators[0].locked_round(),
+        sim.position(0).locked_round,
         Round::INITIAL,
         "a timeout view change must not raise the safe-vote lock",
     );
@@ -595,7 +595,7 @@ fn a_voted_tip_proposal_leaves_the_round_timer_to_the_nominal_timeout() {
 
     for (idx, coordinator) in sim.coordinators.iter().enumerate() {
         assert_eq!(
-            coordinator.last_voted_round(),
+            sim.position(idx).last_voted_round,
             Round::new(1),
             "replica {idx} should have voted the round-1 proposal",
         );
@@ -651,7 +651,7 @@ fn child_before_parent_header_defers_then_votes_on_arrival() {
         "the height-2 header must have been diverted to the held buffer",
     );
     assert!(
-        sim.coordinators[0].last_voted_round() < Round::new(3),
+        sim.position(0).last_voted_round < Round::new(3),
         "child height 3 must stay deferred while its parent header is withheld",
     );
 
@@ -659,7 +659,7 @@ fn child_before_parent_header_defers_then_votes_on_arrival() {
     sim.release_held(lagging);
     sim.run_for_at_most(MAX_STEPS);
     assert!(
-        sim.coordinators[0].last_voted_round() >= Round::new(3),
+        sim.position(0).last_voted_round >= Round::new(3),
         "arrival of the parent header must un-defer the child so idx 0 votes it",
     );
 }

@@ -18,8 +18,35 @@ use hyperscale_types::{
 use super::core::SimShardStorage;
 use crate::crash_point;
 
+impl SimShardStorage {
+    /// Whether the stored record already dominates `position`'s registers
+    /// and every block justifying them is stored, so persisting it would
+    /// write nothing new.
+    fn vote_position_held(&self, validator: ValidatorId, position: &VotePosition) -> bool {
+        let c = read_or_recover(&self.consensus);
+        let origin = c.chain_origin;
+        let held = c
+            .safe_vote_registers
+            .get(&validator)
+            .is_some_and(|(stored_origin, stored)| {
+                *stored_origin == origin
+                    && position.registers.clone().max((**stored).clone()) == **stored
+            })
+            && position.justification.iter().all(|block| {
+                c.voted_blocks
+                    .get(&(block.height(), block.hash()))
+                    .is_some_and(|(stored_origin, _)| *stored_origin == origin)
+            });
+        drop(c);
+        held
+    }
+}
+
 impl SafeVoteRegisterStore for SimShardStorage {
     fn persist_vote_position(&self, validator: ValidatorId, position: &VotePosition) {
+        if self.vote_position_held(validator, position) {
+            return;
+        }
         crash_point::write();
         let mut c = write_or_recover(&self.consensus);
         let origin = c.chain_origin;

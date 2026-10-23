@@ -199,7 +199,7 @@ fn safe_vote_rejects_equivocating_second_block() {
     // on the first vote, so the equivocating sibling (also round 1) failed the
     // `round > last_voted_round` clause and was never signed.
     assert_eq!(
-        sim.coordinators[0].last_voted_round(),
+        sim.position(0).last_voted_round,
         Round::new(1),
         "idx 0 should have voted exactly once, at round 1",
     );

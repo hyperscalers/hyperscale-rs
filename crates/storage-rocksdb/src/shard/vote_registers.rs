@@ -40,8 +40,16 @@ impl SafeVoteRegisterStore for RocksDbShardStorage {
             }
             _ => position.registers.clone(),
         };
-        if stored.as_ref() == Some(&(origin, merged.clone())) && position.justification.is_empty() {
-            return; // nothing raised (e.g. a timeout retransmit) — skip the fsync
+        // Nothing raised and every justifying block already stored, as for
+        // a proposer's self-vote after its header or a timeout retransmit:
+        // skip the fsync.
+        if stored.as_ref() == Some(&(origin, merged.clone()))
+            && position.justification.iter().all(|block| {
+                self.cf_get::<VotedBlocksCf>(&(block.height(), block.hash()))
+                    .is_some_and(|(stored_origin, _)| stored_origin == origin)
+            })
+        {
+            return;
         }
 
         let cf = self.cf();

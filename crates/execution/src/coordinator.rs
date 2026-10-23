@@ -678,10 +678,10 @@ pub struct ExecutionCoordinator {
     /// ledger through it.
     counterparts: Counterparts,
 
-    /// This validator's identity.
-    me: ValidatorId,
+    /// The validators this replica signs for.
+    signers: BTreeSet<ValidatorId>,
 
-    /// This validator's home shard.
+    /// This replica's shard.
     local_shard: ShardId,
 }
 
@@ -692,9 +692,13 @@ impl ExecutionCoordinator {
     /// stores across every coordinator in the shard; for a recovered chain,
     /// it also seeds the frontier from storage.
     #[must_use]
-    pub fn new(me: ValidatorId, local_shard: ShardId, code: Arc<dyn CodeAvailability>) -> Self {
+    pub fn new(
+        signers: impl IntoIterator<Item = ValidatorId>,
+        local_shard: ShardId,
+        code: Arc<dyn CodeAvailability>,
+    ) -> Self {
         Self::with_shared_stores(
-            me,
+            signers,
             local_shard,
             code,
             Arc::new(CrossingIndexSlot::default()),
@@ -730,7 +734,7 @@ impl ExecutionCoordinator {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn with_shared_stores(
-        me: ValidatorId,
+        signers: impl IntoIterator<Item = ValidatorId>,
         local_shard: ShardId,
         code: Arc<dyn CodeAvailability>,
         crossing_index: Arc<CrossingIndexSlot>,
@@ -808,9 +812,29 @@ impl ExecutionCoordinator {
             legs_offered: BTreeMap::new(),
             legs_asked: BTreeMap::new(),
             pending_push: None,
-            me,
+            signers: signers.into_iter().collect(),
             local_shard,
         }
+    }
+
+    /// The signer that signs an envelope-only broadcast of `certificate`:
+    /// the lowest-id attached signer in the committee that attests it at
+    /// its anchor, or `None` with no attached signer there.
+    fn envelope_signer(
+        &self,
+        topology_schedule: &TopologySchedule,
+        certificate: &ExecutionCertificate,
+    ) -> Option<ValidatorId> {
+        let committee = attesting_committee(
+            topology_schedule,
+            self.local_shard,
+            certificate.vote_anchor_ts(),
+        )?
+        .committee_for_shard(self.local_shard);
+        self.signers
+            .iter()
+            .copied()
+            .find(|signer| committee.contains(signer))
     }
 
     /// Reference to the shared finalization store. The `io_loop`
@@ -1465,7 +1489,8 @@ impl ExecutionCoordinator {
             self.ticked.insert(tick_id, ticked);
         }
 
-        // Only the tick leader creates a `VoteTracker` for aggregation.
+        // Only the replica the tick leader signs on creates a `VoteTracker`
+        // for aggregation.
         // Resolved under the committee that attests the tick, which is
         // the one that will verify the certificate. A window this shard
         // has already left seats nobody, and there is no leader to be:
@@ -1475,7 +1500,7 @@ impl ExecutionCoordinator {
         if let Some(committee) = attesting_committee(topology_schedule, local_shard, block.ts)
             && let seated = committee.consensus_committee_for_shard(local_shard)
             && !seated.is_empty()
-            && self.me == tick_leader(&tick_id, seated)
+            && self.signers.contains(&tick_leader(&tick_id, seated))
         {
             let mut tracker = VoteTracker::new(tick_id, block.hash);
             tracker.require(block.ts, committee.quorum_threshold_for_shard(local_shard));
@@ -1708,7 +1733,8 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Scan complete ticks and emit `SignAndSendExecutionVote` actions.
+    /// Scan complete ticks and emit `SignAndSendExecutionVote` actions, one
+    /// per signer seated in the tick's attesting committee.
     ///
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so tick state is deterministic at this height.
@@ -1752,14 +1778,17 @@ impl ExecutionCoordinator {
                     tx_outcomes: Arc::clone(&tx_outcomes),
                 },
             );
-            actions.push(Action::SignAndSendExecutionVote {
-                block_hash: completion.block_hash,
-                vote_anchor_ts: completion.vote_anchor_ts,
-                tick_id: completion.tick_id,
-                global_receipt_root: completion.global_receipt_root,
-                tx_outcomes: (*tx_outcomes).clone(),
-                recipients: vec![leader],
-            });
+            for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
+                actions.push(Action::SignAndSendExecutionVote {
+                    block_hash: completion.block_hash,
+                    vote_anchor_ts: completion.vote_anchor_ts,
+                    tick_id: completion.tick_id,
+                    global_receipt_root: completion.global_receipt_root,
+                    tx_outcomes: (*tx_outcomes).clone(),
+                    recipients: vec![leader],
+                    signer,
+                });
+            }
         }
         actions
     }
@@ -1884,7 +1913,7 @@ impl ExecutionCoordinator {
                 return vec![];
             }
             if self.ticks.is_ec_dispatched(&tick_id)
-                && let Some(answer) = self.answer_spent_vote(&vote)
+                && let Some(answer) = self.answer_spent_vote(topology_schedule, &vote)
             {
                 return answer;
             }
@@ -1968,7 +1997,11 @@ impl ExecutionCoordinator {
     /// still sending it never received the certificate, and is sent it.
     /// A vote at a later anchor re-attests a tick still owed past the
     /// held certificate's life, and is tallied.
-    fn answer_spent_vote(&self, vote: &Verifiable<ExecutionVote>) -> Option<Vec<Action>> {
+    fn answer_spent_vote(
+        &self,
+        topology_schedule: &TopologySchedule,
+        vote: &Verifiable<ExecutionVote>,
+    ) -> Option<Vec<Action>> {
         let held = self.exec_certs.get(vote.tick_id());
         if held
             .as_ref()
@@ -1977,10 +2010,14 @@ impl ExecutionCoordinator {
             return None;
         }
         Some(
-            held.map(|certificate| Action::BroadcastExecutionCertificate {
-                shard: self.local_shard,
-                certificate,
-                recipients: vec![vote.validator()],
+            held.and_then(|certificate| {
+                let signer = self.envelope_signer(topology_schedule, &certificate)?;
+                Some(Action::BroadcastExecutionCertificate {
+                    shard: self.local_shard,
+                    certificate,
+                    recipients: vec![vote.validator()],
+                    signer,
+                })
             })
             .into_iter()
             .collect(),
@@ -2208,12 +2245,16 @@ impl ExecutionCoordinator {
         self.ticks.clear_vote_retry(tick_id);
 
         // Broadcast EC to all local peers (they don't aggregate — they need it).
-        let local_peers = peers_excluding_self(head, self.me, self.local_shard);
-        if !local_peers.is_empty() {
+        let envelope_signer = self.envelope_signer(topology_schedule, certificate);
+        let local_peers = peers_excluding_self(head, &self.signers, self.local_shard);
+        if let Some(signer) = envelope_signer
+            && !local_peers.is_empty()
+        {
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: self.local_shard,
                 certificate: Arc::clone(certificate),
                 recipients: local_peers,
+                signer,
             });
         }
 
@@ -2234,11 +2275,14 @@ impl ExecutionCoordinator {
                 recipients.clone(),
                 self.committed_ts,
             );
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: *target_shard,
-                certificate: projected,
-                recipients,
-            });
+            if let Some(signer) = envelope_signer {
+                actions.push(Action::BroadcastExecutionCertificate {
+                    shard: *target_shard,
+                    certificate: projected,
+                    recipients,
+                    signer,
+                });
+            }
         }
 
         tracing::debug!(
@@ -2829,7 +2873,7 @@ impl ExecutionCoordinator {
         for (tick_id, anchor) in stalled {
             let Some(committee) = attesting_committee(topology_schedule, local_shard, anchor)
                 .map(|snapshot| snapshot.consensus_committee_for_shard(local_shard).to_vec())
-                .filter(|committee| committee.contains(&self.me))
+                .filter(|committee| self.signers.iter().any(|s| committee.contains(s)))
             else {
                 continue;
             };
@@ -2859,14 +2903,18 @@ impl ExecutionCoordinator {
                     tx_outcomes: Arc::clone(&tx_outcomes),
                 },
             );
-            actions.push(Action::SignAndSendExecutionVote {
-                block_hash,
-                vote_anchor_ts,
-                tick_id,
-                global_receipt_root,
-                tx_outcomes: (*tx_outcomes).clone(),
-                recipients: vec![tick_leader(&tick_id, &committee)],
-            });
+            let leader = tick_leader(&tick_id, &committee);
+            for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
+                actions.push(Action::SignAndSendExecutionVote {
+                    block_hash,
+                    vote_anchor_ts,
+                    tick_id,
+                    global_receipt_root,
+                    tx_outcomes: (*tx_outcomes).clone(),
+                    recipients: vec![leader],
+                    signer,
+                });
+            }
         }
         actions
     }
@@ -2937,18 +2985,18 @@ impl ExecutionCoordinator {
             tx_outcomes,
         } in effects
         {
-            // A retry goes to the whole committee that attests the tick —
-            // the Ready-filtered set the EC's bitfield indexes — this voter
-            // included, so its own vote meets its peers' in every tally,
-            // its own among them. Three ways there is nobody to send to.
-            // Two defer the retry to a later fire: the beacon is behind
+            // A retry goes to the whole committee that attests the tick — the
+            // Ready-filtered set the EC's bitfield indexes — each seated
+            // signer included, so its own vote meets its peers' in every
+            // tally, its own among them. Three ways there is nobody to send
+            // to. Two defer the retry to a later fire: the beacon is behind
             // the anchor, or the anchor resolves a window this shard has
             // already left, where nobody is seated and no vote can reach a
             // quorum anyway. The third ends it: the anchor's window is
-            // evicted, which no later fire resolves, and a certificate
-            // signed there is past its life wherever it lands. A seat in
-            // the tick's later committee holds a retry at that step's
-            // anchor in this one's place.
+            // evicted, which no later fire resolves, and a certificate signed
+            // there is past its life wherever it lands. A seat in the tick's
+            // later committee holds a retry at that step's anchor in this
+            // one's place.
             let Some(recipients) =
                 attesting_committee(topology_schedule, self.local_shard, vote_anchor_ts)
                     .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
@@ -2970,14 +3018,17 @@ impl ExecutionCoordinator {
                 recipients = recipients.len(),
                 "Vote retry — re-sending to the attesting committee"
             );
-            actions.push(Action::SignAndSendExecutionVote {
-                block_hash,
-                vote_anchor_ts,
-                tick_id,
-                global_receipt_root,
-                tx_outcomes: (*tx_outcomes).clone(),
-                recipients,
-            });
+            for &signer in self.signers.iter().filter(|s| recipients.contains(s)) {
+                actions.push(Action::SignAndSendExecutionVote {
+                    block_hash,
+                    vote_anchor_ts,
+                    tick_id,
+                    global_receipt_root,
+                    tx_outcomes: (*tx_outcomes).clone(),
+                    recipients: recipients.clone(),
+                    signer,
+                });
+            }
         }
         actions
     }
@@ -3204,11 +3255,14 @@ impl ExecutionCoordinator {
         // finalization. Driven from the commit cadence so the schedule is
         // deterministic across validators.
         for directive in self.outbound_certs.on_block_committed(self.committed_ts) {
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: directive.target_shard,
-                certificate: directive.certificate,
-                recipients: directive.recipients,
-            });
+            if let Some(signer) = self.envelope_signer(topology_schedule, &directive.certificate) {
+                actions.push(Action::BroadcastExecutionCertificate {
+                    shard: directive.target_shard,
+                    certificate: directive.certificate,
+                    recipients: directive.recipients,
+                    signer,
+                });
+            }
         }
 
         for (_, tick) in self.ticks.ticks_iter_mut() {
@@ -3319,10 +3373,11 @@ impl ExecutionCoordinator {
         // pushed.
         let mut actions = Vec::new();
         let pending_push = self.pending_push.take();
-        if runnable && self.me == header.proposer() {
+        let proposer = header.proposer();
+        if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(anchored, transactions, self.me, local_shard)
+                build_provision_requests(anchored, transactions, &self.signers, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
@@ -3331,6 +3386,7 @@ impl ExecutionCoordinator {
                     block_height: height,
                     source_block_ts: header.parent_qc().weighted_timestamp(),
                     shard_recipients,
+                    signer: proposer,
                 });
             }
             if let Some((parent_hash, anchor, mut targets)) = pending_push {
@@ -3357,6 +3413,7 @@ impl ExecutionCoordinator {
                     anchor,
                     targets,
                     shard_recipients,
+                    signer: proposer,
                 });
             }
         }
@@ -4912,8 +4969,8 @@ mod tests {
         RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor,
         ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
         SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Verify, Window, compute_global_receipt_root, receipt_hash_of,
-        signed_bytes,
+        ValidatorInfo, ValidatorSet, Verify, VoteCount, Window, compute_global_receipt_root,
+        receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -5088,11 +5145,11 @@ mod tests {
     }
 
     fn make_test_state_for(me: ValidatorId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new(me, ShardId::ROOT, Arc::new(TestCode::default()))
+        ExecutionCoordinator::new([me], ShardId::ROOT, Arc::new(TestCode::default()))
     }
 
     fn make_test_state_for_shard(me: ValidatorId, local_shard: ShardId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new(me, local_shard, Arc::new(TestCode::default()))
+        ExecutionCoordinator::new([me], local_shard, Arc::new(TestCode::default()))
     }
 
     fn make_live_block(
@@ -5177,7 +5234,7 @@ mod tests {
         let package = Hash::from_bytes(b"a package this node has not fetched");
         let code = TestCode::withholding(package);
         let mut state =
-            ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT, Arc::clone(&code) as _);
+            ExecutionCoordinator::new([ValidatorId::new(0)], ShardId::ROOT, Arc::clone(&code) as _);
         let topology_schedule = make_test_topology();
 
         let tx = test_transaction_running(1, &[package]);
@@ -5325,7 +5382,7 @@ mod tests {
     #[test]
     fn an_unrelated_missing_package_holds_no_tick() {
         let mut state = ExecutionCoordinator::new(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             TestCode::withholding(Hash::from_bytes(b"someone else's code")),
         );
@@ -6675,6 +6732,73 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    /// A certificate broadcast goes out under the lowest attached signer in
+    /// the committee attesting the certificate, passing over a lower one
+    /// outside it, and not at all with none attached there.
+    #[test]
+    fn a_certificate_broadcast_signs_under_the_lowest_attached_committee_member() {
+        use hyperscale_types::compute_global_receipt_root;
+        use hyperscale_types::test_utils::test_transaction;
+
+        let validators = ValidatorSet::new(
+            (1..=4u64)
+                .map(|id| ValidatorInfo {
+                    validator_id: ValidatorId::new(id),
+                    public_key: BlsSigner::generate().public_key(),
+                })
+                .collect(),
+        );
+        let topo = TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            validators,
+        )));
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let tx = Arc::new(test_transaction(3));
+        let outcomes = vec![TxOutcome::new(tx.hash(), ExecutionOutcome::Aborted)];
+        let cert = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )));
+        let broadcast_signers = |signers: [u64; 2]| {
+            let mut state = ExecutionCoordinator::new(
+                signers.map(ValidatorId::new),
+                ShardId::ROOT,
+                Arc::new(TestCode::default()),
+            );
+            let participating: BTreeSet<ShardId> =
+                [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
+            state.ticks.insert_tick(
+                tick_id,
+                tick_holding(
+                    tick_id,
+                    WeightedTimestamp::ZERO,
+                    vec![(verified_arc(&tx), participating)],
+                ),
+            );
+            state
+                .on_certificate_aggregated(&topo, &tick_id, &cert)
+                .into_iter()
+                .filter_map(|a| match a {
+                    Action::BroadcastExecutionCertificate { signer, .. } => Some(signer),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let signers = broadcast_signers([0, 2]);
+        assert!(!signers.is_empty());
+        assert!(
+            signers.iter().all(|s| *s == ValidatorId::new(2)),
+            "{signers:?}"
+        );
+        assert!(broadcast_signers([0, 9]).is_empty());
     }
 
     /// A tick of pure legs owes its certificate to nobody: the venue reads
@@ -9024,9 +9148,10 @@ mod tests {
             for (height, anchor_ms) in [(frontier.next(), 2_500), (frontier, 2_400)] {
                 let mut seated = make_test_state_for(me);
                 let tick = ready_tick_at(&mut seated, &unfolded, height, anchor_ms);
-                assert!(
+                assert_eq!(
                     !seated.emit_vote_actions(&unfolded).is_empty(),
-                    "{me:?} signs the tick before it folds the recovery",
+                    me == old[0],
+                    "{me:?} signs the tick before it folds the recovery only from its committee",
                 );
                 for &at in &steps {
                     assert!(
@@ -9403,7 +9528,7 @@ mod tests {
         let topo = make_test_topology();
         // The recovered tip: height 5, its own anchor at 900 ms.
         let mut state = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -9867,7 +9992,7 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11193,7 +11318,7 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11269,7 +11394,7 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11357,7 +11482,7 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11441,7 +11566,7 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -11709,7 +11834,7 @@ mod tests {
             ..RecoveredState::default()
         };
         let mut restarted = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -12090,7 +12215,7 @@ mod tests {
             ..RecoveredState::default()
         };
         ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             Arc::new(TestCode::default()),
             Arc::new(CrossingIndexSlot::default()),
@@ -13322,7 +13447,7 @@ mod tests {
                 ..RecoveredState::default()
             };
             let mut state = ExecutionCoordinator::with_shared_stores(
-                ValidatorId::new(0),
+                [ValidatorId::new(0)],
                 ShardId::ROOT,
                 Arc::new(TestCode::default()),
                 Arc::new(CrossingIndexSlot::default()),
@@ -17299,5 +17424,165 @@ mod tests {
         assert_eq!(after.tick_assignments, 0);
         assert_eq!(after.absorbed_provisions, 0);
         assert_eq!(after.required_provision_shards, 0);
+    }
+
+    // ─── A replica signing for a set of signers ──────────────────────────
+
+    fn replica_signing_for(signers: &[ValidatorId]) -> ExecutionCoordinator {
+        ExecutionCoordinator::new(
+            signers.iter().copied(),
+            ShardId::ROOT,
+            Arc::new(TestCode::default()),
+        )
+    }
+
+    /// The leader of the tick a ready commit at height one seats, and a
+    /// committee member that is not it.
+    fn first_ticks_leader_and_member(schedule: &TopologySchedule) -> (ValidatorId, ValidatorId) {
+        let mut probe = make_test_state();
+        let tick_id = ready_tick_at(&mut probe, schedule, BlockHeight::new(1), 1_000);
+        let committee = schedule
+            .head()
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .to_vec();
+        let leader = tick_leader(&tick_id, &committee);
+        let member = committee
+            .into_iter()
+            .find(|member| *member != leader)
+            .expect("a committee of four");
+        (leader, member)
+    }
+
+    /// Each execution vote emitted, as `(signer, recipients)`.
+    fn execution_votes(actions: &[Action]) -> Vec<(ValidatorId, Vec<ValidatorId>)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndSendExecutionVote {
+                    signer, recipients, ..
+                } => Some((*signer, recipients.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tallied_power(state: &ExecutionCoordinator, tick_id: TickId) -> VoteCount {
+        state
+            .ticks
+            .get_tracker(&tick_id)
+            .map_or(VoteCount::ZERO, VoteTracker::total_verified_power)
+    }
+
+    /// A replica creates the tick's tracker exactly when the tick leader is
+    /// one of its signers.
+    #[test]
+    fn the_tick_leader_tracks_when_it_is_one_of_mine() {
+        let schedule = make_test_topology();
+        let (leader, member) = first_ticks_leader_and_member(&schedule);
+        for (signers, tracks) in [(vec![member, leader], true), (vec![member], false)] {
+            let mut state = replica_signing_for(&signers);
+            let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+            assert_eq!(
+                state.ticks.get_tracker(&tick_id).is_some(),
+                tracks,
+                "signing for {signers:?}",
+            );
+        }
+    }
+
+    /// Every signer seated in the tick's attesting committee signs its
+    /// vote, each to the tick leader; a signer outside it signs none.
+    #[test]
+    fn each_seated_signer_signs_the_execution_vote() {
+        let schedule = make_test_topology();
+        let (leader, _) = first_ticks_leader_and_member(&schedule);
+        let outside = ValidatorId::new(7);
+        let mut state = replica_signing_for(&[ValidatorId::new(1), ValidatorId::new(2), outside]);
+        ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+
+        let actions = state.emit_vote_actions(&schedule);
+        assert_eq!(
+            execution_votes(&actions),
+            vec![
+                (ValidatorId::new(1), vec![leader]),
+                (ValidatorId::new(2), vec![leader]),
+            ],
+        );
+    }
+
+    /// A tick leader's own vote names it among the recipients, which is
+    /// what feeds the vote back to its own tracker, and that tracker
+    /// tallies it.
+    #[test]
+    fn a_signing_tick_leader_tallies_its_own_execution_vote() {
+        let schedule = make_test_topology();
+        let (leader, _) = first_ticks_leader_and_member(&schedule);
+        let mut state = replica_signing_for(&[leader]);
+        let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+
+        let actions = state.emit_vote_actions(&schedule);
+        assert_eq!(execution_votes(&actions), vec![(leader, vec![leader])]);
+
+        let _ = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, leader));
+        assert!(tallied_power(&state, tick_id) > VoteCount::ZERO);
+    }
+
+    /// A sibling's vote goes to the tick leader on the same replica, and
+    /// the leader's tracker tallies it beside the leader's own.
+    #[test]
+    fn a_co_hosted_leader_tallies_its_siblings_execution_vote() {
+        let schedule = make_test_topology();
+        let (leader, sibling) = first_ticks_leader_and_member(&schedule);
+        let mut state = replica_signing_for(&[sibling, leader]);
+        let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+
+        let actions = state.emit_vote_actions(&schedule);
+        assert!(execution_votes(&actions).contains(&(sibling, vec![leader])));
+
+        let _ = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, leader));
+        let own = tallied_power(&state, tick_id);
+        let _ = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, sibling));
+        assert!(tallied_power(&state, tick_id) > own);
+    }
+
+    /// The proposer of the block after a commit pushes the crossing
+    /// readings of that commit under its own key, whichever other signers
+    /// the replica holds; a replica the proposer is not attached to pushes
+    /// nothing.
+    #[test]
+    fn the_proposer_pushes_crossing_readings_under_its_own_key() {
+        let schedule = make_test_topology();
+        let proposer = ValidatorId::new(2);
+        for (signers, pushes) in [
+            (vec![ValidatorId::new(0), proposer], true),
+            (vec![ValidatorId::new(0)], false),
+        ] {
+            let mut state = replica_signing_for(&signers);
+            let first = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+            let _ = state.commit_block_carrying(
+                &schedule,
+                &test_certify(first, 1_000),
+                Naming::Composed,
+            );
+            let second = make_live_block(BlockHeight::new(2), 2_000, proposer, vec![]);
+            let effects = state.commit_block_carrying(
+                &schedule,
+                &test_certify(second, 2_000),
+                Naming::Composed,
+            );
+            let pushed: Vec<ValidatorId> = effects
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::PushCrossingReadings { signer, .. } => Some(*signer),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                pushed,
+                if pushes { vec![proposer] } else { vec![] },
+                "signing for {signers:?}",
+            );
+        }
     }
 }

@@ -44,7 +44,7 @@ pub use action::{
     Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParentJudgement,
     ParticipationChange, ProvisionsRequest, QcSubject, SyncClaimId,
 };
-pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
+pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
 pub use fetch_ids::{BeaconFetchIds, FetchIds};
 pub use fetch_request::FetchRequest;
 pub use hyperscale_dispatch::Parallelism;

@@ -413,7 +413,6 @@ impl PendingBlocks {
     /// `force_immediate` bypasses the age check.
     pub fn check_fetches(
         &self,
-        me: ValidatorId,
         local_shard: ShardId,
         now: LocalTimestamp,
         timeout: Duration,
@@ -437,7 +436,6 @@ impl PendingBlocks {
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() {
                 debug!(
-                    validator = ?me,
                     block_hash = ?block_hash,
                     missing_tx_count = missing_txs.len(),
                     age_ms = age.as_millis(),
@@ -455,7 +453,6 @@ impl PendingBlocks {
             let missing_provisions = pending.missing_provisions();
             if !missing_provisions.is_empty() {
                 debug!(
-                    validator = ?me,
                     block_hash = ?block_hash,
                     missing_provision_count = missing_provisions.len(),
                     age_ms = age.as_millis(),
@@ -472,7 +469,6 @@ impl PendingBlocks {
             let missing_finalizations = pending.missing_finalizations();
             if !missing_finalizations.is_empty() {
                 debug!(
-                    validator = ?me,
                     block_hash = ?block_hash,
                     missing_finalization_count = missing_finalizations.len(),
                     age_ms = age.as_millis(),

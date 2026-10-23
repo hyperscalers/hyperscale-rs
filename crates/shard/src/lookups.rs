@@ -11,8 +11,9 @@ use hyperscale_types::{ConsensusPublicKey, Round, ShardId, TopologySnapshot, Val
 ///
 /// Returns up to `K` distinct proposers for the rounds immediately following
 /// (for pipelining) plus this round's proposer (so the proposer can aggregate
-/// its own QC without waiting for a later header to deliver it). Excludes self
-/// — the coordinator processes its own vote internally.
+/// its own QC without waiting for a later header to deliver it). Excludes the
+/// replica's own signers — the vote is fed back to the replica that tallies
+/// for them.
 ///
 /// `K = 2` provides redundancy: if the primary next proposer crashes before
 /// broadcasting its block, the secondary already has the votes and can form
@@ -20,7 +21,7 @@ use hyperscale_types::{ConsensusPublicKey, Round, ShardId, TopologySnapshot, Val
 pub fn vote_recipients(
     topology_snapshot: &TopologySnapshot,
     shard: ShardId,
-    me: ValidatorId,
+    is_own: impl Fn(ValidatorId) -> bool,
     round: Round,
 ) -> Vec<ValidatorId> {
     const K: usize = 2;
@@ -36,14 +37,14 @@ pub fn vote_recipients(
     let mut recipients = Vec::with_capacity(K + 1);
 
     let block_proposer = topology_snapshot.proposer_for(shard, round);
-    if block_proposer != me {
+    if !is_own(block_proposer) {
         recipients.push(block_proposer);
     }
 
     let mut next_count = 0;
     for offset in 1..=committee_len as u64 {
         let proposer = topology_snapshot.proposer_for(shard, round + offset);
-        if proposer != me && !recipients.contains(&proposer) {
+        if !is_own(proposer) && !recipients.contains(&proposer) {
             recipients.push(proposer);
             next_count += 1;
             if next_count >= K {
@@ -140,7 +141,7 @@ mod tests {
         //   Block proposer: round 0 -> V0 (self, skipped)
         //   Next proposers: V1 (round 1), V2 (round 2)
         assert_eq!(
-            vote_recipients(&topology_snapshot, shard, me, Round::new(0)),
+            vote_recipients(&topology_snapshot, shard, |v| v == me, Round::new(0)),
             vec![ValidatorId::new(1), ValidatorId::new(2)]
         );
 
@@ -148,7 +149,7 @@ mod tests {
         //   Block proposer: round 1 -> V1 (included)
         //   Next proposers: V2 (round 2), V3 (round 3)
         assert_eq!(
-            vote_recipients(&topology_snapshot, shard, me, Round::new(1)),
+            vote_recipients(&topology_snapshot, shard, |v| v == me, Round::new(1)),
             vec![
                 ValidatorId::new(1),
                 ValidatorId::new(2),
@@ -167,7 +168,7 @@ mod tests {
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
         assert_eq!(
-            vote_recipients(&topology_snapshot, shard, me, Round::new(3)),
+            vote_recipients(&topology_snapshot, shard, |v| v == me, Round::new(3)),
             vec![
                 ValidatorId::new(3),
                 ValidatorId::new(1),
@@ -186,7 +187,7 @@ mod tests {
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
         assert_eq!(
-            vote_recipients(&topology_snapshot, shard, me, Round::new(2)),
+            vote_recipients(&topology_snapshot, shard, |v| v == me, Round::new(2)),
             vec![
                 ValidatorId::new(2),
                 ValidatorId::new(3),
@@ -201,7 +202,7 @@ mod tests {
         let topology_snapshot = topology_for(&committee);
         let me = committee.validator_id(0);
         let shard = ShardId::ROOT;
-        assert!(vote_recipients(&topology_snapshot, shard, me, Round::new(0)).is_empty());
+        assert!(vote_recipients(&topology_snapshot, shard, |v| v == me, Round::new(0)).is_empty());
     }
 
     // ─── committee_public_keys ──────────────────────────────────────────

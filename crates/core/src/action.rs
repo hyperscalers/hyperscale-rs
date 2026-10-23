@@ -255,6 +255,12 @@ pub enum Action {
         /// block while a splitting parent the head no longer carries has yet
         /// to commit its terminal.
         recipients: Vec<ValidatorId>,
+        /// The signing position the proposer's self-vote reaches: its round
+        /// spent and its lock at the block's parent QC. The runner persists
+        /// it durably before the header signature exists, so a restarted
+        /// proposer never signs a second header at the round whether or not
+        /// its self-vote was ever signed.
+        position: VotePosition,
     },
 
     /// Sign and broadcast a block vote to the next proposer(s).
@@ -283,6 +289,8 @@ pub enum Action {
         /// crash-restarted validator can never re-vote this round, and
         /// comes back able to extend the certificate it locked on.
         position: VotePosition,
+        /// The attached signer casting the vote.
+        signer: ValidatorId,
     },
 
     /// Sign and broadcast a timeout to the local-shard committee.
@@ -308,6 +316,8 @@ pub enum Action {
         /// so a crash-restarted validator can never vote a round it
         /// already abandoned.
         position: VotePosition,
+        /// The attached signer timing the round out.
+        signer: ValidatorId,
     },
 
     /// Sign and send a just-formed QC for a block this validator proposed
@@ -318,6 +328,9 @@ pub enum Action {
         qc: QuorumCertificate,
         /// Local-shard committee members.
         recipients: Vec<ValidatorId>,
+        /// The attached signer announcing: the block's proposer, or the
+        /// replica's designated sender.
+        signer: ValidatorId,
     },
 
     /// Sign and broadcast a "ready on shard" signal to the local committee.
@@ -339,6 +352,8 @@ pub enum Action {
         wt_window_end: WeightedTimestamp,
         /// Local-shard committee members (full membership view).
         recipients: Vec<ValidatorId>,
+        /// The attached signer signalling its readiness.
+        signer: ValidatorId,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -366,6 +381,8 @@ pub enum Action {
         /// Who tallies the vote. Containing the signer feeds the vote to
         /// its own tracker rather than the network.
         recipients: Vec<ValidatorId>,
+        /// The attached signer attesting the tick.
+        signer: ValidatorId,
     },
 
     /// Broadcast an execution certificate to local peers or remote shards.
@@ -379,6 +396,9 @@ pub enum Action {
         certificate: Arc<Verified<ExecutionCertificate>>,
         /// Target shard peers (excluding self) for the broadcast.
         recipients: Vec<ValidatorId>,
+        /// The signer preferred to sign the envelope. The certificate is
+        /// self-authenticating, so any attached committee signer may.
+        signer: ValidatorId,
     },
 
     /// Prove the crossing records the committed block at `anchor` wrote
@@ -399,6 +419,9 @@ pub enum Action {
         targets: BTreeMap<ShardId, Vec<SubstateKey>>,
         /// Each target's committee.
         shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
+        /// The signer preferred to sign the envelopes: the proposer of the
+        /// block after `anchor`'s.
+        signer: ValidatorId,
     },
 
     /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
@@ -424,6 +447,8 @@ pub enum Action {
         source_block_ts: WeightedTimestamp,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
+        /// The signer preferred to sign the envelopes: the block's proposer.
+        signer: ValidatorId,
     },
 
     /// Sign and broadcast a committed block header globally to all shards.
@@ -1782,6 +1807,103 @@ impl Action {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         self.into()
+    }
+
+    /// The shard signer whose key signs this action, or `None` for an
+    /// action no shard signer signs. For an envelope-only action (see
+    /// [`Self::envelope_only`]) it names the preferred signer.
+    #[must_use]
+    pub fn signer(&self) -> Option<ValidatorId> {
+        match self {
+            Self::SignAndBroadcastBlockVote { signer, .. }
+            | Self::SignAndBroadcastTimeout { signer, .. }
+            | Self::SignAndBroadcastQcAnnouncement { signer, .. }
+            | Self::SignAndBroadcastReadySignal { signer, .. }
+            | Self::SignAndSendExecutionVote { signer, .. }
+            | Self::BroadcastExecutionCertificate { signer, .. }
+            | Self::PushCrossingReadings { signer, .. }
+            | Self::FetchAndBroadcastProvisions { signer, .. } => Some(*signer),
+            Self::BuildProposal { proposer, .. } => Some(*proposer),
+            Self::BroadcastBlockHeader { header, .. } => Some(header.proposer()),
+            Self::BroadcastCertifiedBlockHeader { certified_header } => {
+                Some(certified_header.header().proposer())
+            }
+            Self::BroadcastShardForkProof { .. }
+            | Self::SetTimer { .. }
+            | Self::CancelTimer { .. }
+            | Self::Continuation(..)
+            | Self::VerifyAndBuildQuorumCertificate { .. }
+            | Self::VerifyProvisions { .. }
+            | Self::AggregateExecutionCertificate { .. }
+            | Self::VerifyAndAggregateExecutionVotes { .. }
+            | Self::VerifyExecutionCertificateSignature { .. }
+            | Self::VerifyFinalization { .. }
+            | Self::VerifyQcSignature { .. }
+            | Self::VerifyTimeout { .. }
+            | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyShardForkProof { .. }
+            | Self::VerifyStateRoot { .. }
+            | Self::VerifyBeaconWitnessRoot { .. }
+            | Self::VerifyBodyRoot { .. }
+            | Self::VerifyProvisionTxRoots { .. }
+            | Self::VerifyResolutions { .. }
+            | Self::BuildLegsHalf { .. }
+            | Self::ExecuteTransactions { .. }
+            | Self::ResolveTicks { .. }
+            | Self::ClearTickChain
+            | Self::RaiseTickFloor { .. }
+            | Self::CommitBlock { .. }
+            | Self::CommitBlockByQcOnly { .. }
+            | Self::AttachCertifiedUncommitted { .. }
+            | Self::EmitTransactionStatus { .. }
+            | Self::RecordTxEcCreated { .. }
+            | Self::TopologyChanged { .. }
+            | Self::ReconfigureParticipation(..)
+            | Self::RestoreCommittedState
+            | Self::StartBlockSync { .. }
+            | Self::SyncBlockApplied { .. }
+            | Self::ReopenSyncHeight { .. }
+            | Self::SettleBlockSync
+            | Self::StartBeaconBlockSync { .. }
+            | Self::StartRemoteHeaderSync { .. }
+            | Self::FetchCommitProof { .. }
+            | Self::Fetch(..)
+            | Self::AbandonFetch(..)
+            | Self::ReofferTransactions { .. }
+            | Self::SignAndBroadcastPcVote1 { .. }
+            | Self::SignAndBroadcastPcVote2 { .. }
+            | Self::SignAndBroadcastPcVote3 { .. }
+            | Self::SignAndBroadcastEmptyView { .. }
+            | Self::BroadcastSpcNewView { .. }
+            | Self::BroadcastSpcNewCommit { .. }
+            | Self::BuildAndBroadcastBeaconProposal { .. }
+            | Self::BroadcastBeaconBlock { .. }
+            | Self::VerifyBeaconBlock { .. }
+            | Self::SignAndBroadcastRatifyVote { .. }
+            | Self::VerifyRatifyVote { .. }
+            | Self::BroadcastBeaconCandidate { .. }
+            | Self::VerifyBeaconCandidate { .. }
+            | Self::VerifyPcVote1 { .. }
+            | Self::VerifyPcVote2 { .. }
+            | Self::VerifyPcVote3 { .. }
+            | Self::VerifySpcNewView { .. }
+            | Self::VerifySpcNewCommit { .. }
+            | Self::VerifySpcEmptyView { .. }
+            | Self::CommitBeaconBlock { .. } => None,
+        }
+    }
+
+    /// Whether the signature only authenticates the envelope of a
+    /// self-authenticating payload, so any attached committee signer may
+    /// sign in place of the preferred one.
+    #[must_use]
+    pub const fn envelope_only(&self) -> bool {
+        matches!(
+            self,
+            Self::FetchAndBroadcastProvisions { .. }
+                | Self::PushCrossingReadings { .. }
+                | Self::BroadcastExecutionCertificate { .. }
+        )
     }
 
     /// Which coordinator crate owns this action's delegated work.

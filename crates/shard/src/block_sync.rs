@@ -10,7 +10,7 @@ use hyperscale_core::{Action, QcSubject};
 use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
-    QuorumCertificate, Round, ValidatorId, Verified, VoteCount,
+    QuorumCertificate, Round, Verified, VoteCount,
 };
 use tracing::{debug, info, warn};
 
@@ -835,7 +835,6 @@ impl BlockSyncManager {
     #[allow(clippy::too_many_arguments)] // `ShardCoordinator` owns each input; bundling them just adds a struct without consolidating ownership
     pub(crate) fn health_check(
         &self,
-        me: ValidatorId,
         committed_height: BlockHeight,
         latest_qc: Option<&QuorumCertificate>,
         has_next_block: bool,
@@ -874,7 +873,6 @@ impl BlockSyncManager {
         // reactively.
         if rounds_past_qc >= SPIN_WITHOUT_QC_ADVANCE_THRESHOLD {
             warn!(
-                validator = ?me,
                 committed_height = committed_height.inner(),
                 qc_height = qc_height.inner(),
                 gap = gap,
@@ -888,7 +886,6 @@ impl BlockSyncManager {
 
         if gap > 5 {
             warn!(
-                validator = ?me,
                 committed_height = committed_height.inner(),
                 next_needed_height = next_needed_height.inner(),
                 qc_height = qc_height.inner(),
@@ -905,7 +902,6 @@ impl BlockSyncManager {
             if has_pending_commit {
                 if gap > 10 {
                     warn!(
-                        validator = ?me,
                         committed_height = committed_height.inner(),
                         next_needed_height = next_needed_height.inner(),
                         qc_height = qc_height.inner(),
@@ -921,7 +917,6 @@ impl BlockSyncManager {
 
             if gap > 3 {
                 warn!(
-                    validator = ?me,
                     committed_height = committed_height.inner(),
                     next_needed_height = next_needed_height.inner(),
                     qc_height = qc_height.inner(),
@@ -936,7 +931,6 @@ impl BlockSyncManager {
         }
 
         info!(
-            validator = ?me,
             committed_height = committed_height.inner(),
             next_needed_height = next_needed_height.inner(),
             qc_height = qc_height.inner(),
@@ -957,8 +951,7 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, Block, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
-        ProposerTimestamp, Round, ShardId, SignerBitfield, ValidatorId, WeightedTimestamp,
-        WitnessSources,
+        ProposerTimestamp, Round, ShardId, SignerBitfield, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -1489,7 +1482,6 @@ mod tests {
         let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(0),
             None,
             false,
@@ -1506,7 +1498,6 @@ mod tests {
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(10),
             Some(&qc),
             true,
@@ -1524,7 +1515,6 @@ mod tests {
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(5),
             Some(&qc),
             false,
@@ -1541,7 +1531,6 @@ mod tests {
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(5),
             Some(&qc),
             false,
@@ -1567,7 +1556,6 @@ mod tests {
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(5),
             Some(&qc),
             true,
@@ -1588,7 +1576,6 @@ mod tests {
         let qc = qc_at(BlockHeight::new(7));
         // gap = 2, <= 3, no rounds past the QC → wait for normal consensus.
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(5),
             Some(&qc),
             true,
@@ -1609,7 +1596,6 @@ mod tests {
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(5),
             Some(&qc),
             true,
@@ -1632,7 +1618,6 @@ mod tests {
         let qc = qc_at(BlockHeight::new(7));
         // Two rounds past the QC's successor — still under threshold.
         let decision = sm.health_check(
-            ValidatorId::new(0),
             BlockHeight::new(5),
             Some(&qc),
             true,
@@ -1653,7 +1638,6 @@ mod tests {
             let qc = qc_at(BlockHeight::new(h));
             for view in [h + 1, h + 3] {
                 let decision = sm.health_check(
-                    ValidatorId::new(0),
                     BlockHeight::new(h - 1),
                     Some(&qc),
                     true,

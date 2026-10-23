@@ -10,6 +10,7 @@ mod coordinator_sim;
 mod fixtures;
 
 pub use coordinator_sim::{
-    ByzantineBehaviour, CapturedCommit, HoldFilter, ShardCoordinatorSim, perturb_header_timestamp,
+    ByzantineBehaviour, CapturedCommit, HoldFilter, ShardCoordinatorSim, SignedInProduction,
+    perturb_header_timestamp,
 };
 pub use fixtures::build_genesis_block;

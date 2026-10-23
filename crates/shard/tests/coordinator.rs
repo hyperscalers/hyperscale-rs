@@ -18,7 +18,7 @@ use hyperscale_types::{
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
     ShardCoordinator::new(
         Arc::new(BlsVerifier),
-        ValidatorId::new(0),
+        [ValidatorId::new(0)],
         ShardId::ROOT,
         config,
         RecoveredState::default(),
@@ -129,7 +129,7 @@ fn is_current_proposer_matches_topology() {
         let local_shard = ShardId::ROOT;
         let coordinator = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            me,
+            [me],
             local_shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -159,7 +159,7 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
         let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let coordinator = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(u64::from(local_idx)),
+            [ValidatorId::new(u64::from(local_idx))],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -219,14 +219,15 @@ fn recovered_registers_floor_boot_values() {
 
     let coordinator = ShardCoordinator::new(
         Arc::new(BlsVerifier),
-        me,
+        [me],
         ShardId::ROOT,
         ShardConsensusConfig::default(),
         recovered,
     );
 
-    assert_eq!(coordinator.locked_round(), Round::new(3));
-    assert_eq!(coordinator.last_voted_round(), Round::new(7));
+    let position = coordinator.position(me).expect("built with its signer");
+    assert_eq!(position.locked_round, Round::new(3));
+    assert_eq!(position.last_voted_round, Round::new(7));
 }
 
 /// Register records are per-validator: another validator's record on the
@@ -247,7 +248,7 @@ fn recovered_registers_of_other_validators_are_ignored() {
 
     let coordinator = ShardCoordinator::new(
         Arc::new(BlsVerifier),
-        ValidatorId::new(0),
+        [ValidatorId::new(0)],
         ShardId::ROOT,
         ShardConsensusConfig::default(),
         recovered,
@@ -255,6 +256,9 @@ fn recovered_registers_of_other_validators_are_ignored() {
 
     // No record for this validator and no recovered QC: both registers
     // boot at the genesis QC's round.
-    assert_eq!(coordinator.locked_round(), Round::INITIAL);
-    assert_eq!(coordinator.last_voted_round(), Round::INITIAL);
+    let position = coordinator
+        .position(ValidatorId::new(0))
+        .expect("built with its signer");
+    assert_eq!(position.locked_round, Round::INITIAL);
+    assert_eq!(position.last_voted_round, Round::INITIAL);
 }

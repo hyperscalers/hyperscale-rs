@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, ActionContext, ActionOwner, CommitSource, FetchRequest, ProtocolEvent,
+    Action, ActionContext, ActionOwner, CommitSource, FetchRequest, ProtocolEvent, Signing,
 };
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
@@ -15,7 +15,7 @@ use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     Anchor, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ShardId, SubstateKey,
-    TerminalEvidence, TransactionStatus, TxHash, Verified, WeightedTimestamp,
+    TerminalEvidence, TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -663,8 +663,24 @@ where
         let me = vnode.validator_id;
 
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
+        let resolution =
+            resolve_signer(&action, &[me], topology_snapshot.committee_for_shard(shard));
+        let signing = match resolution {
+            SignerResolution::Unsigned => None,
+            SignerResolution::Signs(signer) => {
+                debug_assert_eq!(signer, me, "a vnode holds only its own key");
+                Some((signer, Arc::clone(&vnode.signer), Arc::clone(&vnode.gate)))
+            }
+            SignerResolution::Dropped => {
+                trace!(
+                    action = action.type_name(),
+                    signer = ?action.signer(),
+                    "Dropping a signing action whose signer is not attached"
+                );
+                return;
+            }
+        };
         let event_tx = self.event_sender().clone();
-        let signer = Arc::clone(&vnode.signer);
         let verifier = Arc::clone(&self.process.verifier);
         let par = self.process.dispatch.parallelism();
         // Resolve the shard's handles here, on the shard's own thread,
@@ -711,14 +727,17 @@ where
             let ctx = ActionContext {
                 executor: handles.executor.as_ref(),
                 topology_snapshot: &topology_snapshot,
-                me,
+                signing: signing.as_ref().map(|(signer, key, gate)| Signing {
+                    me: *signer,
+                    key,
+                    gate: gate.as_ref(),
+                }),
                 shard,
                 pending_chain: &shard_handles.pending_chain,
                 tick_chain: &shard_handles.tick_chain,
                 vote_registers: shard_handles.storage.as_ref(),
                 beacon_chain: handles.beacon_storage.as_ref(),
                 network: &handles.network,
-                signer: &signer,
                 verifier: verifier.as_ref(),
                 notify,
                 commit_prepared: &commit_prepared,
@@ -755,6 +774,45 @@ where
         }
         self.dispatch_event(event);
     }
+}
+
+/// Which attached signer a delegated action signs under.
+#[derive(Debug, PartialEq, Eq)]
+enum SignerResolution {
+    /// The action signs nothing.
+    Unsigned,
+    /// The action signs under this attached signer.
+    Signs(ValidatorId),
+    /// The action names a signer that cannot sign it here.
+    Dropped,
+}
+
+/// Resolve the signer of `action` among the `attached` signers. A
+/// safety-bearing action signs only under the signer it names, whose
+/// registers it ratchets. An envelope-only action authenticates a
+/// self-authenticating payload, so it falls back from an unattached
+/// preference to the lowest-id attached signer in `committee`, the
+/// artifact's governing committee, and is dropped only with none.
+fn resolve_signer(
+    action: &Action,
+    attached: &[ValidatorId],
+    committee: &[ValidatorId],
+) -> SignerResolution {
+    let Some(named) = action.signer() else {
+        return SignerResolution::Unsigned;
+    };
+    if attached.contains(&named) {
+        return SignerResolution::Signs(named);
+    }
+    if !action.envelope_only() {
+        return SignerResolution::Dropped;
+    }
+    attached
+        .iter()
+        .copied()
+        .filter(|signer| committee.contains(signer))
+        .min()
+        .map_or(SignerResolution::Dropped, SignerResolution::Signs)
 }
 
 /// Surface a refutation reported by an off-thread QC-only prep as an
@@ -826,7 +884,7 @@ fn abort_on_refuted_commit(div: &QcOnlyDivergence) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent};
@@ -840,12 +898,13 @@ mod tests {
     use hyperscale_types::network::request::GetFinalizationsRequest;
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        Address, AddressClass, BlockHash, BlockHeight, CheckOutcome, ConsensusReceipt,
-        Finalization, FrontierInputs, GlobalReceiptHash, Hash, SWEEP_BUCKET_MS, SettledWrites,
-        StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, TickId, TxHash,
-        Verifiable, VerificationKind, WeightedTimestamp, shard_prefix_path,
+        Address, AddressClass, BlockHash, BlockHeight, ChainOrigin, CheckOutcome, ConsensusReceipt,
+        Finalization, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, SWEEP_BUCKET_MS,
+        SettledWrites, StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, TickId,
+        TxHash, ValidatorId, Verifiable, VerificationKind, WeightedTimestamp, shard_prefix_path,
     };
 
+    use super::{SignerResolution, resolve_signer};
     use crate::event::{HostEvent, ShardScopedInput};
     use crate::shard::cross_shard::serve_finalizations_request;
     use crate::shard::seated_host::{Fixture, Host, SHARD, loop_of};
@@ -1123,6 +1182,84 @@ mod tests {
                 &[],
             ),
             CheckOutcome::Refused,
+        );
+    }
+
+    fn validator(id: u64) -> ValidatorId {
+        ValidatorId::new(id)
+    }
+
+    fn provisions_preferring(signer: ValidatorId) -> Action {
+        Action::FetchAndBroadcastProvisions {
+            block_hash: BlockHash::ZERO,
+            requests: Vec::new(),
+            source_shard: SHARD,
+            block_height: BlockHeight::new(1),
+            source_block_ts: WeightedTimestamp::ZERO,
+            shard_recipients: HashMap::new(),
+            signer,
+        }
+    }
+
+    /// An envelope-only action signs under its preferred signer when that
+    /// signer is attached, even beside a lower one. Otherwise it falls back
+    /// to the lowest attached signer of the governing committee, and is
+    /// dropped only when none is attached.
+    #[test]
+    fn an_envelope_action_falls_back_to_an_attached_committee_signer() {
+        let committee = [validator(1), validator(2), validator(3)];
+        assert_eq!(
+            resolve_signer(
+                &provisions_preferring(validator(3)),
+                &[validator(2), validator(3)],
+                &committee,
+            ),
+            SignerResolution::Signs(validator(3)),
+        );
+        assert_eq!(
+            resolve_signer(
+                &provisions_preferring(validator(1)),
+                &[validator(0), validator(3), validator(2)],
+                &committee,
+            ),
+            SignerResolution::Signs(validator(2)),
+        );
+        assert_eq!(
+            resolve_signer(
+                &provisions_preferring(validator(1)),
+                &[validator(0)],
+                &committee,
+            ),
+            SignerResolution::Dropped,
+        );
+    }
+
+    /// A safety-bearing action signs only under the signer it names, whose
+    /// registers it ratcheted: naming one not attached drops it, whatever
+    /// else is. An action no signer signs resolves to none.
+    #[test]
+    fn a_safety_bearing_action_naming_an_unattached_signer_is_dropped() {
+        let committee = [validator(1), validator(2), validator(3)];
+        let announcement = |signer| Action::SignAndBroadcastQcAnnouncement {
+            qc: QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
+            recipients: Vec::new(),
+            signer,
+        };
+        assert_eq!(
+            resolve_signer(
+                &announcement(validator(1)),
+                &[validator(2), validator(3)],
+                &committee,
+            ),
+            SignerResolution::Dropped,
+        );
+        assert_eq!(
+            resolve_signer(&announcement(validator(1)), &[validator(1)], &committee),
+            SignerResolution::Signs(validator(1)),
+        );
+        assert_eq!(
+            resolve_signer(&Action::ClearTickChain, &[validator(1)], &committee),
+            SignerResolution::Unsigned,
         );
     }
 }

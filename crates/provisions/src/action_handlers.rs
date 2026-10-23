@@ -117,6 +117,7 @@ where
             block_height,
             source_block_ts,
             shard_recipients,
+            signer: _,
         } => {
             let view = ctx.pending_chain.view_at(block_hash, block_height);
             let batches = fetch_and_broadcast_provision(
@@ -135,7 +136,11 @@ where
                     "provision broadcast built no batches"
                 );
             }
-            let validator_id = ctx.me;
+            let Some(signing) = &ctx.signing else {
+                tracing::error!("provisions broadcast dispatched without a signer; skipping");
+                return;
+            };
+            let validator_id = signing.me;
             for (provisions, recipients) in batches {
                 // Provisions built from the local JMT view satisfy their
                 // own merkle-proof predicate by construction; wrap as
@@ -150,7 +155,7 @@ where
                     &ProvisionsSenderMessage::new(&verified),
                     ctx.topology_snapshot.network(),
                 );
-                let Ok(sig) = ctx.signer.sign(&msg) else {
+                let Ok(sig) = signing.key.sign(&msg) else {
                     tracing::error!("cannot sign provisions broadcast; skipping");
                     return;
                 };
@@ -179,6 +184,7 @@ where
             anchor,
             targets,
             shard_recipients,
+            signer: _,
         } => push_crossing_readings(ctx, block_hash, anchor, &targets, &shard_recipients),
         _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
     }

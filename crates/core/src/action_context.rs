@@ -32,11 +32,11 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// The batch execution seam the execute handlers drive.
     pub executor: &'a Executor,
     pub topology_snapshot: &'a TopologySnapshot,
-    /// Dispatching vnode's validator identity. The shard dispatch site
-    /// reads this off the `Vnode` that emitted the action; handlers use
-    /// it for signing, vote attribution, and self-filtering recipient
-    /// lists.
-    pub me: ValidatorId,
+    /// The attached signer the action is dispatched under, resolved from
+    /// [`crate::Action::signer`] by the dispatch site. `None` for an
+    /// action no signer signs; a signing handler finding `None` drops its
+    /// action unsigned.
+    pub signing: Option<Signing<'a>>,
     /// Dispatching vnode's shard. Equal to the vnode's `local_shard`
     /// for shard-rooted handlers; beacon handlers ignore it.
     pub shard: ShardId,
@@ -59,9 +59,6 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     pub beacon_chain: &'a dyn BeaconChainReader,
     /// Network handle for broadcast/notify/request actions.
     pub network: &'a Arc<N>,
-    /// Local validator's signing identity. Used by handlers that sign
-    /// votes/headers before broadcast.
-    pub signer: &'a Arc<dyn Signer>,
     /// Scheme verifier for signature and certificate checks.
     pub verifier: &'a dyn Verifier,
     /// Send a [`ProtocolEvent`] back to the state machine. The single
@@ -87,6 +84,18 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
     pub fn notify_protocol(&self, event: ProtocolEvent) {
         (self.notify)(event);
     }
+}
+
+/// The attached signer a delegated action signs under.
+pub struct Signing<'a> {
+    /// The signer's validator identity: the signature's attribution and
+    /// the key its durable registers persist under.
+    pub me: ValidatorId,
+    /// The signer's key, shared from the loop that attached it so a
+    /// handler on a dispatch pool signs without re-entering that loop.
+    pub key: &'a Arc<dyn Signer>,
+    /// The release gate of the attachment that emitted the action.
+    pub gate: &'a SignerGate,
 }
 
 /// Context for executing beacon-owned delegated actions.
