@@ -6855,7 +6855,7 @@ impl ShardCoordinator {
         // block's PreparedCommit.
         self.verification.mark_proposal_fully_verified(block);
 
-        let recipients = self.proposal_recipients(topology_schedule, block_hash, proposer);
+        let recipients = self.proposal_recipients(topology_schedule, block_hash);
         // The header persists the position its proposer's self-vote
         // reaches, so a rebuilt or restarted proposer never signs a second
         // header at the round even when the self-vote is never signed, and
@@ -6886,12 +6886,12 @@ impl ShardCoordinator {
     /// and the incoming ones need it to extend the chain. Once the committed
     /// chain proves a terminal's commit, only the head's committee hears it,
     /// which for a shard the head no longer seats is nobody: the chain
-    /// certifies nothing further.
+    /// certifies nothing further. A signer attached to this replica already
+    /// holds the block it built, so none of them is sent it.
     fn proposal_recipients(
         &self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
-        proposer: ValidatorId,
     ) -> Vec<ValidatorId> {
         let head = topology_schedule.head();
         let mut recipients: BTreeSet<ValidatorId> = head
@@ -6904,8 +6904,10 @@ impl ShardCoordinator {
         {
             recipients.extend(certifying.committee_for_shard(self.local_shard));
         }
-        recipients.remove(&proposer);
-        recipients.into_iter().collect()
+        recipients
+            .into_iter()
+            .filter(|member| !self.signers.contains_key(member))
+            .collect()
     }
 
     /// Handle JMT state commit completion.
@@ -7179,7 +7181,7 @@ impl ShardCoordinator {
                 .committee_for_shard(self.local_shard)
                 .iter()
                 .copied()
-                .filter(|v| *v != proposer)
+                .filter(|member| !self.signers.contains_key(member))
                 .collect();
             (proposer, recipients)
         } else {
@@ -28217,6 +28219,29 @@ mod tests {
             "got {actions:?}",
         );
         assert_eq!(voters(&actions), ids(&[1, 2]), "got {actions:?}");
+    }
+
+    /// A self-built block goes to the committee members outside the
+    /// replica: its attached signers hold it already, and a copy looped
+    /// back to them would land at or below the height it commits at.
+    #[test]
+    fn a_co_hosted_proposers_header_reaches_no_attached_signer() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[2, 3]);
+
+        let (own, actions) =
+            own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
+        let recipients = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::BroadcastBlockHeader {
+                    header, recipients, ..
+                } if header.hash() == own.hash() => Some(recipients.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the block's header is broadcast; got {actions:?}"));
+        assert_eq!(recipients, ids(&[0]), "the one member off the replica");
     }
 
     /// The replica built the block under every rule the vote pipeline
