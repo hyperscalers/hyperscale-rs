@@ -1,7 +1,6 @@
-//! A host with seats on one shard, for tests of what its loop does with
-//! more than one of them.
+//! A host running one shard, for tests of what its loop does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -27,14 +26,15 @@ use hyperscale_types::{
 };
 
 use crate::shard::{HostEvent, ShardLoop};
-use crate::{NodeConfig, NodeHost, SeatConfig, StartupChain, VnodeSeat};
+use crate::{HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 
 pub const SHARD: ShardId = ShardId::leaf(1, 0);
 
 pub type Host = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 pub type Loop = ShardLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
-/// A one-pool genesis whose first two validators seat on `SHARD`.
+/// A one-pool genesis whose first two validators sit on `SHARD`'s
+/// committee.
 pub struct Fixture {
     pub committee: TestCommittee,
     genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
@@ -118,6 +118,27 @@ impl Fixture {
         )
     }
 
+    /// A topology over this committee whose leaves are exactly the shards
+    /// `committees` seats, each with its full committee in consensus.
+    pub fn topology_over_leaves(
+        &self,
+        committees: BTreeMap<ShardId, Vec<ValidatorId>>,
+    ) -> TopologySnapshot {
+        let committees: HashMap<ShardId, Vec<ValidatorId>> = committees.into_iter().collect();
+        TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &self.validator_set,
+            committees.clone(),
+            committees,
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        )
+    }
+
     /// The beacon state every host here starts from.
     pub const fn genesis_state(&self) -> &BeaconState {
         &self.genesis_state
@@ -128,9 +149,9 @@ impl Fixture {
         Arc::clone(&self.genesis_block)
     }
 
-    /// How every host here builds its vnodes and its fold.
-    pub fn seat_config(&self) -> SeatConfig {
-        SeatConfig {
+    /// How every host here builds its replicas and its fold.
+    pub fn replica_config(&self) -> ReplicaConfig {
+        ReplicaConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: Arc::new(StubVmStatics),
             code: Arc::new(AllCodeRuns),
@@ -142,21 +163,12 @@ impl Fixture {
         }
     }
 
-    /// A queued seat for `committee[idx]`.
-    pub fn seat(&self, idx: usize) -> VnodeSeat {
-        VnodeSeat {
-            config: self.seat_config(),
-            validator: self.committee.validator_id(idx),
-            signer: self.committee.signer(idx),
-        }
-    }
-
     /// `committee[idx]`'s identity and key.
     pub fn identity(&self, idx: usize) -> (ValidatorId, Arc<dyn Signer>) {
         (self.committee.validator_id(idx), self.committee.signer(idx))
     }
 
-    /// A host running `SHARD` with `committee[0]` seated, restored at
+    /// A host running `SHARD` with `committee[0]` attached, restored at
     /// `committed` over an empty store.
     pub fn host(&self, committed: BlockHeight) -> Host {
         self.host_with_events(committed).0
@@ -177,7 +189,7 @@ impl Fixture {
         self.host_on(storage, committed, Arc::clone(&self.topology_snapshot))
     }
 
-    /// A host running `SHARD` with `committee[0]` seated over `storage`,
+    /// A host running `SHARD` with `committee[0]` attached over `storage`,
     /// restored at `committed`, on a topology attesting `boundary` for
     /// the shard.
     pub fn host_over(
@@ -207,7 +219,7 @@ impl Fixture {
         )
     }
 
-    /// A host running `SHARD` with `committee[0]` seated at genesis, whose
+    /// A host running `SHARD` with `committee[0]` attached at genesis, whose
     /// requests go out through `network` and whose delegated work runs on
     /// `dispatch`, beside the channel its loops push their own events into.
     pub fn host_through_network(
@@ -236,9 +248,9 @@ impl Fixture {
         for (block, state) in history {
             beacon_storage.commit_beacon_block(&block, &Arc::new(state));
         }
-        let registry = Arc::new(HandlerRegistry::new(std::collections::BTreeSet::new()));
+        let registry = Arc::new(HandlerRegistry::new(BTreeSet::new()));
         let host = NodeHost::new(
-            self.seat_config(),
+            self.replica_config(),
             Vec::new(),
             Vec::new(),
             beacon_storage,
@@ -256,7 +268,7 @@ impl Fixture {
 
     /// A host restarted from what it persisted: beacon storage holding
     /// `history`'s blocks and states, and `SHARD`'s `storage`, resumed
-    /// from what the store recovers with `committee[0]` seated, at `now`.
+    /// from what the store recovers with `committee[0]` attached, at `now`.
     pub fn host_resumed(
         &self,
         history: Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)>,
@@ -271,12 +283,12 @@ impl Fixture {
         let recovered = storage.load_recovered_state(SHARD);
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
         let host = NodeHost::new(
-            self.seat_config(),
-            vec![StartupChain {
+            self.replica_config(),
+            vec![HostedChain {
                 shard: SHARD,
                 storage,
                 recovered: &recovered,
-                vnodes: vec![self.identity(0)],
+                signers: vec![self.identity(0)],
             }],
             Vec::new(),
             beacon_storage,
@@ -292,7 +304,7 @@ impl Fixture {
         (host, events)
     }
 
-    /// A host running `SHARD` with `committee[0]` seated at genesis over
+    /// A host running `SHARD` with `committee[0]` attached at genesis over
     /// beacon storage whose committed tip is `state`.
     pub fn host_over_state(&self, state: BeaconState) -> Host {
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
@@ -342,12 +354,12 @@ impl Fixture {
             ..RecoveredState::default()
         };
         let host = NodeHost::new(
-            self.seat_config(),
-            vec![StartupChain {
+            self.replica_config(),
+            vec![HostedChain {
                 shard: SHARD,
                 storage,
                 recovered: &recovered,
-                vnodes: vec![self.identity(0)],
+                signers: vec![self.identity(0)],
             }],
             Vec::new(),
             beacon_storage,

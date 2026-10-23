@@ -350,8 +350,14 @@ pub enum Action {
         /// Last eligible inclusion weighted timestamp; the signer re-emits
         /// if the window passes uncollected.
         wt_window_end: WeightedTimestamp,
-        /// Local-shard committee members (full membership view).
+        /// Local-shard committee members (full membership view) beyond
+        /// the signers of the emitting replica: the signal goes to them
+        /// over the network.
         recipients: Vec<ValidatorId>,
+        /// Whether another signer of the emitting replica is a committee
+        /// member: the signal is fed back to the replica's pool rather
+        /// than sent.
+        local_recipient: bool,
         /// The attached signer signalling its readiness.
         signer: ValidatorId,
     },
@@ -378,9 +384,12 @@ pub enum Action {
         /// Per-tx outcomes in tick order. Carried on the vote so the
         /// leader can extract them directly when building the EC.
         tx_outcomes: Vec<TxOutcome>,
-        /// Who tallies the vote. Containing the signer feeds the vote to
-        /// its own tracker rather than the network.
+        /// Who tallies the vote, beyond the signers of the emitting
+        /// replica: the vote goes to them over the network.
         recipients: Vec<ValidatorId>,
+        /// Whether a signer of the emitting replica tallies the vote too:
+        /// the vote is fed back to the replica rather than sent.
+        local_recipient: bool,
         /// The attached signer attesting the tick.
         signer: ValidatorId,
     },
@@ -502,20 +511,11 @@ pub enum Action {
     /// a follow-on protocol event that should be processed immediately
     /// (at the same timestamp with Internal priority).
     ///
-    /// # Invariant: shard coherence
-    ///
     /// The I/O loop reroutes a `Continuation` through `event_sender`,
     /// where it re-enters the next `step()` as a [`ProtocolEvent`] and
-    /// fans out to **every same-shard vnode** via `dispatch_event` →
-    /// `handle_protocol_passthrough`. The emitting vnode is one of the
-    /// recipients but not the only one.
-    ///
-    /// The carried event MUST therefore be *shard-coherent* — meaningful
-    /// to every same-shard vnode, not just the emitter. Any new
-    /// continuation variant that is genuinely per-vnode (state only the
-    /// emitter should react to) needs a different transport — emitting
-    /// it via `Continuation` would silently apply it to the vnode's
-    /// same-shard peers.
+    /// reaches the one replica of the emitting shard loop. Signers
+    /// attached to that replica see it only through what the replica
+    /// does with it.
     Continuation(ProtocolEvent),
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -559,6 +559,10 @@ pub enum Action {
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
         /// Total votes in the committee (the quorum denominator).
         total_votes: VoteCount,
+        /// The binding of the block's vote set the batch was taken under,
+        /// echoed by the result so a batch that outlives its binding forms
+        /// no QC.
+        binding: u64,
     },
 
     /// Verify provisions' merkle inclusion proofs.
@@ -1320,17 +1324,16 @@ pub enum Action {
     /// keys fetch routing on the schedule's terminal-clamped committees,
     /// and resolves a followed block's window through the schedule.
     TopologyChanged {
-        /// Beacon epoch the schedule was folded at — the monotonic key the
-        /// `io_loop` gates its publish on, so a slower co-hosted shard
-        /// thread folding an older epoch cannot overwrite a newer schedule
-        /// a sibling thread already published.
+        /// Beacon epoch the schedule was folded at. The host's one fold
+        /// emits it once per adopted block, so the epochs published only
+        /// rise.
         epoch: Epoch,
         /// The beacon's window schedule as of this fold: the head, the
         /// retained windows and the lookahead, one clone per epoch.
         schedule: Arc<TopologySchedule>,
     },
 
-    /// The lookahead committees move this vnode's validator onto or off
+    /// The lookahead committees move a local validator onto or off
     /// a shard at the next window — surface the delta to the runner so
     /// it can reconfigure physical participation (open storage and
     /// bootstrap a joined shard, schedule a left shard's drain).

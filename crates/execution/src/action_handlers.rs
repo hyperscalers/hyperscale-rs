@@ -29,8 +29,8 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext,
-    StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, shard_prefix_path, signed_bytes,
+    StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, Verifiable,
+    Verified, shard_prefix_path, signed_bytes,
 };
 
 // ============================================================================
@@ -353,8 +353,8 @@ where
 
             // Append before notifying: the coordinator dispatches the next
             // tick on this event, and its baseline must include this one.
-            // The fates go in with the output, so no other seat's read
-            // finds the entry short of them.
+            // The fates go in with the output, so no read finds the entry
+            // short of them.
             ctx.tick_chain.append(tick, output, &fates);
             ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
                 tick,
@@ -375,6 +375,7 @@ where
             global_receipt_root: _,
             tx_outcomes,
             recipients,
+            local_recipient,
             signer: _,
         } => {
             let Some(signing) = &ctx.signing else {
@@ -402,22 +403,13 @@ where
                 return;
             };
 
-            // Send the vote to every recipient but ourselves. A colocated
-            // vnode's local-dispatch fast path preserves the
-            // `Verifiable::Verified` marker, letting the handler skip
-            // re-verification of our own signature.
-            let peers: Vec<ValidatorId> = recipients
-                .iter()
-                .copied()
-                .filter(|recipient| *recipient != validator_id)
-                .collect();
-            if !peers.is_empty() {
-                ctx.network
-                    .notify(&peers, &ExecutionVoteNotification::new(verified.clone()));
+            if !recipients.is_empty() {
+                ctx.network.notify(
+                    &recipients,
+                    &ExecutionVoteNotification::new(verified.clone()),
+                );
             }
-
-            // A recipient list naming ourselves tallies our own vote here.
-            if recipients.contains(&validator_id) {
+            if local_recipient {
                 ctx.notify_protocol(ProtocolEvent::ExecutionVoteReceived {
                     vote: Verifiable::from(verified),
                 });

@@ -299,7 +299,7 @@ fn view_changes(cluster: &SimCluster) -> Vec<u64> {
     cluster
         .committee_hosts(ShardId::ROOT)
         .into_iter()
-        .flat_map(|host| cluster.shard_stats(host, ShardId::ROOT))
+        .filter_map(|host| cluster.shard_stats(host, ShardId::ROOT))
         .map(|s| s.view_changes)
         .collect()
 }
@@ -2237,7 +2237,7 @@ fn a_halted_tail_reaches_the_survivors_header_frontier_sim() {
     let covered = |c: &SimCluster| {
         let runner = c.runner();
         (0..runner.num_hosts())
-            .filter_map(|host| runner.vnode_state_in(host, survivor))
+            .filter_map(|host| runner.replica_in(host, survivor))
             .all(|vnode| {
                 vnode
                     .remote_headers_coordinator()
@@ -2262,6 +2262,8 @@ fn halted_shard_recovery_agrees_across_retained_and_fresh_sim() {
         11,
         &setup.accounts,
     );
+    // Fresh members rehome onto retained hosts.
+    cluster.co_host_by_design();
     cluster.run_faultable(|c| {
         halted_shard_recovery_agrees_across_retained_and_fresh(c, SimCluster::rehome);
     });
@@ -2411,8 +2413,82 @@ seeded!(
 /// beacon-attested anchor, not either branch and not the unattested retained
 /// suffix above the frontier.
 #[test]
-#[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
 fn shard_fork_drives_committee_recovery_sim() {
+    let (cluster, run) = shard_fork_recovery();
+    let ForkRun {
+        shard,
+        committee,
+        frontier,
+        anchor,
+        retained_suffix,
+        ..
+    } = run;
+    // A fresh member drawn onto a host that kept running the forked shard
+    // seats on a store rebuilt at the anchor, not on the loop's forked tip.
+    let recovered: BTreeSet<usize> = cluster.committee_hosts(shard).into_iter().collect();
+    assert!(
+        recovered.iter().any(|host| committee.contains(host)),
+        "the fresh committee must seat a member on a host that kept the forked \
+         shard; kept {committee:?}, recovered {recovered:?}",
+    );
+
+    // Every fresh replica's first block past the frontier extends the
+    // beacon-attested anchor — not either branch head, and not the retained
+    // committee's unattested suffix. The retained suffix is refused like the
+    // branch heads: the fresh chain re-produces `frontier + 1` rather than
+    // adopting the old committee's block there. A retained head above the
+    // beacon-attested anchor is unattestable — the incomers cannot know it
+    // is the branches' common prefix rather than one side's forgery.
+    let old_block = retained_suffix
+        .get(&BlockHeight::new(frontier.inner() + 1))
+        .expect("the old chain committed past the frontier before the fork");
+    for &host in &recovered {
+        let storage = cluster
+            .runner()
+            .hosts_shard(
+                u32::try_from(host).expect("host index fits a node index"),
+                shard,
+            )
+            .expect("fresh committee host serves the shard");
+        let bridge = storage
+            .get_certified_header(BlockHeight::new(frontier.inner() + 1))
+            .expect("fresh chain holds its first block past the frontier");
+        assert_eq!(
+            bridge.header().parent_block_hash(),
+            anchor,
+            "host {host}: the fresh chain must extend the beacon-attested anchor"
+        );
+        assert_ne!(
+            *old_block,
+            bridge.block_hash(),
+            "host {host}: the fresh chain must not adopt the retained suffix above the frontier"
+        );
+    }
+}
+
+/// The run [`shard_fork_recovery`] leaves behind.
+struct ForkRun {
+    /// The shard that forked.
+    shard: ShardId,
+    /// The hosts that ran the forked committee.
+    committee: Vec<usize>,
+    /// The forked committee's consensus members.
+    members: Vec<ValidatorId>,
+    /// The fresh committee the recovery drew.
+    fresh: Vec<ValidatorId>,
+    /// The beacon-attested frontier the recovery pinned.
+    frontier: BlockHeight,
+    /// The anchor block at that frontier.
+    anchor: BlockHash,
+    /// The forked chain above the frontier, as it froze.
+    retained_suffix: BTreeMap<BlockHeight, BlockHash>,
+}
+
+/// Fork a grown shard's committee, have the beacon fold the fork-caused
+/// recovery with a fresh member on a host that kept the forked shard, and
+/// run until the fresh committee clears the recovery.
+#[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
+fn shard_fork_recovery() -> (SimCluster, ForkRun) {
     let setup = halt_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 1, &setup.accounts);
     // A fork recovery supersedes whatever the old committee committed past
@@ -2462,7 +2538,7 @@ fn shard_fork_drives_committee_recovery_sim() {
     let proof = {
         let runner = cluster.runner();
         let vnode = runner
-            .first_vnode_state(member)
+            .first_replica(member)
             .expect("committee host runs a vnode");
         let schedule = vnode.schedule();
         let storage = runner
@@ -2670,47 +2746,72 @@ fn shard_fork_drives_committee_recovery_sim() {
         "the fresh committee's crossing must clear the fork recovery"
     );
 
-    // A fresh member drawn onto a host that kept running the forked shard
-    // seats on a store rebuilt at the anchor, not on the loop's forked tip.
-    let recovered: BTreeSet<usize> = cluster.committee_hosts(shard).into_iter().collect();
-    assert!(
-        recovered.iter().any(|host| committee.contains(host)),
-        "the fresh committee must seat a member on a host that kept the forked \
-         shard; kept {committee:?}, recovered {recovered:?}",
-    );
-
-    // Every fresh replica's first block past the frontier extends the
-    // beacon-attested anchor — not either branch head, and not the retained
-    // committee's unattested suffix. The retained suffix is refused like the
-    // branch heads: the fresh chain re-produces `frontier + 1` rather than
-    // adopting the old committee's block there. A retained head above the
-    // beacon-attested anchor is unattestable — the incomers cannot know it
-    // is the branches' common prefix rather than one side's forgery.
-    let old_block = retained_suffix
-        .get(&BlockHeight::new(frontier.inner() + 1))
-        .expect("the old chain committed past the frontier before the fork");
-    for &host in &recovered {
-        let storage = cluster
-            .runner()
-            .hosts_shard(
-                u32::try_from(host).expect("host index fits a node index"),
-                shard,
-            )
-            .expect("fresh committee host serves the shard");
-        let bridge = storage
-            .get_certified_header(BlockHeight::new(frontier.inner() + 1))
-            .expect("fresh chain holds its first block past the frontier");
-        assert_eq!(
-            bridge.header().parent_block_hash(),
+    (
+        cluster,
+        ForkRun {
+            shard,
+            committee,
+            members,
+            fresh,
+            frontier,
             anchor,
-            "host {host}: the fresh chain must extend the beacon-attested anchor"
+            retained_suffix,
+        },
+    )
+}
+
+/// A forked rebuild attaches the local validators the fresh committee
+/// places and nothing else: a member the recovery replaced, on a host
+/// that rebuilt the shard for a fresh one, stays off the rebuilt replica
+/// and keeps its beacon participant.
+#[test]
+fn a_forked_rebuild_attaches_only_the_placed_local_validators() {
+    let (cluster, run) = shard_fork_recovery();
+    let runner = cluster.runner();
+    let host_of = |validator: ValidatorId| runner.network().validator_to_node(validator);
+    let rebuilt: Vec<usize> = cluster
+        .committee_hosts(run.shard)
+        .into_iter()
+        .filter(|host| run.committee.contains(host))
+        .collect();
+    assert!(
+        !rebuilt.is_empty(),
+        "a host that kept the forked shard rebuilds it for a fresh member",
+    );
+    let mut replaced_on_rebuilt = 0;
+    for host in rebuilt {
+        let node = u32::try_from(host).expect("host index fits a node index");
+        let attached = runner.signers_in(node, run.shard);
+        let placed: Vec<ValidatorId> = run
+            .fresh
+            .iter()
+            .copied()
+            .filter(|validator| host_of(*validator) == node)
+            .collect();
+        assert_eq!(
+            attached, placed,
+            "host {host}: the rebuilt replica signs for exactly its placed fresh members",
         );
-        assert_ne!(
-            *old_block,
-            bridge.block_hash(),
-            "host {host}: the fresh chain must not adopt the retained suffix above the frontier"
-        );
+        for replaced in run
+            .members
+            .iter()
+            .filter(|member| host_of(**member) == node)
+        {
+            assert!(
+                !run.fresh.contains(replaced),
+                "fixture precondition: {replaced:?} was replaced",
+            );
+            assert!(
+                runner.participants(node).contains(replaced),
+                "host {host}: the replaced {replaced:?} keeps its participant",
+            );
+            replaced_on_rebuilt += 1;
+        }
     }
+    assert!(
+        replaced_on_rebuilt > 0,
+        "fixture precondition: a rebuilt host carries a replaced member",
+    );
 }
 
 /// Assert the seeded 50%-request-loss scenario at `seed`: the shared body's

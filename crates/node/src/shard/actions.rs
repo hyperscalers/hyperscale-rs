@@ -37,12 +37,7 @@ where
 {
     // ─── Action Processing ──────────────────────────────────────────────
 
-    /// Process a single action emitted by the vnode at `vnode_idx`'s
-    /// state machine.
-    ///
-    /// `vnode_idx` identifies the vnode that produced the action so
-    /// dispatched off-thread work can sign with the right validator's
-    /// key.
+    /// Process a single action the replica emitted.
     ///
     /// Two categories of arm:
     /// - **Coordinator policy** — delegated to coordinator crates via
@@ -51,7 +46,7 @@ where
     ///   work IS `ShardLoop` machinery (timers, caches consumed by serving,
     ///   RPC observability, block commit pipeline, topology plumbing).
     #[allow(clippy::too_many_lines)] // single dispatch over Action variants; one arm per variant
-    pub(super) fn process_action(&mut self, vnode_idx: usize, action: Action) {
+    pub(super) fn process_action(&mut self, action: Action) {
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
             Action::AggregateExecutionCertificate { .. }
@@ -83,7 +78,7 @@ where
             | Action::BroadcastShardForkProof { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. } => {
-                self.dispatch_delegated_action(vnode_idx, action);
+                self.dispatch_delegated_action(action);
             }
 
             // ─── The beacon runs on the host's beacon loop ─────────────────
@@ -131,12 +126,9 @@ where
                 self.io.tick_chain.raise_floor(floor, self.shard);
                 // A row the crossing keeps may be stated by a tick this
                 // replica never ran, or whose run lands at or below the floor.
-                self.io.tick_chain.seed_stated(
-                    self.vnodes[vnode_idx]
-                        .state
-                        .shard_coordinator()
-                        .member_rows(),
-                );
+                self.io
+                    .tick_chain
+                    .seed_stated(self.replica.shard_coordinator().member_rows());
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
@@ -144,10 +136,10 @@ where
                 self.process_start_block_sync(target);
             }
             Action::SyncBlockApplied { height } => {
-                self.process_sync_block_applied(vnode_idx, height);
+                self.process_sync_block_applied(height);
             }
             Action::ReopenSyncHeight { height, hash } => {
-                self.process_reopen_sync_height(vnode_idx, height, hash);
+                self.process_reopen_sync_height(height, hash);
             }
             Action::SettleBlockSync => {
                 self.process_settle_block_sync();
@@ -171,21 +163,22 @@ where
                     self.process.submit_transaction(tx);
                 }
             }
-            Action::Fetch(req) => self.process_fetch_request(vnode_idx, req),
+            Action::Fetch(req) => self.process_fetch_request(req),
             Action::AbandonFetch(ids) => self.release_fetch(ids, Release::Abandoned),
 
             // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {
-                let owner = TimerOwner::Seat(self.shard, self.vnode(vnode_idx).validator_id);
                 self.pending_timer_ops.push(TimerOp::Set {
-                    owner,
+                    owner: TimerOwner::Loop(self.shard),
                     id,
                     duration,
                 });
             }
             Action::CancelTimer { id } => {
-                let owner = TimerOwner::Seat(self.shard, self.vnode(vnode_idx).validator_id);
-                self.pending_timer_ops.push(TimerOp::Cancel { owner, id });
+                self.pending_timer_ops.push(TimerOp::Cancel {
+                    owner: TimerOwner::Loop(self.shard),
+                    id,
+                });
             }
 
             Action::Continuation(pe) => self.handle_continuation(pe),
@@ -278,15 +271,15 @@ where
         // advance the source's scope and emit `SyncComplete` once the chain
         // catches up. Drives any newly-emitted range fetches inline.
         //
-        // The scope advances by the seats' contiguous verified frontier, not
-        // this header's own height: a provision- or execution-certificate-
+        // The scope advances by the replica's contiguous verified frontier,
+        // not this header's own height: a provision- or execution-certificate-
         // bundled source header lands above the frontier when
         // `block.committed` gossip is suppressed, and jumping the scope to it
         // would strand the intervening heights below, since the sync queues
         // from its frontier and would never fetch the gap the commit-proof
         // walk needs contiguous.
         if let ProtocolEvent::RemoteHeaderAdmitted { certified_header } = &pe {
-            self.follow_slowest_remote_header_seat(certified_header.shard_id());
+            self.follow_remote_header_frontier(certified_header.shard_id());
         }
 
         push_protocol_event(self.event_sender(), self.shard, pe);
@@ -486,10 +479,10 @@ where
 
     /// Callback for an off-thread JMT prep that refuted the block's
     /// header. A block the store's write frontier reached while its prep
-    /// ran was written by a sibling seat's flush, and the prep read its
-    /// parent over a store already past it: the refutation is no evidence
-    /// about local state, so the slot passes to the next queued entry.
-    /// Anything else is fatal.
+    /// ran was written by another commit path's flush, and the prep read
+    /// its parent over a store already past it: the refutation is no
+    /// evidence about local state, so the slot passes to the next queued
+    /// entry. Anything else is fatal.
     pub(in crate::shard) fn handle_qc_only_commit_diverged(&mut self, div: &QcOnlyDivergence) {
         if !self.io.block_commit.is_written(div.block_height) {
             abort_on_refuted_commit(div);
@@ -516,16 +509,13 @@ where
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its
-    /// decision: point the sync protocol at the height every seat has
-    /// committed and, unless persistence backpressure is active, fire
-    /// `BlockCommitted`. A commit the pipeline already took from a sibling
-    /// still moves this seat, and so perhaps the slowest one.
+    /// decision: feed the sync protocol the new committed height and,
+    /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
     /// [`BlockCommitCoordinator`]: crate::shard::commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, commit: PendingCommit) {
         let now = self.now;
         let decision = self.io.block_commit.accumulate(commit, now);
-        self.follow_slowest_block_sync_seat();
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted {
@@ -535,6 +525,7 @@ where
                 notify_now,
             } => {
                 debug!(height = height.inner(), "Block committed");
+                self.admit_committed_height(height);
 
                 let block_hash = certified.block().hash();
                 self.io
@@ -559,9 +550,8 @@ where
 
     /// Dispatch a typed fetch request to the corresponding binding.
     ///
-    /// The fetch instance lives in this shard's `ShardIo` — keyed by the
-    /// emitting vnode's shard, not the routing target, which rides on the
-    /// request. `Ask` never emits `Send`s on its own — it only adds the
+    /// The fetch instance lives in this shard's `ShardIo`, not the
+    /// routing target's, which rides on the request. `Ask` never emits `Send`s on its own — it only adds the
     /// ids to the pending set; chunks fan out under the per-tick cap. The
     /// tick timer is refreshed once at the end of `NodeHost::step`.
     ///
@@ -572,8 +562,7 @@ where
     /// here — for an id nobody re-asks about, against a committee that
     /// may never answer, this is the only release there is.
     #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
-    fn process_fetch_request(&mut self, vnode_idx: usize, req: FetchRequest) {
-        let seat = self.vnode(vnode_idx).validator_id;
+    fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
             FetchRequest::Ask {
                 ids,
@@ -591,17 +580,12 @@ where
                     keys.into_iter().map(|key| (terminal, key)).collect();
                 // The scan re-derives the whole wanted set under this
                 // terminal each pass, so anything the fetch still holds
-                // under it and no seat's scan names is an answer nobody
+                // under it and the scan no longer names is an answer nobody
                 // is waiting for — a transaction that expired out of the
                 // pool, or the rule retiring as the chain outlives its
                 // origin. Nothing else retires these ids: a terminated
                 // committee that never answers would pin them for good.
-                let named = self
-                    .io
-                    .cross_shard
-                    .precut_wants
-                    .replace(seat, &wanted, |id| id.0 == terminal);
-                self.abandon_unwanted::<StateProofBinding>(&named, |id| id.0 == terminal);
+                self.abandon_unwanted::<StateProofBinding>(&wanted, |id| id.0 == terminal);
                 self.drive_fetch::<StateProofBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
                     shard: terminal.shard,
@@ -615,17 +599,12 @@ where
                 class,
             } => {
                 // The whole wanted set arrives on every beacon fold, so
-                // a terminal the fetch still holds and no seat's set
+                // a terminal the fetch still holds and the set no longer
                 // names — acquired, its window closed, its shard evicted
                 // — is released here; nothing else retires it, and a
                 // committee that never answers would pin it for good.
                 let wanted: BTreeSet<TerminalEvidence> = wanted.into_iter().collect();
-                let named = self
-                    .io
-                    .cross_shard
-                    .settled_wants
-                    .replace(seat, &wanted, |_| true);
-                self.abandon_unwanted::<SettledTxsBinding>(&named, |_| true);
+                self.abandon_unwanted::<SettledTxsBinding>(&wanted, |_| true);
                 let mut by_shard: BTreeMap<ShardId, Vec<TerminalEvidence>> = BTreeMap::new();
                 for evidence in wanted {
                     by_shard.entry(evidence.shard).or_default().push(evidence);
@@ -651,7 +630,7 @@ where
     /// this shard's event channel and are processed on a future `step()`
     /// call. With `SyncDispatch` (simulation), `spawn_*` runs inline so
     /// events enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&self, vnode_idx: usize, action: Action) {
+    fn dispatch_delegated_action(&self, action: Action) {
         let owner = action.owner();
         let pool = owner
             .pool()
@@ -659,17 +638,21 @@ where
 
         let shard = self.shard;
         let handles = Arc::clone(&self.process.dispatch_handles);
-        let vnode = self.vnode(vnode_idx);
-        let me = vnode.validator_id;
-
-        let topology_snapshot = Arc::clone(vnode.state.topology_arc());
-        let resolution =
-            resolve_signer(&action, &[me], topology_snapshot.committee_for_shard(shard));
+        let topology_snapshot = Arc::clone(self.replica.topology_arc());
+        let resolution = resolve_signer(
+            &action,
+            &self.signers,
+            topology_snapshot.committee_for_shard(shard),
+        );
         let signing = match resolution {
             SignerResolution::Unsigned => None,
             SignerResolution::Signs(signer) => {
-                debug_assert_eq!(signer, me, "a vnode holds only its own key");
-                Some((signer, Arc::clone(&vnode.signer), Arc::clone(&vnode.gate)))
+                let attached = &self.signers[&signer];
+                Some((
+                    signer,
+                    Arc::clone(&attached.signer),
+                    Arc::clone(&attached.gate),
+                ))
             }
             SignerResolution::Dropped => {
                 trace!(
@@ -692,34 +675,16 @@ where
             .per_shard
             .load()
             .get(&shard)
-            .expect("hosted shard derived from vnode")
+            .expect("a loop's shard is hosted while it runs")
             .clone();
 
-        // A tick's batch is one seat's run of it, and what comes back
-        // releases that seat's next tick and the fates it holds for this
-        // one. A sibling runs the tick itself, from wherever its own
-        // queue stands, so the result is no word on its run.
-        let own_result = matches!(action, Action::ExecuteTransactions { .. });
-
         self.process.dispatch.spawn(pool, move || {
-            // Action handlers emit `ProtocolEvent`s; stamp each with the
-            // dispatching vnode's shard so the receiver routes back to
-            // the right `ShardLoop`. `Arc`-shaped so handlers can clone
-            // it into callback closures that outlive the action call.
-            let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> = Arc::new(move |event| {
-                if own_result {
-                    push_shard_input(
-                        &event_tx,
-                        shard,
-                        ShardScopedInput::SeatResult {
-                            validator: me,
-                            event: Box::new(event),
-                        },
-                    );
-                } else {
-                    push_protocol_event(&event_tx, shard, event);
-                }
-            });
+            // Action handlers emit `ProtocolEvent`s; stamp each with this
+            // loop's shard so the receiver routes back to it. `Arc`-shaped
+            // so handlers can clone it into callback closures that outlive
+            // the action call.
+            let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> =
+                Arc::new(move |event| push_protocol_event(&event_tx, shard, event));
             let commit_prepared = make_commit_prepared(
                 Arc::clone(&shard_handles.pending_chain),
                 Arc::clone(&shard_handles.prepared_commits),
@@ -763,7 +728,7 @@ where
     /// entrant, not the recovery's fresh committee. The committed tip is
     /// the anchor's exact state for as long as it stays the tip, so pin it
     /// the moment the attestation lands. A pin that already exists costs a
-    /// stat. Then every vnode holds the schedule and replays what waited
+    /// stat. Then the replica holds the schedule and replays what waited
     /// on the epoch.
     pub(in crate::shard) fn handle_beacon_block_persisted(&mut self, event: ProtocolEvent) {
         if let ProtocolEvent::BeaconBlockPersisted { schedule, .. } = &event
@@ -793,25 +758,24 @@ enum SignerResolution {
 /// self-authenticating payload, so it falls back from an unattached
 /// preference to the lowest-id attached signer in `committee`, the
 /// artifact's governing committee, and is dropped only with none.
-fn resolve_signer(
+fn resolve_signer<T>(
     action: &Action,
-    attached: &[ValidatorId],
+    attached: &BTreeMap<ValidatorId, T>,
     committee: &[ValidatorId],
 ) -> SignerResolution {
     let Some(named) = action.signer() else {
         return SignerResolution::Unsigned;
     };
-    if attached.contains(&named) {
+    if attached.contains_key(&named) {
         return SignerResolution::Signs(named);
     }
     if !action.envelope_only() {
         return SignerResolution::Dropped;
     }
     attached
-        .iter()
+        .keys()
         .copied()
-        .filter(|signer| committee.contains(signer))
-        .min()
+        .find(|signer| committee.contains(signer))
         .map_or(SignerResolution::Dropped, SignerResolution::Signs)
 }
 
@@ -888,7 +852,6 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent};
-    use hyperscale_engine::TickEnvironment;
     use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
@@ -907,7 +870,7 @@ mod tests {
     use super::{SignerResolution, resolve_signer};
     use crate::event::{HostEvent, ShardScopedInput};
     use crate::shard::cross_shard::serve_finalizations_request;
-    use crate::shard::seated_host::{Fixture, Host, SHARD, loop_of};
+    use crate::shard::test_host::{Fixture, SHARD, loop_of};
 
     /// A block may name a legs entry its proposer has since replaced by
     /// one naming more of the tick's legs. Every entry announced enters
@@ -918,7 +881,6 @@ mod tests {
     fn a_replaced_legs_entry_is_still_served_by_its_hash() {
         let fix = Fixture::new();
         let (mut host, _events) = fix.host_with_events(BlockHeight::GENESIS);
-        host.seat_vnode(SHARD, fix.seat(1));
 
         let tick_id = TickId::new(SHARD, BlockHeight::new(1));
         let legs: Vec<StoredReceipt> = [b"first leg", b"other leg"]
@@ -944,7 +906,6 @@ mod tests {
         assert_ne!(replaced.receipt_hash(), every_leg.receipt_hash());
 
         loop_of(&mut host).drain_actions(
-            1,
             [&replaced, &every_leg]
                 .map(|fw| {
                     Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
@@ -967,53 +928,6 @@ mod tests {
                 .map(|fw| (fw.receipt_hash(), fw.tx_hashes().collect::<Vec<_>>()))
                 .collect::<Vec<_>>(),
             vec![(replaced.receipt_hash(), vec![first_leg])],
-        );
-    }
-
-    /// A seat's batch result reaches that seat alone. Each seat on a loop
-    /// runs every tick itself, and a result is what releases its next
-    /// tick and the fates it holds for the one that ran; a sibling still
-    /// to run that tick, or ticks below it, is no further on for it.
-    #[test]
-    fn a_batch_result_reaches_only_the_seat_that_ran_it() {
-        let fix = Fixture::new();
-        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
-        let out = host.seat_vnode(SHARD, fix.seat(1));
-        assert_eq!(out.seated, vec![fix.committee.validator_id(1)]);
-        while events.try_recv().is_ok() {}
-
-        let ran = BlockHeight::new(1);
-        loop_of(&mut host).drain_actions(
-            1,
-            vec![Action::ExecuteTransactions {
-                tick: ran,
-                fates: Vec::new(),
-                tick_ts: WeightedTimestamp::ZERO,
-                env: TickEnvironment::unfolded(),
-                requests: Vec::new(),
-                included: Vec::new(),
-            }],
-        );
-        while let Ok(event) = events.try_recv() {
-            let _ = host.step(event);
-        }
-
-        let baseline_floor = |host: &mut Host, seat: usize| {
-            loop_of(host)
-                .vnode(seat)
-                .state
-                .execution_coordinator()
-                .baseline_floor()
-        };
-        assert_eq!(
-            baseline_floor(&mut host, 1),
-            ran,
-            "the seat that ran the tick has completed it",
-        );
-        assert_eq!(
-            baseline_floor(&mut host, 0),
-            BlockHeight::GENESIS,
-            "its sibling has every tick of its own still to run",
         );
     }
 
@@ -1040,7 +954,7 @@ mod tests {
         (storage, key)
     }
 
-    /// How the seated loop's state root check ends for a certified,
+    /// How the loop's state root check ends for a certified,
     /// empty child of `storage`'s tip anchored twenty buckets up, whose
     /// header names `swept_to` over a parent that stopped at
     /// `swept_from`, and whose root is the tip's with `removals` taken
@@ -1084,32 +998,29 @@ mod tests {
             Fixture::new().host_with_events_over(storage.clone(), parent_block_height);
         while events.try_recv().is_ok() {}
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a certified child"));
-        loop_of(&mut host).drain_actions(
-            0,
-            vec![Action::VerifyStateRoot {
-                block_hash,
-                transactions: Arc::new(Capped::empty()),
-                parent_block_hash: BlockHash::ZERO,
-                parent_state_root,
-                parent_block_height,
-                expected_root,
-                finalizations: Vec::new(),
-                creations: Vec::new(),
-                block_height,
-                claimed_split_child_roots: None,
-                split_child_roots_required: false,
-                terminal_settled_txs_required: false,
-                claimed_terminal_settled_txs: None,
-                parent_weighted_timestamp: WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS),
-                settled_txs_window_floor: None,
-                parent_sweep_frontier: swept_from,
-                claimed_sweep_frontier: swept_to,
-                frontier,
-                members,
-                parent_judgement: None,
-                state_claims: Vec::new(),
-            }],
-        );
+        loop_of(&mut host).drain_actions(vec![Action::VerifyStateRoot {
+            block_hash,
+            transactions: Arc::new(Capped::empty()),
+            parent_block_hash: BlockHash::ZERO,
+            parent_state_root,
+            parent_block_height,
+            expected_root,
+            finalizations: Vec::new(),
+            creations: Vec::new(),
+            block_height,
+            claimed_split_child_roots: None,
+            split_child_roots_required: false,
+            terminal_settled_txs_required: false,
+            claimed_terminal_settled_txs: None,
+            parent_weighted_timestamp: WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS),
+            settled_txs_window_floor: None,
+            parent_sweep_frontier: swept_from,
+            claimed_sweep_frontier: swept_to,
+            frontier,
+            members,
+            parent_judgement: None,
+            state_claims: Vec::new(),
+        }]);
         events
             .try_iter()
             .find_map(|event| match event {
@@ -1185,6 +1096,17 @@ mod tests {
         );
     }
 
+    /// [`resolve_signer`] among the `attached` ids.
+    fn resolve(
+        action: &Action,
+        attached: &[ValidatorId],
+        committee: &[ValidatorId],
+    ) -> SignerResolution {
+        let attached: BTreeMap<ValidatorId, ValidatorId> =
+            attached.iter().map(|&id| (id, id)).collect();
+        resolve_signer(action, &attached, committee)
+    }
+
     fn validator(id: u64) -> ValidatorId {
         ValidatorId::new(id)
     }
@@ -1209,7 +1131,7 @@ mod tests {
     fn an_envelope_action_falls_back_to_an_attached_committee_signer() {
         let committee = [validator(1), validator(2), validator(3)];
         assert_eq!(
-            resolve_signer(
+            resolve(
                 &provisions_preferring(validator(3)),
                 &[validator(2), validator(3)],
                 &committee,
@@ -1217,7 +1139,7 @@ mod tests {
             SignerResolution::Signs(validator(3)),
         );
         assert_eq!(
-            resolve_signer(
+            resolve(
                 &provisions_preferring(validator(1)),
                 &[validator(0), validator(3), validator(2)],
                 &committee,
@@ -1225,7 +1147,7 @@ mod tests {
             SignerResolution::Signs(validator(2)),
         );
         assert_eq!(
-            resolve_signer(
+            resolve(
                 &provisions_preferring(validator(1)),
                 &[validator(0)],
                 &committee,
@@ -1246,7 +1168,7 @@ mod tests {
             signer,
         };
         assert_eq!(
-            resolve_signer(
+            resolve(
                 &announcement(validator(1)),
                 &[validator(2), validator(3)],
                 &committee,
@@ -1254,11 +1176,11 @@ mod tests {
             SignerResolution::Dropped,
         );
         assert_eq!(
-            resolve_signer(&announcement(validator(1)), &[validator(1)], &committee),
+            resolve(&announcement(validator(1)), &[validator(1)], &committee),
             SignerResolution::Signs(validator(1)),
         );
         assert_eq!(
-            resolve_signer(&Action::ClearTickChain, &[validator(1)], &committee),
+            resolve(&Action::ClearTickChain, &[validator(1)], &committee),
             SignerResolution::Unsigned,
         );
     }

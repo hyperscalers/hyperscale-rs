@@ -42,9 +42,9 @@ const FRUITLESS_ROUND_PAUSE: Duration = Duration::from_secs(1);
 /// without waiting.
 const ROUNDS_BEFORE_ANCHOR_REFRESH: u32 = 30;
 
-/// Bootstrap a joining vnode's shard state against the beacon-attested
-/// boundary anchor, returning the [`RecoveredState`] its state machines
-/// boot from. The caller has already established that `storage` is
+/// Bootstrap a joining host's shard state against the beacon-attested
+/// boundary anchor, returning the [`RecoveredState`] its replica boots
+/// from. The caller has already established that `storage` is
 /// fresh and an anchor exists.
 ///
 /// A `local` store this host already holds for the shard answers each

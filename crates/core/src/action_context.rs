@@ -37,7 +37,7 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// action no signer signs; a signing handler finding `None` drops its
     /// action unsigned.
     pub signing: Option<Signing<'a>>,
-    /// Dispatching vnode's shard. Equal to the vnode's `local_shard`
+    /// Dispatching loop's shard. Equal to the replica's `local_shard`
     /// for shard-rooted handlers; beacon handlers ignore it.
     pub shard: ShardId,
     /// Chain-state lookup. Handlers that read state call
@@ -63,7 +63,7 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     pub verifier: &'a dyn Verifier,
     /// Send a [`ProtocolEvent`] back to the state machine. The single
     /// sink for delegated-action outcomes — the dispatch wrapper at
-    /// the I/O loop boundary stamps the emitting vnode's shard and
+    /// the I/O loop boundary stamps the emitting loop's shard and
     /// re-enters the next `step()`. Owned so handlers can clone it
     /// into network-callback closures that outlive the action call.
     pub notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync>,
@@ -120,7 +120,7 @@ impl Signing<'_> {
 #[allow(missing_docs)] // bag of references; field names match ActionContext's
 pub struct BeaconActionContext<'a, N: Network> {
     pub topology_snapshot: &'a TopologySnapshot,
-    /// Dispatching vnode's validator identity, used for signing, vote
+    /// Dispatching participant's validator identity, used for signing, vote
     /// attribution, and self-filtering recipient lists.
     pub me: ValidatorId,
     /// Durable ratification registers on the process's beacon store —
@@ -142,7 +142,7 @@ pub struct BeaconActionContext<'a, N: Network> {
     /// cache that serves inbound `GetBeaconProposalRequest`s.
     pub cache_beacon_proposal:
         &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
-    /// Hand a candidate this vnode assembled or verified to the
+    /// Hand a candidate this participant assembled or verified to the
     /// process-level cache that serves inbound
     /// `GetBeaconCandidateRequest`s.
     pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),

@@ -4,7 +4,7 @@
 //! between local aggregation or verification and the tick's containing
 //! block committing: a late voter is answered with the certificate, and a
 //! retransmit of one already verified skips verification. Held behind an
-//! `Arc` so same-shard vnodes share one map.
+//! `Arc` so the shard loop's request serving reads the replica's map.
 //!
 //! Two writers — both inside the coordinator — feed this store:
 //!

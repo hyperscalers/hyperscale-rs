@@ -114,20 +114,14 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
         heights: (0..4u32)
             .map(|i| {
                 runner
-                    .first_vnode_state(i)
+                    .first_replica(i)
                     .unwrap()
                     .shard_coordinator()
                     .committed_height()
             })
             .collect(),
         views: (0..4u32)
-            .map(|i| {
-                runner
-                    .first_vnode_state(i)
-                    .unwrap()
-                    .shard_coordinator()
-                    .view()
-            })
+            .map(|i| runner.first_replica(i).unwrap().shard_coordinator().view())
             .collect(),
         state_roots: (0..4u32)
             .map(|i| {
@@ -272,7 +266,7 @@ fn grow_and_transfer(seed: u64) -> (Vec<BlockHeight>, u64, u64, [u8; 32]) {
         .iter()
         .flat_map(|&leaf| {
             runner
-                .shard_vnodes(leaf)
+                .shard_replicas(leaf)
                 .into_iter()
                 .map(|v| v.shard_coordinator().committed_height())
                 .collect::<Vec<_>>()

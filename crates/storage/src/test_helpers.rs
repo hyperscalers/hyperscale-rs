@@ -4351,11 +4351,10 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
 /// A prepared commit whose height the tree already reached refuses when
 /// the store holds a *different* block there.
 ///
-/// The benign cause of that skip is the same block going in twice — a
-/// sync commit landing between prepare and flush, or a second vnode on
-/// the store. A different block is a fork that reached the writer, and
-/// skipping it would hand back a root for a block the store never
-/// applied while the caller took the commit as done.
+/// The benign cause of that skip is the same block going in twice — a sync
+/// commit landing between prepare and flush. A different block is a fork that
+/// reached the writer, and skipping it would hand back a root for a block the
+/// store never applied while the caller took the commit as done.
 ///
 /// # Panics
 ///
@@ -4409,9 +4408,9 @@ where
 /// Shared: a prepared commit whose base root the store has moved off
 /// applies nothing and answers with the root it computed.
 ///
-/// The benign cause is the same block arriving twice — a synced copy, or
-/// a co-hosted vnode's — so the batch is dropped rather than replayed
-/// onto a store that already holds the block. The block carries a write,
+/// The benign cause is the same block arriving twice — a synced copy —
+/// so the batch is dropped rather than replayed onto a store that
+/// already holds the block. The block carries a write,
 /// because a root unchanged by an empty commit is the one case both
 /// backends wave through on purpose.
 ///

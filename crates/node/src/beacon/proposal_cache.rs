@@ -4,7 +4,7 @@
 //! recover proposals they missed on gossip. Fed at the two admission
 //! boundaries — the wire `BeaconProposalNotification` handler and the
 //! `BuildAndBroadcastBeaconProposal` action handler's locally signed
-//! proposal — so serving never reads any vnode's coordinator pool.
+//! proposal — so serving never reads the beacon coordinator's pool.
 //! Entries are verified against their author before admission; an
 //! unauthenticated peer can't occupy a validator's serve slot with junk.
 

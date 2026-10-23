@@ -607,10 +607,9 @@ pub struct ShardCoordinator {
     /// an announcer that spends a round on a forgery spends only its own.
     qc_announcements: BTreeMap<ValidatorId, Round>,
 
-    /// Round of the newest QC this replica has announced. A QC reaches
-    /// [`Self::on_qc_formed`] once from this replica's own vote set and
-    /// once more from every same-shard seat on its host that formed it
-    /// too, and each announcement is a signature; it goes out once.
+    /// Round of the newest QC this replica has announced. A QC can reach
+    /// [`Self::on_qc_formed`] more than once, and each announcement is a
+    /// signature; it goes out once.
     announced_round: Option<Round>,
 
     /// Per committee member, the proposal its vote named that this replica
@@ -671,8 +670,8 @@ pub struct ShardCoordinator {
     /// their claims, and the last few it has.
     committed_carried: CommittedCarried,
 
-    /// Tick membership as the committed state holds it: loaded at the
-    /// seat and advanced by the fold every commit runs, so it is the
+    /// Tick membership as the committed state holds it: loaded when the
+    /// replica is built and advanced by the fold every commit runs, so it is the
     /// state's own rows without a read of the store.
     member_rows: MemberIndex,
 
@@ -715,22 +714,18 @@ pub struct ShardCoordinator {
     /// anchor (use `committed_ts: WeightedTimestamp` for that).
     now: LocalTimestamp,
 
-    /// When this seat's next proposal may go out.
+    /// When this replica's next proposal may go out.
     pace: ProposalPace,
 
     /// The round of the QC whose adoption last moved the view, and the
     /// instant it did. An idle leader's wait runs from here.
     qc_adopted_at: Option<(Round, LocalTimestamp)>,
 
-    /// The highest certified tip this seat, leading, builds on at once
+    /// The highest certified tip this replica, leading, builds on at once
     /// whatever it holds: one past the newest commit that carried content
     /// or crossed an epoch, so that commit's follow-ups go out at network
     /// speed. Local to the leader; no follower reads it.
     eager_through: BlockHeight,
-
-    /// Validators this host seats in this shard. Their votes, and this
-    /// replica's signers', reach each other without crossing the network.
-    host_seats: BTreeSet<ValidatorId>,
 
     /// This replica's shard.
     local_shard: ShardId,
@@ -747,11 +742,11 @@ pub struct ShardCoordinator {
     /// refusal to the transactions a predecessor actually committed.
     ///
     /// Seeded from the reshape flip, which is the delivery that lands
-    /// inside the window the pre-cut rule is live for. A seat that missed
-    /// the flip — a restart, or a validator rotated on afterwards — picks
-    /// the predecessors up from its topology projection instead, at the
-    /// first beacon block it commits; holding none means the strict rule
-    /// stands, which is always safe. Retired once the chain has outlived
+    /// inside the window the pre-cut rule is live for. A replica that
+    /// missed the flip — a restart, or a validator rotated on afterwards —
+    /// picks the predecessors up from its topology projection instead, at
+    /// the first beacon block it commits; holding none means the strict
+    /// rule stands, which is always safe. Retired once the chain has outlived
     /// its origin by `MAX_VALIDITY_RANGE`, past which nothing on offer
     /// predates the cut.
     precut: Precut,
@@ -1013,7 +1008,6 @@ impl ShardCoordinator {
             // A restored chain's next blocks go out at network speed, as a
             // fresh chain's first ones do.
             eager_through: recovered.committed_height.next(),
-            host_seats: BTreeSet::new(),
             local_shard,
             chain_origin: recovered.chain_origin,
             precut: Precut::adopted(local_shard, &recovered.predecessors),
@@ -1394,7 +1388,7 @@ impl ShardCoordinator {
     ///
     /// A dissolved chain takes none: it judges no block again, and the
     /// mirror is retired only by this chain's own commits, so a parent
-    /// whose seat outlives its split would hold every header its
+    /// whose replica outlives its split would hold every header its
     /// successors commit for as long as the process runs.
     pub fn record_proven_anchor(
         &mut self,
@@ -1611,6 +1605,84 @@ impl ShardCoordinator {
         self.dissolved_latched = self.dissolved(topology_schedule);
     }
 
+    /// Take `next` in place of `held`, the schedule this replica judged
+    /// by until now: latch [`Self::dissolved`] against both, and drop
+    /// every block judged under a committee that no longer governs it
+    /// (see [`Self::drop_rebound_blocks`]).
+    pub fn on_schedule_replaced(
+        &mut self,
+        held: &TopologySchedule,
+        next: &TopologySchedule,
+    ) -> Vec<Action> {
+        self.latch_dissolution(held);
+        self.latch_dissolution(next);
+        self.drop_rebound_blocks(held, next)
+    }
+
+    /// Drop each pending block above the high QC whose governing committee
+    /// `next` resolves to another than `held` did, with its vote set and
+    /// every verdict reached on it.
+    ///
+    /// A recovery's seating is the one change that does this, whatever
+    /// the recovery's cause, and a chained recovery's newer bridge does it
+    /// again for the blocks it re-binds: a block anchored below a bridge
+    /// resolves the committee the recovery replaces until the fold seats
+    /// the recovery and the fresh one after. A block this replica holds
+    /// from before the seating was verified, and its votes indexed,
+    /// against the replaced committee, so a fresh signer voting it would
+    /// vote a verdict the fresh committee never reached and tally its vote
+    /// beside indices that name other members. Dropped, the block is what
+    /// it is to a replica that never held it: one the fresh committee
+    /// judges for itself if anyone serves it again.
+    ///
+    /// Nothing certified goes. A block at or below the high QC's round is
+    /// on the certified chain the fresh committee extends, or a sibling
+    /// no fresh signer can vote, and a halt recovery's retained tip, which
+    /// the harvest fetches, travels as a QC and returns by block sync, not
+    /// from here. A fresh committee's own block resolves the fresh
+    /// committee under both schedules once the recovery is seated, so only
+    /// a replica that took one before it folded the recovery drops it, and
+    /// that replica had judged it under the replaced committee too.
+    fn drop_rebound_blocks(
+        &mut self,
+        held: &TopologySchedule,
+        next: &TopologySchedule,
+    ) -> Vec<Action> {
+        let high_qc_round = self.high_qc_round();
+        let committee = |schedule, hash| {
+            self.committee_of_block(schedule, hash)
+                .map(|snapshot| snapshot.consensus_committee_for_shard(self.local_shard))
+        };
+        let rebound: Vec<BlockHash> = self
+            .pending_blocks
+            .values()
+            .map(PendingBlock::header)
+            .filter(|header| header.round() > high_qc_round)
+            .map(BlockHeader::hash)
+            .filter(
+                |&hash| match (committee(held, hash), committee(next, hash)) {
+                    (Some(was), Some(now)) => was != now,
+                    _ => false,
+                },
+            )
+            .collect();
+        if rebound.is_empty() {
+            return Vec::new();
+        }
+        info!(
+            signers = ?self.signers.keys(),
+            ?rebound,
+            "Dropping pending blocks judged under a committee that no longer governs them"
+        );
+        let mut actions = Vec::new();
+        for block_hash in rebound {
+            actions.extend(self.remove_pending_block(block_hash));
+            self.votes.forget(block_hash);
+        }
+        self.retain_pending_judgements();
+        actions
+    }
+
     /// Whether the committed chain proves its terminal committed to a
     /// reader that holds only committed headers: the tip and its parent
     /// both sit at or above the terminal and their rounds are contiguous.
@@ -1650,10 +1722,10 @@ impl ShardCoordinator {
     }
 
     /// Read the chains this one succeeds off the beacon's own boundary
-    /// records, for a seat the reshape flip never reached.
+    /// records, for a replica the reshape flip never reached.
     ///
-    /// The flip is the fast delivery and covers the seats present at the
-    /// cut. This is the durable one, and the only path for a restart, a
+    /// The flip is the fast delivery and covers the replicas present at
+    /// the cut. This is the durable one, and the only path for a restart, a
     /// validator rotated onto the successor committee afterwards, or a
     /// snap-synced joiner — none of which run a reshape duty.
     ///
@@ -1986,11 +2058,17 @@ impl ShardCoordinator {
                     window_end = wt_window_end.as_millis(),
                     "Synced to tip while not yet ready — broadcasting ReadySignal"
                 );
+                let (local, recipients): (Vec<ValidatorId>, Vec<ValidatorId>) = committee
+                    .iter()
+                    .copied()
+                    .filter(|&member| member != signer)
+                    .partition(|member| self.signers.contains_key(member));
                 Action::SignAndBroadcastReadySignal {
                     shard: self.local_shard,
                     wt_window_start,
                     wt_window_end,
-                    recipients: committee.iter().copied().filter(|&v| v != signer).collect(),
+                    recipients,
+                    local_recipient: !local.is_empty(),
                     signer,
                 }
             })
@@ -2539,7 +2617,7 @@ impl ShardCoordinator {
         Some(self.ancestry(windows, parent)?.rows)
     }
 
-    /// What the seat building a block on `parent` asks its node with,
+    /// What the replica building a block on `parent` asks its node with,
     /// every reading taken at `parent`: `committee`, which the block is
     /// classified under, the shards `reshaping` at the block's anchor,
     /// the rows of `members` standing toward each shard, the answers and
@@ -3104,13 +3182,13 @@ impl ShardCoordinator {
     /// deadline and a dwell ending on withheld content; every other retry
     /// is the caller's, triggered by events.
     ///
-    /// `gather` supplies the block's content. It is asked at most once,
-    /// with the readings of the parent the block extends, and only once
-    /// every gate that reads none of that content has passed: this seat
-    /// leads the round with no build in flight, the block carries content
-    /// at all, its frame resolves, and nothing known beforehand defers
-    /// the build or holds it back. What is gathered can still go unbuilt
-    /// where the member lines over it do not resolve.
+    /// `gather` supplies the block's content. It is asked at most once, with
+    /// the readings of the parent the block extends, and only once every gate
+    /// that reads none of that content has passed: a signer attached here
+    /// leads the round with no build in flight, the block carries content at
+    /// all, its frame resolves, and nothing known beforehand defers the build
+    /// or holds it back. What is gathered can still go unbuilt where the
+    /// member lines over it do not resolve.
     #[instrument(skip(self, topology_schedule, gather))]
     pub fn try_propose(
         &mut self,
@@ -3411,7 +3489,7 @@ impl ShardCoordinator {
     /// its content is in hand: the substate count behind the parent is
     /// resolved, a certificate justifies every round the block skips,
     /// and [`Self::build_tree_held`]. A build that fails one of these
-    /// defers or stops whatever it would have carried, so its seat is
+    /// defers or stops whatever it would have carried, so its replica is
     /// asked for nothing.
     fn build_goes_out(&self, frame: &ProposalFrame<'_>, round: Round) -> bool {
         frame.substate.is_ok() && frame.rounds_justified(round) && self.build_tree_held()
@@ -5881,11 +5959,10 @@ impl ShardCoordinator {
     /// the vote is admitted directly to the verified tally. Wire-arrived
     /// votes route through [`Self::on_unverified_block_vote`].
     ///
-    /// Two producers reach here: this validator's own signed vote, fed
-    /// back for local tally tracking, and a co-hosted validator's vote,
-    /// whose notification keeps its marker because `notify` hands local
-    /// recipients the in-memory message rather than wire bytes. Only the
-    /// first implies we hold the block being voted on.
+    /// The producer is a signer of this replica: its signed vote is fed
+    /// back for the local tally, and a host that also delivers the vote to
+    /// itself hands over the in-memory message, marker intact, which the
+    /// vote set dedups by index. Neither implies the block is still held.
     #[instrument(skip(self, topology_schedule, vote), fields(
         height = vote.height().inner(),
         voter = ?vote.voter(),
@@ -5903,8 +5980,9 @@ impl ShardCoordinator {
             "Received pre-verified block vote"
         );
 
-        // A co-hosted voter's vote can outrun the block it names, exactly
-        // as a wire vote can: hold it raw until the anchor resolves, and
+        // A signer voted a block this replica held, but a cap eviction or
+        // a drop at a recovery's seating can remove it before the vote
+        // lands here: hold the vote raw until the anchor resolves, and
         // admit it in `link_buffered_votes_to_header`. Buffering drops the
         // marker, so such a vote is batch-verified on admission.
         if self.committee_anchor(vote.block_hash()).is_none() {
@@ -6159,9 +6237,12 @@ impl ShardCoordinator {
     ///
     /// Called when the runner completes `Action::VerifyAndBuildQuorumCertificate`.
     ///
-    /// If QC was built successfully, enqueues `QuorumCertificateFormed` event.
-    /// If quorum wasn't reached (some sigs invalid), adds verified votes back
-    /// to `VoteSet` and checks if more buffered votes can now reach quorum.
+    /// If QC was built successfully under the vote set's current
+    /// `binding`, enqueues `QuorumCertificateFormed` event; one built under
+    /// a binding the set no longer holds, or for a set forgotten since, is
+    /// dropped. If quorum wasn't reached (some sigs invalid), adds verified
+    /// votes back to `VoteSet` and checks if more buffered votes can now
+    /// reach quorum.
     #[instrument(skip(self, qc, verified_votes), fields(
         block_hash = ?block_hash,
         has_qc = qc.is_some(),
@@ -6170,17 +6251,28 @@ impl ShardCoordinator {
     pub fn on_qc_result(
         &mut self,
         block_hash: BlockHash,
+        binding: u64,
         qc: Option<Verified<QuorumCertificate>>,
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
     ) -> Vec<Action> {
         if let Some(qc) = qc {
+            if !self.votes.admit_formed_qc(block_hash, binding) {
+                warn!(
+                    signers = ?self.signers.keys(),
+                    ?block_hash,
+                    height = qc.height().inner(),
+                    "Dropping a QC whose batch outlived its vote set's binding"
+                );
+                return self
+                    .votes
+                    .maybe_trigger_verification(self.local_shard, block_hash);
+            }
             info!(
                 block_hash = ?block_hash,
                 height = qc.height().inner(),
                 signers = qc.signer_count(),
                 "QC built successfully"
             );
-            self.votes.mark_qc_built(block_hash);
             let mut actions = self.populate_certified_for(&qc);
             actions.push(Action::Continuation(
                 ProtocolEvent::QuorumCertificateFormed { block_hash, qc },
@@ -6217,7 +6309,7 @@ impl ShardCoordinator {
         }
 
         self.votes
-            .finalize_pending_batch(block_hash, verified_votes);
+            .finalize_pending_batch(block_hash, binding, verified_votes);
         // The tally's denominator rides on the vote set, latched from the
         // committee that governed the block when its first vote landed — so a
         // batch returning after the block's committee stops resolving still
@@ -7032,7 +7124,8 @@ impl ShardCoordinator {
         actions
     }
 
-    /// Whether every signer of `qc` is seated on this host.
+    /// Whether every signer of `qc` is attached to this replica: their
+    /// votes reached each other without crossing the network.
     fn formed_on_this_host(
         &self,
         topology_schedule: &TopologySchedule,
@@ -7044,9 +7137,9 @@ impl ShardCoordinator {
         let members = committee.consensus_committee_for_shard(self.local_shard);
         qc.signer_count() > 0
             && qc.signers().set_indices().all(|index| {
-                members.get(index).is_some_and(|member| {
-                    self.host_seats.contains(member) || self.signers.contains_key(member)
-                })
+                members
+                    .get(index)
+                    .is_some_and(|member| self.signers.contains_key(member))
             })
     }
 
@@ -7512,7 +7605,7 @@ impl ShardCoordinator {
         // replica derives the same leaves however late it commits (the
         // completed recovery keeps the bridge answering after the pending
         // record clears). `commit_one_buffered_block` parks any commit
-        // whose committee this seat's schedule does not resolve, so it
+        // whose committee this replica's schedule does not resolve, so it
         // always resolves here. If it ever doesn't, local state is
         // corrupt: deriving leaves under a different committee would fork
         // the beacon-witness accumulator across the committee, so fail
@@ -7740,8 +7833,8 @@ impl ShardCoordinator {
     }
 
     /// Re-drive the commit [`Self::commit_one_buffered_block`] parked at the
-    /// next height because this seat's schedule did not hold its committee
-    /// window. It parks again if the window is still missing.
+    /// next height because this replica's schedule did not hold its
+    /// committee window. It parks again if the window is still missing.
     fn retry_parked_commit(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         match self.commits.take_out_of_order(self.committed_height.next()) {
             Some((certified, source)) => {
@@ -7760,10 +7853,8 @@ impl ShardCoordinator {
     /// block arrives out of height order, or parks awaiting its committee
     /// window — the caller should stop driving the chain.
     ///
-    /// A commit reaches here verified by whichever seat of this shard's
-    /// loop emitted it: `BlockReadyToCommit` fans out to every co-hosted
-    /// seat, and each seat's schedule follows its own beacon. A seat whose
-    /// beacon has not committed the window that certified the block cannot
+    /// A commit can reach here before the beacon has committed the window
+    /// that certified the block. Without that window the replica cannot
     /// derive the block's beacon-witness leaves, so the commit parks at its
     /// height until [`Self::on_beacon_block_persisted`] brings the window.
     fn commit_one_buffered_block(
@@ -8142,7 +8233,7 @@ impl ShardCoordinator {
     /// `NotYetCommitted` lookup). The beacon adopting the epoch is that
     /// path's only retry signal.
     ///
-    /// Also re-evaluates Ready emission: a vnode that finished its
+    /// Also re-evaluates Ready emission: a replica that finished its
     /// bootstrap sync before its committee window opened got `None`
     /// from the sync-complete gate (it wasn't yet in the head
     /// committee), and a beacon commit is the only signal that the
@@ -8169,8 +8260,8 @@ impl ShardCoordinator {
         // not committed here is re-driven by the beacon block that commits
         // it, rather than waiting on a view change.
         actions.extend(self.redrive_pending_votes(topology_schedule));
-        // The same fold is what carries this chain's predecessors to a seat
-        // the flip never reached, so a boot that lands mid-window picks
+        // The same fold is what carries this chain's predecessors to a
+        // replica the flip never reached, so a boot that lands mid-window picks
         // them up at the first beacon block it commits.
         self.adopt_precut_predecessors(topology_schedule);
         if !self.is_block_syncing() {
@@ -8911,9 +9002,9 @@ impl ShardCoordinator {
         // the fresh committee's pacemaker bounds reject, and the harvest
         // below is the only route back to the certified frontier.
         let Some(power) = self.committee_timeout_power(committee, timeout.voter()) else {
-            // A co-hosted retained ex-member's timeout keeps its marker —
-            // `notify` hands local recipients the in-memory message — so
-            // the harvest has to run here too, not only on the wire path.
+            // A retained ex-member signing on this replica feeds its own
+            // timeout back here, marker intact, so the harvest has to run
+            // on this path too, not only on the wire path.
             if let Some(actions) = self.harvest_retained_tip(topology_schedule, &timeout) {
                 return actions;
             }
@@ -9583,15 +9674,21 @@ impl ShardCoordinator {
         // local committed height (remote shards have independent heights).
 
         self.block_sync.cleanup(committed_height);
+        self.retain_pending_judgements();
+
+        orphaned.into_abandon_actions()
+    }
+
+    /// Drop what was judged of blocks no longer pending: their
+    /// verification state, substate deltas and answer deltas.
+    fn retain_pending_judgements(&mut self) {
         self.verification
-            .cleanup(&self.pending_blocks, committed_height);
+            .cleanup(&self.pending_blocks, self.committed_height);
         self.pending_bytes_deltas
             .retain(|hash, _| self.pending_blocks.get(*hash).is_some());
         let pending_blocks = &self.pending_blocks;
         self.answers
             .retain_pending(|hash| pending_blocks.get(hash).is_some());
-
-        orphaned.into_abandon_actions()
     }
 
     /// Drive the verification of the blocks the store handed back at
@@ -9932,11 +10029,6 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn latest_qc(&self) -> Option<&Verified<QuorumCertificate>> {
         self.latest_qc.as_ref()
-    }
-
-    /// Record the validators this host seats in this shard.
-    pub fn set_host_seats(&mut self, seats: impl IntoIterator<Item = ValidatorId>) {
-        self.host_seats = seats.into_iter().collect();
     }
 
     /// Get the current view/round.
@@ -10356,7 +10448,7 @@ mod tests {
     }
 
     /// `local_shard` cut at `cut`, clock at `now`, holding `predecessors`
-    /// — empty for the seat the reshape flip never reached.
+    /// — empty for the replica the reshape flip never reached.
     fn successor_holding(
         local_shard: ShardId,
         cut: WeightedTimestamp,
@@ -10549,11 +10641,11 @@ mod tests {
         sched
     }
 
-    /// A seat the reshape flip never reached — a restart, or a validator
-    /// rotated on afterwards — reads its predecessors off the beacon's own
-    /// boundary records instead. A right child then asks the parent's
-    /// terminal; a left child reads the parent's markers in its own state
-    /// and asks nothing.
+    /// A replica the reshape flip never reached — a restart, or a
+    /// validator rotated on afterwards — reads its predecessors off the
+    /// beacon's own boundary records instead. A right child then asks the
+    /// parent's terminal; a left child reads the parent's markers in its
+    /// own state and asks nothing.
     #[test]
     fn a_seat_that_missed_the_flip_adopts_its_predecessors_from_the_projection() {
         let sched = post_split_schedule();
@@ -10578,7 +10670,7 @@ mod tests {
     }
 
     /// Adoption never displaces what the flip delivered: the flip is the
-    /// authority for the seats it reached, and re-reading the projection
+    /// authority for the replicas it reached, and re-reading the projection
     /// over it would churn the answers already recorded against it.
     #[test]
     fn adoption_leaves_flip_delivered_predecessors_alone() {
@@ -14954,11 +15046,10 @@ mod tests {
         }
     }
 
-    /// `BlockReadyToCommit` fans out to every co-hosted seat, so a seat can
-    /// be handed a commit a sibling verified under a window its own beacon
-    /// has not committed. It parks the commit rather than derive the
-    /// block's beacon-witness leaves with no committee, and commits it once
-    /// the beacon brings the window.
+    /// A replica handed a commit certified under a window its beacon has
+    /// not committed parks the commit rather than derive the block's
+    /// beacon-witness leaves with no committee, and commits it once the
+    /// beacon brings the window.
     #[test]
     fn a_commit_whose_committee_window_is_not_held_parks_for_the_beacon() {
         let (mut state, full) = make_test_state();
@@ -15885,11 +15976,10 @@ mod tests {
         );
     }
 
-    /// A co-hosted validator's vote reaches `on_verified_block_vote` with
-    /// its marker intact, and it can name a block this coordinator does
-    /// not hold yet — `notify` hands local recipients the in-memory
-    /// message, so the wire decode that would have stripped the marker
-    /// never runs.
+    /// A signer's own vote reaches `on_verified_block_vote` with its
+    /// marker intact, and it can name a block this coordinator no longer
+    /// holds: a cap eviction or a drop at a recovery's seating can remove
+    /// the block between the vote and its feedback.
     #[test]
     fn a_verified_vote_for_an_unanchored_block_is_held_not_dropped() {
         let (mut state, topology_schedule) = make_test_state();
@@ -19768,9 +19858,7 @@ mod tests {
         }
     }
 
-    /// A QC formed again — by a same-shard seat on this host whose
-    /// formation fans out to this replica, or a second time here — is not
-    /// announced again.
+    /// A QC formed a second time is not announced again.
     #[test]
     fn a_qc_is_announced_once() {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(1);
@@ -19921,11 +20009,11 @@ mod tests {
         );
     }
 
-    /// The harvest must also run when the retained ex-member is co-hosted:
-    /// `notify` hands local recipients the in-memory message, so its
-    /// timeout keeps its marker and lands on the verified path. The round
-    /// is far past the fresh committee's pacemaker bound, as a halted
-    /// chain's rounds are — so the membership screen has to come first.
+    /// The harvest must also run when the retained ex-member signs on this
+    /// replica: its timeout is fed back with its marker and lands on the
+    /// verified path. The round is far past the fresh committee's
+    /// pacemaker bound, as a halted chain's rounds are, so the membership
+    /// screen has to come first.
     #[test]
     fn a_verified_retained_timeout_still_harvests_the_halted_tip() {
         use hyperscale_types::{RecoveryCause, ShardRecovery};
@@ -19973,7 +20061,7 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::StartBlockSync { .. })),
-            "a co-hosted retained ex-member's timeout must harvest, not drop",
+            "a retained ex-member's own timeout must harvest, not drop",
         );
     }
 
@@ -21236,6 +21324,7 @@ mod tests {
 
         let _ = state.on_qc_result(
             block_b,
+            0,
             None,
             vec![(0, Verified::<BlockVote>::new_unchecked_for_test(vote))],
         );
@@ -21246,6 +21335,97 @@ mod tests {
             .expect("legitimate vote must be recorded");
         assert_eq!(recorded_hash, block_b);
     }
+
+    /// A batch taken under the committee a block's vote set was bound to,
+    /// still in flight when the set re-binds to the committee that governs
+    /// the block now, forms no QC when it returns at quorum: its signer
+    /// bitfield indexes the replaced committee. The set takes a fresh
+    /// batch once the fresh committee reaches quorum.
+    #[test]
+    fn a_batch_in_flight_across_a_rebind_forms_no_qc() {
+        let (mut state, _schedule) = make_multi_validator_state();
+        let snapshot = |ids: [u64; 4]| {
+            let validators = ids
+                .into_iter()
+                .map(|id| ValidatorInfo {
+                    validator_id: ValidatorId::new(id),
+                    public_key: BlsSigner::generate().public_key(),
+                })
+                .collect();
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators),
+            )
+        };
+        let replaced = snapshot([0, 1, 2, 3]);
+        let fresh = snapshot([4, 5, 6, 7]);
+        let height = BlockHeight::new(1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            height,
+            parent_block_hash: BlockHash::ZERO,
+            round: Round::new(1),
+            ..Default::default()
+        });
+        let block_hash = header.hash();
+        let vote = |state: &mut ShardCoordinator, committee: &TopologySnapshot, voter: u64| {
+            state.votes.accept_unverified_vote(
+                committee,
+                ShardId::ROOT,
+                BlockVote::from_parts(
+                    block_hash,
+                    ShardId::ROOT,
+                    height,
+                    Round::new(1),
+                    ValidatorId::new(voter),
+                    ConsensusSignature::ZERO,
+                    ProposerTimestamp::from_millis(1_000),
+                ),
+                BlockHeight::GENESIS,
+                Some(&header),
+            )
+        };
+        let batch_binding = |actions: &[Action]| {
+            actions.iter().find_map(|action| match action {
+                Action::VerifyAndBuildQuorumCertificate { binding, .. } => Some(*binding),
+                _ => None,
+            })
+        };
+
+        let replaced_batch: Vec<Action> = [0, 1, 2]
+            .into_iter()
+            .flat_map(|voter| vote(&mut state, &replaced, voter))
+            .collect();
+        let replaced_binding =
+            batch_binding(&replaced_batch).expect("the replaced committee reaches a batch");
+        assert!(
+            vote(&mut state, &fresh, 4).is_empty(),
+            "one batch in flight at a time"
+        );
+
+        let actions = state.on_qc_result(
+            block_hash,
+            replaced_binding,
+            Some(make_test_qc(block_hash, height)),
+            vec![],
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::QuorumCertificateFormed { .. })
+            )),
+            "a batch taken under the replaced committee forms no QC: {actions:?}"
+        );
+
+        let fresh_batch: Vec<Action> = [5, 6]
+            .into_iter()
+            .flat_map(|voter| vote(&mut state, &fresh, voter))
+            .collect();
+        let fresh_binding =
+            batch_binding(&fresh_batch).expect("the fresh committee reaches a batch");
+        assert_ne!(fresh_binding, replaced_binding);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Re-proposal After View Change Tests
     // ═══════════════════════════════════════════════════════════════════════════
@@ -21910,16 +22090,18 @@ mod tests {
         );
     }
 
-    /// A quorum seated together on one host trades its votes without
+    /// A quorum attached together to one replica trades its votes without
     /// crossing the network, so its QC paces the next proposal as a lone
     /// member's does. The same quorum spread over hosts proposes at once,
     /// and so does one whose block reached the host a pace ago.
     #[test]
     fn a_qc_formed_on_one_host_paces_the_next_proposal() {
         let formed_at = LocalTimestamp::from_millis(100_000);
-        let qc_formed = |host_seats: &[u64], arrived: LocalTimestamp| {
-            let (mut state, topology_schedule) = make_test_state_with_validators(3);
-            state.set_host_seats(host_seats.iter().copied().map(ValidatorId::new));
+        let qc_formed = |attached: &[u64], arrived: LocalTimestamp| {
+            let (state, topology_schedule) = make_test_state_with_validators(3);
+            let mut state = attached
+                .iter()
+                .fold(state, |state, &id| state.signed_by(ValidatorId::new(id)));
             state.set_time(formed_at);
             state.committed_height = BlockHeight::new(3);
             state.verification.on_block_persisted(BlockHeight::new(3));
@@ -22802,7 +22984,7 @@ mod tests {
         assert!(!recipients.contains(&state.sole_signer()));
     }
 
-    /// A vnode that finished bootstrap sync before its committee window
+    /// A replica that finished bootstrap sync before its committee window
     /// opened missed the sync-complete emission (the head committee
     /// didn't include it yet). The beacon commit that activates the
     /// window must re-fire the signal — without this the flag only
@@ -23205,7 +23387,7 @@ mod tests {
     /// replica drops it and syncs the body the header commits.
     #[test]
     fn a_certified_header_beside_a_forged_body_is_not_certified() {
-        let (mut state, _schedule) = make_test_state();
+        let (mut state, schedule) = make_test_state();
         let parent = BlockHash::from_raw(Hash::from_bytes(b"forged body parent"));
         let genuine = block_chained_on(BlockHeight::new(2), parent, 1_500);
         let Block::Live {
@@ -23241,7 +23423,11 @@ mod tests {
         let qc = make_test_qc(block_hash, genuine.height());
 
         install_complete_block(&mut state, &forged);
-        let actions = state.on_qc_result(block_hash, Some(qc.clone()), vec![]);
+        let binding = state.votes.bind(
+            forged.header(),
+            schedule.head().consensus_committee_for_shard(ShardId::ROOT),
+        );
+        let actions = state.on_qc_result(block_hash, binding, Some(qc.clone()), vec![]);
 
         assert!(
             !actions
@@ -23265,7 +23451,7 @@ mod tests {
         );
 
         install_complete_block(&mut state, &genuine);
-        let actions = state.on_qc_result(block_hash, Some(qc), vec![]);
+        let actions = state.on_qc_result(block_hash, binding, Some(qc), vec![]);
         let attached = actions.iter().find_map(|a| match a {
             Action::AttachCertifiedUncommitted { certified } => Some(certified),
             _ => None,
@@ -26107,7 +26293,7 @@ mod tests {
         chain: Loop,
         voter: HeldAnswers,
         /// A second chain diverging from the voter's: the store follows
-        /// it while the voter commits its own, until the seat rebuilds.
+        /// it while the voter commits its own, until the replica rebuilds.
         fork: Option<BTreeMap<SubstateKey, Vec<u8>>>,
         resolved: u32,
         at_parents: u32,
@@ -26133,7 +26319,7 @@ mod tests {
             }
         }
 
-        /// A successor's seat at its genesis over `under`: every flush
+        /// A successor's replica at its genesis over `under`: every flush
         /// landed, and one whole read seeds a fresh voter.
         fn reseat(&mut self, under: NibblePath, consumers: Vec<Address>) {
             self.chain.flush(usize::MAX);
@@ -26246,7 +26432,7 @@ mod tests {
     /// store stands above them, flushes landing inside a whole read,
     /// restarts, a split and a merge of the consumer, producers on every
     /// lineage of the trie, and a store that followed another fork until
-    /// the seat rebuilt onto it. The count at a pending parent equals
+    /// the replica rebuilt onto it. The count at a pending parent equals
     /// the read of what that parent leaves, and the count resolves at
     /// most commits.
     #[test]
@@ -26360,9 +26546,8 @@ mod tests {
 
     /// The committed blocks a voter holds deltas for are those above the
     /// newest persist: a block sync of thousands of blocks, its persists
-    /// carrying a count or none, never holds more, and a co-hosted seat
-    /// replaying below its loop's persisted head records nothing until it
-    /// passes it.
+    /// carrying a count or none, never holds more, and a replica replaying
+    /// below its loop's persisted head records nothing until it passes it.
     #[test]
     fn the_committed_answer_map_stays_within_the_unpersisted_run() {
         let from = BlockHash::from_raw(Hash::from_bytes(b"synced tip"));
@@ -28435,8 +28620,9 @@ mod tests {
         assert_eq!(state.view(), view);
     }
 
-    /// A not-yet-ready signer's ready signal names its co-hosted proposer
-    /// among the recipients, and the replica's pool takes it from there.
+    /// A not-yet-ready signer's ready signal is fed back to its replica,
+    /// whose other signer proposes, rather than sent to that signer over
+    /// the network, and the replica's pool takes it.
     #[test]
     fn a_co_hosted_proposer_pools_its_siblings_ready_signal() {
         let (mut state, _) = make_test_state();
@@ -28450,23 +28636,26 @@ mod tests {
                 Action::SignAndBroadcastReadySignal {
                     signer,
                     recipients,
+                    local_recipient,
                     wt_window_start,
                     wt_window_end,
                     ..
                 } => Some((
                     *signer,
                     recipients.clone(),
+                    *local_recipient,
                     *wt_window_start,
                     *wt_window_end,
                 )),
                 _ => None,
             })
             .collect();
-        let [(signer, recipients, start, end)] = signals.as_slice() else {
+        let [(signer, recipients, local_recipient, start, end)] = signals.as_slice() else {
             panic!("only the not-ready signer signals; got {actions:?}");
         };
         assert_eq!(*signer, ValidatorId::new(0));
-        assert!(recipients.contains(&ValidatorId::new(1)));
+        assert!(*local_recipient, "the sibling's pool takes it here");
+        assert!(!recipients.contains(&ValidatorId::new(1)));
         assert!(!recipients.contains(signer));
 
         let signal = ReadySignal::sign(
@@ -28925,6 +29114,96 @@ mod tests {
             AnswerAdditions::default(),
         );
         assert_eq!(voters(&actions), ids(&[1]), "{actions:?}");
+    }
+
+    /// The committee on one-second windows a halt recovery replaces, and
+    /// the one it seats: `[0, 1, 2, 3]` governs every window of the first
+    /// schedule; the second is the fold that seated the recovery at epoch
+    /// 100, `[0, 1, 2, 7]` governing from its bridge at 101. Round 2's
+    /// proposer is validator 2 under both.
+    fn before_and_after_a_seated_halt_recovery() -> (TopologySchedule, TopologySchedule) {
+        use hyperscale_types::ShardRecovery;
+
+        let keys: Vec<BlsSigner> = (0..8).map(|_| BlsSigner::generate()).collect();
+        let committee = |members: &[u64]| {
+            let validators = members
+                .iter()
+                .map(|&id| ValidatorInfo {
+                    validator_id: ValidatorId::new(id),
+                    public_key: keys[usize::try_from(id).expect("fits")].public_key(),
+                })
+                .collect();
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators),
+            )
+        };
+        let halted = Arc::new(committee(&[0, 1, 2, 3]));
+        let fresh = Arc::new(
+            committee(&[0, 1, 2, 7]).with_pending_recoveries(
+                std::iter::once((
+                    ShardId::ROOT,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at: Epoch::new(100),
+                        retained: ids(&[3]),
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                ))
+                .collect(),
+            ),
+        );
+        let mut before = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
+        let mut after = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
+        for epoch in 1..=110 {
+            before.insert(Epoch::new(epoch), Arc::clone(&halted));
+            let seated = if epoch < 101 { &halted } else { &fresh };
+            after.insert(Epoch::new(epoch), Arc::clone(seated));
+        }
+        before.set_head(halted);
+        after.set_head(fresh);
+        (before, after)
+    }
+
+    /// A retained replica holding the halted committee's uncertified
+    /// block at the view drops it once the fold seats the recovery, so a
+    /// fresh signer attached after does not vote it; the fresh
+    /// committee's own block at that round is voted.
+    #[test]
+    fn a_fresh_signer_on_a_retained_replica_does_not_vote_the_halted_committees_pending_block() {
+        let (mut state, _, parent) = unsigned_on_a_count(Some(StandingAnswers::default()));
+        let (halted, seated) = before_and_after_a_seated_halt_recovery();
+        let header = header_on(parent.hash(), 2, 99_000);
+        delivered(&mut state, &halted, &header);
+        assert_eq!(state.view(), header.round());
+        let judged = state_root_checked(
+            &mut state,
+            &halted,
+            header.hash(),
+            AnswerAdditions::default(),
+        );
+        assert!(!votes(&judged), "{judged:?}");
+        assert!(state.pending_blocks.contains_key(header.hash()));
+
+        state.set_time(LocalTimestamp::from_millis(101_500));
+        let _ = state.on_schedule_replaced(&halted, &seated);
+        let attached = attach_and_drain(&mut state, &seated, 7, None, Round::new(1));
+        assert!(voters(&attached).is_empty(), "{attached:?}");
+        assert!(!state.pending_blocks.contains_key(header.hash()));
+
+        let fresh = BlockHeader::new(BlockHeaderParts {
+            timestamp: ProposerTimestamp::from_millis(101_400),
+            ..header.into_parts()
+        });
+        delivered(&mut state, &seated, &fresh);
+        let actions = state_root_checked(
+            &mut state,
+            &seated,
+            fresh.hash(),
+            AnswerAdditions::default(),
+        );
+        assert_eq!(voters(&actions), ids(&[7]), "{actions:?}");
     }
 
     /// A signer attached to a store a forked rebuild replaced, which

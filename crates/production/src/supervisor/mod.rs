@@ -3,20 +3,20 @@
 //! [`ShardSupervisor`] owns every pinned shard thread after startup and
 //! executes membership changes off those threads (a thread can't safely
 //! spawn or join its siblings): a [`ShardCommand::Join`] opens the
-//! shard's storage, builds its vnode state machines from the host's
-//! beacon chain, wires the process-scoped maps via
-//! [`attach_shard`], and spawns the pinned thread; a
-//! [`ShardCommand::Leave`] releases one vnode's membership and tears
+//! shard's storage, builds its replica from the host's beacon chain with
+//! the joining validators attached as signers, wires the process-scoped
+//! maps via [`attach_shard`], and spawns the pinned thread; a
+//! [`ShardCommand::Leave`] detaches one validator's signer and tears
 //! the shard down — shutdown signal, thread join, map unwire, storage
-//! drop — only when the last local vnode leaves.
+//! drop — only when the last local validator leaves.
 //!
 //! Membership is refcounted per shard because a host runs several
-//! vnodes and `NodeHost` dedups shard participation: two co-hosted
-//! vnodes on one shard share storage and a thread, and a departing one
-//! must not tear the other down. A join for a shard already running
-//! seats its vnodes into that thread's loop over a [`ShardControl`]
-//! channel, and a vnode that loses its role in a shard that stays up
-//! leaves the loop the same way.
+//! validators and one replica per shard: two local validators on one
+//! shard are two signers on one replica, and a departing one must not
+//! tear the other down. A join for a shard already running attaches its
+//! validators to that thread's replica over a [`ShardControl`] channel,
+//! and a validator that loses its role in a shard that stays up is
+//! detached the same way.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -89,24 +89,24 @@ pub fn shard_data_dir(root: &Path, shard: ShardId) -> PathBuf {
 /// A runtime shard-membership change, executed by [`ShardSupervisor`].
 #[derive(Clone)]
 pub enum ShardCommand {
-    /// Begin hosting a shard with the given local vnodes. The first
+    /// Begin hosting a shard with the given local validators. The first
     /// join for a shard brings up storage, thread, and subscriptions;
-    /// a join for a shard already running seats the vnodes it does not
-    /// yet carry into its loop.
+    /// a join for a shard already running attaches the validators its
+    /// replica does not yet carry.
     Join {
         /// Shard to host.
         shard: ShardId,
-        /// Local vnodes participating in the shard's consensus. Every
+        /// Local validators participating in the shard's consensus. Every
         /// entry's `local_shard` must equal `shard`.
         vnodes: Vec<VnodeConfig>,
     },
-    /// Release one local vnode's membership in `shard`. The shard's
+    /// Release one local validator's membership in `shard`. The shard's
     /// thread, subscriptions, and storage are torn down when the last
-    /// local vnode leaves.
+    /// local validator leaves.
     Leave {
         /// Shard to release the membership of.
         shard: ShardId,
-        /// The vnode leaving it.
+        /// The validator leaving it.
         validator: ValidatorId,
     },
 }
@@ -120,7 +120,7 @@ pub enum SupervisorEvent {
     Opened {
         /// Shard the join targets.
         shard: ShardId,
-        /// The join's vnodes, threaded through the open.
+        /// The join's validators, threaded through the open.
         vnodes: Vec<VnodeConfig>,
         /// The opened storage and its recovered state, or the open
         /// failure.
@@ -134,11 +134,11 @@ pub enum SupervisorEvent {
     Rebuilt(Result<CompletedBootstrap, ShardId>, Replaced),
     /// A reshape orchestrator io result settled.
     Reshape(ReshapeIo),
-    /// A shard loop admitted a queued seat.
-    Seated {
-        /// Shard whose loop seated it.
+    /// A shard loop attached a validator to its replica.
+    Attached {
+        /// Shard whose replica it attached to.
         shard: ShardId,
-        /// The validator now seated there.
+        /// The validator now attached there.
         validator: ValidatorId,
     },
     /// A shard loop's store needs a height beneath every serving peer's
@@ -161,7 +161,7 @@ pub enum SupervisorEvent {
     TornDown {
         /// Shard whose thread exited.
         shard: ShardId,
-        /// The departed vnodes' validator ids, for the RPC scrub.
+        /// The departed validators' ids, for the RPC scrub.
         validator_ids: Vec<u64>,
     },
 }
@@ -192,13 +192,14 @@ pub struct Registering {
 struct ShardThread {
     join: std::thread::JoinHandle<()>,
     shutdown_tx: Sender<()>,
-    /// Seat changes into the running loop.
+    /// Signer changes into the running loop.
     control_tx: Sender<ShardControl>,
-    /// Validators whose seat was sent to the loop and not yet admitted.
+    /// Validators whose attach was sent to the loop and not yet reported
+    /// back.
     queued: Vec<u64>,
-    /// Hosted vnodes' validator ids. The shard tears down when the last
-    /// leaves, and teardown scrubs their slots from the validator-keyed
-    /// RPC state maps.
+    /// The ids of the validators attached to the shard's replica. The
+    /// shard tears down when the last leaves, and teardown scrubs their
+    /// slots from the validator-keyed RPC state maps.
     validator_ids: Vec<u64>,
 }
 
@@ -233,8 +234,8 @@ pub struct ShardSupervisor {
     shards: BTreeMap<ShardId, ShardThread>,
     /// Shards whose join is parked on background work — the off-loop
     /// storage open or an in-flight snap-sync bootstrap — mapped to the
-    /// vnodes still pending. Guards against a second `Join` racing a
-    /// double import; a `Leave` meanwhile releases its vnode, abandoning
+    /// validators still pending. Guards against a second `Join` racing a
+    /// double import; a `Leave` meanwhile releases its validator, abandoning
     /// the join when none is left.
     bootstrapping: HashMap<ShardId, BTreeSet<ValidatorId>>,
     /// Running shards rebuilding at their attested anchor, after a fork
@@ -301,7 +302,7 @@ pub struct ShardSupervisor {
     /// Seats whose chain is registering with the beacon loop, by seat
     /// number, built and spawned once the registration comes back. A
     /// shard has at most one, and while it does its `bootstrapping` entry
-    /// holds the seat's pending vnodes.
+    /// holds the seat's pending validators.
     registering: BTreeMap<u64, Registering>,
     /// How many seats have registered, numbering each so its reply is
     /// matched to the seat that sent it.
@@ -388,7 +389,7 @@ impl ShardSupervisor {
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
             SupervisorEvent::Rebuilt(done, replaced) => self.on_rebuilt(done, replaced),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
-            SupervisorEvent::Seated { shard, validator } => self.on_seated(shard, validator),
+            SupervisorEvent::Attached { shard, validator } => self.on_attached(shard, validator),
             SupervisorEvent::Reseat { shard } => self.reseat(shard),
             SupervisorEvent::Registered {
                 shard,
@@ -411,7 +412,7 @@ impl ShardSupervisor {
     /// and beacon timers and latches a proposal attempt; the restore also
     /// replays what execution owes from the recovered chain. A loop whose
     /// committee has no member elsewhere hears nothing to start it, so
-    /// without this its vnodes never propose or time out.
+    /// without this its signers never propose or time out.
     pub(crate) fn start_loop(
         &mut self,
         mut shard_loop: ProdShardLoop,
@@ -426,11 +427,7 @@ impl ShardSupervisor {
         let shard = shard_loop.shard;
         let shutdown_tx = channels.shutdown_tx.clone();
         let control_tx = channels.control_tx.clone();
-        let validator_ids = shard_loop
-            .vnodes
-            .iter()
-            .map(|v| v.validator_id.inner())
-            .collect();
+        let validator_ids = shard_loop.signers().map(ValidatorId::inner).collect();
         let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
         self.shards.insert(

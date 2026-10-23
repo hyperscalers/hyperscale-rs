@@ -1,7 +1,7 @@
 //! Serving-side access to shard state pinned at epoch boundaries.
 //!
 //! A serving shard member pins its committed state at recent epoch
-//! boundary blocks so a joining vnode can snap-sync against the
+//! boundary blocks so a joining host can snap-sync against the
 //! beacon-attested boundary `state_root` while the live store keeps
 //! committing and garbage-collecting. The pinning mechanics are the
 //! backend's business — `RocksDB` uses hard-link checkpoints, the
@@ -483,7 +483,7 @@ pub trait BoundaryStore {
     /// The read frontier `shard`'s slice of the committed state holds:
     /// [`load_read_frontier`](crate::load_read_frontier) over the store,
     /// read the same way however the store was reached, since the table
-    /// is state and the state is what every seat imports.
+    /// is state and the state is what every replica imports.
     fn read_frontier(&self, shard: ShardId) -> ReadFrontier;
 
     /// The tick membership `shard`'s slice of the committed state holds:

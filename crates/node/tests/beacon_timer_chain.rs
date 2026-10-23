@@ -7,12 +7,9 @@
 //! `BeaconRatifyTrigger`) the moment the host runs it. Without the chain,
 //! a validator adopts beacon blocks by gossip but never proposes, never
 //! drives SPC rounds, and never casts ratify votes; enough of them in one
-//! ratify pool starves the pool quorum and parks the beacon. A shard seat
-//! arms no beacon timer: its validator's chain runs on its participant.
-//!
-//! Vnodes co-hosted on one shard loop arm the same timers against their
-//! own deadlines, so each seat's timers are its own: a seat's arm never
-//! replaces a sibling's, and a seat's fire reaches that seat alone.
+//! ratify pool starves the pool quorum and parks the beacon. A shard
+//! replica arms no beacon timer: its signers' chains run on their
+//! participants.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,7 +25,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::{NodeConfig, NodeHost, SeatConfig, TimerOp, TimerOwner, timer_event};
+use hyperscale_node::{HostedChain, NodeConfig, NodeHost, ReplicaConfig, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -110,9 +107,9 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    /// How the host builds its vnodes and its fold.
-    fn seat_config(&self) -> SeatConfig {
-        SeatConfig {
+    /// How the host builds its replicas and its fold.
+    fn replica_config(&self) -> ReplicaConfig {
+        ReplicaConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: Arc::new(StubVmStatics),
             code: Arc::new(AllCodeRuns),
@@ -129,9 +126,9 @@ impl Fixture {
         (self.committee.validator_id(idx), self.committee.signer(idx))
     }
 
-    /// Seat `committee[idx]` for each of `idxs` on `shard` at runtime,
-    /// through the real seating seam — the runtime-join construction, not
-    /// the genesis ceremony.
+    /// Run `shard` at runtime with `committee[idx]` attached for each of
+    /// `idxs`, through the real seating seam — the runtime-join
+    /// construction, not the genesis ceremony.
     fn seat(
         &self,
         host: &mut NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>,
@@ -140,11 +137,13 @@ impl Fixture {
     ) {
         let (event_tx, _event_rx) = unbounded::<HostEvent>();
         host.add_shard(
-            shard,
-            self.seat_config(),
-            &RecoveredState::default(),
-            idxs.iter().map(|&idx| self.identity(idx)).collect(),
-            SimShardStorage::new(shard_prefix_path(shard)),
+            &self.replica_config(),
+            HostedChain {
+                shard,
+                storage: SimShardStorage::new(shard_prefix_path(shard)),
+                recovered: &RecoveredState::default(),
+                signers: idxs.iter().map(|&idx| self.identity(idx)).collect(),
+            },
             event_tx,
         );
     }
@@ -164,7 +163,7 @@ impl Fixture {
         let network = SimNetworkAdapter::new(Arc::clone(&registry));
         let (event_tx, event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            self.seat_config(),
+            self.replica_config(),
             Vec::new(),
             vec![self.identity(idx)],
             Arc::clone(&self.beacon_storage),
@@ -231,7 +230,7 @@ fn follower_seat_arms_the_startup_timers() {
     );
 }
 
-/// A vnode group seated mid-life arms no beacon timer at its resume: its
+/// A replica taken up mid-life arms no beacon timer at its resume: its
 /// validator's beacon chain runs on its participant, which the seat does
 /// not touch, so a second chain for the same identity never starts.
 #[test]
@@ -316,37 +315,4 @@ fn ratify_vote_gossip_routes_to_the_beacon_loop() {
     );
     // The beacon loop folds it without treating it as unexpected.
     let _ = host.step(event);
-}
-
-/// The owners of every `Set` for timer `want` in `ops`.
-fn set_owners(ops: &[TimerOp], want: &TimerId) -> Vec<TimerOwner> {
-    ops.iter()
-        .filter_map(|op| match op {
-            TimerOp::Set { owner, id, .. } if id == want => Some(*owner),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Two vnodes seated together on one shard loop each own their timers:
-/// a fire reaches only the seat that armed it, and its re-arm is that
-/// seat's alone. Keyed by the loop alone, a later arm replaced an earlier
-/// one: a co-hosted proposer paced past a sibling's shorter deadline was
-/// woken early, found itself still paced, and was never woken again.
-#[test]
-fn co_hosted_seats_own_their_timers() {
-    let fix = fixture();
-    let (mut host, _registry, _host_rx) = fix.follower_host(2);
-    fix.seat(&mut host, &[0, 1], SHARD_A);
-    host.set_time(LocalTimestamp::from_millis(1_000));
-    for idx in [0, 1] {
-        let seat = TimerOwner::Seat(SHARD_A, fix.committee.validator_id(idx));
-        let out = host.step(timer_event(&TimerId::Cleanup, seat));
-        let owners = set_owners(&out.timer_ops, &TimerId::Cleanup);
-        assert!(
-            !owners.is_empty() && owners.iter().all(|owner| *owner == seat),
-            "a seat's fire must reach that seat alone: got {:?}",
-            out.timer_ops,
-        );
-    }
 }

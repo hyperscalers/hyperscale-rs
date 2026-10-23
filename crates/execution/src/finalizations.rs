@@ -25,9 +25,10 @@
 //! already holds.
 //!
 //! Held behind an `RwLock` so an `Arc<FinalizationStore>` can be shared
-//! across every same-shard vnode's `ExecutionCoordinator`. In practice
-//! the pinned thread serializes every write, so the lock never contends
-//! — it exists to satisfy the type system around shared mutability.
+//! between the replica's `ExecutionCoordinator` and the shard loop's
+//! request-serving caches. In practice the pinned thread serializes
+//! every write, so the lock never contends — it exists to satisfy the
+//! type system around shared mutability.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};

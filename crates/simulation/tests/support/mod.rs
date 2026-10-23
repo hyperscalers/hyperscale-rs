@@ -129,6 +129,6 @@ pub fn committee_member_host(
     members
         .iter()
         .map(|m| (runner.network().validator_to_node(*m), *m))
-        .find(|(node, _)| except != Some(*node) && runner.vnode_state_in(*node, shard).is_some())
+        .find(|(node, _)| except != Some(*node) && runner.replica_in(*node, shard).is_some())
         .expect("a current member of the shard is hosted")
 }

@@ -108,6 +108,10 @@ pub struct SimCluster {
     /// only at a topology step, so re-reading them after each one cuts
     /// every send a joining host makes.
     member_rules: Vec<MemberRule>,
+    /// Whether the run is the dedicated-host oracle: one identity per
+    /// host, checked after every rehome and every slice. A run that
+    /// co-hosts by design leaves it through [`Self::co_host_by_design`].
+    one_identity_per_host: bool,
 }
 
 impl Drop for SimCluster {
@@ -250,8 +254,9 @@ impl SimCluster {
     /// need: they follow a vnode onto a host not already serving the
     /// destination shard, and a host whose only occupant is a beacon-loop
     /// follower.
-    /// A vnode drawn onto a host already serving its shard seats into the
-    /// running loop instead, which `co_hosted_seat` covers. Portable
+    /// A validator drawn onto a host already serving its shard attaches
+    /// as a signer to the running replica instead, which `co_hosted_seat`
+    /// covers. Portable
     /// scenarios never need it — they express host packing through
     /// `vnodes_per_host` alone.
     #[must_use]
@@ -351,11 +356,41 @@ impl SimCluster {
         let mut runner = SimulationRunner::new(&sim_config, seed);
         runner.initialize_genesis();
 
-        Self {
+        let cluster = Self {
             runner,
             recorder: MemoryRecorder::new(),
             tuning,
             member_rules: Vec::new(),
+            one_identity_per_host: args.dedicated_pool_hosts && config.vnodes_per_host == 1,
+        };
+        cluster.assert_one_identity_per_host();
+        cluster
+    }
+
+    /// Leave the dedicated-host oracle: this run puts more than one
+    /// identity on a host on purpose.
+    pub const fn co_host_by_design(&mut self) {
+        self.one_identity_per_host = false;
+    }
+
+    /// On the dedicated-host oracle, no host runs more than one identity:
+    /// a beacon participant and a shard signer of one validator, at most.
+    /// On those layouts no host holds a quorum, so a validity input that
+    /// is not deterministic still splits replicas across hosts.
+    fn assert_one_identity_per_host(&self) {
+        if !self.one_identity_per_host {
+            return;
+        }
+        for host in 0..self.runner.num_hosts() {
+            let mut identities: BTreeSet<ValidatorId> =
+                self.runner.participants(host).into_iter().collect();
+            for shard in self.runner.hosted_shards_of(host) {
+                identities.extend(self.runner.signers_in(host, shard));
+            }
+            assert!(
+                identities.len() <= 1,
+                "host {host} runs {identities:?} on a one-identity-per-host run",
+            );
         }
     }
 
@@ -610,8 +645,8 @@ impl SimCluster {
     /// old hosts; those carry no current committee seat, so this filters
     /// them out.
     ///
-    /// Any of the host's vnodes on the shard, not its first: a host that
-    /// kept a lapsed member's vnode on the shard and took a pool
+    /// Any of the host's signers on the shard, not its first: a host that
+    /// kept a lapsed member's signer on the shard and took a pool
     /// validator's seat beside it holds one store for both, and that
     /// store is the committee's.
     fn live_committee_hosts(&self, shard: ShardId) -> Vec<NodeIndex> {
@@ -629,7 +664,7 @@ impl SimCluster {
         (0..self.runner.num_hosts())
             .filter(|&host| {
                 self.runner
-                    .seated_in(host, shard)
+                    .signers_in(host, shard)
                     .iter()
                     .any(|validator| committee.contains(validator))
             })
@@ -712,10 +747,10 @@ impl SimCluster {
         FaultHandle::new(move || handle.fired())
     }
 
-    /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode
-    /// order; empty when the host doesn't carry it.
+    /// Shard consensus statistics of `host`'s replica of `shard`, or
+    /// `None` when the host doesn't carry it.
     #[must_use]
-    pub fn shard_stats(&self, host: usize, shard: ShardId) -> Vec<ShardStats> {
+    pub fn shard_stats(&self, host: usize, shard: ShardId) -> Option<ShardStats> {
         self.runner.shard_stats(host_index(host), shard)
     }
 
@@ -758,7 +793,9 @@ impl SimCluster {
     /// Run `validator` on `host` from here on, if it holds no seat: its
     /// next placement seats there. Returns whether it moved.
     pub fn rehome(&mut self, validator: ValidatorId, host: usize) -> bool {
-        self.runner.rehome_validator(validator, host_index(host))
+        let moved = self.runner.rehome_validator(validator, host_index(host));
+        self.assert_one_identity_per_host();
+        moved
     }
 
     /// The host a submission of `tx` enters at: a member of the payer
@@ -862,6 +899,7 @@ impl Cluster for SimCluster {
             let next = (self.runner.now() + SLICE).min(deadline);
             self.runner.run_until(next);
             self.assert_beacon_cadence();
+            self.assert_one_identity_per_host();
             if cond(self) {
                 return true;
             }
@@ -897,7 +935,7 @@ impl Cluster for SimCluster {
     fn running_loops(&self, shard: ShardId) -> Vec<(Epoch, bool)> {
         (0..self.runner.num_hosts())
             .filter_map(|host| {
-                let replica = self.runner.vnode_state_in(host, shard)?;
+                let replica = self.runner.replica_in(host, shard)?;
                 let oldest = self.runner.oldest_retained_epoch(host)?;
                 let dissolved = replica.shard_coordinator().dissolved(replica.schedule());
                 Some((oldest, dissolved))
@@ -1155,8 +1193,9 @@ impl Cluster for SimCluster {
 }
 
 /// `shard`'s whole committed chain as the run archived it: every replica
-/// prunes beneath its chain floor, and a runtime seat's chain starts at its
-/// snap-sync anchor, so no one store answers for the whole history.
+/// prunes beneath its chain floor, and a replica built at runtime starts its
+/// chain at its snap-sync anchor, so no one store answers for the whole
+/// history.
 struct History<'a>(ArchivedChain<'a>);
 
 impl CommittedChain for History<'_> {

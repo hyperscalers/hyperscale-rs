@@ -938,20 +938,25 @@ impl RemoteHeaderCoordinator {
     }
 
     /// The highest contiguously-verified height for `shard` — the sync
-    /// frontier. The remote-header sync follows the lowest of these across
-    /// the seats it serves, not a header's own height, so an out-of-band
-    /// admission above the frontier never jumps the sync past a gap it must
-    /// still fetch. `None` if the shard isn't tracked.
+    /// frontier. The remote-header sync follows this, not a header's own
+    /// height, so an out-of-band admission above the frontier never jumps
+    /// the sync past a gap it must still fetch. `None` if the shard isn't
+    /// tracked.
     #[must_use]
     pub fn verified_frontier(&self, shard: ShardId) -> Option<BlockHeight> {
         self.expected.get(&shard).map(|e| e.last_verified_height)
     }
 
-    /// Every tracked shard with its [`Self::verified_frontier`].
-    pub fn verified_frontiers(&self) -> impl Iterator<Item = (ShardId, BlockHeight)> + '_ {
+    /// How far a sync of `shard` has to reach while a header verified
+    /// from it sits above the contiguous frontier, leaving a gap the sync
+    /// has to close. `None` when the frontier holds every verified header,
+    /// or the replica does not track the shard.
+    #[must_use]
+    pub fn gap_sync_target(&self, shard: ShardId) -> Option<BlockHeight> {
         self.expected
-            .iter()
-            .map(|(&shard, e)| (shard, e.last_verified_height))
+            .get(&shard)
+            .filter(|e| e.verified_tip > e.last_verified_height)
+            .map(ExpectedHeader::sync_target)
     }
 
     /// Get the in-flight count from the tip header of each remote shard.

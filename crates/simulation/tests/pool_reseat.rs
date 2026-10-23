@@ -79,7 +79,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
         "the drain keeps the participant"
     );
     assert!(
-        runner.vnode_state_in(node, leaf).is_none(),
+        runner.replica_in(node, leaf).is_none(),
         "the drained shards are gone from the host"
     );
 
@@ -115,7 +115,7 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
         "seating keeps the one participant it ran all along"
     );
     assert!(
-        runner.vnode_state_in(node, leaf).is_some(),
+        runner.replica_in(node, leaf).is_some(),
         "the validator is seated on the shard again"
     );
 }
@@ -210,7 +210,7 @@ fn a_join_before_the_first_crossing_seats_at_genesis() {
     runner.run_until(runner.now() + Duration::from_millis(1));
     let genesis = |host| {
         let coordinator = runner
-            .vnode_state_in(host, ShardId::ROOT)
+            .replica_in(host, ShardId::ROOT)
             .expect("the host runs ROOT")
             .shard_coordinator();
         (coordinator.committed_hash(), coordinator.jmt_root())

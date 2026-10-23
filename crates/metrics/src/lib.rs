@@ -98,25 +98,30 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Set the current block height gauge for a shard.
     fn set_block_height(&self, shard: u64, height: u64) {}
 
-    /// Set the current shard round gauge for one hosted vnode.
-    fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {}
+    /// Set the number of validators attached to a shard's replica.
+    fn set_attached_signers(&self, shard: u64, count: usize) {}
 
-    /// Set the view changes gauge (self-originated round advances) for one vnode.
-    fn set_view_changes(&self, shard: u64, validator_id: u64, count: u64) {}
+    /// Set the current shard round gauge for a shard's replica.
+    fn set_shard_round(&self, shard: u64, round: u64) {}
 
-    /// Set the view syncs gauge (rounds caught up to from peers) for one vnode.
-    fn set_view_syncs(&self, shard: u64, validator_id: u64, count: u64) {}
+    /// Set the view changes gauge (self-originated round advances) for a
+    /// shard's replica.
+    fn set_view_changes(&self, shard: u64, count: u64) {}
 
-    /// Set the mempool size gauge for one vnode.
-    fn set_mempool_size(&self, shard: u64, validator_id: u64, size: usize) {}
+    /// Set the view syncs gauge (rounds caught up to from peers) for a
+    /// shard's replica.
+    fn set_view_syncs(&self, shard: u64, count: u64) {}
 
-    /// Set the drain the committed tip records for one vnode, in the
-    /// units `MAX_UNSETTLED_TXS` bounds.
-    fn set_in_flight(&self, shard: u64, validator_id: u64, drain: u64) {}
+    /// Set the mempool size gauge for a shard's replica.
+    fn set_mempool_size(&self, shard: u64, size: usize) {}
 
-    /// Set whether one vnode's drain has reached its budget, which stops
-    /// both RPC admission and the proposer taking new transactions.
-    fn set_backpressure_active(&self, shard: u64, validator_id: u64, active: bool) {}
+    /// Set the drain the committed tip records for a shard's replica, in
+    /// the units `MAX_UNSETTLED_TXS` bounds.
+    fn set_in_flight(&self, shard: u64, drain: u64) {}
+
+    /// Set whether a shard's replica's drain has reached its budget, which
+    /// stops both RPC admission and the proposer taking new transactions.
+    fn set_backpressure_active(&self, shard: u64, active: bool) {}
 
     // ── Infrastructure ───────────────────────────────────────────────
 
@@ -514,21 +519,20 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     // ── Memory ────────────────────────────────────────────────────────
 
-    /// Set one collection-size readout for a coordinator on one vnode.
-    /// `family` names the coordinator ("shard", "exec", …), `field` the
-    /// readout within it.
-    fn set_vnode_memory_gauge(
+    /// Set one collection-size readout for a coordinator of one shard's
+    /// replica. `family` names the coordinator ("shard", "exec", …),
+    /// `field` the readout within it.
+    fn set_replica_memory_gauge(
         &self,
         family: MemoryFamily,
         field: &str,
         shard: u64,
-        validator_id: u64,
         value: usize,
     ) {
     }
 
     /// Set one collection-size readout for shard-scoped runner state,
-    /// which no single vnode owns.
+    /// which no coordinator owns.
     fn set_shard_memory_gauge(&self, field: &str, shard: u64, value: usize) {}
 }
 
@@ -687,40 +691,46 @@ pub fn set_block_height(shard: u64, height: u64) {
     recorder().set_block_height(shard, height);
 }
 
-/// Set the current shard round gauge for one hosted vnode.
+/// Set the number of validators attached to a shard's replica.
 #[inline]
-pub fn set_shard_round(shard: u64, validator_id: u64, round: u64) {
-    recorder().set_shard_round(shard, validator_id, round);
+pub fn set_attached_signers(shard: u64, count: usize) {
+    recorder().set_attached_signers(shard, count);
 }
 
-/// Set the view changes gauge for one hosted vnode.
+/// Set the current shard round gauge for a shard's replica.
 #[inline]
-pub fn set_view_changes(shard: u64, validator_id: u64, count: u64) {
-    recorder().set_view_changes(shard, validator_id, count);
+pub fn set_shard_round(shard: u64, round: u64) {
+    recorder().set_shard_round(shard, round);
 }
 
-/// Set the view syncs gauge for one hosted vnode.
+/// Set the view changes gauge for a shard's replica.
 #[inline]
-pub fn set_view_syncs(shard: u64, validator_id: u64, count: u64) {
-    recorder().set_view_syncs(shard, validator_id, count);
+pub fn set_view_changes(shard: u64, count: u64) {
+    recorder().set_view_changes(shard, count);
 }
 
-/// Set the mempool size gauge for one hosted vnode.
+/// Set the view syncs gauge for a shard's replica.
 #[inline]
-pub fn set_mempool_size(shard: u64, validator_id: u64, size: usize) {
-    recorder().set_mempool_size(shard, validator_id, size);
+pub fn set_view_syncs(shard: u64, count: u64) {
+    recorder().set_view_syncs(shard, count);
 }
 
-/// Set the drain the committed tip records for one hosted vnode.
+/// Set the mempool size gauge for a shard's replica.
 #[inline]
-pub fn set_in_flight(shard: u64, validator_id: u64, drain: u64) {
-    recorder().set_in_flight(shard, validator_id, drain);
+pub fn set_mempool_size(shard: u64, size: usize) {
+    recorder().set_mempool_size(shard, size);
 }
 
-/// Set whether one hosted vnode's drain has reached its budget.
+/// Set the drain the committed tip records for a shard's replica.
 #[inline]
-pub fn set_backpressure_active(shard: u64, validator_id: u64, active: bool) {
-    recorder().set_backpressure_active(shard, validator_id, active);
+pub fn set_in_flight(shard: u64, drain: u64) {
+    recorder().set_in_flight(shard, drain);
+}
+
+/// Set whether a shard's replica's drain has reached its budget.
+#[inline]
+pub fn set_backpressure_active(shard: u64, active: bool) {
+    recorder().set_backpressure_active(shard, active);
 }
 
 // ── Infrastructure ───────────────────────────────────────────────────
@@ -1200,16 +1210,11 @@ pub fn record_expected_tx_dropped() {
 
 // ── Memory ────────────────────────────────────────────────────────
 
-/// Set one collection-size readout for a coordinator on one vnode.
+/// Set one collection-size readout for a coordinator of one shard's
+/// replica.
 #[inline]
-pub fn set_vnode_memory_gauge(
-    family: MemoryFamily,
-    field: &str,
-    shard: u64,
-    validator_id: u64,
-    value: usize,
-) {
-    recorder().set_vnode_memory_gauge(family, field, shard, validator_id, value);
+pub fn set_replica_memory_gauge(family: MemoryFamily, field: &str, shard: u64, value: usize) {
+    recorder().set_replica_memory_gauge(family, field, shard, value);
 }
 
 /// Set one collection-size readout for shard-scoped runner state.

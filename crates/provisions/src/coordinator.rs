@@ -2501,7 +2501,7 @@ mod tests {
 
     /// Regression: under cross-shard packed hosting, the local-serve
     /// fall-through in `Network::request` re-routes a fetch through a
-    /// peer when the co-located vnode's local store has aged out the
+    /// peer when the co-located replica's local store has aged out the
     /// requested batch. Without the tombstone, that wire arrival lands
     /// in `on_state_provisions_received` past `pipeline.verified`'s
     /// `source_block_ts + RETENTION_HORIZON` eviction, sails through the

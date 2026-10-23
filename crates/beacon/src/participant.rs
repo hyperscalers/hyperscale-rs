@@ -150,7 +150,7 @@ pub struct BeaconParticipant {
 
     /// Per-epoch cache of committee members' `BeaconProposal`s.
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
-    /// reset on commit. Vnode-local — inbound fetch serving reads the
+    /// reset on commit. Participant-local — inbound fetch serving reads the
     /// driver's process-level cache, never this pool.
     pub(crate) proposal_pool: BeaconProposalPool,
 

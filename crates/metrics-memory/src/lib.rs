@@ -303,50 +303,34 @@ impl MetricsRecorder for MemoryRecorder {
         self.set("block_height", Some(&shard.to_string()), height as f64);
     }
 
-    fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {
-        self.set(
-            "shard_round",
-            Some(&format!("{shard}:{validator_id}")),
-            round as f64,
-        );
+    fn set_attached_signers(&self, shard: u64, count: usize) {
+        self.set("attached_signers", Some(&shard.to_string()), count as f64);
     }
 
-    fn set_view_changes(&self, shard: u64, validator_id: u64, count: u64) {
-        self.set(
-            "view_changes",
-            Some(&format!("{shard}:{validator_id}")),
-            count as f64,
-        );
+    fn set_shard_round(&self, shard: u64, round: u64) {
+        self.set("shard_round", Some(&shard.to_string()), round as f64);
     }
 
-    fn set_view_syncs(&self, shard: u64, validator_id: u64, count: u64) {
-        self.set(
-            "view_syncs",
-            Some(&format!("{shard}:{validator_id}")),
-            count as f64,
-        );
+    fn set_view_changes(&self, shard: u64, count: u64) {
+        self.set("view_changes", Some(&shard.to_string()), count as f64);
     }
 
-    fn set_mempool_size(&self, shard: u64, validator_id: u64, size: usize) {
-        self.set(
-            "mempool_size",
-            Some(&format!("{shard}:{validator_id}")),
-            size as f64,
-        );
+    fn set_view_syncs(&self, shard: u64, count: u64) {
+        self.set("view_syncs", Some(&shard.to_string()), count as f64);
     }
 
-    fn set_in_flight(&self, shard: u64, validator_id: u64, drain: u64) {
-        self.set(
-            "in_flight",
-            Some(&format!("{shard}:{validator_id}")),
-            drain as f64,
-        );
+    fn set_mempool_size(&self, shard: u64, size: usize) {
+        self.set("mempool_size", Some(&shard.to_string()), size as f64);
     }
 
-    fn set_backpressure_active(&self, shard: u64, validator_id: u64, active: bool) {
+    fn set_in_flight(&self, shard: u64, drain: u64) {
+        self.set("in_flight", Some(&shard.to_string()), drain as f64);
+    }
+
+    fn set_backpressure_active(&self, shard: u64, active: bool) {
         self.set(
             "backpressure_active",
-            Some(&format!("{shard}:{validator_id}")),
+            Some(&shard.to_string()),
             if active { 1.0 } else { 0.0 },
         );
     }

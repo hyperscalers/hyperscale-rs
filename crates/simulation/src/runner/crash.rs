@@ -21,8 +21,8 @@ use hyperscale_engine::Executor;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
-use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
-use hyperscale_node::{NodeHost, SeatConfig, StartupChain};
+use hyperscale_node::startup::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
+use hyperscale_node::{HostedChain, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
@@ -189,7 +189,7 @@ impl SimulationRunner {
             &self.packages,
             self.execution_mode,
         ));
-        let config = SeatConfig {
+        let config = ReplicaConfig {
             verifier: Arc::clone(&self.verifier),
             derivation: executor.derivation(),
             code: Arc::clone(&executor) as _,
@@ -216,11 +216,11 @@ impl SimulationRunner {
         let chains = seated
             .chains
             .iter()
-            .map(|(shard, store, recovered, vnodes)| StartupChain {
+            .map(|(shard, store, recovered, signers)| HostedChain {
                 shard: *shard,
                 storage: store.clone(),
                 recovered,
-                vnodes: vnodes.clone(),
+                signers: signers.clone(),
             })
             .collect();
         let restarted = NodeHost::new(
@@ -271,7 +271,7 @@ impl SimulationRunner {
             }
             h != host
         });
-        let local: ShardVnodes = self
+        let local: ShardSigners = self
             .homed_validators(host)
             .into_iter()
             .map(|validator| (validator, self.signer_of(validator)))
@@ -298,9 +298,9 @@ impl SimulationRunner {
             chains: Vec::new(),
             identities: local.clone(),
         };
-        for (shard, (store, vnodes)) in plan.resumed {
+        for (shard, (store, signers)) in plan.resumed {
             disk.remove(&shard);
-            seated.restore(shard, (*store).clone(), vnodes);
+            seated.restore(shard, (*store).clone(), signers);
         }
         let departed = departed_to_serve(
             &beacon_state.boundaries,
@@ -310,9 +310,9 @@ impl SimulationRunner {
             &routing,
             &local,
         );
-        for (shard, vnodes) in departed {
+        for (shard, signers) in departed {
             let store = disk.remove(&shard).expect("served only from disk");
-            seated.restore(shard, store, vnodes);
+            seated.restore(shard, store, signers);
         }
         for (shard, store) in disk {
             self.retained_storages.insert((host, shard), store);
@@ -335,15 +335,15 @@ impl SimulationRunner {
 struct Seated {
     /// Each store-backed chain: its shard, its store, the state the store
     /// recovered, and the validators it seats.
-    chains: Vec<(ShardId, SimShardStorage, RecoveredState, ShardVnodes)>,
+    chains: Vec<(ShardId, SimShardStorage, RecoveredState, ShardSigners)>,
     /// Every validator the host holds, each run as a beacon participant.
-    identities: ShardVnodes,
+    identities: ShardSigners,
 }
 
 impl Seated {
-    /// Seat `vnodes` on `shard` from what `store` recovers.
-    fn restore(&mut self, shard: ShardId, store: SimShardStorage, vnodes: ShardVnodes) {
+    /// Run `shard` with `signers` attached from what `store` recovers.
+    fn restore(&mut self, shard: ShardId, store: SimShardStorage, signers: ShardSigners) {
         let recovered = store.load_recovered_state(shard);
-        self.chains.push((shard, store, recovered, vnodes));
+        self.chains.push((shard, store, recovered, signers));
     }
 }

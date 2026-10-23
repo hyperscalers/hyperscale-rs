@@ -56,29 +56,34 @@ where
         self.process_block_sync_outputs(outputs);
     }
 
-    /// Handle `Action::SyncBlockApplied`: the height is in the chain
-    /// state of the vnode at `vnode_idx`, with its commit pending. Once
-    /// every seat holds it, the FSM holds it out of the window and may
-    /// report the sync complete.
-    pub(crate) fn process_sync_block_applied(&mut self, vnode_idx: usize, height: BlockHeight) {
-        let seat = self.vnode(vnode_idx).validator_id;
-        self.io.consensus.seat_frontiers.applied(seat, height);
-        self.follow_slowest_block_sync_seat();
+    /// Handle `Action::SyncBlockApplied`: the height is in the replica's
+    /// chain state with its commit pending. The FSM holds it out of the
+    /// window and may report the sync complete.
+    pub(crate) fn process_sync_block_applied(&mut self, height: BlockHeight) {
+        let outputs = self
+            .io
+            .consensus
+            .block_sync
+            .handle(BlockSyncInput::Applied { scope: (), height });
+        self.process_block_sync_outputs(outputs);
     }
 
-    /// Handle `Action::ReopenSyncHeight`: the block the vnode at
-    /// `vnode_idx` applied at `height` has a certified sibling, `hash`,
-    /// that is committing instead. The FSM fetches the height again, and
-    /// the fetch names `hash`: this host's own store still answers the
-    /// height with the block it applied.
-    pub(crate) fn process_reopen_sync_height(
-        &mut self,
-        vnode_idx: usize,
-        height: BlockHeight,
-        hash: BlockHash,
-    ) {
-        let seat = self.vnode(vnode_idx).validator_id;
-        self.io.consensus.seat_frontiers.reopened(seat, height);
+    /// Feed the FSM a height the commit pipeline accepted.
+    pub(crate) fn admit_committed_height(&mut self, height: BlockHeight) {
+        let outputs = self
+            .io
+            .consensus
+            .block_sync
+            .handle(BlockSyncInput::Admitted { scope: (), height });
+        self.process_block_sync_outputs(outputs);
+    }
+
+    /// Handle `Action::ReopenSyncHeight`: the block the replica applied at
+    /// `height` has a certified sibling, `hash`, that is committing
+    /// instead. The FSM fetches the height again, and the fetch names
+    /// `hash`: this host's own store still answers the height with the
+    /// block it applied.
+    pub(crate) fn process_reopen_sync_height(&mut self, height: BlockHeight, hash: BlockHash) {
         self.io.consensus.block_sync.name_block(height, hash);
         let outputs = self
             .io
@@ -328,12 +333,11 @@ where
             .boundary(self.shard)
             .map(|anchor| anchor.height);
         attested.unwrap_or_else(|| {
-            self.vnodes
-                .first()
-                .and_then(|vnode| {
-                    let origin = vnode.state.shard_coordinator().chain_origin();
-                    origin.genesis_height.prev()
-                })
+            self.replica
+                .shard_coordinator()
+                .chain_origin()
+                .genesis_height
+                .prev()
                 .unwrap_or(BlockHeight::GENESIS)
         })
     }

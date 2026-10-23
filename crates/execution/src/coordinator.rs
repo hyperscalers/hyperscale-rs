@@ -455,10 +455,8 @@ pub struct ExecutionCoordinator {
     /// Finalizations ready for block inclusion, keyed by
     /// `TickId`. Terminal-state lookup surface for tick-id fetches,
     /// tx-membership queries, and proposal building. Held behind an
-    /// `Arc` and shared across same-shard `ExecutionCoordinator`s so
-    /// `IoLoop`'s sync-inventory bloom and elided-block rehydration read
-    /// from one canonical store per shard rather than vnode-0's
-    /// incidentally-convergent copy.
+    /// `Arc` shared with the shard loop's caches, so its sync-inventory
+    /// bloom and elided-block rehydration read this same store.
     finalized: Arc<FinalizationStore>,
 
     /// Current committed height for pruning stale entries.
@@ -638,9 +636,10 @@ pub struct ExecutionCoordinator {
     outbound_certs: OutboundExecutionCertificateTracker,
 
     /// Aggregated local-shard execution certificates awaiting block commit,
-    /// behind an `Arc` so same-shard vnodes share one map. A late vote for
-    /// a held tick is answered with its certificate, and a retransmitted
-    /// certificate already held is not verified again. Populated on local aggregation and on verifying a complete
+    /// behind an `Arc` the shard loop's request serving shares. A late
+    /// vote for a held tick is answered with its certificate, and a
+    /// retransmitted certificate already held is not verified again.
+    /// Populated on local aggregation and on verifying a complete
     /// local-shard EC received via broadcast; evicted in
     /// `remove_finalization` once the containing block commits.
     exec_certs: Arc<ExecCertStore>,
@@ -687,10 +686,9 @@ pub struct ExecutionCoordinator {
 
 impl ExecutionCoordinator {
     /// Create a new execution state machine with its own fresh stores, a
-    /// genesis commit frontier and no signer. For hosts running multiple
-    /// same-shard validators, prefer [`Self::with_shared_stores`] to share
-    /// one set of stores across every coordinator in the shard; for a
-    /// recovered chain, it also seeds the frontier from storage.
+    /// genesis commit frontier and no signer. [`Self::with_shared_stores`]
+    /// takes stores the caller also holds, as the shard loop's caches do,
+    /// and for a recovered chain seeds the frontier from storage.
     #[must_use]
     pub fn new(local_shard: ShardId, code: Arc<dyn CodeAvailability>) -> Self {
         Self::with_shared_stores(
@@ -702,14 +700,14 @@ impl ExecutionCoordinator {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
     }
 
     /// Create a new execution state machine sharing both externally-owned
-    /// `ExecCertStore` and `FinalizationStore`. Same-shard vnodes share
-    /// one set of stores so the `IoLoop`'s inbound fetch handler and
-    /// sync-inventory bloom read from a single canonical view per shard
-    /// rather than vnode-0's incidentally-convergent copy.
+    /// `ExecCertStore` and `FinalizationStore`. The shard loop holds the
+    /// same stores, so its inbound fetch handler and sync-inventory bloom
+    /// read what this coordinator writes.
     ///
     /// The commit-frontier scalars seed from where execution's own
     /// account resumes, which is not where consensus's does: a restart
@@ -726,6 +724,11 @@ impl ExecutionCoordinator {
     /// differently from its peers and split execution votes. A seeded
     /// frontier also gives pre-first-commit bookkeeping a real clock
     /// instead of a zero one.
+    ///
+    /// `persisted_base` is how far the store under the replica's tick
+    /// chain is written: the store's tree version. Each tick waits until
+    /// the base it reads is written, and nothing reports a write the
+    /// store already holds.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn with_shared_stores(
@@ -737,6 +740,7 @@ impl ExecutionCoordinator {
         finalized: Arc<FinalizationStore>,
         proven_anchors: Arc<ProvenAnchors>,
         mirror: Arc<CounterpartMirror>,
+        persisted_base: BlockHeight,
     ) -> Self {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
@@ -780,7 +784,7 @@ impl ExecutionCoordinator {
             pending_ticks: VecDeque::new(),
             held: BTreeMap::new(),
             code,
-            persisted: BlockHeight::GENESIS,
+            persisted: persisted_base,
             tick_in_flight: false,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
@@ -839,17 +843,30 @@ impl ExecutionCoordinator {
             else {
                 continue;
             };
+            let (recipients, local_recipient) =
+                self.addressed(vec![tick_leader(tick_id, &committee)]);
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash: tick.block_hash(),
                 vote_anchor_ts,
                 tick_id: *tick_id,
                 global_receipt_root,
                 tx_outcomes,
-                recipients: vec![tick_leader(tick_id, &committee)],
+                recipients,
+                local_recipient,
                 signer,
             });
         }
         actions
+    }
+
+    /// Split a vote's `recipients` into the ones it is sent to over the
+    /// network and whether a signer of this replica is among them, which
+    /// takes the vote here: one replica tallies for every signer it holds.
+    fn addressed(&self, recipients: Vec<ValidatorId>) -> (Vec<ValidatorId>, bool) {
+        let (local, peers): (Vec<ValidatorId>, Vec<ValidatorId>) = recipients
+            .into_iter()
+            .partition(|recipient| self.signers.contains(recipient));
+        (peers, !local.is_empty())
     }
 
     /// Detach `signer`: no vote is signed for it from here on.
@@ -879,16 +896,15 @@ impl ExecutionCoordinator {
 
     /// Reference to the shared finalization store. The `io_loop`
     /// clones this `Arc` into its `SharedCaches` so sync-inventory
-    /// blooms and elided-block rehydration read from a single canonical
-    /// per-shard store rather than vnode-0's incidentally-convergent
-    /// copy.
+    /// blooms and elided-block rehydration read this coordinator's own
+    /// store.
     #[must_use]
     pub const fn finalization_store(&self) -> &Arc<FinalizationStore> {
         &self.finalized
     }
 
     /// The slot this coordinator's crossing questions read from, shared
-    /// by the vnode group: the host binds it to the shard's chain once
+    /// with the shard loop: the host binds it to the shard's chain once
     /// the chain is open.
     #[must_use]
     pub const fn crossing_index(&self) -> &Arc<CrossingIndexSlot> {
@@ -896,17 +912,10 @@ impl ExecutionCoordinator {
     }
 
     /// Reference to the shared execution-certificate store, which the
-    /// host shares with every vnode of this shard.
+    /// shard loop's request serving also reads.
     #[must_use]
     pub const fn exec_cert_store(&self) -> &Arc<ExecCertStore> {
         &self.exec_certs
-    }
-
-    /// Record that the settled base this seat reads carries `height`,
-    /// as the store stood when the seat joined its loop. Nothing is
-    /// queued that early, so there is no tick to release.
-    pub fn seat_on_persisted_base(&mut self, height: BlockHeight) {
-        self.persisted = self.persisted.max(height);
     }
 
     /// Record that the settled base now carries `height`, and dispatch
@@ -1818,6 +1827,7 @@ impl ExecutionCoordinator {
                     tx_outcomes: Arc::clone(&tx_outcomes),
                 },
             );
+            let (recipients, local_recipient) = self.addressed(vec![leader]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
                 actions.push(Action::SignAndSendExecutionVote {
                     block_hash: completion.block_hash,
@@ -1825,7 +1835,8 @@ impl ExecutionCoordinator {
                     tick_id: completion.tick_id,
                     global_receipt_root: completion.global_receipt_root,
                     tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: vec![leader],
+                    recipients: recipients.clone(),
+                    local_recipient,
                     signer,
                 });
             }
@@ -2279,8 +2290,8 @@ impl ExecutionCoordinator {
                     .collect()
             });
 
-        // Hold the cert until the containing block commits, for late voters
-        // and same-shard vnodes.
+        // Hold the cert until the containing block commits, for late
+        // voters.
         self.exec_certs.insert(Arc::clone(certificate));
         self.ticks.clear_vote_retry(tick_id);
 
@@ -2391,12 +2402,11 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let shard = cert.shard_id();
 
-        // Cached-verified short-circuit. `exec_certs` is shared across
-        // same-shard vnodes (one `Arc<ExecCertStore>` per shard), so a
-        // peer vnode's aggregation makes this EC available to ours
-        // before the gossip arrives. A wire-hash match against the
-        // cached entry means this is the same aggregation we already
-        // verified and routed; a mismatch is a different aggregation
+        // Cached-verified short-circuit. This replica's own aggregation,
+        // or an earlier verification, makes this EC available before the
+        // gossip arrives. A wire-hash match against the cached entry
+        // means this is the same aggregation we already verified and
+        // routed; a mismatch is a different aggregation
         // of the same logical EC and still needs its own signature check.
         if let Some(cached) = self.exec_certs.get(cert.tick_id())
             && cached.wire_hash() == cert.wire_hash()
@@ -2943,7 +2953,8 @@ impl ExecutionCoordinator {
                     tx_outcomes: Arc::clone(&tx_outcomes),
                 },
             );
-            let leader = tick_leader(&tick_id, &committee);
+            let (recipients, local_recipient) =
+                self.addressed(vec![tick_leader(&tick_id, &committee)]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
                 actions.push(Action::SignAndSendExecutionVote {
                     block_hash,
@@ -2951,7 +2962,8 @@ impl ExecutionCoordinator {
                     tick_id,
                     global_receipt_root,
                     tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: vec![leader],
+                    recipients: recipients.clone(),
+                    local_recipient,
                     signer,
                 });
             }
@@ -2967,7 +2979,7 @@ impl ExecutionCoordinator {
     /// is sent no more proposals, and a fold held behind a window this
     /// node's beacon lacks commits nothing. A vote such a member holds is
     /// still owed to the attesting committee, and the cleanup timer keeps
-    /// ticking on every seated vnode, so it is what keeps the vote moving.
+    /// ticking on every replica, so it is what keeps the vote moving.
     /// A change in `committed_ts` restarts the count, and the commit-time
     /// retries take over again.
     pub fn on_cleanup_tick(
@@ -3058,7 +3070,14 @@ impl ExecutionCoordinator {
                 recipients = recipients.len(),
                 "Vote retry — re-sending to the attesting committee"
             );
-            for &signer in self.signers.iter().filter(|s| recipients.contains(s)) {
+            let signers: Vec<ValidatorId> = self
+                .signers
+                .iter()
+                .copied()
+                .filter(|signer| recipients.contains(signer))
+                .collect();
+            let (recipients, local_recipient) = self.addressed(recipients);
+            for signer in signers {
                 actions.push(Action::SignAndSendExecutionVote {
                     block_hash,
                     vote_anchor_ts,
@@ -3066,6 +3085,7 @@ impl ExecutionCoordinator {
                     global_receipt_root,
                     tx_outcomes: (*tx_outcomes).clone(),
                     recipients: recipients.clone(),
+                    local_recipient,
                     signer,
                 });
             }
@@ -5785,10 +5805,13 @@ mod tests {
         use crate::ticks::VOTE_RETRY_TIMEOUT;
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let topo = make_test_topology();
-        let committee = topo
+        let others: Vec<ValidatorId> = topo
             .head()
             .consensus_committee_for_shard(ShardId::ROOT)
-            .to_vec();
+            .iter()
+            .copied()
+            .filter(|member| *member != ValidatorId::new(0))
+            .collect();
 
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(20);
@@ -5815,12 +5838,14 @@ mod tests {
         match &actions[0] {
             Action::SignAndSendExecutionVote {
                 recipients,
+                local_recipient,
                 tick_id: wid,
                 ..
             } => {
                 assert_eq!(wid, &tick_id);
                 assert_eq!(
-                    recipients, &committee,
+                    (recipients, *local_recipient),
+                    (&others, true),
                     "a retry addresses the whole committee"
                 );
             }
@@ -5839,7 +5864,7 @@ mod tests {
         assert_eq!(next.len(), 1);
         if let Action::SignAndSendExecutionVote { recipients, .. } = &next[0] {
             assert_eq!(
-                recipients, &committee,
+                recipients, &others,
                 "the second fire addresses the committee"
             );
         } else {
@@ -5959,19 +5984,28 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
         let sent_to = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
-                Action::SignAndSendExecutionVote { recipients, .. } => Some(recipients.clone()),
+                Action::SignAndSendExecutionVote {
+                    recipients,
+                    local_recipient,
+                    ..
+                } => Some((recipients.clone(), *local_recipient)),
                 _ => None,
             })
         };
         assert_eq!(
             sent_to(&state.emit_vote_actions(&schedule)),
-            Some(vec![leader])
+            Some((vec![], true))
         );
 
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
+        let others: Vec<ValidatorId> = committee
+            .iter()
+            .copied()
+            .filter(|member| *member != leader)
+            .collect();
         assert_eq!(
             sent_to(&state.check_vote_retry_timeouts(&schedule)),
-            Some(committee),
+            Some((others, true)),
             "the leader re-sends its vote to the whole committee, itself included",
         );
 
@@ -7972,7 +8006,7 @@ mod tests {
         ));
     }
 
-    /// An EC already in `exec_certs` (placed there by a co-hosted vnode's
+    /// An EC already in `exec_certs` (placed there by this replica's
     /// aggregation, or by an earlier verification of the same wire bytes)
     /// short-circuits the verify dispatch on a wire-hash match.
     #[test]
@@ -9609,6 +9643,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -10068,6 +10103,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -11394,6 +11430,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -11470,6 +11507,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
         assert_eq!(
@@ -11558,6 +11596,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -11642,6 +11681,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
         restarted.on_committed_state_restored(&schedule, &StubVmStatics);
@@ -11910,14 +11950,14 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            // The store it restarted over holds every block it replays.
+            recovered.committed_height,
         )
         .signed_by(ValidatorId::new(0));
         assert!(
             restarted.candidates.is_empty(),
             "construction has no topology to compose against, so it holds",
         );
-        // The store it restarted over holds every block it replays.
-        restarted.seat_on_persisted_base(recovered.committed_height);
 
         let actions = restarted
             .on_committed_state_restored(&schedule, &StubVmStatics)
@@ -12291,6 +12331,7 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+            BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0))
     }
@@ -13523,9 +13564,9 @@ mod tests {
                 Arc::new(FinalizationStore::new()),
                 Arc::new(ProvenAnchors::new()),
                 Arc::new(CounterpartMirror::new()),
+                BlockHeight::new(1),
             )
             .signed_by(ValidatorId::new(0));
-            state.seat_on_persisted_base(BlockHeight::new(1));
             let actions = state
                 .on_committed_state_restored(&schedule, &StubVmStatics)
                 .actions;
@@ -17520,14 +17561,18 @@ mod tests {
         (leader, member)
     }
 
-    /// Each execution vote emitted, as `(signer, recipients)`.
-    fn execution_votes(actions: &[Action]) -> Vec<(ValidatorId, Vec<ValidatorId>)> {
+    /// Each execution vote in `actions`: its signer, the recipients it
+    /// is sent to, and whether it is fed back to this replica.
+    fn execution_votes(actions: &[Action]) -> Vec<(ValidatorId, Vec<ValidatorId>, bool)> {
         actions
             .iter()
             .filter_map(|a| match a {
                 Action::SignAndSendExecutionVote {
-                    signer, recipients, ..
-                } => Some((*signer, recipients.clone())),
+                    signer,
+                    recipients,
+                    local_recipient,
+                    ..
+                } => Some((*signer, recipients.clone(), *local_recipient)),
                 _ => None,
             })
             .collect()
@@ -17571,15 +17616,14 @@ mod tests {
         assert_eq!(
             execution_votes(&actions),
             vec![
-                (ValidatorId::new(1), vec![leader]),
-                (ValidatorId::new(2), vec![leader]),
+                (ValidatorId::new(1), vec![leader], false),
+                (ValidatorId::new(2), vec![leader], false),
             ],
         );
     }
 
-    /// A tick leader's own vote names it among the recipients, which is
-    /// what feeds the vote back to its own tracker, and that tracker
-    /// tallies it.
+    /// A tick leader's own vote is sent to nobody and fed back to its own
+    /// tracker, which tallies it.
     #[test]
     fn a_signing_tick_leader_tallies_its_own_execution_vote() {
         let schedule = make_test_topology();
@@ -17588,14 +17632,16 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
 
         let actions = state.emit_vote_actions(&schedule);
-        assert_eq!(execution_votes(&actions), vec![(leader, vec![leader])]);
+        assert_eq!(execution_votes(&actions), vec![(leader, vec![], true)]);
 
         let _ = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, leader));
         assert!(tallied_power(&state, tick_id) > VoteCount::ZERO);
     }
 
-    /// A sibling's vote goes to the tick leader on the same replica, and
-    /// the leader's tracker tallies it beside the leader's own.
+    /// A vote signed by one attached signer for the tick leader attached
+    /// to the same replica is sent over no network, so no copy of it can
+    /// be lost there: it is fed back to the replica, and the leader's
+    /// tracker tallies it beside the leader's own.
     #[test]
     fn a_co_hosted_leader_tallies_its_siblings_execution_vote() {
         let schedule = make_test_topology();
@@ -17604,7 +17650,7 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
 
         let actions = state.emit_vote_actions(&schedule);
-        assert!(execution_votes(&actions).contains(&(sibling, vec![leader])));
+        assert!(execution_votes(&actions).contains(&(sibling, vec![], true)));
 
         let _ = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, leader));
         let own = tallied_power(&state, tick_id);

@@ -2,17 +2,18 @@
 //!
 //! [`ShardLoop::record_prometheus`] runs on the shard's pinned thread on
 //! the metrics tick and emits every gauge this shard owns: sync and fetch
-//! state per shard, consensus, mempool and drain readouts per vnode, and the
-//! coordinator collection sizes each `memory_stats().gauges()` reports.
+//! state, the attached signer count, consensus, mempool and drain
+//! readouts, and the coordinator collection sizes each
+//! `memory_stats().gauges()` reports.
 //! All reads are `.len()` / `.stats()` — no locks beyond cheap cache
 //! lengths, no I/O.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    MemoryFamily, set_backpressure_active, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms,
-    set_in_flight, set_mempool_size, set_shard_memory_gauge, set_shard_round,
-    set_sync_blocks_behind, set_sync_in_progress, set_sync_round_in_flight, set_view_changes,
-    set_view_syncs, set_vnode_memory_gauge,
+    MemoryFamily, set_attached_signers, set_backpressure_active, set_fetch_in_flight,
+    set_fetch_oldest_in_flight_age_ms, set_in_flight, set_mempool_size, set_replica_memory_gauge,
+    set_shard_memory_gauge, set_shard_round, set_sync_blocks_behind, set_sync_in_progress,
+    set_sync_round_in_flight, set_view_changes, set_view_syncs,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -24,7 +25,7 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Emit this shard's per-shard and per-vnode prometheus gauges.
+    /// Emit this shard's prometheus gauges.
     /// Called from the shard's pinned thread on the metrics tick.
     pub fn record_prometheus(&self) {
         let s = self.shard.inner();
@@ -63,57 +64,54 @@ where
             fetches.finalization_oldest_in_flight_age_ms,
         );
 
-        for vnode in &self.vnodes {
-            let v = vnode.validator_id.inner();
-            let state = &vnode.state;
-            let shard_stats = state.shard_coordinator().stats();
-            let mempool = state.mempool_coordinator();
-            set_shard_round(s, v, shard_stats.current_round);
-            set_view_changes(s, v, shard_stats.view_changes);
-            set_view_syncs(s, v, shard_stats.view_syncs);
-            set_mempool_size(s, v, mempool.len());
-            let drain = state.shard_coordinator().committed_in_flight();
-            set_in_flight(s, v, drain);
-            set_backpressure_active(s, v, drain >= MAX_UNSETTLED_TXS);
-        }
+        let state = &self.replica;
+        let shard_stats = state.shard_coordinator().stats();
+        let mempool = state.mempool_coordinator();
+        let drain = state.shard_coordinator().committed_in_flight();
+        set_attached_signers(s, self.signers.len());
+        set_shard_round(s, shard_stats.current_round);
+        set_view_changes(s, shard_stats.view_changes);
+        set_view_syncs(s, shard_stats.view_syncs);
+        set_mempool_size(s, mempool.len());
+        set_in_flight(s, drain);
+        set_backpressure_active(s, drain >= MAX_UNSETTLED_TXS);
 
         self.record_memory_gauges();
     }
 
     /// Emit every coordinator's collection sizes, plus the runner state no
-    /// single vnode owns.
+    /// coordinator owns.
     fn record_memory_gauges(&self) {
         let s = self.shard.inner();
         let fetches = self.io.fetch_metrics();
         let rh = &self.io.cross_shard.remote_header_sync;
 
-        for vnode in &self.vnodes {
-            let v = vnode.validator_id.inner();
-            let state = &vnode.state;
-            let mempool = state.mempool_coordinator();
-            let families = [
-                (
-                    MemoryFamily::Shard,
-                    state.shard_coordinator().memory_stats().gauges(),
-                ),
-                (
-                    MemoryFamily::Execution,
-                    state.execution_coordinator().memory_stats().gauges(),
-                ),
-                (MemoryFamily::Mempool, mempool.memory_stats().gauges()),
-                (
-                    MemoryFamily::RemoteHeaders,
-                    state.remote_headers_coordinator().memory_stats().gauges(),
-                ),
-                (
-                    MemoryFamily::Provisions,
-                    state.provisions_coordinator().memory_stats().gauges(),
-                ),
-            ];
-            for (family, gauges) in families {
-                for (field, value) in gauges {
-                    set_vnode_memory_gauge(family, field, s, v, value);
-                }
+        let state = &self.replica;
+        let families = [
+            (
+                MemoryFamily::Shard,
+                state.shard_coordinator().memory_stats().gauges(),
+            ),
+            (
+                MemoryFamily::Execution,
+                state.execution_coordinator().memory_stats().gauges(),
+            ),
+            (
+                MemoryFamily::Mempool,
+                state.mempool_coordinator().memory_stats().gauges(),
+            ),
+            (
+                MemoryFamily::RemoteHeaders,
+                state.remote_headers_coordinator().memory_stats().gauges(),
+            ),
+            (
+                MemoryFamily::Provisions,
+                state.provisions_coordinator().memory_stats().gauges(),
+            ),
+        ];
+        for (family, gauges) in families {
+            for (field, value) in gauges {
+                set_replica_memory_gauge(family, field, s, value);
             }
         }
 

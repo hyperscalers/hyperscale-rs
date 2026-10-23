@@ -101,9 +101,10 @@ impl ShardParticipation {
                 block_hash,
                 qc,
                 verified_votes,
+                binding,
             } => self
                 .shard_coordinator
-                .on_qc_result(block_hash, qc, verified_votes),
+                .on_qc_result(block_hash, binding, qc, verified_votes),
             ProtocolEvent::QcSignatureVerified { subject, result } => self
                 .shard_coordinator
                 .on_qc_signature_verified(topology_schedule, subject, result),
@@ -763,7 +764,7 @@ mod tests {
 
     /// `BlockPersisted` reaches execution as well as consensus: the tick
     /// above the written block was waiting to read the base that block
-    /// left, and every seat's state machine is fed the event.
+    /// left, and the replica's state machine is fed the event.
     #[test]
     fn block_persisted_releases_the_tick_above_the_written_block() {
         let TestNode { mut node, .. } = TestNode::new();
@@ -983,7 +984,11 @@ mod tests {
     /// proposer's commit.
     #[test]
     fn a_certified_local_block_reaches_the_beacon_before_it_commits() {
-        let TestNode { mut node, .. } = TestNode::new();
+        let TestNode {
+            mut node,
+            committee,
+            ..
+        } = TestNode::new();
         let certified = certify(
             make_live_block(
                 ShardId::ROOT,
@@ -1004,6 +1009,31 @@ mod tests {
             },
         );
         let qc = certified.qc().clone();
+        let header = certified.block().header();
+        let batch: Vec<Action> = (1..4)
+            .flat_map(|idx| {
+                let vote = BlockVote::from_parts(
+                    block_hash,
+                    ShardId::ROOT,
+                    header.height(),
+                    header.round(),
+                    committee.validator_id(idx),
+                    ConsensusSignature::ZERO,
+                    ProposerTimestamp::ZERO,
+                );
+                node.handle(
+                    LocalTimestamp::ZERO,
+                    ProtocolEvent::UnverifiedBlockVoteReceived { vote },
+                )
+            })
+            .collect();
+        let binding = batch
+            .iter()
+            .find_map(|action| match action {
+                Action::VerifyAndBuildQuorumCertificate { binding, .. } => Some(*binding),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the votes reach a batch: {batch:?}"));
 
         let actions = node.handle(
             LocalTimestamp::ZERO,
@@ -1011,6 +1041,7 @@ mod tests {
                 block_hash,
                 qc: Some(Verified::new_unchecked_for_test(qc)),
                 verified_votes: vec![],
+                binding,
             },
         );
 

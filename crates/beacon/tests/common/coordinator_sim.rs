@@ -616,7 +616,7 @@ impl CoordinatorSim {
                 payloads.clone(),
                 range_proof.clone(),
             );
-            self.absorb(idx, a_w);
+            self.absorb(idx, a_w.unwrap_or_default());
         }
         b.block_hash()
     }
@@ -827,7 +827,7 @@ impl CoordinatorSim {
                 payloads.to_vec(),
                 range_proof.to_vec(),
             );
-            self.absorb(idx, a_w);
+            self.absorb(idx, a_w.unwrap_or_default());
         }
         b_hash
     }

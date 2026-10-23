@@ -1,7 +1,7 @@
 //! Sans-io shard bootstrap sequencer.
 //!
 //! Composes the two snap-sync assemblers into the full bootstrap a
-//! joining vnode runs against its beacon-attested boundary anchor:
+//! joining host runs against its beacon-attested boundary anchor:
 //!
 //! 1. **Witness history** — [`WitnessHistorySync`] assembles the anchor
 //!    window's leaf payloads, bound to the anchor through the boundary
@@ -15,7 +15,7 @@
 //!    `BoundaryStore::finalize_boundary_import` and feeds the resulting
 //!    root back, which the sequencer checks against the anchor;
 //! 4. **Complete** — the verified pieces assemble into the
-//!    [`RecoveredState`] the shard's state machines boot from.
+//!    [`RecoveredState`] the shard's replica boots from.
 //!
 //! Sans-io: drivers own transport, pacing, and the staging and finalize
 //! writes. The production runner pumps it with async requests; the

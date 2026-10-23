@@ -1,6 +1,6 @@
 //! Joiner-side beacon-witness history assembler.
 //!
-//! A vnode joining a shard must seed its beacon-witness accumulator
+//! A host joining a shard must seed its beacon-witness accumulator
 //! with the leaf-hash history at its boundary anchor: block headers
 //! commit `(beacon_witness_root, beacon_witness_leaf_count)` over the
 //! accumulator's full leaf-hash vector, so verifying any future

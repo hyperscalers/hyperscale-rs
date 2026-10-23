@@ -32,7 +32,7 @@ use hyperscale_types::Block;
 /// orchestrator's `OpenStore` and `Seat` requests.
 ///
 /// Bundles the open store the duty imports and adopts into, the recovered
-/// state its seated vnodes boot from (rebuilt at the adopt), and the derived
+/// state its seated replica boots from (rebuilt at the adopt), and the derived
 /// genesis the seat installs.
 pub struct PreparedStore<S> {
     /// The opened store the duty imports and adopts into.

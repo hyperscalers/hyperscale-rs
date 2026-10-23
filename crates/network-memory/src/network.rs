@@ -544,7 +544,7 @@ pub struct SimulatedNetwork {
     request_sequence: u64,
     /// Optional traffic analyzer for bandwidth metrics.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
-    /// Runtime validator→host bindings for vnodes seated after
+    /// Runtime validator→host bindings for validators seated after
     /// construction (split-child flips, pool draws); checked before the
     /// hosting-mode formula in [`Self::validator_to_node`].
     validator_bindings: HashMap<ValidatorId, NodeIndex>,
@@ -648,7 +648,7 @@ impl SimulatedNetwork {
 
     /// Translate a `ValidatorId` to its hosting `NodeIndex`, from the
     /// validator→host map seeded at construction and updated by
-    /// [`Self::bind_validator`] as vnodes relocate. A validator that runs on
+    /// [`Self::bind_validator`] as validators relocate. A validator that runs on
     /// no host (an unplaced pool extra) maps to an out-of-range index, which
     /// the delivery guards drop the same as an unreachable peer.
     #[must_use]
@@ -660,7 +660,7 @@ impl SimulatedNetwork {
     }
 
     /// Bind `validator` to `node`, overriding its construction-time host.
-    /// Harnesses call this when seating a vnode at runtime on a different
+    /// Harnesses call this when seating a validator at runtime on a different
     /// host (a pool draw or a split-child flip).
     pub fn bind_validator(&mut self, validator: ValidatorId, node: NodeIndex) {
         self.validator_bindings.insert(validator, node);
@@ -805,7 +805,7 @@ impl SimulatedNetwork {
 
     /// Bring `node`'s process back up hosting `hosted`, the shards it
     /// reopened: a process starting on its disk builds its registry from
-    /// the shards it opens, and a broadcast reaches a host's vnodes only
+    /// the shards it opens, and a broadcast reaches a host's loops only
     /// through the shards its registry hosts.
     pub fn bring_up(&mut self, node: NodeIndex, hosted: BTreeSet<ShardId>) {
         self.down.remove(&node);
@@ -1670,8 +1670,11 @@ impl SimulatedNetwork {
 
     /// Buffer notifications for delivery with simulated latency.
     ///
-    /// Decompresses the payload once, then for each recipient: checks
-    /// partition/loss, samples latency, and queues into `pending_notifications`.
+    /// Decompresses the payload once, then for each host the recipients
+    /// live on: checks partition/loss, samples latency, and queues into
+    /// `pending_notifications`. Recipients sharing a host collapse to one
+    /// delivery, as the production transport dispatches a host's local
+    /// recipients once.
     ///
     /// The harness calls [`flush_notifications()`](Self::flush_notifications)
     /// to deliver due messages via each target's registered notification handler.
@@ -1705,9 +1708,14 @@ impl SimulatedNetwork {
                 }
             };
 
+            let mut hosts: Vec<NodeIndex> = Vec::with_capacity(recipients.len());
             for &recipient in &recipients {
                 let to = self.validator_to_node(recipient);
-
+                if !hosts.contains(&to) {
+                    hosts.push(to);
+                }
+            }
+            for to in hosts {
                 match self.should_deliver(sender, to, now, data.len(), streams.link(sender, to)) {
                     None => {
                         if self.is_partitioned(sender, to, now) {

@@ -285,6 +285,7 @@ enum SimEvent {
         block_hash: BlockHash,
         qc: Option<Verified<QuorumCertificate>>,
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
+        binding: u64,
     },
     QcSignatureVerified {
         subject: QcSubject,
@@ -799,8 +800,11 @@ impl ShardCoordinatorSim {
             .head()
             .committee_index_for_shard(self.shard, verified_vote.voter())
             .expect("voter is a committee member");
+        // No batch is in flight under `u64::MAX`, so the result settles
+        // none and only lands its vote.
         let actions = self.coordinators[idx].on_qc_result(
             block_hash,
+            u64::MAX,
             None,
             vec![(voter_index, verified_vote)],
         );
@@ -1352,7 +1356,8 @@ impl ShardCoordinatorSim {
                 block_hash,
                 qc,
                 verified_votes,
-            } => coord.on_qc_result(block_hash, qc, verified_votes),
+                binding,
+            } => coord.on_qc_result(block_hash, binding, qc, verified_votes),
             SimEvent::QcSignatureVerified { subject, result } => {
                 coord.on_qc_signature_verified(topology_schedule, subject, result)
             }
@@ -1973,6 +1978,7 @@ impl ShardCoordinatorSim {
                 votes_to_verify,
                 verified_votes,
                 total_votes,
+                binding,
             } => {
                 let result = verify_and_build_qc(
                     &BlsVerifier,
@@ -1993,6 +1999,7 @@ impl ShardCoordinatorSim {
                         block_hash: result.block_hash,
                         qc: result.qc,
                         verified_votes: result.verified_votes,
+                        binding,
                     },
                 });
             }

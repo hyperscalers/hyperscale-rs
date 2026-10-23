@@ -303,6 +303,8 @@ pub enum ProtocolEvent {
         qc: Option<Verified<QuorumCertificate>>,
         /// Verified votes, returned for accumulation when no QC was built.
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
+        /// The vote set binding the batch was taken under.
+        binding: u64,
     },
 
     /// QC signature verification completed. The payload carries the
@@ -423,9 +425,8 @@ pub enum ProtocolEvent {
     ///
     /// The state root's replay also side-channels its `PreparedCommit`
     /// byproduct to the commit pipeline via `ActionContext::commit_prepared`
-    /// — vnode-private `IoLoop` data that doesn't belong on this fan-out
-    /// channel — and reports the net substate byte change it measured
-    /// in the outcome.
+    /// — loop-private data that doesn't belong on this event channel — and
+    /// reports the net substate byte change it measured in the outcome.
     BlockCheckCompleted {
         /// Block the check ran on.
         block_hash: BlockHash,
@@ -488,8 +489,8 @@ pub enum ProtocolEvent {
     },
 
     /// Received provisions whose merkle proof predicate already holds —
-    /// produced only by the local-dispatch fast path when a colocated
-    /// source-shard vnode emits a notification carrying
+    /// produced only by the local-dispatch fast path when a source-shard
+    /// replica on the same host emits a notification carrying
     /// `Verifiable::Verified`. The recipient skips
     /// [`Action::VerifyProvisions`] and admits directly.
     ///
@@ -564,9 +565,8 @@ pub enum ProtocolEvent {
     /// before this event reaches the state machine, so the coordinator may
     /// dispatch the next tick on it.
     ///
-    /// For the coordinator that dispatched the batch and no other: it
-    /// reads the event as its own run completing, and a co-hosted seat
-    /// runs the tick itself, from wherever its own queue stands.
+    /// For the coordinator that dispatched the batch: it reads the event
+    /// as its own run completing.
     ExecutionBatchCompleted {
         /// The tick whose batch completed: the composing block's height.
         tick: BlockHeight,

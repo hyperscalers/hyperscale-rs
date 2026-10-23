@@ -143,8 +143,8 @@ pub enum CrossingRead {
 }
 
 /// The index a shard's store answers with, bound once the store's
-/// chain is open: a vnode group is seated before its shard's chain
-/// exists, and every coordinator of the group asks the same one.
+/// chain is open: a replica is built before its shard's chain exists,
+/// and the shard loop binds the slot once it does.
 ///
 /// Answers as an empty index until bound.
 #[derive(Default)]
@@ -5190,7 +5190,7 @@ mod tests {
     }
 
     /// A seeded pause stands through a refutation at a boundary older
-    /// than the seat's clock, and clears at the first later one that
+    /// than the replica's clock, and clears at the first later one that
     /// refutes the `Taken`.
     #[test]
     fn a_seeded_pause_clears_at_a_later_refuting_boundary() {

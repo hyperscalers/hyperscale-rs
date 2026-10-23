@@ -2,9 +2,9 @@
 //!
 //! Backs the inbound `GetBeaconCandidateRequest` responder so a pool
 //! member that missed a candidate on gossip can fetch it from one that
-//! prevoted it. Fed at the two places a vnode comes to hold a candidate
-//! — assembling it and verifying a peer's — so serving never reads any
-//! vnode's coordinator.
+//! prevoted it. Fed at the two places a participant comes to hold a
+//! candidate — assembling it and verifying a peer's — so serving never
+//! reads the beacon coordinator.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use hyperscale_types::{BeaconBlockHash, CandidateBeaconBlock, Epoch, Verifiable,
 /// the cache bounded whatever it does.
 const MAX_CANDIDATES_PER_EPOCH: usize = 4;
 
-/// The newest epoch's candidates any vnode on this host assembled or
+/// The newest epoch's candidates any participant on this host assembled or
 /// verified, by block hash. Older epochs drop on advance: a candidate
 /// is only ever fetched while its epoch is pending.
 pub struct BeaconCandidateCache {

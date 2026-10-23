@@ -107,8 +107,10 @@ where
     /// a reshape follow classifies a followed parent block under — the
     /// parent's own window, which the head no longer describes once its
     /// cut has landed, and which the parent's committee can anchor into
-    /// before this host folds the commit that opens it.
-    topology_schedule: ArcSwap<TopologySchedule>,
+    /// before this host folds the commit that opens it. Published with
+    /// the epoch the fold folded it at, so a reader takes both from one
+    /// load.
+    topology_schedule: ArcSwap<(Epoch, Arc<TopologySchedule>)>,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     pub(crate) dispatch_handles: Arc<DispatchHandles<S, N>>,
@@ -158,7 +160,7 @@ where
         shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
         beacon_event_sender: Sender<HostEvent>,
         topology_snapshot: SharedTopologySnapshot,
-        topology_schedule: Arc<TopologySchedule>,
+        (epoch, topology_schedule): (Epoch, Arc<TopologySchedule>),
         dispatch_handles: Arc<DispatchHandles<S, N>>,
         beacon_storage: Arc<dyn BeaconStorage>,
     ) -> Self
@@ -180,7 +182,7 @@ where
             beacon_event_sender,
             next_attachment: AtomicU64::new(0),
             topology_snapshot,
-            topology_schedule: ArcSwap::new(topology_schedule),
+            topology_schedule: ArcSwap::from_pointee((epoch, topology_schedule)),
             dispatch_handles,
             beacon_storage,
             tx_status: Arc::new(TxStatusCache::new()),
@@ -209,7 +211,7 @@ where
         &self.beacon_storage
     }
 
-    /// This node's derivation, held by its engine — what a vnode seated
+    /// This node's derivation, held by its engine — what a replica built
     /// at runtime resolves envelopes against.
     #[must_use]
     pub fn derivation(&self) -> Arc<dyn Derivation> {
@@ -217,7 +219,7 @@ where
     }
 
     /// This node's code availability, held by the same engine — what a
-    /// vnode seated at runtime holds its tick dispatch to.
+    /// replica built at runtime holds its tick dispatch to.
     #[must_use]
     pub fn code(&self) -> Arc<dyn CodeAvailability> {
         Arc::clone(&self.dispatch_handles.executor) as Arc<dyn CodeAvailability>
@@ -240,7 +242,14 @@ where
     /// The beacon's window schedule as last folded on this host.
     #[must_use]
     pub fn topology_schedule(&self) -> Arc<TopologySchedule> {
-        self.topology_schedule.load_full()
+        Arc::clone(&self.topology_schedule.load().1)
+    }
+
+    /// The beacon's window schedule as last folded on this host, with the
+    /// epoch the fold folded it at.
+    pub(crate) fn folded_schedule(&self) -> (Epoch, Arc<TopologySchedule>) {
+        let folded = self.topology_schedule.load();
+        (folded.0, Arc::clone(&folded.1))
     }
 
     /// Shared lock-free topology snapshot handle, refreshed on every
@@ -606,15 +615,15 @@ where
     ///
     /// The beacon loop is the one caller, once per adopted block, so the
     /// epochs it publishes only rise.
-    pub(crate) fn apply_topology(&self, schedule: Arc<TopologySchedule>) {
+    pub(crate) fn apply_topology(&self, epoch: Epoch, schedule: Arc<TopologySchedule>) {
         debug_assert!(
-            newest_epoch(&schedule) > newest_epoch(&self.topology_schedule.load()),
+            newest_epoch(&schedule) > newest_epoch(&self.topology_schedule.load().1),
             "published topology epochs only rise",
         );
         let head = Arc::clone(schedule.head());
         let routing_committees = Arc::new(schedule.routing_committees());
         self.topology_snapshot.store(Arc::clone(&head));
-        self.topology_schedule.store(schedule);
+        self.topology_schedule.store(Arc::new((epoch, schedule)));
         self.network.update_topology(head);
         self.network.update_routing_committees(routing_committees);
         self.release_parked_submissions();

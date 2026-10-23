@@ -414,35 +414,6 @@ fn halted_past_settling_the_frontier() -> (ExecutionSim, Finalization) {
     (sim, above)
 }
 
-/// A seat drawn onto the shard past its crossing, over the tick chain a
-/// sibling raised the floor of, lands its runs on that chain: the next
-/// tick reads what it ran, though the seat never crossed itself.
-#[test]
-fn a_seat_joining_past_the_crossing_lands_its_runs() {
-    let mut sim = ExecutionSim::new(Schedule::Eager);
-    for seed in 0..5 {
-        sim.commit(vec![local_tx(seed)], Vec::new());
-    }
-    sim.drain();
-    sim.recover(FRONTIER, sim.next_epoch());
-    sim.commit(vec![local_tx(5)], Vec::new());
-    sim.drain();
-    assert_eq!(counter(sim.read(cell_of(test_prefix(LOCAL)))), 1);
-
-    sim.seat_joiner_at_tip();
-    sim.commit(vec![local_tx(6)], Vec::new());
-    sim.drain();
-    assert!(
-        output_of(&sim, BlockHeight::new(7)).is_some(),
-        "the joiner runs the tick past the crossing",
-    );
-    assert_eq!(
-        counter(sim.read(cell_of(test_prefix(LOCAL)))),
-        2,
-        "its run lands on the chain the next tick reads",
-    );
-}
-
 /// The crossing raises the tick chain floor under the committee the
 /// shard reads the block with. The crossing block's parent is anchored in
 /// a window the beacon froze before it stamped the recovery, and the

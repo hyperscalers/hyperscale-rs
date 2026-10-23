@@ -687,7 +687,7 @@ impl BeaconCoordinator {
         lo: LeafIndex,
         payloads: Vec<ShardWitnessPayload>,
         range_proof: Vec<Hash>,
-    ) -> Vec<Action> {
+    ) -> Option<Vec<Action>> {
         self.fold
             .on_shard_witnesses_received(shard_id, anchor, lo, payloads, range_proof)
     }
@@ -4369,7 +4369,7 @@ mod tests {
             payloads,
             range_proof,
         );
-        assert!(actions.is_empty());
+        assert!(actions.is_some_and(|actions| actions.is_empty()));
         assert_eq!(coord.fold.shard_source.total_chunk_len(), 2);
     }
 
@@ -4388,7 +4388,7 @@ mod tests {
             payloads,
             range_proof,
         );
-        assert!(actions.is_empty());
+        assert!(actions.is_none(), "a chunk on an unheld anchor is refused");
         assert_eq!(coord.fold.shard_source.total_chunk_len(), 0);
     }
 
@@ -4413,8 +4413,69 @@ mod tests {
             payloads,
             range_proof,
         );
-        assert!(actions.is_empty());
+        assert!(actions.is_none(), "a misplaced chunk is refused");
         assert_eq!(coord.fold.shard_source.total_chunk_len(), 0);
+    }
+
+    /// A chunk that fails its root check while its crossing stays the one
+    /// to fetch asks for nothing: the fetch that delivered it decides
+    /// when the run is asked again, and a run this host serves itself
+    /// would otherwise be re-asked and refused without end.
+    #[test]
+    fn a_refused_chunk_of_the_current_crossing_asks_nothing_itself() {
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        coord
+            .fold
+            .state
+            .boundaries
+            .insert(shard, genesis_boundary());
+        coord.fold.state.shard_committees.insert(
+            shard,
+            ShardCommittee {
+                members: vec![ValidatorId::new(0)],
+            },
+        );
+        let anchor = StateRoot::from_raw(Hash::from_bytes(b"refused-anchor"));
+        let (b, mut payloads, range_proof) =
+            boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        let c = linked_block_header(shard, 6, b.block_hash(), 301_000, 3);
+        let d = linked_block_header(shard, 7, c.block_hash(), 301_000, 3);
+        let asked = |actions: &[Action]| {
+            actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::Fetch(FetchRequest::Ask {
+                        ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(_)),
+                        ..
+                    })
+                )
+            })
+        };
+        coord.on_verified_source_header(&b);
+        coord.on_verified_source_header(&c);
+        let asked_first = coord.on_verified_source_header(&d);
+        assert!(
+            asked(&asked_first),
+            "the crossing's chunk is asked: {asked_first:?}"
+        );
+
+        payloads[0] = ShardWitnessPayload::StakeDeposit {
+            pool_id: StakePoolId::new(999),
+            amount: Stake::from_whole_tokens(7),
+        };
+        let refused = coord.on_shard_witnesses_received(
+            shard,
+            b.block_hash(),
+            LeafIndex::new(0),
+            payloads,
+            range_proof,
+        );
+        assert!(refused.is_none(), "{refused:?}");
+        assert!(
+            asked(&coord.fetch_witness_chunk(shard)),
+            "the run is still the one to fetch"
+        );
     }
 
     /// A mutated payload breaks the recomputed root, so the whole chunk is
@@ -4442,7 +4503,7 @@ mod tests {
             payloads,
             range_proof,
         );
-        assert!(actions.is_empty());
+        assert!(actions.is_none(), "a mutated chunk is refused");
         assert_eq!(coord.fold.shard_source.total_chunk_len(), 0);
     }
 
@@ -4465,7 +4526,7 @@ mod tests {
             payloads,
             range_proof,
         );
-        assert!(actions.is_empty());
+        assert!(actions.is_some_and(|actions| actions.is_empty()));
         // Pool stays empty — off-committee never admits chunks.
         assert_eq!(observer.fold.shard_source.total_chunk_len(), 0);
     }

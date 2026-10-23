@@ -220,7 +220,7 @@ where
     /// clearing the deterministic wasm profile and parsing every export
     /// it declares, and persisting it means a synchronous store write —
     /// per artifact, at a transaction's whole byte budget each. The loop
-    /// this would otherwise run on drives vnode state machines and
+    /// this would otherwise run on drives the shard's replica and its
     /// consensus timers, and nothing here is on the path of a verdict:
     /// what waits on these bytes waits at a door of this node's own.
     ///

@@ -958,6 +958,7 @@ where
             votes_to_verify,
             verified_votes,
             total_votes,
+            binding,
         } => {
             let start = Stopwatch::start();
             let result = verify_and_build_qc(
@@ -978,6 +979,7 @@ where
                 block_hash: result.block_hash,
                 qc: result.qc,
                 verified_votes: result.verified_votes,
+                binding,
             });
         }
 
@@ -1908,6 +1910,7 @@ where
             wt_window_start,
             wt_window_end,
             recipients,
+            local_recipient,
             signer: _,
         } => {
             let Some(signing) = &ctx.signing else {
@@ -1928,11 +1931,15 @@ where
                 tracing::error!(?shard, "cannot sign ready signal; skipping");
                 return;
             };
-            // No local feedback: the sender is outside the consensus
-            // subset, so it never proposes and its own pool entry would
-            // never drain — only the recipients' pools matter.
-            ctx.network
-                .notify(&recipients, &ReadySignalNotification::new(signal));
+            if local_recipient {
+                ctx.notify_protocol(ProtocolEvent::ReadySignalReceived {
+                    signal: signal.clone(),
+                });
+            }
+            if !recipients.is_empty() {
+                ctx.network
+                    .notify(&recipients, &ReadySignalNotification::new(signal));
+            }
         }
 
         Action::VerifyTimeout {

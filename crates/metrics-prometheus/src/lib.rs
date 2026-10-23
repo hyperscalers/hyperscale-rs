@@ -30,24 +30,26 @@ pub struct Metrics {
     pub block_commit_latency: HistogramVec,
     /// Per-shard chain height. Each hosted shard maintains its own height.
     pub block_height: GaugeVec,
-    /// Per-vnode current shard round.
+    /// Per-shard count of validators attached to the replica.
+    pub attached_signers: GaugeVec,
+    /// Per-replica current shard round.
     pub round: GaugeVec,
-    /// Per-vnode self-originated view changes (leader-activity timer fired).
+    /// Per-replica self-originated view changes (leader-activity timer fired).
     pub view_changes: GaugeVec,
-    /// Per-vnode view syncs (rounds caught up to from peers).
+    /// Per-replica view syncs (rounds caught up to from peers).
     pub view_syncs: GaugeVec,
     pub build_info: GaugeVec,
 
     // === Transactions ===
     pub transactions_finalized: HistogramVec,
     pub transactions_executed: Counter,
-    /// Per-vnode mempool size.
+    /// Per-replica mempool size.
     pub mempool_size: GaugeVec,
 
     // === Backpressure ===
-    /// Per-vnode drain the committed tip records.
+    /// Per-replica drain the committed tip records.
     pub in_flight: GaugeVec,
-    /// Per-vnode flag (0 or 1): the drain is at its budget.
+    /// Per-replica flag (0 or 1): the drain is at its budget.
     pub backpressure_active: GaugeVec,
 
     // === Infrastructure ===
@@ -291,24 +293,31 @@ impl Metrics {
             )
             .unwrap(),
 
+            attached_signers: register_gauge_vec!(
+                "hyperscale_attached_signers",
+                "Validators attached to the shard's replica",
+                &["shard"]
+            )
+            .unwrap(),
+
             round: register_gauge_vec!(
                 "hyperscale_round",
-                "Current shard round within current height, per (shard, validator_id)",
-                &["shard", "validator_id"]
+                "Current shard round within current height, per shard replica",
+                &["shard"]
             )
             .unwrap(),
 
             view_changes: register_gauge_vec!(
                 "hyperscale_view_changes",
-                "Self-originated view changes (this validator's leader-activity timer fired)",
-                &["shard", "validator_id"]
+                "Self-originated view changes (the replica's leader-activity timer fired)",
+                &["shard"]
             )
             .unwrap(),
 
             view_syncs: register_gauge_vec!(
                 "hyperscale_view_syncs",
                 "Rounds advanced via sync_to_qc_round (caught up to higher round seen on peers)",
-                &["shard", "validator_id"]
+                &["shard"]
             )
             .unwrap(),
 
@@ -329,8 +338,8 @@ impl Metrics {
 
             mempool_size: register_gauge_vec!(
                 "hyperscale_mempool_size",
-                "Number of pending transactions in mempool, per (shard, validator_id)",
-                &["shard", "validator_id"]
+                "Number of pending transactions in mempool, per shard replica",
+                &["shard"]
             )
             .unwrap(),
 
@@ -338,13 +347,13 @@ impl Metrics {
             in_flight: register_gauge_vec!(
                 "hyperscale_in_flight",
                 "Drain the committed tip records: what committed transactions reserved and their ticks have not yet returned",
-                &["shard", "validator_id"]
+                &["shard"]
             )
             .unwrap(),
             backpressure_active: register_gauge_vec!(
                 "hyperscale_backpressure_active",
                 "Whether the drain is at MAX_UNSETTLED_TXS (1), refusing RPC submissions and new proposed transactions, or not (0)",
-                &["shard", "validator_id"]
+                &["shard"]
             )
             .unwrap(),
 
@@ -672,35 +681,35 @@ impl Metrics {
             memory_shard: register_gauge_vec!(
                 "hyperscale_memory_shard_collections",
                 "shard consensus state machine collection sizes (entry count)",
-                &["collection", "shard", "validator_id"]
+                &["collection", "shard"]
             )
             .unwrap(),
 
             memory_exec: register_gauge_vec!(
                 "hyperscale_memory_exec_collections",
                 "Execution state machine collection sizes (entry count)",
-                &["collection", "shard", "validator_id"]
+                &["collection", "shard"]
             )
             .unwrap(),
 
             memory_mempool: register_gauge_vec!(
                 "hyperscale_memory_mempool_collections",
                 "Mempool collection sizes (entry count)",
-                &["collection", "shard", "validator_id"]
+                &["collection", "shard"]
             )
             .unwrap(),
 
             memory_remote_headers: register_gauge_vec!(
                 "hyperscale_memory_remote_headers_collections",
                 "Remote header coordinator collection sizes (entry count)",
-                &["collection", "shard", "validator_id"]
+                &["collection", "shard"]
             )
             .unwrap(),
 
             memory_provisions: register_gauge_vec!(
                 "hyperscale_memory_provisions_collections",
                 "Provision coordinator collection sizes (entry count)",
-                &["collection", "shard", "validator_id"]
+                &["collection", "shard"]
             )
             .unwrap(),
 
@@ -1171,45 +1180,52 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(height as f64);
     }
 
-    fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {
+    fn set_attached_signers(&self, shard: u64, count: usize) {
+        self.metrics
+            .attached_signers
+            .with_label_values(&[&shard.to_string()])
+            .set(count as f64);
+    }
+
+    fn set_shard_round(&self, shard: u64, round: u64) {
         self.metrics
             .round
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[&shard.to_string()])
             .set(round as f64);
     }
 
-    fn set_view_changes(&self, shard: u64, validator_id: u64, count: u64) {
+    fn set_view_changes(&self, shard: u64, count: u64) {
         self.metrics
             .view_changes
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[&shard.to_string()])
             .set(count as f64);
     }
 
-    fn set_view_syncs(&self, shard: u64, validator_id: u64, count: u64) {
+    fn set_view_syncs(&self, shard: u64, count: u64) {
         self.metrics
             .view_syncs
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[&shard.to_string()])
             .set(count as f64);
     }
 
-    fn set_mempool_size(&self, shard: u64, validator_id: u64, size: usize) {
+    fn set_mempool_size(&self, shard: u64, size: usize) {
         self.metrics
             .mempool_size
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[&shard.to_string()])
             .set(size as f64);
     }
 
-    fn set_in_flight(&self, shard: u64, validator_id: u64, drain: u64) {
+    fn set_in_flight(&self, shard: u64, drain: u64) {
         self.metrics
             .in_flight
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[&shard.to_string()])
             .set(drain as f64);
     }
 
-    fn set_backpressure_active(&self, shard: u64, validator_id: u64, active: bool) {
+    fn set_backpressure_active(&self, shard: u64, active: bool) {
         self.metrics
             .backpressure_active
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[&shard.to_string()])
             .set(if active { 1.0 } else { 0.0 });
     }
 
@@ -1710,12 +1726,11 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Memory ──────────────────────────────────────────────────────
 
-    fn set_vnode_memory_gauge(
+    fn set_replica_memory_gauge(
         &self,
         family: MemoryFamily,
         field: &str,
         shard: u64,
-        validator_id: u64,
         value: usize,
     ) {
         let gauge = match family {
@@ -1726,7 +1741,7 @@ impl MetricsRecorder for PrometheusRecorder {
             MemoryFamily::Provisions => &self.metrics.memory_provisions,
         };
         gauge
-            .with_label_values(&[field, &shard.to_string(), &validator_id.to_string()])
+            .with_label_values(&[field, &shard.to_string()])
             .set(value as f64);
     }
 

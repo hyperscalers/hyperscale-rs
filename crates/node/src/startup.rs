@@ -23,22 +23,22 @@ use hyperscale_types::{
 };
 use tracing::info;
 
-/// The `(validator, signer)` pairs seated together on one shard.
-pub type ShardVnodes = Vec<(ValidatorId, Arc<dyn Signer>)>;
+/// The `(validator, signer)` pairs attached to one shard's replica.
+pub type ShardSigners = Vec<(ValidatorId, Arc<dyn Signer>)>;
 
 /// How a starting host seats the validators it runs.
 pub struct SeatPlan<S> {
     /// Shards whose store committed past genesis on their own chain, each
     /// with that open store and the validators it resumes: those placed
     /// there and those routing still names there.
-    pub resumed: BTreeMap<ShardId, (S, ShardVnodes)>,
+    pub resumed: BTreeMap<ShardId, (S, ShardSigners)>,
     /// Shards a local validator is placed on whose store holds no chain of
     /// its own — fresh, or a split clone no adoption ran over — each with
     /// the validators a join seats there. They follow the beacon until it
     /// does.
-    pub joins: BTreeMap<ShardId, ShardVnodes>,
+    pub joins: BTreeMap<ShardId, ShardSigners>,
     /// Validators the beacon places on no shard.
-    pub unplaced: ShardVnodes,
+    pub unplaced: ShardSigners,
 }
 
 impl<S> SeatPlan<S> {
@@ -107,8 +107,8 @@ pub fn plan_seats<S, E>(
 where
     S: Deref<Target: ShardChainReader>,
 {
-    let mut placed: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
-    let mut unplaced = ShardVnodes::new();
+    let mut placed: BTreeMap<ShardId, ShardSigners> = BTreeMap::new();
+    let mut unplaced = ShardSigners::new();
     let records = &head.validators;
     for (validator, signer) in validators {
         match records.get(validator).map(|record| record.status) {
@@ -119,7 +119,7 @@ where
             _ => unplaced.push((*validator, Arc::clone(signer))),
         }
     }
-    let mut routed: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
+    let mut routed: BTreeMap<ShardId, ShardSigners> = BTreeMap::new();
     let live = |shard: &ShardId| {
         head.shard_committees.contains_key(shard)
             && head
@@ -199,11 +199,11 @@ pub fn departed_to_serve(
     topology: &TopologySnapshot,
     routing: &RoutingCommittees,
     validators: &[(ValidatorId, Arc<dyn Signer>)],
-) -> Vec<(ShardId, ShardVnodes)> {
+) -> Vec<(ShardId, ShardSigners)> {
     departed_shards_on_disk(boundaries, placed, on_disk)
         .into_iter()
         .filter_map(|shard| {
-            let serving: ShardVnodes = validators
+            let serving: ShardSigners = validators
                 .iter()
                 .filter(|(validator, _)| {
                     holds_window_role(shard, topology, routing, &HashSet::from([*validator]))
@@ -238,7 +238,7 @@ fn departed_shards_on_disk(
 
 /// Whether a local validator in `host_ids` sits in `shard`'s committed
 /// committee in any window role or in its routing committee: the serving
-/// obligation a hosted shard's vnode keeps it up for.
+/// obligation a hosted shard's replica keeps it up for.
 #[must_use]
 pub fn holds_window_role<H: BuildHasher>(
     shard: ShardId,
@@ -285,7 +285,7 @@ mod tests {
 
     use super::*;
 
-    fn local(committee: &TestCommittee) -> ShardVnodes {
+    fn local(committee: &TestCommittee) -> ShardSigners {
         (0..committee.size())
             .map(|i| (validator(i), committee.signer(i)))
             .collect()
@@ -342,7 +342,7 @@ mod tests {
         }
     }
 
-    fn ids(vnodes: &ShardVnodes) -> Vec<ValidatorId> {
+    fn ids(vnodes: &ShardSigners) -> Vec<ValidatorId> {
         vnodes.iter().map(|(validator, _)| *validator).collect()
     }
 

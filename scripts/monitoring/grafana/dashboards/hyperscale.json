@@ -87,7 +87,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "count(count by (shard, validator_id) (hyperscale_round))",
+          "expr": "sum(hyperscale_attached_signers)",
           "refId": "A"
         }
       ],
@@ -1181,7 +1181,7 @@
             "uid": "${datasource}"
           },
           "expr": "hyperscale_view_changes",
-          "legendFormat": "{{instance}} self-timeout",
+          "legendFormat": "{{instance}} shard {{shard}} self-timeout",
           "refId": "A"
         },
         {
@@ -1190,11 +1190,11 @@
             "uid": "${datasource}"
           },
           "expr": "hyperscale_view_syncs",
-          "legendFormat": "{{instance}} caught-up",
+          "legendFormat": "{{instance}} shard {{shard}} caught-up",
           "refId": "B"
         }
       ],
-      "title": "Round advances by Validator (self-timeout vs caught-up)",
+      "title": "Round advances by Shard Replica (self-timeout vs caught-up)",
       "type": "timeseries"
     },
     {

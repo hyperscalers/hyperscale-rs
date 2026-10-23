@@ -1,5 +1,5 @@
-//! The shard half of a vnode: the coordinators a node runs while seated on
-//! a shard, plus the per-domain dispatch over them.
+//! The shard half of a replica: the coordinators it runs on its shard,
+//! plus the per-domain dispatch over them.
 //!
 //! [`ShardParticipation`] bundles [`ShardCoordinator`], [`ExecutionCoordinator`],
 //! [`MempoolCoordinator`], [`ProvisionCoordinator`], [`OutboundProvisionTracker`],
@@ -37,13 +37,13 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, Verifier};
 
-/// The coordinators a vnode runs while seated on a shard.
+/// The coordinators a replica runs on its shard.
 ///
 /// Fields are visible across the `state` module tree so the per-domain handlers
 /// here, the orchestrators on [`NodeStateMachine`](super::NodeStateMachine), and
 /// its accessors all read them directly.
 pub(in crate::state) struct ShardParticipation {
-    /// This vnode's home shard.
+    /// This replica's shard.
     pub(in crate::state) local_shard: ShardId,
 
     /// What this node can resolve an envelope against. Blocks that
@@ -103,11 +103,16 @@ pub(in crate::state) struct ShardParticipation {
 }
 
 impl ShardParticipation {
-    /// Build the shard half from the same per-shard-shared stores
-    /// [`NodeStateMachine::new`](super::NodeStateMachine::new) threads in. Use
-    /// `RecoveredState::default()` for a fresh start.
+    /// Build the shard half from `recovered`, over a store written
+    /// through `persisted_base`. Use `RecoveredState::default()` for a
+    /// fresh start.
+    ///
+    /// The bodies the replica's own committed blocks carried go back in
+    /// the provision store everything reads them from: a stored block
+    /// keeps only their hashes, so without them a restarted host holds
+    /// blocks it cannot serve and legs it cannot replay.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
+    #[allow(clippy::too_many_arguments)] // a replica's whole construction context
     pub(in crate::state) fn new(
         verifier: Arc<dyn Verifier>,
         derivation: Arc<dyn Derivation>,
@@ -117,12 +122,12 @@ impl ShardParticipation {
         recovered: &RecoveredState,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
-        provision_store: Arc<ProvisionStore>,
-        tx_store: Arc<TxStore>,
-        exec_cert_store: Arc<ExecCertStore>,
-        finalization_store: Arc<FinalizationStore>,
-        crossing_index: Arc<CrossingIndexSlot>,
+        persisted_base: BlockHeight,
     ) -> Self {
+        let provision_store = Arc::new(ProvisionStore::new());
+        for provisions in &recovered.retained_provisions {
+            provision_store.insert(Arc::clone(provisions));
+        }
         // Execution's commit frontier and its account of what is still in
         // flight both seed from the same recovered tip the shard
         // coordinator restores, so the first post-restart commit
@@ -145,7 +150,7 @@ impl ShardParticipation {
         let mut mempool_coordinator = MempoolCoordinator::with_tx_store(
             local_shard,
             mempool_config,
-            tx_store,
+            Arc::new(TxStore::new()),
             clock.clone(),
             fork_fence.clone(),
         );
@@ -157,12 +162,13 @@ impl ShardParticipation {
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
             local_shard,
             code,
-            crossing_index,
+            Arc::new(CrossingIndexSlot::default()),
             recovered,
-            exec_cert_store,
-            finalization_store,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
             Arc::clone(shard_coordinator.proven_anchors()),
             Arc::clone(shard_coordinator.mirror()),
+            persisted_base,
         );
         let committed_provisions = Arc::clone(shard_coordinator.committed_provisions());
         // The shard's committed-provision window, shared rather than

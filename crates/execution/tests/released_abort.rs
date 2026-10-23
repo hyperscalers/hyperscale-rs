@@ -140,12 +140,12 @@ fn a_released_shared_member_settles_the_abort_its_row_names_with_no_counterpart_
     assert_eq!(amount(sim.settled(vault)), FUNDED);
 
     sim.commit_naming(abort_named_at_once(&sim, &tx));
-    let seated_in = sim.tick_of(hash).expect("the line seats the abort");
+    let signers_in = sim.tick_of(hash).expect("the line seats the abort");
     let offered = sim.certify_votable();
     let [half] = &offered[..] else {
         panic!("the abort's tick offers one half: {offered:?}");
     };
-    assert_eq!(*half.tick_id(), seated_in);
+    assert_eq!(*half.tick_id(), signers_in);
     assert_eq!(half.half(), TickHalf::Stated);
     let certificate = half
         .local_ec()

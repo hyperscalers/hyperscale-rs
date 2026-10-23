@@ -60,7 +60,7 @@ fn fingerprint(runner: &SimulationRunner) -> Fingerprint {
             .iter()
             .flat_map(|&leaf| {
                 runner
-                    .shard_vnodes(leaf)
+                    .shard_replicas(leaf)
                     .into_iter()
                     .map(|v| v.shard_coordinator().committed_height())
                     .collect::<Vec<_>>()

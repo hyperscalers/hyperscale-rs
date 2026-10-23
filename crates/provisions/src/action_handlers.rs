@@ -148,8 +148,8 @@ where
                 // Provisions built from the local JMT view satisfy their
                 // own merkle-proof predicate by construction; wrap as
                 // `Verified` so the local-dispatch fast path can let a
-                // colocated target-shard vnode admit without re-running
-                // `Action::VerifyProvisions`.
+                // target-shard replica on this host admit without
+                // re-running `Action::VerifyProvisions`.
                 let verified = Arc::new(Verified::<Provisions>::from_local(Arc::unwrap_or_clone(
                     provisions,
                 )));
