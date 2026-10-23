@@ -9679,16 +9679,24 @@ impl ShardCoordinator {
         orphaned.into_abandon_actions()
     }
 
-    /// Drop what was judged of blocks no longer pending: their
+    /// Drop what was judged of blocks this replica no longer holds: their
     /// verification state, substate deltas and answer deltas.
+    ///
+    /// A sync-admitted block is never pending, and keeps its judgements
+    /// while the certified cache holds it above the committed tip: its
+    /// state-root stage stays checked, so a delta dropped here is never
+    /// measured again, and a child's substate count waits on it for good.
     fn retain_pending_judgements(&mut self) {
         self.verification
             .cleanup(&self.pending_blocks, self.committed_height);
-        self.pending_bytes_deltas
-            .retain(|hash, _| self.pending_blocks.get(*hash).is_some());
         let pending_blocks = &self.pending_blocks;
-        self.answers
-            .retain_pending(|hash| pending_blocks.get(hash).is_some());
+        let verification = &self.verification;
+        let judged = |hash: BlockHash| {
+            pending_blocks.get(hash).is_some()
+                || verification.cached_verified_certified_block(hash).is_some()
+        };
+        self.pending_bytes_deltas.retain(|hash, _| judged(*hash));
+        self.answers.retain_pending(judged);
     }
 
     /// Drive the verification of the blocks the store handed back at
@@ -20942,6 +20950,30 @@ mod tests {
                 "delta {delta:?}",
             );
         }
+    }
+
+    /// A sync-admitted block above the committed tip keeps its substate
+    /// delta through a commit's cleanup, which drops the delta of a block
+    /// held nowhere: the synced block is never pending, and its checked
+    /// state-root stage is never run again to measure the delta anew.
+    #[test]
+    fn a_synced_block_above_the_tip_keeps_its_substate_delta_through_a_cleanup() {
+        let (mut state, _, _, five) = harvested_unexecuted_suffix();
+        assert!(state.pending_blocks.get(five.hash()).is_none());
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(five.hash())
+                .is_some()
+        );
+        let gone = BlockHash::from_raw(Hash::from_bytes(b"held_nowhere"));
+        state.pending_bytes_deltas.insert(five.hash(), 64);
+        state.pending_bytes_deltas.insert(gone, 32);
+
+        let _ = state.cleanup_old_state(state.committed_height);
+
+        assert_eq!(state.pending_bytes_deltas.get(&five.hash()), Some(&64));
+        assert_eq!(state.pending_bytes_deltas.get(&gone), None);
     }
 
     /// A harvested certified tip whose tree is not held stays the parent
