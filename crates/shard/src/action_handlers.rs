@@ -1529,12 +1529,16 @@ where
             timeout_cert,
             standing_answers,
         } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!(?shard_id, "proposal dispatched without a signer; skipping");
+                return;
+            };
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
             // digest is the link the block adds to its reveal chain; the proof
             // rides the block body and manifest for the verifier's re-check.
             let Ok(randomness_reveal) = shard_reveal_sign(
-                ctx.signer.as_ref(),
+                signing.key.as_ref(),
                 ctx.topology_snapshot.network(),
                 shard_id,
                 height,
@@ -1755,7 +1759,16 @@ where
             header,
             manifest,
             recipients,
+            position,
         } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!("block header dispatched without a signer; skipping");
+                return;
+            };
+            // The proposer's spent round is durable before the header
+            // signature exists, as the vote arm's position is.
+            ctx.vote_registers
+                .persist_vote_position(signing.me, &position);
             let block_hash = header.hash();
             let msg = signed_bytes(
                 &BlockProposalMessage {
@@ -1766,7 +1779,7 @@ where
                 },
                 ctx.topology_snapshot.network(),
             );
-            let Ok(sig) = ctx.signer.sign(&msg) else {
+            let Ok(sig) = signing.key.sign(&msg) else {
                 tracing::error!(?block_hash, "cannot sign block header; skipping broadcast");
                 return;
             };
@@ -1782,11 +1795,20 @@ where
             timestamp,
             next_proposers,
             position,
+            signer: _,
         } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!(
+                    ?block_hash,
+                    "block vote dispatched without a signer; abstaining"
+                );
+                return;
+            };
             // The position this vote ratcheted must be durable before
             // the signature exists — a crash between them costs at most
             // an abstention, never a second vote in a consumed round.
-            ctx.vote_registers.persist_vote_position(ctx.me, &position);
+            ctx.vote_registers
+                .persist_vote_position(signing.me, &position);
             let Ok(verified) = Verified::<BlockVote>::sign_local(
                 ctx.topology_snapshot.network(),
                 block_hash,
@@ -1794,8 +1816,8 @@ where
                 ctx.shard,
                 height,
                 round,
-                ctx.me,
-                ctx.signer.as_ref(),
+                signing.me,
+                signing.key.as_ref(),
                 timestamp,
             ) else {
                 tracing::error!(?block_hash, "cannot sign block vote; abstaining");
@@ -1813,17 +1835,23 @@ where
             high_tc,
             recipients,
             position,
+            signer: _,
         } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!(?round, "timeout dispatched without a signer; abstaining");
+                return;
+            };
             // Same persistence rule as the vote arm: the abandoned round
             // is durable before the timeout signature exists.
-            ctx.vote_registers.persist_vote_position(ctx.me, &position);
+            ctx.vote_registers
+                .persist_vote_position(signing.me, &position);
             let Ok(verified) = Verified::<Timeout>::sign_local(
                 ctx.topology_snapshot.network(),
                 ctx.shard,
                 round,
                 high_qc,
-                ctx.me,
-                ctx.signer.as_ref(),
+                signing.me,
+                signing.key.as_ref(),
             ) else {
                 tracing::error!(?round, "cannot sign timeout; abstaining");
                 return;
@@ -1835,14 +1863,22 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
         }
 
-        Action::SignAndBroadcastQcAnnouncement { qc, recipients } => {
+        Action::SignAndBroadcastQcAnnouncement {
+            qc,
+            recipients,
+            signer: _,
+        } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!("QC announcement dispatched without a signer; skipping");
+                return;
+            };
             let mut announcement = QcAnnouncementNotification {
                 qc,
-                sender: ctx.me,
+                sender: signing.me,
                 sender_signature: ConsensusSignature::ZERO,
             };
             let message = announcement.signing_message(ctx.topology_snapshot.network());
-            let Ok(signature) = ctx.signer.sign(&message) else {
+            let Ok(signature) = signing.key.sign(&message) else {
                 tracing::error!("cannot sign QC announcement; skipping");
                 return;
             };
@@ -1855,14 +1891,19 @@ where
             wt_window_start,
             wt_window_end,
             recipients,
+            signer: _,
         } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!(?shard, "ready signal dispatched without a signer; skipping");
+                return;
+            };
             let Ok(signal) = ReadySignal::sign(
                 ctx.topology_snapshot.network(),
-                ctx.me,
+                signing.me,
                 shard,
                 wt_window_start,
                 wt_window_end,
-                ctx.signer.as_ref(),
+                signing.key.as_ref(),
             ) else {
                 tracing::error!(?shard, "cannot sign ready signal; skipping");
                 return;
@@ -1894,6 +1935,10 @@ where
         }
 
         Action::BroadcastCertifiedBlockHeader { certified_header } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!("certified header gossip dispatched without a signer; skipping");
+                return;
+            };
             let msg = signed_bytes(
                 &CertifiedBlockHeaderSenderMessage {
                     shard_id: certified_header.header().shard_id(),
@@ -1902,7 +1947,7 @@ where
                 },
                 ctx.topology_snapshot.network(),
             );
-            let Ok(sig) = ctx.signer.sign(&msg) else {
+            let Ok(sig) = signing.key.sign(&msg) else {
                 tracing::error!("cannot sign certified header gossip; skipping");
                 return;
             };
@@ -1910,7 +1955,7 @@ where
                 certified_header: Arc::new(Verifiable::<CertifiedBlockHeader>::from(
                     certified_header,
                 )),
-                sender: ctx.me,
+                sender: signing.me,
                 sender_signature: sig,
             };
             ctx.network.broadcast_global(&gossip);

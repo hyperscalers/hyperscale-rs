@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_core::SignerGate;
 use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
@@ -51,6 +52,7 @@ impl VnodeInit {
             validator_id: self.validator,
             state: self.state,
             signer: self.signer,
+            gate: Arc::new(SignerGate::new()),
         }
     }
 }
@@ -213,4 +215,7 @@ pub struct Vnode {
     /// `DispatchHandles` via `Arc` so delegated handlers running on
     /// thread pools can sign without re-entering the pinned thread.
     pub(crate) signer: Arc<dyn Signer>,
+
+    /// The release gate every action this vnode signs carries.
+    pub(crate) gate: Arc<SignerGate>,
 }

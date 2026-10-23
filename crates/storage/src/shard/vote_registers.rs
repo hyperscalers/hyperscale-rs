@@ -20,8 +20,9 @@ use hyperscale_types::{Block, BlockHeight, SafeVoteRegisters, ValidatorId, VoteP
 ///   together or not at all. A record that outlives its justification
 ///   describes a lock its holder can never satisfy again.
 /// - **Monotone.** Writes merge field-wise-max into the stored record,
-///   so out-of-order calls from concurrent signers cannot regress it,
-///   and a write that raises nothing is a no-op.
+///   so out-of-order calls from concurrent signers cannot regress it.
+///   A write that raises nothing and stores no new block writes nothing,
+///   so a proposer's self-vote after its header costs no second write.
 /// - **Bound to the chain incarnation.** Records are tagged with the
 ///   store's chain origin at write time and ignored by reads when the
 ///   tag no longer matches — a store seeded from a parent shard's

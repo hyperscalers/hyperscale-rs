@@ -46,22 +46,22 @@ pub fn attesting_committee(
         .map(|(snapshot, _)| snapshot)
 }
 
-/// Committee members of `shard` with the local validator filtered out.
+/// Committee members of `shard` with the replica's own signers filtered out.
 ///
 /// Used for broadcast-style actions (e.g. `BroadcastExecutionCertificate`,
 /// provision fetch) that fan out to every other member of a committee. Works
-/// for both the local shard (self is always a member, filter removes exactly
-/// one entry) and remote shards (filter is a no-op when self isn't a member).
+/// for both the local shard and remote shards (the filter is a no-op where
+/// no signer is a member).
 pub fn peers_excluding_self(
     topology_snapshot: &TopologySnapshot,
-    me: ValidatorId,
+    signers: &BTreeSet<ValidatorId>,
     shard: ShardId,
 ) -> Vec<ValidatorId> {
     topology_snapshot
         .committee_for_shard(shard)
         .iter()
         .copied()
-        .filter(|&v| v != me)
+        .filter(|v| !signers.contains(v))
         .collect()
 }
 
@@ -299,11 +299,9 @@ pub fn record_pushes(
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
     transactions: &[Arc<Verifiable<Transaction>>],
-    me: ValidatorId,
+    signers: &BTreeSet<ValidatorId>,
     local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
-    let local_vid = me;
-
     let mut provision_requests = Vec::new();
     for tx in transactions {
         if !tx.as_unverified().is_routed() || topology_snapshot.is_single_shard_transaction(tx) {
@@ -325,7 +323,7 @@ pub fn build_provision_requests(
                     .committee_for_shard(target_shard)
                     .iter()
                     .copied()
-                    .filter(|&v| v != local_vid)
+                    .filter(|v| !signers.contains(v))
                     .collect()
             });
         }
@@ -387,7 +385,7 @@ mod tests {
             build_provision_requests(
                 &topology,
                 &[unrouted],
-                committee.validator_id(0),
+                &BTreeSet::from([committee.validator_id(0)]),
                 ShardId::ROOT,
             )
             .is_none()
@@ -635,7 +633,11 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology_snapshot = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology_snapshot, ValidatorId::new(0), ShardId::ROOT);
+        let peers = peers_excluding_self(
+            &topology_snapshot,
+            &BTreeSet::from([ValidatorId::new(0)]),
+            ShardId::ROOT,
+        );
         assert_eq!(peers.len(), 3);
         assert!(!peers.contains(&ValidatorId::new(0)));
         assert!(peers.contains(&ValidatorId::new(1)));
@@ -652,7 +654,7 @@ mod tests {
         // of who the local validator is.
         let peers = peers_excluding_self(
             &topology_snapshot,
-            ValidatorId::new(0),
+            &BTreeSet::from([ValidatorId::new(0)]),
             ShardId::leaf(8, 99),
         );
         assert!(peers.is_empty());
@@ -663,7 +665,11 @@ mod tests {
         let committee = TestCommittee::new(1, 42);
         let topology_snapshot = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology_snapshot, ValidatorId::new(0), ShardId::ROOT);
+        let peers = peers_excluding_self(
+            &topology_snapshot,
+            &BTreeSet::from([ValidatorId::new(0)]),
+            ShardId::ROOT,
+        );
         assert!(peers.is_empty());
     }
 

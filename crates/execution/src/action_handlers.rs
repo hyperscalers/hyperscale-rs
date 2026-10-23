@@ -375,8 +375,16 @@ where
             global_receipt_root: _,
             tx_outcomes,
             recipients,
+            signer: _,
         } => {
-            let validator_id = ctx.me;
+            let Some(signing) = &ctx.signing else {
+                tracing::error!(
+                    ?block_hash,
+                    "execution vote dispatched without a signer; abstaining"
+                );
+                return;
+            };
+            let validator_id = signing.me;
             let network = ctx.topology_snapshot.network();
 
             let Ok(verified) = Verified::<ExecutionVote>::sign_local(
@@ -385,7 +393,7 @@ where
                 tick_id,
                 Capped::new(tx_outcomes).expect("a list under the cap its source already met"),
                 validator_id,
-                ctx.signer.as_ref(),
+                signing.key.as_ref(),
             ) else {
                 tracing::error!(?block_hash, "cannot sign execution vote; abstaining");
                 return;
@@ -417,7 +425,12 @@ where
             shard: _,
             certificate,
             recipients,
+            signer: _,
         } => {
+            let Some(signing) = &ctx.signing else {
+                tracing::error!("execution certificate dispatched without a signer; skipping");
+                return;
+            };
             let cert = Arc::unwrap_or_clone(certificate).into_inner();
             let msg = signed_bytes(
                 &ExecutionCertificatesSenderMessage::new(
@@ -426,12 +439,12 @@ where
                 ),
                 ctx.topology_snapshot.network(),
             );
-            let Ok(sig) = ctx.signer.sign(&msg) else {
+            let Ok(sig) = signing.key.sign(&msg) else {
                 tracing::error!("cannot sign execution certificate batch; skipping broadcast");
                 return;
             };
             let batch =
-                ExecutionCertificatesNotification::new(Capped::from_array([cert]), ctx.me, sig);
+                ExecutionCertificatesNotification::new(Capped::from_array([cert]), signing.me, sig);
             ctx.network.notify(&recipients, &batch);
         }
 

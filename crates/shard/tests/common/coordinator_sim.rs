@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use hyperscale_core::{
     Action, ActionContext, CommitSource, FetchIds, Parallelism, ParentJudgement, PreparedBlock,
-    ProtocolEvent, QcSubject, TimerId,
+    ProtocolEvent, QcSubject, SignerGate, Signing, TimerId,
 };
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::{ExecutionMode, Executor};
@@ -45,14 +45,16 @@ use hyperscale_shard::action_handlers::{
 use hyperscale_shard::parent_checks::{
     AtParent, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
 };
-use hyperscale_shard::{ProposalInputs, ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
+use hyperscale_shard::{
+    ProposalInputs, ShardConsensusConfig, ShardCoordinator, ShardMemoryStats, SignerPosition,
+};
 use hyperscale_storage::{
     AnswerFollow, BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex,
     ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
     SubstateStore, Substates, TerminalWindow, TickChain, answer_additions,
     colliding_committed_cell, colliding_member_row, creations_of, filter_writes_to_prefix,
 };
-use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
+use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage, crash_point};
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::test_utils::{TestCommittee, test_transaction};
@@ -65,11 +67,11 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalTimestamp, MessageClass, NetworkDefinition, NetworkMessage,
     ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Request,
-    Round, RoutingCommittees, SectionRoots, SettledWrites, ShardId, ShardLoad,
-    ShardVoteEquivocation, ShardWitnessPayload, SharedTransactions, Signer, SignerBitfield,
-    StateClaim, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, SubstateKey,
-    SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    Round, RoutingCommittees, SafeVoteRegisters, SectionRoots, SettledWrites, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, SharedTransactions, SignError, Signer,
+    SignerBitfield, StateClaim, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt,
+    SubstateKey, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
     VerificationKind, Verified, Verify, VoteCount, VrfProof, WeightedTimestamp,
     local_settled_tx_hashes, shard_prefix_path, shard_reveal_sign, signed_bytes,
 };
@@ -549,7 +551,7 @@ impl ShardCoordinatorSim {
 
             let mut coord = ShardCoordinator::new(
                 Arc::new(BlsVerifier),
-                id,
+                [id],
                 shard,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
@@ -614,6 +616,13 @@ impl ShardCoordinatorSim {
         self.coordinators.len()
     }
 
+    /// The safe-vote registers of the replica at `idx`, under its one signer.
+    pub fn position(&self, idx: usize) -> SignerPosition {
+        self.coordinators[idx]
+            .position(self.members[idx].0)
+            .expect("each replica signs as its member")
+    }
+
     /// Drop the next `n` envelopes addressed to `replica`. Mirrors
     /// beacon `CoordinatorSim::drop_for`.
     pub fn drop_for(&mut self, replica: ValidatorId, n: usize) {
@@ -665,7 +674,7 @@ impl ShardCoordinatorSim {
         let replica = self.members[idx].0;
         let mut coord = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            replica,
+            [replica],
             self.shard,
             ShardConsensusConfig::default(),
             recovered,
@@ -1375,11 +1384,16 @@ impl ShardCoordinatorSim {
         }
     }
 
-    /// Run `action`, a `BuildProposal`, through the production handler
-    /// as the replica at `emitter_idx`: its prepared block joins the
-    /// replica's pending chain and the proposal it reports is queued
-    /// back to it.
-    fn build_in_production(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+    /// Run `action` through the production handler as the replica at
+    /// `emitter_idx`, signing under `key`: the events it reported and the
+    /// blocks it prepared.
+    fn run_in_production(
+        &self,
+        emitter_idx: usize,
+        me: ValidatorId,
+        key: &Arc<dyn Signer>,
+        action: Action,
+    ) -> (Vec<ProtocolEvent>, Vec<PreparedBlock>) {
         let production = self
             .production
             .as_ref()
@@ -1390,24 +1404,61 @@ impl ShardCoordinatorSim {
         let commit_prepared = |block: PreparedBlock| {
             prepared.lock().expect("prepared lock").push(block);
         };
+        let gate = SignerGate::new();
         let ctx = ActionContext {
             executor: &production.executor,
             topology_snapshot: self.topology_schedule.head(),
-            me,
+            signing: Some(Signing {
+                me,
+                key,
+                gate: &gate,
+            }),
             shard: self.shard,
             pending_chain: &self.pending_chains[emitter_idx],
             tick_chain: &Arc::new(TickChain::new(Arc::clone(&self.storages[emitter_idx]))),
             vote_registers: self.storages[emitter_idx].as_ref(),
             beacon_chain: &production.beacon,
             network: &production.network,
-            signer: &self.sks[emitter_idx],
             verifier: &BlsVerifier,
             notify: Arc::new(move |event| sink.lock().expect("reported lock").push(event)),
             commit_prepared: &commit_prepared,
             par: Parallelism::Sequential,
         };
         handle_action(action, &ctx);
-        for block in prepared.into_inner().expect("prepared lock") {
+        let reported = std::mem::take(&mut *reported.lock().expect("reported lock"));
+        (reported, prepared.into_inner().expect("prepared lock"))
+    }
+
+    /// Run `action`, a signing action, through the production handler as
+    /// the replica at `idx`, under a key that reads the replica's stored
+    /// registers at each signature it makes.
+    pub fn sign_in_production(&self, idx: usize, action: Action) -> SignedInProduction {
+        let me = self.members[idx].0;
+        let probe = Arc::new(RegisterProbe {
+            inner: Arc::clone(&self.sks[idx]),
+            storage: Arc::clone(&self.storages[idx]),
+            me,
+            seen: Mutex::new(Vec::new()),
+        });
+        let key: Arc<dyn Signer> = probe.clone();
+        let (ran, left) = crash_point::armed(Some(u64::MAX), || {
+            self.run_in_production(idx, me, &key, action)
+        });
+        ran.expect("no write crashes under an unreachable countdown");
+        SignedInProduction {
+            writes: u64::MAX - left.expect("the countdown is never reached"),
+            registers_at_sign: std::mem::take(&mut *probe.seen.lock().expect("probe lock")),
+        }
+    }
+
+    /// Run `action`, a `BuildProposal`, through the production handler
+    /// as the replica at `emitter_idx`: its prepared block joins the
+    /// replica's pending chain and the proposal it reports is queued
+    /// back to it.
+    fn build_in_production(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+        let key = Arc::clone(&self.sks[emitter_idx]);
+        let (reported, prepared) = self.run_in_production(emitter_idx, me, &key, action);
+        for block in prepared {
             self.pending_chains[emitter_idx].insert(
                 block.block_hash,
                 ChainEntry {
@@ -1419,7 +1470,6 @@ impl ShardCoordinatorSim {
                 },
             );
         }
-        let reported = std::mem::take(&mut *reported.lock().expect("reported lock"));
         for event in reported {
             let ProtocolEvent::ProposalBuilt {
                 height,
@@ -1466,7 +1516,11 @@ impl ShardCoordinatorSim {
                 header,
                 manifest,
                 recipients: committee_ids,
+                position,
             } => {
+                // Mirror the production sign handler: the proposer's spent
+                // round is durable before the header signature exists.
+                self.storages[emitter_idx].persist_vote_position(me, &position);
                 let header = Arc::new(*header);
                 let manifest = *manifest;
                 self.header_by_block
@@ -1540,6 +1594,7 @@ impl ShardCoordinatorSim {
                 timestamp,
                 next_proposers,
                 position,
+                signer: _,
             } => {
                 self.votes_cast[emitter_idx].push((block_hash, round));
                 // Mirror the production sign handler: the registers
@@ -1593,7 +1648,7 @@ impl ShardCoordinatorSim {
                     event: SimEvent::VerifiedVote { vote: verified },
                 });
             }
-            Action::SignAndBroadcastQcAnnouncement { qc, recipients } => {
+            Action::SignAndBroadcastQcAnnouncement { qc, recipients, .. } => {
                 let mut announcement = QcAnnouncementNotification {
                     qc,
                     sender: me,
@@ -1620,6 +1675,7 @@ impl ShardCoordinatorSim {
                 high_tc,
                 recipients,
                 position,
+                signer: _,
             } => {
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
@@ -2360,6 +2416,49 @@ fn fresh_store(shard: ShardId) -> Arc<SimShardStorage> {
     let storage = Arc::new(SimShardStorage::new(prefix));
     let _ = storage.install_genesis(&funding, &funding);
     storage
+}
+
+/// What the production handler did with a signing action.
+pub struct SignedInProduction {
+    /// Durable writes the replica's store made.
+    pub writes: u64,
+    /// The signer's stored registers as each signature was made.
+    pub registers_at_sign: Vec<Option<SafeVoteRegisters>>,
+}
+
+/// A key that records its signer's stored registers before each
+/// signature it makes.
+struct RegisterProbe {
+    inner: Arc<dyn Signer>,
+    storage: Arc<SimShardStorage>,
+    me: ValidatorId,
+    seen: Mutex<Vec<Option<SafeVoteRegisters>>>,
+}
+
+impl std::fmt::Debug for RegisterProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterProbe")
+            .field("me", &self.me)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Signer for RegisterProbe {
+    fn public_key(&self) -> ConsensusPublicKey {
+        self.inner.public_key()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<ConsensusSignature, SignError> {
+        self.seen
+            .lock()
+            .expect("probe lock")
+            .push(self.storage.safe_vote_registers(self.me));
+        self.inner.sign(message)
+    }
+
+    fn vrf_sign(&self, message: &[u8]) -> Result<VrfProof, SignError> {
+        self.inner.vrf_sign(message)
+    }
 }
 
 /// What the production `BuildProposal` handler reads beyond a replica's

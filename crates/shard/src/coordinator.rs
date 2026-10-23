@@ -337,6 +337,9 @@ struct ProposalFrame<'t> {
     parent_qc: Verified<QuorumCertificate>,
     /// The committee the block is classified and signed under.
     committee: &'t Arc<TopologySnapshot>,
+    /// The round's proposer in `committee`: an attached signer still
+    /// fresh at the round.
+    proposer: ValidatorId,
     carry: TerminalCarry,
     parent_reveal_chain: RevealChain,
     parent_committee_anchor_epoch: Epoch,
@@ -571,8 +574,7 @@ pub struct ShardCoordinator {
     answers: HeldAnswers,
 
     /// Vote accounting: per-block vote sets and received-vote equivocation
-    /// tracking. The safe-vote lock itself lives on the coordinator
-    /// (`locked_round` / `last_voted_round`).
+    /// tracking. The safe-vote locks live on each signer's position.
     votes: VoteKeeper,
 
     /// Timeout accounting for the pacemaker: per-round verified timeout shares,
@@ -613,10 +615,6 @@ pub struct ShardCoordinator {
     /// or the view passes the round.
     proposal_fetches: BTreeMap<ValidatorId, ProposalWanted>,
 
-    /// The last round we broadcast our own timeout for, so Bracha amplification
-    /// emits at most one timeout per round (the timer itself retransmits).
-    last_timed_out_round: Option<Round>,
-
     /// The highest certified height a retained ex-member has offered
     /// across a halt recovery — read off the timeouts
     /// [`Self::harvest_retained_tip`] harvests, which is the only signal
@@ -637,16 +635,9 @@ pub struct ShardCoordinator {
     /// ([`Self::release_stalled_harvest`]).
     halt_harvest_progress: Option<LocalTimestamp>,
 
-    /// HotStuff-2 safe-vote lock: the highest `parent_qc` round we have ever
-    /// voted to extend. We refuse to vote for a block whose `parent_qc` round
-    /// is below this — the entire fork-safety mechanism, kept local (no
-    /// certificate rides on the block).
-    locked_round: Round,
-
-    /// Highest round in which we have cast a vote or broadcast a timeout. One
-    /// vote per round, monotone: we never sign two votes, or a vote and a
-    /// timeout, in the same round.
-    last_voted_round: Round,
+    /// The validators this replica signs for, each under its own
+    /// safe-vote registers. No signer's position is read into another's.
+    signers: BTreeMap<ValidatorId, SignerPosition>,
 
     /// Certified blocks awaiting commit, out-of-order commit buffering, and
     /// awaiting-data commit buffering.
@@ -731,14 +722,12 @@ pub struct ShardCoordinator {
     /// speed. Local to the leader; no follower reads it.
     eager_through: BlockHeight,
 
-    /// Validators this host seats in this shard, this one among them.
-    /// Their votes reach each other without crossing the network.
+    /// Validators this host seats in this shard, this replica's signers
+    /// among them. Their votes reach each other without crossing the
+    /// network.
     host_seats: BTreeSet<ValidatorId>,
 
-    /// This validator's identity.
-    me: ValidatorId,
-
-    /// This validator's home shard.
+    /// This replica's shard.
     local_shard: ShardId,
 
     /// The chain's origin — genesis height plus start-time anchor.
@@ -847,6 +836,47 @@ fn certified_block_landed(certified: Arc<Verified<CertifiedBlock>>) -> Vec<Actio
     ]
 }
 
+/// One signer's safe-vote registers (HotStuff-2 Rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignerPosition {
+    /// The highest `parent_qc` round this signer has voted to extend. It
+    /// refuses a block whose `parent_qc` round is below it: the entire
+    /// fork-safety mechanism, since no certificate rides on the block.
+    pub locked_round: Round,
+    /// The highest round this signer has voted or timed out in. It never
+    /// signs two votes, or a vote and a timeout, in one round.
+    pub last_voted_round: Round,
+    /// The last round this signer broadcast its timeout for, so Bracha
+    /// amplification emits at most one per round.
+    pub last_timed_out_round: Option<Round>,
+}
+
+impl SignerPosition {
+    /// Whether this signer may vote or build at `round` over a parent QC
+    /// at `parent_qc_round` while the replica sits at `view`.
+    fn can_safe_vote(&self, view: Round, round: Round, parent_qc_round: Round) -> bool {
+        round == view && self.admits(round, parent_qc_round)
+    }
+
+    /// Whether this signer may sign at `round` over a parent QC at
+    /// `parent_qc_round`, whatever the view: the round is fresh to it and
+    /// the parent QC reaches its lock.
+    fn admits(&self, round: Round, parent_qc_round: Round) -> bool {
+        round > self.last_voted_round && parent_qc_round >= self.locked_round
+    }
+
+    /// This position once its signer votes at `round` over a parent QC at
+    /// `parent_qc_round`: the round is spent and the lock rises to the
+    /// parent QC.
+    fn voted(self, round: Round, parent_qc_round: Round) -> Self {
+        Self {
+            last_voted_round: self.last_voted_round.max(round),
+            locked_round: self.locked_round.max(parent_qc_round),
+            ..self
+        }
+    }
+}
+
 /// The QC a restarted validator resumes on: the higher of the committed
 /// tip's and the one its safe-vote registers justify.
 ///
@@ -872,6 +902,49 @@ fn restored_high_qc(
     }
 }
 
+/// The replica's high QC and restored high TC, and each signer's
+/// position, from the signers' durable records over the persisted QC.
+///
+/// Certificates are self-justifying, so the replica resumes at the
+/// highest any signer recorded. Each signer's registers are its own
+/// record, floored at the persisted QC's round (`floor`) so a lock cannot
+/// slip beneath a committed block even when no record survives (fresh
+/// store, new chain incarnation).
+fn restore_signers(
+    signers: impl IntoIterator<Item = ValidatorId>,
+    persisted_qc: Option<Verified<QuorumCertificate>>,
+    records: &BTreeMap<ValidatorId, SafeVoteRegisters>,
+    floor: Round,
+) -> (
+    Option<Verified<QuorumCertificate>>,
+    Option<TimeoutCertificate>,
+    BTreeMap<ValidatorId, SignerPosition>,
+) {
+    let records: Vec<(ValidatorId, SafeVoteRegisters)> = signers
+        .into_iter()
+        .map(|signer| (signer, records.get(&signer).cloned().unwrap_or_default()))
+        .collect();
+    let high_qc = records.iter().fold(persisted_qc, |held, (_, record)| {
+        restored_high_qc(held, record.high_qc.clone())
+    });
+    let restored_tc = records
+        .iter()
+        .filter_map(|(_, record)| record.high_tc.clone())
+        .max_by_key(TimeoutCertificate::round);
+    let positions = records
+        .into_iter()
+        .map(|(signer, record)| {
+            let position = SignerPosition {
+                locked_round: floor.max(record.locked_round),
+                last_voted_round: floor.max(record.last_voted_round),
+                last_timed_out_round: None,
+            };
+            (signer, position)
+        })
+        .collect();
+    (high_qc, restored_tc, positions)
+}
+
 impl ShardCoordinator {
     /// Create a new shard consensus state machine.
     ///
@@ -889,7 +962,7 @@ impl ShardCoordinator {
     #[must_use]
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        me: ValidatorId,
+        signers: impl IntoIterator<Item = ValidatorId>,
         local_shard: ShardId,
         config: ShardConsensusConfig,
         recovered: RecoveredState,
@@ -914,12 +987,13 @@ impl ShardCoordinator {
         // to two blocks ahead.
         let committed_block_anchor_wt = recovered.block_anchor_wt();
         let committed_committee_anchor_wt = recovered.committee_anchor_wt();
-        let recovered_registers = recovered
-            .safe_vote_registers
-            .get(&me)
-            .cloned()
-            .unwrap_or_default();
-        let high_qc = restored_high_qc(recovered.latest_qc, recovered_registers.high_qc.clone());
+        let (high_qc, restored_high_tc, signers) = restore_signers(
+            signers,
+            recovered.latest_qc,
+            &recovered.safe_vote_registers,
+            high_qc_round,
+        );
+        let host_seats = signers.keys().copied().collect();
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
         // chain without it re-admits everything the window still covers.
@@ -974,21 +1048,14 @@ impl ShardCoordinator {
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             high_tc: None,
-            restored_high_tc: recovered_registers.high_tc.clone(),
+            restored_high_tc,
             carried_checks: BTreeMap::new(),
             qc_announcements: BTreeMap::new(),
             announced_round: None,
             proposal_fetches: BTreeMap::new(),
-            last_timed_out_round: None,
             retained_tip: None,
             halt_harvest_progress: None,
-            // Recover the registers from the durable record (which holds
-            // every position this validator signed — persisted before each
-            // signature left the process), floored at the high QC's round
-            // so the lock can't slip beneath a committed block even when
-            // no record survives (fresh store, new chain incarnation).
-            locked_round: high_qc_round.max(recovered_registers.locked_round),
-            last_voted_round: high_qc_round.max(recovered_registers.last_voted_round),
+            signers,
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(
                 recovered.committed_height,
@@ -1017,8 +1084,7 @@ impl ShardCoordinator {
             // A restored chain's next blocks go out at network speed, as a
             // fresh chain's first ones do.
             eager_through: recovered.committed_height.next(),
-            host_seats: BTreeSet::from([me]),
-            me,
+            host_seats,
             local_shard,
             chain_origin: recovered.chain_origin,
             precut: Precut::adopted(local_shard, &recovered.predecessors),
@@ -1602,7 +1668,7 @@ impl ShardCoordinator {
             return false;
         }
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             shard = ?self.local_shard,
             count = predecessors.len(),
             "Adopted this chain's predecessors from the topology projection"
@@ -1778,12 +1844,12 @@ impl ShardCoordinator {
     fn set_block_syncing(&mut self, syncing: bool) {
         if syncing && !self.block_sync.is_syncing() {
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 "Entering sync mode - will propose empty blocks if selected"
             );
         } else if !syncing && self.block_sync.is_syncing() {
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 "Exiting sync mode - resuming normal block production"
             );
             self.view_change.record_sync_exit_activity(self.now);
@@ -1825,7 +1891,7 @@ impl ShardCoordinator {
 
         if !self.block_sync.is_syncing() {
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 target_height = target_height.inner(),
                 committed_height = self.committed_height.inner(),
                 "Starting sync - setting syncing flag and requesting blocks"
@@ -1870,7 +1936,7 @@ impl ShardCoordinator {
     /// resume actions.
     pub fn on_block_sync_complete(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             "Sync complete, resuming normal consensus"
         );
         self.set_block_syncing(false);
@@ -1888,45 +1954,42 @@ impl ShardCoordinator {
         actions
     }
 
-    /// A self-signed `ReadySignal` if the local validator is a committee
+    /// A self-signed `ReadySignal` for each signer that is a committee
     /// member of this shard still outside the consensus subset — placed,
     /// now synced to tip, and waiting on the beacon to flip
-    /// `ready: true`. `None` for already-ready members (a routine
+    /// `ready: true`. Nothing for already-ready members (a routine
     /// catch-up resync stays silent) and for non-members.
     ///
     /// The window opens at the current committed weighted timestamp and
     /// spans [`ready_signal_window`] of the configured epoch; if it passes
     /// uncollected the beacon's ready timeout remains the fallback.
-    fn maybe_emit_ready_signal(&self, topology_schedule: &TopologySchedule) -> Option<Action> {
+    fn maybe_emit_ready_signal(&self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let head = topology_schedule.head();
         let committee = head.committee_for_shard(self.local_shard);
-        if !committee.contains(&self.me)
-            || head
-                .consensus_committee_for_shard(self.local_shard)
-                .contains(&self.me)
-        {
-            return None;
-        }
+        let subset = head.consensus_committee_for_shard(self.local_shard);
         let wt_window_start = self.clock.now();
         let wt_window_end =
             wt_window_start.plus(ready_signal_window(topology_schedule.epoch_duration_ms()));
-        let recipients: Vec<ValidatorId> = committee
-            .iter()
+        self.signers
+            .keys()
             .copied()
-            .filter(|&v| v != self.me)
-            .collect();
-        info!(
-            validator = ?self.me,
-            window_start = wt_window_start.as_millis(),
-            window_end = wt_window_end.as_millis(),
-            "Synced to tip while not yet ready — broadcasting ReadySignal"
-        );
-        Some(Action::SignAndBroadcastReadySignal {
-            shard: self.local_shard,
-            wt_window_start,
-            wt_window_end,
-            recipients,
-        })
+            .filter(|signer| committee.contains(signer) && !subset.contains(signer))
+            .map(|signer| {
+                info!(
+                    ?signer,
+                    window_start = wt_window_start.as_millis(),
+                    window_end = wt_window_end.as_millis(),
+                    "Synced to tip while not yet ready — broadcasting ReadySignal"
+                );
+                Action::SignAndBroadcastReadySignal {
+                    shard: self.local_shard,
+                    wt_window_start,
+                    wt_window_end,
+                    recipients: committee.iter().copied().filter(|&v| v != signer).collect(),
+                    signer,
+                }
+            })
+            .collect()
     }
 
     /// Record leader activity (resets the view change timeout).
@@ -2034,7 +2097,7 @@ impl ShardCoordinator {
             || self.committed_height.inner() + 1,
             |qc| qc.height().inner() + 1,
         );
-        let awaiting_tip_proposal = self.last_voted_round < self.view_change.view
+        let awaiting_tip_proposal = self.any_signer_fresh_at(self.view_change.view)
             && self.view_leader(topology_schedule).is_some_and(|leader| {
                 self.pending_blocks.has_own_work_at_round(
                     BlockHeight::new(next_height),
@@ -2103,7 +2166,7 @@ impl ShardCoordinator {
 
         let round = self.view_change.view;
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             view = round.inner(),
             timeout_ms = self.current_view_change_timeout().as_millis(),
             "Round timeout — broadcasting timeout (HotStuff-2 pacemaker)"
@@ -2147,7 +2210,7 @@ impl ShardCoordinator {
         self.view_change.record_leader_activity(self.now);
 
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             genesis_hash = ?hash,
             "Initialized genesis block"
         );
@@ -2190,15 +2253,14 @@ impl ShardCoordinator {
         self.answers.seeded(height, count, seated);
     }
 
-    /// Whether this validator sits in its shard's committee, at the
-    /// head or for the block extending the committed tip, and so may
-    /// vote on what its chain proposes.
+    /// Whether any signer sits in its shard's committee, at the head or
+    /// for the block extending the committed tip, and so may vote on what
+    /// its chain proposes.
     #[must_use]
     pub fn seated_to_vote(&self, topology_schedule: &TopologySchedule) -> bool {
         let seats = |snapshot: &TopologySnapshot| {
-            snapshot
-                .committee_for_shard(self.local_shard)
-                .contains(&self.me)
+            let committee = snapshot.committee_for_shard(self.local_shard);
+            self.signers.keys().any(|signer| committee.contains(signer))
         };
         seats(topology_schedule.head()) || self.tip_committee(topology_schedule).is_some_and(seats)
     }
@@ -2291,20 +2353,26 @@ impl ShardCoordinator {
         }
     }
 
-    /// The vote on `block_hash` where the cap admits it: a refusal drops
-    /// the block, and a held vote emits nothing.
+    /// Each of `voters`' vote on `block_hash` where the cap admits it: a
+    /// refusal drops the block, and a held vote emits nothing.
     fn create_vote_within_cap(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         height: BlockHeight,
         round: Round,
+        voters: &[ValidatorId],
     ) -> Vec<Action> {
         match self.vote_within_cap(topology_schedule, block_hash) {
-            Cap::Admitted => self.create_vote(topology_schedule, block_hash, height, round),
+            Cap::Admitted => voters
+                .iter()
+                .flat_map(|&voter| {
+                    self.create_vote(topology_schedule, voter, block_hash, height, round)
+                })
+                .collect(),
             Cap::Held => {
                 trace!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     "No answer count behind the block's parent — holding the vote"
                 );
@@ -2312,7 +2380,7 @@ impl ShardCoordinator {
             }
             Cap::Refused(lineage) => {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     ?lineage,
                     "The block carries its chain's answers past the cap — not voting"
@@ -2335,7 +2403,7 @@ impl ShardCoordinator {
         if height == BlockHeight::GENESIS && hash.is_none() {
             // No committed blocks - this is a fresh start
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 "No committed blocks found - fresh start"
             );
             return vec![];
@@ -2346,17 +2414,19 @@ impl ShardCoordinator {
             self.committed_hash = h;
         }
         let has_qc = qc.is_some();
-        // Raise the safe-vote lock to the QC's round without ever lowering
-        // it: `Self::new` already floored both registers at the max of the
-        // durable record — every round this validator signed, persisted
-        // before the signature left the process — and the high QC's round.
-        // Assigning the QC round here would roll that floor back for a
-        // validator whose last vote or timeout outran its highest committed
-        // QC, letting it vote twice in one round. `max` keeps the durable
-        // floor.
+        // Raise every signer's safe-vote lock to the QC's round without
+        // ever lowering it: `Self::new` already floored both registers at
+        // the max of the signer's durable record — every round it signed,
+        // persisted before the signature left the process — and the
+        // persisted QC's round. Assigning the QC round here would roll that
+        // floor back for a signer whose last vote or timeout outran the
+        // highest committed QC, letting it vote twice in one round. `max`
+        // keeps the durable floor.
         if let Some(qc_round) = qc.as_deref().map(QuorumCertificate::round) {
-            self.locked_round = self.locked_round.max(qc_round);
-            self.last_voted_round = self.last_voted_round.max(qc_round);
+            for position in self.signers.values_mut() {
+                position.locked_round = position.locked_round.max(qc_round);
+                position.last_voted_round = position.last_voted_round.max(qc_round);
+            }
         }
         // The high QC only rises, for the same reason the lock does.
         // `Self::new` restored the higher of the committed tip's
@@ -2383,7 +2453,7 @@ impl ShardCoordinator {
         self.view_change.last_leader_activity = Some(self.now);
 
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             committed_height = self.committed_height.inner(),
             committed_hash = ?self.committed_hash,
             has_qc,
@@ -3273,7 +3343,7 @@ impl ShardCoordinator {
             .flatten()
             .fold(idle_until, LocalTimestamp::min);
         trace!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             round = round.inner(),
             "Nothing to carry; holding the empty block"
         );
@@ -3538,9 +3608,10 @@ impl ShardCoordinator {
         )
     }
 
-    /// Pre-build gate: we must be the proposer for this round, must not have
-    /// voted at it yet, and must not already be building (or parked on the
-    /// verification pipeline for) the same height/round.
+    /// Pre-build gate: the round's proposer must be one of this replica's
+    /// signers and may build at the round, and the replica must not
+    /// already be building (or parked on the verification pipeline for)
+    /// the same height/round.
     fn can_propose(
         &self,
         topology_schedule: &TopologySchedule,
@@ -3559,27 +3630,31 @@ impl ShardCoordinator {
         let Some(committee) = self.tip_committee(topology_schedule) else {
             return false;
         };
-        if committee.proposer_for(self.local_shard, round) != self.me {
+        let proposer = committee.proposer_for(self.local_shard, round);
+        let Some(position) = self.signers.get(&proposer) else {
             return false;
-        }
+        };
 
-        // Safe-vote rule, proposer side: `on_proposal_built` self-votes the
-        // block, so building again at a round we already voted in would sign
-        // a second vote at one round — and `proposal_parent()` is unchanged
-        // until a QC forms, so that second block would be a sibling of the
-        // first. A QC or timeout always advances the view past
-        // `last_voted_round`, so the legitimate next proposal passes.
         if self.pace.floor.is_some_and(|until| self.now < until) {
             return false;
         }
 
-        if round <= self.last_voted_round {
+        // Safe-vote rule, proposer side: `on_proposal_built` self-votes the
+        // block, so building again at a round the proposer already voted in
+        // would sign a second vote at one round — and `proposal_parent()` is
+        // unchanged until a QC forms, so that second block would be a
+        // sibling of the first. A QC or timeout always advances the view
+        // past `last_voted_round`, so the legitimate next proposal passes.
+        // Building over a high QC beneath the proposer's lock would vote
+        // beneath it.
+        if !self.may_build(position, round) {
             trace!(
-                validator = ?self.me,
+                ?proposer,
                 height = next_height.inner(),
                 round = round.inner(),
-                last_voted_round = self.last_voted_round.inner(),
-                "Already voted at this round, skipping proposal"
+                last_voted_round = position.last_voted_round.inner(),
+                locked_round = position.locked_round.inner(),
+                "Proposer may not sign at this round, skipping proposal"
             );
             return false;
         }
@@ -3589,7 +3664,7 @@ impl ShardCoordinator {
             && pending.round == round
         {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = next_height.inner(),
                 round = round.inner(),
                 "Proposal build already in-flight, skipping"
@@ -3608,7 +3683,7 @@ impl ShardCoordinator {
             && deferred.round == round
         {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = next_height.inner(),
                 round = round.inner(),
                 "Proposal deferred pending parent tree, skipping"
@@ -3766,7 +3841,7 @@ impl ShardCoordinator {
             Ok(settling) => settling,
             Err(blocking) => {
                 trace!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     ?blocking,
                     "The rows behind a draining shard's assertion are not held; deferring the build"
                 );
@@ -3789,7 +3864,7 @@ impl ShardCoordinator {
             )
             .unwrap_or_else(|blocking| {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     ?blocking,
                     "Beacon-witness ancestor walk blocked at proposal; previewing against committed prefix"
                 );
@@ -3920,13 +3995,6 @@ impl ShardCoordinator {
         if self.recovery_behind_retained_tip() {
             return None;
         }
-        // Every kind self-votes once built, so none may build at a round
-        // this validator already voted or timed out in: amplification can
-        // time out a round above the view, and entering that round later
-        // must not sign in it.
-        if round <= self.last_voted_round {
-            return None;
-        }
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
         // A genesis QC parents only the chain's first block. A member seated
         // above its chain's origin with no QC yet — a recovery's fresh
@@ -3945,6 +4013,12 @@ impl ShardCoordinator {
         // shard's final-epoch committee. Recovery-bridged: a block extending
         // a halted tip resolves the fresh committee.
         let committee = self.committee_for_child_of(topology_schedule, parent_block_hash)?;
+        // Every kind self-votes once built, so none may build where its
+        // proposer may not vote: at a round it already voted or timed out
+        // in (amplification can time out a round above the view, and
+        // entering that round later must not sign in it), or over a parent
+        // QC beneath its lock.
+        let (proposer, _) = self.attached_proposer(committee, round)?;
         // A terminating shard's final-window headers and its terminal carry
         // the terminal roots. A window the schedule does not hold leaves it
         // unanswerable — stall the build (before the witness preview drains
@@ -3956,7 +4030,7 @@ impl ShardCoordinator {
             parent_qc.weighted_timestamp(),
         ) else {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = height.inner(),
                 "Terminal-carry window missing from the schedule; deferring the build"
             );
@@ -3982,7 +4056,7 @@ impl ShardCoordinator {
         )
         else {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = height.inner(),
                 "Parent reveal chain unresolvable; deferring the build"
             );
@@ -4002,6 +4076,7 @@ impl ShardCoordinator {
         Some(ProposalFrame {
             parent_block_hash,
             committee,
+            proposer,
             carry,
             parent_reveal_chain,
             parent_committee_anchor_epoch: topology_schedule.epoch_for(parent_committee_anchor_wt),
@@ -4016,7 +4091,7 @@ impl ShardCoordinator {
     /// ancestor its substate count waits on, lands.
     fn defer_on_substate(&mut self, blocking: BlockHash, height: BlockHeight) -> Vec<Action> {
         trace!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             height = height.inner(),
             ?blocking,
             "Substate count unavailable at proposal; deferring until the ancestor delta lands"
@@ -4048,6 +4123,7 @@ impl ShardCoordinator {
             parent_block_hash,
             parent_qc,
             committee,
+            proposer,
             carry,
             parent_reveal_chain,
             parent_committee_anchor_epoch,
@@ -4092,7 +4168,7 @@ impl ShardCoordinator {
             payload,
         ) else {
             trace!(
-                validator = ?self.me,
+                ?proposer,
                 height = height.inner(),
                 "A block between the committed tip and the parent is not held; deferring the build"
             );
@@ -4100,7 +4176,6 @@ impl ShardCoordinator {
         };
         if !rounds_justified {
             trace!(
-                validator = ?self.me,
                 height = height.inner(),
                 round = round.inner(),
                 parent_qc_round = parent_qc.round().inner(),
@@ -4109,7 +4184,7 @@ impl ShardCoordinator {
             return vec![];
         }
         let plan = assemble_build_action(
-            self.me,
+            proposer,
             self.local_shard,
             &self.chain_view(),
             height,
@@ -4137,7 +4212,7 @@ impl ShardCoordinator {
         );
 
         info!(
-            validator = ?self.me,
+            ?proposer,
             height = height.inner(),
             round = round.inner(),
             plan.log_label,
@@ -4190,7 +4265,7 @@ impl ShardCoordinator {
         // the terminal tip via block sync rather than live proposals.
         if self.dissolved(topology_schedule) {
             debug!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 block_hash = ?block_hash,
                 "Ignoring block header — chain terminated at its crossing"
             );
@@ -4198,7 +4273,7 @@ impl ShardCoordinator {
         }
 
         debug!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             proposer = ?header.proposer(),
             height = height.inner(),
             round = round.inner(),
@@ -4238,7 +4313,7 @@ impl ShardCoordinator {
                 .saturating_add(MAX_HEADER_HEIGHT_LOOKAHEAD)
         {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = height.inner(),
                 committed = self.committed_height.inner(),
                 "Dropping header — height beyond storage lookahead"
@@ -4253,7 +4328,7 @@ impl ShardCoordinator {
         // round is already forfeit if its proposer is equivocating.
         if self.pending_blocks.count_at(height, round) >= MAX_HEADERS_PER_HEIGHT_ROUND {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 proposer = ?header.proposer(),
                 height = height.inner(),
                 round = round.inner(),
@@ -4266,7 +4341,7 @@ impl ShardCoordinator {
         // progress to make room, or drop this one if it is itself the farthest.
         let Some(cap_actions) = self.enforce_pending_block_cap(height, round) else {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = height.inner(),
                 round = round.inner(),
                 "Dropping header — height at pending cap and no farther entry to evict"
@@ -4449,7 +4524,7 @@ impl ShardCoordinator {
         }
         if committees.is_empty() {
             debug!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 ?carrier,
                 target_height = qc.height().inner(),
                 "No committee resolves for a cited certificate yet — not syncing toward it"
@@ -4648,7 +4723,7 @@ impl ShardCoordinator {
             }
             ClaimOutcome::Refuted { carrier, qc } => {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     ?carrier,
                     target_height = qc.height().inner(),
                     "A cited certificate verifies under no committee — not syncing toward it"
@@ -4669,7 +4744,7 @@ impl ShardCoordinator {
             return Vec::new();
         }
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             committed_height = self.committed_height.inner(),
             target_height = qc.height().inner(),
             qc_round = qc.round().inner(),
@@ -4755,7 +4830,7 @@ impl ShardCoordinator {
             // the cases so a forgery cannot pin retries forever.
             if self.committee_of_qc(topology_schedule, &qc).is_some() {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     height = qc.height().inner(),
                     "Snap-synced anchor QC failed verification — discarding"
                 );
@@ -4764,7 +4839,7 @@ impl ShardCoordinator {
             return Vec::new();
         };
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             height = qc.height().inner(),
             round = qc.round().inner(),
             "Adopted the snap-synced anchor QC"
@@ -4792,7 +4867,7 @@ impl ShardCoordinator {
             return Vec::new();
         }
         debug!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             qc_height = qc.height().inner(),
             qc_round = qc.round().inner(),
             "Adopted verified parent QC"
@@ -4846,14 +4921,14 @@ impl ShardCoordinator {
                 ScheduleLookup::Committee(committee) => Some(committee.as_ref()),
                 ScheduleLookup::NotYetCommitted => {
                     warn!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         "No committee for header's epoch yet — beacon behind, dropping header"
                     );
                     return true;
                 }
                 ScheduleLookup::Evicted => {
                     warn!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         "Header's committee epoch is below the schedule floor — dropping header"
                     );
                     return true;
@@ -4879,7 +4954,7 @@ impl ShardCoordinator {
             self.now,
         ) {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 error = %e,
                 "Invalid block header"
             );
@@ -4944,7 +5019,6 @@ impl ShardCoordinator {
         for vote in buffered {
             actions.extend(self.votes.accept_unverified_vote(
                 committee,
-                self.me,
                 self.local_shard,
                 vote,
                 self.committed_height,
@@ -5029,7 +5103,7 @@ impl ShardCoordinator {
     fn log_incomplete_block(&self, block_hash: BlockHash) {
         if let Some(pending) = self.pending_blocks.get(block_hash) {
             debug!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
                 missing_finalizations = pending.missing_finalization_count(),
@@ -5086,7 +5160,7 @@ impl ShardCoordinator {
             let Some(committee_anchor_wt) = self.block_anchor(header.parent_qc().block_hash())
             else {
                 trace!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     parent = ?header.parent_qc().block_hash(),
                     "Parent block not held — deferring anchor check until it arrives"
@@ -5095,7 +5169,7 @@ impl ShardCoordinator {
             };
             if header.parent_qc().weighted_timestamp() < committee_anchor_wt {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     height = height.inner(),
                     qc_weighted_ms = header.parent_qc().weighted_timestamp().as_millis(),
@@ -5118,7 +5192,7 @@ impl ShardCoordinator {
                 && let Err(e) = validate_proposer(committee.as_ref(), self.local_shard, &header)
             {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     error = %e,
                     "Header names the wrong proposer for its committee — dropping it"
@@ -5164,7 +5238,7 @@ impl ShardCoordinator {
                 self.committee_of_qc(topology_schedule, header.parent_qc())
             else {
                 trace!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     parent = ?header.parent_qc().block_hash(),
                     "Parent block not held — deferring parent-QC verification until it arrives"
@@ -5205,10 +5279,56 @@ impl ShardCoordinator {
     /// extends a QC at least as high as our lock. The local `locked_round` is
     /// the entire fork-safety mechanism — nothing rides on the block but its
     /// `parent_qc`.
-    fn can_safe_vote(&self, round: Round, parent_qc_round: Round) -> bool {
-        round == self.view_change.view
-            && round > self.last_voted_round
-            && parent_qc_round >= self.locked_round
+    fn can_safe_vote(
+        &self,
+        position: &SignerPosition,
+        round: Round,
+        parent_qc_round: Round,
+    ) -> bool {
+        position.can_safe_vote(self.view_change.view, round, parent_qc_round)
+    }
+
+    /// `round`'s proposer in `committee` with its position, when it is
+    /// one of this replica's signers and may build at `round`.
+    fn attached_proposer(
+        &self,
+        committee: &TopologySnapshot,
+        round: Round,
+    ) -> Option<(ValidatorId, SignerPosition)> {
+        let proposer = committee.proposer_for(self.local_shard, round);
+        self.signers
+            .get(&proposer)
+            .filter(|position| self.may_build(position, round))
+            .map(|position| (proposer, *position))
+    }
+
+    /// Whether `position`'s signer may build at `round` over the high QC,
+    /// the parent every proposal extends: it has neither voted nor timed
+    /// out at `round`, and the high QC reaches its lock, since it votes
+    /// the block it builds.
+    fn may_build(&self, position: &SignerPosition, round: Round) -> bool {
+        position.admits(round, self.high_qc_round())
+    }
+
+    /// Whether any signer has neither voted nor timed out at `round`.
+    fn any_signer_fresh_at(&self, round: Round) -> bool {
+        self.signers
+            .values()
+            .any(|position| position.last_voted_round < round)
+    }
+
+    /// The lowest lock any signer holds, or the high QC's round with no
+    /// signer: what a replica-level bound on votable rounds reads.
+    fn lowest_lock(&self) -> Round {
+        self.signers
+            .values()
+            .map(|position| position.locked_round)
+            .min()
+            .unwrap_or_else(|| {
+                self.latest_qc
+                    .as_deref()
+                    .map_or(Round::INITIAL, QuorumCertificate::round)
+            })
     }
 
     /// Try to vote on a block after it's complete and QC is verified.
@@ -5312,23 +5432,26 @@ impl ShardCoordinator {
         round: Round,
         justified: bool,
     ) -> Vec<Action> {
-        // Safe-vote rule. A block that fails the rule still runs verification —
-        // so its `PreparedCommit` is ready if a quorum forms it elsewhere — but
-        // we never emit a vote for it.
+        // Safe-vote rule, per eligible signer. A block every signer's rule
+        // declines still runs verification — so its `PreparedCommit` is
+        // ready if a quorum forms it elsewhere — but no vote goes out for it.
         let parent_qc_round = self
             .pending_blocks
             .get_header(block_hash)
-            .map_or(self.locked_round, |h| h.parent_qc().round());
-        let safe = justified && self.can_safe_vote(round, parent_qc_round);
+            .map_or_else(|| self.lowest_lock(), |h| h.parent_qc().round());
+        let voters = if justified {
+            self.safe_voters(topology_schedule, block_hash, round, parent_qc_round)
+        } else {
+            Vec::new()
+        };
+        let safe = !voters.is_empty();
         if !safe {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers,
                 block_hash = ?block_hash,
                 height = height.inner(),
                 round = round.inner(),
                 cur_round = self.view_change.view.inner(),
-                last_voted_round = self.last_voted_round.inner(),
-                locked_round = self.locked_round.inner(),
                 parent_qc_round = parent_qc_round.inner(),
                 "Safe-vote rule declines — running verification only"
             );
@@ -5351,11 +5474,11 @@ impl ShardCoordinator {
             self.view_change
                 .view
                 .inner()
-                .saturating_sub(self.locked_round.inner()),
+                .saturating_sub(self.lowest_lock().inner()),
         );
         if round.inner().saturating_sub(parent_qc_round.inner()) > justified_gap {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 block_hash = ?block_hash,
                 round = round.inner(),
                 parent_qc_round = parent_qc_round.inner(),
@@ -5373,7 +5496,7 @@ impl ShardCoordinator {
             && self.recovery_quiesced(topology_schedule, anchor)
         {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 block_hash = ?block_hash,
                 "Recovery seating window open on this anchor — deferring the vote"
             );
@@ -5408,7 +5531,7 @@ impl ShardCoordinator {
                 let chain = QcChainSets::behind(&self.chain_view(), parent);
                 let Some(members) = self.rows_at(topology_schedule.windows(), parent) else {
                     trace!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         block_hash = ?block_hash,
                         "A block between the committed tip and the parent is not held — deferring the vote"
                     );
@@ -5422,7 +5545,7 @@ impl ShardCoordinator {
                     block.header().parent_qc(),
                 ) else {
                     trace!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         block_hash = ?block_hash,
                         "The block's anchor window is not held — deferring the vote"
                     );
@@ -5432,7 +5555,7 @@ impl ShardCoordinator {
             };
             if let Err(e) = verdict {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     error = %e,
                     "Block failed pre-vote validation - not voting"
@@ -5447,7 +5570,7 @@ impl ShardCoordinator {
                 Ok(counted) => counted,
                 Err(Withheld::Refused(why)) => {
                     warn!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         block_hash = ?block_hash,
                         %why,
                         "The block's tick lines are not the chain's — not voting"
@@ -5456,7 +5579,7 @@ impl ShardCoordinator {
                 }
                 Err(Withheld::Deferred { why, wanted }) => {
                     trace!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         block_hash = ?block_hash,
                         %why,
                         "The block's tick lines cannot yet be judged — deferring"
@@ -5507,7 +5630,7 @@ impl ShardCoordinator {
             }) = self.terminal_carry(topology_schedule, parent, anchor_wt)
             else {
                 trace!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     "Terminal-carry window missing from the schedule; deferring the vote"
                 );
@@ -5526,7 +5649,7 @@ impl ShardCoordinator {
                 }
                 Err(Withheld::Refused(why)) => {
                     warn!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         block_hash = ?block_hash,
                         %why,
                         "The vote fence refuses the block — not voting"
@@ -5535,7 +5658,7 @@ impl ShardCoordinator {
                 }
                 Err(Withheld::Deferred { why, wanted }) => {
                     trace!(
-                        validator = ?self.me,
+                        signers = ?self.signers.keys(),
                         block_hash = ?block_hash,
                         %why,
                         "The vote fence cannot yet judge the block — deferring"
@@ -5590,10 +5713,33 @@ impl ShardCoordinator {
             return vec![];
         }
 
-        self.create_vote_within_cap(topology_schedule, block_hash, height, round)
+        self.create_vote_within_cap(topology_schedule, block_hash, height, round, &voters)
     }
 
-    /// Create a vote for a block.
+    /// The signers that may vote `block_hash` at `round` over a parent QC
+    /// at `parent_qc_round`: those in the consensus subset of the block's
+    /// committee whose own position passes the safe-vote rule.
+    fn safe_voters(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        round: Round,
+        parent_qc_round: Round,
+    ) -> Vec<ValidatorId> {
+        let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
+            return Vec::new();
+        };
+        let subset = committee.consensus_committee_for_shard(self.local_shard);
+        self.signers
+            .iter()
+            .filter(|(signer, position)| {
+                subset.contains(signer) && self.can_safe_vote(position, round, parent_qc_round)
+            })
+            .map(|(signer, _)| *signer)
+            .collect()
+    }
+
+    /// Create `voter`'s vote for a block.
     #[tracing::instrument(level = "debug", skip(self, topology_schedule), fields(
         height = height.inner(),
         round = round.inner(),
@@ -5602,16 +5748,21 @@ impl ShardCoordinator {
     fn create_vote(
         &mut self,
         topology_schedule: &TopologySchedule,
+        voter: ValidatorId,
         block_hash: BlockHash,
         height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
-        // Advance the safe-vote lock (Rule 1). `last_voted_round` enforces one
-        // vote per round; `locked_round` rises to the round of the QC this
-        // block extends, so we will never again vote for a block that extends a
-        // QC below it. Both are local — no certificate rides on the block.
+        let Some(position) = self.signers.get(&voter).copied() else {
+            return vec![];
+        };
+        // Advance the voter's safe-vote lock (Rule 1). `last_voted_round`
+        // enforces one vote per round; `locked_round` rises to the round of
+        // the QC this block extends, so the voter never again votes for a
+        // block that extends a QC below it. Both are local — no certificate
+        // rides on the block.
         let header = self.pending_blocks.get_header(block_hash);
-        let parent_qc_round = header.map_or(self.locked_round, |h| h.parent_qc().round());
+        let parent_qc_round = header.map_or(position.locked_round, |h| h.parent_qc().round());
         // Sign over the block's own parent so the QC commits to which block it extends.
         let parent_block_hash = header.map_or(self.committed_hash, BlockHeader::parent_block_hash);
         // The weighted timestamp the block's committee resolves against, used
@@ -5619,8 +5770,8 @@ impl ShardCoordinator {
         // already dropped from the head still reaches its own committee.
         let anchored_wt = header.map(|h| h.parent_qc().weighted_timestamp());
         let block_proposer = header.map(BlockHeader::proposer);
-        self.last_voted_round = self.last_voted_round.max(round);
-        self.locked_round = self.locked_round.max(parent_qc_round);
+        let position = position.voted(round, parent_qc_round);
+        self.signers.insert(voter, position);
 
         // Reset the view change timer — voting proves the leader produced a
         // valid block. Non-proposers only learn about QC formation when the
@@ -5632,7 +5783,7 @@ impl ShardCoordinator {
         let timestamp = ProposerTimestamp::from_local(self.now);
 
         debug!(
-            validator = ?self.me,
+            ?voter,
             height = height.inner(),
             round = round.inner(),
             block_hash = ?block_hash,
@@ -5670,13 +5821,18 @@ impl ShardCoordinator {
                     .filter(|snapshot| seats_anyone(snapshot))
             })
             .map_or_else(|| topology_schedule.head().as_ref(), Arc::as_ref);
-        let mut next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
+        let mut next_proposers = vote_recipients(
+            governing,
+            self.local_shard,
+            |v| self.signers.contains_key(&v),
+            round,
+        );
         // The block's own proposer announces its QC to the committee, so it
         // must receive the votes. `vote_recipients` names the slot holders
         // of the child's committee, which at an epoch-cut block is not the
         // committee that elected this block's proposer.
         if let Some(proposer) = block_proposer
-            && proposer != self.me
+            && !self.signers.contains_key(&proposer)
             && !next_proposers.contains(&proposer)
         {
             next_proposers.push(proposer);
@@ -5693,7 +5849,8 @@ impl ShardCoordinator {
             round,
             timestamp,
             next_proposers,
-            position: self.vote_position(Some(block_hash)),
+            position: self.vote_position(position, Some(block_hash)),
+            signer: voter,
         }]
     }
 
@@ -5721,7 +5878,7 @@ impl ShardCoordinator {
         vote: Verified<BlockVote>,
     ) -> Vec<Action> {
         trace!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             voter = ?vote.voter(),
             block_hash = ?vote.block_hash(),
             "Received pre-verified block vote"
@@ -5742,7 +5899,6 @@ impl ShardCoordinator {
         let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
         self.votes.accept_verified_vote(
             committee,
-            self.me,
             self.local_shard,
             vote,
             self.committed_height,
@@ -5768,7 +5924,7 @@ impl ShardCoordinator {
         vote: BlockVote,
     ) -> Vec<Action> {
         trace!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             voter = ?vote.voter(),
             block_hash = ?vote.block_hash(),
             "Received block vote"
@@ -5791,7 +5947,6 @@ impl ShardCoordinator {
         let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
         self.votes.accept_unverified_vote(
             committee,
-            self.me,
             self.local_shard,
             vote,
             self.committed_height,
@@ -5825,7 +5980,7 @@ impl ShardCoordinator {
         let round = vote.round();
         let view = self.view_change.view;
         if vote.shard_id() != self.local_shard
-            || voter == self.me
+            || self.signers.contains_key(&voter)
             || round < view
             || round > view.next()
             || self.chain_view().get_header(block_hash).is_some()
@@ -6199,7 +6354,7 @@ impl ShardCoordinator {
             }
             CheckOutcome::Deferred(DeferOn::Bodies(names)) => {
                 trace!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     block_hash = ?block_hash,
                     ?kind,
                     ?names,
@@ -6258,16 +6413,19 @@ impl ShardCoordinator {
         let round = pending_block.header().round();
         let parent_qc_round = pending_block.header().parent_qc().round();
 
-        // Re-check the safe-vote rule at emission time: the round or our lock
-        // may have advanced while the async verifications were in flight, in
-        // which case this block is now stale and we must not vote for it (it
-        // can still commit via a quorum formed elsewhere).
-        if self.can_safe_vote(round, parent_qc_round) {
+        // Re-check the safe-vote rule at emission time: the round or a
+        // signer's lock may have advanced while the async verifications were
+        // in flight, in which case this block is now stale for that signer
+        // and it must not vote for it (it can still commit via a quorum
+        // formed elsewhere).
+        let voters = self.safe_voters(topology_schedule, block_hash, round, parent_qc_round);
+        if !voters.is_empty() {
             actions.extend(self.create_vote_within_cap(
                 topology_schedule,
                 block_hash,
                 height,
                 round,
+                &voters,
             ));
         }
         // If this completion finished assembly for a block that
@@ -6323,7 +6481,7 @@ impl ShardCoordinator {
             && let Err(why) = block.check_body_bound()
         {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 ?block_hash,
                 height = qc.height().inner(),
                 %why,
@@ -6523,14 +6681,28 @@ impl ShardCoordinator {
             );
             return vec![];
         }
-        // The round may have timed out while the build ran; broadcasting
-        // would self-vote in a round this validator gave up.
-        if round <= self.last_voted_round {
+        // The proposer may have left this replica while the build ran, and
+        // only an attached signer's block goes out.
+        let proposer = block.header().proposer();
+        let Some(position) = self.signers.get(&proposer).copied() else {
             debug!(
                 height = height.inner(),
                 round = round.inner(),
-                last_voted_round = self.last_voted_round.inner(),
-                "ProposalBuilt for a round already voted or timed out - discarding"
+                ?proposer,
+                "ProposalBuilt for a proposer no longer attached - discarding"
+            );
+            return vec![];
+        };
+        // The round may have timed out while the build ran, and a block
+        // its proposer may not vote is one it may not broadcast.
+        let parent_qc_round = block.header().parent_qc().round();
+        if !self.can_safe_vote(&position, round, parent_qc_round) {
+            debug!(
+                height = height.inner(),
+                round = round.inner(),
+                last_voted_round = position.last_voted_round.inner(),
+                locked_round = position.locked_round.inner(),
+                "ProposalBuilt for a round its proposer may not vote - discarding"
             );
             return vec![];
         }
@@ -6543,7 +6715,7 @@ impl ShardCoordinator {
 
         let total_tx_count = pending_block.transaction_count();
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             height = height.inner(),
             round = round.inner(),
             block_hash = ?block_hash,
@@ -6571,13 +6743,44 @@ impl ShardCoordinator {
         // block's PreparedCommit.
         self.verification.mark_proposal_fully_verified(block);
 
-        // A proposal goes to the committee that certifies it and to the
-        // head's. At an epoch cut the two differ: the outgoing members the
-        // head no longer seats still vote on the block, and the incoming ones
-        // need it to extend the chain. Once the committed chain proves a
-        // terminal's commit, only the head's committee hears it, which for a
-        // shard the head no longer seats is nobody: the chain certifies
-        // nothing further.
+        let recipients = self.proposal_recipients(topology_schedule, block_hash, proposer);
+        // The header persists the position its proposer's self-vote
+        // reaches, so a rebuilt or restarted proposer never signs a second
+        // header at the round even when the self-vote is never signed, and
+        // the self-vote's own persist finds nothing left to write.
+        let header_position =
+            self.vote_position(position.voted(round, parent_qc_round), Some(block_hash));
+        let mut actions = vec![Action::BroadcastBlockHeader {
+            header: Box::new(block.header().clone()),
+            manifest: Box::new(manifest),
+            recipients,
+            position: header_position,
+        }];
+
+        // The proposer votes its own block, and so does every eligible
+        // sibling the safe-vote rule admits. The replica built the block
+        // under every rule the vote pipeline checks, so neither runs it.
+        actions.extend(self.create_vote(topology_schedule, proposer, block_hash, height, round));
+        for sibling in self.safe_voters(topology_schedule, block_hash, round, parent_qc_round) {
+            actions.extend(self.create_vote(topology_schedule, sibling, block_hash, height, round));
+        }
+
+        actions
+    }
+
+    /// Who hears `proposer`'s block `block_hash`: the committee that
+    /// certifies it and the head's. At an epoch cut the two differ: the
+    /// outgoing members the head no longer seats still vote on the block,
+    /// and the incoming ones need it to extend the chain. Once the committed
+    /// chain proves a terminal's commit, only the head's committee hears it,
+    /// which for a shard the head no longer seats is nobody: the chain
+    /// certifies nothing further.
+    fn proposal_recipients(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        proposer: ValidatorId,
+    ) -> Vec<ValidatorId> {
         let head = topology_schedule.head();
         let mut recipients: BTreeSet<ValidatorId> = head
             .committee_for_shard(self.local_shard)
@@ -6589,18 +6792,8 @@ impl ShardCoordinator {
         {
             recipients.extend(certifying.committee_for_shard(self.local_shard));
         }
-        recipients.remove(&self.me);
-        let recipients: Vec<ValidatorId> = recipients.into_iter().collect();
-        let mut actions = vec![Action::BroadcastBlockHeader {
-            header: Box::new(block.header().clone()),
-            manifest: Box::new(manifest),
-            recipients,
-        }];
-
-        // Vote for our own block
-        actions.extend(self.create_vote(topology_schedule, block_hash, height, round));
-
-        actions
+        recipients.remove(&proposer);
+        recipients.into_iter().collect()
     }
 
     /// Handle JMT state commit completion.
@@ -6743,7 +6936,7 @@ impl ShardCoordinator {
         let height = qc.height();
 
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             block_hash = ?block_hash,
             height = height.inner(),
             "QC formed"
@@ -6840,7 +7033,7 @@ impl ShardCoordinator {
             })
     }
 
-    /// Announce a QC this validator formed.
+    /// Announce a QC this replica formed.
     ///
     /// The block's proposer announces it to the whole committee. Votes
     /// reach only the block's proposer and the next two, so the rest of
@@ -6870,25 +7063,38 @@ impl ShardCoordinator {
         }
         let proposer = self.chain_view().get_header(block_hash)?.proposer();
         let committee = self.tip_committee(topology_schedule)?;
-        let recipients: Vec<ValidatorId> = if proposer == self.me {
-            committee
+        let (signer, recipients) = if self.signers.contains_key(&proposer) {
+            let recipients = committee
                 .committee_for_shard(self.local_shard)
                 .iter()
                 .copied()
-                .filter(|v| *v != self.me)
-                .collect()
+                .filter(|v| *v != proposer)
+                .collect();
+            (proposer, recipients)
         } else {
             let next = committee.proposer_for(self.local_shard, qc.round().next());
-            if next == self.me {
+            if self.signers.contains_key(&next) {
                 return None;
             }
-            vec![next]
+            (self.designated_sender(committee)?, vec![next])
         };
         self.announced_round = Some(qc.round());
         Some(Action::SignAndBroadcastQcAnnouncement {
             qc: (**qc).clone(),
             recipients,
+            signer,
         })
+    }
+
+    /// The signer that speaks for this replica where no signer's role
+    /// names one: the lowest-id attached signer in `committee`'s consensus
+    /// subset, which is the index a recipient admits senders from.
+    fn designated_sender(&self, committee: &TopologySnapshot) -> Option<ValidatorId> {
+        let subset = committee.consensus_committee_for_shard(self.local_shard);
+        self.signers
+            .keys()
+            .copied()
+            .find(|signer| subset.contains(signer))
     }
 
     /// A committee member announced the QC of a block it proposed. Adopt it
@@ -6946,7 +7152,7 @@ impl ShardCoordinator {
             verifier: self.verifier.as_ref(),
         });
         if signed.is_err() {
-            warn!(validator = ?self.me, ?sender, "QC announcement with an invalid sender signature");
+            warn!(signers = ?self.signers.keys(), ?sender, "QC announcement with an invalid sender signature");
             return Vec::new();
         }
         let Some(verified) = self.verify_qc_sync(topology_schedule, qc) else {
@@ -6957,7 +7163,7 @@ impl ShardCoordinator {
                     Carrier::Relayer(sender),
                 );
             }
-            warn!(validator = ?self.me, ?sender, round = round.inner(), "Announced QC failed verification");
+            warn!(signers = ?self.signers.keys(), ?sender, round = round.inner(), "Announced QC failed verification");
             return Vec::new();
         };
         // Cached as a locally formed QC is: the two-chain commit of its
@@ -7021,7 +7227,7 @@ impl ShardCoordinator {
             .map(Arc::clone)
         else {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 qc_block_hash = ?qc.block_hash(),
                 committable_hash = ?committable_hash,
                 "Cannot extract assembled Verified<CertifiedBlock> for committable block — deferring commit"
@@ -7048,7 +7254,7 @@ impl ShardCoordinator {
         // block in.
         if qc.round() != committable.block().header().round().next() {
             trace!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 qc_round = qc.round().inner(),
                 committable_round = committable.block().header().round().inner(),
                 committable_height = committable_height.inner(),
@@ -7111,7 +7317,7 @@ impl ShardCoordinator {
         // exactly the next height.
         if parent_hash != self.committed_hash {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 shard = ?self.local_shard,
                 height = committable.block().height().inner(),
                 committable = ?committable.block().hash(),
@@ -7566,7 +7772,7 @@ impl ShardCoordinator {
             .is_none()
         {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = height.inner(),
                 ?block_hash,
                 "Commit's committee window is not in the schedule; parking it for the beacon"
@@ -7577,7 +7783,7 @@ impl ShardCoordinator {
         }
 
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             height = height.inner(),
             block_hash = ?block_hash,
             transactions = certified.block().transactions().len(),
@@ -7665,11 +7871,12 @@ impl ShardCoordinator {
             }
         });
 
-        // Only the block proposer gossips the certified header globally.
-        // Other validators rely on receiving it via gossip propagation. If the
-        // proposer is Byzantine/slow, the RemoteHeaderCoordinator will detect
-        // the liveness timeout and trigger a fallback fetch.
-        if proposer == self.me {
+        // Only the block proposer gossips the certified header globally, from
+        // the replica it is attached to. Other validators rely on receiving
+        // it via gossip propagation. If the proposer is Byzantine/slow, the
+        // RemoteHeaderCoordinator will detect the liveness timeout and
+        // trigger a fallback fetch.
+        if self.signers.contains_key(&proposer) {
             // SAFETY: attestation source is the local `Verified<CertifiedBlock>`.
             let certified_header = Verified::<CertifiedBlockHeader>::from_qc_attestation(
                 certified.block().header().clone(),
@@ -7980,7 +8187,7 @@ impl ShardCoordinator {
         let height = block.height();
 
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             height = height.inner(),
             block_hash = ?block_hash,
             transactions = block.transactions().len(),
@@ -8129,7 +8336,7 @@ impl ShardCoordinator {
         )
         else {
             debug!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 height = block.height().inner(),
                 "Synced block's window missing from the schedule; parking its tree until the beacon commits it"
             );
@@ -8200,7 +8407,7 @@ impl ShardCoordinator {
         self.proposal.clear();
 
         info!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             height = height.inner(),
             new_round = self.view_change.view.inner(),
             view_changes = self.view_change.view_changes,
@@ -8235,44 +8442,41 @@ impl ShardCoordinator {
             id: TimerId::ViewChange,
             duration: self.current_view_change_timeout(),
         };
-        // A round at or below `last_voted_round` is one this replica can
+        // A round at or below a signer's `last_voted_round` is one it can
         // only abstain in — it voted or timed out there before, as after a
         // restart whose durable registers outran its certificates — so it
         // times out at once rather than spend a round timer per abstained
         // round.
-        if self.view_change.view <= self.last_voted_round {
-            let mut actions = self.broadcast_timeout(topology_schedule, self.view_change.view);
-            actions.push(timer);
-            return actions;
-        }
+        let view = self.view_change.view;
+        let mut actions = self.broadcast_timeouts_where(topology_schedule, view, |_, position| {
+            view <= position.last_voted_round
+        });
 
-        // The new round's leader proposes a fresh fallback block extending
-        // `high_qc`. There is no lock to re-propose: HotStuff-2 carries safety
-        // in the local `locked_round`, not on the block, so a new round always
-        // builds anew rather than re-broadcasting a prior height's proposal.
-        // Without the in-progress committee we can't know the leader — only the
-        // timer goes out.
-        let is_new_proposer = self
+        // The new round's leader, attached and fresh, proposes a fresh
+        // fallback block extending `high_qc`. There is no lock to
+        // re-propose: HotStuff-2 carries safety in each signer's local
+        // `locked_round`, not on the block, so a new round always builds
+        // anew rather than re-broadcasting a prior height's proposal.
+        // Without the in-progress committee we can't know the leader — only
+        // the timer goes out.
+        let new_proposer = self
             .tip_committee(topology_schedule)
-            .is_some_and(|c| c.proposer_for(self.local_shard, self.view_change.view) == self.me);
-        if is_new_proposer {
+            .and_then(|c| self.attached_proposer(c, view));
+        if let Some((proposer, _)) = new_proposer {
             info!(
-                validator = ?self.me,
+                ?proposer,
                 height = height.inner(),
-                new_round = self.view_change.view.inner(),
-                "We are the new proposer after round advance - building block"
+                new_round = view.inner(),
+                "Attached signer is the new proposer after round advance - building block"
             );
-
-            let mut actions = self.build_and_broadcast_fallback_block(
+            actions.extend(self.build_and_broadcast_fallback_block(
                 topology_schedule,
                 height,
-                self.view_change.view,
-            );
-            actions.push(timer);
-            return actions;
+                view,
+            ));
         }
-
-        vec![timer]
+        actions.push(timer);
+        actions
     }
 
     // ── Pacemaker: timeout-driven view change (HotStuff-2 synchronizer) ─────
@@ -8303,15 +8507,30 @@ impl ShardCoordinator {
         Round::new(self.high_qc_round().inner().saturating_add(MAX_ROUND_GAP))
     }
 
-    /// Broadcast our timeout for `round` (carrying our `high_qc`) to the
-    /// committee, which tallies it. The round timer drives this on every fire,
-    /// so a timeout lost to a partition is retransmitted until a 2f+1 quorum
-    /// forms — without retransmission a healed partition never re-collects the
-    /// shares it dropped and the chain wedges.
+    /// Broadcast every timeout-eligible signer's timeout for `round`
+    /// (carrying the replica's `high_qc`) to the committee, which tallies
+    /// it. The round timer drives this on every fire, so a timeout lost to
+    /// a partition is retransmitted until a 2f+1 quorum forms — without
+    /// retransmission a healed partition never re-collects the shares it
+    /// dropped and the chain wedges.
     fn broadcast_timeout(
         &mut self,
         topology_schedule: &TopologySchedule,
         round: Round,
+    ) -> Vec<Action> {
+        self.broadcast_timeouts_where(topology_schedule, round, |_, _| true)
+    }
+
+    /// Broadcast the timeout for `round` of each timeout-eligible signer
+    /// whose position `which` admits. Eligible are the tip committee's
+    /// consensus subset, whose timeouts the pacemaker tallies, and the
+    /// retained members of a pending halt recovery for this shard, whose
+    /// timeouts carry the halted tip to the fresh committee.
+    fn broadcast_timeouts_where(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+        which: impl Fn(ValidatorId, &SignerPosition) -> bool,
     ) -> Vec<Action> {
         // A terminated chain drives no view changes; the pacemaker only
         // needed to reach the crossing's commit, which has happened.
@@ -8324,40 +8543,71 @@ impl ShardCoordinator {
         let Some(committee) = self.tip_committee(topology_schedule) else {
             return vec![];
         };
-        self.last_timed_out_round = Some(round);
-        // A timed-out round is never voted: bump `last_voted_round` so the
-        // safe-vote rule refuses any block that arrives at this round after we
-        // gave up on it (Rule 1).
-        self.last_voted_round = self.last_voted_round.max(round);
-        let recipients: Vec<ValidatorId> = committee
-            .committee_for_shard(self.local_shard)
+        let subset = committee.consensus_committee_for_shard(self.local_shard);
+        let signers: Vec<ValidatorId> = self
+            .signers
             .iter()
-            .copied()
-            .filter(|v| *v != self.me)
+            .filter(|(signer, position)| {
+                which(**signer, position)
+                    && (subset.contains(signer)
+                        || self.retained_by_halt(topology_schedule, **signer))
+            })
+            .map(|(signer, _)| *signer)
             .collect();
-        vec![Action::SignAndBroadcastTimeout {
-            round,
-            high_qc: self.high_qc(),
-            high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
-            recipients,
-            position: self.vote_position(None),
-        }]
+        let members = committee.committee_for_shard(self.local_shard);
+        let high_qc = self.high_qc();
+        let timeout_cert = self.high_tc.as_deref().map(|tc| (**tc).clone());
+        let mut actions = Vec::with_capacity(signers.len());
+        for signer in signers {
+            let Some(position) = self.signers.get_mut(&signer) else {
+                continue;
+            };
+            position.last_timed_out_round = Some(round);
+            // A timed-out round is never voted: bump `last_voted_round` so
+            // the safe-vote rule refuses any block that arrives at this round
+            // after the signer gave up on it (Rule 1).
+            position.last_voted_round = position.last_voted_round.max(round);
+            let position = *position;
+            actions.push(Action::SignAndBroadcastTimeout {
+                round,
+                high_qc: high_qc.clone(),
+                high_tc: timeout_cert.clone(),
+                recipients: members.iter().copied().filter(|v| *v != signer).collect(),
+                position: self.vote_position(position, None),
+                signer,
+            });
+        }
+        actions
     }
 
-    /// Bracha-amplify: broadcast our own timeout for `round` the first time we
-    /// hear f+1 of them, so every honest replica eventually times out. Unlike
-    /// the timer-driven retransmit, this fires at most once per round — a
-    /// replica that already broadcast (via its timer or an earlier amplify)
-    /// stays quiet.
+    /// Whether a pending halt recovery for this shard retains `validator`.
+    fn retained_by_halt(
+        &self,
+        topology_schedule: &TopologySchedule,
+        validator: ValidatorId,
+    ) -> bool {
+        topology_schedule
+            .head()
+            .pending_recoveries()
+            .get(&self.local_shard)
+            .is_some_and(|recovery| {
+                recovery.cause == RecoveryCause::Halt && recovery.retained.contains(&validator)
+            })
+    }
+
+    /// Bracha-amplify: broadcast each signer's timeout for `round` the
+    /// first time the replica hears f+1 of them, so every honest replica
+    /// eventually times out. Unlike the timer-driven retransmit, this fires
+    /// at most once per signer and round — a signer that already broadcast
+    /// (via the timer or an earlier amplify) stays quiet.
     fn amplify_timeout(
         &mut self,
         topology_schedule: &TopologySchedule,
         round: Round,
     ) -> Vec<Action> {
-        if self.last_timed_out_round == Some(round) {
-            return Vec::new();
-        }
-        self.broadcast_timeout(topology_schedule, round)
+        self.broadcast_timeouts_where(topology_schedule, round, |_, position| {
+            position.last_timed_out_round != Some(round)
+        })
     }
 
     /// Voting power of `voter` iff it belongs to the local shard committee —
@@ -8426,7 +8676,7 @@ impl ShardCoordinator {
                 actions.extend(harvest);
                 return actions;
             }
-            warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
+            warn!(signers = ?self.signers.keys(), voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return actions;
         }
         // Skip rounds we've advanced past, rounds too far beyond verified
@@ -8539,7 +8789,7 @@ impl ShardCoordinator {
         }
         if recovery.cause == RecoveryCause::Fork {
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 voter = ?timeout.voter(),
                 carried_height = carried.height().inner(),
                 frontier = recovery.attested_frontier.inner(),
@@ -8551,7 +8801,7 @@ impl ShardCoordinator {
             && !self.recovery_bridging(topology_schedule, latest.weighted_timestamp())
         {
             warn!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 voter = ?timeout.voter(),
                 carried_height = carried.height().inner(),
                 high_qc_height = latest.height().inner(),
@@ -8561,7 +8811,7 @@ impl ShardCoordinator {
             return Some(Vec::new());
         }
         debug!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             voter = ?timeout.voter(),
             carried_height = carried.height().inner(),
             committed_height = self.committed_height.inner(),
@@ -8613,7 +8863,7 @@ impl ShardCoordinator {
             if let Some(actions) = self.harvest_retained_tip(topology_schedule, &timeout) {
                 return actions;
             }
-            warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
+            warn!(signers = ?self.signers.keys(), voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         };
         // Ignore timeouts we've advanced past or that sit too far beyond
@@ -8814,25 +9064,27 @@ impl ShardCoordinator {
         let view = self.view_change.view;
         if view > derived {
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 from = view.inner(),
                 to = derived.inner(),
                 "View fell back to the tip committee's certificates"
             );
             self.view_change.fall_back(derived);
-            // A round this replica never signed in waits its full timeout,
+            // A round some signer never signed in waits its full timeout,
             // not the remainder of the round it fell from.
-            if derived > self.last_voted_round {
+            if self.any_signer_fresh_at(derived) {
                 self.record_leader_activity();
             }
             let mut actions = self.enter_round(topology_schedule);
             actions.extend(self.redrive_pending_votes(topology_schedule));
             return actions;
         }
-        if seating == Seating::Changed
-            && self.last_timed_out_round.is_some_and(|round| round >= view)
-        {
-            return self.broadcast_timeout(topology_schedule, view);
+        if seating == Seating::Changed {
+            return self.broadcast_timeouts_where(topology_schedule, view, |_, position| {
+                position
+                    .last_timed_out_round
+                    .is_some_and(|round| round >= view)
+            });
         }
         Vec::new()
     }
@@ -9063,7 +9315,7 @@ impl ShardCoordinator {
             // lower-round candidate may still be sound.
             if qc_weighted_timestamp_too_far_ahead(&candidate, self.now) {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     qc_round = candidate.round().inner(),
                     "Timeout high_qc weighted timestamp too far ahead — trying next-highest"
                 );
@@ -9071,7 +9323,7 @@ impl ShardCoordinator {
             }
             let Some(verified) = self.verify_qc_sync(topology_schedule, &candidate) else {
                 warn!(
-                    validator = ?self.me,
+                    signers = ?self.signers.keys(),
                     qc_round = candidate.round().inner(),
                     "Timeout high_qc failed verification — trying next-highest"
                 );
@@ -9137,7 +9389,7 @@ impl ShardCoordinator {
             self.qc_adopted_at = Some((qc.round(), self.now));
             self.record_leader_activity();
             info!(
-                validator = ?self.me,
+                signers = ?self.signers.keys(),
                 old_view = old_view.inner(),
                 new_view = self.view_change.view.inner(),
                 qc_height = qc.height().inner(),
@@ -9246,7 +9498,7 @@ impl ShardCoordinator {
         block_hash: BlockHash,
     ) -> Vec<Action> {
         debug!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             block_hash = ?block_hash,
             "Pending block completed"
         );
@@ -9332,7 +9584,6 @@ impl ShardCoordinator {
         }
 
         self.pending_blocks.check_fetches(
-            self.me,
             self.local_shard,
             self.now,
             self.view_change.fetch_timeout(),
@@ -9373,7 +9624,6 @@ impl ShardCoordinator {
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
 
         let sync_actions = match self.block_sync.health_check(
-            self.me,
             self.committed_height,
             self.latest_qc.as_deref(),
             has_next_block,
@@ -9414,7 +9664,7 @@ impl ShardCoordinator {
             return Vec::new();
         };
         warn!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             offered = offered.inner(),
             "Retained tip harvest stalled; releasing the proposal hold"
         );
@@ -9438,7 +9688,7 @@ impl ShardCoordinator {
             return;
         }
         warn!(
-            validator = ?self.me,
+            signers = ?self.signers.keys(),
             offered = offered.inner(),
             frontier = frontier.inner(),
             "Retained tip harvest ended short of the offer; building on what was reached"
@@ -9455,8 +9705,8 @@ impl ShardCoordinator {
             .max(self.block_sync.sync_applied_height())
     }
 
-    /// Re-broadcast this member's current-round timeout on the periodic
-    /// tick while a pending halt recovery names it retained.
+    /// Re-broadcast the current-round timeout of each signer a pending
+    /// halt recovery names retained, on the periodic tick.
     ///
     /// The timeout carries `high_qc`, and it is the only signal that
     /// carries the halted tip to the fresh committee, which
@@ -9465,29 +9715,37 @@ impl ShardCoordinator {
     /// halted height is still on its first round, and up to the backoff
     /// cap when rounds were abandoned before quorum was lost. The fresh
     /// committee's `HALT_HARVEST_WAIT` is sized against this tick, not
-    /// against that timer. Guarded on the timer having fired for the
-    /// current round, so a member that has not timed out its round does
-    /// not manufacture a timeout the pacemaker never produced. The share
-    /// reaches the fresh committee through the recovery bridge and is
-    /// harvested there, never tallied, so re-sending it changes no quorum
-    /// arithmetic; on this side it re-asserts a vote and a lock the timed
-    /// out round already holds.
+    /// against that timer.
+    ///
+    /// A signer outside the tip committee's consensus subset offers on
+    /// every tick. Its share is harvested, never tallied, since the
+    /// pacemaker counts only the subset, so it moves no quorum; raising its
+    /// own registers to the view discards nothing, because it owes no
+    /// proposal or vote there.
+    ///
+    /// A signer inside the subset — a retained member a stalled recovery's
+    /// re-draw seated in the fresh committee — offers only once the timer
+    /// has fired for the current round. It can be the view's proposer or owe
+    /// the pending block's vote, so it must not time out before the timer
+    /// does.
     fn reoffer_retained_tip(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let view = self.view_change.view;
-        if self.last_timed_out_round != Some(view) {
+        let Some(committee) = self.tip_committee(topology_schedule) else {
             return Vec::new();
-        }
-        let retained = topology_schedule
-            .head()
-            .pending_recoveries()
-            .get(&self.local_shard)
-            .is_some_and(|recovery| {
-                recovery.cause == RecoveryCause::Halt && recovery.retained.contains(&self.me)
-            });
-        if !retained {
-            return Vec::new();
-        }
-        self.broadcast_timeout(topology_schedule, view)
+        };
+        let subset = committee.consensus_committee_for_shard(self.local_shard);
+        let offering: BTreeSet<ValidatorId> = self
+            .signers
+            .iter()
+            .filter(|(signer, position)| {
+                self.retained_by_halt(topology_schedule, **signer)
+                    && (!subset.contains(signer) || position.last_timed_out_round == Some(view))
+            })
+            .map(|(signer, _)| *signer)
+            .collect();
+        self.broadcast_timeouts_where(topology_schedule, view, |signer, _| {
+            offering.contains(&signer)
+        })
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -9617,10 +9875,13 @@ impl ShardCoordinator {
         self.latest_qc.as_ref()
     }
 
-    /// Record the validators this host seats in this shard. This one is
-    /// always among them.
+    /// Record the validators this host seats in this shard. This
+    /// replica's signers are always among them.
     pub fn set_host_seats(&mut self, seats: impl IntoIterator<Item = ValidatorId>) {
-        self.host_seats = seats.into_iter().chain([self.me]).collect();
+        self.host_seats = seats
+            .into_iter()
+            .chain(self.signers.keys().copied())
+            .collect();
     }
 
     /// Get the current view/round.
@@ -9669,8 +9930,10 @@ impl ShardCoordinator {
     /// in-progress committee isn't yet known (beacon behind).
     #[must_use]
     pub fn is_current_proposer(&self, topology_schedule: &TopologySchedule) -> bool {
-        self.tip_committee(topology_schedule)
-            .is_some_and(|c| c.proposer_for(self.local_shard, self.view_change.view) == self.me)
+        self.tip_committee(topology_schedule).is_some_and(|c| {
+            self.signers
+                .contains_key(&c.proposer_for(self.local_shard, self.view_change.view))
+        })
     }
 
     /// The drain the committed tip records: the member rows standing
@@ -9687,30 +9950,24 @@ impl ShardCoordinator {
         &self.config
     }
 
-    /// Highest round in which we have voted or timed out (for testing/debugging).
+    /// `signer`'s safe-vote registers, or `None` when it is not one of
+    /// this replica's signers.
     #[must_use]
-    pub const fn last_voted_round(&self) -> Round {
-        self.last_voted_round
+    pub fn position(&self, signer: ValidatorId) -> Option<SignerPosition> {
+        self.signers.get(&signer).copied()
     }
 
-    /// Our current safe-vote lock round (for testing/debugging).
-    #[must_use]
-    pub const fn locked_round(&self) -> Round {
-        self.locked_round
-    }
-
-    /// Snapshot of the safe-vote registers, carried on vote and timeout
+    /// Snapshot of a signer's safe-vote registers, carried on vote and timeout
     /// signing actions so the runner can persist them ahead of the
     /// signature.
     ///
     /// The high QC rides along because the lock is unusable without it: a
     /// record restored with a lock above every QC the validator can
     /// produce refuses every proposal forever.
-    #[must_use]
-    pub(crate) fn safe_vote_registers(&self) -> SafeVoteRegisters {
+    fn safe_vote_registers(&self, position: SignerPosition) -> SafeVoteRegisters {
         SafeVoteRegisters {
-            locked_round: self.locked_round,
-            last_voted_round: self.last_voted_round,
+            locked_round: position.locked_round,
+            last_voted_round: position.last_voted_round,
             high_qc: self.latest_qc.as_deref().map(|qc| (*qc).clone()),
             high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
         }
@@ -9725,10 +9982,10 @@ impl ShardCoordinator {
     /// certificate either way; what it cannot rebuild from a committed
     /// chain alone is the state these blocks left.
     #[must_use]
-    pub(crate) fn vote_position(&self, voted: Option<BlockHash>) -> VotePosition {
+    fn vote_position(&self, position: SignerPosition, voted: Option<BlockHash>) -> VotePosition {
         let tip = voted.or_else(|| self.latest_qc.as_deref().map(QuorumCertificate::block_hash));
         VotePosition {
-            registers: self.safe_vote_registers(),
+            registers: self.safe_vote_registers(position),
             justification: tip.map_or_default(|tip| self.uncommitted_suffix(tip)),
         }
     }
@@ -9817,16 +10074,14 @@ impl ShardCoordinator {
 
     /// Check if this node will propose in the current round.
     ///
-    /// Returns true if we are the round's proposer and haven't already voted
-    /// (or timed out) in it. Used to avoid destructively taking certificates
-    /// from execution state when we won't actually be proposing a block.
+    /// Returns true if the round's proposer is an attached signer that may
+    /// build at it. Used to avoid destructively taking certificates from
+    /// execution state when we won't actually be proposing a block.
     #[must_use]
     pub fn will_propose_next(&self, topology_schedule: &TopologySchedule) -> bool {
         let round = self.view_change.view;
-        self.last_voted_round < round
-            && self
-                .tip_committee(topology_schedule)
-                .is_some_and(|c| c.proposer_for(self.local_shard, round) == self.me)
+        self.tip_committee(topology_schedule)
+            .is_some_and(|c| self.attached_proposer(c, round).is_some())
     }
 }
 
@@ -9886,6 +10141,35 @@ mod tests {
     use crate::action_handlers::{Named, Naming, build_proposal};
     use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all, unwrapped};
     use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent, within_the_cap};
+
+    impl ShardCoordinator {
+        /// The one signer a test replica is built with.
+        fn sole_signer(&self) -> ValidatorId {
+            let mut signers = self.signers.keys();
+            let signer = *signers.next().expect("a test replica has a signer");
+            assert!(signers.next().is_none(), "a test replica has one signer");
+            signer
+        }
+
+        /// The one signer's position.
+        fn sole(&self) -> SignerPosition {
+            self.signers[&self.sole_signer()]
+        }
+
+        /// Move the one signer's position to `signer`.
+        fn reseat_sole_signer(&mut self, signer: ValidatorId) {
+            let position = self.sole();
+            self.signers = BTreeMap::from([(signer, position)]);
+        }
+
+        /// The one signer's position, to set.
+        fn sole_mut(&mut self) -> &mut SignerPosition {
+            let signer = self.sole_signer();
+            self.signers
+                .get_mut(&signer)
+                .expect("the sole signer is attached")
+        }
+    }
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
@@ -9967,7 +10251,7 @@ mod tests {
 
         let state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             config,
             RecoveredState::default(),
@@ -10025,7 +10309,7 @@ mod tests {
         )));
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             local_shard,
             ShardConsensusConfig::default(),
             recovered,
@@ -10281,7 +10565,7 @@ mod tests {
         // Local validator is ValidatorId::new(0) — only proposes when proposer_for = 0.
         let (state, topology_schedule) = make_test_state();
         let shard = state.local_shard;
-        let me = state.me;
+        let me = state.sole_signer();
         assert_eq!(
             topology_schedule.head().proposer_for(shard, Round::new(0)),
             me
@@ -11317,6 +11601,7 @@ mod tests {
                 WeightedTimestamp::from_millis(anchor_ms),
             )),
             committee,
+            proposer: state.sole_signer(),
             carry: TerminalCarry::default(),
             parent_reveal_chain: RevealChain::ZERO,
             parent_committee_anchor_epoch: Epoch::GENESIS,
@@ -12566,6 +12851,7 @@ mod tests {
                 WeightedTimestamp::from_millis(2_500),
             )),
             committee: &committee,
+            proposer: state.sole_signer(),
             carry: TerminalCarry::default(),
             parent_reveal_chain: RevealChain::ZERO,
             parent_committee_anchor_epoch: Epoch::GENESIS,
@@ -13237,7 +13523,7 @@ mod tests {
     fn left_of_two() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -13551,7 +13837,7 @@ mod tests {
 
         let restarted = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             local,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -14824,7 +15110,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -14886,7 +15172,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -14936,7 +15222,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -15006,7 +15292,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -15086,7 +15372,7 @@ mod tests {
         let tip = BlockHash::from_raw(Hash::from_bytes(b"restarted_tip"));
         let state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -15192,7 +15478,7 @@ mod tests {
         let round = tip_qc.round().next();
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            split.proposer_for(local, round),
+            [split.proposer_for(local, round)],
             local,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -15487,7 +15773,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -17128,7 +17414,7 @@ mod tests {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
         let _ = state.broadcast_timeout(&topology_schedule, Round::new(2));
-        assert_eq!(state.last_voted_round, Round::new(2));
+        assert_eq!(state.sole().last_voted_round, Round::new(2));
 
         let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         assert_eq!(state.view(), Round::new(2));
@@ -17180,7 +17466,7 @@ mod tests {
     fn entering_an_abstained_round_times_it_out_at_once() {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
         state.set_time(LocalTimestamp::from_millis(100_000));
-        state.last_voted_round = Round::new(5);
+        state.sole_mut().last_voted_round = Round::new(5);
 
         let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         assert!(
@@ -17199,21 +17485,21 @@ mod tests {
         // as high as our lock.
         let (mut state, _topology) = make_test_state();
         state.view_change.view = Round::new(5);
-        state.last_voted_round = Round::new(4);
-        state.locked_round = Round::new(3);
+        state.sole_mut().last_voted_round = Round::new(4);
+        state.sole_mut().locked_round = Round::new(3);
 
         // All three clauses satisfied.
-        assert!(state.can_safe_vote(Round::new(5), Round::new(3)));
+        assert!(state.can_safe_vote(&state.sole(), Round::new(5), Round::new(3)));
         // The safe-vote bar: an honest validator refuses a block extending a QC
         // below its locked round.
-        assert!(!state.can_safe_vote(Round::new(5), Round::new(2)));
+        assert!(!state.can_safe_vote(&state.sole(), Round::new(5), Round::new(2)));
         // Not the current round.
-        assert!(!state.can_safe_vote(Round::new(4), Round::new(3)));
-        assert!(!state.can_safe_vote(Round::new(6), Round::new(3)));
+        assert!(!state.can_safe_vote(&state.sole(), Round::new(4), Round::new(3)));
+        assert!(!state.can_safe_vote(&state.sole(), Round::new(6), Round::new(3)));
         // One vote per round: a round we have already voted (or timed out) in is
         // refused even with an otherwise-safe parent QC.
-        state.last_voted_round = Round::new(5);
-        assert!(!state.can_safe_vote(Round::new(5), Round::new(3)));
+        state.sole_mut().last_voted_round = Round::new(5);
+        assert!(!state.can_safe_vote(&state.sole(), Round::new(5), Round::new(3)));
     }
 
     #[test]
@@ -17225,8 +17511,8 @@ mod tests {
         // the one-vote-per-round guard would admit a second vote at a round
         // already signed.
         let (mut state, _topology) = make_test_state();
-        state.last_voted_round = Round::new(7);
-        state.locked_round = Round::new(6);
+        state.sole_mut().last_voted_round = Round::new(7);
+        state.sole_mut().locked_round = Round::new(6);
 
         let trailing_qc =
             Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
@@ -17246,12 +17532,12 @@ mod tests {
         );
 
         assert_eq!(
-            state.last_voted_round,
+            state.sole().last_voted_round,
             Round::new(7),
             "the restore must not lower last_voted_round below the durable register",
         );
         assert_eq!(
-            state.locked_round,
+            state.sole().locked_round,
             Round::new(6),
             "the restore must not lower locked_round below the durable register",
         );
@@ -17769,7 +18055,7 @@ mod tests {
         );
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             recovered,
@@ -17778,7 +18064,10 @@ mod tests {
         let _ = state.check_sync_health(&topology_schedule);
         assert_eq!(state.view(), Round::new(6));
         assert_eq!(
-            state.safe_vote_registers().high_tc.map(|tc| tc.round()),
+            state
+                .safe_vote_registers(state.sole())
+                .high_tc
+                .map(|tc| tc.round()),
             Some(Round::new(5)),
             "the certificate is written back on the next signing position",
         );
@@ -17970,7 +18259,7 @@ mod tests {
             }
             let mut state = ShardCoordinator::new(
                 Arc::new(BlsVerifier),
-                ValidatorId::new(4),
+                [ValidatorId::new(4)],
                 shard,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
@@ -18245,7 +18534,8 @@ mod tests {
         assert_eq!(cut.state.view(), Round::new(8));
         assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
         assert!(
-            cut.state.can_safe_vote(Round::new(8), Round::new(6)),
+            cut.state
+                .can_safe_vote(&cut.state.sole(), Round::new(8), Round::new(6)),
             "the lifted replica may vote the leader's block"
         );
     }
@@ -18277,7 +18567,7 @@ mod tests {
         }
         assert_eq!(cut.state.view(), Round::new(8));
         assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
-        assert_eq!(cut.state.last_voted_round, Round::new(7));
+        assert_eq!(cut.state.sole().last_voted_round, Round::new(7));
 
         let _ = cut.land_q();
         let actions = cut
@@ -18416,7 +18706,7 @@ mod tests {
         let _ = cut.land_q();
         let _ = cut.state.check_round_timeout(&cut.schedule);
         assert_eq!(cut.state.view(), Round::new(7));
-        let last_voted = cut.state.last_voted_round;
+        let last_voted = cut.state.sole().last_voted_round;
 
         cut.state.proposal.start(height, Round::new(9));
         let block = make_test_block(height);
@@ -18433,7 +18723,7 @@ mod tests {
             AnswerAdditions::default(),
         );
         assert!(actions.is_empty(), "got {actions:?}");
-        assert_eq!(cut.state.last_voted_round, last_voted);
+        assert_eq!(cut.state.sole().last_voted_round, last_voted);
     }
 
     /// A block at the round the view falls back to, held unvoted while the
@@ -18447,7 +18737,7 @@ mod tests {
         let lifted = cut.certificate(&epoch0, &[2, 5, 10], 7, &qc_p);
         let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &lifted);
         assert_eq!(cut.state.view(), Round::new(8));
-        assert!(cut.state.last_voted_round < Round::new(7));
+        assert!(cut.state.sole().last_voted_round < Round::new(7));
 
         let _ = cut.land_q();
         let qc_q = (*cut.qc_q).clone();
@@ -18471,14 +18761,20 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         install_complete_block(&mut cut.state, &block);
-        assert!(!cut.state.can_safe_vote(Round::new(7), Round::new(6)));
+        assert!(
+            !cut.state
+                .can_safe_vote(&cut.state.sole(), Round::new(7), Round::new(6))
+        );
 
         let actions = cut
             .state
             .check_round_timeout(&cut.schedule)
             .expect("the refresh moved the pacemaker");
         assert_eq!(cut.state.view(), Round::new(7));
-        assert!(cut.state.can_safe_vote(Round::new(7), Round::new(6)));
+        assert!(
+            cut.state
+                .can_safe_vote(&cut.state.sole(), Round::new(7), Round::new(6))
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -18635,7 +18931,7 @@ mod tests {
         let epoch0 = Arc::clone(&cut.epoch0);
         let lifted = cut.certificate(&epoch0, &[2, 5, 10], 7, &qc_p);
         let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &lifted);
-        cut.state.last_timed_out_round = Some(Round::new(8));
+        cut.state.sole_mut().last_timed_out_round = Some(Round::new(8));
         assert_eq!(cut.state.view(), Round::new(8));
 
         let _ = cut.land_q();
@@ -18921,7 +19217,7 @@ mod tests {
         schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -19384,7 +19680,7 @@ mod tests {
                 1 => {
                     let recipients = recipients.expect("the proposer announces");
                     assert_eq!(recipients.len(), 3);
-                    assert!(!recipients.contains(&state.me));
+                    assert!(!recipients.contains(&state.sole_signer()));
                 }
                 0 => assert_eq!(
                     recipients,
@@ -19707,7 +20003,7 @@ mod tests {
         ));
         let view = state.view_change.view;
         time_out_current_round(&mut state, &before);
-        assert_eq!(state.last_timed_out_round, Some(view));
+        assert_eq!(state.sole().last_timed_out_round, Some(view));
 
         let folded = TopologySchedule::single(with_pending_halt_recovery(
             &TopologySchedule::single(Arc::new(committee_snapshot_with_ids(&[1, 2, 3, 4]))),
@@ -19717,7 +20013,7 @@ mod tests {
         let refreshed = state.check_round_timeout(&folded).unwrap_or_default();
         assert!(offers_timeout_at(&refreshed, view), "{refreshed:?}");
         assert_eq!(state.view_change.view, view);
-        assert_eq!(state.last_timed_out_round, Some(view));
+        assert_eq!(state.sole().last_timed_out_round, Some(view));
         assert!(offers_timeout_at(&state.check_sync_health(&folded), view));
     }
 
@@ -20018,6 +20314,7 @@ mod tests {
             ))
         });
         state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
+        state.reseat_sole_signer(schedule.head().proposer_for(ShardId::ROOT, Round::new(1)));
         (state, schedule)
     }
 
@@ -20323,7 +20620,7 @@ mod tests {
         let _ = state.refresh_pacemaker_at_tip(&schedule);
         let round = state.high_qc_round().next();
         state.view_change.view = round;
-        state.me = schedule.head().proposer_for(ShardId::ROOT, round);
+        state.reseat_sole_signer(schedule.head().proposer_for(ShardId::ROOT, round));
         assert!(state.can_propose(&schedule, BlockHeight::new(6), round));
         let frame = state
             .proposal_frame(&schedule, BlockHeight::new(6), round)
@@ -20647,7 +20944,7 @@ mod tests {
             TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set);
         let state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(u64::from(local_idx)),
+            [ValidatorId::new(u64::from(local_idx))],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -21009,7 +21306,7 @@ mod tests {
 
         asked.set(0);
         let (mut other, schedule, qc) = about_to_certify(3, 7, &[]);
-        other.me = ValidatorId::new(1);
+        other.reseat_sole_signer(ValidatorId::new(1));
         let mut actions = other.on_qc_formed(&schedule, qc.block_hash(), &qc, counting);
         actions.extend(other.try_propose(&schedule, counting));
         assert_eq!(
@@ -21054,11 +21351,11 @@ mod tests {
         // The QC is adopted from a seat that does not lead its round,
         // which then leads a round five past it with no certificate held.
         let (mut skipping, schedule, qc) = about_to_certify(3, 7, &[]);
-        skipping.me = ValidatorId::new(1);
+        skipping.reseat_sole_signer(ValidatorId::new(1));
         let _ = skipping.on_qc_formed(&schedule, qc.block_hash(), &qc, asking);
         let round = Round::new(qc.round().inner() + 5);
         skipping.view_change.view = round;
-        skipping.me = schedule.head().proposer_for(ShardId::ROOT, round);
+        skipping.reseat_sole_signer(schedule.head().proposer_for(ShardId::ROOT, round));
         assert!(skipping.can_propose(&schedule, next, round));
         let frame = skipping
             .proposal_frame(&schedule, next, round)
@@ -21175,9 +21472,11 @@ mod tests {
         install_complete_block(&mut state, &certified);
         let qc = Verified::new_unchecked_for_test(qc_over(certified.header()));
         state.verification.on_block_persisted(qc.height());
-        state.me = schedule
-            .head()
-            .proposer_for(ShardId::ROOT, qc.round().next());
+        state.reseat_sole_signer(
+            schedule
+                .head()
+                .proposer_for(ShardId::ROOT, qc.round().next()),
+        );
         (state, schedule, [committing, certified], qc)
     }
 
@@ -22040,12 +22339,18 @@ mod tests {
             TakeResult::Matched
         ));
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"own_block_4"));
-        let vote = state.create_vote(&topology_schedule, block_hash, height, round);
+        let vote = state.create_vote(
+            &topology_schedule,
+            state.sole_signer(),
+            block_hash,
+            height,
+            round,
+        );
         assert!(
             vote.iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
-        assert_eq!(state.last_voted_round(), round);
+        assert_eq!(state.sole().last_voted_round, round);
 
         // The retry at the same view must be a no-op, not a sibling build.
         let retry = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
@@ -22237,7 +22542,7 @@ mod tests {
             start.plus(ready_signal_window(topology_schedule.epoch_duration_ms()))
         );
         assert_eq!(recipients.len(), 3);
-        assert!(!recipients.contains(&state.me));
+        assert!(!recipients.contains(&state.sole_signer()));
     }
 
     /// A vnode that finished bootstrap sync before its committee window
@@ -22293,7 +22598,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -22367,7 +22672,7 @@ mod tests {
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -23000,7 +23305,7 @@ mod tests {
         let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -23352,10 +23657,18 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.set_block_syncing(true);
 
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"other_proposer_block"));
-        let height = BlockHeight::new(1);
         // A fresh state's current round is 1, so vote at the matching round.
-        let round = Round::new(1);
+        let header = empty_block_at_round(state.committed_hash, 1)
+            .header()
+            .clone();
+        let block_hash = header.hash();
+        let height = header.height();
+        let round = header.round();
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            header,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
         state.answers.measured(
             block_hash,
             AnswerDelta::default(),
@@ -23368,7 +23681,7 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
-        assert_eq!(state.last_voted_round(), round);
+        assert_eq!(state.sole().last_voted_round, round);
     }
 
     #[test]
@@ -23813,6 +24126,11 @@ mod tests {
         state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
 
         state.set_block_syncing(true);
+        state.reseat_sole_signer(
+            topology_schedule
+                .head()
+                .proposer_for(ShardId::ROOT, Round::new(1)),
+        );
         let sync_actions = state.build_and_dispatch_proposal(
             &topology_schedule,
             BlockHeight::new(4),
@@ -23823,6 +24141,11 @@ mod tests {
 
         state.pending_blocks.clear();
 
+        state.reseat_sole_signer(
+            topology_schedule
+                .head()
+                .proposer_for(ShardId::ROOT, Round::new(2)),
+        );
         let fallback_actions = state.build_and_broadcast_fallback_block(
             &topology_schedule,
             BlockHeight::new(4),
@@ -24459,7 +24782,7 @@ mod tests {
         };
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             recovered,
@@ -24722,7 +25045,7 @@ mod tests {
     fn fence_coordinator() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -25930,7 +26253,7 @@ mod tests {
         let (_, schedule) = make_test_state();
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(99),
+            [ValidatorId::new(99)],
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
@@ -27027,5 +27350,723 @@ mod tests {
         gridded.insert(Epoch::GENESIS, Arc::clone(schedule.head()));
         assert_eq!(watermark_after_committing(&gridded, 900, |_| {}), unmoved);
         assert_eq!(watermark_after_committing(&gridded, 1_500, |_| {}), moved);
+    }
+
+    // ─── A replica signing for a set of signers ──────────────────────────
+
+    /// Attach `siblings` beside the replica's signer, each at its position.
+    fn attach_siblings(state: &mut ShardCoordinator, siblings: &[u64]) {
+        let position = state.sole();
+        for &sibling in siblings {
+            state.signers.insert(ValidatorId::new(sibling), position);
+        }
+    }
+
+    fn position_of(state: &ShardCoordinator, signer: u64) -> SignerPosition {
+        state
+            .position(ValidatorId::new(signer))
+            .expect("an attached signer")
+    }
+
+    fn position_mut_of(state: &mut ShardCoordinator, signer: u64) -> &mut SignerPosition {
+        state
+            .signers
+            .get_mut(&ValidatorId::new(signer))
+            .expect("an attached signer")
+    }
+
+    fn voters(actions: &[Action]) -> Vec<ValidatorId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndBroadcastBlockVote { signer, .. } => Some(*signer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn timed_out_by(actions: &[Action], at: Round) -> Vec<ValidatorId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndBroadcastTimeout { round, signer, .. } if *round == at => {
+                    Some(*signer)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ids(signers: &[u64]) -> Vec<ValidatorId> {
+        signers.iter().copied().map(ValidatorId::new).collect()
+    }
+
+    /// The header of round one's block over the committed tip, proposed by
+    /// validator 1, held without its body and adding nothing to the count.
+    fn received_round_one_header(state: &mut ShardCoordinator) -> BlockHeader {
+        let header = empty_block_at_round(state.committed_hash, 1)
+            .header()
+            .clone();
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            header.clone(),
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+        state.answers.measured(
+            header.hash(),
+            AnswerDelta::default(),
+            AnswerAdditions::default(),
+        );
+        header
+    }
+
+    fn vote_on(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        header: &BlockHeader,
+    ) -> Vec<Action> {
+        state.try_vote_on_block(schedule, header.hash(), header.height(), header.round())
+    }
+
+    /// Round one's block, built by validator 1 on this replica, reported
+    /// back from the build.
+    fn own_round_one_block_built(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        additions: AnswerAdditions,
+    ) -> (Block, Vec<Action>) {
+        let own = empty_block_at_round(state.committed_hash, 1);
+        let actions = own_block_built(state, schedule, &own, additions);
+        (own, actions)
+    }
+
+    /// `own`, built on this replica, reported back from the build.
+    fn own_block_built(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        own: &Block,
+        additions: AnswerAdditions,
+    ) -> Vec<Action> {
+        state.proposal.start(own.height(), own.header().round());
+        state.on_proposal_built(
+            schedule,
+            own.height(),
+            own.header().round(),
+            own,
+            own.hash(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            AnswerDelta::default(),
+            additions,
+        )
+    }
+
+    /// The position `actions` persist under the header and under each
+    /// vote, in that order.
+    fn persisted_positions(actions: &[Action]) -> Vec<(SafeVoteRegisters, Vec<BlockHash>)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::BroadcastBlockHeader { position, .. }
+                | Action::SignAndBroadcastBlockVote { position, .. } => Some((
+                    position.registers.clone(),
+                    position.justification.iter().map(|b| b.hash()).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every eligible signer votes a votable block once, under its own
+    /// position, in the step that makes it votable; none votes it twice.
+    #[test]
+    fn two_signers_in_the_committee_each_vote_once_per_round() {
+        let (mut state, schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[3]);
+        let header = received_round_one_header(&mut state);
+
+        let actions = vote_on(&mut state, &schedule, &header);
+        assert_eq!(voters(&actions), ids(&[2, 3]), "got {actions:?}");
+        for signer in [2, 3] {
+            assert_eq!(position_of(&state, signer).last_voted_round, Round::new(1));
+        }
+
+        let again = vote_on(&mut state, &schedule, &header);
+        assert!(voters(&again).is_empty(), "got {again:?}");
+    }
+
+    /// A signer outside the consensus subset of the block's committee
+    /// signs no vote for it.
+    #[test]
+    fn a_signer_outside_the_blocks_committee_does_not_vote() {
+        let (mut state, schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[7]);
+        let header = received_round_one_header(&mut state);
+
+        let actions = vote_on(&mut state, &schedule, &header);
+        assert_eq!(voters(&actions), ids(&[2]), "got {actions:?}");
+        assert_eq!(position_of(&state, 7).last_voted_round, Round::INITIAL);
+    }
+
+    /// The safe-vote rule reads each signer's own position: one already
+    /// spent at the round abstains, and its sibling still votes.
+    #[test]
+    fn a_signer_whose_position_passed_the_round_abstains_while_its_sibling_votes() {
+        let (mut state, schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[3]);
+        position_mut_of(&mut state, 3).last_voted_round = Round::new(1);
+        let header = received_round_one_header(&mut state);
+
+        let actions = vote_on(&mut state, &schedule, &header);
+        assert_eq!(voters(&actions), ids(&[2]), "got {actions:?}");
+    }
+
+    /// A record's lock above every certificate the store holds, as a
+    /// carried lock with no high QC is, binds the signer it belongs to and
+    /// no other: its sibling boots at the persisted QC's floor and votes.
+    #[test]
+    fn a_carried_lock_above_the_high_qc_binds_only_its_own_signer() {
+        let (_, schedule) = make_multi_validator_state_at(2);
+        let mut recovered = RecoveredState::default();
+        recovered.safe_vote_registers.insert(
+            ValidatorId::new(2),
+            SafeVoteRegisters {
+                locked_round: Round::new(5),
+                last_voted_round: Round::new(5),
+                high_qc: None,
+                high_tc: None,
+            },
+        );
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ids(&[2, 3]),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            recovered,
+        );
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        assert_eq!(position_of(&state, 2).locked_round, Round::new(5));
+        assert_eq!(position_of(&state, 3).locked_round, Round::INITIAL);
+        assert_eq!(position_of(&state, 3).last_voted_round, Round::INITIAL);
+
+        let header = received_round_one_header(&mut state);
+        let actions = vote_on(&mut state, &schedule, &header);
+        assert_eq!(voters(&actions), ids(&[3]), "got {actions:?}");
+    }
+
+    /// A signer whose lock sits above the high QC leads a round the
+    /// pacemaker advanced to, and neither builds over the high QC nor
+    /// votes a block already built over it: either would vote beneath
+    /// its lock.
+    #[test]
+    fn a_proposer_locked_above_the_high_qc_neither_builds_nor_votes_beneath_its_lock() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        position_mut_of(&mut state, 2).locked_round = Round::new(5);
+
+        let actions = advance_one_round(&mut state, &schedule, &keys);
+        assert_eq!(state.view(), Round::new(2));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "got {actions:?}",
+        );
+        assert!(!state.will_propose_next(&schedule));
+        assert!(!state.can_propose(&schedule, BlockHeight::new(1), Round::new(2)));
+
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        position_mut_of(&mut state, 1).locked_round = Round::new(5);
+        let (own, actions) =
+            own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
+        assert!(actions.is_empty(), "got {actions:?}");
+        assert!(state.pending_blocks.get(own.hash()).is_none());
+        assert_eq!(position_of(&state, 1).last_voted_round, Round::INITIAL);
+    }
+
+    /// A sibling whose own lock sits above the self-built block's parent QC
+    /// does not vote it, while the proposer does.
+    #[test]
+    fn a_sibling_locked_above_the_parent_qc_does_not_vote_the_proposers_block() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[2]);
+        position_mut_of(&mut state, 2).locked_round = Round::new(5);
+
+        let (_, actions) =
+            own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
+        assert_eq!(voters(&actions), ids(&[1]), "got {actions:?}");
+        assert_eq!(position_of(&state, 2).last_voted_round, Round::INITIAL);
+    }
+
+    /// The header persists exactly the position its proposer's self-vote
+    /// reaches, lock raised to the parent QC included, so the self-vote's
+    /// persist finds its record already written.
+    #[test]
+    fn a_proposers_header_persists_the_position_its_self_vote_reaches() {
+        let (mut state, schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent_qc = QuorumCertificate::new(
+            state.committed_hash,
+            ShardId::ROOT,
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::new(1),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100_000),
+        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(1),
+            parent_block_hash: state.committed_hash,
+            parent_qc: parent_qc.into(),
+            proposer: ValidatorId::new(2),
+            timestamp: ProposerTimestamp::from_millis(100_000),
+            round: Round::new(2),
+            load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, None),
+            ..Default::default()
+        });
+        let own = bare_block(header, WitnessSources::empty());
+        state.view_change.advance_to(Round::new(2));
+
+        let actions = own_block_built(&mut state, &schedule, &own, AnswerAdditions::default());
+        let [header_position, vote_position] = persisted_positions(&actions)
+            .try_into()
+            .unwrap_or_else(|got| panic!("a header and one self-vote; got {got:?}"));
+        assert_eq!(header_position.0.locked_round, Round::new(1));
+        assert_eq!(header_position.0.last_voted_round, Round::new(2));
+        assert_eq!(header_position, vote_position);
+    }
+
+    /// A self-built block gets its proposer's vote and every eligible
+    /// sibling's in the step that broadcasts it, so a host holding a
+    /// quorum forms the QC from its own feedback.
+    #[test]
+    fn a_co_hosted_proposers_siblings_vote_its_block_in_the_same_round() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[2, 7]);
+
+        let (own, actions) =
+            own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BroadcastBlockHeader { header, recipients, .. }
+                    if header.hash() == own.hash()
+                        && !recipients.contains(&ValidatorId::new(1))
+            )),
+            "got {actions:?}",
+        );
+        assert_eq!(voters(&actions), ids(&[1, 2]), "got {actions:?}");
+    }
+
+    /// The replica built the block under every rule the vote pipeline
+    /// checks, so the proposer's vote and its siblings' run neither the
+    /// cap nor the fence: a block the cap would hold, or the fence would
+    /// withhold, from a received copy is still voted.
+    #[test]
+    fn a_proposers_self_vote_runs_no_cap_or_fence() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[2]);
+
+        let (own, actions) = own_round_one_block_built(&mut state, &schedule, adding(1));
+        assert_eq!(
+            state.vote_within_cap(&schedule, own.hash()),
+            Cap::Held,
+            "a received copy of the block would wait on a count",
+        );
+        assert_eq!(voters(&actions), ids(&[1, 2]), "got {actions:?}");
+
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[2]);
+        let claims = vec![bundle_against(ShardId::leaf(1, 1), b"root", 5_000)];
+        let own = Block::Live {
+            header: empty_block_at_round(state.committed_hash, 1)
+                .header()
+                .clone(),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        assert!(
+            state.vote_fence().judge(&schedule, &own).is_err(),
+            "a received copy of the block would be withheld at the fence",
+        );
+        let actions = own_block_built(&mut state, &schedule, &own, AnswerAdditions::default());
+        assert_eq!(voters(&actions), ids(&[1, 2]), "got {actions:?}");
+    }
+
+    /// Whether the replica takes certificates for a proposal reads the
+    /// round proposer's own position: a stale proposer does not propose
+    /// because a sibling is fresh.
+    #[test]
+    fn a_stale_proposer_signer_takes_no_certificates_beside_a_fresh_sibling() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        attach_siblings(&mut state, &[2]);
+        assert!(state.will_propose_next(&schedule));
+
+        position_mut_of(&mut state, 1).last_voted_round = Round::new(1);
+        assert_eq!(position_of(&state, 2).last_voted_round, Round::INITIAL);
+        assert!(!state.will_propose_next(&schedule));
+        assert!(!state.can_propose(&schedule, BlockHeight::new(1), Round::new(1)));
+    }
+
+    /// The header carries the proposer's position with its round spent,
+    /// persisted before the header is signed. A proposer whose self-vote
+    /// never left reads as spent at the round after a restart, so it
+    /// neither builds nor broadcasts a second header there.
+    #[test]
+    fn a_proposer_whose_header_left_does_not_sign_a_second_header_after_a_restart() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let (own, actions) =
+            own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
+        let Some(Action::BroadcastBlockHeader { position, .. }) = actions
+            .iter()
+            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }))
+        else {
+            panic!("the proposer broadcasts its header; got {actions:?}");
+        };
+        assert_eq!(position.registers.last_voted_round, Round::new(1));
+
+        // Only the header's position reached the store: the self-vote was
+        // dropped at a close, or the crash came first.
+        let mut recovered = RecoveredState::default();
+        recovered
+            .safe_vote_registers
+            .insert(ValidatorId::new(1), position.registers.clone());
+        let mut restarted = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ids(&[1]),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            recovered,
+        );
+        restarted.set_time(LocalTimestamp::from_millis(100_000));
+        assert_eq!(restarted.view(), Round::new(1));
+        assert!(!restarted.will_propose_next(&schedule));
+        assert!(!restarted.can_propose(&schedule, own.height(), Round::new(1)));
+
+        restarted.proposal.start(own.height(), Round::new(1));
+        let again = restarted.on_proposal_built(
+            &schedule,
+            own.height(),
+            Round::new(1),
+            &own,
+            own.hash(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            AnswerDelta::default(),
+            AnswerAdditions::default(),
+        );
+        assert!(again.is_empty(), "got {again:?}");
+    }
+
+    /// A build that returns after its proposer left the replica is dropped
+    /// before it is held or counted as leader activity.
+    #[test]
+    fn a_detached_proposers_built_block_does_not_reset_the_round_timer() {
+        let (mut state, schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let before = state.view_change.last_leader_activity;
+
+        let (own, actions) =
+            own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
+        assert!(actions.is_empty(), "got {actions:?}");
+        assert_eq!(state.view_change.last_leader_activity, before);
+        assert!(state.pending_blocks.get(own.hash()).is_none());
+    }
+
+    /// Entering a round, a signer that can only abstain in it times it
+    /// out at once, and the round's fresh proposer still builds.
+    #[test]
+    fn a_spent_signer_times_out_an_abstained_round_while_a_fresh_proposer_builds() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[3]);
+        position_mut_of(&mut state, 3).last_voted_round = Round::new(5);
+
+        let actions = advance_one_round(&mut state, &schedule, &keys);
+        assert_eq!(state.view(), Round::new(2));
+        assert_eq!(
+            timed_out_by(&actions, Round::new(2)),
+            ids(&[3]),
+            "got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BuildProposal { proposer, round, .. }
+                    if *proposer == ValidatorId::new(2) && *round == Round::new(2)
+            )),
+            "got {actions:?}",
+        );
+    }
+
+    /// The replica resumes on the highest certificates any signer's record
+    /// holds, and seats each signer at its own record over the floor.
+    #[test]
+    fn restored_signers_resume_on_the_highest_certificates_any_record_holds() {
+        let qc_at = |round: u64| {
+            QuorumCertificate::new(
+                BlockHash::from_raw(Hash::from_bytes(&round.to_le_bytes())),
+                ShardId::ROOT,
+                BlockHeight::new(round),
+                BlockHash::ZERO,
+                Round::new(round),
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(100_000),
+            )
+        };
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let records = BTreeMap::from([
+            (
+                ValidatorId::new(1),
+                SafeVoteRegisters {
+                    locked_round: Round::new(5),
+                    last_voted_round: Round::new(5),
+                    high_qc: Some(qc_at(5)),
+                    high_tc: Some(certificate_over(Round::new(4), &genesis)),
+                },
+            ),
+            (
+                ValidatorId::new(2),
+                SafeVoteRegisters {
+                    locked_round: Round::new(3),
+                    last_voted_round: Round::new(7),
+                    high_qc: Some(qc_at(3)),
+                    high_tc: Some(certificate_over(Round::new(6), &genesis)),
+                },
+            ),
+        ]);
+        let persisted = Verified::<QuorumCertificate>::new_unchecked_for_test(qc_at(2));
+
+        let (quorum, timeout, positions) =
+            restore_signers(ids(&[1, 2, 3]), Some(persisted), &records, Round::new(2));
+        assert_eq!(quorum.map(|qc| qc.round()), Some(Round::new(5)));
+        assert_eq!(timeout.map(|tc| tc.round()), Some(Round::new(6)));
+        let seated = |signer: u64| {
+            let position = positions[&ValidatorId::new(signer)];
+            (position.locked_round, position.last_voted_round)
+        };
+        assert_eq!(seated(1), (Round::new(5), Round::new(5)));
+        assert_eq!(seated(2), (Round::new(3), Round::new(7)));
+        assert_eq!(
+            seated(3),
+            (Round::new(2), Round::new(2)),
+            "no record: the floor"
+        );
+    }
+
+    /// A committed-state restore raises every signer to the restored QC's
+    /// round and lowers none.
+    #[test]
+    fn a_committed_state_restore_raises_every_signer() {
+        let (mut state, _) = make_multi_validator_state_at(1);
+        attach_siblings(&mut state, &[2]);
+        position_mut_of(&mut state, 2).locked_round = Round::new(6);
+        position_mut_of(&mut state, 2).last_voted_round = Round::new(7);
+
+        let _ = state.on_committed_state_restored(
+            BlockHeight::new(4),
+            Some(BlockHash::ZERO),
+            Some(make_test_qc(BlockHash::ZERO, BlockHeight::new(4))),
+        );
+        assert_eq!(position_of(&state, 1).locked_round, Round::new(4));
+        assert_eq!(position_of(&state, 1).last_voted_round, Round::new(4));
+        assert_eq!(position_of(&state, 2).locked_round, Round::new(6));
+        assert_eq!(position_of(&state, 2).last_voted_round, Round::new(7));
+    }
+
+    /// Bracha amplification times out each signer that has not timed the
+    /// round out itself, once.
+    #[test]
+    fn amplification_times_out_each_signer_once() {
+        let (mut state, schedule) = make_multi_validator_state_at(1);
+        attach_siblings(&mut state, &[2]);
+        let round = Round::new(3);
+        position_mut_of(&mut state, 1).last_timed_out_round = Some(round);
+
+        let first = state.amplify_timeout(&schedule, round);
+        assert_eq!(timed_out_by(&first, round), ids(&[2]), "got {first:?}");
+        assert_eq!(position_of(&state, 2).last_voted_round, round);
+
+        let second = state.amplify_timeout(&schedule, round);
+        assert!(second.is_empty(), "got {second:?}");
+    }
+
+    /// A QC the replica forms goes out once, under the block's proposer
+    /// when it is attached, and otherwise under the designated sender, the
+    /// lowest attached member of the consensus subset.
+    #[test]
+    fn a_qc_announcement_goes_out_once_per_round() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(1);
+        attach_siblings(&mut state, &[2]);
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let Some(Action::SignAndBroadcastQcAnnouncement {
+            recipients, signer, ..
+        }) = state.announce_qc(&schedule, block.hash(), &qc)
+        else {
+            panic!("the attached proposer announces");
+        };
+        assert_eq!(signer, ValidatorId::new(1));
+        assert!(!recipients.contains(&signer));
+        assert!(
+            state.announce_qc(&schedule, block.hash(), &qc).is_none(),
+            "a sibling's formation of the same QC announces nothing more",
+        );
+
+        let (mut other, schedule, keys) = make_multi_validator_state_with_keys(3);
+        attach_siblings(&mut other, &[0, 7]);
+        let block = empty_block_at_round(other.committed_hash, 1);
+        install_complete_block(&mut other, &block);
+        let qc = quorum_over_round_one(&other, &keys, &block);
+        assert!(matches!(
+            other.announce_qc(&schedule, block.hash(), &qc),
+            Some(Action::SignAndBroadcastQcAnnouncement { signer, recipients, .. })
+                if signer == ValidatorId::new(0) && recipients == ids(&[2])
+        ));
+    }
+
+    /// Under a pending halt recovery a retained signer outside the tip
+    /// committee's consensus subset re-offers the view's timeout on the
+    /// tick, while the fresh signer beside it keeps its position and votes
+    /// the view's block.
+    #[test]
+    fn a_retained_signer_reoffers_while_a_fresh_signer_votes_in_one_view() {
+        let (mut state, schedule) = make_multi_validator_state_at(2);
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(9)],
+            Epoch::new(2),
+        ));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        attach_siblings(&mut state, &[9]);
+        let view = state.view();
+
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(timed_out_by(&ticked, view), ids(&[9]), "got {ticked:?}");
+        assert_eq!(position_of(&state, 2).last_voted_round, Round::INITIAL);
+
+        let header = received_round_one_header(&mut state);
+        let actions = vote_on(&mut state, &schedule, &header);
+        assert_eq!(voters(&actions), ids(&[2]), "got {actions:?}");
+    }
+
+    /// A retained signer outside the tip committee's consensus subset
+    /// offers on the first tick, with no timer fire behind it, and its
+    /// share moves no tally. One inside the subset waits for the fire.
+    #[test]
+    fn a_retained_signer_outside_the_subset_reoffers_on_the_tick_before_any_fire() {
+        let (mut state, schedule) = make_test_state();
+        let schedule = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            ids(&[0, 9]),
+            Epoch::new(2),
+        ));
+        attach_siblings(&mut state, &[9]);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let view = state.view();
+
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(timed_out_by(&ticked, view), ids(&[9]), "got {ticked:?}");
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(
+            timed_out_by(&ticked, view),
+            ids(&[9]),
+            "every tick re-offers"
+        );
+
+        time_out_current_round(&mut state, &schedule);
+        let ticked = state.check_sync_health(&schedule);
+        assert_eq!(
+            timed_out_by(&ticked, view),
+            ids(&[0, 9]),
+            "an in-subset retained signer re-offers once its timer fired",
+        );
+
+        let share = Verified::<Timeout>::sign_local(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            view,
+            state.high_qc(),
+            ValidatorId::new(9),
+            &BlsSigner::generate(),
+        )
+        .expect("sign");
+        let before = state.timeouts.power(view);
+        let _ = state.on_verified_timeout(&schedule, share);
+        assert_eq!(
+            state.timeouts.power(view),
+            before,
+            "the share is not tallied"
+        );
+        assert!(!state.timeouts.contains(view, ValidatorId::new(9)));
+        assert_eq!(state.view(), view);
+    }
+
+    /// A not-yet-ready signer's ready signal names its co-hosted proposer
+    /// among the recipients, and the replica's pool takes it from there.
+    #[test]
+    fn a_co_hosted_proposer_pools_its_siblings_ready_signal() {
+        let (mut state, _) = make_test_state();
+        let schedule = not_ready_member_topology();
+        attach_siblings(&mut state, &[1]);
+
+        let actions = state.on_beacon_block_persisted(&schedule);
+        let signals: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndBroadcastReadySignal {
+                    signer,
+                    recipients,
+                    wt_window_start,
+                    wt_window_end,
+                    ..
+                } => Some((
+                    *signer,
+                    recipients.clone(),
+                    *wt_window_start,
+                    *wt_window_end,
+                )),
+                _ => None,
+            })
+            .collect();
+        let [(signer, recipients, start, end)] = signals.as_slice() else {
+            panic!("only the not-ready signer signals; got {actions:?}");
+        };
+        assert_eq!(*signer, ValidatorId::new(0));
+        assert!(recipients.contains(&ValidatorId::new(1)));
+        assert!(!recipients.contains(signer));
+
+        let signal = ReadySignal::sign(
+            &NetworkDefinition::simulator(),
+            *signer,
+            ShardId::ROOT,
+            *start,
+            *end,
+            &BlsSigner::generate(),
+        )
+        .expect("sign");
+        state.on_ready_signal_received(&schedule, signal);
+        assert_eq!(state.ready_signal_pool.len(), 1);
     }
 }

@@ -21,8 +21,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{HoldFilter, ShardCoordinatorSim, perturb_header_timestamp};
-use hyperscale_types::{BlockHash, BlockHeight, BlockManifest, Round, ValidatorId};
+use common::{HoldFilter, ShardCoordinatorSim, build_genesis_block, perturb_header_timestamp};
+use hyperscale_core::Action;
+use hyperscale_types::{
+    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, ProposerTimestamp, Round,
+    SafeVoteRegisters, ShardId, ValidatorId, VotePosition,
+};
 
 const MAX_STEPS: usize = 5_000;
 const PAST_TIMEOUT: Duration = Duration::from_secs(12);
@@ -206,8 +210,8 @@ fn crash_restarted_replica_refuses_revote_in_consumed_round() {
         "V3 voted the original block at round 1 before the crash",
     );
 
-    let pre_locked = sim.coordinators[3].locked_round();
-    let pre_last_voted = sim.coordinators[3].last_voted_round();
+    let pre_locked = sim.position(3).locked_round;
+    let pre_last_voted = sim.position(3).last_voted_round;
     assert!(pre_last_voted >= r1);
 
     sim.crash_and_restart(v3);
@@ -216,8 +220,8 @@ fn crash_restarted_replica_refuses_revote_in_consumed_round() {
     // no QC, so without the record both would re-initialize to round 0
     // while the view returns to round 1 — and every safe-vote guard
     // would pass for the sibling delivered below.
-    assert_eq!(sim.coordinators[3].locked_round(), pre_locked);
-    assert_eq!(sim.coordinators[3].last_voted_round(), pre_last_voted);
+    assert_eq!(sim.position(3).locked_round, pre_locked);
+    assert_eq!(sim.position(3).last_voted_round, pre_last_voted);
     assert_eq!(sim.coordinators[3].view(), r1);
 
     // Mint the sibling: same height, round, parent, and content roots
@@ -279,14 +283,14 @@ fn reseated_replica_refuses_revote_in_consumed_round() {
         "V3 voted the original block at round 1 before the re-seat",
     );
 
-    let pre_locked = sim.coordinators[3].locked_round();
-    let pre_last_voted = sim.coordinators[3].last_voted_round();
+    let pre_locked = sim.position(3).locked_round;
+    let pre_last_voted = sim.position(3).last_voted_round;
     assert!(pre_last_voted >= r1);
 
     sim.reseat_on_rebuilt_store(v3);
 
-    assert_eq!(sim.coordinators[3].locked_round(), pre_locked);
-    assert_eq!(sim.coordinators[3].last_voted_round(), pre_last_voted);
+    assert_eq!(sim.position(3).locked_round, pre_locked);
+    assert_eq!(sim.position(3).last_voted_round, pre_last_voted);
     assert_eq!(sim.coordinators[3].view(), r1);
 
     let sibling = Arc::new(perturb_header_timestamp(original.block().header()));
@@ -313,4 +317,61 @@ fn reseated_replica_refuses_revote_in_consumed_round() {
         "two honest replicas committed different blocks at one height: {:?}",
         find_fork(&sim),
     );
+}
+
+/// The production header handler makes the proposer's spent round durable
+/// before it signs, and the self-vote that reaches the same position
+/// writes nothing more: a proposer's header and self-vote cost one
+/// durable write between them.
+#[test]
+fn a_header_signs_after_its_position_is_durable_and_its_self_vote_writes_nothing() {
+    let mut sim = ShardCoordinatorSim::new(4, 1);
+    sim.build_through_the_production_handler();
+    let proposer = sim.members[0].0;
+    let header = BlockHeader::new(BlockHeaderParts {
+        height: BlockHeight::new(1),
+        round: Round::new(1),
+        proposer,
+        ..Default::default()
+    });
+    let justified = build_genesis_block(&sim.storages[0], proposer, ShardId::ROOT);
+    let position = VotePosition {
+        registers: SafeVoteRegisters {
+            last_voted_round: Round::new(1),
+            ..SafeVoteRegisters::default()
+        },
+        justification: vec![Arc::new(justified)],
+    };
+
+    let sent = sim.sign_in_production(
+        0,
+        Action::BroadcastBlockHeader {
+            header: Box::new(header.clone()),
+            manifest: Box::new(BlockManifest::default()),
+            recipients: Vec::new(),
+            position: position.clone(),
+        },
+    );
+    assert_eq!(
+        sent.registers_at_sign,
+        vec![Some(position.registers.clone())],
+        "the header is signed over a durable spent round",
+    );
+    assert_eq!(sent.writes, 1);
+
+    let voted = sim.sign_in_production(
+        0,
+        Action::SignAndBroadcastBlockVote {
+            block_hash: header.hash(),
+            parent_block_hash: header.parent_block_hash(),
+            height: header.height(),
+            round: header.round(),
+            timestamp: ProposerTimestamp::ZERO,
+            next_proposers: Vec::new(),
+            position,
+            signer: proposer,
+        },
+    );
+    assert_eq!(voted.registers_at_sign.len(), 1, "the self-vote is signed");
+    assert_eq!(voted.writes, 0, "the header already wrote its position");
 }

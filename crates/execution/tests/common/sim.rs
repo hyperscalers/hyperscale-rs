@@ -297,7 +297,7 @@ impl ExecutionSim {
         let snapshot = Arc::new(committee.topology_snapshot(num_shards));
         Self {
             coord: ExecutionCoordinator::new(
-                ValidatorId::new(0),
+                [ValidatorId::new(0)],
                 local_shard,
                 Arc::new(AllCodeRuns),
             ),
@@ -332,7 +332,7 @@ impl ExecutionSim {
             ..RecoveredState::default()
         };
         sim.coord = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             sim.local_shard,
             Arc::new(AllCodeRuns),
             Arc::new(CrossingIndexSlot::default()),
@@ -833,7 +833,7 @@ impl ExecutionSim {
             ..RecoveredState::default()
         };
         self.coord = ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             self.local_shard,
             Arc::new(AllCodeRuns),
             Arc::new(CrossingIndexSlot::default()),
@@ -911,7 +911,7 @@ impl ExecutionSim {
             ..RecoveredState::default()
         };
         ExecutionCoordinator::with_shared_stores(
-            ValidatorId::new(0),
+            [ValidatorId::new(0)],
             self.local_shard,
             Arc::new(AllCodeRuns),
             Arc::new(CrossingIndexSlot::default()),

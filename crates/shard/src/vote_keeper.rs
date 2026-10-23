@@ -185,7 +185,6 @@ impl VoteKeeper {
     pub(crate) fn accept_verified_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        me: ValidatorId,
         local_shard: ShardId,
         vote: Verified<BlockVote>,
         committed_height: BlockHeight,
@@ -210,12 +209,7 @@ impl VoteKeeper {
             return vec![];
         }
 
-        let is_own_vote = vote.voter() == me;
-        trace!(
-            block_hash = ?block_hash,
-            is_own_vote,
-            "Admitting pre-verified vote"
-        );
+        trace!(block_hash = ?block_hash, "Admitting pre-verified vote");
         vote_set.add_verified_vote(prep.voter_index, vote);
 
         self.maybe_trigger_verification(local_shard, block_hash)
@@ -230,7 +224,6 @@ impl VoteKeeper {
     pub(crate) fn accept_unverified_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        me: ValidatorId,
         local_shard: ShardId,
         vote: BlockVote,
         committed_height: BlockHeight,
@@ -266,7 +259,6 @@ impl VoteKeeper {
 
         vote_set.buffer_unverified_vote(prep.voter_index, vote, prep.public_key);
         trace!(
-            validator = ?me,
             block_hash = ?block_hash,
             verified_power = vote_set.verified_power().inner(),
             unverified_power = vote_set.unverified_power().inner(),
@@ -838,18 +830,17 @@ mod tests {
     fn far_future_vote_height_creates_no_vote_set() {
         let (keys, topo) = keys_and_topology(4);
         let shard = ShardId::ROOT;
-        let me = ValidatorId::new(0);
         let committed = BlockHeight::new(10);
         let mut vk = VoteKeeper::new();
 
         // A vote far above committed is dropped before any set is created.
         let far = BlockHeight::new(10 + MAX_VOTE_HEIGHT_LOOKAHEAD + 1);
-        vk.accept_unverified_vote(&topo, me, shard, wire_vote(&keys, 0, far), committed, None);
+        vk.accept_unverified_vote(&topo, shard, wire_vote(&keys, 0, far), committed, None);
         assert_eq!(vk.vote_sets_len(), 0);
 
         // A vote at the lookahead edge is tracked.
         let edge = BlockHeight::new(10 + MAX_VOTE_HEIGHT_LOOKAHEAD);
-        vk.accept_unverified_vote(&topo, me, shard, wire_vote(&keys, 0, edge), committed, None);
+        vk.accept_unverified_vote(&topo, shard, wire_vote(&keys, 0, edge), committed, None);
         assert_eq!(vk.vote_sets_len(), 1);
     }
 

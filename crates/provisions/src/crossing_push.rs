@@ -188,6 +188,10 @@ pub fn push_crossing_readings<S, N>(
             None => pushes.push((target, claims)),
         }
     }
+    let Some(signing) = &ctx.signing else {
+        tracing::error!("crossing readings push dispatched without a signer; skipping");
+        return;
+    };
     for (target_shard, sections) in pushes {
         let recipients = shard_recipients
             .get(&target_shard)
@@ -206,11 +210,12 @@ pub fn push_crossing_readings<S, N>(
                 &CrossingReadingsSenderMessage::new(target_shard, &claims),
                 ctx.topology_snapshot.network(),
             );
-            let Ok(sig) = ctx.signer.sign(&msg) else {
+            let Ok(sig) = signing.key.sign(&msg) else {
                 tracing::error!("cannot sign crossing readings push; skipping");
                 return;
             };
-            let notification = CrossingReadingsNotification::new(claims, target_shard, ctx.me, sig);
+            let notification =
+                CrossingReadingsNotification::new(claims, target_shard, signing.me, sig);
             ctx.network.notify(recipients, &notification);
         }
     }

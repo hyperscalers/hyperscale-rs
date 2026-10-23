@@ -104,7 +104,7 @@ mod vote_keeper;
 mod vote_set;
 
 pub use config::ShardConsensusConfig;
-pub use coordinator::{ShardCoordinator, ShardMemoryStats, ShardStats};
+pub use coordinator::{ShardCoordinator, ShardMemoryStats, ShardStats, SignerPosition};
 pub use hyperscale_types::SettledTxSet;
 pub use proposal::{ProposalAsk, ProposalInputs};
 pub use verification::{ReadyStateRootVerification, committed_cells_for};

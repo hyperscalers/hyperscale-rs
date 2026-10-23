@@ -13,7 +13,7 @@ use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{FinalizationHash, Hash, ShardId, TopologySchedule, TxHash, ValidatorId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
-    ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT, Arc::new(AllCodeRuns))
+    ExecutionCoordinator::new([ValidatorId::new(0)], ShardId::ROOT, Arc::new(AllCodeRuns))
 }
 
 fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySchedule) {
