@@ -3058,11 +3058,18 @@ mod tests {
         );
 
         let live = fix.topology(BTreeMap::from([(SHARD, vec![id(0), id(1)])]));
+        let (folded, held) = host.process.folded_schedule();
+        let (_, newest) = held.retained_epochs().expect("the host holds a schedule");
+        let epoch = folded.next();
         host.beacon.process_action(
             BeaconOwner::Fold,
             Action::TopologyChanged {
-                epoch: Epoch::new(1),
-                schedule: Arc::new(TopologySchedule::single(Arc::new(live))),
+                epoch,
+                schedule: Arc::new(TopologySchedule::new(
+                    fix.genesis_state().chain_config.epoch_duration_ms,
+                    newest.next(),
+                    Arc::new(live),
+                )),
             },
         );
         assert_eq!(
