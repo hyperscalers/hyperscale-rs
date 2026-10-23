@@ -1,14 +1,14 @@
 //! The answers a voter holds its consumer chain to, per producer route:
 //! a count at a committed height, the deltas of the committed blocks no
-//! persist has reached, and the deltas of the pending ones.
+//! persist has reached, and the deltas of the uncommitted ones.
 //!
 //! Nothing attests the count in a header, so the count behind a block
 //! is rebuilt from the frontier over every delta between them. A block
-//! whose delta this voter never measured, a sync commit or one that
-//! committed on its certificate before its check here completed, leaves
-//! a hole the frontier cannot pass. A persist carrying the count its
-//! shard loop read at a block this voter committed re-bases the frontier
-//! on it, which closes a hole and re-anchors the count on the store.
+//! whose delta this voter never measured, one that committed before its
+//! state-root check here completed, leaves a hole the frontier cannot
+//! pass. A persist carrying the count its shard loop read at a block
+//! this voter committed re-bases the frontier on it, which closes a hole
+//! and re-anchors the count on the store.
 //!
 //! A count never honestly falls below zero: every delta is measured
 //! against the parent its block commits on, and every frontier is read
@@ -26,7 +26,7 @@ use tracing::warn;
 pub struct HeldAnswers {
     /// The count at a committed height.
     frontier: Option<(BlockHeight, StandingAnswers)>,
-    /// The delta each pending block measured, and what it adds, by
+    /// The delta each uncommitted block measured, and what it adds, by
     /// block.
     pending: HashMap<BlockHash, (AnswerDelta, AnswerAdditions)>,
     /// The committed blocks above the newest persist and above the
@@ -49,13 +49,13 @@ impl HeldAnswers {
         self.pending.insert(block, (delta, additions));
     }
 
-    /// What pending `block` adds, where this voter measured it.
+    /// What uncommitted `block` adds, where this voter measured it.
     pub fn additions(&self, block: BlockHash) -> Option<&AnswerAdditions> {
         self.pending.get(&block).map(|(_, additions)| additions)
     }
 
-    /// Keep the pending deltas of the blocks `keep` names.
-    pub fn retain_pending(&mut self, keep: impl Fn(BlockHash) -> bool) {
+    /// Keep the uncommitted deltas of the blocks `keep` names.
+    pub fn retain(&mut self, keep: impl Fn(BlockHash) -> bool) {
         self.pending.retain(|block, _| keep(*block));
     }
 
