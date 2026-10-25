@@ -1,0 +1,196 @@
+//! The library front door: hosts started through `Node::start` alone, as an
+//! embedder starts them. Each host's address is fixed before it starts (a
+//! chosen port, and on iroh a chosen key), so the second host can be pointed at
+//! the first without reaching into the transport.
+
+use std::net::UdpSocket;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use hyperscale_dispatch_pooled::ThreadPoolConfig;
+use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
+use hyperscale_mempool::MempoolConfig;
+use hyperscale_production::{LocalValidator, Node, NodeError, NodeSetup};
+use hyperscale_provisions::ProvisionConfig;
+use hyperscale_shard::ShardConsensusConfig;
+use hyperscale_storage_rocksdb::RocksDbConfig;
+use hyperscale_types::{BeaconChainConfig, ValidatorId};
+use serial_test::serial;
+use tempfile::TempDir;
+use tokio::time::{sleep, timeout};
+use tracing_subscriber::fmt;
+
+/// How long a fresh four-validator network gets to commit its first blocks.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The height every hosted validator must reach.
+const TARGET_HEIGHT: u64 = 3;
+
+/// A localhost QUIC port nothing holds right now.
+fn free_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("bind a free port")
+        .port()
+}
+
+/// Where a host listens and what another host dials to reach it.
+#[cfg(feature = "iroh")]
+mod net {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    pub use hyperscale_network_iroh::test_utils::TestFixtures;
+    use hyperscale_network_iroh::{EndpointAddr, IrohConfig, SecretKey};
+
+    pub struct Listen {
+        key: SecretKey,
+        at: SocketAddr,
+    }
+    pub type Dial = EndpointAddr;
+
+    pub fn listen(port: u16) -> Listen {
+        Listen {
+            key: SecretKey::generate(),
+            at: (Ipv4Addr::LOCALHOST, port).into(),
+        }
+    }
+
+    pub fn dial(listen: &Listen) -> Dial {
+        EndpointAddr::new(listen.key.public()).with_ip_addr(listen.at)
+    }
+
+    pub fn config(listen: Listen, bootstrap_peers: Vec<Dial>) -> IrohConfig {
+        IrohConfig {
+            bootstrap_peers,
+            ..IrohConfig::for_testing(listen.key, listen.at)
+        }
+    }
+}
+
+/// Where a host listens and what another host dials to reach it.
+#[cfg(not(feature = "iroh"))]
+mod net {
+    use hyperscale_network_libp2p::Libp2pConfig;
+    pub use hyperscale_network_libp2p::test_utils::TestFixtures;
+    use libp2p::Multiaddr;
+
+    pub type Listen = Multiaddr;
+    pub type Dial = Multiaddr;
+
+    pub fn listen(port: u16) -> Listen {
+        format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+            .parse()
+            .expect("a QUIC multiaddr")
+    }
+
+    pub fn dial(listen: &Listen) -> Dial {
+        listen.clone()
+    }
+
+    pub fn config(listen: Listen, bootstrap_peers: Vec<Dial>) -> Libp2pConfig {
+        Libp2pConfig {
+            listen_addresses: vec![listen],
+            bootstrap_peers,
+            ..Default::default()
+        }
+    }
+}
+
+use net::{Dial, Listen, TestFixtures};
+
+fn setup(
+    data_dir: &Path,
+    fixtures: &TestFixtures,
+    validators: &[u32],
+    listen: Listen,
+    bootstrap_peers: Vec<Dial>,
+) -> NodeSetup {
+    NodeSetup {
+        data_dir: data_dir.to_path_buf(),
+        validators: validators
+            .iter()
+            .map(|&i| LocalValidator {
+                validator_id: ValidatorId::new(u64::from(i)),
+                signer: fixtures.signer(i),
+            })
+            .collect(),
+        genesis: fixtures.genesis_validators(),
+        engine_genesis: EngineGenesisConfig::default(),
+        // The network starts now, as a fresh testnet's genesis does.
+        beacon_chain: BeaconChainConfig {
+            genesis_timestamp_ms: now_ms(),
+            ..BeaconChainConfig::default()
+        },
+        shard_consensus: ShardConsensusConfig::default(),
+        mempool: MempoolConfig::default(),
+        provisions: ProvisionConfig::default(),
+        transport: net::config(listen, bootstrap_peers),
+        threads: ThreadPoolConfig::minimal(),
+        storage: RocksDbConfig::default(),
+    }
+}
+
+fn now_ms() -> u64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after 1970");
+    u64::try_from(since.as_millis()).expect("milliseconds fit u64")
+}
+
+/// The lowest height any of the node's hosted validators has committed.
+fn lowest_height(node: &Node) -> Option<u64> {
+    let status = node.status().load_full();
+    status.vnodes.iter().map(|v| v.block_height).min()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn two_co_hosted_nodes_commit() {
+    let _ = fmt().with_test_writer().try_init();
+    let fixtures = TestFixtures::new(11, 4);
+    let (dir0, dir1) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let listen0 = net::listen(free_port());
+    let dial0 = net::dial(&listen0);
+
+    let node0 =
+        Node::start(setup(dir0.path(), &fixtures, &[0, 1], listen0, vec![])).expect("start host 0");
+    let node1 = Node::start(setup(
+        dir1.path(),
+        &fixtures,
+        &[2, 3],
+        net::listen(free_port()),
+        vec![dial0],
+    ))
+    .expect("start host 1");
+
+    timeout(COMMIT_TIMEOUT, async {
+        loop {
+            let heights = (lowest_height(&node0), lowest_height(&node1));
+            if let (Some(h0), Some(h1)) = heights
+                && h0 >= TARGET_HEIGHT
+                && h1 >= TARGET_HEIGHT
+            {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("every co-hosted validator reaches the target height");
+
+    node0.stop().await.expect("host 0 stops cleanly");
+    node1.stop().await.expect("host 1 stops cleanly");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_current_thread_runtime_is_refused() {
+    let fixtures = TestFixtures::new(11, 4);
+    let dir = TempDir::new().unwrap();
+    let started = Node::start(setup(
+        dir.path(),
+        &fixtures,
+        &[0],
+        net::listen(free_port()),
+        vec![],
+    ));
+    assert!(matches!(started, Err(NodeError::Runtime)));
+}

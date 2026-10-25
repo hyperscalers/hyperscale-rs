@@ -45,12 +45,14 @@
 //! [`PooledDispatch`]: hyperscale_dispatch_pooled::PooledDispatch
 
 mod bootstrap;
+mod node;
 pub mod rpc;
 mod runner;
 mod status;
 mod supervisor;
 mod telemetry;
 pub mod transport;
+pub use node::{Node, NodeError, NodeSetup};
 pub use runner::{LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, VnodeConfig};
 pub use status::SyncStatus;
 pub use supervisor::{ShardCommand, StorageDirResolver, StorageFactory, shard_data_dir};

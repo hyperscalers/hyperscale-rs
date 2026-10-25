@@ -53,32 +53,26 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, bail};
-use arc_swap::ArcSwap;
 use clap::Parser;
 use hex::{decode as hex_decode, encode as hex_encode};
 use hyperscale_crypto_bls::BlsSigner;
-use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
+use hyperscale_dispatch_pooled::ThreadPoolConfig;
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
+use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::transport::VersionInteroperabilityMode;
 use hyperscale_production::{
-    LocalValidator, ProductionRunner, StorageDirResolver, StorageFactory, SyncStatus,
-    TelemetryConfig, TelemetryGuard, init_telemetry, shard_data_dir,
+    LocalValidator, Node, NodeSetup, TelemetryConfig, TelemetryGuard, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::BeaconStorage;
-use hyperscale_storage_rocksdb::{
-    CompressionType as RocksCompressionType, RocksDbBeaconStorage, RocksDbConfig,
-    RocksDbShardStorage,
-};
+use hyperscale_storage_rocksdb::{CompressionType as RocksCompressionType, RocksDbConfig};
 use hyperscale_types::{
     Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition,
-    PrincipalAddr, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet, shard_prefix_path,
+    PrincipalAddr, Signer, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use serde::Deserialize;
-use tokio::runtime::{Builder as RuntimeBuilder, Handle as TokioHandle};
+use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tokio::task::spawn;
 use toml::from_str as toml_from_str;
@@ -914,40 +908,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let beacon_chain_config = BeaconChainConfig::production();
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
-    let dispatch = Arc::new(
-        PooledDispatch::new(thread_config, TokioHandle::current())
-            .context("Failed to initialize thread pools")?,
-    );
-
-    let dir_data_dir = config.node.data_dir.clone();
-    let storage_dir: StorageDirResolver =
-        Arc::new(move |shard: ShardId| shard_data_dir(&dir_data_dir, shard));
-
-    // Opens a shard's storage when the runner seats this host on it — a
-    // beacon-derived startup seat or a runtime placement change — at one
-    // directory convention so a restart reopens what an earlier seat created.
-    // The runner derives which shards to open from the committed beacon
-    // state, so the host opens none up front.
-    let factory_rocksdb_config = rocksdb_config.clone();
-    let storage_factory: StorageFactory = Arc::new(move |shard_dir: &Path, shard: ShardId| {
-        RocksDbShardStorage::open_with_config(
-            shard_dir,
-            &factory_rocksdb_config,
-            shard_prefix_path(shard),
-        )
-        .map(Arc::new)
-        .map_err(|e| format!("failed to open database at {}: {e:?}", shard_dir.display()))
-    });
-
-    // Process-level beacon storage, shared across the beacon loop's fold
-    // and participants. One DB under `{data_dir}/beacon/db`.
-    let beacon_db_path = config.node.data_dir.join("beacon").join("db");
-    let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(
-        RocksDbBeaconStorage::open_with_config(&beacon_db_path, &rocksdb_config)
-            .with_context(|| format!("Failed to open beacon DB at {}", beacon_db_path.display()))?,
-    );
-    info!(path = %beacon_db_path.display(), "Beacon storage opened");
-
     // Pass 1: load every hosted vnode's signing keypair so the topology builder
     // can substitute trusted local public keys for genesis-hex pubkeys.
     // Ordered Vec — single-validator mode picks the first entry, so source
@@ -984,51 +944,23 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         })
         .collect();
 
-    // Shared RPC state objects used by both runner and RPC server. ArcSwap gives
-    // HTTP handlers lock-free reads. Per-vnode entries are filled in by the
-    // runner's first status tick; until then `vnodes` is empty.
-    let rpc_ready = Arc::new(AtomicBool::new(false));
-    let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
-    // `num_shards` is published by the runner from the live topology on each
-    // status tick; it starts at the default until the first tick.
-    let rpc_node_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default())));
-    let rpc_mempool_snapshot = Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default())));
-
-    // The runner is built before the RPC server because it owns the crossbeam
-    // event channel the RPC server submits transactions through.
-    let mut runner_builder = ProductionRunner::builder(
+    let mut node = Node::start(NodeSetup {
+        data_dir: config.node.data_dir.clone(),
         validators,
-        genesis_validators,
-        shard_config,
-        beacon_storage,
-        network_config,
-        storage_factory,
-        storage_dir,
-    )
-    .dispatch(dispatch)
-    .rpc_status(rpc_node_status.clone())
-    .mempool_snapshot(rpc_mempool_snapshot.clone())
-    .sync_status(rpc_sync_status.clone())
-    .mempool_config(config.mempool.clone())
-    .provision_config(config.provisions)
-    .beacon_chain_config(beacon_chain_config);
+        genesis: genesis_validators,
+        engine_genesis: build_engine_genesis_config(&config.genesis)
+            .context("Failed to parse genesis configuration")?,
+        beacon_chain: beacon_chain_config,
+        shard_consensus: shard_config,
+        mempool: config.mempool.clone(),
+        provisions: config.provisions,
+        transport: network_config,
+        threads: thread_config,
+        storage: rocksdb_config,
+    })
+    .context("Failed to start the node")?;
 
-    if !config.genesis.accounts.is_empty() {
-        let engine_genesis = build_engine_genesis_config(&config.genesis)
-            .context("Failed to parse genesis configuration")?;
-        runner_builder = runner_builder.genesis_config(engine_genesis);
-    }
-
-    let mut runner = runner_builder
-        .build()
-        .context("Failed to create production runner")?;
-
-    // RPC-submitted transactions flow through this channel: gossip to all
-    // relevant shards, validate via the shared batcher, dispatch to mempool.
-    let tx_submission_sender = runner.tx_submission_sender();
-    let preview_sender = runner.preview_sender();
-    let rpc_tx_status = runner.tx_status_cache();
-
+    let rpc_ready = Arc::new(AtomicBool::new(false));
     let rpc_handle = if config.metrics.enabled {
         let rpc_config = RpcServerConfig {
             listen_addr: config.metrics.listen_addr.parse().with_context(|| {
@@ -1044,12 +976,12 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         let rpc_server = RpcServer::with_state(
             rpc_config,
             rpc_ready.clone(),
-            rpc_sync_status,
-            rpc_node_status.clone(),
-            tx_submission_sender,
-            preview_sender,
-            rpc_tx_status,
-            rpc_mempool_snapshot,
+            node.sync_status(),
+            node.status(),
+            node.submit(),
+            node.preview(),
+            node.tx_status(),
+            node.mempool(),
         );
         let handle = rpc_server
             .start()
@@ -1061,7 +993,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         None
     };
 
-    let shutdown_handle = runner.shutdown_handle();
+    let shutdown_handle = node.take_shutdown();
 
     spawn(async move {
         let ctrl_c = async {
@@ -1098,7 +1030,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     info!("Validator node started, press Ctrl+C to stop");
 
-    if let Err(e) = runner.run().await {
+    if let Err(e) = node.finished().await {
         bail!("Runner error: {e}");
     }
 
