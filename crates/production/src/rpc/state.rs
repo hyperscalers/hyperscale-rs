@@ -11,7 +11,7 @@ use hyperscale_node::TxStatusCache;
 use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, TxsInFlight};
 use serde::{Deserialize, Serialize};
 
-use crate::observe::HeaderRing;
+use crate::observe::{HeaderRing, Importing, Observations};
 use crate::status::SyncStatus;
 
 /// Shared RPC state publishers — whole-value `ArcSwap`s the runner and
@@ -28,6 +28,11 @@ pub struct RpcPublishers {
     /// The last hour of certified headers per shard, kept by the beacon
     /// thread.
     pub headers: Arc<HeaderRing>,
+    /// What the beacon thread has seen, published after each step that
+    /// changed it.
+    pub observations: Observations,
+    /// Bytes staged by each snap-sync import in progress.
+    pub importing: Arc<Importing>,
 }
 
 /// Submit a locally-issued transaction to the runner.

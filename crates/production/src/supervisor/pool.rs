@@ -33,6 +33,8 @@ impl ShardSupervisor {
             participation_tx: self.participation_tx.clone(),
             genesis_offset_ms: self.genesis_offset_ms,
             headers: Arc::clone(&self.publishers.headers),
+            observations: self.publishers.observations.clone(),
+            genesis: self.beacon_config_hash,
         };
         let join = spawn_beacon_loop(beacon, cfg, exited);
         self.beacon = Some(BeaconThread { join, shutdown_tx });

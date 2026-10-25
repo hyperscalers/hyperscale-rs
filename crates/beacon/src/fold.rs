@@ -69,6 +69,8 @@ pub struct HostedChain {
 /// What one adoption produced: the slot effects the fold returned, for
 /// the participants' own reading, and the fold's own actions.
 pub struct Adopted {
+    /// The epoch the block folded.
+    pub epoch: Epoch,
     /// What the epoch's fold settled, for each participant to read.
     pub effects: SlotEffects,
     /// The fold's own actions: the commit, the topology and the witness
@@ -583,7 +585,8 @@ impl BeaconFold {
     /// epoch reaches here, and the first to arrive is the one that
     /// folds it, so `apply_epoch` never sees a regression.
     pub fn adopt(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Option<Adopted> {
-        if block.epoch() != self.state.current_epoch.next() {
+        let epoch = block.epoch();
+        if epoch != self.state.current_epoch.next() {
             return None;
         }
         // The sets governing the epoch being adopted, captured before
@@ -661,7 +664,11 @@ impl BeaconFold {
         // contribution can't include them and the runner's slot should
         // free rather than pin on a payload the tracker would only evict.
         actions.extend(abandon_witnesses(abandoned_witness_ids));
-        Some(Adopted { effects, actions })
+        Some(Adopted {
+            epoch,
+            effects,
+            actions,
+        })
     }
 
     /// The oldest committee anchor a hosted chain still keys schedule

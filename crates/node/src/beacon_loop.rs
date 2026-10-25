@@ -46,7 +46,7 @@ use hyperscale_types::{
     BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
     BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlockHeader, Epoch,
     GenesisConfigHash, LeafIndex, LocalTimestamp, MessageClass, NetworkDefinition, ShardId,
-    ShardVoteEquivocation, Signer, TopologySchedule, TopologySnapshot, ValidatorId,
+    ShardVoteEquivocation, Signer, SlotEffects, TopologySchedule, TopologySnapshot, ValidatorId,
     ValidatorStatus, Verifiable, Verified, Verifier, Verify, verify_shard_vote_equivocation,
 };
 use tracing::warn;
@@ -101,6 +101,11 @@ where
     /// ([`Self::take_admitted`]). Cleared at step entry, so a host that never
     /// drains it holds one step's worth at most.
     pending_admitted: Vec<Arc<Verified<CertifiedBlockHeader>>>,
+
+    /// Per-step scratch: each epoch adopted this step with what its fold
+    /// settled, in the order the epochs folded ([`Self::take_adopted`]).
+    /// Cleared at step entry like [`Self::pending_admitted`].
+    pending_adopted: Vec<(Epoch, SlotEffects)>,
 
     /// Per-step scratch: timer operations, each owned by the participant
     /// that armed it or by the loop for its fetch tick.
@@ -165,6 +170,7 @@ where
             now,
             pending_participation_changes: Vec::new(),
             pending_admitted: Vec::new(),
+            pending_adopted: Vec::new(),
             pending_timer_ops: Vec::new(),
             actions_generated: 0,
             beacon_block,
@@ -328,6 +334,7 @@ where
     pub(crate) fn clear_scratch(&mut self) {
         self.pending_participation_changes.clear();
         self.pending_admitted.clear();
+        self.pending_adopted.clear();
         self.pending_timer_ops.clear();
         self.actions_generated = 0;
     }
@@ -350,6 +357,18 @@ where
     /// after each step to keep its header summaries.
     pub fn take_admitted(&mut self) -> Vec<Arc<Verified<CertifiedBlockHeader>>> {
         std::mem::take(&mut self.pending_admitted)
+    }
+
+    /// The epochs adopted since the last step began, each with what its fold
+    /// settled, oldest first, emptying the scratch.
+    pub fn take_adopted(&mut self) -> Vec<(Epoch, SlotEffects)> {
+        std::mem::take(&mut self.pending_adopted)
+    }
+
+    /// The fold's latest committed beacon state.
+    #[must_use]
+    pub const fn beacon_state(&self) -> &BeaconState {
+        self.fold.state()
     }
 
     /// The topology schedule the fold keeps: every retained epoch's
@@ -720,7 +739,14 @@ where
     /// A participant's commit-proof asks last one epoch, so the routes of
     /// the asks no participant still holds go with them.
     fn settle(&mut self, adopted: Adopted) {
-        let Adopted { effects, actions } = adopted;
+        let Adopted {
+            epoch,
+            effects,
+            actions,
+        } = adopted;
+        // Recorded before the participants run: driving them can adopt the
+        // next epoch, which must record after this one.
+        self.pending_adopted.push((epoch, effects.clone()));
         self.run_fold_actions(actions);
         self.refresh_committee_flag();
         let actions = self.fold.redrive_terminal_witness_fetches();

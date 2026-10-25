@@ -2,20 +2,155 @@
 //!
 //! Every certified header a chain loop reports to the beacon thread, its own
 //! shard's or a remote one's, is summarised once against the committee that
-//! signed it and kept for an hour. The beacon thread writes; readers take a
-//! copy under the lock.
+//! signed it and kept for an hour. Every epoch the fold adopts is kept with
+//! what it settled. After each step that changed either, the beacon thread
+//! publishes an [`Observation`] on a watch channel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlockHeader, ProposerTimestamp, Round, ScheduleLookup,
-    ShardId, ShardWitnessPayload, TopologySchedule, ValidatorId, Verified, WeightedTimestamp,
-    missed_proposals_since_prev_commit,
+    BeaconState, BlockHash, BlockHeight, CertifiedBlockHeader, Epoch, GenesisConfigHash,
+    ProposerTimestamp, Round, ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects,
+    TopologySchedule, ValidatorId, Verified, WeightedTimestamp, missed_proposals_since_prev_commit,
 };
+use tokio::sync::watch;
 
 /// How far behind a shard's newest header the ring keeps its older ones.
 const KEPT_MS: u64 = 60 * 60 * 1000;
+
+/// How many adopted epochs' effects an observation carries: a day of
+/// five-minute epochs.
+const EFFECTS_KEPT: usize = 288;
+
+/// The channel observations are published on; `None` until the beacon
+/// thread's first publish.
+pub type Observations = watch::Sender<Option<Arc<Observation>>>;
+
+/// Everything the host's beacon thread has seen, as of one step.
+#[derive(Debug)]
+pub struct Observation {
+    /// The genesis this host's network started from.
+    pub genesis: GenesisConfigHash,
+    /// The latest committed beacon state.
+    pub beacon: Arc<BeaconState>,
+    /// The newest certified header kept for each shard. A host that hosts
+    /// no shard admits no headers and has none.
+    pub tips: BTreeMap<ShardId, HeaderSummary>,
+    /// The epochs adopted since the host started, the last day of them,
+    /// oldest first, each with what its fold settled: the registrations,
+    /// jailings, readies and committee moves the beacon applied. Epochs
+    /// adopted before a restart and not adopted again after it are absent.
+    pub effects: Arc<VecDeque<(Epoch, Arc<SlotEffects>)>>,
+}
+
+/// The bytes each shard's snap-sync import has staged so far, while it
+/// runs. A shard's entry appears with its first round and leaves when the
+/// import ends, however it ends.
+#[derive(Debug, Default)]
+pub struct Importing {
+    shards: Mutex<BTreeMap<ShardId, u64>>,
+}
+
+impl Importing {
+    /// Every import in progress, with the bytes it has staged.
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<ShardId, u64> {
+        self.lock().clone()
+    }
+
+    /// The gauge one import of `shard` reports through.
+    pub fn gauge(self: &Arc<Self>, shard: ShardId) -> ImportGauge {
+        ImportGauge {
+            importing: Arc::clone(self),
+            shard,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<ShardId, u64>> {
+        self.shards.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One import's report into [`Importing`]; its shard's entry goes when the
+/// gauge does.
+pub struct ImportGauge {
+    importing: Arc<Importing>,
+    shard: ShardId,
+}
+
+impl ImportGauge {
+    pub fn record(&self, staged_bytes: u64) {
+        self.importing.lock().insert(self.shard, staged_bytes);
+    }
+}
+
+impl Drop for ImportGauge {
+    fn drop(&mut self) {
+        self.importing.lock().remove(&self.shard);
+    }
+}
+
+/// The beacon thread's half: folds each step's adopted epochs and reported
+/// headers in and publishes when anything changed.
+pub struct Observer {
+    genesis: GenesisConfigHash,
+    headers: Arc<HeaderRing>,
+    observations: Observations,
+    effects: VecDeque<(Epoch, Arc<SlotEffects>)>,
+    beacon: Option<Arc<BeaconState>>,
+}
+
+impl Observer {
+    pub const fn new(
+        genesis: GenesisConfigHash,
+        headers: Arc<HeaderRing>,
+        observations: Observations,
+    ) -> Self {
+        Self {
+            genesis,
+            headers,
+            observations,
+            effects: VecDeque::new(),
+            beacon: None,
+        }
+    }
+
+    /// Take in one step's adopted epochs and reported headers, and publish
+    /// if they changed anything, or on the first step.
+    pub fn step(
+        &mut self,
+        adopted: Vec<(Epoch, SlotEffects)>,
+        admitted: Vec<Arc<Verified<CertifiedBlockHeader>>>,
+        state: &BeaconState,
+        schedule: &TopologySchedule,
+    ) {
+        let first = self.beacon.is_none();
+        if adopted.is_empty() && admitted.is_empty() && !first {
+            return;
+        }
+        if first || !adopted.is_empty() {
+            self.beacon = Some(Arc::new(state.clone()));
+        }
+        for (epoch, effects) in adopted {
+            self.effects.push_back((epoch, Arc::new(effects)));
+        }
+        while self.effects.len() > EFFECTS_KEPT {
+            self.effects.pop_front();
+        }
+        self.headers.admit(admitted, schedule);
+        let observation = Observation {
+            genesis: self.genesis,
+            beacon: self
+                .beacon
+                .clone()
+                .unwrap_or_else(|| Arc::new(state.clone())),
+            tips: self.headers.tips(),
+            effects: Arc::new(self.effects.clone()),
+        };
+        self.observations.send_replace(Some(Arc::new(observation)));
+    }
+}
 
 /// One certified header: who proposed it, whose votes its certificate
 /// carries, and whose turns failed before it.
@@ -66,10 +201,22 @@ impl HeaderRing {
         })
     }
 
+    /// The newest kept header of every shard.
+    #[must_use]
+    pub fn tips(&self) -> BTreeMap<ShardId, HeaderSummary> {
+        self.lock()
+            .iter()
+            .filter_map(|(shard, kept)| {
+                kept.last_key_value()
+                    .map(|(_, summary)| (*shard, summary.clone()))
+            })
+            .collect()
+    }
+
     /// Summarise and keep each reported header. A header already kept for
     /// its block keeps its first summary; a different block at a kept
     /// height replaces it.
-    pub(crate) fn admit(
+    pub fn admit(
         &self,
         headers: Vec<Arc<Verified<CertifiedBlockHeader>>>,
         schedule: &TopologySchedule,
@@ -256,6 +403,17 @@ mod tests {
             kept[0].signers,
             Some(vec![members[0], members[1], members[2]])
         );
+    }
+
+    #[test]
+    fn an_import_leaves_when_its_gauge_goes() {
+        let importing = Arc::new(Importing::default());
+        let gauge = importing.gauge(ROOT);
+        gauge.record(10);
+        gauge.record(25);
+        assert_eq!(importing.snapshot().get(&ROOT), Some(&25));
+        drop(gauge);
+        assert!(importing.snapshot().is_empty());
     }
 
     #[test]
