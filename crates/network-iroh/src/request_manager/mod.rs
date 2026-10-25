@@ -73,38 +73,6 @@ pub const fn is_cross_shard(class: MessageClass) -> bool {
     matches!(class, MessageClass::CrossShardProgress)
 }
 
-#[cfg(test)]
-mod retry_regime_tests {
-    use hyperscale_types::MessageClass;
-
-    use super::uses_relaxed_retry;
-
-    #[test]
-    fn consensus_uses_tight_retry() {
-        assert!(!uses_relaxed_retry(MessageClass::Consensus));
-    }
-
-    #[test]
-    fn block_completion_uses_tight_retry() {
-        assert!(!uses_relaxed_retry(MessageClass::BlockCompletion));
-    }
-
-    #[test]
-    fn cross_shard_progress_uses_tight_retry() {
-        assert!(!uses_relaxed_retry(MessageClass::CrossShardProgress));
-    }
-
-    #[test]
-    fn recovery_uses_relaxed_retry() {
-        assert!(uses_relaxed_retry(MessageClass::Recovery));
-    }
-
-    #[test]
-    fn bulk_uses_relaxed_retry() {
-        assert!(uses_relaxed_retry(MessageClass::Bulk));
-    }
-}
-
 /// Configuration for the request manager.
 #[derive(Debug, Clone)]
 pub struct RequestManagerConfig {
@@ -291,5 +259,37 @@ impl RequestManager {
     pub(crate) fn record_invalid(&self, peer: EndpointId) {
         let now = self.now();
         self.health.lock().record_invalid(peer, now);
+    }
+}
+
+#[cfg(test)]
+mod retry_regime_tests {
+    use hyperscale_types::MessageClass;
+
+    use super::uses_relaxed_retry;
+
+    #[test]
+    fn consensus_uses_tight_retry() {
+        assert!(!uses_relaxed_retry(MessageClass::Consensus));
+    }
+
+    #[test]
+    fn block_completion_uses_tight_retry() {
+        assert!(!uses_relaxed_retry(MessageClass::BlockCompletion));
+    }
+
+    #[test]
+    fn cross_shard_progress_uses_tight_retry() {
+        assert!(!uses_relaxed_retry(MessageClass::CrossShardProgress));
+    }
+
+    #[test]
+    fn recovery_uses_relaxed_retry() {
+        assert!(uses_relaxed_retry(MessageClass::Recovery));
+    }
+
+    #[test]
+    fn bulk_uses_relaxed_retry() {
+        assert!(uses_relaxed_retry(MessageClass::Bulk));
     }
 }

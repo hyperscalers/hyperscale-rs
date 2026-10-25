@@ -260,7 +260,7 @@ proptest! {
         prop_assert!(result.is_err());
     }
 
-    /// Tampering a value_hash in a leaf claim must break verify.
+    /// Tampering a `value_hash` in a leaf claim must break verify.
     #[test]
     fn tampered_value_rejected(
         entries in non_empty_entries(),
