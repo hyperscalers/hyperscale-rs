@@ -44,7 +44,16 @@ pub struct Observation {
     pub effects: Arc<VecDeque<(Epoch, Arc<SlotEffects>)>>,
     /// What the beacon's own rules say about `beacon`.
     pub answers: Arc<Answers>,
+    /// For each shard in `tips`, the consensus committee its tip's child is
+    /// proposed under, in turn order, resolved at the tip's anchor as the
+    /// shard itself resolves it. A shard switches committees by its chain's
+    /// anchor, not when the beacon adopts an epoch. Absent while this host's
+    /// schedule no longer holds the window.
+    pub proposing: BTreeMap<ShardId, Vec<ValidatorId>>,
 }
+
+type Tips = BTreeMap<ShardId, HeaderSummary>;
+type Proposing = BTreeMap<ShardId, Vec<ValidatorId>>;
 
 /// Answers the beacon's rules give on one committed state.
 ///
@@ -57,6 +66,11 @@ pub struct Answers {
     pub rotation_order: BTreeMap<ShardId, Vec<ValidatorId>>,
     /// The next epoch the shuffle runs at.
     pub next_shuffle_epoch: Epoch,
+    /// Whether the beacon-eligible set is at its floor, where the shuffle
+    /// holds every rotation and eligible members are spared liveness jails.
+    /// The shuffle reads it partway through its boundary's fold, so this is
+    /// as of `beacon`, not a promise for the boundary.
+    pub beacon_at_floor: bool,
 }
 
 impl Answers {
@@ -68,6 +82,7 @@ impl Answers {
                 .map(|&shard| (shard, state.rotation_order(shard)))
                 .collect(),
             next_shuffle_epoch: state.next_shuffle_epoch(),
+            beacon_at_floor: state.beacon_at_floor(),
         }
     }
 }
@@ -171,12 +186,14 @@ impl Observer {
             self.effects.pop_front();
         }
         self.headers.admit(admitted, schedule);
+        let (tips, proposing) = self.headers.tips(schedule);
         let observation = Observation {
             genesis: self.genesis,
             beacon,
-            tips: self.headers.tips(),
+            tips,
             effects: Arc::new(self.effects.clone()),
             answers,
+            proposing,
         };
         self.observations.send_replace(Some(Arc::new(observation)));
     }
@@ -211,15 +228,19 @@ pub struct HeaderSummary {
     /// The shard's state size behind this block's parent, as the block
     /// attests it. `None` across a halt recovery's unresolved suffix.
     pub substate_bytes: Option<u64>,
-    /// This header's parent-QC timestamp: the anchor its child's committee
-    /// resolves by.
+}
+
+/// A kept summary beside its header's parent-QC timestamp, the anchor its
+/// child's committee resolves by.
+struct Kept {
+    summary: HeaderSummary,
     anchor: WeightedTimestamp,
 }
 
 /// The last hour of certified headers per shard, keyed by height.
 #[derive(Default)]
 pub struct HeaderRing {
-    shards: Mutex<BTreeMap<ShardId, BTreeMap<BlockHeight, HeaderSummary>>>,
+    shards: Mutex<BTreeMap<ShardId, BTreeMap<BlockHeight, Kept>>>,
 }
 
 impl HeaderRing {
@@ -227,20 +248,32 @@ impl HeaderRing {
     #[must_use]
     pub fn since(&self, shard: ShardId, since: BlockHeight) -> Vec<HeaderSummary> {
         self.lock().get(&shard).map_or_else(Vec::new, |kept| {
-            kept.range(since..).map(|(_, s)| s.clone()).collect()
+            kept.range(since..)
+                .map(|(_, k)| k.summary.clone())
+                .collect()
         })
     }
 
-    /// The newest kept header of every shard.
-    #[must_use]
-    pub fn tips(&self) -> BTreeMap<ShardId, HeaderSummary> {
-        self.lock()
-            .iter()
-            .filter_map(|(shard, kept)| {
-                kept.last_key_value()
-                    .map(|(_, summary)| (*shard, summary.clone()))
-            })
-            .collect()
+    /// The newest kept header of every shard, and the consensus committee
+    /// each one's child is proposed under, where `schedule` still holds it.
+    fn tips(&self, schedule: &TopologySchedule) -> (Tips, Proposing) {
+        let mut tips = BTreeMap::new();
+        let mut proposing = BTreeMap::new();
+        for (&shard, kept) in self.lock().iter() {
+            let Some((_, tip)) = kept.last_key_value() else {
+                continue;
+            };
+            tips.insert(shard, tip.summary.clone());
+            if let (ScheduleLookup::Committee(snapshot), _) =
+                schedule.lookup_for_shard(shard, tip.anchor)
+            {
+                proposing.insert(
+                    shard,
+                    snapshot.consensus_committee_for_shard(shard).to_vec(),
+                );
+            }
+        }
+        (tips, proposing)
     }
 
     /// Summarise and keep each reported header. A header already kept for
@@ -260,7 +293,7 @@ impl HeaderRing {
             let kept = shards.entry(header.shard_id()).or_default();
             if kept
                 .get(&header.height())
-                .is_some_and(|summary| summary.block == header.hash())
+                .is_some_and(|k| k.summary.block == header.hash())
             {
                 continue;
             }
@@ -268,18 +301,24 @@ impl HeaderRing {
                 .height()
                 .prev()
                 .and_then(|height| kept.get(&height))
-                .filter(|parent| parent.block == header.parent_block_hash())
+                .filter(|parent| parent.summary.block == header.parent_block_hash())
                 .map(|parent| parent.anchor);
             let summary = summarise(&certified, parent_anchor, schedule);
             let newest = summary.timestamp.as_millis();
-            kept.insert(summary.height, summary);
+            kept.insert(
+                summary.height,
+                Kept {
+                    summary,
+                    anchor: header.parent_qc().weighted_timestamp(),
+                },
+            );
             let floor = newest.saturating_sub(KEPT_MS);
-            kept.retain(|_, s| s.timestamp.as_millis() >= floor);
+            kept.retain(|_, k| k.summary.timestamp.as_millis() >= floor);
         }
         drop(shards);
     }
 
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<ShardId, BTreeMap<BlockHeight, HeaderSummary>>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<ShardId, BTreeMap<BlockHeight, Kept>>> {
         self.shards.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -331,7 +370,6 @@ fn summarise(
         signers,
         missed,
         substate_bytes: header.load().substate_bytes,
-        anchor: header.parent_qc().weighted_timestamp(),
     }
 }
 

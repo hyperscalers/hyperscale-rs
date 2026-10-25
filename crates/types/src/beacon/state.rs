@@ -33,8 +33,8 @@ use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::{DeclaredWork, PriceTable};
 
 use crate::beacon::constants::{
-    HALT_THRESHOLD_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, RECOVERY_HISTORY_DEPTH,
-    RESHAPE_READY_TTL_EPOCHS,
+    HALT_THRESHOLD_EPOCHS, JAIL_COOLDOWN_EPOCHS, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
+    POOL_BUFFER_TARGET, RECOVERY_HISTORY_DEPTH, RESHAPE_READY_TTL_EPOCHS,
 };
 use crate::beacon::genesis::BeaconChainConfig;
 use crate::beacon::params::{NetworkParams, ParamProposal};
@@ -123,6 +123,30 @@ pub struct StakePool {
 }
 
 // ─── validator types ─────────────────────────────────────────────────────────
+
+/// Why an `Unjail` witness for a validator would lift nothing, in the order
+/// the fold checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnjailRefusal {
+    /// No such validator is registered.
+    Unknown,
+    /// The validator belongs to another pool than the one lifting it.
+    OtherPool,
+    /// The validator is not jailed.
+    NotJailed,
+    /// The jail's cooldown runs until `lifts_at`; a lift folded earlier is
+    /// dropped, not deferred.
+    CoolingDown {
+        /// The first epoch whose fold can lift it.
+        lifts_at: Epoch,
+    },
+    /// The lifting pool does not exist.
+    NoPool,
+    /// The pool stands convicted.
+    Convicted,
+    /// The pool's stake supports no further active validator.
+    PoolFull,
+}
 
 /// What caused a validator to be jailed.
 ///
@@ -1482,6 +1506,45 @@ impl BeaconState {
         )
     }
 
+    /// Why an `Unjail` of `id` lifted by `pool` would lift nothing in the
+    /// fold of this state's epoch; `None` when it would return `id` to the
+    /// pool. A withholding jail lasts a recency period, which moves with the
+    /// eligible set; a performance jail the fixed cooldown.
+    #[must_use]
+    pub fn unjail_refusal(&self, id: ValidatorId, pool: StakePoolId) -> Option<UnjailRefusal> {
+        let Some(record) = self.validators.get(&id) else {
+            return Some(UnjailRefusal::Unknown);
+        };
+        if record.pool != pool {
+            return Some(UnjailRefusal::OtherPool);
+        }
+        let ValidatorStatus::Jailed {
+            since_epoch,
+            reason,
+        } = record.status
+        else {
+            return Some(UnjailRefusal::NotJailed);
+        };
+        let cooldown = match reason {
+            JailReason::Withholding => self.beacon_recency_period(),
+            JailReason::Performance => JAIL_COOLDOWN_EPOCHS,
+        };
+        let lifts_at = since_epoch.saturating_add(cooldown);
+        if self.current_epoch < lifts_at {
+            return Some(UnjailRefusal::CoolingDown { lifts_at });
+        }
+        let Some(stake_pool) = self.pools.get(&pool) else {
+            return Some(UnjailRefusal::NoPool);
+        };
+        if stake_pool.conviction.is_some() {
+            return Some(UnjailRefusal::Convicted);
+        }
+        if stake_pool.current_active_count(self) + 1 > stake_pool.max_active_count(self) {
+            return Some(UnjailRefusal::PoolFull);
+        }
+        None
+    }
+
     /// The members of `shard` a rotation may retire, the first of them next.
     ///
     /// A member is a candidate while its status holds a ready seat on
@@ -1745,6 +1808,16 @@ impl BeaconState {
     #[must_use]
     pub fn beacon_eligible_count(&self) -> usize {
         self.beacon_eligible_ids().count()
+    }
+
+    /// Whether the beacon-eligible set is at its floor,
+    /// [`MIN_BEACON_COMMITTEE_SIZE`] or under. There the shuffle holds every
+    /// shard's rotation, since an entrant seats unready and the set has no
+    /// slack to cover it, and an eligible member is spared every liveness
+    /// jail, since the committee is then the whole eligible set.
+    #[must_use]
+    pub fn beacon_at_floor(&self) -> bool {
+        self.beacon_eligible_count() <= MIN_BEACON_COMMITTEE_SIZE
     }
 
     /// The eligibility predicate behind [`Self::beacon_eligible`], in
@@ -3224,5 +3297,81 @@ mod tests {
             state.current_epoch = Epoch::new(epoch);
             assert_eq!(state.next_shuffle_epoch(), Epoch::new(next));
         }
+    }
+
+    // ─── unjail_refusal ───────────────────────────────────────────────
+
+    /// The gate names the first reason the fold would drop a lift, in the
+    /// fold's order, and nothing once every check passes.
+    #[test]
+    fn an_unjail_is_refused_for_the_first_failing_check() {
+        let mut state = single_pool_state(4);
+        let pool = StakePoolId::new(0);
+        let (jailed, seated) = (ValidatorId::new(0), ValidatorId::new(1));
+        state.validators.get_mut(&jailed).unwrap().status = ValidatorStatus::Jailed {
+            since_epoch: Epoch::new(2),
+            reason: JailReason::Performance,
+        };
+        let refusal = |state: &BeaconState| state.unjail_refusal(jailed, pool);
+
+        assert_eq!(
+            state.unjail_refusal(ValidatorId::new(99), pool),
+            Some(UnjailRefusal::Unknown)
+        );
+        assert_eq!(
+            state.unjail_refusal(jailed, StakePoolId::new(7)),
+            Some(UnjailRefusal::OtherPool)
+        );
+        assert_eq!(
+            state.unjail_refusal(seated, pool),
+            Some(UnjailRefusal::NotJailed)
+        );
+        let lifts_at = Epoch::new(2 + JAIL_COOLDOWN_EPOCHS);
+        state.current_epoch = Epoch::new(lifts_at.inner() - 1);
+        assert_eq!(
+            refusal(&state),
+            Some(UnjailRefusal::CoolingDown { lifts_at })
+        );
+
+        state.current_epoch = lifts_at;
+        let record = state.pools.remove(&pool).unwrap();
+        assert_eq!(refusal(&state), Some(UnjailRefusal::NoPool));
+        state.pools.insert(pool, record);
+        state.pools.get_mut(&pool).unwrap().conviction = Some(PoolConviction {
+            convicted_at: Epoch::new(1),
+            lifts_at: Epoch::new(99),
+        });
+        assert_eq!(refusal(&state), Some(UnjailRefusal::Convicted));
+        state.pools.get_mut(&pool).unwrap().conviction = None;
+        state.pools.get_mut(&pool).unwrap().total_stake =
+            Stake::from_quanta(3 * MIN_STAKE_FLOOR.quanta());
+        assert_eq!(refusal(&state), Some(UnjailRefusal::PoolFull));
+        state.pools.get_mut(&pool).unwrap().total_stake =
+            Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta());
+        assert_eq!(refusal(&state), None);
+    }
+
+    /// A withholding jail lasts the recency period, not the fixed cooldown.
+    #[test]
+    fn a_withholding_jail_lifts_after_the_recency_period() {
+        let mut state = single_pool_state(20);
+        let since = Epoch::new(3);
+        state
+            .validators
+            .get_mut(&ValidatorId::new(0))
+            .unwrap()
+            .status = ValidatorStatus::Jailed {
+            since_epoch: since,
+            reason: JailReason::Withholding,
+        };
+        state.current_epoch = since;
+        let period = state.beacon_recency_period();
+        assert_ne!(period, JAIL_COOLDOWN_EPOCHS);
+        assert_eq!(
+            state.unjail_refusal(ValidatorId::new(0), StakePoolId::new(0)),
+            Some(UnjailRefusal::CoolingDown {
+                lifts_at: since.saturating_add(period)
+            })
+        );
     }
 }

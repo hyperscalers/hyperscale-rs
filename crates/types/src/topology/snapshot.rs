@@ -1307,9 +1307,7 @@ impl TopologySnapshot {
             !committee.is_empty(),
             "proposer_for called with empty consensus committee for shard {shard:?}",
         );
-        let index = usize::try_from(round.inner() % committee.len() as u64)
-            .expect("modulo of usize len fits in usize");
-        committee[index]
+        committee[proposer_index(round, committee.len())]
     }
 
     // ── Node / transaction routing ───────────────────────────────────────
@@ -1410,6 +1408,29 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// The index in a consensus committee of `len` members whose turn `round`
+/// is: rounds rotate the turn member by member.
+fn proposer_index(round: Round, len: usize) -> usize {
+    usize::try_from(round.inner() % len as u64).expect("modulo of usize len fits in usize")
+}
+
+/// The rounds after `after` until `id` proposes, `None` when it is not a
+/// member of `committee`.
+///
+/// The turn order is the one [`TopologySnapshot::proposer_for`] selects in.
+/// Rounds advance on view-change timeouts too, so this counts rounds, not
+/// blocks.
+#[must_use]
+pub fn rounds_until_turn(committee: &[ValidatorId], after: Round, id: ValidatorId) -> Option<u64> {
+    let position = committee.iter().position(|member| *member == id)?;
+    (1..=committee.len() as u64).find(|ahead| {
+        proposer_index(
+            Round::new(after.inner().saturating_add(*ahead)),
+            committee.len(),
+        ) == position
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -2043,5 +2064,34 @@ mod tests {
             2,
             "a transaction spanning two shards touches both",
         );
+    }
+
+    /// The rounds until a member's turn land on the round `proposer_for`
+    /// names it in, for every member after every round of two committees.
+    #[test]
+    fn rounds_until_turn_lands_on_the_proposers_round() {
+        for size in [4, 7] {
+            let snapshot = make_snapshot(size);
+            let shard = ShardId::ROOT;
+            let committee = snapshot.consensus_committee_for_shard(shard).to_vec();
+            for after in 0..(3 * size) {
+                for &id in &committee {
+                    let ahead = rounds_until_turn(&committee, Round::new(after), id)
+                        .expect("a member has a turn");
+                    assert!((1..=size).contains(&ahead));
+                    assert_eq!(snapshot.proposer_for(shard, Round::new(after + ahead)), id);
+                    for earlier in 1..ahead {
+                        assert_ne!(
+                            snapshot.proposer_for(shard, Round::new(after + earlier)),
+                            id
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                rounds_until_turn(&committee, Round::new(0), ValidatorId::new(999)),
+                None
+            );
+        }
     }
 }
