@@ -9,13 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hyperscale_dispatch_pooled::ThreadPoolConfig;
-use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
-use hyperscale_mempool::MempoolConfig;
-use hyperscale_production::{LocalValidator, Node, NodeError, NodeSetup, Observation};
-use hyperscale_provisions::ProvisionConfig;
-use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage_rocksdb::RocksDbConfig;
+use hex::encode as hex_encode;
+use hyperscale_production::network_file::{Chain, Genesis, ValidatorEntry};
+use hyperscale_production::{LocalValidator, NetworkFile, Node, NodeError, NodeSetup, Observation};
 use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId, ValidatorId};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -99,6 +95,43 @@ mod net {
 
 use net::{Dial, Listen, TestFixtures};
 
+/// The network file the fixtures' network would ship: its genesis committee
+/// listed with their keys, and `beacon_chain`'s parameters.
+fn network_file(fixtures: &TestFixtures, beacon_chain: BeaconChainConfig) -> NetworkFile {
+    let genesis = fixtures.genesis_validators();
+    let validators = genesis
+        .committee
+        .iter()
+        .map(|&id| {
+            let info = genesis
+                .validators
+                .validators
+                .iter()
+                .find(|v| v.validator_id == id)
+                .expect("a committee member is registered");
+            ValidatorEntry {
+                id: id.inner(),
+                public_key: hex_encode(info.public_key.as_bytes()),
+            }
+        })
+        .collect();
+    NetworkFile {
+        network: genesis.network,
+        bootstrap_peers: Vec::new(),
+        relays: Vec::new(),
+        chain: Chain {
+            genesis_timestamp_ms: beacon_chain.genesis_timestamp_ms,
+            epoch_duration_ms: Some(beacon_chain.epoch_duration_ms),
+            shard_size: Some(beacon_chain.shard_size),
+            ready_timeout_epochs: Some(beacon_chain.ready_timeout_epochs),
+        },
+        genesis: Genesis {
+            validators,
+            ..Genesis::default()
+        },
+    }
+}
+
 fn setup(
     data_dir: &Path,
     fixtures: &TestFixtures,
@@ -107,25 +140,27 @@ fn setup(
     bootstrap_peers: Vec<Dial>,
     beacon_chain: BeaconChainConfig,
 ) -> NodeSetup {
-    NodeSetup {
-        data_dir: data_dir.to_path_buf(),
-        validators: validators
-            .iter()
-            .map(|&i| LocalValidator {
-                validator_id: ValidatorId::new(u64::from(i)),
-                signer: fixtures.signer(i),
-            })
-            .collect(),
-        genesis: fixtures.genesis_validators(),
-        engine_genesis: EngineGenesisConfig::default(),
-        beacon_chain,
-        shard_consensus: ShardConsensusConfig::default(),
-        mempool: MempoolConfig::default(),
-        provisions: ProvisionConfig::default(),
-        transport: net::config(listen, bootstrap_peers),
-        threads: ThreadPoolConfig::minimal(),
-        storage: RocksDbConfig::default(),
+    let validators = validators
+        .iter()
+        .map(|&i| LocalValidator {
+            validator_id: ValidatorId::new(u64::from(i)),
+            signer: fixtures.signer(i),
+        })
+        .collect();
+    let mut setup = NodeSetup::from_network(
+        data_dir.to_path_buf(),
+        validators,
+        &network_file(fixtures, beacon_chain),
+        net::config(listen, bootstrap_peers),
+    )
+    .expect("the fixtures' network file starts a host");
+    // A file seats every validator it lists; a genesis that leaves some in
+    // the draw is the fixtures' own.
+    let genesis = fixtures.genesis_validators();
+    if genesis.committee.len() < genesis.validators.validators.len() {
+        setup.genesis = genesis;
     }
+    setup
 }
 
 fn now_ms() -> u64 {

@@ -28,7 +28,7 @@ use crossbeam::channel::{Receiver, Sender, after, never, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, TimerId};
-use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, PreviewGrants};
@@ -146,6 +146,18 @@ pub struct VnodeConfig {
     /// allocation is shared between the bind service, the state machine,
     /// and delegated dispatch closures.
     pub signer: Arc<dyn Signer>,
+}
+
+impl LocalValidator {
+    /// Validator `validator_id`, signing with the BLS key its 32-byte seed
+    /// makes.
+    #[must_use]
+    pub fn from_seed(validator_id: ValidatorId, seed: &[u8; 32]) -> Self {
+        Self {
+            validator_id,
+            signer: Arc::new(BlsSigner::from_seed(seed)),
+        }
+    }
 }
 
 /// One validator a host runs, as supplied to the runner at startup.

@@ -45,6 +45,7 @@
 //! [`PooledDispatch`]: hyperscale_dispatch_pooled::PooledDispatch
 
 mod bootstrap;
+pub mod network_file;
 mod node;
 mod observe;
 pub mod rpc;
@@ -53,7 +54,14 @@ mod status;
 mod supervisor;
 mod telemetry;
 pub mod transport;
-pub use node::{Node, NodeError, NodeSetup};
+pub use arc_swap::ArcSwap;
+pub use hyperscale_engine::PreviewReport;
+#[cfg(feature = "iroh")]
+pub use hyperscale_network_iroh::{RelayUrl, SecretKey, load_or_generate_secret_key};
+pub use hyperscale_node::TxStatusCache;
+pub use hyperscale_storage::BeaconChainReader;
+pub use network_file::{NetworkFile, NetworkFileError};
+pub use node::{DEFAULT_BLOCK_CACHE_MB, Node, NodeError, NodeSetup, for_core_count};
 pub use observe::{Answers, HeaderRing, HeaderSummary, Importing, Observation, Observations};
 pub use runner::{LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, VnodeConfig};
 pub use status::SyncStatus;
