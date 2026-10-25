@@ -67,6 +67,7 @@ pub use constants::{
     RESHAPE_HANDOFF_TTL_EPOCHS, RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS,
     SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT,
     TERMINAL_EVIDENCE_EPOCHS, TOKENS_PER_YEAR_TARGET, UNBONDING_WINDOW_EPOCHS, byzantine_threshold,
+    missed_turn_limit,
 };
 pub use genesis::{
     BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash,
@@ -110,7 +111,7 @@ pub use state::{
     Admission, BeaconState, CohortSeat, CommitteeTransition, JailReason, KeeperSeat, KeptSeat,
     MergeHalf, ObserverSeat, PendingReshape, PendingRotation, PendingWithdrawal, PoolConviction,
     RecoveryBinding, RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery,
-    SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
+    SlotEffects, StakePool, TransitionCause, UnjailRefusal, ValidatorRecord, ValidatorStatus,
 };
 pub use vote_record::{
     BeaconVote, BeaconVoteAdmission, BeaconVoteKind, BeaconVoteRecord, BeaconVoteSlot,

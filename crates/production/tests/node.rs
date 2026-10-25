@@ -6,12 +6,13 @@
 use std::collections::BTreeMap;
 use std::net::UdpSocket;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hyperscale_dispatch_pooled::ThreadPoolConfig;
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_production::{LocalValidator, Node, NodeError, NodeSetup};
+use hyperscale_production::{LocalValidator, Node, NodeError, NodeSetup, Observation};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::RocksDbConfig;
@@ -254,6 +255,44 @@ const SHORT_EPOCH_MS: u64 = 5_000;
 /// The epoch each host's observation must have adopted.
 const TARGET_EPOCH: u64 = 2;
 
+/// The host's observations up to the target epoch: the last, and the
+/// committee each published root tip said its child is proposed under.
+async fn watch_to_target(
+    node: &Node,
+) -> (Arc<Observation>, BTreeMap<BlockHeight, Vec<ValidatorId>>) {
+    let mut observe = node.observe();
+    let mut proposing = BTreeMap::new();
+    let last = timeout(COMMIT_TIMEOUT, async {
+        loop {
+            observe.changed().await.expect("the host publishes");
+            let Some(observation) = observe.borrow_and_update().clone() else {
+                continue;
+            };
+            // Never an epoch past genesis published without its effects: a
+            // fresh network adopts every one of them in this process.
+            if observation.beacon.current_epoch.inner() > 0 {
+                let (epoch, _) = observation
+                    .effects
+                    .back()
+                    .expect("an adopted epoch carries its effects");
+                assert_eq!(*epoch, observation.beacon.current_epoch);
+            }
+            if let (Some(tip), Some(committee)) = (
+                observation.tips.get(&ShardId::ROOT),
+                observation.proposing.get(&ShardId::ROOT),
+            ) {
+                proposing.insert(tip.height, committee.clone());
+            }
+            if observation.beacon.current_epoch.inner() >= TARGET_EPOCH {
+                return observation;
+            }
+        }
+    })
+    .await
+    .expect("the host adopts the target epoch");
+    (last, proposing)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn each_observation_carries_its_epochs_effects() {
@@ -267,37 +306,31 @@ async fn each_observation_carries_its_epochs_effects() {
         network(Some(SHORT_EPOCH_MS)),
     );
 
+    // Watched together: a watch channel keeps only its newest value, so a
+    // host awaited after the other would skip its early tips.
+    let (watched0, watched1) = tokio::join!(watch_to_target(&node0), watch_to_target(&node1));
     let mut seen = Vec::new();
-    for node in [&node0, &node1] {
-        let mut observe = node.observe();
-        let last = timeout(COMMIT_TIMEOUT, async {
-            loop {
-                observe.changed().await.expect("the host publishes");
-                let Some(observation) = observe.borrow_and_update().clone() else {
-                    continue;
-                };
-                // Never an epoch past genesis published without its effects:
-                // a fresh network adopts every one of them in this process.
-                if observation.beacon.current_epoch.inner() > 0 {
-                    let (epoch, _) = observation
-                        .effects
-                        .back()
-                        .expect("an adopted epoch carries its effects");
-                    assert_eq!(*epoch, observation.beacon.current_epoch);
-                }
-                if observation.beacon.current_epoch.inner() >= TARGET_EPOCH {
-                    return observation;
-                }
-            }
-        })
-        .await
-        .expect("the host adopts the target epoch");
+    for (node, (last, proposing)) in [(&node0, watched0), (&node1, watched1)] {
         let epochs: Vec<u64> = last.effects.iter().map(|(e, _)| e.inner()).collect();
         assert!(
             epochs.windows(2).all(|pair| pair[0] < pair[1]),
             "effects in epoch order: {epochs:?}"
         );
         assert!(last.tips.contains_key(&ShardId::ROOT));
+        // The header after each published tip is proposed and signed by the
+        // committee the tip said its child is proposed under.
+        let kept = node.headers(ShardId::ROOT, BlockHeight::new(1));
+        let mut checked = 0;
+        for (height, committee) in &proposing {
+            let Some(child) = kept.iter().find(|s| s.height == height.next()) else {
+                continue;
+            };
+            assert!(committee.contains(&child.proposer));
+            let signers = child.signers.as_ref().expect("the committee resolves");
+            assert!(signers.iter().all(|s| committee.contains(s)));
+            checked += 1;
+        }
+        assert!(checked > 0, "a published tip's child was kept");
         seen.push(last.genesis);
     }
     assert_eq!(seen[0], seen[1], "one network, one genesis");

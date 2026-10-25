@@ -229,8 +229,8 @@ pub(super) fn distribute_epoch_rewards(
 /// Returns the ids that flipped this epoch, deterministic ascending
 /// by `BTreeMap` iteration.
 pub(super) fn auto_ready_timeout(state: &mut BeaconState) -> Vec<ValidatorId> {
-    let current_epoch = state.current_epoch.inner();
-    let timeout = state.chain_config.ready_timeout_epochs;
+    let current_epoch = state.current_epoch;
+    let config = state.chain_config;
     let mut readied = Vec::new();
     for (id, rec) in &mut state.validators {
         if let ValidatorStatus::OnShard {
@@ -238,7 +238,7 @@ pub(super) fn auto_ready_timeout(state: &mut BeaconState) -> Vec<ValidatorId> {
             ready: false,
             placed_at_epoch,
         } = rec.status
-            && current_epoch.saturating_sub(placed_at_epoch.inner()) >= timeout
+            && current_epoch >= config.ready_deadline(placed_at_epoch)
         {
             rec.status = ValidatorStatus::OnShard {
                 shard,

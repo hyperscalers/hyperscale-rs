@@ -4,12 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    Admission, BASIS_POINTS, BeaconProposal, BeaconState, BlockHeader, Epoch, Hash,
-    JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MISSED_PROPOSAL_JAIL_FLOOR,
-    MISSED_PROPOSAL_JAIL_SHARE_BPS, MergeHalf, NetworkDefinition, PendingReshape,
-    PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake,
-    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
-    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
+    Admission, BeaconProposal, BeaconState, BlockHeader, Epoch, Hash, JailReason, MAX_SHARDS,
+    MISSED_PROPOSAL_JAIL_FLOOR, MergeHalf, NetworkDefinition, PendingReshape, PendingWithdrawal,
+    RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake, StakePool,
+    ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
+    missed_turn_limit, validator_possession_proof_verify, verify_shard_vote_equivocation,
+    verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -136,8 +136,6 @@ pub(super) fn jail_chronic_missers(
             })
             .unwrap_or(1)
     };
-    let seats = state.chain_config.shard_size as usize;
-    let seat_quorum = seats - byzantine_threshold(seats);
     let turns = |state: &BeaconState, shard: ShardId| {
         let committed = state.boundaries.get(&shard).map_or(0, |record| {
             record
@@ -155,10 +153,9 @@ pub(super) fn jail_chronic_missers(
         let Some(shard) = placed(state, id) else {
             continue;
         };
-        let missed_bps = u64::from(*misses) * u64::from(BASIS_POINTS);
-        if missed_bps >= turns(state, shard) * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS)
+        if u64::from(*misses) >= missed_turn_limit(turns(state, shard))
             && !halted.contains(&shard)
-            && committee_size(state, shard) > seat_quorum
+            && committee_size(state, shard) > state.chain_config.jailing_floor()
         {
             by_shard.entry(shard).or_default().push((*misses, *id));
         }
@@ -451,38 +448,16 @@ pub(super) fn apply_shard_payload(
             // long enough that a grinder cannot return inside the
             // window its resample weight would still suppress it —
             // where a plain performance jail lifts after the short
-            // fixed cooldown.
-            let rec = state.validators.get(id)?;
-            // Same binding as a deactivation: the lift stamps the pool
-            // and the fold checks the validator is that pool's.
-            if rec.pool != *pool_id {
-                return None;
-            }
-            let ValidatorStatus::Jailed {
-                since_epoch,
-                reason,
-            } = rec.status
-            else {
-                return None;
-            };
-            let cooldown = match reason {
-                JailReason::Withholding => state.beacon_recency_period(),
-                JailReason::Performance => JAIL_COOLDOWN_EPOCHS,
-            };
-            if state.current_epoch.inner() < since_epoch.inner().saturating_add(cooldown) {
-                return None;
-            }
-            let pool = state.pools.get(pool_id)?;
-            if pool.conviction.is_some() {
-                return None;
-            }
-            if pool.current_active_count(state) + 1 > pool.max_active_count(state) {
+            // fixed cooldown. The pool binding is the deactivation's: the
+            // lift stamps the pool and the gate checks the validator is
+            // that pool's.
+            if state.unjail_refusal(*id, *pool_id).is_some() {
                 return None;
             }
             state
                 .validators
                 .get_mut(id)
-                .expect("rec read above guarantees presence")
+                .expect("the gate found it registered")
                 .status = ValidatorStatus::Pooled;
             Some(HostEvent::Unjailed(*id))
         }

@@ -69,14 +69,14 @@ pub use beacon::{
     SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcHighTriple,
     SpcHighTripleVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcVerifyContext, StakePool, TERMINAL_EVIDENCE_EPOCHS,
-    TOKENS_PER_YEAR_TARGET, TransitionCause, UNBONDING_WINDOW_EPOCHS, ValidatorRecord,
-    ValidatorStatus, build_indirect_cert, build_qc1, build_qc2, build_qc3, build_ratify_cert,
-    byzantine_threshold, genesis_config_hash, hash_high_value, mce, mcp, qc1_certify,
-    ratify_quorum, ready_signal_window, sign_empty_view_msg, sign_ratify_vote, sign_vote1,
-    sign_vote2, sign_vote3, skip_target, verify_block_cert, verify_block_equivocations,
-    verify_cert, verify_certified, verify_empty_view_msg, verify_proposal_object, verify_qc1,
-    verify_qc2, verify_qc3, verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation,
-    verify_vote1, verify_vote2, verify_vote3,
+    TOKENS_PER_YEAR_TARGET, TransitionCause, UNBONDING_WINDOW_EPOCHS, UnjailRefusal,
+    ValidatorRecord, ValidatorStatus, build_indirect_cert, build_qc1, build_qc2, build_qc3,
+    build_ratify_cert, byzantine_threshold, genesis_config_hash, hash_high_value, mce, mcp,
+    missed_turn_limit, qc1_certify, ratify_quorum, ready_signal_window, sign_empty_view_msg,
+    sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, skip_target, verify_block_cert,
+    verify_block_equivocations, verify_cert, verify_certified, verify_empty_view_msg,
+    verify_proposal_object, verify_qc1, verify_qc2, verify_qc3, verify_ratify_cert,
+    verify_ratify_vote, verify_vote_equivocation, verify_vote1, verify_vote2, verify_vote3,
 };
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
@@ -275,7 +275,7 @@ pub use topology::schedule::{
 };
 pub use topology::settled_set::{Evidence, SettledTxSet, TerminalEvidence, partner_evidence};
 pub use topology::shard_prefix::shard_prefix_path;
-pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
+pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot, rounds_until_turn};
 pub use topology::trie::{RoutePrefix, ShardTrie};
 pub use topology::validator::{ValidatorInfo, ValidatorSet};
 pub use transaction::declared_key::{DeclaredKey, DeclaredRange};

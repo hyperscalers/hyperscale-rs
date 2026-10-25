@@ -164,7 +164,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     // Ready witness to recover it, so hold rotation network-wide until
     // it does. Opening a rotation moves nobody in or out of the eligible
     // set, so one reading covers the whole step.
-    if state.beacon_eligible_count() <= MIN_BEACON_COMMITTEE_SIZE {
+    if state.beacon_at_floor() {
         return;
     }
     let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();

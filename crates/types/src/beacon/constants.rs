@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use crate::{MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, STATING_GRACE, Stake};
+use crate::{BASIS_POINTS, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, STATING_GRACE, Stake};
 
 // ─── Consensus timeouts ────────────────────────────────────────────────────
 
@@ -334,6 +334,16 @@ pub const MISSED_PROPOSAL_JAIL_SHARE_BPS: u32 = 3_334;
 /// about a proposer to take its seat.
 pub const MISSED_PROPOSAL_JAIL_FLOOR: u32 = 4;
 
+/// The fewest misses within one fold that jail a member with `turns`
+/// turns: [`MISSED_PROPOSAL_JAIL_SHARE_BPS`] of them, rounded up, and never
+/// under [`MISSED_PROPOSAL_JAIL_FLOOR`].
+#[must_use]
+pub fn missed_turn_limit(turns: u64) -> u64 {
+    let share =
+        (turns * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS)).div_ceil(u64::from(BASIS_POINTS));
+    share.max(u64::from(MISSED_PROPOSAL_JAIL_FLOOR))
+}
+
 // ─── Economics ─────────────────────────────────────────────────────────────
 
 /// Target annual emission envelope in whole tokens.
@@ -390,3 +400,34 @@ pub const EMISSION_WORK_WEIGHT: u64 = 1_000_000;
 /// storage rate grandfathers nobody. A share on the same footing as
 /// [`EMISSION_WORK_WEIGHT`], placeholder like it.
 pub const EMISSION_STORAGE_WEIGHT: u64 = 1_000_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_missed_turn_limit_is_the_floor_until_the_share_passes_it() {
+        assert_eq!(missed_turn_limit(0), u64::from(MISSED_PROPOSAL_JAIL_FLOOR));
+        assert_eq!(missed_turn_limit(11), u64::from(MISSED_PROPOSAL_JAIL_FLOOR));
+        assert_eq!(missed_turn_limit(12), 5);
+        assert_eq!(missed_turn_limit(30), 11);
+    }
+
+    /// The limit is the least miss count the share and the floor both
+    /// let through.
+    #[test]
+    fn the_missed_turn_limit_is_the_least_jailing_count() {
+        for turns in 0..300_u64 {
+            for misses in 0..150_u64 {
+                let jails = misses >= u64::from(MISSED_PROPOSAL_JAIL_FLOOR)
+                    && misses * u64::from(BASIS_POINTS)
+                        >= turns * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS);
+                assert_eq!(
+                    misses >= missed_turn_limit(turns),
+                    jails,
+                    "{misses} of {turns}"
+                );
+            }
+        }
+    }
+}

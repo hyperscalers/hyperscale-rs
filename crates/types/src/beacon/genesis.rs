@@ -13,10 +13,11 @@ use blake3::Hasher;
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
 use crate::{
-    BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash, Hash,
-    IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE,
-    RESHAPE_DRAIN_SPAN, Randomness, ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM,
-    Stake, StakePoolId, StakePoolSeat, ValidatorId,
+    BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, Epoch, EpochWindows,
+    GenesisConfigHash, Hash, IMPOUND_EPOCHS_DEFAULT, NetworkDefinition,
+    PRODUCTION_BEACON_COMMITTEE_SIZE, RESHAPE_DRAIN_SPAN, Randomness, ReshapeThresholds,
+    SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat, ValidatorId,
+    byzantine_threshold,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -126,7 +127,8 @@ impl BeaconChainConfig {
     /// cadence, derived rather than stored:
     /// `max(1, ⌈SHUFFLE_SYNC_HEADROOM · ready_timeout_epochs / shard_size⌉)`.
     ///
-    /// Per-seat tenure is `shard_size × interval` epochs, so the formula
+    /// Per-seat tenure is [`Self::tenure_epochs`], `shard_size × interval`
+    /// epochs, so the formula
     /// pins tenure at `≥ SHUFFLE_SYNC_HEADROOM × ready_timeout_epochs`
     /// whatever the committee size. Rotation is the defense against
     /// adaptive corruption of seated validators, and its resistance grows
@@ -146,6 +148,35 @@ impl BeaconChainConfig {
             .saturating_mul(self.ready_timeout_epochs)
             .div_ceil(shard_size);
         if interval == 0 { 1 } else { interval }
+    }
+
+    /// The nominal epochs one seat is held: one rotation per interval walks
+    /// a full committee, `max(1, shard_size) × interval`. A real tenure runs
+    /// longer whenever a boundary skips its shard or rotations stand open.
+    #[must_use]
+    pub const fn tenure_epochs(&self) -> u64 {
+        let shard_size = if self.shard_size == 0 {
+            1
+        } else {
+            self.shard_size as u64
+        };
+        shard_size.saturating_mul(self.shuffle_interval_epochs())
+    }
+
+    /// The epoch whose fold readies a seat placed in `placed` that has not
+    /// readied itself, synced or not. It signs from the epoch after.
+    #[must_use]
+    pub const fn ready_deadline(&self, placed: Epoch) -> Epoch {
+        placed.saturating_add(self.ready_timeout_epochs)
+    }
+
+    /// The consensus subset size at or under which a shard jails nobody for
+    /// missed turns: a quorum of its seats, `shard_size − f`, which cannot
+    /// afford to lose a member to a liveness verdict.
+    #[must_use]
+    pub const fn jailing_floor(&self) -> usize {
+        let seats = self.shard_size as usize;
+        seats - byzantine_threshold(seats)
     }
 
     /// Rotations a shard may hold open at once, derived rather than
@@ -590,6 +621,31 @@ mod tests {
         assert_ne!(
             genesis_config_hash(&config, &net(), std::slice::from_ref(&seat)),
             genesis_config_hash(&config, &net(), &[other_operator]),
+        );
+    }
+
+    #[test]
+    fn the_jailing_floor_is_a_quorum_of_seats() {
+        for (seats, floor) in [(0, 0), (4, 3), (7, 5)] {
+            let config = BeaconChainConfig {
+                shard_size: seats,
+                ..BeaconChainConfig::default()
+            };
+            assert_eq!(config.jailing_floor(), floor, "{seats} seats");
+        }
+    }
+
+    #[test]
+    fn a_seat_readies_by_its_deadline() {
+        let config = BeaconChainConfig::default();
+        let placed = Epoch::new(5);
+        assert_eq!(
+            config.ready_deadline(placed),
+            Epoch::new(5 + config.ready_timeout_epochs)
+        );
+        assert_eq!(
+            config.tenure_epochs(),
+            u64::from(config.shard_size) * config.shuffle_interval_epochs()
         );
     }
 }

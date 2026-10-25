@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconProposal, BeaconState, Epoch, EpochSeed, HALT_THRESHOLD_EPOCHS, JailReason,
-    MIN_BEACON_COMMITTEE_SIZE, NetworkDefinition, Randomness, RevealChain, SeedSource, ShardId,
-    ValidatorId, ValidatorStatus, Verifier, VrfOutput, beacon_reveal_verify, byzantine_threshold,
+    NetworkDefinition, Randomness, RevealChain, SeedSource, ShardId, ValidatorId, ValidatorStatus,
+    Verifier, VrfOutput, beacon_reveal_verify, byzantine_threshold,
 };
 
 use crate::state::pool::exit_placement;
@@ -273,8 +273,7 @@ pub(super) fn on_missing_crossings_shard(state: &BeaconState, party: ValidatorId
 /// the committee is the whole eligible set. Equivocation is not spared: a
 /// revocation answers a fault against safety, not liveness.
 pub(super) fn jail_would_strand_the_beacon(state: &BeaconState, party: ValidatorId) -> bool {
-    state.beacon_eligible_count() <= MIN_BEACON_COMMITTEE_SIZE
-        && state.beacon_eligible().contains(&party)
+    state.beacon_at_floor() && state.beacon_eligible().contains(&party)
 }
 
 /// Transition `victim` to `Jailed { since_epoch, reason }`, then run
