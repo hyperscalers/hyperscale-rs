@@ -12,12 +12,12 @@ use std::time::Duration;
 use hyperscale_effects_bridge::genesis::{GenesisPackages, genesis_world_with_pools};
 use hyperscale_effects_bridge::vm_statics::{package_key, principal_for};
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
-use hyperscale_engine::genesis::{
-    OWNER_BADGE_ID, pool_address, pool_owner_badge, stake_unit, staking_artifact,
-};
+use hyperscale_engine::genesis::{OWNER_BADGE_ID, pool_owner_badge, stake_unit};
 use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
-use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits, principal_of};
+use hyperscale_transactions::{
+    Ceilings, Client, Terms, default_gas_limits, pool_address, principal_of,
+};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR,
@@ -2586,12 +2586,11 @@ pub(crate) fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
 /// a scenario names a pool the way genesis places it.
 #[must_use]
 pub(crate) fn pool_at(id: StakePoolId) -> ComponentAddr {
-    let seat = StakePoolSeat {
+    pool_address(&StakePoolSeat {
         id,
         operator: pool_operator().1,
         founding: Vec::new(),
-    };
-    pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat)
+    })
 }
 
 /// The pools a staking cluster seats.
@@ -2632,17 +2631,9 @@ pub(crate) fn build_deactivate_tx(
     validator: ValidatorId,
     validity: TimestampRange,
 ) -> Transaction {
-    let graph = graph(account_address(&operator.public_key().0), |b| {
-        let proof = account::present_instance(
-            b,
-            account_address(&operator.public_key().0),
-            pool_owner_badge(pool),
-            OWNER_BADGE_ID,
-        )?;
-        b.presenting(proof, |b| {
-            staking::Staking::at(pool).deactivate_validator(b, validator.inner())
-        })
-    });
+    let graph = client()
+        .deactivate_validator_graph(account_address(&operator.public_key().0), pool, validator)
+        .expect("a retirement types against the pool's signature");
     Transaction::new(envelope(graph, operator, validity))
 }
 
@@ -2662,22 +2653,15 @@ pub(crate) fn build_register_tx(
     possession_proof: &ConsensusSignature,
     validity: TimestampRange,
 ) -> Transaction {
-    let graph = graph(account_address(&operator.public_key().0), |b| {
-        let proof = account::present_instance(
-            b,
+    let graph = client()
+        .register_validator_graph(
             account_address(&operator.public_key().0),
-            pool_owner_badge(pool),
-            OWNER_BADGE_ID,
-        )?;
-        b.presenting(proof, |b| {
-            staking::Staking::at(pool).register_validator(
-                b,
-                validator.inner(),
-                *pubkey.as_bytes(),
-                *possession_proof.as_bytes(),
-            )
-        })
-    });
+            pool,
+            validator,
+            pubkey,
+            possession_proof,
+        )
+        .expect("a registration types against the pool's signature");
     Transaction::new(envelope(graph, operator, validity))
 }
 
@@ -2725,11 +2709,14 @@ pub(crate) fn build_stake_tx(
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    let graph = graph(account_address(&delegator.public_key().0), |b| {
-        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
-        let units = staking::Staking::at(pool).stake(b, funds)?;
-        account::deposit(b, from, units)
-    });
+    let graph = client()
+        .stake_graph(
+            account_address(&delegator.public_key().0),
+            from,
+            pool,
+            amount,
+        )
+        .expect("a delegation types against the pool's signature");
     Transaction::new(envelope(graph, delegator, validity))
 }
 

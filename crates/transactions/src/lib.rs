@@ -16,6 +16,8 @@
 //! builders enforce, so a defect can cost a signer a refused transaction
 //! and can never produce one the chain would wrongly accept.
 
+mod staking;
+
 use std::sync::LazyLock;
 
 use hyperscale_effects_bridge::genesis::{World, genesis_world};
@@ -28,6 +30,7 @@ use hyperscale_vm_effects::{Claim, Intent, IntentHeader, IntentTree, ManifestGra
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
+pub use staking::pool_address;
 
 /// The compute every built envelope signs for whole, split evenly over
 /// its nodes by [`default_gas_limits`].
