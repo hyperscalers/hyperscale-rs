@@ -1482,6 +1482,55 @@ impl BeaconState {
         )
     }
 
+    /// The members of `shard` a rotation may retire, the first of them next.
+    ///
+    /// A member is a candidate while its status holds a ready seat on
+    /// `shard`, it is not a keeper the shard's pending merge holds, and no
+    /// open rotation names it already. Candidates run oldest placement
+    /// first, ties by id. The shuffle retires the head of this order on the
+    /// state it reads, when its shard gates let it rotate at all; whether a
+    /// boundary rotates, and who enters, is the shuffle's and its seeded
+    /// draw's.
+    #[must_use]
+    pub fn rotation_order(&self, shard: ShardId) -> Vec<ValidatorId> {
+        let Some(committee) = self.next_shard_committees.get(&shard) else {
+            return Vec::new();
+        };
+        let open = self.pending_rotations.get(&shard);
+        let mut candidates: Vec<(Epoch, ValidatorId)> = committee
+            .members
+            .iter()
+            // Bind the candidates to validators whose status records *this*
+            // shard, so a stale member entry pointing elsewhere is skipped
+            // rather than rotated.
+            .filter_map(|id| match self.validators.get(id).map(|r| r.status) {
+                Some(ValidatorStatus::OnShard {
+                    shard: s,
+                    ready: true,
+                    placed_at_epoch,
+                }) if s == shard => Some((placed_at_epoch, *id)),
+                _ => None,
+            })
+            // A pending merge's keepers must hold their child until they
+            // sync the sibling half; their departure would strand the merged
+            // committee below quorum.
+            .filter(|(_, id)| !self.is_merge_keeper(shard, *id))
+            // A member an open rotation names is spoken for. Naming it again
+            // would seat entrant after entrant against one seat while the
+            // rest of the committee never aged.
+            .filter(|(_, id)| !open.is_some_and(|rotations| rotations.contains_key(id)))
+            .collect();
+        candidates.sort_unstable();
+        candidates.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The next epoch the shuffle runs at, after this state's own.
+    #[must_use]
+    pub const fn next_shuffle_epoch(&self) -> Epoch {
+        let interval = self.chain_config.shuffle_interval_epochs();
+        Epoch::new((self.current_epoch.inner() / interval + 1).saturating_mul(interval))
+    }
+
     /// The applied witness-fold watermark for `shard` — how many of its
     /// accumulator leaves the fold has consumed
     /// ([`ShardBoundary::witness_leaf_count`]), or `0` for a shard with no
@@ -3161,5 +3210,19 @@ mod tests {
         state.miss_counters.insert(ValidatorId::new(7), 12);
         assert_eq!(state.miss_counters.get(&ValidatorId::new(5)), Some(&3));
         assert_eq!(state.miss_counters.get(&ValidatorId::new(7)), Some(&12));
+    }
+
+    #[test]
+    fn the_next_shuffle_epoch_is_the_next_multiple_of_the_interval() {
+        let mut state = BeaconState::empty(BeaconChainConfig::default());
+        let interval = state.chain_config.shuffle_interval_epochs();
+        for (epoch, next) in [
+            (0, interval),
+            (interval - 1, interval),
+            (interval, 2 * interval),
+        ] {
+            state.current_epoch = Epoch::new(epoch);
+            assert_eq!(state.next_shuffle_epoch(), Epoch::new(next));
+        }
     }
 }

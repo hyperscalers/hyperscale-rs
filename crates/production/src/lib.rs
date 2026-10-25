@@ -54,7 +54,7 @@ mod supervisor;
 mod telemetry;
 pub mod transport;
 pub use node::{Node, NodeError, NodeSetup};
-pub use observe::{HeaderRing, HeaderSummary, Importing, Observation, Observations};
+pub use observe::{Answers, HeaderRing, HeaderSummary, Importing, Observation, Observations};
 pub use runner::{LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, VnodeConfig};
 pub use status::SyncStatus;
 pub use supervisor::{ShardCommand, StorageDirResolver, StorageFactory, shard_data_dir};

@@ -42,6 +42,34 @@ pub struct Observation {
     /// jailings, readies and committee moves the beacon applied. Epochs
     /// adopted before a restart and not adopted again after it are absent.
     pub effects: Arc<VecDeque<(Epoch, Arc<SlotEffects>)>>,
+    /// What the beacon's own rules say about `beacon`.
+    pub answers: Arc<Answers>,
+}
+
+/// Answers the beacon's rules give on one committed state.
+///
+/// Rotation is an order, not a prediction: a boundary may rotate no one on
+/// a shard, a jail or readiness folded at the boundary can change who is
+/// first, and the entrant is a seeded draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answers {
+    /// Each shard's members a rotation may retire, the next of them first.
+    pub rotation_order: BTreeMap<ShardId, Vec<ValidatorId>>,
+    /// The next epoch the shuffle runs at.
+    pub next_shuffle_epoch: Epoch,
+}
+
+impl Answers {
+    fn of(state: &BeaconState) -> Self {
+        Self {
+            rotation_order: state
+                .next_shard_committees
+                .keys()
+                .map(|&shard| (shard, state.rotation_order(shard)))
+                .collect(),
+            next_shuffle_epoch: state.next_shuffle_epoch(),
+        }
+    }
 }
 
 /// The bytes each shard's snap-sync import has staged so far, while it
@@ -98,7 +126,7 @@ pub struct Observer {
     headers: Arc<HeaderRing>,
     observations: Observations,
     effects: VecDeque<(Epoch, Arc<SlotEffects>)>,
-    beacon: Option<Arc<BeaconState>>,
+    beacon: Option<(Arc<BeaconState>, Arc<Answers>)>,
 }
 
 impl Observer {
@@ -125,13 +153,17 @@ impl Observer {
         state: &BeaconState,
         schedule: &TopologySchedule,
     ) {
-        let first = self.beacon.is_none();
-        if adopted.is_empty() && admitted.is_empty() && !first {
+        if adopted.is_empty() && admitted.is_empty() && self.beacon.is_some() {
             return;
         }
-        if first || !adopted.is_empty() {
-            self.beacon = Some(Arc::new(state.clone()));
-        }
+        let (beacon, answers) = match &self.beacon {
+            Some(kept) if adopted.is_empty() => kept.clone(),
+            _ => {
+                let fresh = (Arc::new(state.clone()), Arc::new(Answers::of(state)));
+                self.beacon = Some(fresh.clone());
+                fresh
+            }
+        };
         for (epoch, effects) in adopted {
             self.effects.push_back((epoch, Arc::new(effects)));
         }
@@ -141,12 +173,10 @@ impl Observer {
         self.headers.admit(admitted, schedule);
         let observation = Observation {
             genesis: self.genesis,
-            beacon: self
-                .beacon
-                .clone()
-                .unwrap_or_else(|| Arc::new(state.clone())),
+            beacon,
             tips: self.headers.tips(),
             effects: Arc::new(self.effects.clone()),
+            answers,
         };
         self.observations.send_replace(Some(Arc::new(observation)));
     }
