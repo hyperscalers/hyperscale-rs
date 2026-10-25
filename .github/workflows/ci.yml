@@ -50,7 +50,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.97.0"
           targets: wasm32-unknown-unknown
       # The guest fixtures pin their own toolchain and build with
       # -Zbuild-std, so that channel and rust-src are present before any
