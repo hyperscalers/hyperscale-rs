@@ -14,11 +14,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use hyperscale_network_iroh::{
-    IrohConfig, RedialBudget, RedialSchedule, RelayUrl, VersionInteroperabilityMode,
-    load_or_generate_secret_key, parse_endpoint_addr,
+    IrohConfig, RedialBudget, RedialSchedule, VersionInteroperabilityMode,
+    load_or_generate_secret_key,
 };
+use hyperscale_production::network_file::iroh_config;
 use serde::Deserialize;
 use tracing::info;
 
@@ -105,29 +106,10 @@ pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
                 .with_context(|| format!("Invalid listen address: {addr}"))
         })
         .transpose()?;
-    let relays = network
-        .relays
-        .iter()
-        .map(|url| {
-            url.parse::<RelayUrl>()
-                .with_context(|| format!("Invalid relay URL: {url}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let bootstrap_peers = network
-        .bootstrap_peers
-        .iter()
-        .map(|peer| parse_endpoint_addr(peer).map_err(|e| anyhow!("Invalid bootstrap peer: {e}")))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|peer| peer.id != secret_key.public())
-        .collect();
-
-    let defaults = IrohConfig::new(secret_key);
+    let defaults = iroh_config(secret_key, &network.bootstrap_peers, &network.relays)?;
     Ok(IrohConfig {
         bind_addr,
-        relays,
         external_addrs: network.external_addrs.clone(),
-        bootstrap_peers,
         port_mapping: network.upnp_enabled,
         path_idle_timeout: network
             .path_idle_timeout_ms
@@ -154,7 +136,7 @@ pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
         },
         version_interop_mode: network
             .version_interop_mode
-            .unwrap_or(VersionInteroperabilityMode::Strict),
+            .unwrap_or(defaults.version_interop_mode),
         ..defaults
     })
 }

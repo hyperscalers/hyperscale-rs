@@ -20,12 +20,14 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbConfig, RocksDbShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, GenesisValidators, ShardId, shard_prefix_path,
+    BeaconChainConfig, BlockHeight, ConsensusPublicKey, GenesisValidators, ShardId, ValidatorId,
+    shard_prefix_path,
 };
 use tokio::runtime::{Handle as TokioHandle, RuntimeFlavor};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::network_file::{NetworkFile, NetworkFileError};
 use crate::observe::{HeaderRing, HeaderSummary, Importing, Observation};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, PreviewSender, TxSubmissionSender};
 use crate::transport::TransportConfig;
@@ -63,6 +65,67 @@ pub struct NodeSetup {
     pub threads: ThreadPoolConfig,
     /// `RocksDB` tuning for every store the host opens.
     pub storage: RocksDbConfig,
+}
+
+/// Megabytes of block cache each `RocksDB` store keeps unless told otherwise.
+pub const DEFAULT_BLOCK_CACHE_MB: usize = 512;
+
+/// The (consensus, throughput) pool threads for a host with `total_cores`.
+///
+/// Two go to the consensus pool, whose work is liveness-critical, and every
+/// other core to throughput, at least one. State-machine threads are not
+/// reserved against: unpinned, the scheduler interleaves them with pool
+/// workers.
+#[must_use]
+pub const fn for_core_count(total_cores: usize) -> (usize, usize) {
+    let consensus = 2;
+    let throughput = total_cores.saturating_sub(consensus);
+    (consensus, if throughput == 0 { 1 } else { throughput })
+}
+
+impl NodeSetup {
+    /// A host of `validators` joining the network `network` defines, over
+    /// `transport`, every other setting at the validator binary's default.
+    ///
+    /// # Errors
+    ///
+    /// When the file's genesis is malformed, or a validator here signs with
+    /// a key other than the one the file lists for it.
+    pub fn from_network(
+        data_dir: PathBuf,
+        validators: Vec<LocalValidator>,
+        network: &NetworkFile,
+        transport: TransportConfig,
+    ) -> Result<Self, NetworkFileError> {
+        let local: Vec<(ValidatorId, ConsensusPublicKey)> = validators
+            .iter()
+            .map(|v| (v.validator_id, v.signer.public_key()))
+            .collect();
+        network.check_hosted(&local)?;
+        let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        let (consensus, throughput) = for_core_count(available);
+        Ok(Self {
+            data_dir,
+            genesis: network
+                .genesis
+                .validators(network.network.clone(), &local)?,
+            engine_genesis: network.genesis.engine()?,
+            beacon_chain: network.beacon_chain(),
+            validators,
+            shard_consensus: ShardConsensusConfig::default(),
+            mempool: MempoolConfig::default(),
+            provisions: ProvisionConfig::default(),
+            transport,
+            threads: ThreadPoolConfig::builder()
+                .consensus_threads(consensus)
+                .throughput_threads(throughput)
+                .build_unchecked(),
+            storage: RocksDbConfig {
+                block_cache_size: Some(DEFAULT_BLOCK_CACHE_MB * 1024 * 1024),
+                ..RocksDbConfig::default()
+            },
+        })
+    }
 }
 
 /// Why a host did not start or stopped with an error.
@@ -296,5 +359,22 @@ impl Node {
             shutdown.shutdown();
         }
         self.finished().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::for_core_count;
+
+    #[test]
+    fn two_cores_go_to_consensus_and_the_rest_to_throughput() {
+        assert_eq!(for_core_count(16), (2, 14));
+        assert_eq!(for_core_count(32), (2, 30));
+        assert_eq!(for_core_count(4), (2, 2));
+    }
+
+    #[test]
+    fn throughput_keeps_a_thread_when_consensus_takes_every_core() {
+        assert_eq!(for_core_count(2), (2, 1));
     }
 }

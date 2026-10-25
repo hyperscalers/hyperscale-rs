@@ -57,19 +57,19 @@ use clap::Parser;
 use hex::{decode as hex_decode, encode as hex_encode};
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_dispatch_pooled::ThreadPoolConfig;
-use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
+use hyperscale_production::network_file::{Genesis, network_name};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::transport::VersionInteroperabilityMode;
 use hyperscale_production::{
-    LocalValidator, Node, NodeSetup, TelemetryConfig, TelemetryGuard, init_telemetry,
+    DEFAULT_BLOCK_CACHE_MB, LocalValidator, Node, NodeSetup, TelemetryConfig, TelemetryGuard,
+    for_core_count, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{CompressionType as RocksCompressionType, RocksDbConfig};
 use hyperscale_types::{
-    Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition,
-    PrincipalAddr, Signer, StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
+    BeaconChainConfig, ConsensusPublicKey, NetworkDefinition, Signer, ValidatorId,
 };
 use serde::Deserialize;
 use tokio::runtime::Builder as RuntimeBuilder;
@@ -174,7 +174,7 @@ pub(crate) struct ValidatorConfig {
 
     /// Genesis configuration (validators in the network)
     #[serde(default)]
-    pub genesis: GenesisConfig,
+    pub genesis: Genesis,
 
     /// Mempool configuration
     #[serde(default)]
@@ -197,7 +197,7 @@ pub(crate) struct NodeConfig {
     /// signed consensus message to prevent cross-network replay.
     /// Parsed from a network name (`"mainnet"`, `"testnet"`,
     /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`](std::str::FromStr::from_str).
-    #[serde(default = "default_network", with = "network_serde")]
+    #[serde(default = "default_network", with = "network_name")]
     pub(crate) network: NetworkDefinition,
 
     /// Data directory for storage. Per-shard `RocksDB` instances are
@@ -208,32 +208,6 @@ pub(crate) struct NodeConfig {
 
 fn default_network() -> NetworkDefinition {
     NetworkDefinition::simulator()
-}
-
-/// `serde` adapter that parses `NetworkDefinition` from its logical name.
-///
-/// `NetworkDefinition` doesn't impl `Deserialize` directly because a
-/// definition is fixed by which network it is, not assembled field by
-/// field — the name string is the whole of it, and everything else follows
-/// from the id it names.
-mod network_serde {
-    use std::str::FromStr;
-
-    use hyperscale_types::NetworkDefinition;
-    use serde::de::Error;
-    use serde::{Deserialize, Deserializer};
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<NetworkDefinition, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let name = String::deserialize(deserializer)?;
-        NetworkDefinition::from_str(&name).map_err(|_| {
-            D::Error::custom(format!(
-                "unknown network `{name}` (expected one of: mainnet, testnet, simulator, ...)"
-            ))
-        })
-    }
 }
 
 /// One hosted validator's identity inputs.
@@ -370,7 +344,7 @@ const fn default_max_write_buffer_number() -> i32 {
 }
 
 const fn default_block_cache_mb() -> usize {
-    512
+    DEFAULT_BLOCK_CACHE_MB
 }
 
 const fn default_bloom_filter_bits() -> f64 {
@@ -436,59 +410,6 @@ pub(crate) struct TelemetryConfigToml {
 
 fn default_service_name() -> String {
     "hyperscale-validator".to_string()
-}
-
-/// Genesis configuration defining the validator set and initial balances.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub(crate) struct GenesisConfig {
-    /// Validators in the network
-    #[serde(default)]
-    pub(crate) validators: Vec<ValidatorEntry>,
-
-    /// Initial balances for funded accounts, keyed by their 32-byte
-    /// address. This is what genesis actually seeds: an account's address
-    /// *is* its shard placement, so the list needs no routing metadata.
-    #[serde(default)]
-    pub(crate) accounts: Vec<AccountBalanceEntry>,
-
-    /// Staking pools seated at genesis. Every genesis validator belongs to
-    /// pool 0, so a network whose validators vote on parameters seats pool 0.
-    #[serde(default)]
-    pub(crate) pools: Vec<PoolEntry>,
-}
-
-/// A staking pool seated at genesis. Its founding members are not listed:
-/// genesis fills them from the validator set, for the pool whose id they
-/// share.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PoolEntry {
-    /// The id the beacon folds the pool's facts under.
-    pub(crate) id: u32,
-
-    /// Hex-encoded 32-byte address of the account that receives the pool's
-    /// owner badge.
-    pub(crate) operator: String,
-}
-
-/// A funded-account entry for genesis configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AccountBalanceEntry {
-    /// Hex-encoded 32-byte account address.
-    pub(crate) address: String,
-
-    /// Balance as a string, parsed as `u128`.
-    pub(crate) balance: String,
-}
-
-/// A validator entry in genesis configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ValidatorEntry {
-    /// Validator ID
-    pub(crate) id: u64,
-
-    /// Hex-encoded public key
-    pub(crate) public_key: String,
 }
 
 impl ValidatorConfig {
@@ -605,137 +526,6 @@ fn write_private_seed(path: &Path, seed: &[u8; 32]) -> Result<()> {
     options.mode(0o600);
     options.open(path)?.write_all(seed)?;
     Ok(())
-}
-
-/// Build the genesis validators the runner projects the host's topology
-/// snapshot from.
-///
-/// `local_signers` carries every hosted vnode's (`validator_id`, private key)
-/// in `config.vnodes` order. For each genesis validator whose id matches a
-/// hosted vnode, the public key is taken from the local keypair rather than
-/// parsed from the genesis hex — keeping the set consistent with what this
-/// process actually signs with.
-///
-/// Genesis is always a single ROOT shard: the network launches at one shard
-/// and grows by splitting, so there is no operator-facing genesis-distribution
-/// knob. The network reaches its target topology by driving the real split
-/// lifecycle.
-fn build_genesis_validators(
-    network: NetworkDefinition,
-    genesis: &GenesisConfig,
-    local_signers: &[(ValidatorId, Arc<BlsSigner>)],
-) -> Result<GenesisValidators> {
-    let lookup_local = |id: ValidatorId| -> Option<&Arc<BlsSigner>> {
-        local_signers
-            .iter()
-            .find_map(|(vid, k)| (*vid == id).then_some(k))
-    };
-
-    let validators: Vec<ValidatorInfo> = if genesis.validators.is_empty() {
-        warn!("No validators in genesis config, running in single-validator mode");
-        let (validator_id, keypair) = local_signers.first().expect("at least one hosted vnode");
-        vec![ValidatorInfo {
-            validator_id: *validator_id,
-            public_key: keypair.public_key(),
-        }]
-    } else {
-        genesis
-            .validators
-            .iter()
-            .map(|v| {
-                let validator_id = ValidatorId::new(v.id);
-                let public_key = if let Some(keypair) = lookup_local(validator_id) {
-                    keypair.public_key()
-                } else {
-                    let key_bytes = hex_decode(&v.public_key).with_context(|| {
-                        format!("Invalid hex public key for validator {}", v.id)
-                    })?;
-                    if key_bytes.len() != 48 {
-                        bail!(
-                            "Invalid public key length for validator {}: expected 48 (BLS), got {}",
-                            v.id,
-                            key_bytes.len()
-                        );
-                    }
-                    let mut key_arr = [0u8; 48];
-                    key_arr.copy_from_slice(&key_bytes);
-                    ConsensusPublicKey::new(key_arr)
-                };
-                Ok(ValidatorInfo {
-                    validator_id,
-                    public_key,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    let validator_set = ValidatorSet::new(validators);
-
-    // Genesis seats every configured validator in the single ROOT committee.
-    let committee: Vec<ValidatorId> = validator_set
-        .validators
-        .iter()
-        .map(|v| v.validator_id)
-        .collect();
-
-    Ok(GenesisValidators::new(network, validator_set, committee))
-}
-
-/// Build genesis configuration from TOML config.
-///
-/// Converts the TOML-friendly genesis config (with string addresses and
-/// balances) to the engine's `GenesisConfig` type.
-fn build_engine_genesis_config(config: &GenesisConfig) -> Result<EngineGenesisConfig> {
-    let mut engine_config = EngineGenesisConfig::default();
-
-    for entry in &config.accounts {
-        let address = parse_principal(&entry.address)?;
-        let balance = entry
-            .balance
-            .parse::<u128>()
-            .map_err(|e| anyhow::anyhow!("Invalid balance '{}': {e}", entry.balance))?;
-        engine_config.accounts.push((address, balance));
-    }
-
-    for entry in &config.pools {
-        engine_config.pools.push(StakePoolSeat {
-            id: StakePoolId::new(entry.id),
-            operator: parse_principal(&entry.operator)?,
-            founding: Vec::new(),
-        });
-    }
-
-    info!(
-        accounts = engine_config.accounts.len(),
-        pools = engine_config.pools.len(),
-        "Parsed genesis balances and pools"
-    );
-
-    Ok(engine_config)
-}
-
-/// A principal's address from its 64 hex characters.
-fn parse_principal(hex: &str) -> Result<PrincipalAddr> {
-    let bytes = hex_decode(hex).map_err(|e| anyhow::anyhow!("Invalid address '{hex}': {e}"))?;
-    let raw = <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| anyhow::anyhow!("Address '{hex}' is not 32 bytes"))?;
-    let address = Address::from_bytes(raw).map_err(|e| anyhow::anyhow!("Address '{hex}': {e}"))?;
-    PrincipalAddr::try_from(address).map_err(|e| anyhow::anyhow!("Address '{hex}': {e}"))
-}
-
-/// Compute (consensus, throughput) pool thread counts for the given host
-/// core count.
-///
-/// 2 cores go to the dedicated consensus pool (liveness-critical work);
-/// every remaining core goes to the throughput pool. State-machine
-/// threads are not reserved against because pinning is off by default —
-/// the OS scheduler interleaves them with pool workers. Floors at
-/// (2, 1) so small machines still come up; oversubscription is tolerable
-/// there.
-fn for_core_count(total_cores: usize) -> (usize, usize) {
-    let consensus = 2;
-    let throughput = total_cores.saturating_sub(consensus).max(1);
-    (consensus, throughput)
 }
 
 /// Build thread pool configuration from TOML config.
@@ -957,11 +747,13 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // Build the host's genesis validators. Genesis is always a single ROOT
     // shard; the network grows to its target topology by splitting under load.
     // The runner projects the host's topology snapshot from this.
-    let genesis_validators = build_genesis_validators(
-        config.node.network.clone(),
-        &config.genesis,
-        &hosted_signers,
-    )?;
+    let local_keys: Vec<(ValidatorId, ConsensusPublicKey)> = hosted_signers
+        .iter()
+        .map(|(validator_id, signer)| (*validator_id, signer.public_key()))
+        .collect();
+    let genesis_validators = config
+        .genesis
+        .validators(config.node.network.clone(), &local_keys)?;
 
     // The validators this host runs. Shard participation is not named here —
     // the runner derives each validator's seat (or pool membership) from the
@@ -978,7 +770,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         data_dir: config.node.data_dir.clone(),
         validators,
         genesis: genesis_validators,
-        engine_genesis: build_engine_genesis_config(&config.genesis)
+        engine_genesis: config
+            .genesis
+            .engine()
             .context("Failed to parse genesis configuration")?,
         beacon_chain: beacon_chain_config,
         shard_consensus: shard_config,
@@ -1074,10 +868,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
-    use hyperscale_scenarios::tx::world_pools;
-
     use super::*;
 
     #[cfg(unix)]
@@ -1107,32 +897,6 @@ mod tests {
     }
 
     #[test]
-    fn test_for_core_count() {
-        // 16 cores: 2 consensus + 14 throughput
-        let (consensus, throughput) = for_core_count(16);
-        assert_eq!(consensus, 2);
-        assert_eq!(throughput, 14);
-
-        // 32 cores: 2 consensus + 30 throughput
-        let (consensus, throughput) = for_core_count(32);
-        assert_eq!(consensus, 2);
-        assert_eq!(throughput, 30);
-
-        // 4 cores: 2 consensus + 2 throughput
-        let (consensus, throughput) = for_core_count(4);
-        assert_eq!(consensus, 2);
-        assert_eq!(throughput, 2);
-    }
-
-    #[test]
-    fn test_for_core_count_floor() {
-        // 2 cores: floored at 1 throughput (consensus would otherwise eat both).
-        let (consensus, throughput) = for_core_count(2);
-        assert_eq!(consensus, 2);
-        assert_eq!(throughput, 1);
-    }
-
-    #[test]
     fn test_build_thread_pool_config_auto() {
         let config = ThreadsConfig::default();
         let pool_config = build_thread_pool_config(&config);
@@ -1151,34 +915,6 @@ mod tests {
         let pool_config = build_thread_pool_config(&config);
         assert_eq!(pool_config.consensus_threads, 3);
         assert_eq!(pool_config.throughput_threads, 14);
-    }
-
-    /// A `pools` table seats exactly the pools it names: the scenario
-    /// world's seats, written out as an operator would, read back equal.
-    #[test]
-    fn genesis_pools_parse_to_their_seats() {
-        let seats = world_pools();
-        let mut toml = String::new();
-        for seat in &seats {
-            writeln!(
-                toml,
-                "[[pools]]\nid = {}\noperator = \"{}\"",
-                seat.id.inner(),
-                hex_encode(seat.operator.to_bytes())
-            )
-            .expect("writing to a string");
-        }
-        let genesis: GenesisConfig = toml_from_str(&toml).expect("pools table parses");
-        let engine = build_engine_genesis_config(&genesis).expect("pools build");
-        assert_eq!(engine.pools, seats);
-    }
-
-    /// Founding members come from the validator set, never the config: a
-    /// listed one would enter the genesis hash and then be overwritten.
-    #[test]
-    fn genesis_pools_refuse_founding_members() {
-        let toml = "[[pools]]\nid = 0\noperator = \"00\"\nfounding = []\n";
-        assert!(toml_from_str::<GenesisConfig>(toml).is_err());
     }
 
     /// The shipped example config must satisfy the `deny_unknown_fields`
