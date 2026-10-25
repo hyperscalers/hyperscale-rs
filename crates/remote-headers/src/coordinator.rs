@@ -1652,23 +1652,17 @@ impl RemoteHeaderCoordinator {
         shard: ShardId,
         header: &BlockHeader,
     ) -> (WeightedTimestamp, bool) {
-        let parent_hash = header.parent_block_hash();
-        if let Some(parent) = header
+        let parent_anchor = header
             .height()
             .prev()
-            .and_then(|parent_height| self.held_header(shard, parent_height, parent_hash))
-        {
-            return (parent.parent_qc().weighted_timestamp(), true);
-        }
-        let anchor = topology_schedule
-            .head()
-            .boundary(shard)
-            .filter(|boundary| boundary.block_hash == parent_hash)
-            .map_or_else(
-                || header.parent_qc().weighted_timestamp(),
-                |boundary| boundary.weighted_timestamp,
-            );
-        (anchor, false)
+            .and_then(|parent_height| {
+                self.held_header(shard, parent_height, header.parent_block_hash())
+            })
+            .map(|parent| parent.parent_qc().weighted_timestamp());
+        (
+            topology_schedule.signing_anchor(shard, header, parent_anchor),
+            parent_anchor.is_some(),
+        )
     }
 
     /// Park `certified_header`, which failed verification under a committee

@@ -14,7 +14,7 @@ use hyperscale_production::{LocalValidator, Node, NodeError, NodeSetup};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::RocksDbConfig;
-use hyperscale_types::{BeaconChainConfig, ValidatorId};
+use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId, ValidatorId};
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -176,6 +176,27 @@ async fn two_co_hosted_nodes_commit() {
     })
     .await
     .expect("every co-hosted validator reaches the target height");
+
+    // Each host keeps the root chain's certified headers once per height,
+    // every certificate past genesis signed by members of the four-validator
+    // committee (genesis's own certificate carries no votes).
+    let validators: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+    for node in [&node0, &node1] {
+        let kept = node.headers(ShardId::ROOT, BlockHeight::new(1));
+        assert!(
+            kept.len() >= usize::try_from(TARGET_HEIGHT).unwrap(),
+            "the host kept the root chain's headers"
+        );
+        for pair in kept.windows(2) {
+            assert!(pair[0].height < pair[1].height, "one summary per height");
+        }
+        for summary in &kept {
+            let signers = summary.signers.as_ref().expect("the committee resolves");
+            assert!(!signers.is_empty());
+            assert!(signers.iter().all(|s| validators.contains(s)));
+            assert!(validators.contains(&summary.proposer));
+        }
+    }
 
     node0.stop().await.expect("host 0 stops cleanly");
     node1.stop().await.expect("host 1 stops cleanly");

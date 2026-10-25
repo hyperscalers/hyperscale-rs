@@ -11,6 +11,7 @@ use hyperscale_node::TxStatusCache;
 use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, TxsInFlight};
 use serde::{Deserialize, Serialize};
 
+use crate::observe::HeaderRing;
 use crate::status::SyncStatus;
 
 /// Shared RPC state publishers — whole-value `ArcSwap`s the runner and
@@ -24,6 +25,9 @@ pub struct RpcPublishers {
     pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
     /// Per-signer mempool snapshots feeding RPC submission backpressure.
     pub mempool: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+    /// The last hour of certified headers per shard, kept by the beacon
+    /// thread.
+    pub headers: Arc<HeaderRing>,
 }
 
 /// Submit a locally-issued transaction to the runner.

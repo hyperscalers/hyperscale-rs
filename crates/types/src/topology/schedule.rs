@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    Anchor, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, PriceTable, RecoveryBinding,
-    ReshapeThresholds, ShardAnchor, ShardForkProof, ShardId, ShardTrie, TopologySnapshot,
-    ValidatorId, WeightedTimestamp,
+    Anchor, BlockHeader, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, PriceTable,
+    RecoveryBinding, ReshapeThresholds, ShardAnchor, ShardForkProof, ShardId, ShardTrie,
+    TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// A window this schedule does not hold as the fold before it first
@@ -1217,6 +1217,31 @@ impl TopologySchedule {
         qc_wt: WeightedTimestamp,
     ) -> Option<(&Arc<TopologySnapshot>, bool)> {
         Self::resolved(self.lookup_for_shard_certified(shard, anchor_wt, qc_wt))
+    }
+
+    /// The anchor that selects the committee which signed the QC over
+    /// `header`'s block. A block's committee anchors on its parent, so the
+    /// window that signed is the one the parent dates itself in:
+    /// `parent_anchor`, the held parent's own `parent_qc` timestamp, when the
+    /// caller holds the parent. Without it, the head's attested boundary
+    /// stands in when it names the parent, and otherwise the header's own
+    /// anchor does, the same window except across an epoch cut.
+    #[must_use]
+    pub fn signing_anchor(
+        &self,
+        shard: ShardId,
+        header: &BlockHeader,
+        parent_anchor: Option<WeightedTimestamp>,
+    ) -> WeightedTimestamp {
+        parent_anchor.unwrap_or_else(|| {
+            self.head()
+                .boundary(shard)
+                .filter(|boundary| boundary.block_hash == header.parent_block_hash())
+                .map_or_else(
+                    || header.parent_qc().weighted_timestamp(),
+                    |boundary| boundary.weighted_timestamp,
+                )
+        })
     }
 
     /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) for

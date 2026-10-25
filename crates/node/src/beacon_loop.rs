@@ -44,10 +44,10 @@ use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
     BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
-    BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, Epoch, GenesisConfigHash, LeafIndex,
-    LocalTimestamp, MessageClass, NetworkDefinition, ShardId, ShardVoteEquivocation, Signer,
-    TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verifier, Verify,
-    verify_shard_vote_equivocation,
+    BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlockHeader, Epoch,
+    GenesisConfigHash, LeafIndex, LocalTimestamp, MessageClass, NetworkDefinition, ShardId,
+    ShardVoteEquivocation, Signer, TopologySchedule, TopologySnapshot, ValidatorId,
+    ValidatorStatus, Verifiable, Verified, Verifier, Verify, verify_shard_vote_equivocation,
 };
 use tracing::warn;
 
@@ -95,6 +95,12 @@ where
     /// `Action::ReconfigureParticipation` — the seat/drain triggers the runner
     /// acts on. Cleared at step entry, drained into the step's `StepOutput`.
     pub(crate) pending_participation_changes: Vec<ParticipationChange>,
+
+    /// Per-step scratch: every certified header a chain loop reported this
+    /// step, its own or a remote shard's, for a host that summarises them
+    /// ([`Self::take_admitted`]). Cleared at step entry, so a host that never
+    /// drains it holds one step's worth at most.
+    pending_admitted: Vec<Arc<Verified<CertifiedBlockHeader>>>,
 
     /// Per-step scratch: timer operations, each owned by the participant
     /// that armed it or by the loop for its fetch tick.
@@ -158,6 +164,7 @@ where
             proof_routes: BTreeMap::new(),
             now,
             pending_participation_changes: Vec::new(),
+            pending_admitted: Vec::new(),
             pending_timer_ops: Vec::new(),
             actions_generated: 0,
             beacon_block,
@@ -320,6 +327,7 @@ where
     /// before dispatch so the drained output reflects only this step.
     pub(crate) fn clear_scratch(&mut self) {
         self.pending_participation_changes.clear();
+        self.pending_admitted.clear();
         self.pending_timer_ops.clear();
         self.actions_generated = 0;
     }
@@ -335,6 +343,20 @@ where
         self.clear_scratch();
         self.dispatch_event(input);
         self.take_output()
+    }
+
+    /// The certified headers reported since the last step began, oldest
+    /// first, emptying the scratch. The production beacon thread drains it
+    /// after each step to keep its header summaries.
+    pub fn take_admitted(&mut self) -> Vec<Arc<Verified<CertifiedBlockHeader>>> {
+        std::mem::take(&mut self.pending_admitted)
+    }
+
+    /// The topology schedule the fold keeps: every retained epoch's
+    /// committees, by which a reported header's signers resolve.
+    #[must_use]
+    pub const fn schedule(&self) -> &TopologySchedule {
+        self.fold.schedule()
     }
 
     /// Drain this step's scratch into a [`StepOutput`]. The loop emits no
@@ -733,15 +755,18 @@ where
         }
         match input {
             BeaconInput::LocalCommit { header } => {
+                self.pending_admitted.push(Arc::clone(&header));
                 let actions = self.fold.on_local_block_committed(chain, &header);
                 self.run_fold_actions(actions);
                 self.release_awaited_proposals();
             }
             BeaconInput::CertifiedHeader { header } => {
+                self.pending_admitted.push(Arc::clone(&header));
                 self.fold.on_certified_local_header(chain, &header);
                 self.release_awaited_proposals();
             }
             BeaconInput::SourceHeader { header } => {
+                self.pending_admitted.push(Arc::clone(&header));
                 let actions = self.fold.on_source_header(&header);
                 self.run_fold_actions(actions);
                 self.release_awaited_proposals();

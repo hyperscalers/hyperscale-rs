@@ -6,6 +6,8 @@
 //! which is fixed for the life of the process, so the loop is never
 //! rebuilt. Chains register and deregister with it over its channel.
 
+use std::sync::Arc;
+
 use crossbeam::channel::{Sender, unbounded};
 use tokio::sync::oneshot;
 use tracing::warn;
@@ -30,6 +32,7 @@ impl ShardSupervisor {
             shutdown_rx,
             participation_tx: self.participation_tx.clone(),
             genesis_offset_ms: self.genesis_offset_ms,
+            headers: Arc::clone(&self.publishers.headers),
         };
         let join = spawn_beacon_loop(beacon, cfg, exited);
         self.beacon = Some(BeaconThread { join, shutdown_tx });

@@ -18,10 +18,13 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbConfig, RocksDbShardStorage};
-use hyperscale_types::{BeaconChainConfig, GenesisValidators, ShardId, shard_prefix_path};
+use hyperscale_types::{
+    BeaconChainConfig, BlockHeight, GenesisValidators, ShardId, shard_prefix_path,
+};
 use tokio::runtime::{Handle as TokioHandle, RuntimeFlavor};
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::observe::{HeaderRing, HeaderSummary};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, PreviewSender, TxSubmissionSender};
 use crate::transport::TransportConfig;
 use crate::{
@@ -95,6 +98,7 @@ pub struct Node {
     submit: TxSubmissionSender,
     preview: PreviewSender,
     tx_status: Arc<TxStatusCache>,
+    headers: Arc<HeaderRing>,
     shutdown: Option<ShutdownHandle>,
     running: JoinHandle<Result<(), RunnerError>>,
 }
@@ -164,6 +168,7 @@ impl Node {
         let submit = runner.tx_submission_sender();
         let preview = runner.preview_sender();
         let tx_status = runner.tx_status_cache();
+        let headers = runner.header_ring();
         let shutdown = runner.shutdown_handle();
         let running = runtime.spawn(runner.run());
 
@@ -174,6 +179,7 @@ impl Node {
             submit,
             preview,
             tx_status,
+            headers,
             shutdown,
             running,
         })
@@ -216,6 +222,14 @@ impl Node {
     #[must_use]
     pub fn tx_status(&self) -> Arc<TxStatusCache> {
         Arc::clone(&self.tx_status)
+    }
+
+    /// The certified headers this host has seen for `shard` from `since` on,
+    /// oldest first: the last hour of them, each with its signers and the
+    /// proposers whose rounds failed before it.
+    #[must_use]
+    pub fn headers(&self, shard: ShardId, since: BlockHeight) -> Vec<HeaderSummary> {
+        self.headers.since(shard, since)
     }
 
     /// The handle that stops the host, for a caller that stops it from
