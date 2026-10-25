@@ -131,7 +131,8 @@ pub(super) fn abort_rotations(state: &mut BeaconState, shard: ShardId) {
 /// which is sized so the open window is a bounded fraction of it.
 ///
 /// Shards iterate in sorted [`ShardId`] order; the victim within each
-/// shard is its longest-tenured ready member — the smallest
+/// shard is the head of its [`rotation_order`](BeaconState::rotation_order), its longest-tenured
+/// ready member that no merge holds and no open rotation names — the smallest
 /// `(placed_at_epoch, ValidatorId)`, the id breaking ties within a
 /// cohort placed together. The fixed tenure is load-bearing: a victim
 /// drawn from `state.randomness` hands a randomness grinder a lever to
@@ -219,43 +220,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         if in_flight >= state.chain_config.max_rotations_in_flight() {
             continue;
         }
-        // Bind the candidate set to validators whose status records
-        // *this* shard. The global invariant `members ⇔ status ==
-        // OnShard { shard: s, .. }` holds today; matching the shard
-        // here means a future bug that drops a transition site (a
-        // stale `members` entry pointing at a different shard) fails
-        // to a skipped shuffle rather than picking from the wrong
-        // shard.
-        let victim = state
-            .next_shard_committees
-            .get(&shard)
-            .expect("just iterated")
-            .members
-            .iter()
-            .filter_map(|id| match state.validators.get(id).map(|r| r.status) {
-                Some(ValidatorStatus::OnShard {
-                    shard: s,
-                    ready: true,
-                    placed_at_epoch,
-                }) if s == shard => Some((placed_at_epoch, *id)),
-                _ => None,
-            })
-            // A pending merge's keepers must hold their child until they
-            // sync the sibling half, so rotation skips them — their
-            // departure would strand the merged committee below quorum.
-            .filter(|(_, id)| !state.is_merge_keeper(shard, *id))
-            // A member already named by an open rotation is spoken for.
-            // Without this the same longest-tenured member would be named
-            // again every interval, seating entrant after entrant against
-            // one seat while the rest of the committee never aged.
-            .filter(|(_, id)| {
-                !state
-                    .pending_rotations
-                    .get(&shard)
-                    .is_some_and(|rotations| rotations.contains_key(id))
-            })
-            .min();
-        let Some((_, victim)) = victim else {
+        let Some(&victim) = state.rotation_order(shard).first() else {
             continue;
         };
         // An empty pool leaves the rotation unopened rather than half

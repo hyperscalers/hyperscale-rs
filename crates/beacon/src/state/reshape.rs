@@ -1820,6 +1820,90 @@ mod tests {
         }
     }
 
+    /// A rotation's victim is the head of the shard's rotation order on the
+    /// state the shuffle reads. Each exclusion is placed at genesis, so it
+    /// would head the order but for what excludes it: a merge keeper, the
+    /// victim of a rotation already open, and an unready member.
+    #[test]
+    fn the_shuffle_retires_the_head_of_the_rotation_order() {
+        use hyperscale_types::PendingRotation;
+
+        use crate::state::committee::run_shuffle_step;
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(4);
+        let boundary = Epoch::new(state.chain_config.shuffle_interval_epochs());
+        let merge = merge_assertion(parent);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+        let keepers: Vec<ValidatorId> = keepers_of(&state, parent)
+            .into_iter()
+            .filter(|(_, seat)| seat.child == left)
+            .map(|(id, _)| id)
+            .collect();
+        let others: Vec<ValidatorId> = state.next_shard_committees[&left]
+            .members
+            .iter()
+            .copied()
+            .filter(|id| !keepers.contains(id))
+            .collect();
+        let [spoken_for, unready] = others[..] else {
+            panic!("two of the left child's four members are keepers");
+        };
+
+        // Two later members: the head, placed at epoch 1, and the open
+        // rotation's entrant, placed at epoch 2 and readied, so the open
+        // rotation leaves the shard under its in-flight cap.
+        let (head, entrant) = (ValidatorId::new(200), ValidatorId::new(201));
+        for (id, placed) in [(head, 1), (entrant, 2)] {
+            state.validators.insert(
+                id,
+                validator_record(
+                    id.inner(),
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard: left,
+                        ready: true,
+                        placed_at_epoch: Epoch::new(placed),
+                    },
+                ),
+            );
+            state
+                .next_shard_committees
+                .get_mut(&left)
+                .unwrap()
+                .members
+                .push(id);
+        }
+        state.pending_rotations.entry(left).or_default().insert(
+            spoken_for,
+            PendingRotation {
+                entrant,
+                opened_at: Epoch::GENESIS,
+            },
+        );
+        let ValidatorStatus::OnShard { ready, .. } =
+            &mut state.validators.get_mut(&unready).unwrap().status
+        else {
+            unreachable!("a member of the left child");
+        };
+        *ready = false;
+        state.current_epoch = boundary;
+
+        let order = state.rotation_order(left);
+        assert_eq!(order, vec![head, entrant]);
+
+        run_shuffle_step(&mut state);
+
+        let opened: Vec<ValidatorId> = state.pending_rotations[&left]
+            .iter()
+            .filter(|(_, rotation)| rotation.opened_at == boundary)
+            .map(|(victim, _)| *victim)
+            .collect();
+        assert_eq!(opened, vec![order[0]]);
+    }
+
     /// Pairing draws the keepers, and the draw prefers ready members —
     /// which is exactly what a rotation's victim is. Cancel first, so no
     /// keeper seat is handed to a member on its way out and both children

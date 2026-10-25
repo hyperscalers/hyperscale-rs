@@ -3,6 +3,7 @@
 //! chosen port, and on iroh a chosen key), so the second host can be pointed at
 //! the first without reaching into the transport.
 
+use std::collections::BTreeMap;
 use std::net::UdpSocket;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -144,30 +145,28 @@ fn network(epoch_duration_ms: Option<u64>) -> BeaconChainConfig {
     }
 }
 
-/// Two hosts of two co-hosted validators each, the second pointed at the
-/// first.
+/// Two hosts of co-hosted validators, the second pointed at the first.
 fn start_pair(
-    dir0: &Path,
-    dir1: &Path,
+    dirs: [&Path; 2],
     fixtures: &TestFixtures,
-    epoch_duration_ms: Option<u64>,
+    hosted: [&[u32]; 2],
+    beacon_chain: BeaconChainConfig,
 ) -> (Node, Node) {
-    let beacon_chain = network(epoch_duration_ms);
     let listen0 = net::listen(free_port());
     let dial0 = net::dial(&listen0);
     let node0 = Node::start(setup(
-        dir0,
+        dirs[0],
         fixtures,
-        &[0, 1],
+        hosted[0],
         listen0,
         vec![],
         beacon_chain,
     ))
     .expect("start host 0");
     let node1 = Node::start(setup(
-        dir1,
+        dirs[1],
         fixtures,
-        &[2, 3],
+        hosted[1],
         net::listen(free_port()),
         vec![dial0],
         beacon_chain,
@@ -188,7 +187,12 @@ async fn two_co_hosted_nodes_commit() {
     let _ = fmt().with_test_writer().try_init();
     let fixtures = TestFixtures::new(11, 4);
     let (dir0, dir1) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let (node0, node1) = start_pair(dir0.path(), dir1.path(), &fixtures, None);
+    let (node0, node1) = start_pair(
+        [dir0.path(), dir1.path()],
+        &fixtures,
+        [&[0, 1], &[2, 3]],
+        network(None),
+    );
 
     timeout(COMMIT_TIMEOUT, async {
         loop {
@@ -256,7 +260,12 @@ async fn each_observation_carries_its_epochs_effects() {
     let _ = fmt().with_test_writer().try_init();
     let fixtures = TestFixtures::new(13, 4);
     let (dir0, dir1) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let (node0, node1) = start_pair(dir0.path(), dir1.path(), &fixtures, Some(SHORT_EPOCH_MS));
+    let (node0, node1) = start_pair(
+        [dir0.path(), dir1.path()],
+        &fixtures,
+        [&[0, 1], &[2, 3]],
+        network(Some(SHORT_EPOCH_MS)),
+    );
 
     let mut seen = Vec::new();
     for node in [&node0, &node1] {
@@ -292,6 +301,75 @@ async fn each_observation_carries_its_epochs_effects() {
         seen.push(last.genesis);
     }
     assert_eq!(seen[0], seen[1], "one network, one genesis");
+
+    node0.stop().await.expect("host 0 stops cleanly");
+    node1.stop().await.expect("host 1 stops cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_rotation_retires_the_head_of_the_published_order() {
+    let _ = fmt().with_test_writer().try_init();
+    // Five seated on the root shard and one pooled, so the beacon-eligible
+    // set clears its floor and the shuffle has an entrant to draw. A
+    // one-epoch ready timeout puts the first shuffle boundary at epoch 2.
+    let fixtures = TestFixtures::with_surplus(17, 5, 1);
+    let beacon_chain = BeaconChainConfig {
+        shard_size: 5,
+        ready_timeout_epochs: 1,
+        ..network(Some(SHORT_EPOCH_MS))
+    };
+    let (dir0, dir1) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (node0, node1) = start_pair(
+        [dir0.path(), dir1.path()],
+        &fixtures,
+        [&[0, 1, 2], &[3, 4, 5]],
+        beacon_chain,
+    );
+
+    let mut observe = node0.observe();
+    let mut published = BTreeMap::new();
+    let (boundary, before, after) = timeout(COMMIT_TIMEOUT, async {
+        loop {
+            observe.changed().await.expect("the host publishes");
+            let Some(observation) = observe.borrow_and_update().clone() else {
+                continue;
+            };
+            let epoch = observation.beacon.current_epoch;
+            let opened = observation
+                .beacon
+                .pending_rotations
+                .get(&ShardId::ROOT)
+                .is_some_and(|rotations| rotations.values().any(|r| r.opened_at == epoch));
+            if opened {
+                let before = published
+                    .remove(&(epoch.inner() - 1))
+                    .expect("the epoch before the boundary was published");
+                return (epoch, before, observation);
+            }
+            published.insert(epoch.inner(), observation);
+        }
+    })
+    .await
+    .expect("the root shard opens a rotation");
+
+    // Nothing the boundary folded ahead of its shuffle moved the order.
+    let (_, effects) = after
+        .effects
+        .iter()
+        .find(|(epoch, _)| *epoch == boundary)
+        .expect("the boundary's effects");
+    assert!(effects.jailed.is_empty() && effects.readied.is_empty());
+    assert_eq!(before.beacon.params, after.beacon.params);
+
+    assert_eq!(before.answers.next_shuffle_epoch, boundary);
+    let victims: Vec<ValidatorId> = after.beacon.pending_rotations[&ShardId::ROOT]
+        .iter()
+        .filter(|(_, rotation)| rotation.opened_at == boundary)
+        .map(|(victim, _)| *victim)
+        .collect();
+    let order = &before.answers.rotation_order[&ShardId::ROOT];
+    assert_eq!(victims, vec![order[0]], "order published: {order:?}");
 
     node0.stop().await.expect("host 0 stops cleanly");
     node1.stop().await.expect("host 1 stops cleanly");
