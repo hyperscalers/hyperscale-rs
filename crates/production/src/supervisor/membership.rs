@@ -259,6 +259,7 @@ impl ShardSupervisor {
         if fresh_store && topology_snapshot.boundary(shard).is_some() {
             let process = Arc::clone(&self.process);
             let events = self.events_tx.clone();
+            let gauge = self.publishers.importing.gauge(shard);
             self.tokio_handle.spawn(async move {
                 let done = match bootstrap_shard_state(
                     process.network(),
@@ -266,6 +267,7 @@ impl ShardSupervisor {
                     &storage,
                     shard,
                     None,
+                    gauge,
                 )
                 .await
                 {
@@ -595,6 +597,7 @@ impl ShardSupervisor {
         let process = Arc::clone(&self.process);
         let events = self.events_tx.clone();
         let vnodes = vnodes.to_vec();
+        let gauge = self.publishers.importing.gauge(shard);
         self.tokio_handle.spawn(async move {
             let opened = spawn_blocking(move || {
                 // A staging directory an interrupted rebuild left behind
@@ -617,6 +620,7 @@ impl ShardSupervisor {
                     &storage,
                     shard,
                     Some(old),
+                    gauge,
                 )
                 .await
                 .map(|recovered| CompletedBootstrap {

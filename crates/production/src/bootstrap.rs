@@ -31,6 +31,8 @@ use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+use crate::observe::ImportGauge;
+
 /// Pause between rounds that made no progress, so an unreachable or
 /// still-syncing committee isn't hammered.
 const FRUITLESS_ROUND_PAUSE: Duration = Duration::from_secs(1);
@@ -64,6 +66,7 @@ pub async fn bootstrap_shard_state<S, N>(
     storage: &Arc<S>,
     shard: ShardId,
     local: Option<Arc<S>>,
+    gauge: ImportGauge,
 ) -> Result<RecoveredState, String>
 where
     S: ShardStorage,
@@ -112,6 +115,7 @@ where
                 .map_err(|error| format!("import staging wipe failed: {error}"))?;
             ShardBootstrap::new(shard, anchor, anchor_qc, floor)
         };
+        gauge.record(bootstrap.imported_substate_bytes());
         let bootstrap = Arc::new(Mutex::new(bootstrap));
         let mut fruitless = 0u32;
         while !lock(&bootstrap).is_complete() {
@@ -135,6 +139,7 @@ where
             }
 
             let round = pump_round(network, shard, storage, &bootstrap, &mut local).await?;
+            gauge.record(lock(&bootstrap).imported_substate_bytes());
             if round.accepted == 0 {
                 fruitless += 1;
                 let refresh_due = fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH;
@@ -521,8 +526,14 @@ mod tests {
     };
 
     use super::*;
+    use crate::observe::Importing;
 
     const ENTRIES: u8 = 12;
+
+    /// A gauge nothing reads, for imports the test only awaits.
+    fn gauge(shard: ShardId) -> ImportGauge {
+        Arc::new(Importing::default()).gauge(shard)
+    }
 
     /// A committed replica: `ENTRIES` substate blocks, then a boundary
     /// block whose header carries the (empty) witness commitment, pinned
@@ -681,11 +692,21 @@ mod tests {
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 3));
         let topology_snapshot = shared_topology(anchor, shard);
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
+        let importing = Arc::new(Importing::default());
 
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
-            .await
-            .expect("bootstrap succeeds");
+        let recovered = bootstrap_shard_state(
+            &network,
+            &topology_snapshot,
+            &fresh,
+            shard,
+            None,
+            importing.gauge(shard),
+        )
+        .await
+        .expect("bootstrap succeeds");
 
+        // A finished import leaves nothing in progress.
+        assert!(importing.snapshot().is_empty());
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -709,10 +730,16 @@ mod tests {
         let topology_snapshot = shared_topology(anchor, shard);
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
 
-        let recovered =
-            bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, Some(local))
-                .await
-                .expect("bootstrap succeeds");
+        let recovered = bootstrap_shard_state(
+            &network,
+            &topology_snapshot,
+            &fresh,
+            shard,
+            Some(local),
+            gauge(shard),
+        )
+        .await
+        .expect("bootstrap succeeds");
 
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -763,9 +790,16 @@ mod tests {
 
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
         let topology_snapshot = shared_topology(anchor, shard);
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
-            .await
-            .expect("bootstrap succeeds");
+        let recovered = bootstrap_shard_state(
+            &network,
+            &topology_snapshot,
+            &fresh,
+            shard,
+            None,
+            gauge(shard),
+        )
+        .await
+        .expect("bootstrap succeeds");
 
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
         assert_eq!(fresh.state_root(), anchor.state_root);
@@ -798,9 +832,16 @@ mod tests {
 
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
         let topology_snapshot = shared_topology(anchor, shard);
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
-            .await
-            .expect("bootstrap succeeds");
+        let recovered = bootstrap_shard_state(
+            &network,
+            &topology_snapshot,
+            &fresh,
+            shard,
+            None,
+            gauge(shard),
+        )
+        .await
+        .expect("bootstrap succeeds");
 
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
         // The wipe removed the poisoned chunk; the full fan-out ran.
@@ -839,9 +880,16 @@ mod tests {
         }));
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
 
-        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
-            .await
-            .expect("bootstrap succeeds");
+        let recovered = bootstrap_shard_state(
+            &network,
+            &topology_snapshot,
+            &fresh,
+            shard,
+            None,
+            gauge(shard),
+        )
+        .await
+        .expect("bootstrap succeeds");
 
         assert_eq!(recovered.committed_height, advanced.height);
         assert_eq!(fresh.state_root(), advanced.state_root);

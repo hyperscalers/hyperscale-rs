@@ -6,6 +6,7 @@
 //! first-wins statics the runner already sets; tracing, signals and the
 //! allocator stay with the embedder.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,15 +17,16 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_node::TxStatusCache;
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::BeaconStorage;
+use hyperscale_storage::{BeaconChainReader, BeaconStorage};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbConfig, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, GenesisValidators, ShardId, shard_prefix_path,
 };
 use tokio::runtime::{Handle as TokioHandle, RuntimeFlavor};
+use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 
-use crate::observe::{HeaderRing, HeaderSummary};
+use crate::observe::{HeaderRing, HeaderSummary, Importing, Observation};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, PreviewSender, TxSubmissionSender};
 use crate::transport::TransportConfig;
 use crate::{
@@ -99,6 +101,9 @@ pub struct Node {
     preview: PreviewSender,
     tx_status: Arc<TxStatusCache>,
     headers: Arc<HeaderRing>,
+    observe: watch::Receiver<Option<Arc<Observation>>>,
+    history: Arc<dyn BeaconChainReader>,
+    importing: Arc<Importing>,
     shutdown: Option<ShutdownHandle>,
     running: JoinHandle<Result<(), RunnerError>>,
 }
@@ -132,7 +137,7 @@ impl Node {
         });
 
         let beacon_path = setup.data_dir.join("beacon").join("db");
-        let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(
+        let beacon_db = Arc::new(
             RocksDbBeaconStorage::open_with_config(&beacon_path, &setup.storage).map_err(|e| {
                 NodeError::BeaconStore {
                     path: beacon_path.clone(),
@@ -140,6 +145,8 @@ impl Node {
                 }
             })?,
         );
+        let beacon_storage: Arc<dyn BeaconStorage> = Arc::clone(&beacon_db) as _;
+        let history: Arc<dyn BeaconChainReader> = beacon_db;
 
         let status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default())));
         let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
@@ -169,6 +176,8 @@ impl Node {
         let preview = runner.preview_sender();
         let tx_status = runner.tx_status_cache();
         let headers = runner.header_ring();
+        let observe = runner.observe();
+        let importing = runner.importing();
         let shutdown = runner.shutdown_handle();
         let running = runtime.spawn(runner.run());
 
@@ -180,6 +189,9 @@ impl Node {
             preview,
             tx_status,
             headers,
+            observe,
+            history,
+            importing,
             shutdown,
             running,
         })
@@ -230,6 +242,29 @@ impl Node {
     #[must_use]
     pub fn headers(&self, shard: ShardId, since: BlockHeight) -> Vec<HeaderSummary> {
         self.headers.since(shard, since)
+    }
+
+    /// What the host's beacon thread has seen, republished after each step
+    /// that changed it: the latest committed beacon state, each shard's
+    /// newest certified header, and the last day of adopted epochs with
+    /// what each settled. `None` until the thread's first step.
+    #[must_use]
+    pub fn observe(&self) -> watch::Receiver<Option<Arc<Observation>>> {
+        self.observe.clone()
+    }
+
+    /// The bytes each shard's snap-sync import has staged, for every import
+    /// in progress: a shard this host is copying before it can sign.
+    #[must_use]
+    pub fn importing(&self) -> BTreeMap<ShardId, u64> {
+        self.importing.snapshot()
+    }
+
+    /// The committed beacon chain, for history the observation does not
+    /// carry: any epoch's block and state.
+    #[must_use]
+    pub fn history(&self) -> Arc<dyn BeaconChainReader> {
+        Arc::clone(&self.history)
     }
 
     /// The handle that stops the host, for a caller that stops it from

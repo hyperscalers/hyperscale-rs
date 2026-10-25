@@ -51,17 +51,18 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, Derivation, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS,
-    NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight, ValidatorId,
+    BeaconChainConfig, Derivation, GenesisConfigHash, GenesisValidators, LocalTimestamp,
+    MAX_UNSETTLED_TXS, NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight,
+    ValidatorId,
 };
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, error, info, warn};
 
-use crate::observe::HeaderRing;
+use crate::observe::{HeaderRing, Importing, Observation, Observations, Observer};
 use crate::rpc::state::{PreviewSender, RpcPublishers, VnodeMempoolSnapshot};
 use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
@@ -786,6 +787,19 @@ impl ProductionRunner {
     #[must_use]
     pub fn header_ring(&self) -> Arc<HeaderRing> {
         Arc::clone(&self.publishers.headers)
+    }
+
+    /// Bytes staged by each snap-sync import in progress.
+    #[must_use]
+    pub fn importing(&self) -> Arc<Importing> {
+        Arc::clone(&self.publishers.importing)
+    }
+
+    /// What the beacon thread has seen, as of its latest step; `None` until
+    /// its first.
+    #[must_use]
+    pub fn observe(&self) -> watch::Receiver<Option<Arc<Observation>>> {
+        self.publishers.observations.subscribe()
     }
 
     /// Get the process-wide transaction status cache shared from
@@ -1638,6 +1652,11 @@ pub struct BeaconLoopConfig {
     pub(crate) genesis_offset_ms: u64,
     /// Where each step's reported headers are summarised and kept.
     pub(crate) headers: Arc<HeaderRing>,
+    /// Where each step's observation is published.
+    pub(crate) observations: Observations,
+    /// The genesis this host's network started from, stamped on every
+    /// observation.
+    pub(crate) genesis: GenesisConfigHash,
 }
 
 /// Apply one beacon step's output: fold its timer ops into the loop's
@@ -1699,7 +1718,10 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         participation_tx,
         genesis_offset_ms,
         headers,
+        observations,
+        genesis,
     } = config;
+    let mut observer = Observer::new(genesis, headers, observations);
 
     let mut deadlines: BTreeMap<(TimerOwner, TimerId), LocalTimestamp> = BTreeMap::new();
 
@@ -1712,7 +1734,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
     beacon.set_time(now);
     let startup = beacon.startup_output();
     apply_beacon_step_output(&mut deadlines, &participation_tx, now, startup);
-    headers.admit(beacon.take_admitted(), beacon.schedule());
+    observe_step(&mut observer, beacon);
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -1727,7 +1749,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         for input in take_due_beacon_timers(&mut deadlines, now) {
             let output = beacon.run_step(input);
             apply_beacon_step_output(&mut deadlines, &participation_tx, now, output);
-            headers.admit(beacon.take_admitted(), beacon.schedule());
+            observe_step(&mut observer, beacon);
         }
 
         let wake = beacon_wake(&deadlines, now);
@@ -1751,8 +1773,15 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         };
         let output = beacon.run_step(input);
         apply_beacon_step_output(&mut deadlines, &participation_tx, now, output);
-        headers.admit(beacon.take_admitted(), beacon.schedule());
+        observe_step(&mut observer, beacon);
     }
+}
+
+/// Hand the step's adopted epochs and reported headers to the observer.
+fn observe_step(observer: &mut Observer, beacon: &mut ProdBeaconLoop) {
+    let adopted = beacon.take_adopted();
+    let admitted = beacon.take_admitted();
+    observer.step(adopted, admitted, beacon.beacon_state(), beacon.schedule());
 }
 
 /// Remove every beacon timer due at `now` from the table, returning the
