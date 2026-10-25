@@ -61,6 +61,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, error, info, warn};
 
+use crate::observe::HeaderRing;
 use crate::rpc::state::{PreviewSender, RpcPublishers, VnodeMempoolSnapshot};
 use crate::rpc::{
     MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
@@ -778,6 +779,13 @@ impl ProductionRunner {
     #[must_use]
     pub const fn topology_snapshot(&self) -> &SharedTopologySnapshot {
         &self.topology_snapshot
+    }
+
+    /// The certified headers the beacon thread keeps, the last hour per
+    /// shard, summarised against the committees that signed them.
+    #[must_use]
+    pub fn header_ring(&self) -> Arc<HeaderRing> {
+        Arc::clone(&self.publishers.headers)
     }
 
     /// Get the process-wide transaction status cache shared from
@@ -1628,6 +1636,8 @@ pub struct BeaconLoopConfig {
     pub(crate) participation_tx: mpsc::UnboundedSender<ParticipationChange>,
     /// Genesis instant the consensus clock is measured against.
     pub(crate) genesis_offset_ms: u64,
+    /// Where each step's reported headers are summarised and kept.
+    pub(crate) headers: Arc<HeaderRing>,
 }
 
 /// Apply one beacon step's output: fold its timer ops into the loop's
@@ -1688,6 +1698,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         shutdown_rx,
         participation_tx,
         genesis_offset_ms,
+        headers,
     } = config;
 
     let mut deadlines: BTreeMap<(TimerOwner, TimerId), LocalTimestamp> = BTreeMap::new();
@@ -1701,6 +1712,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
     beacon.set_time(now);
     let startup = beacon.startup_output();
     apply_beacon_step_output(&mut deadlines, &participation_tx, now, startup);
+    headers.admit(beacon.take_admitted(), beacon.schedule());
 
     loop {
         if shutdown_rx.try_recv().is_ok() {
@@ -1715,6 +1727,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         for input in take_due_beacon_timers(&mut deadlines, now) {
             let output = beacon.run_step(input);
             apply_beacon_step_output(&mut deadlines, &participation_tx, now, output);
+            headers.admit(beacon.take_admitted(), beacon.schedule());
         }
 
         let wake = beacon_wake(&deadlines, now);
@@ -1738,6 +1751,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         };
         let output = beacon.run_step(input);
         apply_beacon_step_output(&mut deadlines, &participation_tx, now, output);
+        headers.admit(beacon.take_admitted(), beacon.schedule());
     }
 }
 
