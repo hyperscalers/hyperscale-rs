@@ -185,3 +185,10 @@ service_name = "hyperscale-validator"
 # [[genesis.validators]]
 # id = 3
 # public_key = "9876543210abcdef..."
+#
+# Staking pools seated at genesis. Every genesis validator belongs to pool 0,
+# and genesis fills each pool's founding members from the validator set.
+#
+# [[genesis.pools]]
+# id = 0
+# operator = "0123456789abcdef..." # 64 hex chars, the account given the pool's owner badge

@@ -69,7 +69,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{CompressionType as RocksCompressionType, RocksDbConfig};
 use hyperscale_types::{
     Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition,
-    PrincipalAddr, Signer, ValidatorId, ValidatorInfo, ValidatorSet,
+    PrincipalAddr, Signer, StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use serde::Deserialize;
 use tokio::runtime::Builder as RuntimeBuilder;
@@ -450,6 +450,25 @@ pub(crate) struct GenesisConfig {
     /// *is* its shard placement, so the list needs no routing metadata.
     #[serde(default)]
     pub(crate) accounts: Vec<AccountBalanceEntry>,
+
+    /// Staking pools seated at genesis. Every genesis validator belongs to
+    /// pool 0, so a network whose validators vote on parameters seats pool 0.
+    #[serde(default)]
+    pub(crate) pools: Vec<PoolEntry>,
+}
+
+/// A staking pool seated at genesis. Its founding members are not listed:
+/// genesis fills them from the validator set, for the pool whose id they
+/// share.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PoolEntry {
+    /// The id the beacon folds the pool's facts under.
+    pub(crate) id: u32,
+
+    /// Hex-encoded 32-byte address of the account that receives the pool's
+    /// owner badge.
+    pub(crate) operator: String,
 }
 
 /// A funded-account entry for genesis configuration.
@@ -670,14 +689,7 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<EngineGenesisCo
     let mut engine_config = EngineGenesisConfig::default();
 
     for entry in &config.accounts {
-        let bytes = hex_decode(&entry.address)
-            .map_err(|e| anyhow::anyhow!("Invalid address '{}': {e}", entry.address))?;
-        let raw = <[u8; 32]>::try_from(bytes.as_slice())
-            .map_err(|_| anyhow::anyhow!("Address '{}' is not 32 bytes", entry.address))?;
-        let address = Address::from_bytes(raw)
-            .map_err(|e| anyhow::anyhow!("Address '{}': {e}", entry.address))?;
-        let address = PrincipalAddr::try_from(address)
-            .map_err(|e| anyhow::anyhow!("Address '{}': {e}", entry.address))?;
+        let address = parse_principal(&entry.address)?;
         let balance = entry
             .balance
             .parse::<u128>()
@@ -685,12 +697,30 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<EngineGenesisCo
         engine_config.accounts.push((address, balance));
     }
 
+    for entry in &config.pools {
+        engine_config.pools.push(StakePoolSeat {
+            id: StakePoolId::new(entry.id),
+            operator: parse_principal(&entry.operator)?,
+            founding: Vec::new(),
+        });
+    }
+
     info!(
         accounts = engine_config.accounts.len(),
-        "Parsed genesis balances"
+        pools = engine_config.pools.len(),
+        "Parsed genesis balances and pools"
     );
 
     Ok(engine_config)
+}
+
+/// A principal's address from its 64 hex characters.
+fn parse_principal(hex: &str) -> Result<PrincipalAddr> {
+    let bytes = hex_decode(hex).map_err(|e| anyhow::anyhow!("Invalid address '{hex}': {e}"))?;
+    let raw = <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow::anyhow!("Address '{hex}' is not 32 bytes"))?;
+    let address = Address::from_bytes(raw).map_err(|e| anyhow::anyhow!("Address '{hex}': {e}"))?;
+    PrincipalAddr::try_from(address).map_err(|e| anyhow::anyhow!("Address '{hex}': {e}"))
 }
 
 /// Compute (consensus, throughput) pool thread counts for the given host
@@ -1044,6 +1074,10 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
+    use hyperscale_scenarios::tx::world_pools;
+
     use super::*;
 
     #[cfg(unix)]
@@ -1117,6 +1151,34 @@ mod tests {
         let pool_config = build_thread_pool_config(&config);
         assert_eq!(pool_config.consensus_threads, 3);
         assert_eq!(pool_config.throughput_threads, 14);
+    }
+
+    /// A `pools` table seats exactly the pools it names: the scenario
+    /// world's seats, written out as an operator would, read back equal.
+    #[test]
+    fn genesis_pools_parse_to_their_seats() {
+        let seats = world_pools();
+        let mut toml = String::new();
+        for seat in &seats {
+            writeln!(
+                toml,
+                "[[pools]]\nid = {}\noperator = \"{}\"",
+                seat.id.inner(),
+                hex_encode(seat.operator.to_bytes())
+            )
+            .expect("writing to a string");
+        }
+        let genesis: GenesisConfig = toml_from_str(&toml).expect("pools table parses");
+        let engine = build_engine_genesis_config(&genesis).expect("pools build");
+        assert_eq!(engine.pools, seats);
+    }
+
+    /// Founding members come from the validator set, never the config: a
+    /// listed one would enter the genesis hash and then be overwritten.
+    #[test]
+    fn genesis_pools_refuse_founding_members() {
+        let toml = "[[pools]]\nid = 0\noperator = \"00\"\nfounding = []\n";
+        assert!(toml_from_str::<GenesisConfig>(toml).is_err());
     }
 
     /// The shipped example config must satisfy the `deny_unknown_fields`
