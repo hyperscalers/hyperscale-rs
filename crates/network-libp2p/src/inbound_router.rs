@@ -99,8 +99,7 @@ impl PeerRateState {
 
 /// Handle for the inbound router tasks.
 ///
-/// Kept alive inside `Libp2pNetwork` to prevent the tokio tasks from
-/// being aborted when the `JoinHandle`s are dropped. One request accept
+/// Owned by `Libp2pNetwork`; dropping it aborts every loop. One request accept
 /// loop per hosted shard — keyed so a single shard's loop can be
 /// started or stopped when shard participation changes — plus the
 /// singleton notify handle.
@@ -108,7 +107,6 @@ pub struct InboundRouterHandle {
     router: Arc<InboundRouter>,
     control: Control,
     request_handles: DashMap<ShardId, JoinHandle<()>>,
-    #[allow(dead_code)]
     notify_handle: JoinHandle<()>,
 }
 
@@ -133,6 +131,17 @@ impl InboundRouterHandle {
         if let Some((_, handle)) = self.request_handles.remove(&shard) {
             handle.abort();
         }
+    }
+}
+
+/// The loops hold the router, and through its registry the handlers' stores;
+/// left to run, they outlive the network that owned them.
+impl Drop for InboundRouterHandle {
+    fn drop(&mut self) {
+        for entry in &self.request_handles {
+            entry.value().abort();
+        }
+        self.notify_handle.abort();
     }
 }
 
