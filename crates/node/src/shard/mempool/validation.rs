@@ -472,8 +472,8 @@ where
                         )],
                     });
             }
-            SubmitFanout::NoHostedShard => {
-                tracing::warn!("Dropping locally-submitted transaction: host carries no shard");
+            SubmitFanout::PublishDirect { touched_shards } => {
+                self.process.publish_direct(tx, &touched_shards);
             }
             SubmitFanout::Parked | SubmitFanout::Underivable => {}
         }

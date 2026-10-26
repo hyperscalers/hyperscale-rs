@@ -25,8 +25,10 @@ use hyperscale_engine::{
     CodeAvailability, FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport,
     TickEnvironment,
 };
+use hyperscale_hbor::Capped;
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage, SubstateStore};
+use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::{
     Derivation, Epoch, MAX_TXS_PER_BLOCK, ShardId, TopologySchedule, TopologySnapshot, Transaction,
@@ -309,7 +311,8 @@ where
     ///
     /// Otherwise, if no hosted shard is touched, returns
     /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
-    /// hosted shard, but no shard admits or takes ownership.
+    /// hosted shard, but no shard admits or takes ownership — or, on a
+    /// host seated nowhere, [`SubmitFanout::PublishDirect`].
     pub(crate) fn compute_submit_fanout(&self, tx: &Arc<Transaction>) -> SubmitFanout {
         // Ingress bytes are unverified, and routing is a derivation the
         // envelope has to earn: asking an envelope that derives no
@@ -355,9 +358,7 @@ where
                 touched_shards,
             }
         } else {
-            // A host seated nowhere runs no pipeline to admit or gossip
-            // through.
-            SubmitFanout::NoHostedShard
+            SubmitFanout::PublishDirect { touched_shards }
         }
     }
 
@@ -389,6 +390,54 @@ where
         }
         parked.push_back(Arc::clone(tx));
         None
+    }
+}
+
+/// Whether this host is still seating the reshape successor of a shard it
+/// serves, and `touched` reaches that successor: a hosted predecessor
+/// mid-handoff whose trie line holds a touched shard and no other hosted
+/// one. Once the host serves any shard on that line, the handoff it was
+/// waiting on has reached it.
+fn seating_successor(topology: &TopologySnapshot, hosted: &[ShardId], touched: &[ShardId]) -> bool {
+    let on_line = |a: ShardId, b: ShardId| a.is_ancestor_of(b) || b.is_ancestor_of(a);
+    hosted.iter().any(|&predecessor| {
+        topology.reshape_handoff_pending(predecessor)
+            && touched.iter().any(|&shard| on_line(predecessor, shard))
+            && !hosted
+                .iter()
+                .any(|&other| other != predecessor && on_line(predecessor, other))
+    })
+}
+
+impl<S, N, D> ProcessIo<S, N, D>
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    /// Route every parked submission again against the current shards and
+    /// topology. Whatever the fanout now yields is its answer, a renewed
+    /// park included.
+    pub(crate) fn release_parked_submissions(&self) {
+        let released = std::mem::take(
+            &mut *self
+                .parked_submissions
+                .lock()
+                .expect("parked submissions lock"),
+        );
+        for tx in released {
+            self.submit_transaction(&tx);
+        }
+    }
+
+    /// Publish `tx` to each of `touched_shards` as gossip of its own, for a
+    /// host seated nowhere: no shard loop batches it, and the receiving
+    /// committees verify it as any gossip.
+    pub(crate) fn publish_direct(&self, tx: &Arc<Transaction>, touched_shards: &[ShardId]) {
+        let gossip = TransactionGossip::new(Capped::from_array([Arc::clone(tx)]));
+        for &dst in touched_shards {
+            self.network.broadcast_to_shard(dst, &gossip);
+        }
     }
 
     /// Fan a locally-submitted transaction out via
@@ -448,9 +497,8 @@ where
                     ok = false;
                 }
             }
-            SubmitFanout::NoHostedShard => {
-                tracing::warn!("Dropping locally-submitted transaction: host carries no shard");
-                ok = false;
+            SubmitFanout::PublishDirect { touched_shards } => {
+                self.publish_direct(tx, &touched_shards);
             }
             SubmitFanout::WantsRecords { host, wanted } => {
                 let env = HostEvent::shard(
@@ -473,44 +521,6 @@ where
         ok
     }
 
-    /// Route every parked submission again against the current shards and
-    /// topology. Whatever the fanout now yields is its answer, a renewed
-    /// park included.
-    pub(crate) fn release_parked_submissions(&self) {
-        let released = std::mem::take(
-            &mut *self
-                .parked_submissions
-                .lock()
-                .expect("parked submissions lock"),
-        );
-        for tx in released {
-            self.submit_transaction(&tx);
-        }
-    }
-}
-
-/// Whether this host is still seating the reshape successor of a shard it
-/// serves, and `touched` reaches that successor: a hosted predecessor
-/// mid-handoff whose trie line holds a touched shard and no other hosted
-/// one. Once the host serves any shard on that line, the handoff it was
-/// waiting on has reached it.
-fn seating_successor(topology: &TopologySnapshot, hosted: &[ShardId], touched: &[ShardId]) -> bool {
-    let on_line = |a: ShardId, b: ShardId| a.is_ancestor_of(b) || b.is_ancestor_of(a);
-    hosted.iter().any(|&predecessor| {
-        topology.reshape_handoff_pending(predecessor)
-            && touched.iter().any(|&shard| on_line(predecessor, shard))
-            && !hosted
-                .iter()
-                .any(|&other| other != predecessor && on_line(predecessor, other))
-    })
-}
-
-impl<S, N, D> ProcessIo<S, N, D>
-where
-    S: ShardStorage,
-    N: Network,
-    D: Dispatch,
-{
     /// What `tx` would do against a hosted shard's committed state.
     ///
     /// Answered on the calling thread and not on the shard driver's.
@@ -666,9 +676,13 @@ pub(crate) enum SubmitFanout {
     /// reshape successor a touched shard is. The submission waits in
     /// [`ProcessIo`] until the host's shards or the topology change.
     Parked,
-    /// The host carries no shard at all. It runs no shard pipeline to
-    /// admit or gossip through, so a locally-submitted tx is dropped.
-    NoHostedShard,
+    /// The host carries no shard at all, so no shard loop batches its
+    /// gossip: the submission goes out at once, to each touched shard's
+    /// committee, through [`ProcessIo::publish_direct`].
+    PublishDirect {
+        /// Every shard the tx touches (declared reads ∪ writes).
+        touched_shards: Vec<ShardId>,
+    },
     /// The envelope names components this node has not seen sealed, so
     /// it derives no routing yet and there is nothing to fan out to.
     ///
