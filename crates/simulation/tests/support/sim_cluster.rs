@@ -1457,6 +1457,10 @@ impl FaultableCluster for SimCluster {
         (host < self.runner.num_hosts()).then_some(host as usize)
     }
 
+    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+        self.submit_at(host_index(host), &tx);
+    }
+
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
         self.live_committee_hosts(shard)
             .into_iter()

@@ -16,6 +16,7 @@ use hyperscale_types::{
     Epoch, NetworkDefinition, NetworkParams, ShardId, Stake, Transaction, ValidatorStatus,
     validator_possession_proof_sign,
 };
+use hyperscale_vm_types::PrincipalAddr;
 
 use super::query::{beacon_epoch, live_shards, pool_total_stake, validator_status};
 use super::tx::{
@@ -137,6 +138,16 @@ pub fn grow_and_hold(c: &mut impl Cluster, target: u32, split_bytes: u64) {
 ///
 /// Panics if the delegation or a registration does not fold within budget.
 pub fn register_staged(c: &mut impl Cluster) {
+    register_staged_handing_to(c, None);
+}
+
+/// [`register_staged`], each registration also handing the staging pool's
+/// owner badge and a float to `hand_to`'s account.
+///
+/// # Panics
+///
+/// As [`register_staged`].
+pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<(PrincipalAddr, u128)>) {
     let staged = c.staged_validators();
     if staged.is_empty() {
         return;
@@ -174,6 +185,7 @@ pub fn register_staged(c: &mut impl Cluster) {
                     validator,
                     &pubkey,
                     &proof,
+                    hand_to,
                     validity_around(now),
                 )
             },
