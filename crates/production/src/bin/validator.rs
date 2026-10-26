@@ -243,8 +243,9 @@ pub(crate) struct ThreadsConfig {
     #[serde(default)]
     pub(crate) throughput_threads: usize,
 
-    /// Number of tokio runtime worker threads (0 = auto).
-    /// Controls the async I/O runtime used for networking, timers, and RPC.
+    /// Worker threads of the host's tokio runtime, which carries its
+    /// networking, timers and storage I/O (0 = one per core). The RPC
+    /// server, metrics and signals run on a small runtime of their own.
     #[serde(default)]
     pub(crate) io_threads: usize,
 
@@ -585,21 +586,20 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+/// Workers of the binary's own runtime, beside the host's.
+const SERVICE_THREADS: usize = 2;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load configuration first (before runtime construction) to read io_threads
     let mut config = ValidatorConfig::load(&cli.config)?;
     config.apply_overrides(&cli);
 
-    // Build tokio runtime with configurable worker threads.
-    // io_threads = 0 means auto (tokio default: one thread per CPU core).
-    let mut rt_builder = RuntimeBuilder::new_multi_thread();
-    rt_builder.enable_all();
-    if config.threads.io_threads > 0 {
-        rt_builder.worker_threads(config.threads.io_threads);
-    }
-    let rt = rt_builder
+    // The RPC server, metrics, telemetry and signals; the host runs on a
+    // runtime of its own, sized by `io_threads`.
+    let rt = RuntimeBuilder::new_multi_thread()
+        .worker_threads(SERVICE_THREADS)
+        .enable_all()
         .build()
         .context("Failed to build tokio runtime")?;
 
@@ -780,6 +780,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         provisions: config.provisions,
         transport: network_config,
         threads: thread_config,
+        io_threads: config.threads.io_threads,
         storage: rocksdb_config,
     })
     .context("Failed to start the node")?;

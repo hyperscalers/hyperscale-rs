@@ -172,7 +172,7 @@ async fn bindings_are_evicted_when_the_peer_goes_away() {
     let host1 = spec.bind().await;
     assert!(wait_for(BIND_BUDGET, || resolves(&host0, &[1], &host1)).await);
 
-    host1.shutdown();
+    host1.shutdown().await;
 
     assert!(
         wait_for(BIND_BUDGET, || host0.peer_for_validator(vid(1)).is_none()).await,

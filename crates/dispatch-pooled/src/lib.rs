@@ -28,8 +28,8 @@
 //! ```
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use core_affinity::{get_core_ids, set_for_current};
 use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
@@ -262,9 +262,47 @@ pub struct PooledDispatch {
     /// time, so [`PooledDispatch::new`] must be called from inside a tokio
     /// runtime context.
     tokio_handle: Handle,
-    consensus_pending: Arc<AtomicUsize>,
-    throughput_pending: Arc<AtomicUsize>,
-    io_pending: Arc<AtomicUsize>,
+    pending: Arc<Pending>,
+}
+
+/// Jobs spawned and not yet finished, per pool. A count drops only once its
+/// job's closure has returned, so its captures are gone by then.
+#[derive(Default)]
+struct Pending {
+    consensus: AtomicUsize,
+    throughput: AtomicUsize,
+    io: AtomicUsize,
+    /// Taken by a rayon job that empties its pool, and held by
+    /// [`PooledDispatch::wait_idle`] between its check and its wait, so the
+    /// wake cannot fall between them.
+    idle_lock: Mutex<()>,
+    idle: Condvar,
+}
+
+impl Pending {
+    const fn counter(&self, pool: DispatchPool) -> &AtomicUsize {
+        match pool {
+            DispatchPool::Consensus => &self.consensus,
+            DispatchPool::Throughput => &self.throughput,
+            DispatchPool::Io => &self.io,
+        }
+    }
+
+    fn rayon_busy(&self) -> bool {
+        self.consensus.load(Ordering::Acquire) + self.throughput.load(Ordering::Acquire) > 0
+    }
+
+    /// Marks a rayon job finished, waking [`PooledDispatch::wait_idle`] when
+    /// its pool has nothing left.
+    fn finish_rayon(&self, pool: DispatchPool) {
+        if self.counter(pool).fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _held = self
+                .idle_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.idle.notify_all();
+        }
+    }
 }
 
 impl PooledDispatch {
@@ -296,10 +334,29 @@ impl PooledDispatch {
             consensus_pool,
             throughput_pool,
             tokio_handle,
-            consensus_pending: Arc::new(AtomicUsize::new(0)),
-            throughput_pending: Arc::new(AtomicUsize::new(0)),
-            io_pending: Arc::new(AtomicUsize::new(0)),
+            pending: Arc::new(Pending::default()),
         })
+    }
+
+    /// Blocks until neither rayon pool has a job queued or running,
+    /// counting jobs spawned while it waits. Call it once nothing will
+    /// spawn more for long, as a host's teardown does once its threads have
+    /// joined and its runtime has dropped: the Io pool's jobs are that
+    /// runtime's to wait for.
+    pub fn wait_idle(&self) {
+        let mut held = self
+            .pending
+            .idle_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while self.pending.rayon_busy() {
+            held = self
+                .pending
+                .idle
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(held);
     }
 
     /// Get the configuration.
@@ -358,30 +415,13 @@ impl PooledDispatch {
 }
 
 impl PooledDispatch {
-    /// Rayon pool + pending counter + metric label for CPU pools.
-    /// Returns `None` for [`DispatchPool::Io`] which routes to tokio.
-    const fn rayon_pool_state(
-        &self,
-        pool: DispatchPool,
-    ) -> Option<(&Arc<ThreadPool>, &Arc<AtomicUsize>, &'static str)> {
+    /// Rayon pool and metric label for CPU pools. Returns `None` for
+    /// [`DispatchPool::Io`], which routes to tokio.
+    const fn rayon_pool(&self, pool: DispatchPool) -> Option<(&Arc<ThreadPool>, &'static str)> {
         match pool {
-            DispatchPool::Consensus => {
-                Some((&self.consensus_pool, &self.consensus_pending, "consensus"))
-            }
-            DispatchPool::Throughput => Some((
-                &self.throughput_pool,
-                &self.throughput_pending,
-                "throughput",
-            )),
+            DispatchPool::Consensus => Some((&self.consensus_pool, "consensus")),
+            DispatchPool::Throughput => Some((&self.throughput_pool, "throughput")),
             DispatchPool::Io => None,
-        }
-    }
-
-    const fn pending_counter(&self, pool: DispatchPool) -> &Arc<AtomicUsize> {
-        match pool {
-            DispatchPool::Consensus => &self.consensus_pending,
-            DispatchPool::Throughput => &self.throughput_pending,
-            DispatchPool::Io => &self.io_pending,
         }
     }
 }
@@ -389,14 +429,14 @@ impl PooledDispatch {
 impl Dispatch for PooledDispatch {
     #[instrument(level = "debug", skip_all, fields(?pool))]
     fn spawn(&self, pool: DispatchPool, f: impl FnOnce() + Send + 'static) {
-        if let Some((rayon_pool, pending, label)) = self.rayon_pool_state(pool) {
-            pending.fetch_add(1, Ordering::Relaxed);
-            let pending = pending.clone();
+        let pending = Arc::clone(&self.pending);
+        pending.counter(pool).fetch_add(1, Ordering::AcqRel);
+        if let Some((rayon_pool, label)) = self.rayon_pool(pool) {
             let rayon_pool_owned = Arc::clone(rayon_pool);
             rayon_pool.spawn_fifo(move || {
                 let start = std::time::Instant::now();
                 rayon_pool_owned.install(f);
-                pending.fetch_sub(1, Ordering::Relaxed);
+                pending.finish_rayon(pool);
                 record_pool_task_completed(label, start.elapsed().as_secs_f64());
             });
         } else {
@@ -404,19 +444,17 @@ impl Dispatch for PooledDispatch {
             // work that doesn't yield (fsync, network sends behind sync
             // libp2p adapters, GC). Non-blocking ops tolerate it fine; the
             // blocking pool just runs them straight through.
-            let pending = Arc::clone(&self.io_pending);
-            pending.fetch_add(1, Ordering::Relaxed);
             self.tokio_handle.spawn_blocking(move || {
                 let start = std::time::Instant::now();
                 f();
-                pending.fetch_sub(1, Ordering::Relaxed);
+                pending.io.fetch_sub(1, Ordering::AcqRel);
                 record_pool_task_completed("io", start.elapsed().as_secs_f64());
             });
         }
     }
 
     fn queue_depth(&self, pool: DispatchPool) -> usize {
-        self.pending_counter(pool).load(Ordering::Relaxed)
+        self.pending.counter(pool).load(Ordering::Relaxed)
     }
 
     fn parallelism(&self) -> Parallelism {
@@ -451,6 +489,8 @@ fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tokio::runtime::{Builder, Runtime};
 
     use super::*;
@@ -514,8 +554,6 @@ mod tests {
 
     #[test]
     fn test_spawn_on_pools() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let rt = test_runtime();
         let config = ThreadPoolConfig::minimal();
         let dispatch = PooledDispatch::new(config, rt.handle().clone()).unwrap();
@@ -534,10 +572,42 @@ mod tests {
         });
 
         // Wait for tasks to complete
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
 
         assert_eq!(consensus_counter.load(Ordering::SeqCst), 1);
         assert_eq!(throughput_counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Counts its drops: a job's capture, gone once the job is.
+    struct Held(Arc<AtomicUsize>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn waiting_for_idle_outlasts_every_job_and_the_jobs_they_queue() {
+        let rt = test_runtime();
+        let dispatch =
+            PooledDispatch::new(ThreadPoolConfig::minimal(), rt.handle().clone()).unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let first = Held(Arc::clone(&dropped));
+        let second = Held(Arc::clone(&dropped));
+        let inner = dispatch.clone();
+        dispatch.spawn(DispatchPool::Consensus, move || {
+            std::thread::sleep(Duration::from_millis(100));
+            inner.spawn(DispatchPool::Throughput, move || {
+                std::thread::sleep(Duration::from_millis(100));
+                drop(second);
+            });
+            drop(first);
+        });
+
+        dispatch.wait_idle();
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 
     #[test]

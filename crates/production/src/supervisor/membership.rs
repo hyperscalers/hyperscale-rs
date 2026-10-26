@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use hyperscale_beacon::ChainRegistration;
@@ -96,7 +96,7 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Join rejected: shard still bootstrapping");
             return;
         }
-        if self.draining.contains(&shard) {
+        if self.draining.contains_key(&shard) {
             info!(shard = ?shard, "Join queued behind the shard's in-flight teardown");
             if self.pending_joins.insert(shard, vnodes.to_vec()).is_some() {
                 warn!(shard = ?shard, "Replaced an earlier queued join for the shard");
@@ -869,17 +869,25 @@ impl ShardSupervisor {
         let _ = entry.shutdown_tx.send(());
         // The thread join waits out an in-flight shard step; run it off
         // the loop and finish the unwire in `on_torn_down`.
-        self.draining.insert(shard);
+        let draining = Arc::new(Mutex::new(Some(entry.join)));
+        self.draining.insert(shard, Arc::clone(&draining));
         let events = self.events_tx.clone();
+        let validator_ids = entry.validator_ids;
         self.tokio_handle.spawn_blocking(move || {
-            if entry.join.join().is_err() {
+            let join = draining
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(join) = join
+                && join.join().is_err()
+            {
                 warn!(shard = ?shard, "Shard thread panicked before teardown");
             }
             // Send failure means the runner is shutting down; the
             // teardown finishes with it.
             let _ = events.send(SupervisorEvent::TornDown {
                 shard,
-                validator_ids: entry.validator_ids,
+                validator_ids,
             });
         });
     }
@@ -988,7 +996,7 @@ impl ShardSupervisor {
                 host_holds_seat(shard, &topology_snapshot, &host_ids)
                     && !self.shards.contains_key(&shard)
                     && !self.bootstrapping.contains_key(&shard)
-                    && !self.draining.contains(&shard)
+                    && !self.draining.contains_key(&shard)
                     && !self.pending_joins.contains_key(&shard)
                     && !self.awaiting_anchor.contains_key(&shard)
                     && !self.reshape.is_seating(shard)
