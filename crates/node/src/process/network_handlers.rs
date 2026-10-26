@@ -104,7 +104,10 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
-        let process = Arc::clone(&self.process);
+        // Weak: the network holds this handler and the process holds the
+        // network, so a strong handle would keep the process, and its
+        // stores, alive past the host.
+        let process = Arc::downgrade(&self.process);
         self.process
             .network
             .register_gossip_handler::<CertifiedBlockHeaderGossip>(
@@ -129,6 +132,9 @@ where
                     // reads its terminal QC off; against the head those
                     // resolve to an empty committee and every receiver
                     // rejects them.
+                    let Some(process) = process.upgrade() else {
+                        return Verdict::Ignore;
+                    };
                     let schedule = process.topology_schedule();
                     let Some((signing, _)) = schedule
                         .at_for_shard(header_shard, header.parent_qc().weighted_timestamp())
@@ -453,7 +459,10 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
-        let process = Arc::clone(&self.process);
+        // Weak: the network holds this handler and the process holds the
+        // network, so a strong handle would keep the process, and its
+        // stores, alive past the host.
+        let process = Arc::downgrade(&self.process);
         let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
@@ -471,6 +480,9 @@ where
                             record_crossing_push_dropped(reason);
                             return Verdict::Reject;
                         }
+                    };
+                    let Some(process) = process.upgrade() else {
+                        return Verdict::Ignore;
                     };
                     let schedule = process.topology_schedule();
                     let Some((signing, _)) = schedule.at_for_shard(anchor.shard, anchor.ts) else {
@@ -563,7 +575,10 @@ where
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
-        let process = Arc::clone(&self.process);
+        // Weak: the network holds this handler and the process holds the
+        // network, so a strong handle would keep the process, and its
+        // stores, alive past the host.
+        let process = Arc::downgrade(&self.process);
         self.process
             .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
@@ -591,6 +606,9 @@ where
                     // each one. At an epoch cut that committee holds members
                     // the head no longer seats: a departing leader still
                     // certifies the ticks its window anchored.
+                    let Some(process) = process.upgrade() else {
+                        return Verdict::Ignore;
+                    };
                     let schedule = process.topology_schedule();
                     let Some(attesting) = batch
                         .certificates

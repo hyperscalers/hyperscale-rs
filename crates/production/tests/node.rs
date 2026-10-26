@@ -15,6 +15,7 @@ use hyperscale_production::{LocalValidator, NetworkFile, Node, NodeError, NodeSe
 use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId, ValidatorId};
 use serial_test::serial;
 use tempfile::TempDir;
+use tokio::runtime::Builder;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
 
@@ -268,6 +269,44 @@ async fn two_co_hosted_nodes_commit() {
 
     node0.stop().await.expect("host 0 stops cleanly");
     node1.stop().await.expect("host 1 stops cleanly");
+}
+
+/// A stopped host whose runtime is gone has closed its stores: the same
+/// process starts it again on the same data, as an embedder restarting its
+/// node does.
+#[test]
+#[serial]
+fn a_stopped_host_starts_again_on_its_own_data() {
+    let _ = fmt().with_test_writer().try_init();
+    let fixtures = TestFixtures::new(11, 4);
+    let dir = TempDir::new().unwrap();
+    let beacon_chain = network(None);
+    let run = |first: bool| {
+        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let node = Node::start(setup(
+                dir.path(),
+                &fixtures,
+                &[0, 1, 2, 3],
+                net::listen(free_port()),
+                vec![],
+                beacon_chain,
+            ))
+            .expect("the host starts on its own data");
+            if first {
+                timeout(COMMIT_TIMEOUT, async {
+                    while lowest_height(&node).is_none_or(|h| h < 1) {
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                })
+                .await
+                .expect("the host commits before it stops");
+            }
+            node.stop().await.expect("the host stops cleanly");
+        });
+    };
+    run(true);
+    run(false);
 }
 
 #[tokio::test(flavor = "current_thread")]
