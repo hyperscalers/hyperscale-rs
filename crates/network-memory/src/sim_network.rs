@@ -47,6 +47,20 @@ pub struct OutboxEntry {
     pub(crate) data: Vec<u8>,
 }
 
+impl OutboxEntry {
+    /// Where the message is addressed.
+    #[must_use]
+    pub const fn target(&self) -> &BroadcastTarget {
+        &self.target
+    }
+
+    /// The message's type identifier.
+    #[must_use]
+    pub const fn message_type(&self) -> &'static str {
+        self.message_type
+    }
+}
+
 /// A buffered notification (fire-and-forget unicast) awaiting harness delivery.
 pub struct PendingNotification {
     /// Validators to deliver to.

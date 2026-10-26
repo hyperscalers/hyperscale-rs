@@ -1559,7 +1559,8 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
     use hyperscale_network_memory::{
-        HostLayout, LinkStreams, NetworkConfig, SimNetworkAdapter, SimulatedNetwork,
+        BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, SimNetworkAdapter,
+        SimulatedNetwork,
     };
     use hyperscale_storage::RecoveredState;
     use hyperscale_storage::test_helpers::commit_one;
@@ -3068,6 +3069,24 @@ mod tests {
         WeightedTimestamp::from_millis(
             epoch * fix.genesis_state().chain_config.epoch_duration_ms + 1,
         )
+    }
+
+    /// A host seated on no shard has no shard loop to gossip through, and
+    /// publishes its own submission straight to the shards it touches.
+    #[test]
+    fn a_host_seated_nowhere_publishes_its_own_submission() {
+        let fix = Fixture::new();
+        let (host, _events) = fix.host_over_history(advanced_history(&fix, 0), far_future());
+        let _ = host.network().drain_outbox();
+        let tx = Arc::new(test_transaction(1));
+        assert!(host.process.submit_transaction(&tx));
+        let sent = host.network().drain_outbox();
+        assert!(
+            sent.iter()
+                .any(|entry| entry.message_type() == "transaction.gossip"
+                    && matches!(entry.target(), BroadcastTarget::Shard(_))),
+            "{sent:?}"
+        );
     }
 
     /// The beacon loop is the one writer of the process's topology, and
