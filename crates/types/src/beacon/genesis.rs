@@ -7,7 +7,7 @@
 //! beacon-side protocol constants (committee sizes, stake floors) and
 //! is not part of the consumer-facing type surface.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
@@ -15,9 +15,9 @@ use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use crate::{
     BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, Epoch, EpochWindows,
     GenesisConfigHash, Hash, IMPOUND_EPOCHS_DEFAULT, NetworkDefinition,
-    PRODUCTION_BEACON_COMMITTEE_SIZE, RESHAPE_DRAIN_SPAN, Randomness, ReshapeThresholds,
-    SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat, ValidatorId,
-    byzantine_threshold,
+    PRODUCTION_BEACON_COMMITTEE_SIZE, ProposerTimestamp, RESHAPE_DRAIN_SPAN, Randomness,
+    ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat,
+    ValidatorId, WeightedTimestamp, byzantine_threshold,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -91,6 +91,34 @@ impl BeaconChainConfig {
     #[must_use]
     pub const fn epoch_duration(&self) -> Duration {
         Duration::from_millis(self.epoch_duration_ms)
+    }
+
+    /// The wall-clock instant of chain time `at`, which counts from
+    /// `genesis_timestamp_ms`.
+    #[must_use]
+    pub fn wall_time(&self, at: WeightedTimestamp) -> SystemTime {
+        self.wall_time_of_ms(at.as_millis())
+    }
+
+    /// The wall-clock instant a proposer stamped into its header.
+    #[must_use]
+    pub fn proposed_wall_time(&self, at: ProposerTimestamp) -> SystemTime {
+        self.wall_time_of_ms(at.as_millis())
+    }
+
+    fn wall_time_of_ms(&self, chain_ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.genesis_timestamp_ms.saturating_add(chain_ms))
+    }
+
+    /// The chain time of wall-clock instant `at`, as a transaction's
+    /// validity range reads it. An instant before genesis is chain time
+    /// zero.
+    #[must_use]
+    pub fn chain_time(&self, at: SystemTime) -> WeightedTimestamp {
+        let unix_ms = at.duration_since(UNIX_EPOCH).map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+        WeightedTimestamp::from_millis(unix_ms.saturating_sub(self.genesis_timestamp_ms))
     }
 
     /// Epochs from the fold that latches a reshape's drain to the fold
@@ -362,6 +390,23 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_principal;
+
+    #[test]
+    fn chain_time_counts_from_genesis_both_ways() {
+        let config = BeaconChainConfig {
+            genesis_timestamp_ms: 1_800_000_000_000,
+            ..BeaconChainConfig::default()
+        };
+        let at = WeightedTimestamp::from_millis(90_000);
+        let wall = config.wall_time(at);
+        assert_eq!(wall, UNIX_EPOCH + Duration::from_secs(1_800_000_090));
+        assert_eq!(config.chain_time(wall), at);
+        assert_eq!(
+            config.chain_time(UNIX_EPOCH),
+            WeightedTimestamp::ZERO,
+            "before genesis is chain time zero"
+        );
+    }
 
     #[test]
     fn the_drain_deadline_covers_the_drain_span_at_30_s_and_300_s_epochs() {
