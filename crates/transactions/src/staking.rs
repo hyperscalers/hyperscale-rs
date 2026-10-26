@@ -64,6 +64,11 @@ impl Client {
     /// key it will be known by and the proof it holds that key, composed by
     /// `operator`, whose account holds the pool's owner badge.
     ///
+    /// With `hand_to`, the same transaction then moves the owner badge and
+    /// `float` of the operator's native balance to the new owner's account,
+    /// so the validator is never registered under an operator who keeps the
+    /// pool, and its owner can pay for its own actions from the start.
+    ///
     /// # Errors
     ///
     /// [`TypedError`] if the operator's account or the pool does not
@@ -75,15 +80,30 @@ impl Client {
         validator: ValidatorId,
         key: &ConsensusPublicKey,
         proof: &ConsensusSignature,
+        hand_to: Option<(PrincipalAddr, u128)>,
     ) -> Result<ManifestGraph, TypedError> {
-        self.as_operator(operator, pool, |b| {
-            staking::Staking::at(pool).register_validator(
-                b,
-                validator.inner(),
-                *key.as_bytes(),
-                *proof.as_bytes(),
-            )
-        })
+        self.as_operator(
+            operator,
+            pool,
+            |b| {
+                staking::Staking::at(pool).register_validator(
+                    b,
+                    validator.inner(),
+                    *key.as_bytes(),
+                    *proof.as_bytes(),
+                )
+            },
+            |b| {
+                let Some((owner, float)) = hand_to else {
+                    return Ok(());
+                };
+                let badge =
+                    account::withdraw_nf(b, operator, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
+                account::deposit_nf(b, owner, badge)?;
+                let funds = account::withdraw(b, operator, *PROTOCOL_RESOURCE, float)?;
+                account::deposit(b, owner, funds)
+            },
+        )
     }
 
     /// The graph retiring `validator` from `pool`, composed by `operator`.
@@ -97,24 +117,52 @@ impl Client {
         pool: ComponentAddr,
         validator: ValidatorId,
     ) -> Result<ManifestGraph, TypedError> {
-        self.as_operator(operator, pool, |b| {
-            staking::Staking::at(pool).deactivate_validator(b, validator.inner())
-        })
+        self.as_operator(
+            operator,
+            pool,
+            |b| staking::Staking::at(pool).deactivate_validator(b, validator.inner()),
+            |_| Ok(()),
+        )
+    }
+
+    /// The graph lifting `validator`'s time-out in `pool`, composed by
+    /// `operator`. The beacon drops a lift it refuses (a cooldown still
+    /// running, a full or convicted pool) though the transaction commits,
+    /// so a caller reads the validator's status, not the transaction's.
+    ///
+    /// # Errors
+    ///
+    /// As [`register_validator_graph`](Self::register_validator_graph).
+    pub fn unjail_validator_graph(
+        &self,
+        operator: PrincipalAddr,
+        pool: ComponentAddr,
+        validator: ValidatorId,
+    ) -> Result<ManifestGraph, TypedError> {
+        self.as_operator(
+            operator,
+            pool,
+            |b| staking::Staking::at(pool).unjail(b, validator.inner()),
+            |_| Ok(()),
+        )
     }
 
     /// `call` under the pool's owner badge, presented from `operator`'s
-    /// account: the whole of an operator action's authority.
+    /// account: the whole of an operator action's authority. `after` runs
+    /// once the presentation has closed.
     fn as_operator(
         &self,
         operator: PrincipalAddr,
         pool: ComponentAddr,
         call: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>,
+        after: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>,
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
         let mut b = self.builder(&chain, operator);
         let badge =
             account::present_instance(&mut b, operator, pool_owner_badge(pool), OWNER_BADGE_ID)?;
         b.presenting(badge, call)?;
+        after(&mut b)?;
         b.build()
     }
 }
@@ -151,12 +199,39 @@ mod tests {
                     ValidatorId::new(1000),
                     &ConsensusPublicKey::ZERO,
                     &ConsensusSignature::ZERO,
+                    None,
                 )
                 .is_ok()
         );
         assert!(
             client
                 .deactivate_validator_graph(operator, pool, ValidatorId::new(1000))
+                .is_ok()
+        );
+    }
+
+    /// A registration that hands the pool over builds in one graph beside
+    /// the registration, and the new owner's unjail builds on its own.
+    #[test]
+    fn a_registration_hands_the_pool_over_and_its_new_owner_unjails() {
+        let client = Client::with_pools(&[seat(0)], NETWORK);
+        let pool = pool_address(&seat(0));
+        let (operator, owner) = (test_principal(7), test_principal(8));
+        assert!(
+            client
+                .register_validator_graph(
+                    operator,
+                    pool,
+                    ValidatorId::new(1000),
+                    &ConsensusPublicKey::ZERO,
+                    &ConsensusSignature::ZERO,
+                    Some((owner, 100)),
+                )
+                .is_ok()
+        );
+        assert!(
+            client
+                .unjail_validator_graph(owner, pool, ValidatorId::new(1000))
                 .is_ok()
         );
     }

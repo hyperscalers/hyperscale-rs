@@ -2660,6 +2660,7 @@ pub(crate) fn build_register_tx(
             validator,
             pubkey,
             possession_proof,
+            None,
         )
         .expect("a registration types against the pool's signature");
     Transaction::new(envelope(graph, operator, validity))
