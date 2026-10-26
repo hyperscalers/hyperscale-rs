@@ -13,16 +13,19 @@
 //!
 //! [`BeaconState`]: hyperscale_types::BeaconState
 
+use std::time::Duration;
+
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    ComponentAddr, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, ShardId, Stake,
-    StakePoolId, Transaction, TransactionDecision, TransactionStatus, UNBONDING_WINDOW_EPOCHS,
-    ValidatorId, ValidatorStatus, validator_possession_proof_sign,
+    ComponentAddr, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, SPC_VIEW_TIMEOUT,
+    ShardId, Stake, StakePoolId, Transaction, TransactionDecision, TransactionStatus,
+    UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus, validator_possession_proof_sign,
 };
 
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    pool_effective_stake, pool_total_stake, validator_pubkey, validator_status,
+    beacon_epoch, epoch_duration_ms, pool_effective_stake, pool_total_stake, validator_pubkey,
+    validator_status,
 };
 use crate::support::tx::{
     GENESIS_POOL_ID, SECOND_POOL_ID, STAKE_POOL_ID, badge_buyer, build_badge_sale_tx,
@@ -30,7 +33,7 @@ use crate::support::tx::{
     build_unstake_tx, delegator, pool_at, pool_operator, pool_vault_cell, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
-use crate::support::{Cluster, epochs};
+use crate::support::{Cluster, Crash, CrashableCluster, epochs, register_staged};
 
 /// The single genesis stake pool every genesis validator belongs to.
 /// Warm the cluster until the beacon folds its first epoch — the precondition a
@@ -692,4 +695,91 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
         "pool capacity must cap registrations at three",
     );
     world.assert_settles_within(c, &charges, epochs(4), "four registrations against three");
+}
+
+/// A newcomer seated and signing whose host then goes away for good
+/// is jailed, and the network carries on without it.
+///
+/// While it sits silent in the beacon committee each epoch still commits
+/// within one SPC view timeout of its start; once it is jailed the shard
+/// keeps committing and no draw seats the dead validator again.
+///
+/// # Panics
+///
+/// Panics if the newcomer is never seated ready, if an epoch it sits
+/// through silent commits a view timeout late, if it is not jailed once its
+/// host is gone or is seated again, or if the shard stops committing.
+pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster) {
+    warm_up(c);
+    let staged = c.staged_validators();
+    let [(newcomer, _)] = staged[..] else {
+        panic!(
+            "this scenario stages exactly one newcomer, not {}",
+            staged.len()
+        );
+    };
+    register_staged(c);
+    assert!(
+        c.run_until(epochs(60), |c| matches!(
+            validator_status(c, newcomer),
+            Some(ValidatorStatus::OnShard { ready: true, .. })
+        )),
+        "the newcomer was never seated ready; status = {:?}",
+        validator_status(c, newcomer),
+    );
+    // Let it sign a few epochs before its host goes.
+    c.run_until(epochs(3), |_| false);
+    let host = c.host_of(newcomer).expect("the newcomer has a host");
+    c.crash(host, Crash::Process, epochs(100_000));
+    let crashed_at = c.beacon_state().map(|s| s.current_epoch);
+
+    // Every epoch the silent newcomer sits through commits within one SPC
+    // view timeout of its start: its missing input costs the committee a
+    // bounded wait, not a view.
+    let epoch_ms = epoch_duration_ms(c).expect("a committed beacon state");
+    while matches!(
+        validator_status(c, newcomer),
+        Some(ValidatorStatus::OnShard { .. })
+    ) {
+        let Some(next) = beacon_epoch(c).map(|epoch| epoch.inner() + 1) else {
+            break;
+        };
+        if !c.run_until(epochs(2), |c| {
+            beacon_epoch(c).is_some_and(|e| e.inner() >= next)
+        }) {
+            break;
+        }
+        let start = Duration::from_millis(next * epoch_ms);
+        let lag = c.now().saturating_sub(start);
+        assert!(
+            lag < SPC_VIEW_TIMEOUT,
+            "epoch {next} committed {lag:?} past its start with the newcomer silent; \
+             a silent member must cost less than a view timeout",
+        );
+    }
+    assert!(
+        c.run_until(epochs(8), |c| matches!(
+            validator_status(c, newcomer),
+            Some(ValidatorStatus::Jailed { .. })
+        )),
+        "the newcomer was never jailed after its host went away at {crashed_at:?}; \
+         status = {:?}, beacon at {:?}",
+        validator_status(c, newcomer),
+        c.beacon_state().map(|s| s.current_epoch),
+    );
+    for _ in 0..10 {
+        let height = c.committed_height(ShardId::ROOT);
+        assert!(
+            c.run_until(epochs(3), |c| c.committed_height(ShardId::ROOT) > height),
+            "the shard stopped committing at {height:?}",
+        );
+        assert!(
+            !matches!(
+                validator_status(c, newcomer),
+                Some(ValidatorStatus::OnShard { .. })
+            ),
+            "a draw seated the dead newcomer again; status = {:?}",
+            validator_status(c, newcomer),
+        );
+    }
 }

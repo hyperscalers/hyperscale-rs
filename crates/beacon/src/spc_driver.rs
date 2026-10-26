@@ -27,6 +27,7 @@ use hyperscale_types::{
 };
 use tracing::{trace, warn};
 
+use crate::participant::MAX_INPUT_WAIT;
 use crate::spc::{MAX_PENDING_EMPTY_VIEW_AHEAD, SpcEffect, SpcEvent, SpcInstance};
 use crate::verification::VerificationSlots;
 
@@ -148,6 +149,7 @@ impl SpcDriver {
             committee,
             self.me,
             SPC_VIEW_TIMEOUT,
+            MAX_INPUT_WAIT,
         ));
     }
 
@@ -650,8 +652,9 @@ impl SpcDriver {
     }
 
     /// `TimerId::BeaconSpcView` fired. Route a synthesized `TimerExpired`
-    /// into the FSM against its current view — the stale-view guard no-ops
-    /// if the view has already advanced.
+    /// into the FSM against its current view. A fire armed for an earlier
+    /// view and already due when the view advanced lands on the new one
+    /// as if its own timer had fired.
     pub(crate) fn on_beacon_spc_view_timer(&mut self, skip_quorum: bool) -> Vec<SpcEffect> {
         let Some(spc) = self.spc.as_ref() else {
             trace!("BeaconSpcViewTimer fired but no SPC instance bootstrapped");

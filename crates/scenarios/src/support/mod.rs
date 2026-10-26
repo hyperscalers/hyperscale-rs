@@ -27,5 +27,5 @@ pub use faultable::{
     BlockServingCap, Crash, CrashableCluster, FaultHandle, FaultableCluster, MemberEdge,
     committees_on_separate_hosts, member_hosts,
 };
-pub use grow::{grow_and_hold, grow_to, vote_params, vote_reshape_threshold};
+pub use grow::{grow_and_hold, grow_to, register_staged, vote_params, vote_reshape_threshold};
 pub use nemesis::Nemesis;

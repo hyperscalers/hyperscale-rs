@@ -100,6 +100,7 @@ use hyperscale_scenarios::{
     an_abandoned_never_outlives_a_late_record,
     an_answer_goes_at_its_producers_boundary_with_every_push_cut,
     an_answer_written_past_the_deadline_is_read_at_a_later_boundary,
+    an_offline_newcomer_leaves_the_network_live,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     an_unseen_never_goes_once_its_producers_leg_is_fated,
     an_unseen_never_goes_when_its_producer_aborts,
@@ -167,9 +168,9 @@ use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::{RowState, ShardChainReader};
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
-    BlockHash, BlockHeight, IDLE_PROPOSAL_INTERVAL, NetworkDefinition, PrincipalAddr,
-    RecoveryCause, Round, ShardForkProof, ShardId, Timeout, TransactionDecision, TxHash,
-    VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId, WeightedTimestamp,
+    BeaconChainConfig, BlockHash, BlockHeight, IDLE_PROPOSAL_INTERVAL, NetworkDefinition,
+    PrincipalAddr, RecoveryCause, Round, ShardForkProof, ShardId, Timeout, TransactionDecision,
+    TxHash, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId, WeightedTimestamp,
 };
 #[cfg(feature = "production-epochs")]
 use hyperscale_types::{JailReason, MISSED_PROPOSAL_JAIL_SHARE_BPS, ValidatorStatus};
@@ -3518,6 +3519,53 @@ fn registered_validator_activates_onto_a_shard_sim() {
         SimCluster::with_accounts(&witness_config(4), 0xAC11, &staking_genesis_accounts());
     registered_validator_activates_onto_a_shard(&mut cluster);
 }
+
+/// The devnet a home validator joins: five genesis validators on one
+/// host seating one five-member shard, and a newcomer on a host of its own.
+const fn devnet_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 5,
+        vnodes_per_host: 5,
+        pool_surplus: 1,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
+}
+
+/// The devnet's beacon: production sizing on thirty-second epochs with a
+/// four-epoch ready timeout.
+fn devnet_chain(chain: BeaconChainConfig) -> BeaconChainConfig {
+    BeaconChainConfig {
+        epoch_duration_ms: 30_000,
+        beacon_committee_size: BeaconChainConfig::production().beacon_committee_size,
+        ready_timeout_epochs: 4,
+        ..chain
+    }
+}
+
+fn an_offline_newcomer_leaves_the_network_live_sim(seed: u64) {
+    let mut cluster = SimCluster::with_staged_newcomers(
+        &devnet_config(),
+        seed,
+        &staking_genesis_accounts(),
+        1,
+        devnet_chain,
+    );
+    cluster.run_faultable(an_offline_newcomer_leaves_the_network_live);
+}
+
+seeded!(
+    an_offline_newcomer_leaves_the_network_live_sim:
+    seed_1 = 1,
+    seed_2 = 2,
+    seed_3 = 3,
+    seed_4 = 4,
+    seed_5 = 5,
+    seed_6 = 6,
+    seed_7 = 7,
+    seed_8 = 8,
+);
 
 #[test]
 fn re_registration_of_a_live_validator_is_a_no_op_sim() {

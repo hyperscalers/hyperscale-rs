@@ -136,7 +136,7 @@ pub fn grow_and_hold(c: &mut impl Cluster, target: u32, split_bytes: u64) {
 /// # Panics
 ///
 /// Panics if the delegation or a registration does not fold within budget.
-fn register_staged(c: &mut impl Cluster) {
+pub fn register_staged(c: &mut impl Cluster) {
     let staged = c.staged_validators();
     if staged.is_empty() {
         return;

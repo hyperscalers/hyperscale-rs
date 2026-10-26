@@ -93,6 +93,7 @@ impl SpcSim {
                     members.clone(),
                     members[i].0,
                     view_timeout,
+                    view_timeout,
                 )
             })
             .collect();

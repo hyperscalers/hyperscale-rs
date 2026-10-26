@@ -84,6 +84,14 @@ struct BuildArgs<'a> {
     processing: Option<ProcessingTimes>,
     /// Whether a host may lose power; see [`SimConfig::power_loss`].
     power_loss: bool,
+    /// The beacon chain config this cluster runs, from the one every
+    /// cluster derives from the scenario config.
+    chain: fn(BeaconChainConfig) -> BeaconChainConfig,
+}
+
+/// [`BuildArgs::chain`] for a cluster that runs the derived config as is.
+const fn stock_chain(chain: BeaconChainConfig) -> BeaconChainConfig {
+    chain
 }
 
 /// A [`FaultableCluster::drop_type_between_members`] rule: its edge, the
@@ -112,6 +120,9 @@ pub struct SimCluster {
     /// host, checked after every rehome and every slice. A run that
     /// co-hosts by design leaves it through [`Self::co_host_by_design`].
     one_identity_per_host: bool,
+    /// The beacon epoch this cluster's chain runs, which a [`Budget`]
+    /// counts in.
+    epoch: Duration,
 }
 
 impl Drop for SimCluster {
@@ -161,6 +172,7 @@ impl SimCluster {
             staged_pool_extras: 0,
             processing: Some(processing),
             power_loss: true,
+            chain: stock_chain,
         })
     }
 
@@ -184,6 +196,7 @@ impl SimCluster {
             staged_pool_extras: 0,
             processing: None,
             power_loss: false,
+            chain: stock_chain,
         })
     }
 
@@ -211,6 +224,7 @@ impl SimCluster {
             staged_pool_extras: 0,
             processing: None,
             power_loss: false,
+            chain: stock_chain,
         })
     }
 
@@ -236,6 +250,34 @@ impl SimCluster {
             staged_pool_extras: 0,
             processing: None,
             power_loss: false,
+            chain: stock_chain,
+        })
+    }
+
+    /// A genesis cluster whose `staged` highest pool extras are left out
+    /// of beacon genesis, each on a host of its own, running the beacon
+    /// chain `chain` makes of the derived config — a network a newcomer
+    /// joins after genesis, as a live one does.
+    #[must_use]
+    pub fn with_staged_newcomers(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        staged: u32,
+        chain: fn(BeaconChainConfig) -> BeaconChainConfig,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: true,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages: GenesisPackages::protocol(),
+            swarm: false,
+            staged_pool_extras: staged,
+            processing: None,
+            power_loss: false,
+            chain,
         })
     }
 
@@ -281,12 +323,13 @@ impl SimCluster {
             staged_pool_extras: 0,
             processing: None,
             power_loss: false,
+            chain: stock_chain,
         })
     }
 
     fn build_full(args: &BuildArgs<'_>) -> Self {
         let config = args.config;
-        let beacon_chain_config = BeaconChainConfig {
+        let beacon_chain_config = (args.chain)(BeaconChainConfig {
             epoch_duration_ms: EPOCH_MS,
             shard_size: config.shard_size,
             reshape_thresholds: ReshapeThresholds {
@@ -294,7 +337,7 @@ impl SimCluster {
                 split_fullness: u32::MAX,
             },
             ..BeaconChainConfig::default()
-        };
+        });
         let seed = sim_seed(args.seed);
         let tuning = (args.swarm || swarm_requested()).then(|| SimTuning::drawn(seed));
         let defaults = SimConfig::default();
@@ -362,6 +405,7 @@ impl SimCluster {
             tuning,
             member_rules: Vec::new(),
             one_identity_per_host: args.dedicated_pool_hosts && config.vnodes_per_host == 1,
+            epoch: beacon_chain_config.epoch_duration(),
         };
         cluster.assert_one_identity_per_host();
         cluster
@@ -526,6 +570,7 @@ impl SimCluster {
             staged_pool_extras: config.staged_pool_extras(),
             processing,
             power_loss: swarm,
+            chain: stock_chain,
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
@@ -536,7 +581,8 @@ impl SimCluster {
     /// rather than letting a distant downstream assert report the symptom
     /// twenty virtual epochs later.
     fn assert_beacon_cadence(&self) {
-        let expected = u64::try_from(self.runner.now().as_millis()).unwrap_or(u64::MAX) / EPOCH_MS;
+        let expected = u64::try_from(self.runner.now().as_millis() / self.epoch.as_millis())
+            .unwrap_or(u64::MAX);
         let actual = self
             .beacon_state()
             .map_or(0, |state| state.current_epoch.inner());
@@ -574,7 +620,7 @@ impl SimCluster {
         if cond(self) {
             return true;
         }
-        let deadline = self.runner.now() + Self::span(budget);
+        let deadline = self.runner.now() + self.span(budget);
         while self.runner.now() < deadline {
             self.topology_step();
             let next = (self.runner.now() + poll).min(deadline);
@@ -661,8 +707,8 @@ impl SimCluster {
     }
 
     /// The duration `budget` epochs span on this harness's clock.
-    fn span(budget: Budget) -> Duration {
-        Duration::from_millis(EPOCH_MS) * budget.0
+    fn span(&self, budget: Budget) -> Duration {
+        self.epoch * budget.0
     }
 
     /// Hosts carrying a `shard` vnode that sits in the shard's current
@@ -1246,7 +1292,7 @@ impl CrashableCluster for SimCluster {
 
     fn crash(&mut self, host: usize, crash: Crash, downtime: Budget) {
         self.runner
-            .crash_host(host_index(host), crash_kind(crash), Self::span(downtime));
+            .crash_host(host_index(host), crash_kind(crash), self.span(downtime));
     }
 
     fn crash_at_write(&mut self, host: usize, writes_before: u64, crash: Crash, downtime: Budget) {
@@ -1254,7 +1300,7 @@ impl CrashableCluster for SimCluster {
             host_index(host),
             writes_before,
             crash_kind(crash),
-            Self::span(downtime),
+            self.span(downtime),
         );
     }
 

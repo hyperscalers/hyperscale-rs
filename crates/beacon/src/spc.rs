@@ -346,6 +346,7 @@ pub struct SpcInstance {
     committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     me: ValidatorId,
     view_timeout: Duration,
+    input_dwell: Duration,
 
     current_view: SpcView,
     views: BTreeMap<SpcView, ViewState>,
@@ -388,9 +389,12 @@ impl SpcInstance {
     ///
     /// `view_timeout` is the duration the parent (the
     /// `BeaconParticipant`) is asked to wait between `SetTimer { view }`
-    /// and `TimerExpired { view }` firing — the `2Δ` cap on a view's
-    /// leader-proposal grace period before participants exchange
-    /// empty-views and skip ahead.
+    /// and `TimerExpired { view }` firing once a view's input is fed —
+    /// the heartbeat that retransmits this node's messages for the view.
+    /// `input_dwell` is the first wait after entering a view ≥ 2: how
+    /// long the node collects the members' proposal objects before
+    /// feeding the inner PC whatever it holds, so a silent member costs
+    /// the dwell rather than a whole view timeout.
     ///
     /// # Panics
     ///
@@ -409,6 +413,7 @@ impl SpcInstance {
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         me: ValidatorId,
         view_timeout: Duration,
+        input_dwell: Duration,
     ) -> Self {
         assert!(
             committee.len() <= MAX_VOTE_VECTOR_LEN,
@@ -432,6 +437,7 @@ impl SpcInstance {
             committee,
             me,
             view_timeout,
+            input_dwell,
             current_view: SpcView::new(1),
             views,
             proposals_by_hash: BTreeMap::new(),
@@ -554,8 +560,8 @@ impl SpcInstance {
         // Arm the heartbeat: view 1 has no entry cert to arm it (it's
         // eager at construction), so the input feed is where its
         // retransmission clock starts. A feed landing after a
-        // cert-driven advance arms nothing — the view ≥ 2 entry armed
-        // its own.
+        // cert-driven advance arms nothing — that view's own feed arms
+        // its heartbeat.
         if self.high_output.is_none() && self.current_view.inner() == 1 {
             out.push(SpcEffect::SetTimer {
                 view: SpcView::new(1),
@@ -777,14 +783,15 @@ impl SpcInstance {
         let mut out = vec![];
         if entered_new {
             self.current_view = view;
-            // Start the view-timeout timer for view ≥ 2. View 1 is
+            // Start the input dwell for view ≥ 2: its expiry feeds the
+            // inner PC whatever proposal objects are held. View 1 is
             // never entered via this path (it's eager at
             // construction), so this branch only fires for views
             // that just got authorised by a cert.
             if view.inner() > 1 {
                 out.push(SpcEffect::SetTimer {
                     view,
-                    duration: self.view_timeout,
+                    duration: self.input_dwell,
                 });
             }
         }
@@ -824,6 +831,16 @@ impl SpcInstance {
         // buffered empty-views, new-views, deferred highs, and blocked
         // commit walks may now resolve.
         out.extend(self.rescan_pending());
+        // A full feed replaces the input dwell with the heartbeat. It
+        // goes last: the parent keeps one view timer per instance, so
+        // the last `SetTimer` in a batch is the one that stands, and the
+        // rescan above may have advanced the view and armed its own.
+        if ready && self.current_view == view && self.high_output.is_none() {
+            out.push(SpcEffect::SetTimer {
+                view,
+                duration: self.view_timeout,
+            });
+        }
         out
     }
 
@@ -833,9 +850,9 @@ impl SpcInstance {
         self.process_empty_view(msg)
     }
 
-    /// Heartbeat for the current view. The first expiry after a
+    /// Heartbeat for the current view. The input dwell's expiry after a
     /// view ≥ 2 entry forces `RunVPC(view)` on a partial
-    /// proposal-object buffer so a silent leader can't stall the view;
+    /// proposal-object buffer so a silent member can't stall the view;
     /// every later expiry retransmits the node's own already-emitted
     /// messages for the view, restoring the reliable-channel
     /// assumption the PC rounds' termination rests on over a transport
@@ -1245,6 +1262,11 @@ mod tests {
         (sks, members)
     }
 
+    /// The view timeout and input dwell every `fsm_instance` runs under,
+    /// distinct so a test can tell which one a `SetTimer` arms.
+    const VIEW_TIMEOUT: Duration = Duration::from_millis(100);
+    const INPUT_DWELL: Duration = Duration::from_millis(10);
+
     fn fsm_instance(idx: usize) -> SpcInstance {
         let (_, members) = fsm_committee(4);
         SpcInstance::new(
@@ -1252,7 +1274,8 @@ mod tests {
             Epoch::new(1),
             members.clone(),
             members[idx].0,
-            Duration::from_millis(100),
+            VIEW_TIMEOUT,
+            INPUT_DWELL,
         )
     }
 
@@ -1296,7 +1319,7 @@ mod tests {
     }
 
     /// An input feed landing after a cert-driven advance past view 1
-    /// arms nothing — the view ≥ 2 entry armed its own heartbeat.
+    /// arms nothing — that view's own feed arms its heartbeat.
     #[test]
     fn late_input_feed_does_not_arm_heartbeat() {
         let (_, members) = fsm_committee(4);
@@ -1448,6 +1471,7 @@ mod tests {
                 members.clone(),
                 members[idx].0,
                 Duration::from_millis(100),
+                Duration::from_millis(10),
             )
         };
         let mut x = mk(0);
@@ -1527,6 +1551,7 @@ mod tests {
             members.clone(),
             members[0].0,
             Duration::from_millis(100),
+            Duration::from_millis(10),
         );
 
         let cert_a = SpcCert::Direct {
@@ -1572,6 +1597,7 @@ mod tests {
             members.clone(),
             members[0].0,
             Duration::from_millis(100),
+            Duration::from_millis(10),
         );
 
         let cert_a = SpcCert::Direct {
@@ -1738,8 +1764,90 @@ mod tests {
         assert!(effects.is_empty());
     }
 
-    /// At view ≥ 2 the first expiry forces the inner PC onto the
-    /// partial proposal buffer (existing semantics); subsequent
+    /// The duration the last `SetTimer` in `effects` arms: the parent
+    /// keeps one view timer per instance, so the last one stands.
+    fn armed(effects: &[SpcEffect]) -> Option<Duration> {
+        effects.iter().rev().find_map(|e| match e {
+            SpcEffect::SetTimer { duration, .. } => Some(*duration),
+            _ => None,
+        })
+    }
+
+    /// A `NewView` for view 2 from `from`, carrying one fixed direct cert.
+    fn view_two_new_view(from: ValidatorId) -> SpcEvent {
+        let cert = SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::new([PcValueElement::new([0xD1; 32])]),
+            proof: dummy_pc_qc3().into(),
+        };
+        SpcEvent::NewViewVerified {
+            from,
+            view: SpcView::new(2),
+            cert: Box::new(Verified::<SpcCert>::new_unchecked_for_test(cert)),
+        }
+    }
+
+    fn signs_vote1_at_view_two(effects: &[SpcEffect]) -> bool {
+        effects.iter().any(
+            |e| matches!(e, SpcEffect::SignAndBroadcastPcVote1 { view, .. } if view.inner() == 2),
+        )
+    }
+
+    /// Entering view 2 short of every member's proposal object arms the
+    /// input dwell, not the view timeout: a silent member costs the
+    /// dwell.
+    #[test]
+    fn a_partial_view_two_entry_arms_the_input_dwell() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        let entry = fsm.handle(view_two_new_view(members[1].0));
+        assert_eq!(fsm.current_view(), SpcView::new(2));
+        assert!(!signs_vote1_at_view_two(&entry), "fed short; got {entry:?}");
+        assert_eq!(armed(&entry), Some(INPUT_DWELL), "got {entry:?}");
+    }
+
+    /// The input dwell's expiry feeds the partial buffer and hands the
+    /// view to the heartbeat.
+    #[test]
+    fn the_input_dwell_feeds_what_is_held_and_arms_the_heartbeat() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        let _ = fsm.handle(view_two_new_view(members[1].0));
+        let expiry = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(2),
+        });
+        assert!(signs_vote1_at_view_two(&expiry), "got {expiry:?}");
+        assert_eq!(armed(&expiry), Some(VIEW_TIMEOUT), "got {expiry:?}");
+    }
+
+    /// The member whose proposal object completes the buffer feeds the
+    /// inner PC at once and hands the view to the heartbeat, though the
+    /// view was entered several objects earlier.
+    #[test]
+    fn the_last_proposal_object_feeds_and_arms_the_heartbeat() {
+        let (_, members) = fsm_committee(4);
+        let mut fsm = fsm_instance(0);
+        for (i, (member, _)) in members.iter().enumerate() {
+            let effects = fsm.handle(view_two_new_view(*member));
+            if i + 1 < members.len() {
+                assert!(
+                    !signs_vote1_at_view_two(&effects),
+                    "fed at {i}; got {effects:?}"
+                );
+                assert_ne!(
+                    armed(&effects),
+                    Some(VIEW_TIMEOUT),
+                    "at {i}; got {effects:?}"
+                );
+            } else {
+                assert!(signs_vote1_at_view_two(&effects), "got {effects:?}");
+                assert_eq!(armed(&effects), Some(VIEW_TIMEOUT), "got {effects:?}");
+            }
+        }
+    }
+
+    /// At view ≥ 2 the input dwell's expiry forces the inner PC onto the
+    /// partial proposal buffer; subsequent
     /// expiries replay the view's messages, including a `NewView`
     /// re-relay of a held cert authorising the view.
     #[test]
@@ -1868,6 +1976,7 @@ mod tests {
                 members.clone(),
                 members[idx].0,
                 Duration::from_millis(100),
+                Duration::from_millis(10),
             )
         };
         let mut x = mk(0);

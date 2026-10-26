@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_core::{
     Action, BeaconFetchIds, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange,
@@ -62,6 +63,12 @@ use crate::{boundary, rules};
 /// seconds — negligible against the epoch, comfortably inside
 /// [`SPC_VIEW_TIMEOUT`](hyperscale_types::SPC_VIEW_TIMEOUT).
 pub const MAX_INPUT_DWELL_REARMS: u32 = 6;
+
+/// The longest a member waits for the committee's inputs to an SPC view
+/// before feeding whatever it holds: view 1's dwell with every re-arm, and
+/// the same bound on a view ≥ 2's proposal objects. A silent member costs
+/// an epoch this, not a view timeout.
+pub const MAX_INPUT_WAIT: Duration = SPC_INPUT_DWELL.saturating_mul(MAX_INPUT_DWELL_REARMS + 1);
 
 /// Candidates held for epochs past the pending one. One committee
 /// certifies one candidate per epoch; the cap bounds what a sender can
@@ -658,17 +665,13 @@ impl BeaconParticipant {
     /// proposal's VRF reveal against `(network.id, epoch)` under
     /// `from`'s pubkey, so admission here is a pure pool insert.
     ///
-    /// Once a quorum (`2f+1`) of committee proposals — including the
-    /// local one, which arrives back via the action handler's
-    /// feedback — is pooled, this is the fast-path trigger that feeds
-    /// SPC's view-1 PC instance: `compute_view_one_input` reads the
-    /// pool's view of committee proposals and `SpcEvent::Input` kicks
-    /// the FSM into outbound traffic. Quorum rather than full
-    /// coverage keeps one faulty or lagging member from pushing every
-    /// epoch onto the dwell timer; requiring the local proposal keeps
-    /// a fast peer tick from feeding an input that omits it. The
-    /// post-bootstrap dwell ([`Self::on_spc_input_dwell_timer`])
-    /// covers the rest.
+    /// Once every committee member's proposal — the local one included,
+    /// which arrives back via the action handler's feedback — is pooled,
+    /// this feeds SPC's view-1 PC instance: `compute_view_one_input`
+    /// reads the pool's view of committee proposals and
+    /// `SpcEvent::Input` kicks the FSM into outbound traffic. The
+    /// post-bootstrap dwell ([`Self::on_spc_input_dwell_timer`]) feeds
+    /// a partial vector when a member's proposal never arrives.
     pub fn on_beacon_proposal_received(
         &mut self,
         fold: &BeaconFold,
