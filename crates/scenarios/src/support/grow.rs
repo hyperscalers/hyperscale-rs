@@ -142,12 +142,12 @@ pub fn register_staged(c: &mut impl Cluster) {
 }
 
 /// [`register_staged`], each registration also handing the staging pool's
-/// owner badge and a float to `hand_to`'s account.
+/// owner badge to `hand_to`'s account.
 ///
 /// # Panics
 ///
 /// As [`register_staged`].
-pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<(PrincipalAddr, u128)>) {
+pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<PrincipalAddr>) {
     let staged = c.staged_validators();
     if staged.is_empty() {
         return;

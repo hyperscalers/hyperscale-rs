@@ -16,6 +16,7 @@
 //! builders enforce, so a defect can cost a signer a refused transaction
 //! and can never produce one the chain would wrongly accept.
 
+mod intents;
 mod staking;
 
 use std::sync::LazyLock;
@@ -26,10 +27,14 @@ use hyperscale_effects_bridge::{NodeRecords, PROTOCOL_RESOURCE};
 use hyperscale_types::{
     AccountSigner, NetworkId, ProtocolHasher, TimestampRange, Transaction, TransactionEnvelope,
 };
-use hyperscale_vm_effects::{Claim, Intent, IntentHeader, IntentTree, ManifestGraph, StoredRule};
-use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
+use hyperscale_vm_effects::{Claim, IntentTree, ManifestGraph, StoredRule};
+pub use hyperscale_vm_effects::{Intent, IntentHeader, SignedIntent};
+use hyperscale_vm_manifest_builder::signing;
+pub use hyperscale_vm_manifest_builder::{IntentError, TypedBuilder, TypedError};
 use hyperscale_vm_stdlib::account;
+pub use hyperscale_vm_stdlib::staking::Staking;
 use hyperscale_vm_types::PrincipalAddr;
+pub use intents::{attested_only_by, decode_intent, encode_intent, sign_intent};
 pub use staking::pool_address;
 
 /// The compute every built envelope signs for whole, split evenly over
