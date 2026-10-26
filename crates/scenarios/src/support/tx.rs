@@ -16,7 +16,7 @@ use hyperscale_engine::genesis::{OWNER_BADGE_ID, pool_owner_badge, stake_unit};
 use hyperscale_engine::{PROTOCOL_RESOURCE, account_address};
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_transactions::{
-    Ceilings, Client, Terms, default_gas_limits, pool_address, principal_of,
+    Ceilings, Client, Terms, default_gas_limits, pool_address, principal_of, sign_intent,
 };
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
@@ -2651,7 +2651,7 @@ pub(crate) fn build_register_tx(
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
-    hand_to: Option<(PrincipalAddr, u128)>,
+    hand_to: Option<PrincipalAddr>,
     validity: TimestampRange,
 ) -> Transaction {
     let graph = client()
@@ -2703,8 +2703,41 @@ pub(crate) fn build_unjail_tx(
     Transaction::new(envelope(graph, owner, validity))
 }
 
-/// The account a registration hands the staging pool to, unfunded until
-/// the hand-over's float reaches it.
+/// [`build_unjail_tx`] declared by `owner` alone and composed by `sponsor`,
+/// which pays.
+#[must_use]
+pub(crate) fn build_sponsored_unjail_tx(
+    sponsor: &Ed25519PrivateKey,
+    owner: &Ed25519PrivateKey,
+    pool: ComponentAddr,
+    validator: ValidatorId,
+    validity: TimestampRange,
+) -> Transaction {
+    let declaration = client()
+        .operator_declaration(
+            account_address(&owner.public_key().0),
+            pool,
+            scenario_header(validity),
+            |b| staking::Staking::at(pool).unjail(b, validator.inner()),
+        )
+        .expect("an unjail declares against the pool's signature");
+    client()
+        .sponsor(
+            sign_intent(declaration, owner),
+            sponsor,
+            scenario_header(validity),
+            Terms {
+                max_fee: MAX_FEE,
+                ceilings: Ceilings::Guessed,
+                priority_bp: 0,
+                message: Vec::new(),
+            },
+        )
+        .expect("a declaration with no sockets or gives composes")
+}
+
+/// The account a registration hands the staging pool to, holding nothing
+/// of its own.
 #[must_use]
 pub(crate) fn pool_heir() -> (Ed25519PrivateKey, PrincipalAddr) {
     let key = signer_from_seed(182);
@@ -2712,8 +2745,8 @@ pub(crate) fn pool_heir() -> (Ed25519PrivateKey, PrincipalAddr) {
     (key, account)
 }
 
-/// What a hand-over leaves the heir to pay its own fees with.
-pub(crate) const HEIR_FLOAT: u128 = MAX_FEE * 8;
+/// What a heir signing its own transactions is given to pay with.
+pub(crate) const HEIR_FUNDING: u128 = MAX_FEE * 8;
 
 /// The principal the staking scenario's pool admits on its operator
 /// surface, and the key that satisfies it.

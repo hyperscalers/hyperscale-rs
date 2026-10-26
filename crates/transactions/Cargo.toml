@@ -7,6 +7,7 @@ description = "Client-side construction of signed transactions"
 
 [dependencies]
 hyperscale-effects-bridge.workspace = true
+hyperscale-hbor.workspace = true
 hyperscale-types.workspace = true
 hyperscale-vm-effects.workspace = true
 hyperscale-vm-types.workspace = true
@@ -14,7 +15,6 @@ hyperscale-vm-manifest-builder.workspace = true
 hyperscale-vm-stdlib.workspace = true
 
 [dev-dependencies]
-hyperscale-hbor.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 [lints]

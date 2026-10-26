@@ -198,6 +198,7 @@ pub use venue::{
 };
 pub use witnesses::{
     a_restarted_genesis_host_resumes_beside_a_newcomer,
+    a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
     a_timed_out_newcomer_is_let_back_in_from_its_own_host,
     an_offline_newcomer_leaves_the_network_live, delegation_folds_into_beacon_state,
     pool_capacity_caps_registrations, pool_transfer_moves_operatorship,

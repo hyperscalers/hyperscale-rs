@@ -94,6 +94,7 @@ use hyperscale_scenarios::{
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
+    a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
     a_timed_out_newcomer_is_let_back_in_from_its_own_host,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
@@ -3559,6 +3560,24 @@ fn a_timed_out_newcomer_is_let_back_in_from_its_own_host_sim(seed: u64) {
 
 seeded!(
     a_timed_out_newcomer_is_let_back_in_from_its_own_host_sim:
+    seed_1 = 1,
+    seed_2 = 2,
+    seed_3 = 3,
+);
+
+fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent_sim(seed: u64) {
+    let mut cluster = SimCluster::with_staged_newcomers(
+        &devnet_config(),
+        seed,
+        &staking_genesis_accounts(),
+        1,
+        devnet_chain,
+    );
+    cluster.run_faultable(a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent);
+}
+
+seeded!(
+    a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent_sim:
     seed_1 = 1,
     seed_2 = 2,
     seed_3 = 3,

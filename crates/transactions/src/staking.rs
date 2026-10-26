@@ -64,10 +64,11 @@ impl Client {
     /// key it will be known by and the proof it holds that key, composed by
     /// `operator`, whose account holds the pool's owner badge.
     ///
-    /// With `hand_to`, the same transaction then moves the owner badge and
-    /// `float` of the operator's native balance to the new owner's account,
-    /// so the validator is never registered under an operator who keeps the
-    /// pool, and its owner can pay for its own actions from the start.
+    /// With `hand_to`, the same transaction then moves the owner badge to
+    /// that account, so the validator is never registered under an operator
+    /// who keeps the pool. The new owner pays for nothing it signs when its
+    /// actions are declarations another account composes and pays for
+    /// ([`Client::sponsor`]).
     ///
     /// # Errors
     ///
@@ -80,7 +81,7 @@ impl Client {
         validator: ValidatorId,
         key: &ConsensusPublicKey,
         proof: &ConsensusSignature,
-        hand_to: Option<(PrincipalAddr, u128)>,
+        hand_to: Option<PrincipalAddr>,
     ) -> Result<ManifestGraph, TypedError> {
         self.as_operator(
             operator,
@@ -94,14 +95,12 @@ impl Client {
                 )
             },
             |b| {
-                let Some((owner, float)) = hand_to else {
+                let Some(owner) = hand_to else {
                     return Ok(());
                 };
                 let badge =
                     account::withdraw_nf(b, operator, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
-                account::deposit_nf(b, owner, badge)?;
-                let funds = account::withdraw(b, operator, *PROTOCOL_RESOURCE, float)?;
-                account::deposit(b, owner, funds)
+                account::deposit_nf(b, owner, badge)
             },
         )
     }
@@ -225,7 +224,7 @@ mod tests {
                     ValidatorId::new(1000),
                     &ConsensusPublicKey::ZERO,
                     &ConsensusSignature::ZERO,
-                    Some((owner, 100)),
+                    Some(owner),
                 )
                 .is_ok()
         );

@@ -30,10 +30,11 @@ use crate::support::query::{
     validator_pubkey, validator_status,
 };
 use crate::support::tx::{
-    GENESIS_POOL_ID, HEIR_FLOAT, SECOND_POOL_ID, STAKE_POOL_ID, badge_buyer, build_badge_sale_tx,
-    build_deactivate_tx, build_register_tx, build_reshape_threshold_vote_tx, build_stake_tx,
-    build_unjail_tx, build_unstake_tx, delegator, pool_at, pool_heir, pool_operator,
-    pool_vault_cell, validity_around,
+    GENESIS_POOL_ID, HEIR_FUNDING, SECOND_POOL_ID, STAKE_POOL_ID, badge_buyer, build_badge_sale_tx,
+    build_deactivate_tx, build_register_tx, build_reshape_threshold_vote_tx,
+    build_sponsored_unjail_tx, build_stake_tx, build_transfer_tx, build_unjail_tx,
+    build_unstake_tx, delegator, pool_at, pool_heir, pool_operator, pool_vault_cell,
+    validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
 use crate::support::{Cluster, Crash, CrashableCluster, epochs, register_staged_handing_to};
@@ -777,12 +778,74 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
 ///
 /// # Panics
 ///
-/// Panics if the newcomer is never seated ready, is not jailed while its
-/// host is down, its host never comes back or keeps a shard loop, its
-/// time-out never ends, or the unjail never returns it to the pool.
-pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host(c: &mut impl CrashableCluster) {
+/// As [`time_out_a_newcomer_handing_to`], or if the unjail never returns the
+/// newcomer to the pool.
+pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: CrashableCluster>(c: &mut C) {
     let (heir_key, heir) = pool_heir();
-    let newcomer = seat_the_staged_newcomer_handing_to(c, Some((heir, HEIR_FLOAT)));
+    let (newcomer, host) = time_out_a_newcomer_handing_to(c, heir, true);
+    let attempt = |c: &mut C| {
+        let unjail = build_unjail_tx(
+            &heir_key,
+            pool_at(STAKE_POOL_ID),
+            newcomer,
+            validity_around(c.now()),
+        );
+        c.submit_at_host(host, Arc::new(unjail));
+    };
+    let_back_in(c, newcomer, attempt);
+}
+
+/// A timed out newcomer whose pool's owner holds nothing is let back in by
+/// an unjail it declares and a sponsor composes and pays for.
+///
+/// # Panics
+///
+/// As [`time_out_a_newcomer_handing_to`], or if the sponsored unjail never
+/// returns the newcomer to the pool.
+pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableCluster>(c: &mut C) {
+    let (heir_key, heir) = pool_heir();
+    let (newcomer, _) = time_out_a_newcomer_handing_to(c, heir, false);
+    let (sponsor_key, _) = delegator();
+    let attempt = |c: &mut C| {
+        let unjail = build_sponsored_unjail_tx(
+            &sponsor_key,
+            &heir_key,
+            pool_at(STAKE_POOL_ID),
+            newcomer,
+            validity_around(c.now()),
+        );
+        c.submit(Arc::new(unjail));
+    };
+    let_back_in(c, newcomer, attempt);
+}
+
+/// Seat the staged newcomer with its registration handing the staging pool
+/// to `heir`, funded for its own fees when `funded`; crash its host until
+/// it is jailed; bring the host back; and wait until its time-out is over
+/// and the host, its loop retired, is seated nowhere. Returns the newcomer
+/// and its host.
+///
+/// # Panics
+///
+/// Panics if the newcomer is never seated ready, is not jailed while its
+/// host is down, its host never comes back or keeps a shard loop, or its
+/// time-out never ends.
+fn time_out_a_newcomer_handing_to(
+    c: &mut impl CrashableCluster,
+    heir: PrincipalAddr,
+    funded: bool,
+) -> (ValidatorId, usize) {
+    let newcomer = seat_the_staged_newcomer_handing_to(c, Some(heir));
+    if funded {
+        let (key, from) = delegator();
+        c.submit(Arc::new(build_transfer_tx(
+            &key,
+            from,
+            heir,
+            HEIR_FUNDING,
+            validity_around(c.now()),
+        )));
+    }
     let host = c.host_of(newcomer).expect("the newcomer has a host");
     c.crash(host, Crash::Process, epochs(12));
     assert!(
@@ -806,14 +869,23 @@ pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host(c: &mut impl Crasha
             .and_then(|s| s.unjail_refusal(newcomer, STAKE_POOL_ID)),
     );
     // The placement scan retires the jailed newcomer's loop; from then on
-    // its host is seated nowhere, which is the host this scenario is for.
+    // its host is seated nowhere.
     assert!(
         c.run_until(epochs(40), |c| live_shards(c)
             .iter()
             .all(|&shard| c.host_committed_height(host, shard).is_none())),
         "the jailed newcomer's host kept a shard loop",
     );
-    let back = |c: &_| {
+    (newcomer, host)
+}
+
+/// Make `attempt` until `newcomer` is back in the pool.
+///
+/// # Panics
+///
+/// Panics if it never is.
+fn let_back_in<C: CrashableCluster>(c: &mut C, newcomer: ValidatorId, attempt: impl Fn(&mut C)) {
+    let back = |c: &C| {
         matches!(
             validator_status(c, newcomer),
             Some(
@@ -824,19 +896,13 @@ pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host(c: &mut impl Crasha
         )
     };
     for _ in 0..UNJAIL_ATTEMPTS {
-        let unjail = build_unjail_tx(
-            &heir_key,
-            pool_at(STAKE_POOL_ID),
-            newcomer,
-            validity_around(c.now()),
-        );
-        c.submit_at_host(host, Arc::new(unjail));
+        attempt(c);
         if c.run_until(epochs(4), back) {
             return;
         }
     }
     panic!(
-        "the heir's unjail never returned the newcomer to the pool; status = {:?}",
+        "the unjail never returned the newcomer to the pool; status = {:?}",
         validator_status(c, newcomer),
     );
 }
@@ -898,7 +964,7 @@ fn seat_the_staged_newcomer(c: &mut impl Cluster) -> ValidatorId {
 /// to `hand_to`'s account.
 fn seat_the_staged_newcomer_handing_to(
     c: &mut impl Cluster,
-    hand_to: Option<(PrincipalAddr, u128)>,
+    hand_to: Option<PrincipalAddr>,
 ) -> ValidatorId {
     warm_up(c);
     let staged = c.staged_validators();
