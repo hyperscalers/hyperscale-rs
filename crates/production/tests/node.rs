@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hex::encode as hex_encode;
 use hyperscale_production::network_file::{Chain, Genesis, ValidatorEntry};
-use hyperscale_production::{LocalValidator, NetworkFile, Node, NodeError, NodeSetup, Observation};
+use hyperscale_production::{LocalValidator, NetworkFile, Node, NodeSetup, Observation};
 use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId, ValidatorId};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -23,6 +23,10 @@ use tracing_subscriber::fmt;
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// The height every hosted validator must reach.
 const TARGET_HEIGHT: u64 = 3;
+
+/// How soon a peer sees a stopped host's connection close: inside the
+/// transports' idle timeouts, so only a close that reached it passes.
+const LEAVE_SEEN_WITHIN: Duration = Duration::from_secs(3);
 
 /// A localhost QUIC port nothing holds right now.
 fn free_port() -> u16 {
@@ -40,6 +44,7 @@ mod net {
     pub use hyperscale_network_iroh::test_utils::TestFixtures;
     use hyperscale_network_iroh::{EndpointAddr, IrohConfig, SecretKey};
 
+    #[derive(Clone)]
     pub struct Listen {
         key: SecretKey,
         at: SocketAddr,
@@ -309,19 +314,96 @@ fn a_stopped_host_starts_again_on_its_own_data() {
     run(false);
 }
 
+/// A stopped host has closed its stores and its socket by the time `stop`
+/// returns, while the caller's runtime and a connected peer live on: its
+/// peer sees it leave, and the same process starts it again at once on the
+/// same data, address and key, and it rejoins the peer.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_host_stopped_beside_a_live_peer_starts_again_at_once() {
+    let _ = fmt().with_test_writer().try_init();
+    let fixtures = TestFixtures::new(11, 4);
+    let (dir0, dir1) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let beacon_chain = network(None);
+    let listen0 = net::listen(free_port());
+    let dial0 = net::dial(&listen0);
+    let node0 = Node::start(setup(
+        dir0.path(),
+        &fixtures,
+        &[0, 1],
+        listen0,
+        vec![],
+        beacon_chain,
+    ))
+    .expect("start host 0");
+    let listen1 = net::listen(free_port());
+    let start1 = || {
+        Node::start(setup(
+            dir1.path(),
+            &fixtures,
+            &[2, 3],
+            listen1.clone(),
+            vec![dial0.clone()],
+            beacon_chain,
+        ))
+    };
+    let reach = |node: &Node, target: u64| {
+        let node_status = node.status();
+        async move {
+            timeout(COMMIT_TIMEOUT, async {
+                loop {
+                    let status = node_status.load_full();
+                    let lowest = status.vnodes.iter().map(|v| v.block_height).min();
+                    if lowest.is_some_and(|h| h >= target) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await
+        }
+    };
+
+    let node1 = start1().expect("start host 1");
+    reach(&node1, TARGET_HEIGHT)
+        .await
+        .expect("host 1 commits beside its peer");
+    node1.stop().await.expect("host 1 stops cleanly");
+    let node0_status = node0.status();
+    timeout(LEAVE_SEEN_WITHIN, async {
+        while node0_status.load().connected_peers > 0 {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("host 0 sees host 1 leave before any idle timeout would tell it");
+
+    let node1 = start1().expect("host 1 starts again on its own data");
+    reach(&node1, TARGET_HEIGHT * 2)
+        .await
+        .expect("host 1 commits again beside its peer");
+
+    node1.stop().await.expect("host 1 stops cleanly again");
+    node0.stop().await.expect("host 0 stops cleanly");
+}
+
+/// A host runs on a runtime of its own, so a caller on any runtime starts
+/// and stops one.
 #[tokio::test(flavor = "current_thread")]
-async fn a_current_thread_runtime_is_refused() {
+#[serial]
+async fn a_current_thread_caller_starts_and_stops_a_host() {
     let fixtures = TestFixtures::new(11, 4);
     let dir = TempDir::new().unwrap();
-    let started = Node::start(setup(
+    let node = Node::start(setup(
         dir.path(),
         &fixtures,
-        &[0],
+        &[0, 1, 2, 3],
         net::listen(free_port()),
         vec![],
         network(None),
-    ));
-    assert!(matches!(started, Err(NodeError::Runtime)));
+    ))
+    .expect("the host starts");
+    node.stop().await.expect("the host stops cleanly");
 }
 
 /// The shortest epochs a chain may run, so a test sees the beacon adopt

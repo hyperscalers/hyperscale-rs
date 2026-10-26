@@ -18,9 +18,9 @@
 //! and a validator that loses its role in a shard that stays up is
 //! detached the same way.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crossbeam::channel::{Receiver, Sender};
 use hyperscale_core::ParticipationChange;
@@ -189,6 +189,10 @@ pub struct Registering {
 
 /// One hosted shard's runtime: its pinned thread plus the handles the
 /// supervisor needs to stop it.
+/// A torn down shard's thread, joined by whichever comes first: its
+/// off-loop join or [`ShardSupervisor::shutdown_all`].
+type DrainingThread = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
+
 struct ShardThread {
     join: std::thread::JoinHandle<()>,
     shutdown_tx: Sender<()>,
@@ -270,9 +274,12 @@ pub struct ShardSupervisor {
     /// Threaded into every shard the supervisor seats so a runtime join
     /// shares the runner's clock origin.
     genesis_offset_ms: u64,
-    /// Shards whose teardown is parked on the off-loop thread join.
-    /// A `Join` arriving meanwhile queues in [`Self::pending_joins`].
-    draining: HashSet<ShardId>,
+    /// Shards whose teardown is parked on the off-loop thread join, each
+    /// with its thread's handle until that join takes it. A `Join`
+    /// arriving meanwhile queues in [`Self::pending_joins`]. The handle
+    /// stays here because the runtime drops a queued blocking job unrun
+    /// when it shuts down; [`Self::shutdown_all`] joins what is left.
+    draining: HashMap<ShardId, DrainingThread>,
     /// Reshape io results held for the next reshape tick rather than fed
     /// straight back: a deferral whose cause still stands would otherwise
     /// re-issue its request as fast as it fails.
@@ -356,7 +363,7 @@ impl ShardSupervisor {
             reshape_stores: HashMap::new(),
             pending_reshape_prep: HashMap::new(),
             epoch_duration_ms,
-            draining: HashSet::new(),
+            draining: HashMap::new(),
             deferred_reshape_events: Vec::new(),
             pending_joins: HashMap::new(),
             awaiting_anchor: BTreeMap::new(),
@@ -462,6 +469,17 @@ impl ShardSupervisor {
         }
         for entry in std::mem::take(&mut self.shards).into_values() {
             if let Err(e) = entry.join.join() {
+                warn!("Shard thread panicked: {e:?}");
+            }
+        }
+        for draining in std::mem::take(&mut self.draining).into_values() {
+            let join = draining
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(join) = join
+                && let Err(e) = join.join()
+            {
                 warn!("Shard thread panicked: {e:?}");
             }
         }

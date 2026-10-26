@@ -300,5 +300,5 @@ async fn main() {
         &out_dir.join(format!("{}.json", cli.index)),
         to_json(&report).expect("a report encodes").as_bytes(),
     );
-    adapter.shutdown();
+    adapter.shutdown().await;
 }

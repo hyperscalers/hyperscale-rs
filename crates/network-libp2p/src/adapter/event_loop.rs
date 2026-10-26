@@ -118,6 +118,7 @@ pub(super) async fn run(
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!("Shutting down libp2p network event loop");
+                close_connections(&mut swarm).await;
                 break;
             }
 
@@ -618,6 +619,22 @@ fn drain_all_higher_priority_commands(
     drain_channel(swarm, consensus_rx);
     drain_channel(swarm, block_completion_rx);
     drain_channel(swarm, cross_shard_progress_rx);
+}
+
+/// Closes every connection and drives the swarm until none is left, so each
+/// close is handed to the transport before the swarm drops. A connection
+/// that comes up meanwhile, a dial already under way or a peer reaching in,
+/// is closed as it arrives.
+async fn close_connections(swarm: &mut Swarm<Behaviour>) {
+    let peers: Vec<Libp2pPeerId> = swarm.connected_peers().copied().collect();
+    for peer in peers {
+        let _ = swarm.disconnect_peer_id(peer);
+    }
+    while swarm.connected_peers().next().is_some() {
+        if let SwarmEvent::ConnectionEstablished { peer_id, .. } = swarm.select_next_some().await {
+            let _ = swarm.disconnect_peer_id(peer_id);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -417,9 +417,9 @@ impl Star {
     ///
     /// Returns the relay's error when it does not stop cleanly.
     pub async fn shutdown(self) -> Result<(), SupervisorError> {
-        self.hub.shutdown();
+        self.hub.shutdown().await;
         for peer in &self.peers {
-            peer.shutdown();
+            peer.shutdown().await;
         }
         self.relay.shutdown().await
     }

@@ -58,7 +58,7 @@ use hyperscale_types::{
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, block_in_place};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, error, info, warn};
 
@@ -1006,10 +1006,12 @@ impl ProductionRunner {
             }
         }
 
-        // ── 5. Fan shutdown to every shard thread in parallel.
+        // ── 5. Fan shutdown to every shard thread in parallel, joining them
+        // without holding up this runtime's other work, then close every
+        // connection so the peers see this host leave.
         info!("Sending shutdown to shard threads");
-        supervisor.shutdown_all();
-        self.network.shutdown();
+        block_in_place(|| supervisor.shutdown_all());
+        self.network.shutdown().await;
 
         info!("Production runner stopped");
         outcome

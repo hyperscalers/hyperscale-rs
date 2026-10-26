@@ -1,8 +1,8 @@
 //! Core `Libp2pAdapter`: construction, public API, and shutdown.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -27,6 +27,7 @@ use libp2p::{Multiaddr, PeerId as Libp2pPeerId, Stream};
 use libp2p_stream::{Behaviour as StreamBehaviour, Control as StreamControl, OpenStreamError};
 use tokio::spawn;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{info, trace};
 
 use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, request_protocol};
@@ -68,6 +69,9 @@ pub struct Libp2pAdapter {
 
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
+
+    /// The swarm's event loop, until [`Self::shutdown`] awaits it.
+    event_loop: Mutex<Option<JoinHandle<()>>>,
 
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
@@ -298,6 +302,7 @@ impl Libp2pAdapter {
             priority_channels,
             validator_peers: validator_peers.clone(),
             shutdown_tx: Some(shutdown_tx),
+            event_loop: Mutex::new(None),
             cached_peer_count: cached_peer_count.clone(),
             stream_control,
             validator_keys: shared_keys,
@@ -319,7 +324,7 @@ impl Libp2pAdapter {
         let announce_vnodes = vnodes;
         let event_loop_wanted = Arc::clone(&adapter.wanted_validators);
         let event_loop_address_book = Arc::clone(&adapter.address_book);
-        spawn(async move {
+        let event_loop = spawn(async move {
             // Keep bind_handle alive for the lifetime of the event loop.
             let _bind_handle = bind_handle;
 
@@ -369,6 +374,10 @@ impl Libp2pAdapter {
                 }
             }
         });
+        *adapter
+            .event_loop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(event_loop);
 
         Ok(adapter)
     }
@@ -666,11 +675,25 @@ impl Libp2pAdapter {
         self.stream_control.clone()
     }
 
-    /// Stop the swarm's event loop, closing every connection and the
-    /// listeners. The adapter answers nothing afterwards; handles to it
-    /// that outlive its owner's shutdown hold a closed transport rather
-    /// than a live peer.
-    pub fn shutdown(&self) {
+    /// Stops the swarm's event loop and waits for it: every connection is
+    /// closed and the swarm, with its listeners, dropped by the time this
+    /// returns. The adapter answers nothing afterwards; handles to it that
+    /// outlive its owner's shutdown hold a closed transport rather than a
+    /// live peer.
+    pub async fn shutdown(&self) {
+        self.signal_shutdown();
+        let event_loop = self
+            .event_loop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(event_loop) = event_loop {
+            // The loop catches its own panics; an error here is a cancel.
+            let _ = event_loop.await;
+        }
+    }
+
+    fn signal_shutdown(&self) {
         if let Some(tx) = &self.shutdown_tx {
             let _ = tx.try_send(());
         }
@@ -679,7 +702,7 @@ impl Libp2pAdapter {
 
 impl Drop for Libp2pAdapter {
     fn drop(&mut self) {
-        self.shutdown();
+        self.signal_shutdown();
     }
 }
 

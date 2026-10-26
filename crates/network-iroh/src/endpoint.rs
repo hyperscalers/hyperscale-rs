@@ -187,7 +187,9 @@ struct SignedRecords {
 /// connections.
 pub struct IrohAdapter {
     inner: Arc<Inner>,
-    tasks: Vec<JoinHandle<()>>,
+    /// The accept and maintenance loops, until [`Self::shutdown`] awaits
+    /// them.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl IrohAdapter {
@@ -295,7 +297,10 @@ impl IrohAdapter {
             inner.runtime.spawn(Arc::clone(&inner).accept_loop()),
             inner.runtime.spawn(Arc::clone(&inner).maintenance_loop()),
         ];
-        Ok(Arc::new(Self { inner, tasks }))
+        Ok(Arc::new(Self {
+            inner,
+            tasks: Mutex::new(tasks),
+        }))
     }
 
     /// The endpoint id this host binds as.
@@ -622,25 +627,33 @@ impl IrohAdapter {
         self.inner.fault_gate.configure(self_host, peers);
     }
 
-    /// Close every connection and the endpoint. The adapter answers nothing
-    /// afterwards.
-    pub fn shutdown(&self) {
-        for task in &self.tasks {
+    /// Closes every connection and the endpoint and waits until they are
+    /// closed, so the peers see this host leave and its socket is free by
+    /// the time this returns. The adapter answers nothing afterwards.
+    pub async fn shutdown(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
+        for task in &tasks {
             task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
         }
         for link in &self.inner.links {
             link.connection.close(CLOSE_SHUTDOWN, b"shutdown");
         }
-        let endpoint = self.inner.endpoint.clone();
-        self.inner
-            .runtime
-            .spawn(async move { endpoint.close().await });
+        for held in &self.inner.redials_held {
+            held.close(CLOSE_SHUTDOWN, b"shutdown");
+        }
+        self.inner.endpoint.close().await;
     }
 }
 
 impl Drop for IrohAdapter {
     fn drop(&mut self) {
-        self.shutdown();
+        let tasks = self.tasks.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for task in tasks.iter() {
+            task.abort();
+        }
     }
 }
 
