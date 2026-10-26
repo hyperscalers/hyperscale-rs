@@ -20,7 +20,7 @@ use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     BlockHeight, MAX_CLAIMS_BYTES, MAX_STATE_CLAIMS_BYTES, PendingReshape, ShardId, StateRoot,
-    ValidatorId,
+    Transaction, ValidatorId,
 };
 
 use super::{Budget, Cluster};
@@ -117,6 +117,10 @@ pub trait FaultableCluster: Cluster {
 
     /// The host running `validator`, or `None` when no host runs it.
     fn host_of(&self, validator: ValidatorId) -> Option<usize>;
+
+    /// Submit `tx` at `host` itself, whatever it serves, as a client
+    /// talking to its own node does.
+    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>);
 
     /// The hosts whose vnode sits in `shard`'s live committee — the copy
     /// currently seated, not a terminated chain lingering on old hosts.

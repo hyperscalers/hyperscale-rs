@@ -2651,6 +2651,7 @@ pub(crate) fn build_register_tx(
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
+    hand_to: Option<(PrincipalAddr, u128)>,
     validity: TimestampRange,
 ) -> Transaction {
     let graph = client()
@@ -2660,7 +2661,7 @@ pub(crate) fn build_register_tx(
             validator,
             pubkey,
             possession_proof,
-            None,
+            hand_to,
         )
         .expect("a registration types against the pool's signature");
     Transaction::new(envelope(graph, operator, validity))
@@ -2686,6 +2687,33 @@ pub(crate) fn build_unstake_tx(
     });
     Transaction::new(envelope(graph, delegator, validity))
 }
+
+/// Lift `validator`'s time-out in `pool`, signed by the account holding
+/// the pool's owner badge.
+#[must_use]
+pub(crate) fn build_unjail_tx(
+    owner: &Ed25519PrivateKey,
+    pool: ComponentAddr,
+    validator: ValidatorId,
+    validity: TimestampRange,
+) -> Transaction {
+    let graph = client()
+        .unjail_validator_graph(account_address(&owner.public_key().0), pool, validator)
+        .expect("an unjail types against the pool's signature");
+    Transaction::new(envelope(graph, owner, validity))
+}
+
+/// The account a registration hands the staging pool to, unfunded until
+/// the hand-over's float reaches it.
+#[must_use]
+pub(crate) fn pool_heir() -> (Ed25519PrivateKey, PrincipalAddr) {
+    let key = signer_from_seed(182);
+    let account = account_address(&key.public_key().0);
+    (key, account)
+}
+
+/// What a hand-over leaves the heir to pay its own fees with.
+pub(crate) const HEIR_FLOAT: u128 = MAX_FEE * 8;
 
 /// The principal the staking scenario's pool admits on its operator
 /// surface, and the key that satisfies it.

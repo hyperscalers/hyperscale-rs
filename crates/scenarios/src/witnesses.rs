@@ -13,6 +13,7 @@
 //!
 //! [`BeaconState`]: hyperscale_types::BeaconState
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -21,19 +22,21 @@ use hyperscale_types::{
     ShardId, Stake, StakePoolId, Transaction, TransactionDecision, TransactionStatus,
     UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus, validator_possession_proof_sign,
 };
+use hyperscale_vm_types::PrincipalAddr;
 
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    beacon_epoch, epoch_duration_ms, pool_effective_stake, pool_total_stake, validator_pubkey,
-    validator_status,
+    beacon_epoch, epoch_duration_ms, live_shards, pool_effective_stake, pool_total_stake,
+    validator_pubkey, validator_status,
 };
 use crate::support::tx::{
-    GENESIS_POOL_ID, SECOND_POOL_ID, STAKE_POOL_ID, badge_buyer, build_badge_sale_tx,
+    GENESIS_POOL_ID, HEIR_FLOAT, SECOND_POOL_ID, STAKE_POOL_ID, badge_buyer, build_badge_sale_tx,
     build_deactivate_tx, build_register_tx, build_reshape_threshold_vote_tx, build_stake_tx,
-    build_unstake_tx, delegator, pool_at, pool_operator, pool_vault_cell, validity_around,
+    build_unjail_tx, build_unstake_tx, delegator, pool_at, pool_heir, pool_operator,
+    pool_vault_cell, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
-use crate::support::{Cluster, Crash, CrashableCluster, epochs, register_staged};
+use crate::support::{Cluster, Crash, CrashableCluster, epochs, register_staged_handing_to};
 
 /// The single genesis stake pool every genesis validator belongs to.
 /// Warm the cluster until the beacon folds its first epoch — the precondition a
@@ -125,6 +128,7 @@ fn register<C: Cluster>(
             validator,
             &keypair.public_key(),
             &proof,
+            None,
             validity_around(c.now()),
         ),
     );
@@ -766,6 +770,82 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
     }
 }
 
+/// A timed out newcomer is let back in from its own host, seated nowhere.
+///
+/// Its registration handed the pool to an account of its own; that account
+/// signs the unjail, and the newcomer's host submits it.
+///
+/// # Panics
+///
+/// Panics if the newcomer is never seated ready, is not jailed while its
+/// host is down, its host never comes back or keeps a shard loop, its
+/// time-out never ends, or the unjail never returns it to the pool.
+pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host(c: &mut impl CrashableCluster) {
+    let (heir_key, heir) = pool_heir();
+    let newcomer = seat_the_staged_newcomer_handing_to(c, Some((heir, HEIR_FLOAT)));
+    let host = c.host_of(newcomer).expect("the newcomer has a host");
+    c.crash(host, Crash::Process, epochs(12));
+    assert!(
+        c.run_until(epochs(12), |c| matches!(
+            validator_status(c, newcomer),
+            Some(ValidatorStatus::Jailed { .. })
+        )),
+        "the newcomer was never jailed while its host was down; status = {:?}",
+        validator_status(c, newcomer),
+    );
+    assert!(
+        c.run_until(epochs(16), |c| c.is_up(host)),
+        "the newcomer's host never came back",
+    );
+    assert!(
+        c.run_until(epochs(40), |c| c.beacon_state().is_some_and(|s| s
+            .unjail_refusal(newcomer, STAKE_POOL_ID)
+            .is_none())),
+        "the newcomer's time-out never ended; refusal = {:?}",
+        c.beacon_state()
+            .and_then(|s| s.unjail_refusal(newcomer, STAKE_POOL_ID)),
+    );
+    // The placement scan retires the jailed newcomer's loop; from then on
+    // its host is seated nowhere, which is the host this scenario is for.
+    assert!(
+        c.run_until(epochs(40), |c| live_shards(c)
+            .iter()
+            .all(|&shard| c.host_committed_height(host, shard).is_none())),
+        "the jailed newcomer's host kept a shard loop",
+    );
+    let back = |c: &_| {
+        matches!(
+            validator_status(c, newcomer),
+            Some(
+                ValidatorStatus::Pooled
+                    | ValidatorStatus::Observing { .. }
+                    | ValidatorStatus::OnShard { .. }
+            )
+        )
+    };
+    for _ in 0..UNJAIL_ATTEMPTS {
+        let unjail = build_unjail_tx(
+            &heir_key,
+            pool_at(STAKE_POOL_ID),
+            newcomer,
+            validity_around(c.now()),
+        );
+        c.submit_at_host(host, Arc::new(unjail));
+        if c.run_until(epochs(4), back) {
+            return;
+        }
+    }
+    panic!(
+        "the heir's unjail never returned the newcomer to the pool; status = {:?}",
+        validator_status(c, newcomer),
+    );
+}
+
+/// Submissions of the unjail before the scenario gives up: the host binds
+/// its peers again after its restart, and a submission before that reaches
+/// nobody.
+const UNJAIL_ATTEMPTS: usize = 4;
+
 /// The host carrying every genesis validator restarts beside a seated
 /// newcomer, live or gone the same instant, and the network resumes.
 ///
@@ -811,6 +891,15 @@ pub fn a_restarted_genesis_host_resumes_beside_a_newcomer(
 /// Register the cluster's one staged validator, wait until it is seated
 /// ready, and let it sign a few epochs; returns its id.
 fn seat_the_staged_newcomer(c: &mut impl Cluster) -> ValidatorId {
+    seat_the_staged_newcomer_handing_to(c, None)
+}
+
+/// [`seat_the_staged_newcomer`], its registration handing the staging pool
+/// to `hand_to`'s account.
+fn seat_the_staged_newcomer_handing_to(
+    c: &mut impl Cluster,
+    hand_to: Option<(PrincipalAddr, u128)>,
+) -> ValidatorId {
     warm_up(c);
     let staged = c.staged_validators();
     let [(newcomer, _)] = staged[..] else {
@@ -819,7 +908,7 @@ fn seat_the_staged_newcomer(c: &mut impl Cluster) -> ValidatorId {
             staged.len()
         );
     };
-    register_staged(c);
+    register_staged_handing_to(c, hand_to);
     assert!(
         c.run_until(epochs(60), |c| matches!(
             validator_status(c, newcomer),

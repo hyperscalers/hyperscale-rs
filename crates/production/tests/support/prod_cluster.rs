@@ -645,6 +645,10 @@ impl FaultableCluster for ProdCluster {
         self.inner.host_of(validator)
     }
 
+    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+        self.inner.submit_transaction(host, &tx);
+    }
+
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {
         self.inner.hosts_serving(shard)
     }
