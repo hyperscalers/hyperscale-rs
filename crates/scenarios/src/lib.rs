@@ -197,6 +197,7 @@ pub use venue::{
     wide_swapper_shards,
 };
 pub use witnesses::{
+    a_restarted_genesis_host_resumes_beside_a_newcomer,
     an_offline_newcomer_leaves_the_network_live, delegation_folds_into_beacon_state,
     pool_capacity_caps_registrations, pool_transfer_moves_operatorship,
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,

@@ -285,8 +285,11 @@ async fn a_current_thread_runtime_is_refused() {
     assert!(matches!(started, Err(NodeError::Runtime)));
 }
 
-/// Five-second epochs, so a test sees the beacon adopt several.
-const SHORT_EPOCH_MS: u64 = 5_000;
+/// The shortest epochs a chain may run, so a test sees the beacon adopt
+/// several.
+const SHORT_EPOCH_MS: u64 = 30_000;
+/// How long a test watching epochs waits: twelve of them.
+const EPOCHS_TIMEOUT: Duration = Duration::from_millis(SHORT_EPOCH_MS * 12);
 /// The epoch each host's observation must have adopted.
 const TARGET_EPOCH: u64 = 2;
 
@@ -297,7 +300,7 @@ async fn watch_to_target(
 ) -> (Arc<Observation>, BTreeMap<BlockHeight, Vec<ValidatorId>>) {
     let mut observe = node.observe();
     let mut proposing = BTreeMap::new();
-    let last = timeout(COMMIT_TIMEOUT, async {
+    let last = timeout(EPOCHS_TIMEOUT, async {
         loop {
             observe.changed().await.expect("the host publishes");
             let Some(observation) = observe.borrow_and_update().clone() else {
@@ -397,7 +400,7 @@ async fn a_rotation_retires_the_head_of_the_published_order() {
 
     let mut observe = node0.observe();
     let mut published = BTreeMap::new();
-    let (boundary, before, after) = timeout(COMMIT_TIMEOUT, async {
+    let (boundary, before, after) = timeout(EPOCHS_TIMEOUT, async {
         loop {
             observe.changed().await.expect("the host publishes");
             let Some(observation) = observe.borrow_and_update().clone() else {

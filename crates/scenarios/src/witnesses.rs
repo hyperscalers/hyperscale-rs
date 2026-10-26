@@ -710,25 +710,7 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
 /// through silent commits a view timeout late, if it is not jailed once its
 /// host is gone or is seated again, or if the shard stops committing.
 pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster) {
-    warm_up(c);
-    let staged = c.staged_validators();
-    let [(newcomer, _)] = staged[..] else {
-        panic!(
-            "this scenario stages exactly one newcomer, not {}",
-            staged.len()
-        );
-    };
-    register_staged(c);
-    assert!(
-        c.run_until(epochs(60), |c| matches!(
-            validator_status(c, newcomer),
-            Some(ValidatorStatus::OnShard { ready: true, .. })
-        )),
-        "the newcomer was never seated ready; status = {:?}",
-        validator_status(c, newcomer),
-    );
-    // Let it sign a few epochs before its host goes.
-    c.run_until(epochs(3), |_| false);
+    let newcomer = seat_the_staged_newcomer(c);
     let host = c.host_of(newcomer).expect("the newcomer has a host");
     c.crash(host, Crash::Process, epochs(100_000));
     let crashed_at = c.beacon_state().map(|s| s.current_epoch);
@@ -782,4 +764,70 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
             validator_status(c, newcomer),
         );
     }
+}
+
+/// The host carrying every genesis validator restarts beside a seated
+/// newcomer, live or gone the same instant, and the network resumes.
+///
+/// After the restart the beacon folds past it and the shard commits again.
+///
+/// # Panics
+///
+/// Panics if the newcomer is never seated ready, the restarted host
+/// never comes back, or the beacon or the shard stays stopped after it.
+pub fn a_restarted_genesis_host_resumes_beside_a_newcomer(
+    c: &mut impl CrashableCluster,
+    newcomer_gone: bool,
+) {
+    let newcomer = seat_the_staged_newcomer(c);
+    if newcomer_gone {
+        let host = c.host_of(newcomer).expect("the newcomer has a host");
+        c.crash(host, Crash::Process, epochs(100_000));
+    }
+    let genesis = c.host_of(ValidatorId::new(0)).expect("genesis has a host");
+    c.crash(genesis, Crash::Process, epochs(1));
+    assert!(
+        c.run_until(epochs(4), |c| c.is_up(genesis)),
+        "the genesis host never came back",
+    );
+    let epoch = beacon_epoch(c);
+    let height = c.committed_height(ShardId::ROOT);
+    assert!(
+        c.run_until(epochs(8), |c| beacon_epoch(c)
+            > epoch.map(|e| e.saturating_add(2))),
+        "the beacon never folded past {epoch:?} after the restart; at {:?}, newcomer {:?}",
+        beacon_epoch(c),
+        validator_status(c, newcomer),
+    );
+    for _ in 0..5 {
+        let before = c.committed_height(ShardId::ROOT);
+        assert!(
+            c.run_until(epochs(3), |c| c.committed_height(ShardId::ROOT) > before),
+            "the shard stopped committing at {before:?} after the restart from {height:?}",
+        );
+    }
+}
+
+/// Register the cluster's one staged validator, wait until it is seated
+/// ready, and let it sign a few epochs; returns its id.
+fn seat_the_staged_newcomer(c: &mut impl Cluster) -> ValidatorId {
+    warm_up(c);
+    let staged = c.staged_validators();
+    let [(newcomer, _)] = staged[..] else {
+        panic!(
+            "this scenario stages exactly one newcomer, not {}",
+            staged.len()
+        );
+    };
+    register_staged(c);
+    assert!(
+        c.run_until(epochs(60), |c| matches!(
+            validator_status(c, newcomer),
+            Some(ValidatorStatus::OnShard { ready: true, .. })
+        )),
+        "the newcomer was never seated ready; status = {:?}",
+        validator_status(c, newcomer),
+    );
+    c.run_until(epochs(3), |_| false);
+    newcomer
 }

@@ -20,9 +20,8 @@ use hyperscale_types::{
     BlockHeight, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
     NetworkDefinition, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT, RatifyRound, SKIP_TIMEOUT,
-    SPC_VIEW_TIMEOUT, ShardId, ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects,
-    TopologySchedule, TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier,
-    WeightedTimestamp,
+    ShardId, ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects, TopologySchedule,
+    TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -1045,24 +1044,17 @@ impl BeaconFold {
     /// a member prevotes the canonical skip hash.
     ///
     /// [`SKIP_TIMEOUT`] is sized for the 5-minute production epoch (a small
-    /// fraction of it). Clamped into `[SPC_VIEW_TIMEOUT, SKIP_TIMEOUT]` against
-    /// `epoch_duration`:
-    ///
-    /// - The upper clamp at the epoch keeps a genuinely dead epoch (no proposer
-    ///   the committee can rally behind) carried within ~one epoch — inside the
-    ///   schedule's `L=1` lookahead — at a faster sim epoch, instead of
-    ///   cascading many epochs behind.
-    /// - The lower clamp at [`SPC_VIEW_TIMEOUT`]
-    ///   keeps the skip above one SPC view change at every epoch length, so a
-    ///   single down proposer rotates to the next proposer (a real block)
-    ///   rather than skipping, and the skip never pre-empts a healthy commit at
-    ///   an epoch shorter than the consensus floor.
+    /// fraction of it). A shorter epoch skips at its own length, which keeps a
+    /// genuinely dead epoch (no proposer the committee can rally behind)
+    /// carried within ~one epoch — inside the schedule's `L=1` lookahead —
+    /// instead of cascading many epochs behind. Genesis refuses an epoch
+    /// under [`MIN_EPOCH_DURATION`](hyperscale_types::MIN_EPOCH_DURATION), so the deadline always leaves an epoch
+    /// with a silent member the time to commit a real block.
     ///
     /// Consensus-critical, but `epoch_duration_ms` rides in the shared genesis
     /// config, so every validator derives the same instant.
     pub(crate) fn skip_timeout(&self) -> Duration {
-        Duration::from_millis(self.state.chain_config.epoch_duration_ms)
-            .clamp(SPC_VIEW_TIMEOUT, SKIP_TIMEOUT)
+        Duration::from_millis(self.state.chain_config.epoch_duration_ms).min(SKIP_TIMEOUT)
     }
 
     /// Whether the skip-trigger timer is due — i.e. wall-clock time

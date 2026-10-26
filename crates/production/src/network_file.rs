@@ -14,8 +14,9 @@ use hyperscale_network_iroh::{
     EndpointAddr, IrohConfig, RelayUrl, SecretKey, VersionInteroperabilityMode, parse_endpoint_addr,
 };
 use hyperscale_types::{
-    Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition,
-    PrincipalAddr, StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
+    Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, MIN_EPOCH_DURATION,
+    NetworkDefinition, PrincipalAddr, StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo,
+    ValidatorSet,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -61,6 +62,14 @@ pub enum NetworkFileError {
         listed: usize,
         /// Seats on the genesis shard.
         seats: u32,
+    },
+    /// The epoch is shorter than any chain may run.
+    #[error("{epoch_ms} ms epochs are shorter than the {floor_ms} ms a chain may run")]
+    EpochTooShort {
+        /// The epoch the file sets.
+        epoch_ms: u64,
+        /// The shortest epoch a chain may run.
+        floor_ms: u128,
     },
     /// A hosted validator signs with another key than the file lists for it,
     /// which would start this host on a genesis of its own.
@@ -301,10 +310,18 @@ impl NetworkFile {
     ///
     /// # Errors
     ///
-    /// When the text is not in the schema, or its genesis lists no
-    /// validator, one twice, or more than the genesis shard seats.
+    /// When the text is not in the schema, its epoch is shorter than a chain
+    /// may run, or its genesis lists no validator, one twice, or more than
+    /// the genesis shard seats.
     pub fn from_toml(text: &str) -> Result<Self, NetworkFileError> {
         let file: Self = toml_from_str(text)?;
+        let epoch_ms = file.beacon_chain().epoch_duration_ms;
+        if u128::from(epoch_ms) < MIN_EPOCH_DURATION.as_millis() {
+            return Err(NetworkFileError::EpochTooShort {
+                epoch_ms,
+                floor_ms: MIN_EPOCH_DURATION.as_millis(),
+            });
+        }
         let listed = &file.genesis.validators;
         if listed.is_empty() {
             return Err(NetworkFileError::NoValidators);
@@ -470,7 +487,7 @@ mod tests {
     /// after its genesis.
     fn file(ids: &[u64], extra: &str) -> String {
         let mut text = String::from(
-            "network = \"simulator\"\nbootstrap_peers = [\"peer\"]\nrelays = [\"https://relay.example\"]\n\n[chain]\ngenesis_timestamp_ms = 1700000000000\nepoch_duration_ms = 5000\nshard_size = 4\n\n[genesis]\n",
+            "network = \"simulator\"\nbootstrap_peers = [\"peer\"]\nrelays = [\"https://relay.example\"]\n\n[chain]\ngenesis_timestamp_ms = 1700000000000\nepoch_duration_ms = 30000\nshard_size = 4\n\n[genesis]\n",
         );
         for &id in ids {
             let seed = u8::try_from(id + 1).expect("a small id");
@@ -490,7 +507,7 @@ mod tests {
         let parsed = NetworkFile::from_toml(&file(&[0, 1, 2], "")).expect("parses");
         let chain = parsed.beacon_chain();
         assert_eq!(chain.genesis_timestamp_ms, 1_700_000_000_000);
-        assert_eq!(chain.epoch_duration_ms, 5_000);
+        assert_eq!(chain.epoch_duration_ms, 30_000);
         assert_eq!(chain.shard_size, 4);
         assert_eq!(
             chain.ready_timeout_epochs,
@@ -519,6 +536,15 @@ mod tests {
         assert!(matches!(
             refused(&file(&[0], "").replace("genesis_timestamp_ms = 1700000000000\n", "")),
             NetworkFileError::Parse(_)
+        ));
+        assert!(matches!(
+            refused(
+                &file(&[0], "").replace("epoch_duration_ms = 30000", "epoch_duration_ms = 29999")
+            ),
+            NetworkFileError::EpochTooShort {
+                epoch_ms: 29_999,
+                floor_ms: 30_000
+            }
         ));
         assert!(matches!(
             refused(&file(&[], "")),

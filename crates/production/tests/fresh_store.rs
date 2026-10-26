@@ -119,9 +119,9 @@ async fn await_height(cluster: &Harness, host: Option<usize>, height: BlockHeigh
     .unwrap_or_else(|_| panic!("ROOT reaches {height:?} on {host:?}"))
 }
 
-/// Epoch length for the split test: short enough that a grow to two
-/// shards finishes in minutes of wall clock.
-const SPLIT_EPOCH_MS: u64 = 5_000;
+/// Epoch length for the split test: the shortest a chain may run, so a
+/// grow to two shards finishes in minutes of wall clock.
+const SPLIT_EPOCH_MS: u64 = 30_000;
 
 /// The scenario suite's split config: the trigger armed, one cohort of
 /// pool surplus, one validator per host, and paced inter-host latency.

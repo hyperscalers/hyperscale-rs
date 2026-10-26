@@ -31,7 +31,9 @@ pub const EPOCH_MS: u64 = 300_000;
 
 /// Beacon epoch length the simulations run at.
 ///
-/// Without the `production-epochs` feature the epoch shrinks to 30s so local
+/// Without the `production-epochs` feature the epoch shrinks to 30s, the
+/// shortest a chain may run
+/// ([`MIN_EPOCH_DURATION`](hyperscale_types::MIN_EPOCH_DURATION)), so local
 /// runs finish quickly. The recovery-timeout ratio is no longer
 /// production-faithful, so the epoch-counted reshape budgets and TTLs can
 /// behave differently than they do in production — run with

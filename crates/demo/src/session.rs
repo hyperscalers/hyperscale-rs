@@ -66,8 +66,8 @@ const DELIVERY_SAMPLE: usize = 64;
 /// readiness gate, flip — so the epoch sets how long a viewer waits before the
 /// page shows a split. The production five-minute epoch makes that span
 /// thousands of blocks, which is minutes of boot before anything moves. Thirty
-/// seconds is the shortest value the recovery timeouts (`SPC_VIEW_TIMEOUT`,
-/// `SKIP_TIMEOUT`) are still sized against.
+/// seconds is the shortest epoch a chain may run
+/// ([`MIN_EPOCH_DURATION`](hyperscale_types::MIN_EPOCH_DURATION)).
 ///
 /// A constant of the demo, not of the simulation: the sims raise their epoch
 /// to production parity under their `ci` feature, and a session that followed

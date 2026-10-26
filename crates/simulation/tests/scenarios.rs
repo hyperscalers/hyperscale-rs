@@ -65,6 +65,7 @@ use hyperscale_scenarios::{
     a_recovered_venue_keeps_what_its_sibling_accepted,
     a_recovery_stalled_beside_a_cancelled_split_is_drawn_again,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_restarted_genesis_host_resumes_beside_a_newcomer,
     a_retained_terminated_loop_releases_its_hosts_schedule,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
@@ -3557,6 +3558,33 @@ fn an_offline_newcomer_leaves_the_network_live_sim(seed: u64) {
 
 seeded!(
     an_offline_newcomer_leaves_the_network_live_sim:
+    seed_1 = 1,
+    seed_2 = 2,
+    seed_3 = 3,
+    seed_4 = 4,
+    seed_5 = 5,
+    seed_6 = 6,
+    seed_7 = 7,
+    seed_8 = 8,
+);
+
+fn a_restarted_genesis_host_resumes_beside_a_newcomer_sim(seed: u64) {
+    for newcomer_gone in [false, true] {
+        let mut cluster = SimCluster::with_staged_newcomers(
+            &devnet_config(),
+            seed,
+            &staking_genesis_accounts(),
+            1,
+            devnet_chain,
+        );
+        cluster.run_faultable(|c| {
+            a_restarted_genesis_host_resumes_beside_a_newcomer(c, newcomer_gone);
+        });
+    }
+}
+
+seeded!(
+    a_restarted_genesis_host_resumes_beside_a_newcomer_sim:
     seed_1 = 1,
     seed_2 = 2,
     seed_3 = 3,

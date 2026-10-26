@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use hyperscale_vm_types::{ARTIFACT_GRACE_MS, COMMITTED_GRACE_MS};
 
-use crate::MAX_VALIDITY_RANGE;
+use crate::{MAX_VALIDITY_RANGE, SPC_VIEW_TIMEOUT};
 
 /// The longest a cross-shard transaction may take to finalize, past the
 /// last block that could have included it.
@@ -240,6 +240,18 @@ pub const HALT_HARVEST_WAIT: Duration =
 /// in a beacon proposal during epoch `E` if its source block's
 /// `weighted_timestamp ≤ t_end_E`.
 pub const EPOCH_DURATION: Duration = Duration::from_mins(5);
+
+/// The shortest epoch a chain may run: two SPC views.
+///
+/// An epoch whose beacon committee holds a silent member commits only
+/// after each view's input wait, and the skip deadline is the epoch itself
+/// below [`SKIP_TIMEOUT`]. Two view timeouts leave that commit, and one
+/// heartbeat replay of a vote the network lost, inside the deadline; a
+/// shorter epoch skips every block while a member is silent, and a skip
+/// carries no proposal to show its absence, so the member is never jailed.
+pub const MIN_EPOCH_DURATION: Duration = SPC_VIEW_TIMEOUT.saturating_mul(2);
+
+const _: () = assert!(MIN_EPOCH_DURATION.as_secs() <= EPOCH_DURATION.as_secs());
 
 /// Wall-clock interval an active validator waits past an epoch's
 /// expected block time before prevoting the skip block in

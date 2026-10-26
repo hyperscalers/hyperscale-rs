@@ -335,7 +335,7 @@ async fn beacon_chain_config_reaches_genesis() {
 
     let fixtures = TestFixtures::new(42, 1);
     let chain_config = BeaconChainConfig {
-        epoch_duration_ms: 400,
+        epoch_duration_ms: 45_000,
         reshape_thresholds: ReshapeThresholds {
             split_bytes: 50_000,
             split_fullness: u32::MAX,
@@ -349,7 +349,7 @@ async fn beacon_chain_config_reaches_genesis() {
         .latest_committed()
         .expect("genesis pair committed at build time");
     assert_eq!(
-        state.chain_config.epoch_duration_ms, 400,
+        state.chain_config.epoch_duration_ms, 45_000,
         "custom epoch duration reaches the beacon genesis state"
     );
     assert_eq!(
@@ -357,6 +357,13 @@ async fn beacon_chain_config_reaches_genesis() {
         "custom split threshold seeds the live network params at genesis"
     );
 }
+
+/// The epoch the restart and recovery tests run, the shortest a chain may,
+/// so their first boundaries cross soon.
+const RESTART_EPOCH_MS: u64 = 30_000;
+/// How long they wait for the beacon to attest a ROOT boundary: twenty
+/// epochs.
+const RESTART_EPOCH_WAIT: Duration = Duration::from_millis(RESTART_EPOCH_MS * 20);
 
 /// A restarted host starts on the topology its committed beacon state
 /// projects, not the genesis one: before it folds a beacon block of the
@@ -379,7 +386,7 @@ async fn a_restarted_host_starts_on_its_committed_topology() {
         genesis: fixtures.genesis_validators(),
         hosts,
         beacon_chain_config: BeaconChainConfig {
-            epoch_duration_ms: 3_000,
+            epoch_duration_ms: RESTART_EPOCH_MS,
             shard_size: 4,
             ..BeaconChainConfig::default()
         },
@@ -393,7 +400,7 @@ async fn a_restarted_host_starts_on_its_committed_topology() {
     );
 
     let restarted = 3;
-    timeout(CONNECTION_TIMEOUT * 12, async {
+    timeout(RESTART_EPOCH_WAIT, async {
         while cluster
             .topology(restarted)
             .load()
@@ -692,7 +699,7 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
             HostSpec::new(vec![local(3)]),
         ],
         beacon_chain_config: BeaconChainConfig {
-            epoch_duration_ms: 3_000,
+            epoch_duration_ms: RESTART_EPOCH_MS,
             shard_size: 4,
             ..BeaconChainConfig::default()
         },
@@ -705,7 +712,7 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
     // past; a fork recovery pinned there makes everything above it a
     // suffix no fresh member may extend.
     let topology = cluster.topology(0);
-    let frontier = timeout(CONNECTION_TIMEOUT * 12, async {
+    let frontier = timeout(RESTART_EPOCH_WAIT, async {
         loop {
             let snapshot = topology.load_full();
             if let Some(anchor) = snapshot

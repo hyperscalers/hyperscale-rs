@@ -579,13 +579,15 @@ impl SimCluster {
     /// Fail the scenario at a beacon park itself: if the committed tip
     /// lags wall-clock epochs beyond [`MAX_BEACON_LAG_EPOCHS`], panic now
     /// rather than letting a distant downstream assert report the symptom
-    /// twenty virtual epochs later.
+    /// twenty virtual epochs later. A cluster with every host down holds
+    /// no readable tip, and says nothing until one is back.
     fn assert_beacon_cadence(&self) {
+        let Some(state) = self.beacon_state() else {
+            return;
+        };
         let expected = u64::try_from(self.runner.now().as_millis() / self.epoch.as_millis())
             .unwrap_or(u64::MAX);
-        let actual = self
-            .beacon_state()
-            .map_or(0, |state| state.current_epoch.inner());
+        let actual = state.current_epoch.inner();
         assert!(
             expected.saturating_sub(actual) <= MAX_BEACON_LAG_EPOCHS,
             "beacon parked: committed epoch {actual} lags wall-clock epoch {expected} \

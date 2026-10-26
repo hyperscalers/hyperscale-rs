@@ -16,7 +16,7 @@ use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs};
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{
     BeaconCert, BeaconChainConfig, BeaconState, BlockHash, Epoch, MIN_BEACON_COMMITTEE_SIZE,
-    SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardId, ValidatorStatus,
+    SKIP_TIMEOUT, ShardId, ValidatorStatus,
 };
 use support::{SimCluster, sim_seed};
 use tracing_test::traced_test;
@@ -135,10 +135,9 @@ fn skip_path_advances_past_blocked_epoch() {
     ];
 
     // Cross the epoch-1 boundary (`EPOCH_MS`) plus the skip timeout (the
-    // epoch length clamped into `[SPC_VIEW_TIMEOUT, SKIP_TIMEOUT]`), then
-    // leave slack for the ratify cert to assemble and the skip block to
-    // broadcast.
-    let skip_timeout = Duration::from_millis(EPOCH_MS).clamp(SPC_VIEW_TIMEOUT, SKIP_TIMEOUT);
+    // epoch length capped at `SKIP_TIMEOUT`), then leave slack for the
+    // ratify cert to assemble and the skip block to broadcast.
+    let skip_timeout = Duration::from_millis(EPOCH_MS).min(SKIP_TIMEOUT);
     runner.run_until(Duration::from_millis(EPOCH_MS) + skip_timeout + Duration::from_secs(30));
 
     let storage_0 = runner.beacon_storage(0).expect("host 0 exists");

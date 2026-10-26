@@ -20,10 +20,10 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount, BlockHash,
     BlockHeight, CertifiedBeaconBlock, DeclaredWork, Epoch, GenesisConfigHash, GenesisPool,
     GenesisValidator, GenesisValidators, MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN,
-    MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkParams, Randomness, ShardBoundary,
-    ShardCommittee, ShardId, Stake, StakePool, StakePoolId, StakePoolSeat, StateRoot,
-    TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus, Verified, WeightedTimestamp,
-    genesis_config_hash,
+    MIN_BEACON_COMMITTEE_SIZE, MIN_EPOCH_DURATION, MIN_STAKE_FLOOR, NetworkParams, Randomness,
+    ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, StakePoolSeat,
+    StateRoot, TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus, Verified,
+    WeightedTimestamp, genesis_config_hash,
 };
 
 // ─── builder ───────────────────────────────────────────────────────────────
@@ -288,6 +288,12 @@ pub fn seed_founding_members(state: &BeaconState, pools: &mut [StakePoolSeat]) {
 /// violation. Returns the set of genesis-seated validators (all on
 /// `ShardId::ROOT`) for the builder to read on its second pass.
 fn validate_config(config: &BeaconGenesisConfig) -> BTreeSet<ValidatorId> {
+    let epoch_ms = config.chain_config.epoch_duration_ms;
+    assert!(
+        u128::from(epoch_ms) >= MIN_EPOCH_DURATION.as_millis(),
+        "chain_config.epoch_duration_ms ({epoch_ms}) is below MIN_EPOCH_DURATION \
+         ({MIN_EPOCH_DURATION:?}); a silent beacon member would skip every epoch",
+    );
     // No duplicate validator or pool ids.
     let mut validator_ids: BTreeSet<ValidatorId> = BTreeSet::new();
     for v in &config.initial_validators {
@@ -835,6 +841,21 @@ mod tests {
         // rather than ship a chain stuck on the skip path.
         let mut cfg = sample_config(4, 4, 4);
         cfg.chain_config.beacon_committee_size = 3;
+        let _ = build_genesis_beacon_state(&cfg);
+    }
+
+    #[test]
+    #[should_panic(expected = "below MIN_EPOCH_DURATION")]
+    fn rejects_an_epoch_below_the_floor() {
+        let mut cfg = sample_config(4, 4, 4);
+        cfg.chain_config.epoch_duration_ms = 29_999;
+        let _ = build_genesis_beacon_state(&cfg);
+    }
+
+    #[test]
+    fn accepts_an_epoch_at_the_floor() {
+        let mut cfg = sample_config(4, 4, 4);
+        cfg.chain_config.epoch_duration_ms = 30_000;
         let _ = build_genesis_beacon_state(&cfg);
     }
 
