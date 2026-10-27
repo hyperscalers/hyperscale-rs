@@ -31,12 +31,12 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::gossip::beacon::RatifyVoteGossip;
-use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool};
 use hyperscale_types::{
     BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, Epoch,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
     NetworkDefinition, Randomness, RatifyPhase, RatifyRound, RatifyVote, ShardId, Signer, Stake,
-    StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+    TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
     genesis_config_hash, shard_prefix_path,
 };
 
@@ -54,7 +54,7 @@ struct Fixture {
 fn fixture() -> Fixture {
     let committee = TestCommittee::new(4, 7);
     let network = NetworkDefinition::simulator();
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let initial_validators: Vec<GenesisValidator> = (0..4)
         .map(|i| GenesisValidator {
             id: committee.validator_id(i),

@@ -2027,20 +2027,19 @@ pub fn committing_shards(
 
 #[cfg(test)]
 mod tests {
-
     use std::sync::Mutex;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         TestCommittee, install_stub_protocol_statics, stating_half_on, stub_abort_charge,
-        stub_transaction, test_prefix, test_principal,
+        stub_transaction, test_pool, test_prefix, test_principal,
     };
     use hyperscale_types::{
         Address, AddressClass, BeaconBlockHash, BeaconChainConfig, BeaconState, BeaconWitnessEvent,
         BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CommittedAt, Deadline,
         DerivationError, Derived, ExecutionOutcome, GlobalReceiptHash, LocalKey, PriceTable,
-        ProposerTimestamp, Role, ShardCommittee, Signer, Stake, StakePoolId, StateWrites, TickHalf,
+        ProposerTimestamp, Role, ShardCommittee, Signer, Stake, StateWrites, TickHalf,
         TimestampRange, TransactionEnvelope, TxOutcome, receipt_hash_of,
     };
 
@@ -2081,7 +2080,7 @@ mod tests {
             Some(b"a package".to_vec()),
         );
         let witness = BeaconWitnessEvent::StakeDeposit {
-            pool_id: StakePoolId::new(1),
+            pool_id: test_pool(1),
             amount: Stake::from_quanta(5),
         };
         let unhashed = ConsensusReceipt::Succeeded {

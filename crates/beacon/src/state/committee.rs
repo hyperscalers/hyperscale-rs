@@ -624,13 +624,14 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         Admission, BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash,
         BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason,
         MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, PendingReshape, RESHAPE_READY_TTL_EPOCHS,
         Randomness, RecoveryCause, Settling, ShardBoundary, ShardCommittee, ShardId,
-        ShardWitnessPayload, Stake, StakePool, StakePoolId, StateRoot, TransitionCause,
-        ValidatorId, ValidatorStatus, WeightedTimestamp, byzantine_threshold,
+        ShardWitnessPayload, Stake, StakePool, StateRoot, TransitionCause, ValidatorId,
+        ValidatorStatus, WeightedTimestamp, byzantine_threshold,
     };
 
     use super::{
@@ -712,7 +713,7 @@ mod tests {
     /// Pool stake is sized generously to keep `min_stake` at the floor.
     fn multi_shard_state(shard_count: u64, per_shard: u64, pool_extras: u64) -> BeaconState {
         let mut state = empty_state();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let total = shard_count * per_shard + pool_extras;
         let mut pool_validators = BTreeSet::new();
         let mut next_id = 0u64;
@@ -779,15 +780,12 @@ mod tests {
         );
         state
             .pools
-            .get_mut(&StakePoolId::new(0))
+            .get_mut(&test_pool(0))
             .unwrap()
             .validators
             .insert(ValidatorId::new(99));
-        state
-            .pools
-            .get_mut(&StakePoolId::new(0))
-            .unwrap()
-            .total_stake = Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
+        state.pools.get_mut(&test_pool(0)).unwrap().total_stake =
+            Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
         let initial_members = state.next_shard_committees[&ShardId::leaf(1, 0)]
             .members
             .clone();
@@ -977,7 +975,7 @@ mod tests {
             ValidatorId::new(99),
             validator_record(99, 0, ValidatorStatus::Pooled),
         );
-        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get_mut(&test_pool(0)).unwrap();
         pool.validators.insert(ValidatorId::new(99));
         pool.total_stake = Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
         state.current_epoch = Epoch::new(shuffle_interval() - 1);
@@ -1031,7 +1029,7 @@ mod tests {
         state
             .validators
             .insert(spare, validator_record(99, 0, ValidatorStatus::Pooled));
-        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get_mut(&test_pool(0)).unwrap();
         pool.validators.insert(spare);
         pool.total_stake = Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
         state.current_epoch = Epoch::new(shuffle_interval() - 1);
@@ -1091,7 +1089,7 @@ mod tests {
         state
             .validators
             .insert(spare, validator_record(99, 0, ValidatorStatus::Pooled));
-        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get_mut(&test_pool(0)).unwrap();
         pool.validators.insert(spare);
         pool.total_stake = Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
         state.current_epoch = Epoch::new(shuffle_interval() - 1);
@@ -1159,7 +1157,7 @@ mod tests {
             ValidatorId::new(99),
             validator_record(99, 0, ValidatorStatus::Pooled),
         );
-        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get_mut(&test_pool(0)).unwrap();
         pool.validators.insert(ValidatorId::new(99));
         pool.total_stake = Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
         state.current_epoch = Epoch::new(shuffle_interval() - 1);
@@ -1554,7 +1552,7 @@ mod tests {
             ValidatorId::new(99),
             validator_record(99, 0, ValidatorStatus::Pooled),
         );
-        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get_mut(&test_pool(0)).unwrap();
         pool.validators.insert(ValidatorId::new(99));
         pool.total_stake = Stake::from_quanta(10 * MIN_STAKE_FLOOR.quanta());
         state.current_epoch = Epoch::new(shuffle_interval() - 1);
@@ -2095,7 +2093,7 @@ mod tests {
                 state,
                 0,
                 vec![ShardWitnessPayload::StakeDeposit {
-                    pool_id: StakePoolId::new(0),
+                    pool_id: test_pool(0),
                     amount: Stake::from_whole_tokens(1_000),
                 }],
             );
@@ -2103,7 +2101,7 @@ mod tests {
                 state,
                 0,
                 vec![ShardWitnessPayload::RegisterValidator {
-                    pool_id: StakePoolId::new(0),
+                    pool_id: test_pool(0),
                     validator_id: ValidatorId::new(77),
                     pubkey: state.validators[&ValidatorId::new(0)].pubkey,
                     possession_proof: possession_proof(0, ValidatorId::new(77)),
@@ -2393,7 +2391,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(200),
+                pool_id: test_pool(200),
                 amount: Stake::from_whole_tokens(1),
             }],
         );

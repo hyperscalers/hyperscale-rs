@@ -20,6 +20,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
+use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
 use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::transport::TransportAdapter;
@@ -202,8 +203,14 @@ impl ClusterBuild {
     /// the runner derives it.
     fn network_genesis_config(&self) -> GenesisConfig {
         let mut config = self.genesis_config.clone().unwrap_or_default();
-        let boot = build_genesis(&self.genesis, self.beacon_chain_config, &config.pools);
-        seed_founding_members(&boot.state, &mut config.pools);
+        config.pools = genesis_seats(&config.pools);
+        let boot = build_genesis(
+            &self.genesis,
+            self.beacon_chain_config,
+            &config.pools,
+            founding_pool(&config.pools),
+        );
+        seed_founding_members(&boot.state, &mut config.pools, seat_pool);
         config
     }
 }

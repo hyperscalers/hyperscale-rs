@@ -23,11 +23,11 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition,
-    QuorumCertificate, Randomness, RecoveryBinding, Round, ShardId, Stake, StakePoolId, Verified,
+    QuorumCertificate, Randomness, RecoveryBinding, Round, ShardId, Stake, Verified,
     genesis_config_hash,
 };
 
@@ -215,7 +215,7 @@ fn test_fold(
     history: Option<BeaconHistory>,
 ) -> BeaconFold {
     let network = NetworkDefinition::simulator();
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let n = committee.size();
     let initial_validators: Vec<GenesisValidator> = (0..n)
         .map(|i| GenesisValidator {

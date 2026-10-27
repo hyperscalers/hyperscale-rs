@@ -805,12 +805,12 @@ const fn pending_id(shard: ShardId, anchor: BlockHash, pending: &PendingFetch) -
 
 #[cfg(test)]
 mod tests {
-
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeaderParts, BlockHeight, CertifiedBlockHeader, Hash, LeafIndex, QuorumCertificate,
-        Round, SettledTxsRoot, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId,
-        Verified, WeightedTimestamp,
+        Round, SettledTxsRoot, ShardId, ShardWitnessPayload, SignerBitfield, Stake, Verified,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -898,7 +898,7 @@ mod tests {
     fn payloads(n: u64) -> Vec<ShardWitnessPayload> {
         (0..n)
             .map(|i| ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(u32::try_from(i).unwrap_or(u32::MAX)),
+                pool_id: test_pool(u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
             })
             .collect()

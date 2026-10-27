@@ -144,10 +144,10 @@ pub(super) fn complete_pending_withdrawals(state: &mut BeaconState) -> Withdrawa
 
 #[cfg(test)]
 mod tests {
-
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         EMISSIONS_PER_EPOCH, Epoch, MIN_STAKE_FLOOR, PendingWithdrawal, ShardId, Stake,
-        StakePoolId, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
+        UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
     };
 
     use crate::state::test_fixtures::{apply_next_epoch, state_with_pending_withdrawal};
@@ -168,12 +168,12 @@ mod tests {
             initiated,
             current,
         );
-        let pre_total = state.pools[&StakePoolId::new(0)].total_stake;
+        let pre_total = state.pools[&test_pool(0)].total_stake;
 
         let effects = apply_next_epoch(&mut state, &[]);
 
         assert!(effects.deactivated.is_empty());
-        let pool = &state.pools[&StakePoolId::new(0)];
+        let pool = &state.pools[&test_pool(0)];
         // Unmatured withdrawal leaves total_stake alone; the only
         // delta is the epoch emission credit.
         assert_eq!(
@@ -203,7 +203,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &[]);
 
         assert!(effects.deactivated.is_empty());
-        let pool = &state.pools[&StakePoolId::new(0)];
+        let pool = &state.pools[&test_pool(0)];
         // 99 × FLOOR after release, plus the epoch emission credit.
         assert_eq!(
             pool.total_stake,
@@ -231,7 +231,7 @@ mod tests {
             current,
         );
         // Add a second matured + a third unmatured.
-        let pool = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get_mut(&test_pool(0)).unwrap();
         pool.pending_withdrawals.push(PendingWithdrawal {
             amount: Stake::from_quanta(2 * MIN_STAKE_FLOOR.quanta()),
             initiated_at_epoch: initiated_b,
@@ -245,11 +245,11 @@ mod tests {
             initiated_at_epoch: still_pending_epoch,
         });
 
-        let pre_total = state.pools[&StakePoolId::new(0)].total_stake;
+        let pre_total = state.pools[&test_pool(0)].total_stake;
 
         apply_next_epoch(&mut state, &[]);
 
-        let pool = &state.pools[&StakePoolId::new(0)];
+        let pool = &state.pools[&test_pool(0)];
         // Released = MIN_STAKE_FLOOR + 2 * MIN_STAKE_FLOOR; epoch
         // emission credit goes back on top.
         assert_eq!(

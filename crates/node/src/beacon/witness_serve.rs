@@ -149,19 +149,19 @@ fn build_chunk<S: ShardStorage>(
 
 #[cfg(test)]
 mod tests {
-
     use std::sync::Arc;
 
     use hyperscale_storage::PendingChain;
     use hyperscale_storage::test_helpers::commit_settled_at;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
         BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, Hash,
         LeafIndex, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardWitnessPayload,
-        SignerBitfield, Stake, StakePoolId, Verified, WeightedTimestamp, WitnessSources,
-        compute_merkle_root, verify_range_inclusion,
+        SignerBitfield, Stake, Verified, WeightedTimestamp, WitnessSources, compute_merkle_root,
+        verify_range_inclusion,
     };
 
     use super::*;
@@ -170,7 +170,7 @@ mod tests {
 
     fn deposit(amount: u64) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(1),
+            pool_id: test_pool(1),
             amount: Stake::from_whole_tokens(amount),
         }
     }

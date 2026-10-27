@@ -20,8 +20,8 @@ use hyperscale_vm_types::PrincipalAddr;
 
 use super::query::{beacon_epoch, live_shards, pool_total_stake, validator_status};
 use super::tx::{
-    ParamBallot, STAKE_POOL_ID, build_param_vote_tx, build_register_tx, build_stake_tx, delegator,
-    pool_at, pool_operator, validity_around,
+    ParamBallot, STAKE_POOL, build_param_vote_tx, build_register_tx, build_stake_tx, delegator,
+    pool_at, pool_id, pool_operator, validity_around,
 };
 use super::{Budget, Cluster, epochs};
 
@@ -152,7 +152,7 @@ pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<Principa
     if staged.is_empty() {
         return;
     }
-    let pool = pool_at(STAKE_POOL_ID);
+    let pool = pool_at(STAKE_POOL);
     let seats = u128::try_from(staged.len() + 1).expect("staged count fits u128");
     let price = c
         .beacon_state()
@@ -163,7 +163,7 @@ pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<Principa
     land(
         c,
         |now| build_stake_tx(&key, from, pool, capacity.quanta(), validity_around(now)),
-        |c| pool_total_stake(c, STAKE_POOL_ID).is_some_and(|stake| stake >= capacity),
+        |c| pool_total_stake(c, pool_id(STAKE_POOL)).is_some_and(|stake| stake >= capacity),
         "the staging pool's delegation",
     );
     let (operator, _) = pool_operator();

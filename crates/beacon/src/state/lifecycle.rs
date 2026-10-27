@@ -255,10 +255,11 @@ pub(super) fn auto_ready_timeout(state: &mut BeaconState) -> Vec<ValidatorId> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         BeaconState, EMISSION_PARTICIPATION_WEIGHT, Epoch, JailReason, MIN_STAKE_FLOOR,
-        ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
-        UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorRecord, ValidatorStatus,
+        ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, UNBONDING_WINDOW_EPOCHS,
+        ValidatorId, ValidatorRecord, ValidatorStatus,
     };
 
     use super::{distribute_epoch_rewards, shard_emission_weight};
@@ -278,7 +279,7 @@ mod tests {
         total_stake_quanta: u128,
     ) -> BeaconState {
         let mut state = empty_state();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let shard = ShardId::leaf(1, 0);
         let mut pool_validators = BTreeSet::new();
         let mut members = Vec::new();
@@ -412,9 +413,9 @@ mod tests {
         let mut flooded = state_with_insufficient(1, &[5, 7, 9], base_quanta);
         for i in 100u32..160 {
             flooded.pools.insert(
-                StakePoolId::new(i),
+                test_pool(i),
                 StakePool {
-                    id: StakePoolId::new(i),
+                    id: test_pool(i),
                     total_stake: Stake::from_quanta(1),
                     validators: BTreeSet::new(),
                     pending_withdrawals: Vec::new(),
@@ -515,9 +516,9 @@ mod tests {
         // over without hitting the no-active branch via empty
         // validators.
         state.pools.insert(
-            StakePoolId::new(0),
+            test_pool(0),
             StakePool {
-                id: StakePoolId::new(0),
+                id: test_pool(0),
                 total_stake: Stake::from_whole_tokens(1_000_000),
                 validators: BTreeSet::new(),
                 pending_withdrawals: Vec::new(),
@@ -525,12 +526,12 @@ mod tests {
                 conviction: None,
             },
         );
-        let pre_total = state.pools[&StakePoolId::new(0)].total_stake;
+        let pre_total = state.pools[&test_pool(0)].total_stake;
 
         let credited = distribute_epoch_rewards(&mut state, &BTreeMap::new());
 
         assert!(credited.is_empty());
-        assert_eq!(state.pools[&StakePoolId::new(0)].total_stake, pre_total);
+        assert_eq!(state.pools[&test_pool(0)].total_stake, pre_total);
     }
 
     /// Validators with `ready: false` don't count — pool with one
@@ -538,7 +539,7 @@ mod tests {
     #[test]
     fn distribute_epoch_rewards_excludes_unready_validators() {
         let mut state = single_pool_state(0);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let shard = ShardId::leaf(1, 0);
         // Two validators: ready and not-ready, both OnShard.
         state.validators.insert(
@@ -594,8 +595,8 @@ mod tests {
     #[test]
     fn distribute_epoch_rewards_splits_pro_rata_by_ready_count() {
         let mut state = empty_state();
-        let pool_a = StakePoolId::new(1);
-        let pool_b = StakePoolId::new(2);
+        let pool_a = test_pool(1);
+        let pool_b = test_pool(2);
         let shard = ShardId::leaf(1, 0);
 
         // Pool A: 1 ready active.
@@ -676,8 +677,8 @@ mod tests {
     #[test]
     fn distribute_epoch_rewards_omits_zero_share_pools() {
         let mut state = empty_state();
-        let pool_a = StakePoolId::new(1);
-        let pool_b = StakePoolId::new(2);
+        let pool_a = test_pool(1);
+        let pool_b = test_pool(2);
 
         // Pool A: 1 ready active. Pool B: only a Pooled validator.
         state.pools.insert(
@@ -747,7 +748,7 @@ mod tests {
         let busy = ShardId::leaf(1, 0);
         let quiet = ShardId::leaf(1, 1);
         let second = ValidatorId::new(1);
-        let second_pool = StakePoolId::new(1);
+        let second_pool = test_pool(1);
         state.pools.insert(
             second_pool,
             StakePool {
@@ -775,7 +776,7 @@ mod tests {
         // Nothing charged anywhere: the floor alone, so the two pools
         // split evenly.
         let flat = distribute_epoch_rewards(&mut state, &BTreeMap::new());
-        assert_eq!(flat[&StakePoolId::new(0)], flat[&second_pool]);
+        assert_eq!(flat[&test_pool(0)], flat[&second_pool]);
 
         // Now the busy shard took every quantum the epoch charged. Its
         // pool's share must exceed the quiet one's, and the emission is
@@ -783,7 +784,7 @@ mod tests {
         let work = BTreeMap::from([(busy, 10_000u128), (quiet, 0u128)]);
         let weighted = distribute_epoch_rewards(&mut state, &work);
         assert!(
-            weighted[&StakePoolId::new(0)] > weighted[&second_pool],
+            weighted[&test_pool(0)] > weighted[&second_pool],
             "work should move emission: {weighted:?}"
         );
         let total: u128 = weighted.values().map(|s| s.quanta()).sum();
@@ -864,7 +865,7 @@ mod tests {
             let mut state = single_pool_state(1);
             let sibling = ShardId::leaf(1, 1);
             let second = ValidatorId::new(1);
-            let second_pool = StakePoolId::new(1);
+            let second_pool = test_pool(1);
             state.pools.insert(
                 second_pool,
                 StakePool {
@@ -932,7 +933,7 @@ mod tests {
     /// with `ready: false`. Inserts into pool 0's validator set so
     /// derived helpers see the pool correctly.
     fn insert_unready_on_shard(state: &mut BeaconState, id: u64, placed_at_epoch: Epoch) {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let shard = ShardId::leaf(1, 0);
         state
             .pools
@@ -1092,7 +1093,7 @@ mod tests {
 
         // Validator 0: OnShard{ready:true} — needed to sign the
         // proposal.
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.insert(
             pool_id,
             StakePool {

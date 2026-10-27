@@ -71,14 +71,14 @@ impl NetworkMessage for GetWitnessHistoryResponse {
 
 #[cfg(test)]
 mod tests {
-
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
+    use crate::test_utils::test_pool;
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BlockHash, BlockHeaderParts, BlockHeight,
         ChainOrigin, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
-        Stake, StakePoolId, WeightedTimestamp,
+        Stake, WeightedTimestamp,
     };
 
     fn make_header() -> BlockHeader {
@@ -120,11 +120,11 @@ mod tests {
                 qc,
                 payloads: Capped::from_array([
                     ShardWitnessPayload::StakeDeposit {
-                        pool_id: StakePoolId::new(1),
+                        pool_id: test_pool(1),
                         amount: Stake::from_whole_tokens(5),
                     },
                     ShardWitnessPayload::StakeDeposit {
-                        pool_id: StakePoolId::new(2),
+                        pool_id: test_pool(2),
                         amount: Stake::from_whole_tokens(7),
                     },
                 ]),

@@ -247,6 +247,7 @@ const fn basis_points(stated: u64) -> u32 {
 mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::CONSENSUS_PUBLIC_KEY_BYTES;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_vm_effects::{Hash32, InstanceMeta, InstanceRegistry, Records};
     use hyperscale_vm_types::{Address, ComponentAddr};
 
@@ -275,7 +276,7 @@ mod tests {
         let pool = instance(&mut chain.instances, 1);
         let impostor = instance(&mut chain.instances, 2);
         let mut pools = PoolRegistry::new();
-        pools.register(pool, StakePoolId::new(POOL_ID));
+        pools.register(pool, test_pool(POOL_ID));
         (pools, chain, pool, impostor)
     }
 
@@ -293,14 +294,14 @@ mod tests {
         assert_eq!(
             witness_from_event(&event(pool, STAKED, 500), &pools, &instances, package(1)),
             Some(BeaconWitnessEvent::StakeDeposit {
-                pool_id: StakePoolId::new(POOL_ID),
+                pool_id: test_pool(POOL_ID),
                 amount: Stake::from_quanta(500),
             }),
         );
         assert_eq!(
             witness_from_event(&event(pool, UNSTAKED, 40), &pools, &instances, package(1)),
             Some(BeaconWitnessEvent::StakeWithdraw {
-                pool_id: StakePoolId::new(POOL_ID),
+                pool_id: test_pool(POOL_ID),
                 amount: Stake::from_quanta(40),
             }),
         );
@@ -360,7 +361,7 @@ mod tests {
     #[test]
     fn a_recognised_pools_operator_actions_read_as_beacon_facts() {
         let (pools, instances, pool, _impostor) = world();
-        let pool_id = StakePoolId::new(POOL_ID);
+        let pool_id = test_pool(POOL_ID);
         assert_eq!(
             witness_from_event(
                 &raw(pool, VALIDATOR_REGISTERED, registration_payload()),
@@ -409,14 +410,14 @@ mod tests {
     #[test]
     fn an_operator_action_is_folded_under_its_emitter() {
         let (mut pools, instances, _pool, impostor) = world();
-        pools.register(impostor, StakePoolId::new(POOL_ID + 1));
+        pools.register(impostor, test_pool(POOL_ID + 1));
         let event = raw(impostor, VALIDATOR_REGISTERED, registration_payload());
         let Some(BeaconWitnessEvent::RegisterValidator { pool_id, .. }) =
             witness_from_event(&event, &pools, &instances, package(1))
         else {
             panic!("a recognised emitter's registration is a fact");
         };
-        assert_eq!(pool_id, StakePoolId::new(POOL_ID + 1));
+        assert_eq!(pool_id, test_pool(POOL_ID + 1));
     }
 
     /// Trailing bytes are as fatal as missing ones: the decode is total
@@ -489,7 +490,7 @@ mod tests {
                 package(1)
             ),
             Some(BeaconWitnessEvent::ParamVote(ParamVote {
-                pool: StakePoolId::new(POOL_ID),
+                pool: test_pool(POOL_ID),
                 proposal: Some(ParamProposal {
                     params: NetworkParams {
                         reshape_thresholds: ReshapeThresholds {
@@ -580,7 +581,7 @@ mod tests {
                 package(1)
             ),
             Some(BeaconWitnessEvent::ParamVote(ParamVote {
-                pool: StakePoolId::new(POOL_ID),
+                pool: test_pool(POOL_ID),
                 proposal: None,
             })),
         );

@@ -21,6 +21,7 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, BeaconFetchIds, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
+use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconBlockHash, BeaconCert, BeaconChainConfig,
     BeaconGenesisConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
@@ -265,7 +266,7 @@ impl CoordinatorSim {
         let members = committee.members.clone();
         let sks = committee.signers();
 
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let chain_config = BeaconChainConfig {
             shard_size: u32::try_from(pool_n).expect("pool_n fits in u32"),
             ..BeaconChainConfig::default()
@@ -677,7 +678,7 @@ impl CoordinatorSim {
     ) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(100 + u32::try_from(i).unwrap_or(u32::MAX)),
+                pool_id: test_pool(100 + u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
             })
             .collect();

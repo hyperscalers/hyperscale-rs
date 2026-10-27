@@ -6,7 +6,7 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use hyperscale_crypto::ConsensusPublicKey;
 use hyperscale_hbor::Hbor;
-use hyperscale_vm_types::PrincipalAddr;
+use hyperscale_vm_types::{ComponentAddr, PrincipalAddr};
 
 /// Validator identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Hbor)]
@@ -478,44 +478,45 @@ impl Display for Stake {
 
 /// Identifier for a beacon-chain stake pool — a dPoS-style aggregation
 /// of delegator stake that operates one or more validator nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Hbor)]
+///
+/// The pool's component address: the instance whose events are the
+/// pool's facts names the pool, so every shard, every replay and the
+/// beacon derive the same identifier from the emitter alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 #[hbor(transparent)]
-pub struct StakePoolId(u32);
+pub struct StakePoolId(ComponentAddr);
 
 impl StakePoolId {
-    /// Construct a stake-pool id from a raw `u32`.
+    /// The pool whose instance sits at `address`.
     #[must_use]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
+    pub const fn of(address: ComponentAddr) -> Self {
+        Self(address)
     }
 
-    /// Inner `u32`. Use sparingly — at boundaries (display, structured
-    /// log fields) only.
+    /// The pool instance's address.
     #[must_use]
-    pub const fn inner(self) -> u32 {
+    pub const fn address(self) -> ComponentAddr {
         self.0
     }
 }
 
 impl Display for StakePoolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Pool({})", self.0)
+        let bytes = self.0.to_bytes();
+        write!(f, "Pool(")?;
+        for byte in &bytes[..4] {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, "…)")
     }
 }
 
-/// A stake pool the network seats.
+/// A stake pool genesis seats.
 ///
-/// The instance whose events it reads as beacon facts, the identifier
-/// it folds them under, the account genesis seats its owner badge in,
-/// and the validators it already operates.
-///
-/// Seating one is a governance act — admitting a pool is admitting a new
-/// source of beacon facts — so the whole seat is fixed where the network
-/// is defined rather than assembled from anything a transaction can
-/// reach. The two addresses are different kinds of thing and easy to
-/// confuse: `address` derives from no key and is the pool's identity,
-/// while `operator` derives from one and is where genesis deposits the
-/// pool's owner badge.
+/// The salt its instance derives under, the account genesis puts its
+/// owner badge in, and the validators it already operates. The pool's
+/// identity is its instance's address, which derives from no key; the
+/// `operator` derives from one and is where the owner badge starts.
 ///
 /// `founding` exists because a pool's membership and its contract have
 /// two different origins. Beacon genesis creates the founding pool and
@@ -527,12 +528,11 @@ impl Display for StakePoolId {
 /// only the contract creates memberships, so they never drift again.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub struct StakePoolSeat {
-    /// The identifier the beacon folds this pool's facts under, and the
-    /// salt separating this pool's instance from any other seated
-    /// identically. The instance's address derives from the record
-    /// genesis builds out of this seat, so there is nothing here to
-    /// declare it with.
-    pub id: StakePoolId,
+    /// The salt separating this pool's instance from any other genesis
+    /// seats identically. The instance's address, and so the pool's
+    /// identifier, derives from the record genesis builds out of this
+    /// seat.
+    pub number: u32,
     /// The account genesis deposits the pool's owner badge into. From
     /// then on the badge — not this record — is what the pool's
     /// operator surface admits, and it moves like any other holding.

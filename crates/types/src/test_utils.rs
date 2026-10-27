@@ -12,9 +12,9 @@ use hyperscale_hbor::{
 use hyperscale_vm_effects::vocabulary::vault_cell;
 use hyperscale_vm_effects::{CrossingId, protocol_resource};
 use hyperscale_vm_types::{
-    Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
-    PrincipalAddr, ProtocolHasher, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, Terms,
-    ValueEdge, attestation_work,
+    Address, AddressClass, ComponentAddr, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey,
+    Mode, Moves, PrincipalAddr, ProtocolHasher, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey,
+    SweepBucket, Terms, ValueEdge, attestation_work,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -27,13 +27,28 @@ use crate::{
     ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
     MemberTerms, MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
     ProtocolStatics, QuorumCertificate, Role, Round, Routing, SectionRoots, SettledTxsRoot,
-    Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StateClaim,
-    StateRoot, StateWrites, StatedTerms, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, install_protocol_statics,
+    Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StakePoolId,
+    StateClaim, StateRoot, StateWrites, StatedTerms, StoredReceipt, TickHalf, TickId, TickLine,
+    TimestampRange, TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope,
+    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, install_protocol_statics,
     protocol_statics_installed, signed_bytes,
 };
+
+/// A stake pool for tests, at a component address `n` alone fixes.
+///
+/// Distinct `n` give distinct pools, and the same `n` the same one, so a
+/// fixture can name pool 3 in one place and find it in another.
+#[must_use]
+pub const fn test_pool(n: u32) -> StakePoolId {
+    let number = n.to_be_bytes();
+    let mut body = [0xB0; 31];
+    body[0] = number[0];
+    body[1] = number[1];
+    body[2] = number[2];
+    body[3] = number[3];
+    StakePoolId::of(ComponentAddr::new(body))
+}
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
 /// `read_prefixes` as shared keys and `write_prefixes` as exclusive ones.

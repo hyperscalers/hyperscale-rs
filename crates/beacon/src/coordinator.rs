@@ -847,6 +847,7 @@ mod tests {
     };
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconChainConfig,
         BeaconGenesisConfig, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader,
@@ -856,10 +857,10 @@ mod tests {
         NetworkDefinition, ObserverSeat, PcScope, PcValueElement, PcVector, PcVoteEquivocation,
         QuorumCertificate, RATIFY_ROUND_TIMEOUT, Randomness, RatifyCert, Round, SKIP_TIMEOUT,
         ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardWitnessPayload,
-        Signer, SignerBitfield, SlotEffects, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-        Unpublished, ValidatorId, ValidatorStatus, VrfProof, WeightedTimestamp, build_qc1,
-        build_qc2, build_qc3, build_ratify_cert, compute_merkle_root, compute_range_proof,
-        genesis_config_hash, sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3,
+        Signer, SignerBitfield, SlotEffects, SpcCert, SpcView, Stake, StateRoot, Unpublished,
+        ValidatorId, ValidatorStatus, VrfProof, WeightedTimestamp, build_qc1, build_qc2, build_qc3,
+        build_ratify_cert, compute_merkle_root, compute_range_proof, genesis_config_hash,
+        sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3,
     };
 
     use super::*;
@@ -957,7 +958,7 @@ mod tests {
     /// 4 validators, all on the beacon committee, all placed on the ROOT
     /// genesis shard.
     fn sample_genesis() -> BeaconGenesisConfig {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -1122,7 +1123,7 @@ mod tests {
     ) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(200 + u32::try_from(i).unwrap_or(u32::MAX)),
+                pool_id: test_pool(200 + u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
             })
             .collect();
@@ -2160,7 +2161,7 @@ mod tests {
         // Genesis committee backed by the TestCommittee's keys, so a proof
         // it signs resolves and verifies against the coordinator's schedule.
         let committee = TestCommittee::new(4, 1);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let validators: Vec<GenesisValidator> = (0usize..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i as u64),
@@ -2239,7 +2240,7 @@ mod tests {
     /// seat order, so a proof the holders of those keys sign resolves
     /// and verifies against the coordinator's schedule.
     fn coord_seating(pubkeys: [ConsensusPublicKey; 4]) -> BeaconCoordinator {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let validators: Vec<GenesisValidator> = (0u64..4)
             .zip(pubkeys)
             .map(|(id, pubkey)| GenesisValidator {
@@ -4178,7 +4179,7 @@ mod tests {
     ) {
         let payloads: Vec<ShardWitnessPayload> = (lo..hi)
             .map(|i| ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(u32::try_from(i).unwrap_or(u32::MAX)),
+                pool_id: test_pool(u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
             })
             .collect();
@@ -4340,7 +4341,7 @@ mod tests {
             lo.inner(),
             (0..3)
                 .map(|i| ShardWitnessPayload::StakeDeposit {
-                    pool_id: StakePoolId::new(i),
+                    pool_id: test_pool(i),
                     amount: Stake::from_whole_tokens(1),
                 })
                 .collect(),
@@ -4461,7 +4462,7 @@ mod tests {
         );
 
         payloads[0] = ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(999),
+            pool_id: test_pool(999),
             amount: Stake::from_whole_tokens(7),
         };
         let refused = coord.on_shard_witnesses_received(
@@ -4493,7 +4494,7 @@ mod tests {
             .on_verified_source_header(Arc::clone(&header));
 
         payloads[0] = ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(999),
+            pool_id: test_pool(999),
             amount: Stake::from_whole_tokens(7),
         };
         let actions = coord.on_shard_witnesses_received(

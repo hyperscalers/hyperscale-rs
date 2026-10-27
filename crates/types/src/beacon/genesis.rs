@@ -389,7 +389,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::test_utils::test_principal;
+    use crate::test_utils::{test_pool, test_principal};
 
     #[test]
     fn chain_time_counts_from_genesis_both_ways() {
@@ -427,7 +427,7 @@ mod tests {
     }
 
     fn sample_config() -> BeaconGenesisConfig {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let validators = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -651,7 +651,7 @@ mod tests {
     fn config_hash_covers_the_seated_pools() {
         let config = sample_config();
         let seat = StakePoolSeat {
-            id: StakePoolId::new(7777),
+            number: 7777,
             operator: test_principal(0x51),
             founding: Vec::new(),
         };

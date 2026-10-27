@@ -51,10 +51,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus, beacon_reveal_sign, byzantine_threshold,
+    Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, ValidatorId, ValidatorRecord,
+    ValidatorStatus, beacon_reveal_sign, byzantine_threshold,
 };
 
 // ─── Analytic model (ported from committee_security.py) ──────────────────────
@@ -229,7 +230,7 @@ fn build_state(
     keys: &[BlsSigner],
     randomness: [u8; 32],
 ) -> BeaconState {
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let target = target_shard();
     let sibling = grinder_shard();
     let seated = u64::from(n) + u64::from(grinders) + u64::from(honest);

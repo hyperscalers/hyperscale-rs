@@ -41,7 +41,7 @@ use crate::support::query::{
     escrowed_into, owning_shard, stands_at, vault_balance,
 };
 use crate::support::tx::{
-    GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_bounded_transfer_tx, build_close_tx,
+    GENESIS_POOL, OVERDRAW_AMOUNT, account_shard, build_bounded_transfer_tx, build_close_tx,
     build_composed_tx, build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx,
     build_publish_tx, build_securify_tx, build_stake_tx, build_swap_tx, build_transfer_at_ceilings,
     build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
@@ -1474,7 +1474,7 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// anywhere but the declared price below where it started.
 pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl FaultableCluster) {
     let (payer_key, payer) = remote_delegator();
-    let pool = pool_at(GENESIS_POOL_ID);
+    let pool = pool_at(GENESIS_POOL);
     let payer_shard = account_shard(payer, 2);
     let core = account_shard(pool, 2);
     assert_ne!(
@@ -1623,7 +1623,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
 /// record does not stand past every window that could dispose of it.
 pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: &mut C) {
     let (payer_key, payer) = remote_delegator();
-    let pool = pool_at(GENESIS_POOL_ID);
+    let pool = pool_at(GENESIS_POOL);
     let payer_shard = account_shard(payer, 2);
     let core = account_shard(pool, 2);
     assert_ne!(

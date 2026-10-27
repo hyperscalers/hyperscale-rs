@@ -20,10 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_crypto_bls::{BlsVerifier, public_key_from_u64_seed};
+use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, Randomness,
-    ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord,
-    ValidatorStatus,
+    ShardCommittee, ShardId, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus,
 };
 
 const V: usize = 3;
@@ -33,7 +33,7 @@ const EPOCHS: u64 = 50;
 /// across two shards of capacity 4, 2 sitting `Pooled` so the shuffle
 /// has refill stock.
 fn initial_state() -> BeaconState {
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let shard_0 = ShardId::leaf(1, 0);
     let shard_1 = ShardId::leaf(1, 1);
 

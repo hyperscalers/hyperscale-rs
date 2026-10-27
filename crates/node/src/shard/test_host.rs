@@ -16,13 +16,12 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
-use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, ShardAnchor, ShardId, Signer, Stake, StakePoolId,
-    TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash,
-    shard_prefix_path,
+    NetworkDefinition, Randomness, ShardAnchor, ShardId, Signer, Stake, TopologySnapshot,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
 };
 
 use crate::shard::{HostEvent, ShardLoop};
@@ -48,7 +47,7 @@ impl Fixture {
     pub fn new() -> Self {
         let committee = TestCommittee::new(4, 7);
         let network = NetworkDefinition::simulator();
-        let pool = StakePoolId::new(0);
+        let pool = test_pool(0);
         let ids: Vec<ValidatorId> = (0..4).map(|i| committee.validator_id(i)).collect();
         let config = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),

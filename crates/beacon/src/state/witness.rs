@@ -977,13 +977,14 @@ fn defer_deadlines(admitted: &mut Admission) {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_types::test_utils::test_pool;
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
         BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
         JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_FLOOR,
         PendingReshape, PoolConviction, ProposerTimestamp, RESHAPE_READY_TTL_EPOCHS, Randomness,
         Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload, Stake,
-        StakePool, StakePoolId, ValidatorId, ValidatorStatus,
+        StakePool, ValidatorId, ValidatorStatus,
     };
     use hyperscale_types::{ConsensusSignature, Signer, signed_bytes};
 
@@ -998,7 +999,7 @@ mod tests {
 
     fn deposit(pool: u32, amount: u64) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(pool),
+            pool_id: test_pool(pool),
             amount: Stake::from_whole_tokens(amount),
         }
     }
@@ -1063,7 +1064,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         apply_witness_chunk(&mut state, 0, vec![deposit(7, 100), deposit(7, 50)]);
 
-        let pool = state.pools.get(&StakePoolId::new(7)).unwrap();
+        let pool = state.pools.get(&test_pool(7)).unwrap();
         assert_eq!(pool.total_stake, Stake::from_whole_tokens(150));
         assert_eq!(applied_count(&state, 0), 2);
     }
@@ -1076,7 +1077,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(3);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let pre_total = state.pools.get(&pool_id).unwrap().total_stake;
         let pre_effective = state.pools.get(&pool_id).unwrap().effective_stake();
 
@@ -1118,7 +1119,7 @@ mod tests {
     fn stake_withdraw_rejects_over_effective_stake() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let effective = state.pools.get(&pool_id).unwrap().effective_stake();
 
         apply_witness_chunk(
@@ -1147,7 +1148,7 @@ mod tests {
             vec![deposit(7, 1), deposit(7, 2), deposit(7, 3)],
         );
 
-        let pool = state.pools.get(&StakePoolId::new(7)).unwrap();
+        let pool = state.pools.get(&test_pool(7)).unwrap();
         assert_eq!(pool.total_stake, Stake::from_whole_tokens(6));
         assert_eq!(applied_count(&state, 0), 3);
     }
@@ -1162,7 +1163,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(2);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let epoch = state.current_epoch;
         let revoked = convict_pool(&mut state, pool_id, epoch);
         assert_eq!(revoked.len(), 4, "whole pool cascades");
@@ -1189,11 +1190,7 @@ mod tests {
     fn unjail_rejected_on_convicted_pool() {
         let since = Epoch::new(5);
         let mut state = state_with_jailed(since, JailReason::Performance);
-        state
-            .pools
-            .get_mut(&StakePoolId::new(0))
-            .unwrap()
-            .conviction = Some(PoolConviction {
+        state.pools.get_mut(&test_pool(0)).unwrap().conviction = Some(PoolConviction {
             convicted_at: since,
             lifts_at: Epoch::new(since.inner() + 100),
         });
@@ -1203,7 +1200,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(10),
             }],
         );
@@ -1227,7 +1224,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: target,
             }],
         );
@@ -1244,7 +1241,7 @@ mod tests {
 
         assert!(effects.revoked.contains(&target), "the fled member revokes");
         assert_eq!(effects.revoked.len(), 4, "the whole pool revokes");
-        assert!(state.pools[&StakePoolId::new(0)].conviction.is_some());
+        assert!(state.pools[&test_pool(0)].conviction.is_some());
         for v in 0..4u64 {
             assert!(matches!(
                 state.validators[&ValidatorId::new(v)].status,
@@ -1279,7 +1276,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &committed);
 
         assert_eq!(effects.revoked, vec![ValidatorId::new(9)]);
-        assert!(state.pools[&StakePoolId::new(9)].conviction.is_some());
+        assert!(state.pools[&test_pool(9)].conviction.is_some());
         assert!(matches!(
             state.validators[&ValidatorId::new(9)].status,
             ValidatorStatus::Revoked { .. },
@@ -1315,7 +1312,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &committed);
 
         assert!(effects.revoked.is_empty());
-        assert!(state.pools[&StakePoolId::new(0)].conviction.is_none());
+        assert!(state.pools[&test_pool(0)].conviction.is_none());
     }
 
     /// Stake ops fold uniformly on a convicted pool: deposits credit
@@ -1327,7 +1324,7 @@ mod tests {
     fn stake_ops_fold_uniformly_on_a_convicted_pool() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let epoch = state.current_epoch;
         convict_pool(&mut state, pool_id, epoch);
         assert!(state.pools[&pool_id].conviction.is_some());
@@ -1362,7 +1359,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(2);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
@@ -1394,7 +1391,7 @@ mod tests {
     fn register_validator_duplicate_id_is_no_op() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
@@ -1426,7 +1423,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::RegisterValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: ValidatorId::new(5),
                 pubkey: pubkey(5),
                 possession_proof: possession_proof(5, ValidatorId::new(5)),
@@ -1445,7 +1442,7 @@ mod tests {
     fn register_validator_rejected_on_wrong_key_pop() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
@@ -1472,7 +1469,7 @@ mod tests {
     fn register_validator_rejected_on_replayed_pop() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
@@ -1497,7 +1494,7 @@ mod tests {
     fn register_validator_rejected_on_malformed_pop() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
 
@@ -1524,7 +1521,7 @@ mod tests {
     fn deactivate_validator_on_shard_cascades() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state
             .pools
             .get_mut(&pool_id)
@@ -1540,7 +1537,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: ValidatorId::new(0),
             }],
         );
@@ -1566,7 +1563,7 @@ mod tests {
     #[test]
     fn an_operator_action_naming_another_pools_validator_is_a_no_op() {
         let mut state = single_pool_state(4);
-        let stranger = StakePoolId::new(1);
+        let stranger = test_pool(1);
         state.pools.insert(
             stranger,
             StakePool {
@@ -1630,7 +1627,7 @@ mod tests {
     fn deactivate_validator_pooled_flips_in_place() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.validators.insert(
             ValidatorId::new(5),
             validator_record(5, 0, ValidatorStatus::Pooled),
@@ -1650,7 +1647,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: ValidatorId::new(5),
             }],
         );
@@ -1692,11 +1689,11 @@ mod tests {
             0,
             vec![
                 ShardWitnessPayload::DeactivateValidator {
-                    pool_id: StakePoolId::new(0),
+                    pool_id: test_pool(0),
                     validator_id: ValidatorId::new(10),
                 },
                 ShardWitnessPayload::DeactivateValidator {
-                    pool_id: StakePoolId::new(0),
+                    pool_id: test_pool(0),
                     validator_id: ValidatorId::new(11),
                 },
             ],
@@ -1737,7 +1734,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: ValidatorId::new(10),
             }],
         );
@@ -1754,7 +1751,7 @@ mod tests {
     fn state_with_jailed(since_epoch: Epoch, reason: JailReason) -> BeaconState {
         let mut state = single_pool_state(3);
         state.committee = (0u64..3).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta());
         state
@@ -1788,7 +1785,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(10),
             }],
         );
@@ -1811,7 +1808,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(10),
             }],
         );
@@ -1838,7 +1835,7 @@ mod tests {
     ) -> BeaconState {
         let mut state = single_pool_state(1);
         let shard = ShardId::leaf(1, 0);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let mut members = Vec::new();
         for i in 0..ready {
             let id = ValidatorId::new(i);
@@ -1914,7 +1911,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(500),
             }],
         );
@@ -1948,7 +1945,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(10),
             }],
         );
@@ -1967,7 +1964,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(since.inner() + JAIL_COOLDOWN_EPOCHS);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state
             .pools
             .get_mut(&pool_id)
@@ -1990,7 +1987,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(10),
             }],
         );
@@ -2014,7 +2011,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(0),
             }],
         );
@@ -2035,7 +2032,7 @@ mod tests {
         state.committee = Vec::new();
         let shard = ShardId::leaf(1, 0);
         let placed = Epoch::new(3);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.insert(
             pool_id,
             StakePool {
@@ -2191,7 +2188,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let target = ValidatorId::new(10);
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
@@ -2295,7 +2292,7 @@ mod tests {
         let mut state = single_pool_state(4);
         lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
@@ -2489,7 +2486,7 @@ mod tests {
     /// cascade stops at its own seat — the shape that keeps the other
     /// fixtures' members observable as unaffected bystanders.
     fn isolate_in_own_pool(state: &mut BeaconState, id: ValidatorId, pool_no: u32) {
-        let pool_id = StakePoolId::new(pool_no);
+        let pool_id = test_pool(pool_no);
         for pool in state.pools.values_mut() {
             pool.validators.remove(&id);
         }
@@ -2576,7 +2573,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: ValidatorId::new(0),
             }],
         );
@@ -2642,7 +2639,7 @@ mod tests {
     fn vote_equivocation_convicts_on_shard_validator_with_cascade() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
@@ -2969,7 +2966,7 @@ mod tests {
             &net(),
             p,
             &ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 validator_id: victim,
             },
         );

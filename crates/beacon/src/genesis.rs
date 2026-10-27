@@ -212,16 +212,17 @@ impl GenesisBoot {
 /// Genesis is a single ROOT shard. The committee seats it; the committee
 /// validators ordered by id form the beacon committee, capped at
 /// [`BeaconChainConfig::beacon_committee_size`]. Every registered validator,
-/// seated or pooled, joins the single genesis stake pool, so the projected
-/// global set carries the pooled surplus a later reshape draws its child
-/// cohort from.
+/// seated or pooled, joins the single genesis stake pool `founding` — the
+/// address of the pool `pools` seats for it — so the projected global set
+/// carries the pooled surplus a later reshape draws its child cohort from.
 #[must_use]
 pub fn build_genesis(
     genesis: &GenesisValidators,
     chain_config: BeaconChainConfig,
     pools: &[StakePoolSeat],
+    founding: StakePoolId,
 ) -> GenesisBoot {
-    let pool_id = StakePoolId::new(0);
+    let pool_id = founding;
     let validators: Vec<GenesisValidator> = genesis
         .validators
         .validators
@@ -272,13 +273,19 @@ pub fn build_genesis(
 /// write the contract's records from. Deriving rather than restating
 /// means the rule lives in one place — here, whatever beacon genesis
 /// decides — instead of being mirrored in every harness that seats a
-/// pool.
-pub fn seed_founding_members(state: &BeaconState, pools: &mut [StakePoolSeat]) {
+/// pool. `pool_of` names the pool a seat installs, which is derived where
+/// the instance records are.
+pub fn seed_founding_members(
+    state: &BeaconState,
+    pools: &mut [StakePoolSeat],
+    pool_of: impl Fn(&StakePoolSeat) -> StakePoolId,
+) {
     for seat in pools {
+        let pool = pool_of(seat);
         seat.founding = state
             .validators
             .values()
-            .filter(|record| record.pool == seat.id)
+            .filter(|record| record.pool == pool)
             .map(|record| (record.id, record.pubkey))
             .collect();
     }
@@ -427,6 +434,7 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         BeaconChainConfig, BlockHeaderParts, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
         NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, TopologySchedule,
@@ -445,7 +453,7 @@ mod tests {
         n_shard_members: u64,
         n_beacon_members: u64,
     ) -> BeaconGenesisConfig {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let validators: Vec<GenesisValidator> = (0..n_validators)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -619,14 +627,14 @@ mod tests {
     fn pool_validators_set_includes_every_member() {
         let cfg = sample_config(6, 4, 4);
         let state = build_genesis_beacon_state(&cfg);
-        let pool = state.pools.get(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get(&test_pool(0)).unwrap();
         let expected: BTreeSet<ValidatorId> = (0u64..6).map(ValidatorId::new).collect();
         assert_eq!(pool.validators, expected);
     }
 
     #[test]
     fn beacon_committee_stored_sorted() {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -668,7 +676,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "validator Validator(2) twice")]
     fn rejects_duplicate_validator_id() {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: vec![
@@ -695,17 +703,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "declares pool Pool(99) which is not in initial_pools")]
+    #[should_panic(expected = "declares pool Pool(00000063…) which is not in initial_pools")]
     fn rejects_validator_referencing_unknown_pool() {
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
-                pool: StakePoolId::new(99),
+                pool: test_pool(99),
                 pubkey: pubkey(0),
             }],
             initial_pools: vec![GenesisPool {
-                id: StakePoolId::new(0),
+                id: test_pool(0),
                 total_stake: Stake::from_whole_tokens(1_000_000),
             }],
             initial_beacon_committee: vec![],
@@ -718,7 +726,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "holds only")]
     fn rejects_pool_with_insufficient_stake() {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: (0u64..4)
@@ -743,7 +751,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "genesis shard committee twice")]
     fn rejects_validator_listed_twice_in_shard_committee() {
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: vec![GenesisValidator {
@@ -783,7 +791,7 @@ mod tests {
     #[should_panic(expected = "exceeds chain_config.beacon_committee_size")]
     fn rejects_beacon_committee_over_signer_count() {
         // Default beacon_committee_size is 4 — pass 5 to overflow.
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: (0u64..5)
@@ -810,7 +818,7 @@ mod tests {
         // A committee past the cap would overflow the `PcVector` that
         // every SPC view input fills; reject the config rather than let
         // `compute_view_input` panic at the first epoch rollover.
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
             chain_config: BeaconChainConfig {
                 beacon_committee_size: u32::try_from(MAX_VOTE_VECTOR_LEN + 1)

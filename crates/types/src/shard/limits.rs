@@ -1020,10 +1020,11 @@ mod tests {
         TX_CAPS, TxsInFlight, budget_admits_block, caps_admit_transaction, drain_admits_block,
         staged_yes_bound, staged_yes_bytes, sweep_admits_block,
     };
+    use crate::test_utils::test_pool;
     use crate::{
         Address, BeaconWitnessEvent, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
         Epoch, GlobalReceiptHash, Hash, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX, NetworkParams,
-        ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId, ValidatorId,
+        ParamProposal, ParamVote, ReshapeThresholds, Stake, ValidatorId,
     };
 
     /// The bound bites on the level a block leaves: one carrying
@@ -1096,7 +1097,7 @@ mod tests {
     /// The widest of each beacon witness event, every field at its
     /// widest encoding.
     fn widest_witness_events() -> Vec<BeaconWitnessEvent> {
-        let pool_id = StakePoolId::new(u32::MAX);
+        let pool_id = test_pool(u32::MAX);
         let validator_id = ValidatorId::new(u64::MAX);
         let table = PriceTable {
             compute: u64::MAX,

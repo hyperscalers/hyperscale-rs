@@ -27,13 +27,13 @@ use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
-use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_transaction};
+use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool, test_transaction};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, ShardId, Signer, Stake, StakePoolId, TopologySnapshot,
-    Transaction, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-    genesis_config_hash, shard_prefix_path,
+    NetworkDefinition, Randomness, ShardId, Signer, Stake, TopologySnapshot, Transaction,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, genesis_config_hash,
+    shard_prefix_path,
 };
 
 const SHARD_A: ShardId = ShardId::leaf(1, 0);
@@ -52,7 +52,7 @@ struct Fixture {
 fn fixture() -> Fixture {
     let committee = TestCommittee::new(4, 7);
     let network = NetworkDefinition::simulator();
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let initial_validators: Vec<GenesisValidator> = (0..4)
         .map(|i| GenesisValidator {
             id: committee.validator_id(i),
