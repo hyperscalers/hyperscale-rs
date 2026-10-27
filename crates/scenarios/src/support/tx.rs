@@ -2003,7 +2003,7 @@ pub fn remote_delegator() -> (Ed25519PrivateKey, PrincipalAddr) {
 /// not live on.
 fn off_genesis_pool_shard(index: usize) -> (Ed25519PrivateKey, PrincipalAddr) {
     let trie = ShardTrie::uniform_from_count(2);
-    let pool_shard = trie.shard_for_prefix(pool_at(GENESIS_POOL_ID));
+    let pool_shard = trie.shard_for_prefix(pool_at(GENESIS_POOL));
     let shard = if pool_shard == ShardId::leaf(1, 0) {
         ShardId::leaf(1, 1)
     } else {
@@ -2025,7 +2025,7 @@ pub(crate) fn build_badge_sale_tx(
     buyer: PrincipalAddr,
     validity: TimestampRange,
 ) -> Transaction {
-    let pool = pool_at(GENESIS_POOL_ID);
+    let pool = pool_at(GENESIS_POOL);
     let graph = graph(account_address(&seller.public_key().0), |b| {
         let seller = account_address(&seller.public_key().0);
         let funds = account::withdraw_nf(b, seller, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
@@ -2521,12 +2521,12 @@ pub(crate) fn build_instance_instantiate_tx(
     ))
 }
 
-/// The identifier the beacon folds the VM staking scenario's pool under.
+/// The seat number of the VM staking scenario's pool.
 ///
 /// Distinct from the genesis pool every seated validator belongs to, so a
 /// delegation through the VM is the only source of this pool's stake and
 /// the assertion cannot be satisfied by anything else.
-pub(crate) const STAKE_POOL_ID: StakePoolId = StakePoolId::new(7777);
+pub(crate) const STAKE_POOL: u32 = 7777;
 
 /// The delegator's signing key and account.
 #[must_use]
@@ -2558,16 +2558,16 @@ pub fn staking_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     ]
 }
 
-/// The identifier the beacon folds the second staking pool under.
-pub(crate) const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
+/// The seat number of the second staking pool.
+pub(crate) const SECOND_POOL: u32 = 7778;
 
-/// The identifier beacon genesis creates the founding pool under.
+/// The seat number beacon genesis creates the founding pool under.
 ///
 /// Beacon genesis creates that pool and its members; seating an instance
 /// for it is what gives it an operator, which is how a deployment retires
 /// a founding validator. Nothing else about the pool changes — its stake
 /// and its membership are still genesis's.
-pub(crate) const GENESIS_POOL_ID: StakePoolId = StakePoolId::new(0);
+pub(crate) const GENESIS_POOL: u32 = 0;
 
 /// The cell a stake pool keeps its delegations in: the pool's declared
 /// vault of the resource it is configured to hold, under the pool's own
@@ -2582,15 +2582,28 @@ pub(crate) fn pool_vault_cell(pool: ComponentAddr) -> SubstateKey {
     )
 }
 
-/// Where genesis seats the pool with `id` — derived from the record, so
-/// a scenario names a pool the way genesis places it.
+/// The seat numbered `number` a staking cluster installs.
 #[must_use]
-pub(crate) fn pool_at(id: StakePoolId) -> ComponentAddr {
-    pool_address(&StakePoolSeat {
-        id,
+fn pool_seat(number: u32) -> StakePoolSeat {
+    StakePoolSeat {
+        number,
         operator: pool_operator().1,
         founding: Vec::new(),
-    })
+    }
+}
+
+/// Where genesis seats the pool numbered `number` — derived from the
+/// record, so a scenario names a pool the way genesis places it.
+#[must_use]
+pub(crate) fn pool_at(number: u32) -> ComponentAddr {
+    pool_address(&pool_seat(number))
+}
+
+/// The identifier the beacon folds the pool numbered `number` under: its
+/// address.
+#[must_use]
+pub(crate) fn pool_id(number: u32) -> StakePoolId {
+    StakePoolId::of(pool_at(number))
 }
 
 /// The pools a staking cluster seats.
@@ -2601,25 +2614,12 @@ pub(crate) fn pool_at(id: StakePoolId) -> ComponentAddr {
 /// is what two *pools* may say about each other.
 #[must_use]
 pub(crate) fn staking_pools() -> Vec<StakePoolSeat> {
-    let operator = pool_operator().1;
     vec![
-        StakePoolSeat {
-            id: STAKE_POOL_ID,
-            operator,
-            founding: Vec::new(),
-        },
-        StakePoolSeat {
-            id: SECOND_POOL_ID,
-            operator,
-            founding: Vec::new(),
-        },
+        pool_seat(STAKE_POOL),
+        pool_seat(SECOND_POOL),
         // The founding pool's members are the beacon's to name, and
         // genesis fills them in from its own folded state.
-        StakePoolSeat {
-            id: GENESIS_POOL_ID,
-            operator,
-            founding: Vec::new(),
-        },
+        pool_seat(GENESIS_POOL),
     ]
 }
 
@@ -3046,11 +3046,11 @@ pub(crate) fn build_param_vote_tx(
         let proof = account::present_instance(
             b,
             account_address(&operator.public_key().0),
-            pool_owner_badge(pool_at(GENESIS_POOL_ID)),
+            pool_owner_badge(pool_at(GENESIS_POOL)),
             OWNER_BADGE_ID,
         )?;
         b.presenting(proof, |b| {
-            staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
+            staking::Staking::at(pool_at(GENESIS_POOL)).cast_param_vote(
                 b,
                 ballot.split_bytes,
                 u64::from(ballot.split_fullness),

@@ -80,11 +80,12 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::{Stake, StakePoolId};
+    use crate::Stake;
+    use crate::test_utils::test_pool;
 
     fn sample_payload(pool: u32) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(pool),
+            pool_id: test_pool(pool),
             amount: Stake::from_whole_tokens(1_000),
         }
     }

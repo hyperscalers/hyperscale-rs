@@ -37,10 +37,11 @@ use std::time::Instant;
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
     Admission, BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    PendingReshape, Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus,
+    PendingReshape, Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, ValidatorId,
+    ValidatorRecord, ValidatorStatus,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -171,7 +172,7 @@ fn shard_ids(shards: u64) -> Vec<ShardId> {
 /// reaches.
 fn mc_state(cell: &Cell) -> BeaconState {
     let pubkey = BlsSigner::from_seed(&[0x5e; 32]).public_key();
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let ids = shard_ids(cell.shards);
     let seats_total = cell.shards * u64::from(cell.shard_size);
     assert!(

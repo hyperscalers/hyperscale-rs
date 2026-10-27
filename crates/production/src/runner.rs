@@ -31,6 +31,7 @@ use hyperscale_core::{ParticipationChange, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
+use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, PreviewGrants};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths, set_shard_channel_depths};
@@ -391,11 +392,18 @@ impl ProductionRunnerBuilder {
 
         // Genesis: build the beacon chain from the validator placement.
         let beacon_network = genesis_validators.network.clone();
-        let seat_list: Vec<StakePoolSeat> = self
-            .genesis_config
-            .as_ref()
-            .map_or_default(|config| config.pools.clone());
-        let boot = build_genesis(&genesis_validators, chain_config, &seat_list);
+        let seat_list: Vec<StakePoolSeat> = genesis_seats(
+            &self
+                .genesis_config
+                .as_ref()
+                .map_or_default(|config| config.pools.clone()),
+        );
+        let boot = build_genesis(
+            &genesis_validators,
+            chain_config,
+            &seat_list,
+            founding_pool(&seat_list),
+        );
         // Warm-restart: resume the beacon coordinator from the latest
         // committed (block, state) in storage. On an empty store, commit the
         // genesis pair first so fresh-start and restart converge on the same
@@ -485,11 +493,12 @@ impl ProductionRunnerBuilder {
         // and installed whole by a fresh store on a never-crossed genesis
         // shard, so every store's substate side agrees.
         let mut bootstrap_config = self.genesis_config.clone().unwrap_or_default();
+        bootstrap_config.pools = seat_list;
         // Each seated pool's founding members, read off the beacon's own
         // folded genesis state: the contract's record of who a pool
         // operates has to agree with the beacon's from the first block,
         // and this is where both exist.
-        seed_founding_members(&boot.state, &mut bootstrap_config.pools);
+        seed_founding_members(&boot.state, &mut bootstrap_config.pools, seat_pool);
         let engine_bootstrap = EngineBootstrap {
             config: bootstrap_config,
         };

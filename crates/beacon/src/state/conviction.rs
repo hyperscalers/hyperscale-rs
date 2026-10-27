@@ -62,6 +62,7 @@ pub(super) fn convict_pool(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         BeaconState, EMISSIONS_PER_EPOCH, Epoch, JailReason, MIN_STAKE_FLOOR, NetworkParams,
         ParamProposal, PendingWithdrawal, ShardCommittee, ShardId, Stake, StakePool,
@@ -107,7 +108,7 @@ mod tests {
         for (pool, ids, stake_multiple) in
             [(0u32, vec![0u64, 1, 2, 3], 4u128), (1, vec![10, 11], 2)]
         {
-            let pool_id = StakePoolId::new(pool);
+            let pool_id = test_pool(pool);
             state.pools.insert(
                 pool_id,
                 StakePool {
@@ -137,7 +138,7 @@ mod tests {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
 
-        let revoked = convict_pool(&mut state, StakePoolId::new(0), epoch);
+        let revoked = convict_pool(&mut state, test_pool(0), epoch);
 
         assert_eq!(
             revoked,
@@ -150,9 +151,7 @@ mod tests {
                 ValidatorStatus::Revoked { at_epoch: epoch },
             );
         }
-        let conviction = state.pools[&StakePoolId::new(0)]
-            .conviction
-            .expect("stamped");
+        let conviction = state.pools[&test_pool(0)].conviction.expect("stamped");
         assert_eq!(conviction.convicted_at, epoch);
         assert_eq!(
             conviction.lifts_at,
@@ -164,13 +163,13 @@ mod tests {
         assert!(!members.contains(&ValidatorId::new(0)));
         assert!(members.contains(&ValidatorId::new(11)));
         // Pool 1 untouched: no conviction, statuses intact.
-        assert!(state.pools[&StakePoolId::new(1)].conviction.is_none());
+        assert!(state.pools[&test_pool(1)].conviction.is_none());
         assert!(matches!(
             state.validators[&ValidatorId::new(10)].status,
             ValidatorStatus::OnShard { .. },
         ));
         // Revoked members stay in the pool's validator set.
-        assert_eq!(state.pools[&StakePoolId::new(0)].validators.len(), 4);
+        assert_eq!(state.pools[&test_pool(0)].validators.len(), 4);
     }
 
     /// A second conviction is a no-op: no re-revocation, and `lifts_at`
@@ -179,18 +178,14 @@ mod tests {
     fn conviction_is_idempotent_and_never_restamps() {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
-        convict_pool(&mut state, StakePoolId::new(0), epoch);
-        let stamped = state.pools[&StakePoolId::new(0)].conviction;
+        convict_pool(&mut state, test_pool(0), epoch);
+        let stamped = state.pools[&test_pool(0)].conviction;
 
         state.params.impound_epochs *= 2;
-        let replay = convict_pool(
-            &mut state,
-            StakePoolId::new(0),
-            Epoch::new(epoch.inner() + 5),
-        );
+        let replay = convict_pool(&mut state, test_pool(0), Epoch::new(epoch.inner() + 5));
 
         assert!(replay.is_empty());
-        assert_eq!(state.pools[&StakePoolId::new(0)].conviction, stamped);
+        assert_eq!(state.pools[&test_pool(0)].conviction, stamped);
     }
 
     /// An unknown pool convicts nothing.
@@ -198,7 +193,7 @@ mod tests {
     fn conviction_of_unknown_pool_is_a_no_op() {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
-        assert!(convict_pool(&mut state, StakePoolId::new(9), epoch).is_empty());
+        assert!(convict_pool(&mut state, test_pool(9), epoch).is_empty());
     }
 
     /// The impound freezes maturation outright — a withdrawal whose
@@ -211,7 +206,7 @@ mod tests {
     fn impound_freezes_maturation_and_releases_whole_after_lift() {
         let mut state = two_pool_state();
         state.params.impound_epochs = UNBONDING_WINDOW_EPOCHS;
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let amount = MIN_STAKE_FLOOR;
         state
             .pools
@@ -252,17 +247,17 @@ mod tests {
     fn convicted_pool_earns_no_emissions() {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
-        convict_pool(&mut state, StakePoolId::new(0), epoch);
-        let total0 = state.pools[&StakePoolId::new(0)].total_stake;
+        convict_pool(&mut state, test_pool(0), epoch);
+        let total0 = state.pools[&test_pool(0)].total_stake;
 
         let credits = distribute_epoch_rewards(&mut state, &std::collections::BTreeMap::new());
 
-        assert!(!credits.contains_key(&StakePoolId::new(0)));
+        assert!(!credits.contains_key(&test_pool(0)));
         assert_eq!(
-            credits.get(&StakePoolId::new(1)).copied(),
+            credits.get(&test_pool(1)).copied(),
             Some(EMISSIONS_PER_EPOCH),
         );
-        assert_eq!(state.pools[&StakePoolId::new(0)].total_stake, total0);
+        assert_eq!(state.pools[&test_pool(0)].total_stake, total0);
     }
 
     /// Conviction drops the pool's standing parameter vote — a vote
@@ -273,16 +268,16 @@ mod tests {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
         state.param_votes.insert(
-            StakePoolId::new(0),
+            test_pool(0),
             ParamProposal {
                 params: NetworkParams::default(),
                 activate_at: Epoch::new(epoch.inner() + 2),
             },
         );
 
-        convict_pool(&mut state, StakePoolId::new(0), epoch);
+        convict_pool(&mut state, test_pool(0), epoch);
 
-        assert!(!state.param_votes.contains_key(&StakePoolId::new(0)));
+        assert!(!state.param_votes.contains_key(&test_pool(0)));
     }
 
     /// The reactivation sweep never resurrects a convicted pool's
@@ -292,7 +287,7 @@ mod tests {
     fn convicted_pool_members_never_auto_reactivate() {
         let mut state = two_pool_state();
         let epoch = state.current_epoch;
-        convict_pool(&mut state, StakePoolId::new(0), epoch);
+        convict_pool(&mut state, test_pool(0), epoch);
         // Force the shape auto_reactivate keys on: an InsufficientStake
         // member of a pool with spare capacity.
         state

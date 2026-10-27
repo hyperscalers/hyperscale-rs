@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
-use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
+use hyperscale_effects_bridge::genesis::{genesis_world_with_pools, seat_pool};
 use hyperscale_effects_bridge::records::committed_instance;
 use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
@@ -33,8 +33,8 @@ use hyperscale_types::{
     Deadline, Ed25519PrivateKey, EntryKey, EscrowedValue, EventExt, EventRoot, ExecutionOutcome,
     GlobalReceipt, Hash, Inclusion, Issuer, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof,
     NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId,
-    ShardTrie, Stake, StakePoolId, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated,
-    SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
+    ShardTrie, Stake, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry,
+    SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
     absorb_committed_cells, answer_hashes, compute_merkle_root, receipt_hash_of, writes_root,
 };
 use hyperscale_vm_effects::{
@@ -142,9 +142,9 @@ fn delegator() -> PrincipalAddr {
 
 /// A pool seat; genesis deposits the pool's owner badge into the named
 /// account, and presenting that badge is what operates the pool.
-fn seat(id: u32) -> StakePoolSeat {
+fn seat(number: u32) -> StakePoolSeat {
     StakePoolSeat {
-        id: StakePoolId::new(id),
+        number,
         operator: account_of(OPERATOR),
         founding: Vec::new(),
     }
@@ -337,8 +337,8 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
 
         assert_eq!(
             *answered, from_state,
-            "the cache and the cell disagree about pool {:?}",
-            seat.id
+            "the cache and the cell disagree about seat {}",
+            seat.number
         );
     }
 
@@ -699,7 +699,7 @@ fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
     assert_eq!(
         witnesses(&executed[0]),
         vec![BeaconWitnessEvent::StakeDeposit {
-            pool_id: StakePoolId::new(POOL_ID),
+            pool_id: seat_pool(&seat(POOL_ID)),
             amount: Stake::from_quanta(500),
         }],
     );
@@ -1942,7 +1942,7 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
     assert_eq!(
         witnesses(&carrying),
         vec![BeaconWitnessEvent::StakeDeposit {
-            pool_id: sealed.id,
+            pool_id: seat_pool(&sealed),
             amount: Stake::from_quanta(500),
         }],
     );
@@ -1981,7 +1981,7 @@ fn a_projected_receipt_recomputes_the_hash_the_executor_gave_it() {
     assert_eq!(
         witnesses(&core),
         vec![BeaconWitnessEvent::StakeDeposit {
-            pool_id: StakePoolId::new(divided.seats[0]),
+            pool_id: seat_pool(&seat(divided.seats[0])),
             amount: Stake::from_quanta(500),
         }],
         "of the two stakes it ran, the core keeps its own pool's fact",

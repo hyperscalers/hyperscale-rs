@@ -161,9 +161,10 @@ pub(super) fn exit_placement(
 mod tests {
     use std::collections::BTreeSet;
 
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         BeaconState, Epoch, MIN_STAKE_FLOOR, Randomness, ShardCommittee, ShardId, Stake, StakePool,
-        StakePoolId, ValidatorId, ValidatorStatus,
+        ValidatorId, ValidatorStatus,
     };
 
     use super::*;
@@ -179,7 +180,7 @@ mod tests {
         let mut state = empty_state();
         state.current_epoch = current_epoch;
         state.randomness = randomness;
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let mut pool_validators = BTreeSet::new();
         for i in 0..n {
             let id = ValidatorId::new(i);

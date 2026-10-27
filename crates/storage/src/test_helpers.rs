@@ -17,7 +17,7 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
     make_finalization_leaving, make_finalization_settling, make_leg_finalization, proven_claim,
-    rebound, stating, stating_half_on, stub_stated_terms, stub_sweepable_cell, test_key,
+    rebound, stating, stating_half_on, stub_stated_terms, stub_sweepable_cell, test_key, test_pool,
     test_transaction,
 };
 use hyperscale_types::{
@@ -34,13 +34,12 @@ use hyperscale_types::{
     RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
     Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
     ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source,
-    SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites,
-    Stated, StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier,
-    SyncHint, TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxsInFlight, UnsettledTx, ValidatorId, Value, Verifiable, Verified, VotePosition,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root, decide,
-    encode_amount, entry_leaf_key, read_amount, receipt_hash_of, shard_prefix_path, value_of,
-    verdict_leaf,
+    SpcCert, SpcView, SplitChildRoots, Stake, StateClaim, StateRoot, StateWrites, Stated,
+    StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
+    TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
+    UnsettledTx, ValidatorId, Value, Verifiable, Verified, VotePosition, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, compute_merkle_root, decide, encode_amount,
+    entry_leaf_key, read_amount, receipt_hash_of, shard_prefix_path, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -944,7 +943,7 @@ pub fn commit_block_with_witness_window(
 #[must_use]
 pub const fn stake_deposit(amount: u64) -> ShardWitnessPayload {
     ShardWitnessPayload::StakeDeposit {
-        pool_id: StakePoolId::new(1),
+        pool_id: test_pool(1),
         amount: Stake::from_whole_tokens(amount),
     }
 }

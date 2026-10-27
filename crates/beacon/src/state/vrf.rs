@@ -324,10 +324,11 @@ mod tests {
 
     use blake3::Hasher;
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         BeaconProposal, BeaconState, Epoch, EpochSeed, Hash, JailReason, MIN_BEACON_COMMITTEE_SIZE,
-        MIN_STAKE_FLOOR, Randomness, RevealChain, SeedSource, ShardId, Stake, StakePoolId,
-        ValidatorId, ValidatorStatus,
+        MIN_STAKE_FLOOR, Randomness, RevealChain, SeedSource, ShardId, Stake, ValidatorId,
+        ValidatorStatus,
     };
 
     use super::{DOMAIN_BEACON_RANDOMNESS, DOMAIN_BEACON_RANDOMNESS_REVEALS};
@@ -423,7 +424,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         // Add a fifth validator sitting in the pool; pool stake bumped
         // to support them.
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
@@ -477,7 +478,7 @@ mod tests {
         let mut state = single_pool_state(4);
         lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
@@ -679,7 +680,7 @@ mod tests {
 
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
             Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
         state
@@ -715,7 +716,7 @@ mod tests {
             &mut state,
             0,
             vec![ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(0),
+                pool_id: test_pool(0),
                 id: ValidatorId::new(0),
             }],
         );

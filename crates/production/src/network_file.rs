@@ -16,7 +16,7 @@ use hyperscale_network_iroh::{
 use hyperscale_types::{
     Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, MIN_EPOCH_DURATION,
     NetworkDefinition, NetworkParams, ParamBoundsError, PrincipalAddr, ReshapeThresholds,
-    StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
+    StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -113,19 +113,20 @@ pub struct Genesis {
     pub accounts: Vec<AccountBalanceEntry>,
 
     /// Staking pools seated at genesis. Every genesis validator belongs to
-    /// pool 0, so a network whose validators vote on parameters seats pool 0.
+    /// pool number 0, so a network whose validators vote on parameters seats
+    /// it with an operator.
     #[serde(default)]
     pub pools: Vec<PoolEntry>,
 }
 
 /// A staking pool seated at genesis. Its founding members are not listed:
-/// genesis fills them from the validator set, for the pool whose id they
-/// share.
+/// genesis fills them from the validator set, for the pool they belong to.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoolEntry {
-    /// The id the beacon folds the pool's facts under.
-    pub id: u32,
+    /// The seat's number: the salt its instance's address derives under.
+    /// Number 0 is the pool every genesis validator belongs to.
+    pub number: u32,
 
     /// Hex-encoded 32-byte address of the account that receives the pool's
     /// owner badge.
@@ -240,7 +241,7 @@ impl Genesis {
         }
         for entry in &self.pools {
             engine.pools.push(StakePoolSeat {
-                id: StakePoolId::new(entry.id),
+                number: entry.number,
                 operator: parse_principal(&entry.operator)?,
                 founding: Vec::new(),
             });
@@ -627,8 +628,8 @@ mod tests {
         for seat in &seats {
             writeln!(
                 toml,
-                "[[pools]]\nid = {}\noperator = \"{}\"",
-                seat.id.inner(),
+                "[[pools]]\nnumber = {}\noperator = \"{}\"",
+                seat.number,
                 hex_encode(seat.operator.to_bytes())
             )
             .expect("writing to a string");
@@ -642,7 +643,7 @@ mod tests {
     /// listed one would enter the genesis hash and then be overwritten.
     #[test]
     fn genesis_pools_refuse_founding_members() {
-        let toml = "[[pools]]\nid = 0\noperator = \"00\"\nfounding = []\n";
+        let toml = "[[pools]]\nnumber = 0\noperator = \"00\"\nfounding = []\n";
         assert!(toml_from_str::<Genesis>(toml).is_err());
     }
 

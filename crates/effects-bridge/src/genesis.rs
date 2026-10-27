@@ -8,7 +8,9 @@
 //! target, and none of them executes anything.
 
 use hyperscale_hbor::Capped;
-use hyperscale_types::{ComponentAddr, PROTOCOL_DISPLAY_DIGITS, ResourceAddr, StakePoolSeat};
+use hyperscale_types::{
+    ComponentAddr, PROTOCOL_DISPLAY_DIGITS, PrincipalAddr, ResourceAddr, StakePoolId, StakePoolSeat,
+};
 use hyperscale_vm_effects::{
     Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, ResourceKind,
     ResourceRecord, Value, package_hash, resource_address,
@@ -178,7 +180,7 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
     let mut registry = PoolRegistry::new();
     for seat in pools {
         let address = instances.create(&ProtocolHasher, pool_meta(staking_package, seat));
-        registry.register(address, seat.id);
+        registry.register(address, StakePoolId::of(address));
     }
     World {
         cache,
@@ -201,8 +203,8 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
 /// genesis pool and a founded one one shape.
 ///
 /// The salt stands in for a creating transaction's fresh id, which
-/// genesis has none of: the pool's own beacon identifier separates two
-/// pools that would otherwise be seated identically.
+/// genesis has none of: the seat's number separates two pools that would
+/// otherwise be seated identically.
 #[must_use]
 pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> InstanceMeta {
     InstanceMeta {
@@ -211,7 +213,7 @@ pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> Instance
             Value::Address(PROTOCOL_RESOURCE.address()),
             Value::Address(seat.operator.address()),
         ]),
-        salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.id.inner().to_le_bytes()]),
+        salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.number.to_le_bytes()]),
     }
 }
 
@@ -220,6 +222,72 @@ pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> Instance
 pub fn pool_address(staking_package: PackageHash, seat: &StakePoolSeat) -> ComponentAddr {
     pool_meta(staking_package, seat).address(&ProtocolHasher)
 }
+
+/// The pool genesis seats `seat` as: its instance's address under the
+/// protocol's staking package.
+#[must_use]
+pub fn seat_pool(seat: &StakePoolSeat) -> StakePoolId {
+    StakePoolId::of(pool_address(
+        package_hash(&ProtocolHasher, staking_artifact()),
+        seat,
+    ))
+}
+
+/// The seats genesis installs: `pools`, with seat number 0 added,
+/// operated by [`unoperated`], when none is numbered 0.
+///
+/// Seat 0 is the pool beacon genesis places every genesis validator in
+/// ([`founding_pool`]), so every genesis seats it on its shard: its
+/// configuration is written there, and no one can seal its address
+/// afterwards and take the badge of a pool holding the genesis stake.
+#[must_use]
+pub fn genesis_seats(pools: &[StakePoolSeat]) -> Vec<StakePoolSeat> {
+    if pools.iter().any(|seat| seat.number == 0) {
+        return pools.to_vec();
+    }
+    let mut seats = Vec::with_capacity(pools.len() + 1);
+    seats.push(unoperated_seat());
+    seats.extend_from_slice(pools);
+    seats
+}
+
+/// The pool beacon genesis places every genesis validator in: seat 0 of
+/// [`genesis_seats`].
+#[must_use]
+pub fn founding_pool(pools: &[StakePoolSeat]) -> StakePoolId {
+    pools
+        .iter()
+        .find(|seat| seat.number == 0)
+        .map_or_else(|| seat_pool(&unoperated_seat()), seat_pool)
+}
+
+/// Seat 0 as genesis installs it when no configured seat claims it.
+fn unoperated_seat() -> StakePoolSeat {
+    StakePoolSeat {
+        number: 0,
+        operator: unoperated(),
+        founding: Vec::new(),
+    }
+}
+
+/// The operator of a founding pool no configured seat claims.
+///
+/// An address under its own hashing domain rather than one a key derives,
+/// so nobody can sign as it: the pool's owner badge sits in an account no
+/// one can move it from.
+#[must_use]
+pub fn unoperated() -> PrincipalAddr {
+    let digest = ProtocolHasher.hash(DOMAIN_UNOPERATED, &[]);
+    let mut body = [0; 31];
+    body.copy_from_slice(&digest.0[..31]);
+    PrincipalAddr::new(body)
+}
+
+/// The domain [`unoperated`] derives under.
+///
+/// A hashing input, so its bytes fix the address rather than where the
+/// constant is declared.
+const DOMAIN_UNOPERATED: &[u8] = b"hyperscale/genesis/unoperated-pool";
 
 /// The domain separating a genesis instance's salt.
 ///

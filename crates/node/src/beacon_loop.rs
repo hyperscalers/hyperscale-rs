@@ -1566,7 +1566,7 @@ mod tests {
     use hyperscale_storage::test_helpers::commit_one;
     use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
     use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
-    use hyperscale_types::test_utils::{certify, make_live_block, test_transaction};
+    use hyperscale_types::test_utils::{certify, make_live_block, test_pool, test_transaction};
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconCert, BeaconChainConfig, BeaconProposalDraft,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
@@ -1691,7 +1691,7 @@ mod tests {
     /// costs one retry a tick instead of one per refusal.
     #[test]
     fn a_refused_witness_run_retries_once_and_then_on_the_tick() {
-        use hyperscale_types::{ShardWitnessPayload, Stake, StakePoolId};
+        use hyperscale_types::{ShardWitnessPayload, Stake};
 
         let fix = Fixture::new();
         let mut host = fix.host(BlockHeight::GENESIS);
@@ -1715,7 +1715,7 @@ mod tests {
                 committed_block_hash: anchor,
                 lo: LeafIndex::new(0),
                 payloads: vec![ShardWitnessPayload::StakeDeposit {
-                    pool_id: StakePoolId::new(0),
+                    pool_id: test_pool(0),
                     amount: Stake::from_whole_tokens(1),
                 }],
                 range_proof: Vec::new(),

@@ -13,6 +13,7 @@ pub use hyperscale_crypto_bls::{
     public_key_from_u64_seed as pubkey, signer_from_u64_seed as keypair,
 };
 use hyperscale_hbor::Capped;
+use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
     Admission, AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState,
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts,
@@ -20,9 +21,8 @@ use hyperscale_types::{
     PcVoteEquivocation, PendingReshape, PendingWithdrawal, QuorumCertificate, Round, Settling,
     ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardLoad,
     ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool,
-    StakePoolId, StateRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof,
-    WeightedTimestamp, beacon_reveal_sign, compute_merkle_root, compute_range_proof,
-    validator_possession_proof_sign,
+    StateRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
+    beacon_reveal_sign, compute_merkle_root, compute_range_proof, validator_possession_proof_sign,
 };
 
 use crate::state::witness::apply_shard_payload;
@@ -71,7 +71,7 @@ pub fn malformed_vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
 pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
     ValidatorRecord {
         id: ValidatorId::new(id),
-        pool: StakePoolId::new(pool),
+        pool: test_pool(pool),
         status,
         registered_at_epoch: Epoch::GENESIS,
         pubkey: pubkey(id),
@@ -125,7 +125,7 @@ pub fn empty_state() -> BeaconState {
 /// set at the floor.
 pub fn single_pool_state(n_active: u64) -> BeaconState {
     let mut state = empty_state();
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let shard = ShardId::leaf(1, 0);
 
     let mut pool_validators = BTreeSet::new();
@@ -180,7 +180,7 @@ pub fn single_pool_state_at_genesis(n_active: u64) -> BeaconState {
 /// is never spared to keep the beacon able to propose.
 pub fn lift_above_the_beacon_floor(state: &mut BeaconState) {
     let id = ValidatorId::new(99);
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let pool = state
         .pools
         .get_mut(&pool_id)
@@ -543,7 +543,7 @@ pub fn state_with_pending_withdrawal(
 ) -> BeaconState {
     let mut state = empty_state();
     state.current_epoch = current_epoch;
-    let pool_id = StakePoolId::new(0);
+    let pool_id = test_pool(0);
     let shard = ShardId::leaf(1, 0);
     let mut pool_validators = BTreeSet::new();
     let mut members = Vec::new();

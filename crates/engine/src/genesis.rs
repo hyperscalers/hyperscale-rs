@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 pub use hyperscale_effects_bridge::genesis::{
     GenesisPackages, OWNER_BADGE_ID, OWNER_BADGE_RECORD, PROTOCOL_RESOURCE_RECORD,
-    STAKE_UNIT_RECORD, World, account_artifact, genesis_publisher, genesis_world,
-    genesis_world_with_pools, pool_address, pool_meta, pool_owner_badge, stake_unit,
-    staking_artifact,
+    STAKE_UNIT_RECORD, World, account_artifact, founding_pool, genesis_publisher, genesis_seats,
+    genesis_world, genesis_world_with_pools, pool_address, pool_meta, pool_owner_badge, seat_pool,
+    stake_unit, staking_artifact,
 };
 use hyperscale_effects_bridge::vm_statics::config_key;
 pub use hyperscale_effects_bridge::{PROTOCOL_RESOURCE, draw_key, vault_key};

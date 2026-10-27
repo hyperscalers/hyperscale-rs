@@ -276,10 +276,10 @@ mod tests {
 
     use hyperscale_storage::test_helpers::commit_one;
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::test_utils::TestCommittee;
+    use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
         BeaconChainConfig, BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, JailReason,
-        ShardCommittee, StakePoolId, StateRoot, ValidatorRecord, ValidatorSet, WeightedTimestamp,
+        ShardCommittee, StateRoot, ValidatorRecord, ValidatorSet, WeightedTimestamp,
         shard_prefix_path,
     };
 
@@ -324,7 +324,7 @@ mod tests {
                 let id = validator(i);
                 let record = ValidatorRecord {
                     id,
-                    pool: StakePoolId::new(1),
+                    pool: test_pool(1),
                     status: *status,
                     registered_at_epoch: Epoch::GENESIS,
                     pubkey: *committee.public_key(i),

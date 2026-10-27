@@ -2536,12 +2536,13 @@ mod tests {
     use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
+    use crate::test_utils::test_pool;
     use crate::{EpochSeed, Hash, JailReason, SeedSource, TopologySnapshot};
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
         ValidatorRecord {
             id: ValidatorId::new(id),
-            pool: StakePoolId::new(pool),
+            pool: test_pool(pool),
             status,
             registered_at_epoch: Epoch::GENESIS,
             pubkey: public_key_from_u64_seed(id),
@@ -2636,7 +2637,7 @@ mod tests {
     /// set at the floor.
     fn single_pool_state(n_active: u64) -> BeaconState {
         let mut state = empty_state();
-        let pool_id = StakePoolId::new(0);
+        let pool_id = test_pool(0);
         let shard = ShardId::ROOT;
 
         let mut pool_validators = BTreeSet::new();
@@ -2935,7 +2936,7 @@ mod tests {
     #[test]
     fn effective_stake_subtracts_pending_withdrawals() {
         let pool = StakePool {
-            id: StakePoolId::new(0),
+            id: test_pool(0),
             total_stake: Stake::from_whole_tokens(1_000),
             validators: BTreeSet::new(),
             pending_withdrawals: vec![
@@ -2959,7 +2960,7 @@ mod tests {
     #[test]
     fn effective_stake_saturates_when_pending_exceeds_total() {
         let pool = StakePool {
-            id: StakePoolId::new(0),
+            id: test_pool(0),
             total_stake: Stake::from_whole_tokens(100),
             validators: BTreeSet::new(),
             pending_withdrawals: vec![PendingWithdrawal {
@@ -2977,7 +2978,7 @@ mod tests {
     #[test]
     fn current_active_count_includes_pooled_and_on_shard() {
         let state = single_pool_state(4);
-        let pool = state.pools.get(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get(&test_pool(0)).unwrap();
         assert_eq!(pool.current_active_count(&state), 4);
     }
 
@@ -2998,7 +2999,7 @@ mod tests {
             .get_mut(&ValidatorId::new(1))
             .unwrap()
             .status = ValidatorStatus::InsufficientStake;
-        let pool = state.pools.get(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get(&test_pool(0)).unwrap();
         assert_eq!(pool.current_active_count(&state), 2);
     }
 
@@ -3055,7 +3056,7 @@ mod tests {
     #[test]
     fn max_active_count_equals_effective_over_min_stake() {
         let state = single_pool_state(4);
-        let pool = state.pools.get(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get(&test_pool(0)).unwrap();
         // 4 floors of stake, `min_stake = floor` ⇒ cap of 4.
         assert_eq!(pool.max_active_count(&state), 4);
     }
@@ -3066,12 +3067,12 @@ mod tests {
     #[test]
     fn max_active_count_respects_pending_withdrawals() {
         let mut state = single_pool_state(4);
-        let pool_mut = state.pools.get_mut(&StakePoolId::new(0)).unwrap();
+        let pool_mut = state.pools.get_mut(&test_pool(0)).unwrap();
         pool_mut.pending_withdrawals.push(PendingWithdrawal {
             amount: pool_mut.total_stake,
             initiated_at_epoch: Epoch::GENESIS,
         });
-        let pool = state.pools.get(&StakePoolId::new(0)).unwrap();
+        let pool = state.pools.get(&test_pool(0)).unwrap();
         assert_eq!(pool.max_active_count(&state), 0);
     }
 
@@ -3306,7 +3307,7 @@ mod tests {
     #[test]
     fn an_unjail_is_refused_for_the_first_failing_check() {
         let mut state = single_pool_state(4);
-        let pool = StakePoolId::new(0);
+        let pool = test_pool(0);
         let (jailed, seated) = (ValidatorId::new(0), ValidatorId::new(1));
         state.validators.get_mut(&jailed).unwrap().status = ValidatorStatus::Jailed {
             since_epoch: Epoch::new(2),
@@ -3319,7 +3320,7 @@ mod tests {
             Some(UnjailRefusal::Unknown)
         );
         assert_eq!(
-            state.unjail_refusal(jailed, StakePoolId::new(7)),
+            state.unjail_refusal(jailed, test_pool(7)),
             Some(UnjailRefusal::OtherPool)
         );
         assert_eq!(
@@ -3368,7 +3369,7 @@ mod tests {
         let period = state.beacon_recency_period();
         assert_ne!(period, JAIL_COOLDOWN_EPOCHS);
         assert_eq!(
-            state.unjail_refusal(ValidatorId::new(0), StakePoolId::new(0)),
+            state.unjail_refusal(ValidatorId::new(0), test_pool(0)),
             Some(UnjailRefusal::CoolingDown {
                 lifts_at: since.saturating_add(period)
             })

@@ -38,7 +38,7 @@ use crate::support::query::{
     stands_at, vault_balance,
 };
 use crate::support::tx::{
-    GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
+    GENESIS_POOL, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
     build_sponsored_swap_tx, build_stake_tx, build_swap_tx, build_transfer_tx, pool_at,
     validity_around, venue_on, venues_on,
 };
@@ -177,7 +177,7 @@ pub struct StockedVenue {
 /// Panics if the stake, the seal or the stocking misses its budget.
 pub fn stand_up_venue<C: Cluster>(c: &mut C, shard: ShardId, taken: &mut Vec<u8>) -> StockedVenue {
     let (provider_key, provider_account) = grind_onto(shard, taken);
-    let pool = pool_at(GENESIS_POOL_ID);
+    let pool = pool_at(GENESIS_POOL);
     let unit = stake_unit(pool);
     let meta = venue_on(shard, (*PROTOCOL_RESOURCE, unit));
     stock_venue(c, &provider_key, provider_account, pool, &meta, unit);
@@ -282,7 +282,7 @@ pub fn stand_up_venues_on<C: Cluster>(
     count: usize,
     taken: &mut Vec<u8>,
 ) -> Vec<Vec<StockedVenue>> {
-    let pool = pool_at(GENESIS_POOL_ID);
+    let pool = pool_at(GENESIS_POOL);
     let unit = stake_unit(pool);
     let pair = (*PROTOCOL_RESOURCE, unit);
     let share = MIN_STAKE_FLOOR.quanta() / u128::try_from(count).expect("a count of venues");

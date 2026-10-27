@@ -1513,7 +1513,7 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof_signed_by};
+    use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof_signed_by, test_pool};
     use hyperscale_types::{
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
@@ -1522,9 +1522,9 @@ mod tests {
         ParamProposal, PriceBounds, PriceTable, QuorumCertificate, RETENTION_HORIZON,
         RecoveryBinding, ReshapeThresholds, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
         ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
-        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS,
-        TopologySchedule, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root, compute_range_proof, derive_reshape_trigger,
+        SplitChildRoots, Stake, StakePool, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
+        compute_range_proof, derive_reshape_trigger,
     };
 
     use super::*;
@@ -1667,7 +1667,7 @@ mod tests {
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(200 + u32::try_from(i).unwrap_or(u32::MAX)),
+                pool_id: test_pool(200 + u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
             })
             .collect();
@@ -1823,7 +1823,7 @@ mod tests {
         state.boundaries.insert(seated, live_boundary(0));
         let deposit = || {
             vec![ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(200),
+                pool_id: test_pool(200),
                 amount: Stake::from_whole_tokens(1),
             }]
         };
@@ -1832,7 +1832,7 @@ mod tests {
 
         assert!(!state.boundaries.contains_key(&departed));
         assert!(!state.advanced.contains(&departed));
-        assert!(!state.pools.contains_key(&StakePoolId::new(200)));
+        assert!(!state.pools.contains_key(&test_pool(200)));
         assert_eq!(state.fold_watermark(departed), 0);
         assert!(
             state
@@ -1845,7 +1845,7 @@ mod tests {
         // is a contribution like any other.
         fold_witness_chunk(&mut state, 0, 0, deposit());
         assert!(state.advanced.contains(&seated));
-        assert!(state.pools.contains_key(&StakePoolId::new(200)));
+        assert!(state.pools.contains_key(&test_pool(200)));
     }
 
     /// The first crossing of a shard genesis seated, and of one a reshape
@@ -1869,7 +1869,7 @@ mod tests {
                 0,
                 0,
                 vec![ShardWitnessPayload::StakeDeposit {
-                    pool_id: StakePoolId::new(200),
+                    pool_id: test_pool(200),
                     amount: Stake::from_whole_tokens(1),
                 }],
             );
@@ -1880,7 +1880,7 @@ mod tests {
             assert_eq!(recorded.last_live_epoch, Epoch::new(21));
             assert_eq!(state.fold_watermark(shard), 1);
             assert!(state.advanced.contains(&shard));
-            assert!(state.pools.contains_key(&StakePoolId::new(200)));
+            assert!(state.pools.contains_key(&test_pool(200)));
         }
     }
 
@@ -2911,7 +2911,7 @@ mod tests {
         let ids: Vec<ValidatorId> = state.validators.keys().copied().collect();
         state.pools.clear();
         for (i, id) in ids.iter().enumerate() {
-            let pool_id = StakePoolId::new(u32::try_from(i).unwrap());
+            let pool_id = test_pool(u32::try_from(i).unwrap());
             state.validators.get_mut(id).unwrap().pool = pool_id;
             state.pools.insert(
                 pool_id,
@@ -2985,7 +2985,7 @@ mod tests {
             );
         }
         assert!(
-            state.pools[&StakePoolId::new(0)].conviction.is_some(),
+            state.pools[&test_pool(0)].conviction.is_some(),
             "one conviction for the shared pool",
         );
     }
@@ -3055,7 +3055,7 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
 
         let payloads = vec![ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(200),
+            pool_id: test_pool(200),
             amount: Stake::from_whole_tokens(1),
         }];
         let (b, payloads, range_proof) =
@@ -3957,7 +3957,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let deposit = ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(200),
+            pool_id: test_pool(200),
             amount: Stake::from_whole_tokens(1),
         };
 
@@ -4261,7 +4261,7 @@ mod tests {
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(200 + u32::try_from(i).unwrap_or(u32::MAX)),
+                pool_id: test_pool(200 + u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
             })
             .collect();
@@ -6857,7 +6857,7 @@ mod tests {
         assert_ne!(voted, state.params);
         let activate_at = Epoch::new(state.current_epoch.inner() + 3);
         state.param_votes.insert(
-            StakePoolId::new(0),
+            test_pool(0),
             ParamProposal {
                 params: voted,
                 activate_at,

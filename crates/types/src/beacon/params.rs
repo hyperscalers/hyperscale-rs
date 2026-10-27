@@ -175,6 +175,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
+    use crate::test_utils::test_pool;
 
     #[test]
     fn seeds_reshape_thresholds_from_config() {
@@ -245,7 +246,7 @@ mod tests {
     fn vote_hbor_round_trip() {
         let votes = [
             ParamVote {
-                pool: StakePoolId::new(3),
+                pool: test_pool(3),
                 proposal: Some(ParamProposal {
                     params: NetworkParams {
                         reshape_thresholds: ReshapeThresholds {
@@ -258,7 +259,7 @@ mod tests {
                 }),
             },
             ParamVote {
-                pool: StakePoolId::new(3),
+                pool: test_pool(3),
                 proposal: None,
             },
         ];

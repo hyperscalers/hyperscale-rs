@@ -31,9 +31,9 @@ use hyperscale_types::{
     AddressClass, Block, BlockHeight, CollectionId, ComponentAddr, ConsensusReceipt, Deadline,
     DeclaredKey, DeclaredRange, Ed25519PrivateKey, EpochWindows, Evidence, FrontierInputs, Joins,
     MAX_INTENT_VALIDITY_RANGE, Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
-    Settlement, ShardId, ShardTrie, StakePoolId, StakePoolSeat, StateRoot, StateWrites,
-    StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction,
-    TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
+    Settlement, ShardId, ShardTrie, StakePoolSeat, StateRoot, StateWrites, StatedTerms,
+    StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction, TxHash,
+    Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{Composed, Hash32, InstanceMeta, IntentHeader, Value, package_hash};
 use hyperscale_vm_fixtures::{peg, peg_package_hash};
@@ -1012,7 +1012,7 @@ impl Window {
     fn new() -> Self {
         let trie = ShardTrie::uniform(1);
         let seat = StakePoolSeat {
-            id: StakePoolId::new(1),
+            number: 1,
             operator: Self::account(1),
             founding: Vec::new(),
         };

@@ -13,13 +13,13 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim, Crossing};
 use hyperscale_core::Action;
 use hyperscale_hbor::Capped;
+use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
     AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal,
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CandidateBeaconBlock, ConsensusSignature,
     Epoch, Hash, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation,
     PcVoteRound, PcXpProof, RatifyPhase, Round, ShardId, ShardVoteEquivocation, SignerBitfield,
-    SpcCert, SpcView, StakePoolId, StateRoot, ValidatorId, ValidatorStatus, Verifiable, Verified,
-    VrfProof,
+    SpcCert, SpcView, StateRoot, ValidatorId, ValidatorStatus, Verifiable, Verified, VrfProof,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -235,7 +235,7 @@ fn observed_crossing_records_shard_boundary_through_full_commit() {
     // through the fold's `apply_contribution_witnesses` step.
     for pool_n in 100..103 {
         assert!(
-            commit.state.pools.contains_key(&StakePoolId::new(pool_n)),
+            commit.state.pools.contains_key(&test_pool(pool_n)),
             "boundary witness payload didn't mutate state at commit — pool {pool_n} missing",
         );
     }

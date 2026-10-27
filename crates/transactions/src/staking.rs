@@ -168,16 +168,17 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+
     use hyperscale_types::test_utils::test_principal;
-    use hyperscale_types::{ConsensusPublicKey, ConsensusSignature, StakePoolId};
+    use hyperscale_types::{ConsensusPublicKey, ConsensusSignature};
 
     use super::*;
 
     const NETWORK: NetworkId = NetworkId(242);
 
-    fn seat(id: u32) -> StakePoolSeat {
+    fn seat(number: u32) -> StakePoolSeat {
         StakePoolSeat {
-            id: StakePoolId::new(id),
+            number,
             operator: test_principal(7),
             founding: Vec::new(),
         }

@@ -30,10 +30,10 @@ use crate::support::query::{
     validator_pubkey, validator_status,
 };
 use crate::support::tx::{
-    GENESIS_POOL_ID, HEIR_FUNDING, SECOND_POOL_ID, STAKE_POOL_ID, badge_buyer, build_badge_sale_tx,
+    GENESIS_POOL, HEIR_FUNDING, SECOND_POOL, STAKE_POOL, badge_buyer, build_badge_sale_tx,
     build_deactivate_tx, build_register_tx, build_reshape_threshold_vote_tx,
     build_sponsored_unjail_tx, build_stake_tx, build_transfer_tx, build_unjail_tx,
-    build_unstake_tx, delegator, pool_at, pool_heir, pool_operator, pool_vault_cell,
+    build_unstake_tx, delegator, pool_at, pool_heir, pool_id, pool_operator, pool_vault_cell,
     validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
@@ -158,20 +158,20 @@ fn register<C: Cluster>(
 pub fn delegation_folds_into_beacon_state(c: &mut impl Cluster) {
     warm_up(c);
 
-    let pool = STAKE_POOL_ID;
+    let pool = pool_id(STAKE_POOL);
     assert_eq!(
         pool_total_stake(c, pool),
         None,
         "the pool must have no stake before anyone delegates to it",
     );
 
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
     let (key, delegator) = delegator();
     let tx = build_stake_tx(
         &key,
         delegator,
-        pool_at(STAKE_POOL_ID),
+        pool_at(STAKE_POOL),
         DELEGATION,
         validity_around(c.now()),
     );
@@ -213,16 +213,16 @@ pub fn register_validator_pools_a_node(c: &mut impl Cluster) {
     warm_up(c);
 
     let newcomer = ValidatorId::new(1000);
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         MIN_STAKE_FLOOR.quanta() * 10,
     );
-    register(c, &mut charges, pool_at(STAKE_POOL_ID), 9, newcomer);
+    register(c, &mut charges, pool_at(STAKE_POOL), 9, newcomer);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, newcomer)
             == Some(ValidatorStatus::Pooled)),
@@ -244,20 +244,20 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
     // The pool exists but holds less than one min_stake, so it can support no
     // validator — the registration must be rejected on the capacity gate.
     let newcomer = ValidatorId::new(2000);
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         MIN_STAKE_FLOOR.quanta() / 2,
     );
 
     // The registration itself commits — it is a well-formed action by the
     // pool's own operator, and what refuses it is the beacon's capacity
     // gate rather than anything the transaction did wrong.
-    register(c, &mut charges, pool_at(STAKE_POOL_ID), 11, newcomer);
+    register(c, &mut charges, pool_at(STAKE_POOL), 11, newcomer);
     // Run long enough that the registration has folded; an accepted one
     // would surface within a couple of epochs.
     c.run_until(epochs(5), |_| false);
@@ -276,11 +276,11 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         MIN_STAKE_FLOOR.quanta() * 2,
     );
-    register(c, &mut charges, pool_at(STAKE_POOL_ID), 12, funded);
+    register(c, &mut charges, pool_at(STAKE_POOL), 12, funded);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, funded)
             == Some(ValidatorStatus::Pooled)),
@@ -309,12 +309,12 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
 pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
     warm_up(c);
 
-    let pool = STAKE_POOL_ID;
+    let pool = pool_id(STAKE_POOL);
     let delegated = MIN_STAKE_FLOOR.quanta() * 5;
     let returned = MIN_STAKE_FLOOR.quanta() * 2;
     let remaining = Stake::from_quanta(delegated - returned);
     let (key, delegator) = delegator();
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
 
     submit_committed(
@@ -323,7 +323,7 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
         build_stake_tx(
             &key,
             delegator,
-            pool_at(STAKE_POOL_ID),
+            pool_at(STAKE_POOL),
             delegated,
             validity_around(c.now()),
         ),
@@ -341,7 +341,7 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
         build_unstake_tx(
             &key,
             delegator,
-            pool_at(STAKE_POOL_ID),
+            pool_at(STAKE_POOL),
             returned,
             validity_around(c.now()),
         ),
@@ -382,16 +382,16 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
 
     let member = ValidatorId::new(3000);
     let funded = MIN_STAKE_FLOOR.quanta() * 10;
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         funded,
     );
-    register(c, &mut charges, pool_at(STAKE_POOL_ID), 13, member);
+    register(c, &mut charges, pool_at(STAKE_POOL), 13, member);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, member)
             == Some(ValidatorStatus::Pooled)),
@@ -409,7 +409,7 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
         build_unstake_tx(
             &key,
             delegator,
-            pool_at(STAKE_POOL_ID),
+            pool_at(STAKE_POOL),
             returned,
             validity_around(c.now()),
         ),
@@ -427,8 +427,8 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         funded,
     );
     assert!(
@@ -461,7 +461,7 @@ pub fn pool_transfer_moves_operatorship(c: &mut impl Cluster) {
     warm_up(c);
     let (seller, _) = pool_operator();
     let (buyer_key, buyer) = badge_buyer();
-    let world = pool_world(c, [pool_at(GENESIS_POOL_ID)]);
+    let world = pool_world(c, [pool_at(GENESIS_POOL)]);
     let mut charges = Charges::default();
 
     // The sale: an ordinary NF transfer of the badge.
@@ -546,16 +546,16 @@ pub fn registered_validator_activates_onto_a_shard(c: &mut impl Cluster) {
     // full it parks in the pool. Which pool it joins does not matter to
     // the draw — the committee fills from the pooled set network-wide.
     let newcomer = ValidatorId::new(1000);
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         MIN_STAKE_FLOOR.quanta() * 10,
     );
-    register(c, &mut charges, pool_at(STAKE_POOL_ID), 9, newcomer);
+    register(c, &mut charges, pool_at(STAKE_POOL), 9, newcomer);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, newcomer)
             == Some(ValidatorStatus::Pooled)),
@@ -574,7 +574,7 @@ pub fn registered_validator_activates_onto_a_shard(c: &mut impl Cluster) {
         &mut charges,
         build_deactivate_tx(
             &operator,
-            pool_at(GENESIS_POOL_ID),
+            pool_at(GENESIS_POOL),
             ValidatorId::new(0),
             validity_around(c.now()),
         ),
@@ -608,24 +608,24 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
     let id = ValidatorId::new(1000);
     let first = dummy_pubkey(c, 9);
     let capacity = MIN_STAKE_FLOOR.quanta() * 10;
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID), pool_at(SECOND_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL), pool_at(SECOND_POOL)]);
     let mut charges = Charges::default();
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         capacity,
     );
     delegate(
         c,
         &mut charges,
-        pool_at(SECOND_POOL_ID),
-        SECOND_POOL_ID,
+        pool_at(SECOND_POOL),
+        pool_id(SECOND_POOL),
         capacity,
     );
 
-    register(c, &mut charges, pool_at(STAKE_POOL_ID), 9, id);
+    register(c, &mut charges, pool_at(STAKE_POOL), 9, id);
     assert!(
         c.run_until(epochs(8), |c| validator_pubkey(c, id) == Some(first)),
         "validator never registered",
@@ -633,7 +633,7 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
 
     // A second pool, funded and with capacity to spare, claims the same
     // id under a different key. The id is dead, so the record stands.
-    register(c, &mut charges, pool_at(SECOND_POOL_ID), 99, id);
+    register(c, &mut charges, pool_at(SECOND_POOL), 99, id);
     c.run_until(epochs(5), |_| false);
     assert_eq!(
         validator_pubkey(c, id),
@@ -665,13 +665,13 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
         ValidatorId::new(1002),
         ValidatorId::new(1003),
     ];
-    let world = pool_world(c, [pool_at(STAKE_POOL_ID)]);
+    let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
     delegate(
         c,
         &mut charges,
-        pool_at(STAKE_POOL_ID),
-        STAKE_POOL_ID,
+        pool_at(STAKE_POOL),
+        pool_id(STAKE_POOL),
         MIN_STAKE_FLOOR.quanta() * 3,
     );
 
@@ -679,7 +679,7 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
     // action by the pool's own operator, and exactly three take.
     for (i, id) in candidates.iter().enumerate() {
         let offset = u8::try_from(i).expect("candidate index fits u8");
-        register(c, &mut charges, pool_at(STAKE_POOL_ID), 20 + offset, *id);
+        register(c, &mut charges, pool_at(STAKE_POOL), 20 + offset, *id);
     }
     assert!(
         c.run_until(epochs(8), |c| candidates
@@ -786,7 +786,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: CrashableCluster
     let attempt = |c: &mut C| {
         let unjail = build_unjail_tx(
             &heir_key,
-            pool_at(STAKE_POOL_ID),
+            pool_at(STAKE_POOL),
             newcomer,
             validity_around(c.now()),
         );
@@ -810,7 +810,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableClu
         let unjail = build_sponsored_unjail_tx(
             &sponsor_key,
             &heir_key,
-            pool_at(STAKE_POOL_ID),
+            pool_at(STAKE_POOL),
             newcomer,
             validity_around(c.now()),
         );
@@ -862,11 +862,11 @@ fn time_out_a_newcomer_handing_to(
     );
     assert!(
         c.run_until(epochs(40), |c| c.beacon_state().is_some_and(|s| s
-            .unjail_refusal(newcomer, STAKE_POOL_ID)
+            .unjail_refusal(newcomer, pool_id(STAKE_POOL))
             .is_none())),
         "the newcomer's time-out never ended; refusal = {:?}",
         c.beacon_state()
-            .and_then(|s| s.unjail_refusal(newcomer, STAKE_POOL_ID)),
+            .and_then(|s| s.unjail_refusal(newcomer, pool_id(STAKE_POOL))),
     );
     // The placement scan retires the jailed newcomer's loop; from then on
     // its host is seated nowhere.

@@ -783,6 +783,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         Address, AddressClass, Admission, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence,
         Formed, HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding, RecoveryCause, ReshapeKind,
@@ -1536,7 +1537,7 @@ mod tests {
     /// a stake-backed pool so the shuffle can refill. `current_epoch =
     /// 5`, committee target 4.
     fn merge_grow_state(pooled: u64) -> BeaconState {
-        use hyperscale_types::{MIN_STAKE_FLOOR, Stake, StakePool, StakePoolId};
+        use hyperscale_types::{MIN_STAKE_FLOOR, Stake, StakePool};
 
         let mut state = empty_state();
         state.current_epoch = Epoch::new(5);
@@ -1607,9 +1608,9 @@ mod tests {
         }
         let count = 8 + u128::from(pooled);
         state.pools.insert(
-            StakePoolId::new(0),
+            test_pool(0),
             StakePool {
-                id: StakePoolId::new(0),
+                id: test_pool(0),
                 total_stake: Stake::from_quanta(count * MIN_STAKE_FLOOR.quanta()),
                 validators,
                 pending_withdrawals: Vec::new(),
@@ -3575,7 +3576,7 @@ mod tests {
     type Contribution = (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>);
 
     /// The pool a crossing's one witness leaf deposits into.
-    const DEPOSITED: StakePoolId = StakePoolId::new(200);
+    const DEPOSITED: StakePoolId = test_pool(200);
 
     /// The instant [`crossing_of_the_previous_life`] is certified at.
     const OLD_CERTIFIED: u64 = 1_500;

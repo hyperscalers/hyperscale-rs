@@ -129,8 +129,9 @@ pub fn attested_only_by(signed: &SignedIntent, principal: PrincipalAddr) -> bool
 
 #[cfg(test)]
 mod tests {
+
     use hyperscale_types::test_utils::test_principal;
-    use hyperscale_types::{NetworkId, StakePoolId, StakePoolSeat, ed25519_keypair_from_seed};
+    use hyperscale_types::{NetworkId, StakePoolSeat, ed25519_keypair_from_seed};
 
     use super::*;
     use crate::{Ceilings, Staking, pool_address};
@@ -139,7 +140,7 @@ mod tests {
 
     fn seat() -> StakePoolSeat {
         StakePoolSeat {
-            id: StakePoolId::new(0),
+            number: 0,
             operator: test_principal(7),
             founding: Vec::new(),
         }

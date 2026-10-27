@@ -265,7 +265,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::TestCommittee;
+    use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
         ConsensusSignature, Epoch, LocalTimestamp, NetworkDefinition, QuorumCertificate,
@@ -277,7 +277,7 @@ mod tests {
     use super::*;
 
     fn pool_id() -> StakePoolId {
-        StakePoolId::new(1)
+        test_pool(1)
     }
 
     fn deposit(amount: u64) -> ShardWitnessPayload {

@@ -314,11 +314,12 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
+    use crate::test_utils::test_pool;
 
     fn sample_param_vote() -> ParamVote {
         use crate::{Epoch, NetworkParams, ParamProposal, ReshapeThresholds};
         ParamVote {
-            pool: StakePoolId::new(5),
+            pool: test_pool(5),
             proposal: Some(ParamProposal {
                 params: NetworkParams {
                     reshape_thresholds: ReshapeThresholds {
@@ -337,25 +338,25 @@ mod tests {
         let pubkey = ConsensusPublicKey::new([0xAB; 48]);
         let payloads = vec![
             ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(1),
+                pool_id: test_pool(1),
                 amount: Stake::from_whole_tokens(100),
             },
             ShardWitnessPayload::StakeWithdraw {
-                pool_id: StakePoolId::new(2),
+                pool_id: test_pool(2),
                 amount: Stake::from_whole_tokens(50),
             },
             ShardWitnessPayload::RegisterValidator {
-                pool_id: StakePoolId::new(3),
+                pool_id: test_pool(3),
                 validator_id: ValidatorId::new(7),
                 pubkey,
                 possession_proof: ConsensusSignature::new([0xAB; 96]),
             },
             ShardWitnessPayload::DeactivateValidator {
-                pool_id: StakePoolId::new(3),
+                pool_id: test_pool(3),
                 validator_id: ValidatorId::new(8),
             },
             ShardWitnessPayload::Unjail {
-                pool_id: StakePoolId::new(3),
+                pool_id: test_pool(3),
                 id: ValidatorId::new(10),
             },
             ShardWitnessPayload::Ready {
@@ -397,31 +398,31 @@ mod tests {
         let pubkey = ConsensusPublicKey::new([0xCD; 48]);
         let events = vec![
             BeaconWitnessEvent::StakeDeposit {
-                pool_id: StakePoolId::new(1),
+                pool_id: test_pool(1),
                 amount: Stake::from_whole_tokens(100),
             },
             BeaconWitnessEvent::StakeWithdraw {
-                pool_id: StakePoolId::new(2),
+                pool_id: test_pool(2),
                 amount: Stake::from_whole_tokens(50),
             },
             BeaconWitnessEvent::RegisterValidator {
-                pool_id: StakePoolId::new(3),
+                pool_id: test_pool(3),
                 validator_id: ValidatorId::new(7),
                 pubkey,
                 possession_proof: ConsensusSignature::new([0xCD; 96]),
             },
             BeaconWitnessEvent::DeactivateValidator {
-                pool_id: StakePoolId::new(3),
+                pool_id: test_pool(3),
                 validator_id: ValidatorId::new(8),
             },
             BeaconWitnessEvent::Unjail {
-                pool_id: StakePoolId::new(3),
+                pool_id: test_pool(3),
                 id: ValidatorId::new(10),
             },
             BeaconWitnessEvent::ParamVote(sample_param_vote()),
             // The clear case carries no proposal.
             BeaconWitnessEvent::ParamVote(ParamVote {
-                pool: StakePoolId::new(5),
+                pool: test_pool(5),
                 proposal: None,
             }),
         ];
@@ -438,33 +439,33 @@ mod tests {
         let cases: Vec<(BeaconWitnessEvent, ShardWitnessPayload)> = vec![
             (
                 BeaconWitnessEvent::StakeDeposit {
-                    pool_id: StakePoolId::new(1),
+                    pool_id: test_pool(1),
                     amount: Stake::from_whole_tokens(100),
                 },
                 ShardWitnessPayload::StakeDeposit {
-                    pool_id: StakePoolId::new(1),
+                    pool_id: test_pool(1),
                     amount: Stake::from_whole_tokens(100),
                 },
             ),
             (
                 BeaconWitnessEvent::StakeWithdraw {
-                    pool_id: StakePoolId::new(2),
+                    pool_id: test_pool(2),
                     amount: Stake::from_whole_tokens(50),
                 },
                 ShardWitnessPayload::StakeWithdraw {
-                    pool_id: StakePoolId::new(2),
+                    pool_id: test_pool(2),
                     amount: Stake::from_whole_tokens(50),
                 },
             ),
             (
                 BeaconWitnessEvent::RegisterValidator {
-                    pool_id: StakePoolId::new(3),
+                    pool_id: test_pool(3),
                     validator_id: ValidatorId::new(7),
                     pubkey,
                     possession_proof: ConsensusSignature::new([0xEF; 96]),
                 },
                 ShardWitnessPayload::RegisterValidator {
-                    pool_id: StakePoolId::new(3),
+                    pool_id: test_pool(3),
                     validator_id: ValidatorId::new(7),
                     pubkey,
                     possession_proof: ConsensusSignature::new([0xEF; 96]),
@@ -472,21 +473,21 @@ mod tests {
             ),
             (
                 BeaconWitnessEvent::DeactivateValidator {
-                    pool_id: StakePoolId::new(3),
+                    pool_id: test_pool(3),
                     validator_id: ValidatorId::new(8),
                 },
                 ShardWitnessPayload::DeactivateValidator {
-                    pool_id: StakePoolId::new(3),
+                    pool_id: test_pool(3),
                     validator_id: ValidatorId::new(8),
                 },
             ),
             (
                 BeaconWitnessEvent::Unjail {
-                    pool_id: StakePoolId::new(3),
+                    pool_id: test_pool(3),
                     id: ValidatorId::new(10),
                 },
                 ShardWitnessPayload::Unjail {
-                    pool_id: StakePoolId::new(3),
+                    pool_id: test_pool(3),
                     id: ValidatorId::new(10),
                 },
             ),

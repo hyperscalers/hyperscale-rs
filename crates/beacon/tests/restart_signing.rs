@@ -20,13 +20,13 @@ use hyperscale_network::{
 };
 use hyperscale_storage::RatifyRegisterStore;
 use hyperscale_storage_memory::SimBeaconStorage;
-use hyperscale_types::test_utils::TestCommittee;
+use hyperscale_types::test_utils::{TestCommittee, test_pool};
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, BlockHash, BlockHeight,
     CertifiedBeaconBlock, ConsensusSignature, Epoch, GenesisPool, GenesisValidator, GossipMessage,
     Hash, LocalTimestamp, MIN_STAKE_FLOOR, MessageClass, NetworkDefinition, NetworkMessage,
     PcValueElement, PcVector, Randomness, RatifyPhase, RatifyRound, RatifyVote, Request, Round,
-    RoutingCommittees, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, SpcView, Stake, StakePoolId,
+    RoutingCommittees, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, SpcView, Stake,
     TopologySnapshot, ValidatorId, Verified, genesis_config_hash,
 };
 
@@ -127,7 +127,7 @@ impl Member {
     /// record `storage` holds for it.
     fn coordinator(&self, storage: &SimBeaconStorage) -> BeaconCoordinator {
         let network = NetworkDefinition::simulator();
-        let pool = StakePoolId::new(0);
+        let pool = test_pool(0);
         let size = self.committee.size();
         let config = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
