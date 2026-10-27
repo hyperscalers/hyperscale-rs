@@ -19,7 +19,6 @@ use hyperscale_types::{
     SKIP_TIMEOUT, ShardId, ValidatorStatus,
 };
 use support::{SimCluster, sim_seed};
-use tracing_test::traced_test;
 
 /// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
 /// eight validators: the first four sit on the genesis beacon committee, the
@@ -83,7 +82,6 @@ fn assert_beacon_consensus(runner: &SimulationRunner, epoch: Epoch, num_hosts: u
 /// timer fire `SKIP_TIMEOUT` past the first epoch boundary, prevote the
 /// canonical skip hash, and the chain advances past the abandoned
 /// epoch with a `BeaconCert::Skip` cert.
-#[traced_test]
 #[test]
 fn skip_path_advances_past_blocked_epoch() {
     let mut runner = SimulationRunner::new(&beacon_committee_config(), sim_seed(0xBE_AC));
@@ -175,7 +173,6 @@ fn skip_path_advances_past_blocked_epoch() {
 /// (in `crates/node/src/process/network_handlers.rs`) doesn't
 /// regress: when fetch fires, it serves real proposals rather than
 /// the empty-response stub that used to live there.
-#[traced_test]
 #[test]
 fn fetch_recovery_path_unblocks_dropped_peer() {
     // The whole drop-and-recover run stays below the first committee
@@ -231,7 +228,6 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
 /// anchors seed. One parent half's beacon proposals are cut. Jailing it
 /// would leave three proven members, so the sweep spares it; the anchors
 /// seed and the beacon keeps committing normal blocks.
-#[traced_test]
 #[test]
 fn a_withholding_member_at_the_floor_mid_split_is_spared() {
     let config = ScenarioConfig {

@@ -29,7 +29,6 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, ShardId, ValidatorId, ValidatorStatus, shard_prefix_path,
 };
-use tracing_test::traced_test;
 
 mod support;
 
@@ -130,7 +129,6 @@ fn mover_status(
     state.validators.get(&validator).map(|r| r.status)
 }
 
-#[traced_test]
 #[test]
 #[allow(clippy::too_many_lines)] // one relocation lifecycle asserted end to end
 fn vnode_moves_through_a_committee_rotation() {

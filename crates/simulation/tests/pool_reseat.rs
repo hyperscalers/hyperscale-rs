@@ -15,7 +15,6 @@ use hyperscale_types::{
     BeaconBlockHash, Hash, RatifyPhase, RatifyPolka, ShardId, ValidatorId, ValidatorStatus,
     shard_prefix_path,
 };
-use tracing_test::traced_test;
 
 mod support;
 
@@ -25,7 +24,6 @@ use support::{SimCluster, committee_member_host, rotation_config};
 /// not dependent on a particular shuffle outcome.
 const SEED: u64 = 7;
 
-#[traced_test]
 #[test]
 fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
@@ -129,7 +127,6 @@ fn drained_validator_follows_the_beacon_in_the_pool_and_reseats() {
 /// tip proves the host's beacon loop fetched the gap via
 /// `GetBeaconBlockRequest`, since the fold commits serially and cannot
 /// skip the missing epochs.
-#[traced_test]
 #[test]
 fn partitioned_follower_catches_up_via_beacon_sync() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
@@ -184,7 +181,6 @@ fn partitioned_follower_catches_up_via_beacon_sync() {
 /// boundary has no anchor to snap-sync from, and none is coming until the
 /// shard crosses. It seats at the network genesis instead: the block and
 /// state every member committed at birth, which block sync extends.
-#[traced_test]
 #[test]
 fn a_join_before_the_first_crossing_seats_at_genesis() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
@@ -226,7 +222,6 @@ fn a_join_before_the_first_crossing_seats_at_genesis() {
 /// beacon records it signed where it ran. Its participant on the new host
 /// abstains at every slot it already signed: a vote for another value at
 /// a slot the old host's record holds is refused there.
-#[traced_test]
 #[test]
 fn a_rehomed_identity_abstains_at_beacon_slots_it_signed_on_its_old_host() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);

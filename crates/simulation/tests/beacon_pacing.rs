@@ -22,7 +22,6 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_types::{BeaconChainConfig, Epoch};
 use support::sim_seed;
-use tracing_test::traced_test;
 
 const VALIDATORS: u32 = 4;
 const LAGGER: NodeIndex = 3;
@@ -52,7 +51,6 @@ fn latest_beacon_epoch(runner: &SimulationRunner, node: NodeIndex) -> u64 {
         .map_or(0, Epoch::inner)
 }
 
-#[traced_test]
 #[test]
 fn beacon_never_commits_an_epoch_ahead_of_wall_clock() {
     let mut runner = SimulationRunner::new(&pacing_config(), sim_seed(11));
