@@ -15,8 +15,8 @@ use hyperscale_network_iroh::{
 };
 use hyperscale_types::{
     Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, MIN_EPOCH_DURATION,
-    NetworkDefinition, PrincipalAddr, StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo,
-    ValidatorSet,
+    NetworkDefinition, NetworkParams, ParamBoundsError, PrincipalAddr, ReshapeThresholds,
+    StakePoolId, StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -63,6 +63,10 @@ pub enum NetworkFileError {
         /// Seats on the genesis shard.
         seats: u32,
     },
+    /// A governable parameter the chain section sets is out of the bounds a
+    /// vote could not move it past either.
+    #[error("chain: {0}")]
+    Params(#[from] ParamBoundsError),
     /// The epoch is shorter than any chain may run.
     #[error("{epoch_ms} ms epochs are shorter than the {floor_ms} ms a chain may run")]
     EpochTooShort {
@@ -278,6 +282,9 @@ pub struct Chain {
     pub shard_size: Option<u32>,
     /// Epochs a drawn seat has to report itself ready.
     pub ready_timeout_epochs: Option<u64>,
+    /// Committed state, in bytes, at or above which a shard splits. Unset,
+    /// no shard reshapes on its size, and no header attests one.
+    pub split_bytes: Option<u64>,
 }
 
 /// One network's definition, everything its hosts share: the network, its
@@ -315,6 +322,7 @@ impl NetworkFile {
     /// the genesis shard seats.
     pub fn from_toml(text: &str) -> Result<Self, NetworkFileError> {
         let file: Self = toml_from_str(text)?;
+        NetworkParams::from_genesis(&file.beacon_chain()).validate()?;
         let epoch_ms = file.beacon_chain().epoch_duration_ms;
         if u128::from(epoch_ms) < MIN_EPOCH_DURATION.as_millis() {
             return Err(NetworkFileError::EpochTooShort {
@@ -378,6 +386,13 @@ impl NetworkFile {
                 .chain
                 .ready_timeout_epochs
                 .unwrap_or(base.ready_timeout_epochs),
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: self
+                    .chain
+                    .split_bytes
+                    .unwrap_or(base.reshape_thresholds.split_bytes),
+                ..base.reshape_thresholds
+            },
             ..base
         }
     }
@@ -513,6 +528,10 @@ mod tests {
             chain.ready_timeout_epochs,
             BeaconChainConfig::production().ready_timeout_epochs
         );
+        assert_eq!(
+            chain.reshape_thresholds,
+            BeaconChainConfig::production().reshape_thresholds
+        );
         assert_eq!(parsed.bootstrap_peers, ["peer"]);
         assert_eq!(parsed.relays, ["https://relay.example"]);
         let genesis = parsed
@@ -520,6 +539,22 @@ mod tests {
             .validators(parsed.network.clone(), &[])
             .expect("builds");
         assert_eq!(genesis.validators.validators.len(), 3);
+    }
+
+    #[test]
+    fn a_network_file_sets_the_split_threshold_and_keeps_fullness() {
+        let text =
+            file(&[0], "").replace("shard_size = 4\n", "shard_size = 4\nsplit_bytes = 5000\n");
+        let chain = NetworkFile::from_toml(&text)
+            .expect("parses")
+            .beacon_chain();
+        assert_eq!(
+            chain.reshape_thresholds,
+            ReshapeThresholds {
+                split_bytes: 5_000,
+                ..BeaconChainConfig::production().reshape_thresholds
+            }
+        );
     }
 
     #[test]
@@ -545,6 +580,12 @@ mod tests {
                 epoch_ms: 29_999,
                 floor_ms: 30_000
             }
+        ));
+        assert!(matches!(
+            refused(
+                &file(&[0], "").replace("shard_size = 4\n", "shard_size = 4\nsplit_bytes = 0\n")
+            ),
+            NetworkFileError::Params(ParamBoundsError::ZeroSplitThreshold)
         ));
         assert!(matches!(
             refused(&file(&[], "")),

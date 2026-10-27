@@ -130,6 +130,7 @@ fn network_file(fixtures: &TestFixtures, beacon_chain: BeaconChainConfig) -> Net
             epoch_duration_ms: Some(beacon_chain.epoch_duration_ms),
             shard_size: Some(beacon_chain.shard_size),
             ready_timeout_epochs: Some(beacon_chain.ready_timeout_epochs),
+            split_bytes: Some(beacon_chain.reshape_thresholds.split_bytes),
         },
         genesis: Genesis {
             validators,
