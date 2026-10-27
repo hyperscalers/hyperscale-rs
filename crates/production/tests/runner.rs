@@ -489,6 +489,23 @@ async fn a_restarted_host_resumes_a_committee_it_seats_whole() {
 struct Messages(Arc<Mutex<Vec<String>>>);
 
 impl Messages {
+    /// Install a process subscriber that records and prints events at info
+    /// and above. Below info, a node's consensus and the VM's compiler log
+    /// millions of lines, and every [`Self::contains`] would scan them all
+    /// under the lock each event takes.
+    fn capture() -> Self {
+        let messages = Self::default();
+        let _ = Registry::default()
+            .with(messages.clone().with_filter(LevelFilter::INFO))
+            .with(
+                fmt::layer()
+                    .with_test_writer()
+                    .with_filter(LevelFilter::INFO),
+            )
+            .try_init();
+        messages
+    }
+
     fn contains(&self, needle: &str) -> bool {
         self.0
             .lock()
@@ -530,11 +547,7 @@ impl<S: Subscriber> Layer<S> for Messages {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_join_for_a_running_shard_attaches_to_its_replica() {
-    let messages = Messages::default();
-    let _ = Registry::default()
-        .with(messages.clone())
-        .with(fmt::layer().with_test_writer())
-        .try_init();
+    let messages = Messages::capture();
 
     // Validator 0 holds ROOT's one seat; validator 1, local to the same
     // host, is left pooled.
@@ -596,11 +609,7 @@ async fn a_join_for_a_running_shard_attaches_to_its_replica() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_leave_for_a_queued_validator_detaches_it() {
-    let messages = Messages::default();
-    let _ = Registry::default()
-        .with(messages.clone())
-        .with(fmt::layer().with_test_writer())
-        .try_init();
+    let messages = Messages::capture();
 
     let fixtures = TestFixtures::with_surplus(47, 1, 1);
     let surplus = ValidatorId::new(1);
@@ -670,17 +679,7 @@ async fn a_leave_for_a_queued_validator_detaches_it() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
-    // Four hosts' consensus at trace level floods the run; the supervisor's
-    // lines are at info.
-    let messages = Messages::default();
-    let _ = Registry::default()
-        .with(messages.clone().with_filter(LevelFilter::INFO))
-        .with(
-            fmt::layer()
-                .with_test_writer()
-                .with_filter(LevelFilter::INFO),
-        )
-        .try_init();
+    let messages = Messages::capture();
 
     // ROOT's four seats on four hosts; host 0 also carries the pooled
     // surplus validator the join names.
@@ -782,11 +781,7 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
-    let messages = Messages::default();
-    let _ = Registry::default()
-        .with(messages.clone())
-        .with(fmt::layer().with_test_writer())
-        .try_init();
+    let messages = Messages::capture();
 
     let fixtures = TestFixtures::with_surplus(47, 1, 1);
     let surplus = ValidatorId::new(1);
