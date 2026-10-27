@@ -13,8 +13,8 @@ use hyperscale_network::{HandlerRegistry, Network, RequestError, ResponseVerdict
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::{LocalRelay, Star, UdpBridge};
 use hyperscale_network_iroh::{
-    EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind, RedialBudget,
-    RequestManager, RequestManagerConfig, RequestPool, RequestStreams,
+    EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind, PathStatus,
+    RedialBudget, RequestManager, RequestManagerConfig, RequestPool, RequestStreams,
 };
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, Request, RoutingCommittees,
@@ -297,17 +297,40 @@ impl Pair {
         }
     }
 
+    /// The path each side reports for the other, `None` while unbound.
+    fn statuses(&self) -> (Option<PathStatus>, Option<PathStatus>) {
+        let status =
+            |from: &Host, to: &Host| from.adapter.path_status(to.adapter.local_endpoint_id());
+        (
+            status(&self.asker, &self.server),
+            status(&self.server, &self.asker),
+        )
+    }
+
     /// The kind of path each side reports for the other.
     fn kinds(&self) -> (Option<PathKind>, Option<PathKind>) {
-        let kind = |from: &Host, to: &Host| {
-            from.adapter
-                .path_status(to.adapter.local_endpoint_id())
-                .and_then(|status| status.kind)
-        };
+        let (asker, server) = self.statuses();
         (
-            kind(&self.asker, &self.server),
-            kind(&self.server, &self.asker),
+            asker.and_then(|status| status.kind),
+            server.and_then(|status| status.kind),
         )
+    }
+
+    /// Wait until both sides report a path of `kind` for the other; on
+    /// timeout, panic with `what` and what each side reported last.
+    async fn settle(&self, what: &str, kind: PathKind) {
+        let both = (Some(kind), Some(kind));
+        if timeout(BUDGET, async {
+            while self.kinds() != both {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            let (asker, server) = self.statuses();
+            panic!("{what}: the asker reports {asker:?}, the server {server:?}");
+        }
     }
 }
 
@@ -340,10 +363,8 @@ async fn a_relayed_peer_gets_consensus_traffic_and_no_bulk() {
 
     // The pair meets through the relay and moves to the direct path, on
     // which everything goes.
-    wait_for("the pair reaches a direct path", || {
-        pair.kinds() == (Some(PathKind::Direct), Some(PathKind::Direct))
-    })
-    .await;
+    pair.settle("the pair reaches a direct path", PathKind::Direct)
+        .await;
     asker
         .network
         .broadcast_to_shard(ShardId::ROOT, &Backfill(1));
@@ -353,10 +374,8 @@ async fn a_relayed_peer_gets_consensus_traffic_and_no_bulk() {
 
     // UDP between the two hosts is blocked; both fall back to the relay.
     pair.bridge.set_open(false);
-    wait_for("both sides report the peer relayed", || {
-        pair.kinds() == (Some(PathKind::Relayed), Some(PathKind::Relayed))
-    })
-    .await;
+    pair.settle("both sides report the peer relayed", PathKind::Relayed)
+        .await;
 
     // Consensus traffic still flows, both ways of a request included.
     asker.network.notify(&[vid(1)], &Vote(7));
@@ -404,15 +423,11 @@ async fn a_relayed_peer_gets_consensus_traffic_and_no_bulk() {
 /// [`OUTAGE_AFTER_FALLBACK`]; then restore it. Returns when it was
 /// restored.
 async fn fall_back_and_restore(pair: &Pair) -> Instant {
-    wait_for("the pair reaches a direct path", || {
-        pair.kinds() == (Some(PathKind::Direct), Some(PathKind::Direct))
-    })
-    .await;
+    pair.settle("the pair reaches a direct path", PathKind::Direct)
+        .await;
     pair.bridge.set_open(false);
-    wait_for("both sides report the peer relayed", || {
-        pair.kinds() == (Some(PathKind::Relayed), Some(PathKind::Relayed))
-    })
-    .await;
+    pair.settle("both sides report the peer relayed", PathKind::Relayed)
+        .await;
     sleep(OUTAGE_AFTER_FALLBACK).await;
     pair.bridge.set_open(true);
     Instant::now()
