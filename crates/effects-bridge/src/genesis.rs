@@ -21,7 +21,7 @@ use hyperscale_vm_stdlib::{protocol_artifacts, staking};
 use hyperscale_vm_types::Address;
 
 use crate::records::{InstanceCache, NodeRecords, PackageCache};
-use crate::{PROTOCOL_RESOURCE, PoolRegistry, ProtocolHasher, admit_protocol_package};
+use crate::{PROTOCOL_RESOURCE, ProtocolHasher, admit_protocol_package};
 
 /// The packages a network is born running.
 ///
@@ -78,13 +78,10 @@ pub struct World {
     pub instances: InstanceCache,
     /// The stdlib account package's content address.
     pub account_package: PackageHash,
-    /// The stdlib stake pool package's content address — the code a
-    /// recognised pool must be running for its events to be read as
-    /// beacon facts.
+    /// The stdlib stake pool package's content address — the code an
+    /// instance must be running for its events to be read as beacon
+    /// facts.
     pub staking_package: PackageHash,
-    /// The stake pools the beacon folds for. Empty on a network with no
-    /// staking surface, which is every network until genesis seats one.
-    pub pools: PoolRegistry,
 }
 
 impl World {
@@ -120,7 +117,6 @@ impl World {
             instances: self.instances.forked(),
             account_package: self.account_package,
             staking_package: self.staking_package,
-            pools: self.pools.clone(),
         }
     }
 }
@@ -177,17 +173,14 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
     // commits its own auth material, and the blueprint serving every
     // principal is protocol-defined.
     instances.serve_principals(account_package);
-    let mut registry = PoolRegistry::new();
     for seat in pools {
-        let address = instances.create(&ProtocolHasher, pool_meta(staking_package, seat));
-        registry.register(address, StakePoolId::of(address));
+        instances.create(&ProtocolHasher, pool_meta(staking_package, seat));
     }
     World {
         cache,
         instances: InstanceCache::new(instances),
         account_package,
         staking_package,
-        pools: registry,
     }
 }
 

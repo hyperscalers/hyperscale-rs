@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    Epoch, NetworkDefinition, NetworkParams, ShardId, Stake, Transaction, ValidatorStatus,
-    validator_possession_proof_sign,
+    Epoch, NetworkDefinition, NetworkParams, ShardId, Stake, StakePoolId, Transaction,
+    ValidatorStatus, validator_possession_proof_sign,
 };
 use hyperscale_vm_types::PrincipalAddr;
 
@@ -173,6 +173,7 @@ pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<Principa
             signer.as_ref(),
             &NetworkDefinition::simulator(),
             validator,
+            StakePoolId::of(pool),
         )
         .expect("a possession proof signs");
         let pubkey = signer.public_key();

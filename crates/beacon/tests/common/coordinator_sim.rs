@@ -679,7 +679,7 @@ impl CoordinatorSim {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
                 pool_id: test_pool(100 + u32::try_from(i).unwrap_or(u32::MAX)),
-                amount: Stake::from_whole_tokens(1),
+                amount: MIN_STAKE_FLOOR,
             })
             .collect();
         let leaf_hashes: Vec<Hash> = payloads

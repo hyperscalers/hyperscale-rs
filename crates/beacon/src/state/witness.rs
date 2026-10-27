@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     Admission, BeaconProposal, BeaconState, BlockHeader, Epoch, Hash, JailReason, MAX_SHARDS,
-    MISSED_PROPOSAL_JAIL_FLOOR, MergeHalf, NetworkDefinition, PendingReshape, PendingWithdrawal,
-    RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake, StakePool,
-    ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
+    MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_FLOOR, MergeHalf, NetworkDefinition, PendingReshape,
+    PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake,
+    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
     missed_turn_limit, validator_possession_proof_verify, verify_shard_vote_equivocation,
     verify_vote_equivocation,
 };
@@ -307,8 +307,13 @@ pub(super) fn apply_shard_payload(
 ) -> Option<HostEvent> {
     match payload {
         ShardWitnessPayload::StakeDeposit { pool_id, amount } => {
-            // Implicit pool creation on first deposit; subsequent
-            // deposits accumulate into `total_stake`.
+            // A pool opens on its first deposit, and only one of at least
+            // `MIN_STAKE_FLOOR`: anyone may found a pool, so the floor is
+            // what bounds how many the beacon holds. Later deposits
+            // accumulate into `total_stake` whatever their size.
+            if !state.pools.contains_key(pool_id) && *amount < MIN_STAKE_FLOOR {
+                return None;
+            }
             let pool = state.pools.entry(*pool_id).or_insert_with(|| StakePool {
                 id: *pool_id,
                 total_stake: Stake::ZERO,
@@ -382,6 +387,7 @@ pub(super) fn apply_shard_payload(
                 verifier,
                 network,
                 *validator_id,
+                *pool_id,
                 pubkey,
                 possession_proof,
             ) {
@@ -1057,16 +1063,39 @@ mod tests {
 
     /// `StakeDeposit` for an unknown pool implicitly creates the pool and
     /// accumulates `total_stake`; consecutive deposits accumulate further,
-    /// and the applied watermark advances by the chunk length.
+    /// whatever their size, and the applied watermark advances by the
+    /// chunk length.
     #[test]
     fn stake_deposit_creates_pool_implicitly_and_accumulates() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
-        apply_witness_chunk(&mut state, 0, vec![deposit(7, 100), deposit(7, 50)]);
+        let floor = MIN_STAKE_FLOOR.quanta() / Stake::from_whole_tokens(1).quanta();
+        let floor = u64::try_from(floor).unwrap();
+        apply_witness_chunk(&mut state, 0, vec![deposit(7, floor), deposit(7, 50)]);
 
         let pool = state.pools.get(&test_pool(7)).unwrap();
-        assert_eq!(pool.total_stake, Stake::from_whole_tokens(150));
+        assert_eq!(pool.total_stake, Stake::from_whole_tokens(floor + 50));
         assert_eq!(applied_count(&state, 0), 2);
+    }
+
+    /// A first deposit under `MIN_STAKE_FLOOR` opens no pool, so dust
+    /// cannot fill the beacon with pools; it is consumed all the same.
+    #[test]
+    fn a_first_deposit_under_the_floor_opens_no_pool() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let under = Stake::from_quanta(MIN_STAKE_FLOOR.quanta() - 1);
+        apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::StakeDeposit {
+                pool_id: test_pool(7),
+                amount: under,
+            }],
+        );
+
+        assert!(!state.pools.contains_key(&test_pool(7)));
+        assert_eq!(applied_count(&state, 0), 1);
     }
 
     /// `StakeWithdraw` appends a `PendingWithdrawal` tagged with the
@@ -1142,14 +1171,16 @@ mod tests {
     fn witnesses_applied_in_leaf_index_order() {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let floor = MIN_STAKE_FLOOR.quanta() / Stake::from_whole_tokens(1).quanta();
+        let floor = u64::try_from(floor).unwrap();
         apply_witness_chunk(
             &mut state,
             0,
-            vec![deposit(7, 1), deposit(7, 2), deposit(7, 3)],
+            vec![deposit(7, floor), deposit(7, 2), deposit(7, 3)],
         );
 
         let pool = state.pools.get(&test_pool(7)).unwrap();
-        assert_eq!(pool.total_stake, Stake::from_whole_tokens(6));
+        assert_eq!(pool.total_stake, Stake::from_whole_tokens(floor + 5));
         assert_eq!(applied_count(&state, 0), 3);
     }
 
@@ -1176,7 +1207,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(5, new_id),
+                possession_proof: possession_proof(5, new_id, pool_id),
             }],
         );
 
@@ -1372,7 +1403,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: new_pubkey,
-                possession_proof: possession_proof(5, new_id),
+                possession_proof: possession_proof(5, new_id, pool_id),
             }],
         );
 
@@ -1405,7 +1436,7 @@ mod tests {
                 pool_id,
                 validator_id: existing_id,
                 pubkey: pubkey(99),
-                possession_proof: possession_proof(99, existing_id),
+                possession_proof: possession_proof(99, existing_id, pool_id),
             }],
         );
 
@@ -1426,7 +1457,7 @@ mod tests {
                 pool_id: test_pool(0),
                 validator_id: ValidatorId::new(5),
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(5, ValidatorId::new(5)),
+                possession_proof: possession_proof(5, ValidatorId::new(5), test_pool(0)),
             }],
         );
 
@@ -1454,7 +1485,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(6, new_id),
+                possession_proof: possession_proof(6, new_id, pool_id),
             }],
         );
 
@@ -1481,12 +1512,71 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(5, ValidatorId::new(6)),
+                possession_proof: possession_proof(5, ValidatorId::new(6), pool_id),
             }],
         );
 
         assert!(effects.registered.is_empty());
         assert!(!state.validators.contains_key(&new_id));
+    }
+
+    /// A proof names the pool it registers in: one made for another pool
+    /// does not verify, so a proof seen once cannot seat its owner's key
+    /// under a stranger's pool.
+    #[test]
+    fn a_proof_for_one_pool_does_not_register_in_another() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = test_pool(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta());
+
+        let new_id = ValidatorId::new(5);
+        let effects = apply_witness_chunk(
+            &mut state,
+            0,
+            vec![ShardWitnessPayload::RegisterValidator {
+                pool_id,
+                validator_id: new_id,
+                pubkey: pubkey(5),
+                possession_proof: possession_proof(5, new_id, test_pool(1)),
+            }],
+        );
+
+        assert!(effects.registered.is_empty());
+        assert!(!state.validators.contains_key(&new_id));
+    }
+
+    /// Facts apply in the order a shard emits them: a registration ahead
+    /// of the deposit that gives its pool room is judged against a pool
+    /// that has none, and dropped, while the same two the other way round
+    /// seat the validator.
+    #[test]
+    fn a_registration_ahead_of_its_deposit_is_dropped() {
+        let register = |pool: u32| ShardWitnessPayload::RegisterValidator {
+            pool_id: test_pool(pool),
+            validator_id: ValidatorId::new(5),
+            pubkey: pubkey(5),
+            possession_proof: possession_proof(5, ValidatorId::new(5), test_pool(pool)),
+        };
+        let fund = |pool: u32| ShardWitnessPayload::StakeDeposit {
+            pool_id: test_pool(pool),
+            amount: Stake::from_quanta(5 * MIN_STAKE_FLOOR.quanta()),
+        };
+        let fresh = || {
+            let mut state = single_pool_state(4);
+            state.committee = (0u64..4).map(ValidatorId::new).collect();
+            state
+        };
+
+        let mut ahead = fresh();
+        let effects = apply_witness_chunk(&mut ahead, 0, vec![register(7), fund(7)]);
+        assert!(effects.registered.is_empty());
+        assert!(!ahead.validators.contains_key(&ValidatorId::new(5)));
+
+        let mut behind = fresh();
+        let effects = apply_witness_chunk(&mut behind, 0, vec![fund(7), register(7)]);
+        assert_eq!(effects.registered, vec![ValidatorId::new(5)]);
     }
 
     /// A zeroed (malformed) proof-of-possession is rejected outright.
