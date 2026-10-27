@@ -843,7 +843,9 @@ where
         let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
             genesis.clone(),
         ));
-        let actions = self.replica.initialize_genesis(self.now, genesis);
+        let actions =
+            self.replica
+                .initialize_genesis(self.now, genesis, self.genesis_bytes(genesis));
         self.drain_actions(actions);
         // A genesis block has no parent to anchor its committee on; its own
         // anchor is the chain origin's, the committee anchor of block one.
@@ -855,7 +857,6 @@ where
             },
         )));
 
-        self.seed_genesis_substate_frontier(genesis);
         self.seed_genesis_standing_answers(genesis);
         std::mem::take(&mut self.pending_timer_ops)
     }
@@ -891,21 +892,14 @@ where
         self.replica.seed_standing_answers(genesis.height(), count);
     }
 
-    /// Seed the replica's reshape-trigger count frontier from the genesis
-    /// store count. Genesis substates (engine bootstrap + funded accounts)
-    /// never appear as a commit delta, so without this the frontier reads
-    /// zero until the first delta-bearing block and a non-zero reshape
-    /// threshold misfires (a quiet shard below `merge_bytes` triggers a
-    /// spurious merge). The engine genesis already committed the substates
-    /// before either genesis path reaches here, so the count is readable.
-    pub(crate) fn seed_genesis_substate_frontier(&mut self, genesis: &Block) {
-        let genesis_count = self
-            .io
+    /// The genesis store's committed substate byte total. Every install
+    /// records it with the genesis marker, so a store without it is
+    /// corrupt.
+    pub(crate) fn genesis_bytes(&self, genesis: &Block) -> u64 {
+        self.io
             .storage
             .substate_bytes_at(genesis.height())
-            .unwrap_or(0);
-        self.replica
-            .seed_substate_bytes_frontier(genesis.height(), genesis_count);
+            .expect("an installed genesis records its byte total")
     }
 
     /// Process one [`ShardScopedInput`] end-to-end: clear per-step
@@ -1039,7 +1033,7 @@ mod tests {
     use hyperscale_network::HandlerRegistry;
     use hyperscale_network_memory::{PendingRequest, SimNetworkAdapter};
     use hyperscale_storage::{
-        ChainEntry, ChainWrites, MemberInputs, ParentAnchor, SafeVoteRegisterStore,
+        ChainEntry, ChainWrites, GenesisCommit, MemberInputs, ParentAnchor, SafeVoteRegisterStore,
         ShardChainReader, ShardChainWriter, SubstateStore,
     };
     use hyperscale_types::network::request::GetRemoteHeadersRequest;
@@ -1048,8 +1042,8 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
         ChainOrigin, Epoch, FrontierInputs, LocalTimestamp, ProposerTimestamp, QuorumCertificate,
-        Round, SafeVoteRegisters, ShardAnchor, ShardId, SignerBitfield, StateRoot, SweepFrontier,
-        TopologySchedule, ValidatorId, Verified, VotePosition, WeightedTimestamp,
+        Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, SignerBitfield, StateRoot,
+        SweepFrontier, TopologySchedule, ValidatorId, Verified, VotePosition, WeightedTimestamp,
     };
 
     use crate::shard::cross_shard::RemoteHeaderSyncInput;
@@ -1248,10 +1242,14 @@ mod tests {
         let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
         let mut disk = LaggingDisk::new(events);
         let shard_loop = loop_of(&mut host);
+        let state_root = shard_loop
+            .io
+            .storage
+            .install_genesis(&SettledWrites::default(), &SettledWrites::default());
         let genesis = Block::genesis(
             SHARD,
             fix.committee.validator_id(0),
-            shard_loop.io.storage.state_root(),
+            state_root,
             ChainOrigin::ROOT,
         );
         let _ = shard_loop.install_genesis(&genesis);

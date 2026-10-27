@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::{Budget, Cluster, FaultableCluster, ScenarioConfig, grow_to};
-use hyperscale_types::{BeaconChainConfig, BlockHeight, NetworkDefinition, ShardId, ValidatorId};
+use hyperscale_types::{
+    BeaconChainConfig, BlockHeight, NetworkDefinition, ReshapeThresholds, ShardId, ValidatorId,
+};
 use serial_test::serial;
 use support::ProdCluster;
 use support::harness::{ClusterSpec, Harness, HostSpec};
@@ -65,6 +67,57 @@ async fn a_store_that_installed_genesis_resumes_from_it() {
 
     let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
     await_height(&cluster, Some(restarted), target).await;
+
+    cluster.shutdown().await;
+}
+
+/// A fresh host holding a quorum attests its genesis state from block 1:
+/// the first proposal is built inside the step that installs genesis, and
+/// the host's own signers certify it without checking its claim, so a
+/// count missing the genesis total would be carried by every later block.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_fresh_host_holding_a_quorum_claims_its_genesis_state() {
+    let _ = fmt().with_test_writer().try_init();
+    let fixtures = TestFixtures::new(48, 4);
+    let mut cluster = Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts: vec![HostSpec::new(
+            (0..4)
+                .map(|i| LocalValidator {
+                    validator_id: ValidatorId::new(u64::from(i)),
+                    signer: fixtures.signer(i),
+                })
+                .collect(),
+        )],
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: 600_000,
+            shard_size: 4,
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 1 << 40,
+                ..ReshapeThresholds::DISABLED
+            },
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await;
+
+    let through = BlockHeight::new(5);
+    await_height(&cluster, None, through).await;
+    let genesis = cluster
+        .genesis_substate_bytes(ShardId::ROOT)
+        .expect("ROOT's store records its genesis total");
+    assert!(genesis > 0, "genesis lays down state");
+    let claims = cluster.substate_claims(ShardId::ROOT, through);
+    assert_eq!(claims.len(), 5, "{claims:?}");
+    assert!(
+        claims
+            .iter()
+            .all(|claim| claim.is_some_and(|n| n >= genesis)),
+        "every claim counts the {genesis} genesis bytes: {claims:?}"
+    );
 
     cluster.shutdown().await;
 }

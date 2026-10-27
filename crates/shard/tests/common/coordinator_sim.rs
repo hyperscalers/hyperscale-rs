@@ -51,8 +51,9 @@ use hyperscale_shard::{
 use hyperscale_storage::{
     AnswerFollow, BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex,
     ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
-    SubstateStore, Substates, TerminalWindow, TickChain, answer_additions, carry_signed_rounds,
-    colliding_committed_cell, colliding_member_row, creations_of, filter_writes_to_prefix,
+    SubstateStore, Substates, TerminalWindow, TickChain, VersionedStore, answer_additions,
+    carry_signed_rounds, colliding_committed_cell, colliding_member_row, creations_of,
+    filter_writes_to_prefix,
 };
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage, crash_point};
 use hyperscale_types::network::Signed;
@@ -561,7 +562,10 @@ impl ShardCoordinatorSim {
             // replicas so every genesis block is byte-identical.
             let genesis_proposer = members[0].0;
             let genesis = build_genesis_block(&storages[idx], genesis_proposer, shard);
-            let actions = coord.initialize_genesis(&genesis);
+            let genesis_bytes = storages[idx]
+                .substate_bytes_at(genesis.height())
+                .expect("an installed genesis records its byte total");
+            let actions = coord.initialize_genesis(&genesis, genesis_bytes);
             seed_genesis_answers(&mut coord, &pending_chains[idx], &genesis);
             // `initialize_genesis` only emits `SetTimer`; tripwire
             // in case that ever changes.
@@ -689,7 +693,10 @@ impl ShardCoordinatorSim {
         // deterministic over the store's installed genesis state root.
         let genesis = build_genesis_block(&self.storages[idx], self.members[0].0, self.shard);
         coord.set_time(self.now);
-        let actions = coord.initialize_genesis(&genesis);
+        let genesis_bytes = self.storages[idx]
+            .substate_bytes_at(genesis.height())
+            .expect("an installed genesis records its byte total");
+        let actions = coord.initialize_genesis(&genesis, genesis_bytes);
         assert!(
             actions.iter().all(|a| matches!(a, Action::SetTimer { .. })),
             "initialize_genesis emitted non-SetTimer action: {:?}",

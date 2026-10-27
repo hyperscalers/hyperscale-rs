@@ -473,7 +473,7 @@ mod tests {
             },
         );
         let now = node.fold.now();
-        let _ = node.node.initialize_genesis(now, &genesis);
+        let _ = node.node.initialize_genesis(now, &genesis, 0);
         assert!(node.node.shard_coordinator().dissolved(&node.node.schedule));
 
         adopt_skip(&mut node);
@@ -782,7 +782,7 @@ mod tests {
             StateRoot::ZERO,
             ChainOrigin::ROOT,
         );
-        let _ = test.node.initialize_genesis(at, &genesis);
+        let _ = test.node.initialize_genesis(at, &genesis, 0);
         test.node
             .seed_standing_answers(BlockHeight::GENESIS, StandingAnswers::default());
 

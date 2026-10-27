@@ -39,11 +39,12 @@ where
     /// with that shard's genesis block.
     pub fn initialize_shard_genesis(&mut self, genesis_block: &Block) {
         let shard_loop = self.shard_loop_mut(genesis_block.header().shard_id());
-        let actions = shard_loop
-            .replica
-            .initialize_genesis(shard_loop.now, genesis_block);
+        let genesis_bytes = shard_loop.genesis_bytes(genesis_block);
+        let actions =
+            shard_loop
+                .replica
+                .initialize_genesis(shard_loop.now, genesis_block, genesis_bytes);
         shard_loop.drain_actions(actions);
-        shard_loop.seed_genesis_substate_frontier(genesis_block);
         shard_loop.seed_genesis_standing_answers(genesis_block);
     }
 

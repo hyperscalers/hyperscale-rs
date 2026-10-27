@@ -219,19 +219,13 @@ impl NodeStateMachine {
         &mut self,
         now: LocalTimestamp,
         genesis: &Block,
+        genesis_bytes: u64,
     ) -> Vec<Action> {
         self.now = now;
         self.shard.set_time(now);
-        self.shard.shard_coordinator.initialize_genesis(genesis)
-    }
-
-    /// Seed the reshape trigger's substate-byte frontier from the genesis
-    /// store count — the I/O loop reads it once the genesis block commits.
-    /// See [`hyperscale_shard::ShardCoordinator::seed_substate_bytes_frontier`].
-    pub(crate) const fn seed_substate_bytes_frontier(&mut self, height: BlockHeight, count: u64) {
         self.shard
             .shard_coordinator
-            .seed_substate_bytes_frontier(height, count);
+            .initialize_genesis(genesis, genesis_bytes)
     }
 
     /// Seed the answer count at a chain's genesis. See

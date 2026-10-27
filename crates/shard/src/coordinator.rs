@@ -2267,8 +2267,11 @@ impl ShardCoordinator {
         Some(actions)
     }
 
-    /// Initialize with genesis block (for fresh start).
-    pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
+    /// Initialize with genesis block (for fresh start). `genesis_bytes` is
+    /// the genesis store's committed substate byte total: genesis substates
+    /// never appear as a commit delta, so the reshape trigger's frontier
+    /// names the total from the first step, before any proposal reads it.
+    pub fn initialize_genesis(&mut self, genesis: &Block, genesis_bytes: u64) -> Vec<Action> {
         let hash = genesis.hash();
 
         self.committed_hash = hash;
@@ -2284,7 +2287,7 @@ impl ShardCoordinator {
         self.clock.advance(genesis_anchor);
         self.committed_block_anchor_wt = genesis_anchor;
         self.committed_committee_anchor_wt = genesis_anchor;
-        self.substate_bytes_frontier.0 = genesis.height();
+        self.substate_bytes_frontier = (genesis.height(), genesis_bytes);
         // No commit precedes the chain's first blocks to mark them, and a
         // split child or merged parent opens on business its predecessor
         // left: the first two go out at network speed.
@@ -2312,18 +2315,6 @@ impl ShardCoordinator {
                 duration: self.config.cleanup_interval,
             },
         ]
-    }
-
-    /// Seed the reshape trigger's substate-byte frontier from the genesis
-    /// store count. Genesis lays down the engine bootstrap and any funded
-    /// accounts as substates that never appear as a commit delta, so
-    /// without this the frontier reads zero until the first delta-bearing
-    /// block — and a non-zero reshape threshold would misfire (a quiet
-    /// shard below `merge_bytes` spuriously triggers a merge). Called
-    /// by the I/O loop after the genesis block commits, with the count it
-    /// reads from storage.
-    pub const fn seed_substate_bytes_frontier(&mut self, height: BlockHeight, count: u64) {
-        self.substate_bytes_frontier = (height, count);
     }
 
     /// Seed the answer count at a chain's genesis, read whole off the
@@ -20846,6 +20837,43 @@ mod tests {
         (state, schedule, four, five)
     }
 
+    /// Genesis's child claims the genesis store's byte total: genesis
+    /// substates never appear as a commit delta, so the count has to be
+    /// there from the step that installs genesis, before any proposal.
+    #[test]
+    fn the_first_block_claims_the_genesis_byte_total() {
+        let (mut state, schedule) = make_test_state();
+        let snapshot = Arc::new(schedule.head().as_ref().clone().with_params(NetworkParams {
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: 1 << 40,
+                split_fullness: u32::MAX,
+            },
+            ..NetworkParams::default()
+        }));
+        let schedule = TopologySchedule::single(Arc::clone(&snapshot));
+        let genesis = Block::genesis(
+            state.local_shard,
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+            ChainOrigin::ROOT,
+        );
+        let _ = state.initialize_genesis(&genesis, 4_096);
+
+        assert_eq!(
+            state.proposal_substate_bytes(
+                &schedule,
+                &snapshot,
+                genesis.hash(),
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::ZERO,
+            ),
+            Ok(SubstateClaim {
+                bytes: Some(4_096),
+                base: None,
+            })
+        );
+    }
+
     /// A parent claiming no substate total re-anchors its child's count on
     /// the committed tip: the tip's persisted total plus the parent's
     /// delta, naming the tip as the base. Without the parent's delta the
@@ -20863,7 +20891,7 @@ mod tests {
         let schedule = TopologySchedule::single(Arc::clone(&snapshot));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_3"));
-        state.seed_substate_bytes_frontier(BlockHeight::new(3), 4_096);
+        state.substate_bytes_frontier = (BlockHeight::new(3), 4_096);
         let parent = block_chained_on(BlockHeight::new(4), state.committed_hash, 100);
         assert_eq!(parent.header().load().substate_bytes, None);
         install_complete_block(&mut state, &parent);
@@ -20961,7 +20989,7 @@ mod tests {
         let (mut state, schedule) = make_test_state();
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_3"));
-        state.seed_substate_bytes_frontier(BlockHeight::new(3), 4_096);
+        state.substate_bytes_frontier = (BlockHeight::new(3), 4_096);
         state.verification.on_block_persisted(BlockHeight::new(3));
         state.set_block_syncing(true);
         let unclaimed = block_chained_on(BlockHeight::new(4), state.committed_hash, 100);
@@ -27826,7 +27854,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let _ = state.initialize_genesis(&genesis);
+        let _ = state.initialize_genesis(&genesis, 0);
         assert_eq!(state.eager_through, BlockHeight::new(11));
     }
 

@@ -31,7 +31,9 @@ use hyperscale_scenarios::query::{
     RanAs, chain_burn, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
 };
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
+use hyperscale_storage::{
+    BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore, VersionedStore,
+};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, GenesisValidators,
@@ -619,6 +621,26 @@ impl Harness {
             .expect("store registry")
             .get(&shard)
             .and_then(Weak::upgrade)
+    }
+
+    /// The committed substate byte total `shard`'s live store recorded at
+    /// its genesis. `None` if no host serves `shard`.
+    pub fn genesis_substate_bytes(&self, shard: ShardId) -> Option<u64> {
+        self.store_for(shard)?
+            .substate_bytes_at(BlockHeight::GENESIS)
+    }
+
+    /// The substate byte total each committed block's header claims, from
+    /// height 1 through `through`, read off the live store. Empty if no
+    /// host serves `shard`.
+    pub fn substate_claims(&self, shard: ShardId, through: BlockHeight) -> Vec<Option<u64>> {
+        let Some(store) = self.store_for(shard) else {
+            return Vec::new();
+        };
+        (1..=through.inner())
+            .filter_map(|h| store.get_block(BlockHeight::new(h)))
+            .map(|block| block.block().header().load().substate_bytes)
+            .collect()
     }
 
     /// Where `shard`'s chain starts, read off the live store's recovered
