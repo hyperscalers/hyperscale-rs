@@ -117,6 +117,7 @@ fn register<C: Cluster>(
         keypair.as_ref(),
         &NetworkDefinition::simulator(),
         validator,
+        StakePoolId::of(pool),
     )
     .expect("sign");
     let (operator, _) = pool_operator();
@@ -199,10 +200,11 @@ pub fn delegation_folds_into_beacon_state(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a delegation");
 }
 
-/// What the staking scenario delegates. Large enough that the folded
-/// stake cannot be confused with a rounding artefact and small enough to
-/// sit well inside the delegator's genesis funding.
-const DELEGATION: u128 = 250_000;
+/// What the staking scenario delegates: enough to open a pool, which a
+/// first deposit under `MIN_STAKE_FLOOR` does not, plus a remainder that
+/// keeps the folded stake from reading as the floor itself, and well
+/// inside the delegator's genesis funding.
+const DELEGATION: u128 = MIN_STAKE_FLOOR.quanta() + 250_000;
 
 /// Registering a validator against a funded pool seats it in the pool.
 ///
@@ -231,27 +233,40 @@ pub fn register_validator_pools_a_node(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a delegation and a registration");
 }
 
-/// A registration against a pool below one `min_stake` is rejected on the
-/// capacity gate, leaving no validator record.
+/// A registration a pool's stake cannot cover is rejected on the capacity
+/// gate, leaving no validator record.
 ///
 /// # Panics
 ///
-/// Panics if the deposit never folds, or if the under-capacity registration
-/// creates a validator record.
+/// Panics if the deposit never folds, if the covered registration does not
+/// take, or if the uncovered one creates a validator record.
 pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
     warm_up(c);
 
-    // The pool exists but holds less than one min_stake, so it can support no
-    // validator — the registration must be rejected on the capacity gate.
+    // A pool opens only at `MIN_STAKE_FLOOR` and `min_stake` is never below
+    // it, so a pool short of one seat cannot exist. One short of a second
+    // seat can: funded for one and a half, the first registration takes
+    // and the second is the one the capacity gate must refuse.
+    let seated = ValidatorId::new(1999);
     let newcomer = ValidatorId::new(2000);
     let world = pool_world(c, [pool_at(STAKE_POOL)]);
     let mut charges = Charges::default();
+    let price = c
+        .beacon_state()
+        .expect("a committed beacon state")
+        .min_stake();
     delegate(
         c,
         &mut charges,
         pool_at(STAKE_POOL),
         pool_id(STAKE_POOL),
-        MIN_STAKE_FLOOR.quanta() / 2,
+        price.quanta() * 3 / 2,
+    );
+    register(c, &mut charges, pool_at(STAKE_POOL), 10, seated);
+    assert!(
+        c.run_until(epochs(8), |c| validator_status(c, seated)
+            == Some(ValidatorStatus::Pooled)),
+        "the seat the pool covers must take",
     );
 
     // The registration itself commits — it is a well-formed action by the

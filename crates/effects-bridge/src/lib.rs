@@ -4,8 +4,8 @@
 //! `vm_effects` hashing seam: domain-separated and length-framed, so a
 //! part boundary is always semantic. [`BridgeStatics`] derives a signed
 //! envelope's admission keys, participant prefixes and nullifiers
-//! through it; [`admit_package`] judges a publish; [`PoolRegistry`] reads
-//! a recognised pool's events as beacon facts.
+//! through it; [`admit_package`] judges a publish; [`witness_from_event`]
+//! reads a stake pool's events as beacon facts.
 
 pub mod artifact;
 pub mod genesis;
@@ -19,7 +19,7 @@ pub use artifact::{
 };
 pub use hyperscale_types::ProtocolHasher;
 pub use records::{NodeRecords, RecordStore};
-pub use staking::{PoolRegistry, witness_from_event};
+pub use staking::witness_from_event;
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};
 pub use vm_statics::{
     BridgeStatics, CallEnvelope, DeclaredVector, PROTOCOL_RESOURCE, account_address, attestations,

@@ -21,8 +21,9 @@ use hyperscale_types::{
     PcVoteEquivocation, PendingReshape, PendingWithdrawal, QuorumCertificate, Round, Settling,
     ShardBoundary, ShardCommittee, ShardEpochContribution, ShardId, ShardLoad,
     ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool,
-    StateRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
-    beacon_reveal_sign, compute_merkle_root, compute_range_proof, validator_possession_proof_sign,
+    StakePoolId, StateRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof,
+    WeightedTimestamp, beacon_reveal_sign, compute_merkle_root, compute_range_proof,
+    validator_possession_proof_sign,
 };
 
 use crate::state::witness::apply_shard_payload;
@@ -32,9 +33,10 @@ pub fn net() -> NetworkDefinition {
     NetworkDefinition::simulator()
 }
 
-/// A valid proof-of-possession for `pubkey(seed)` claimed under `id`.
-pub fn possession_proof(seed: u64, id: ValidatorId) -> ConsensusSignature {
-    validator_possession_proof_sign(&keypair(seed), &net(), id).expect("sign")
+/// A valid proof-of-possession for `pubkey(seed)` claimed under `id` in
+/// `pool`.
+pub fn possession_proof(seed: u64, id: ValidatorId, pool: StakePoolId) -> ConsensusSignature {
+    validator_possession_proof_sign(&keypair(seed), &net(), id, pool).expect("sign")
 }
 
 /// Build an honest VRF-signed empty `BeaconProposal` for validator

@@ -22,8 +22,8 @@ use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
-    BridgeStatics, CallEnvelope, DeclaredVector, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry,
-    ProtocolHasher, RecordStore, admit_package, declared_vector, envelope_bytes, is_protocol_vault,
+    BridgeStatics, CallEnvelope, DeclaredVector, NodeRecords, PROTOCOL_RESOURCE, ProtocolHasher,
+    RecordStore, admit_package, declared_vector, envelope_bytes, is_protocol_vault,
     witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
@@ -1234,13 +1234,12 @@ fn declare(
 /// What every transaction in a batch assembles against: the pre-read
 /// baseline its receipts fold over, the share of the world this shard
 /// applies, and what the witness lift needs to decide whether an emitted
-/// event is a beacon fact — the pools the network recognises, what code
-/// each instance runs, and the code a pool must be running.
+/// event is a beacon fact — what code each instance runs and how it is
+/// configured, and the code a pool must be running.
 #[derive(Clone, Copy)]
 struct BatchInputs<'a> {
     base: &'a TickBaseline,
     locality: &'a OwnerSet,
-    pools: &'a PoolRegistry,
     instances: &'a dyn ChainRecords,
     staking_package: PackageHash,
 }
@@ -1340,13 +1339,8 @@ fn assemble_executed_tx(
         let witnesses: Vec<(Address, BeaconWitnessEvent)> = events
             .iter()
             .filter_map(|event| {
-                witness_from_event(
-                    event,
-                    inputs.pools,
-                    inputs.instances,
-                    inputs.staking_package,
-                )
-                .map(|witness| (event.emitter, witness))
+                witness_from_event(event, inputs.instances, inputs.staking_package)
+                    .map(|witness| (event.emitter, witness))
             })
             .collect();
         // The root covers the events this shard's own emitters produced
@@ -1788,7 +1782,6 @@ impl Executor {
                 BatchInputs {
                     base: &base,
                     locality: &locality,
-                    pools: &self.world.pools,
                     instances: &records,
                     staking_package: self.world.staking_package,
                 },

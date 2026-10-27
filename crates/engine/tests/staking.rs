@@ -35,7 +35,8 @@ use hyperscale_types::{
     NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId,
     ShardTrie, Stake, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry,
     SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
-    absorb_committed_cells, answer_hashes, compute_merkle_root, receipt_hash_of, writes_root,
+    absorb_committed_cells, answer_hashes, compute_merkle_root, receipt_hash_of, witness_root,
+    writes_root,
 };
 use hyperscale_vm_effects::{
     Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, CrossingId, IntentHeader, Kind,
@@ -1897,15 +1898,14 @@ fn event_leaves(receipt: &ConsensusReceipt) -> Vec<Hash> {
 /// Two receipts alike in everything but one beacon fact hash apart, so a
 /// receipt cannot gain or lose a fact under the hash a quorum signed.
 ///
-/// The pair comes from two engines running one call against one state:
-/// one seats the pool the call delegates to and lifts its event into a
-/// fact, the other holds the pool only as an instance a transaction
-/// sealed, and lifts nothing.
+/// The fact comes from a pool a transaction sealed rather than one
+/// genesis seated: anyone may found a pool, and what makes its events
+/// facts is the code it runs and the resource it stakes. The pair is that
+/// receipt and the same receipt with the fact taken out.
 #[test]
 fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
     let sealed = seat(56);
-    let unrecognising = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
-    let recognising = seated(&[seat(POOL_ID), sealed.clone()], ExecutionMode::Serial);
+    let executor = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
     let mut store = MapDb::genesis(
         &[(account_of(OPERATOR), 10_000), (delegator(), 10_000)],
         std::slice::from_ref(&seat(POOL_ID)),
@@ -1919,7 +1919,7 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
     };
-    let run = |executor: &Executor, store: &MapDb, raw: Transaction| {
+    let run = |store: &MapDb, raw: Transaction| {
         raw.try_derived(executor.derivation().as_ref())
             .expect("a fixture transaction derives");
         let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
@@ -1929,15 +1929,9 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
             .remove(0)
     };
 
-    let seal = run(
-        &unrecognising,
-        &store,
-        signed_instantiate(OPERATOR, &sealed),
-    );
-    absorb(&mut store, &seal, &unrecognising);
-
-    let carrying = run(&recognising, &store, signed_stake_composed(&sealed, 500));
-    let stripped = run(&unrecognising, &store, signed_stake_composed(&sealed, 500));
+    let seal = run(&store, signed_instantiate(OPERATOR, &sealed));
+    absorb(&mut store, &seal, &executor);
+    let carrying = run(&store, signed_stake_composed(&sealed, 500));
 
     assert_eq!(
         witnesses(&carrying),
@@ -1946,17 +1940,43 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
             amount: Stake::from_quanta(500),
         }],
     );
-    assert!(witnesses(&stripped).is_empty());
+    let mut stripped = carrying.consensus.clone();
+    let ConsensusReceipt::Succeeded {
+        beacon_witness_events,
+        ..
+    } = &mut stripped
+    else {
+        panic!("the delegation must succeed");
+    };
+    *beacon_witness_events = Capped::empty();
+
     // Stated before the comparison, so the fact is the only thing the two
-    // hashes can differ over.
-    assert_eq!(carrying.consensus.writes(), stripped.consensus.writes());
-    assert_eq!(
-        event_leaves(&carrying.consensus),
-        event_leaves(&stripped.consensus)
-    );
+    // hashes can differ over. One whole shard, so a receipt's own parts are
+    // everything its hash covers.
+    assert_eq!(carrying.consensus.writes(), stripped.writes());
+    assert_eq!(event_leaves(&carrying.consensus), event_leaves(&stripped));
+    let recomputed = |receipt: &ConsensusReceipt| {
+        let ConsensusReceipt::Succeeded {
+            writes,
+            beacon_witness_events,
+            ..
+        } = receipt
+        else {
+            panic!("the delegation must succeed");
+        };
+        GlobalReceipt::new(
+            true,
+            EventRoot::from_raw(compute_merkle_root(&event_leaves(receipt))),
+            witness_root(beacon_witness_events.iter()),
+            writes_root(writes),
+        )
+        .receipt_hash()
+    };
+    let hash = carrying.consensus.receipt_hash();
+    assert_eq!(recomputed(&carrying.consensus), hash);
     assert_ne!(
-        carrying.consensus.receipt_hash(),
-        stripped.consensus.receipt_hash(),
+        recomputed(&stripped),
+        hash,
         "one hash names a receipt with the fact and a receipt without it",
     );
 }

@@ -2104,7 +2104,7 @@ mod tests {
                     pool_id: test_pool(0),
                     validator_id: ValidatorId::new(77),
                     pubkey: state.validators[&ValidatorId::new(0)].pubkey,
-                    possession_proof: possession_proof(0, ValidatorId::new(77)),
+                    possession_proof: possession_proof(0, ValidatorId::new(77), test_pool(0)),
                 }],
             );
             for _ in 0..4 {

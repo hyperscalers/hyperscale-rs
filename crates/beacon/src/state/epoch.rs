@@ -1824,7 +1824,7 @@ mod tests {
         let deposit = || {
             vec![ShardWitnessPayload::StakeDeposit {
                 pool_id: test_pool(200),
-                amount: Stake::from_whole_tokens(1),
+                amount: MIN_STAKE_FLOOR,
             }]
         };
 
@@ -1870,7 +1870,7 @@ mod tests {
                 0,
                 vec![ShardWitnessPayload::StakeDeposit {
                     pool_id: test_pool(200),
-                    amount: Stake::from_whole_tokens(1),
+                    amount: MIN_STAKE_FLOOR,
                 }],
             );
 
