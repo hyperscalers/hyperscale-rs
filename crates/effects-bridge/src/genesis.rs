@@ -12,7 +12,7 @@ use hyperscale_types::{
     ComponentAddr, PROTOCOL_DISPLAY_DIGITS, PrincipalAddr, ResourceAddr, StakePoolId, StakePoolSeat,
 };
 use hyperscale_vm_effects::{
-    Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, ResourceKind,
+    Hash32, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, ResourceKind,
     ResourceRecord, Value, package_hash, resource_address,
 };
 use hyperscale_vm_fixtures::artifacts as fixture_artifacts;
@@ -200,13 +200,39 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
 /// otherwise be seated identically.
 #[must_use]
 pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> InstanceMeta {
+    staking_instance(
+        staking_package,
+        seat.operator,
+        ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.number.to_le_bytes()]),
+    )
+}
+
+/// The pool `founder` founds: the one an account's join brings up, at an
+/// address the account alone fixes, so the app and the desk derive it
+/// without anything stored.
+#[must_use]
+pub fn founded_pool(founder: PrincipalAddr) -> InstanceMeta {
+    staking_instance(
+        package_hash(&ProtocolHasher, staking_artifact()),
+        founder,
+        ProtocolHasher.hash(DOMAIN_FOUNDED_SALT, &[]),
+    )
+}
+
+/// A stake pool staking the protocol resource, founded by `founder` under
+/// `salt`: the configuration a pool's facts are recognised by.
+fn staking_instance(
+    staking_package: PackageHash,
+    founder: PrincipalAddr,
+    salt: Hash32,
+) -> InstanceMeta {
     InstanceMeta {
         package: staking_package,
         config: Capped::from_array([
             Value::Address(PROTOCOL_RESOURCE.address()),
-            Value::Address(seat.operator.address()),
+            Value::Address(founder.address()),
         ]),
-        salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.number.to_le_bytes()]),
+        salt,
     }
 }
 
@@ -287,6 +313,12 @@ const DOMAIN_UNOPERATED: &[u8] = b"hyperscale/genesis/unoperated-pool";
 /// A hashing input, so its bytes are part of every seated pool's address
 /// and fixed by that rather than by where the constant is declared.
 const DOMAIN_GENESIS_SALT: &[u8] = b"hyperscale/engine/genesis-instance";
+
+/// The domain separating a founded pool's salt from a genesis seat's.
+///
+/// A hashing input, so its bytes are part of every founded pool's
+/// address.
+const DOMAIN_FOUNDED_SALT: &[u8] = b"hyperscale/engine/founded-pool";
 
 /// The resource a pool issues against delegations.
 ///
