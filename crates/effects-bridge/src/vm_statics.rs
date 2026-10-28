@@ -1310,7 +1310,7 @@ impl ProtocolStatics for BridgeStatics {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_hbor::{Bytes, Capped, to_vec};
     use hyperscale_types::{
         AccountSigner, CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey,
     };
@@ -2835,5 +2835,19 @@ mod tests {
             Some(meta.address(&ProtocolHasher).address())
         );
         assert_eq!(record_address(b"not a record"), None);
+    }
+
+    /// A served record past the configuration cap derives nothing, so a
+    /// responder cannot hand the fetch a record no seal could have
+    /// written.
+    #[test]
+    fn a_served_record_past_the_configuration_cap_derives_no_address() {
+        let over = InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"served"])),
+            config: Capped::new(vec![Value::Bytes(vec![0; 4096]); 5]).unwrap(),
+            salt: Hash32([5; 32]),
+        };
+        let bytes = to_vec(&over).expect("the record's own caps hold");
+        assert_eq!(record_address(&bytes), None);
     }
 }
