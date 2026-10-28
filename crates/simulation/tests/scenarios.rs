@@ -41,7 +41,9 @@ use hyperscale_scenarios::{
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
-    a_fee_hold_stands_until_its_burn, a_fresh_committee_recovered_again_before_its_crossing_folds,
+    a_fee_hold_stands_until_its_burn,
+    a_founded_pool_seats_another_validator_once_its_stake_covers_it,
+    a_fresh_committee_recovered_again_before_its_crossing_folds,
     a_halt_recovery_with_answers_in_its_suffix_completes,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
     a_harvested_tick_over_a_discarded_tick_settles_nothing,
@@ -81,7 +83,6 @@ use hyperscale_scenarios::{
     a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_route_unstated_past_its_stating_window_aborts_on_both_venues,
-    a_second_validator_joins_with_the_desks_top_up,
     a_shard_halted_across_an_abandon_window_settles_again,
     a_silent_sibling_holds_no_more_than_a_quarter, a_spent_nullifier_is_swept_once_unreachable,
     a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort,
@@ -96,7 +97,6 @@ use hyperscale_scenarios::{
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
-    a_third_validator_joins_once_the_pools_stake_covers_it,
     a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
     a_timed_out_newcomer_is_let_back_in_from_its_own_host,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
@@ -3534,17 +3534,10 @@ fn a_newcomer_founds_its_own_pool_sim() {
 }
 
 #[test]
-fn a_second_validator_joins_with_the_desks_top_up_sim() {
-    let mut cluster =
-        SimCluster::with_accounts(&witness_config(4), 0x70B, &staking_genesis_accounts());
-    a_second_validator_joins_with_the_desks_top_up(&mut cluster);
-}
-
-#[test]
-fn a_third_validator_joins_once_the_pools_stake_covers_it_sim() {
+fn a_founded_pool_seats_another_validator_once_its_stake_covers_it_sim() {
     let mut cluster =
         SimCluster::with_accounts(&witness_config(4), 0x3D5, &staking_genesis_accounts());
-    a_third_validator_joins_once_the_pools_stake_covers_it(&mut cluster);
+    a_founded_pool_seats_another_validator_once_its_stake_covers_it(&mut cluster);
 }
 
 /// The devnet a home validator joins: five genesis validators on one

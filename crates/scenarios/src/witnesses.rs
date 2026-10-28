@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
-use hyperscale_engine::genesis::{OWNER_BADGE_ID, pool_owner_badge, stake_unit};
+use hyperscale_engine::genesis::{OWNER_BADGE_ID, pool_owner_badge};
 use hyperscale_types::{
     ComponentAddr, ConsensusPublicKey, ConsensusSignature, Epoch, MIN_STAKE_FLOOR,
     NetworkDefinition, SPC_VIEW_TIMEOUT, ShardId, Stake, StakePoolId, Transaction,
@@ -28,7 +28,7 @@ use hyperscale_vm_types::PrincipalAddr;
 
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    beacon_epoch, epoch_duration_ms, held, holds_instance, live_shards, pool_effective_stake,
+    beacon_epoch, epoch_duration_ms, holds_instance, live_shards, pool_effective_stake,
     pool_total_stake, validator_pubkey, validator_status,
 };
 use crate::support::tx::{
@@ -718,8 +718,8 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
 
 /// A newcomer founds its own pool in one sponsored transaction.
 ///
-/// The newcomer signs it and the desk funds and pays for it: the pool's
-/// bring-up stakes the desk's funds and registers the newcomer's validator
+/// The newcomer signs it and a sponsor funds and pays for it: the pool's
+/// bring-up stakes the sponsor's funds and registers the newcomer's validator
 /// in the node that makes the pool actual, the beacon folds both under
 /// the pool's address, and the pool's owner badge lands in the newcomer's
 /// account.
@@ -769,60 +769,18 @@ pub fn a_newcomer_founds_its_own_pool(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a founding");
 }
 
-/// A founded pool's second validator joins with the desk's top-up.
+/// A founded pool seats another validator only once its stake covers it.
 ///
-/// The founder's declaration presents its badge and registers, and the
-/// desk's stake ahead of it is what covers the second seat. The desk
-/// keeps the units its stake bought.
-///
-/// # Panics
-///
-/// Panics if the founding or the join does not commit, the beacon never
-/// pools the second validator, or the pool's stake is not the founding
-/// plus the top-up.
-pub fn a_second_validator_joins_with_the_desks_top_up(c: &mut impl Cluster) {
-    warm_up(c);
-    let (_, founder) = newcomer_founder();
-    let pool = founded_id(founder);
-    let world = pool_world(c, [founded_at(founder)]);
-    let mut charges = Charges::default();
-    let founding = found(c, &mut charges, 9, ValidatorId::new(1000));
-    await_pooled(
-        c,
-        ValidatorId::new(1000),
-        "the founded pool's first validator",
-    );
-
-    let second = ValidatorId::new(1001);
-    let top_up = shortfall(c, pool, 2);
-    assert!(top_up > 0, "the founding covers one seat, not two");
-    join(c, &mut charges, 10, second, top_up);
-    await_pooled(c, second, "the second validator");
-    assert_eq!(
-        pool_total_stake(c, pool),
-        Some(Stake::from_quanta(founding + top_up)),
-        "the pool holds the founding and the desk's top-up",
-    );
-    let (_, desk) = delegator();
-    assert!(
-        held(c, desk.address(), stake_unit(founded_at(founder))) > 0,
-        "the desk keeps the units its top-up bought",
-    );
-    world.assert_settles_within(c, &charges, epochs(4), "a founding and a topped up join");
-}
-
-/// A founded pool's third validator joins only once the pool's own stake
-/// covers it.
-///
-/// A join with no top-up into a pool covering two seats commits and is
-/// refused at the beacon's capacity gate, and once a delegation covers a
-/// third seat the next join takes.
+/// A join into a pool whose stake covers the seats it holds commits and
+/// is refused at the beacon's capacity gate: the pool registers whoever
+/// its badge holder names, and what refuses the seat is the beacon. Once
+/// a delegation covers another seat, the next join takes.
 ///
 /// # Panics
 ///
 /// Panics if any transaction does not commit, if the uncovered join
 /// creates a validator record, or if the covered one never pools.
-pub fn a_third_validator_joins_once_the_pools_stake_covers_it(c: &mut impl Cluster) {
+pub fn a_founded_pool_seats_another_validator_once_its_stake_covers_it(c: &mut impl Cluster) {
     warm_up(c);
     let (_, founder) = newcomer_founder();
     let pool = founded_id(founder);
@@ -834,14 +792,9 @@ pub fn a_third_validator_joins_once_the_pools_stake_covers_it(c: &mut impl Clust
         ValidatorId::new(1000),
         "the founded pool's first validator",
     );
-    let top_up = shortfall(c, pool, 2);
-    join(c, &mut charges, 10, ValidatorId::new(1001), top_up);
-    await_pooled(c, ValidatorId::new(1001), "the second validator");
 
-    // The join itself commits: the pool registers whoever its badge
-    // holder names, and what refuses the seat is the beacon's gate.
-    let uncovered = ValidatorId::new(1002);
-    join(c, &mut charges, 11, uncovered, 0);
+    let uncovered = ValidatorId::new(1001);
+    join(c, &mut charges, 10, uncovered);
     c.run_until(epochs(5), |_| false);
     assert_eq!(
         validator_status(c, uncovered),
@@ -849,10 +802,9 @@ pub fn a_third_validator_joins_once_the_pools_stake_covers_it(c: &mut impl Clust
         "a join the pool's stake cannot cover must not create a validator record",
     );
 
-    // The control: once the pool's stake covers a third seat, a join
-    // with no top-up takes. A fresh id, because the refused join spent
-    // its own in the pool's record.
-    let covering = shortfall(c, pool, 3);
+    // A fresh id, because the refused join spent its own in the pool's
+    // record.
+    let covering = shortfall(c, pool, 2);
     let expected = pool_total_stake(c, pool)
         .unwrap_or(Stake::ZERO)
         .saturating_add(Stake::from_quanta(covering));
@@ -867,14 +819,14 @@ pub fn a_third_validator_joins_once_the_pools_stake_covers_it(c: &mut impl Clust
         "the delegation never folded; pool stake = {:?}",
         pool_total_stake(c, pool),
     );
-    let covered = ValidatorId::new(1003);
-    join(c, &mut charges, 12, covered, 0);
-    await_pooled(c, covered, "the covered third validator");
+    let covered = ValidatorId::new(1002);
+    join(c, &mut charges, 11, covered);
+    await_pooled(c, covered, "the covered second validator");
     world.assert_settles_within(
         c,
         &charges,
         epochs(4),
-        "a founding, three joins and a delegation",
+        "a founding, two joins and a delegation",
     );
 }
 
@@ -883,14 +835,14 @@ pub fn a_third_validator_joins_once_the_pools_stake_covers_it(c: &mut impl Clust
 /// [`seat_slack`]; returns the founding stake.
 fn found<C: Cluster>(c: &mut C, charges: &mut Charges, seed: u8, validator: ValidatorId) -> u128 {
     let (founder_key, founder) = newcomer_founder();
-    let (desk, _) = delegator();
+    let (sponsor, _) = delegator();
     let (pubkey, proof) = founded_validator(c, seed, validator, founder);
     let amount = shortfall(c, founded_id(founder), 1);
     submit_committed(
         c,
         charges,
         build_found_tx(
-            &desk,
+            &sponsor,
             &founder_key,
             validator,
             &pubkey,
@@ -903,27 +855,20 @@ fn found<C: Cluster>(c: &mut C, charges: &mut Charges, seed: u8, validator: Vali
 }
 
 /// [`newcomer_founder`]'s join of `validator`, keyed by `seed`, to the pool
-/// it founded, with the desk staking `top_up` ahead of it.
-fn join<C: Cluster>(
-    c: &mut C,
-    charges: &mut Charges,
-    seed: u8,
-    validator: ValidatorId,
-    top_up: u128,
-) {
+/// it founded, sponsored by the delegator's account.
+fn join<C: Cluster>(c: &mut C, charges: &mut Charges, seed: u8, validator: ValidatorId) {
     let (founder_key, founder) = newcomer_founder();
-    let (desk, _) = delegator();
+    let (sponsor, _) = delegator();
     let (pubkey, proof) = founded_validator(c, seed, validator, founder);
     submit_committed(
         c,
         charges,
         build_join_tx(
-            &desk,
+            &sponsor,
             &founder_key,
             validator,
             &pubkey,
             &proof,
-            top_up,
             validity_around(c.now()),
         ),
     );

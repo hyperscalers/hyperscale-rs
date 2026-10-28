@@ -21,8 +21,9 @@ use hyperscale_types::{
 
 use super::query::{beacon_epoch, live_shards, pool_total_stake, validator_status};
 use super::tx::{
-    ParamBallot, STAKE_POOL, build_found_tx, build_join_tx, build_param_vote_tx, build_register_tx,
-    build_stake_tx, delegator, founded_id, pool_at, pool_id, pool_operator, validity_around,
+    ParamBallot, STAKE_POOL, build_found_tx, build_founded_stake_tx, build_join_tx,
+    build_param_vote_tx, build_register_tx, build_stake_tx, delegator, founded_id, pool_at,
+    pool_id, pool_operator, validity_around,
 };
 use super::{Budget, Cluster, epochs};
 
@@ -179,28 +180,51 @@ pub fn register_staged(c: &mut impl Cluster) {
 /// Seat every validator [`Cluster::staged_validators`] names in a pool
 /// `founder` founds for them, and wait until the beacon holds each one.
 ///
-/// The first founds the pool and the rest join it, every join sponsored
-/// by the delegator's account, which funds the pool for one more seat
-/// than it takes at the `min_stake` the beacon holds when it does: as in
-/// [`register_staged`], the price of a seat accrues as the chain runs.
+/// The first founds the pool and the rest join it, every transaction
+/// sponsored by the delegator's account. The founding stakes two seats at
+/// the `min_stake` the beacon holds when it lands, and the delegator
+/// stakes one more ahead of each later join, so the pool stays a seat
+/// ahead of what it takes: as in [`register_staged`], the price of a seat
+/// accrues as the chain runs.
 ///
 /// # Panics
 ///
-/// Panics if a founding or a join does not fold within budget.
+/// Panics if a founding, a delegation or a join does not fold within
+/// budget.
 pub fn found_staged(c: &mut impl Cluster, founder: &Ed25519PrivateKey) {
-    let (desk, _) = delegator();
-    let pool = founded_id(account_address(&founder.public_key().0));
+    let (sponsor, from) = delegator();
+    let founder_account = account_address(&founder.public_key().0);
+    let pool = founded_id(founder_account);
     for (index, (validator, signer)) in c.staged_validators().iter().enumerate() {
         let validator = *validator;
         let proof = possession_proof(signer.as_ref(), validator, pool);
         let pubkey = signer.public_key();
         let price = seat_price(c).quanta();
+        if index > 0 {
+            let target = pool_total_stake(c, pool)
+                .unwrap_or(Stake::ZERO)
+                .saturating_add(Stake::from_quanta(price));
+            land(
+                c,
+                |now| {
+                    build_founded_stake_tx(
+                        &sponsor,
+                        from,
+                        founder_account,
+                        price,
+                        validity_around(now),
+                    )
+                },
+                |c| pool_total_stake(c, pool).is_some_and(|stake| stake >= target),
+                &format!("the delegation ahead of staged validator {validator}"),
+            );
+        }
         land(
             c,
             |now| {
                 if index == 0 {
                     build_found_tx(
-                        &desk,
+                        &sponsor,
                         founder,
                         validator,
                         &pubkey,
@@ -210,12 +234,11 @@ pub fn found_staged(c: &mut impl Cluster, founder: &Ed25519PrivateKey) {
                     )
                 } else {
                     build_join_tx(
-                        &desk,
+                        &sponsor,
                         founder,
                         validator,
                         &pubkey,
                         &proof,
-                        price,
                         validity_around(now),
                     )
                 }
