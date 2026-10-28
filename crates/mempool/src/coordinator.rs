@@ -476,14 +476,18 @@ impl MempoolCoordinator {
         }
 
         // Reject once nothing here could include it: past its validity
-        // end.
-        let admissible_until = tx.validity_range().end_timestamp_exclusive;
-        if admissible_until <= self.clock.now() {
+        // end, or a window no block carries before it would long have
+        // expired — malformed, or opening past any anchor a block could
+        // soon carry.
+        let window = tx.validity_range();
+        let committed = self.clock.now();
+        if window.end_timestamp_exclusive <= committed || !window.opens_in_reach(committed) {
             tracing::debug!(
                 tx_hash = ?hash,
-                until_ms = admissible_until.as_millis(),
-                now_ms = self.clock.now().as_millis(),
-                "Rejecting expired transaction"
+                start_ms = window.start_timestamp_inclusive.as_millis(),
+                until_ms = window.end_timestamp_exclusive.as_millis(),
+                committed_ms = committed.as_millis(),
+                "Rejecting a transaction whose validity window no block here can reach"
             );
             return None;
         }
@@ -571,7 +575,7 @@ impl MempoolCoordinator {
                 cross_shard,
                 submitted_locally,
                 admitted_at: now,
-                admissible_until,
+                admissible_until: window.end_timestamp_exclusive,
                 placed: RefCell::new(None),
             },
         );
@@ -3151,6 +3155,36 @@ mod tests {
             mempool.status(&tx.hash()).is_none(),
             "expired tx must not enter the pool"
         );
+    }
+
+    /// A window that opens past any anchor a block could soon carry is
+    /// refused, not held until its end passes: the stuck transaction a
+    /// client clock on the wrong origin signs.
+    #[test]
+    fn a_window_opening_out_of_reach_is_refused() {
+        use hyperscale_types::test_utils::{stub_transaction, test_prefix};
+        use hyperscale_types::{MAX_VALIDITY_RANGE, TimestampRange};
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        let committed = WeightedTimestamp::from_millis(2_000);
+        set_current_ts(&mut mempool, committed);
+
+        let opens = committed
+            .plus(MAX_VALIDITY_RANGE)
+            .plus(Duration::from_secs(1));
+        let tx = Arc::new(verified(stub_transaction(
+            test_principal(1),
+            &[test_prefix(1)],
+            1_000,
+            TimestampRange::new(opens, opens.plus(Duration::from_secs(60))),
+        )));
+        let actions = mempool.on_transaction_gossip(
+            &topology_snapshot,
+            Arc::clone(&tx),
+            LocalTimestamp::ZERO,
+        );
+        assert!(actions.is_empty());
+        assert!(mempool.status(&tx.hash()).is_none());
     }
 
     #[test]

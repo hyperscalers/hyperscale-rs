@@ -1144,6 +1144,28 @@ impl BridgeStatics {
     }
 }
 
+/// What an envelope declares of itself: the tree's own headers and the
+/// terms it states, which the envelope carries whole.
+///
+/// Nothing here reads a record or package cache, so a node that has seen
+/// no seal commit — or a submission front door holding no chain at all —
+/// answers exactly what one that has seen every seal answers.
+///
+/// # Errors
+///
+/// [`DerivationError::Refused`] on an envelope no node admits: a tree that
+/// does not decode, intents for different networks, or windows that do
+/// not meet.
+pub fn declared_of(vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+    let tree = decode_tree(&vm.tree)?;
+    let (effective_window, network) = effective_window(&tree)?;
+    Ok(Declared {
+        effective_window,
+        network,
+        terms: vm.terms.clone(),
+    })
+}
+
 impl Derivation for BridgeStatics {
     fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
         let Ok(owner) = Address::from_bytes(owner) else {
@@ -1157,18 +1179,8 @@ impl Derivation for BridgeStatics {
         self.instances.absorb_cell(owner, local, value);
     }
 
-    /// The tree's own headers and the terms it states, which the
-    /// envelope carries whole — nothing here reads the record or
-    /// package caches, so a node that has seen no seal commit answers
-    /// exactly what one that has seen every seal answers.
     fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
-        let tree = decode_tree(&vm.tree)?;
-        let (effective_window, network) = effective_window(&tree)?;
-        Ok(Declared {
-            effective_window,
-            network,
-            terms: vm.terms.clone(),
-        })
+        declared_of(vm)
     }
 
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {

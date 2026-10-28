@@ -91,6 +91,7 @@ hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
 hyperscale-scenarios.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
+hyperscale-transactions.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 serial_test = "3.5.0"
