@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 use hex::decode as hex_decode;
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_network_iroh::{
-    EndpointAddr, IrohConfig, RelayUrl, SecretKey, VersionInteroperabilityMode, parse_endpoint_addr,
+    BootstrapEntry, IrohConfig, RelayUrl, SecretKey, VersionInteroperabilityMode,
+    parse_bootstrap_entry,
 };
 use hyperscale_types::{
     Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, MIN_EPOCH_DURATION,
@@ -299,7 +300,8 @@ pub struct NetworkFile {
     /// Which network, by name: `mainnet`, `testnet` or `simulator`.
     #[serde(with = "network_name")]
     pub network: NetworkDefinition,
-    /// Hosts to dial first, in the transport's own address form.
+    /// Hosts to dial first, each `<endpoint id>@<address>[,<address>...]`,
+    /// or a domain whose `_hyperscale` TXT records name them in that form.
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
     /// Relays the network's hosts share, for hosts that cannot be dialled
@@ -432,21 +434,22 @@ pub fn iroh_config(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let me = secret_key.public();
-    let bootstrap_peers = peers
-        .iter()
-        .map(|peer| {
-            parse_endpoint_addr(peer).map_err(|reason| NetworkFileError::Peer {
-                peer: peer.clone(),
-                reason,
-            })
-        })
-        .collect::<Result<Vec<EndpointAddr>, _>>()?
-        .into_iter()
-        .filter(|peer| peer.id != me)
-        .collect();
+    let mut bootstrap_peers = Vec::new();
+    let mut bootstrap_domains = Vec::new();
+    for peer in peers {
+        match parse_bootstrap_entry(peer).map_err(|reason| NetworkFileError::Peer {
+            peer: peer.clone(),
+            reason,
+        })? {
+            BootstrapEntry::Peer(addr) if addr.id != me => bootstrap_peers.push(addr),
+            BootstrapEntry::Peer(_) => {}
+            BootstrapEntry::Domain(domain) => bootstrap_domains.push(domain),
+        }
+    }
     Ok(IrohConfig {
         relays,
         bootstrap_peers,
+        bootstrap_domains,
         version_interop_mode: VersionInteroperabilityMode::Strict,
         ..IrohConfig::new(secret_key)
     })
@@ -660,8 +663,9 @@ mod tests {
         ));
     }
 
-    /// The iroh transport dials the file's peers less the host itself,
-    /// through its relays, with versions held strictly.
+    /// The iroh transport dials the file's peers less the host itself, looks
+    /// its domains up, relays through its relays, and holds versions
+    /// strictly.
     #[test]
     fn the_iroh_transport_leaves_the_host_out_of_its_peers() {
         let me = SecretKey::generate();
@@ -669,16 +673,18 @@ mod tests {
         let peers = [
             format!("{}@127.0.0.1:9000", me.public()),
             format!("{}@127.0.0.1:9001", other.public()),
+            "Boot.Example.org".to_owned(),
         ];
         let relays = ["https://relay.example".to_owned()];
         let config = iroh_config(me, &peers, &relays).expect("builds");
         let ids: Vec<_> = config.bootstrap_peers.iter().map(|p| p.id).collect();
         assert_eq!(ids, [other.public()]);
+        assert_eq!(config.bootstrap_domains, ["boot.example.org"]);
         assert_eq!(config.relays.len(), 1);
         assert_eq!(
             config.version_interop_mode,
             VersionInteroperabilityMode::Strict
         );
-        assert!(iroh_config(SecretKey::generate(), &["nonsense".to_owned()], &[]).is_err());
+        assert!(iroh_config(SecretKey::generate(), &["not a peer".to_owned()], &[]).is_err());
     }
 }

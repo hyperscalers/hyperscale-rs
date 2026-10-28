@@ -7,13 +7,14 @@ description = "iroh network transport: direct QUIC paths between validators behi
 
 [features]
 default = []
-# Seeded fixtures, plus loopback fixtures: an in-process relay and a
-# userspace UDP bridge that can be cut. Never enabled by the production
-# binary.
+# Seeded fixtures, plus loopback fixtures: an in-process relay and DNS
+# server, and a userspace UDP bridge that can be cut. Never enabled by the
+# production binary.
 test-utils = [
     "hyperscale-network/test-utils",
     "dep:hyperscale-crypto-bls",
     "dep:iroh-relay",
+    "dep:simple-dns",
 ]
 
 [dependencies]
@@ -42,6 +43,7 @@ tracing.workspace = true
 # Test fixtures mint real BLS keys; the transport itself speaks `dyn Verifier`.
 hyperscale-crypto-bls = { workspace = true, optional = true }
 iroh-relay = { workspace = true, features = ["server"], optional = true }
+simple-dns = { version = "0.12.0", optional = true }
 
 [dev-dependencies]
 arc-swap.workspace = true

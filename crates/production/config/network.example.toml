@@ -10,8 +10,15 @@ network = "simulator"
 # Hosts to dial first, each as <endpoint id>@<address>[,<address>...], an
 # address being a socket address or a relay URL. A host leaves itself out.
 # `hyperscale-keygen --network-key <path>` prints a host's endpoint id.
+#
+# An entry may instead be a domain: each TXT record at _hyperscale.<domain>
+# names one host in the same form, and hosts look the domain up again
+# periodically, so the list can change without touching this file:
+#
+#   _hyperscale.boot.example.  TXT  "<endpoint id>@203.0.113.7:9000"
 bootstrap_peers = [
     "e7b6b05b9dc032b9f2c688eb21e0fb0f99c7bb0a1d8d72305e8bf6aa31895f7d@10.0.0.1:9000",
+    "boot.example.org",
 ]
 
 # Relays the network's hosts share, at most two, for hosts that cannot be

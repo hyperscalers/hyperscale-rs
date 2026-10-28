@@ -2327,6 +2327,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "simple-dns",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

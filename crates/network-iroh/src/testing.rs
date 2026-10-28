@@ -25,6 +25,8 @@ use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use iroh::{Endpoint, EndpointAddr, RelayUrl};
 use iroh_relay::server::{RelayConfig, Server, ServerConfig, SpawnError, SupervisorError};
+use simple_dns::rdata::{RData, TXT};
+use simple_dns::{CLASS, Packet, ResourceRecord};
 use tokio::net::UdpSocket;
 use tokio::spawn;
 use tokio::task::JoinHandle;
@@ -38,6 +40,74 @@ use crate::{IrohAdapter, IrohAdapterArgs, IrohConfig, bind};
 
 /// Largest UDP payload the bridge forwards.
 const MAX_DATAGRAM_BYTES: usize = 65_535;
+
+/// A DNS server on loopback that answers TXT queries from a fixed table,
+/// for resolving bootstrap domains without the network.
+pub struct LocalDns {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl LocalDns {
+    /// Serve `records`: each name with the TXT values it answers, one
+    /// record each.
+    ///
+    /// # Errors
+    ///
+    /// When no loopback socket can be bound.
+    pub async fn serve(records: Vec<(String, Vec<String>)>) -> io::Result<Self> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = socket.local_addr()?;
+        let task = spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                if let Some(reply) = dns_answer(&buf[..len], &records) {
+                    let _ = socket.send_to(&reply, from).await;
+                }
+            }
+        });
+        Ok(Self { addr, task })
+    }
+
+    /// The socket the server answers at.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl Drop for LocalDns {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The reply to `query` from `records`, or `None` for bytes that are no
+/// query.
+fn dns_answer(query: &[u8], records: &[(String, Vec<String>)]) -> Option<Vec<u8>> {
+    let query = Packet::parse(query).ok()?;
+    let mut reply = Packet::new_reply(query.id());
+    for question in &query.questions {
+        reply.questions.push(question.clone());
+        let asked = question.qname.to_string();
+        let asked = asked.trim_end_matches('.');
+        for (_, values) in records
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(asked))
+        {
+            for value in values {
+                let txt = TXT::new().with_string(value).ok()?;
+                reply.answers.push(ResourceRecord::new(
+                    question.qname.clone(),
+                    CLASS::IN,
+                    60,
+                    RData::TXT(txt),
+                ));
+            }
+        }
+    }
+    reply.build_bytes_vec().ok()
+}
 
 /// A relay server on loopback, serving plain HTTP on a free port.
 ///

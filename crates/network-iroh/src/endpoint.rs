@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 use crate::address_book::{AddressBook, IngestOutcome, record_sequence, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
 use crate::bind_gate::{BindGate, Origin, Ticket};
+use crate::bootstrap::{self, RESOLVE_INTERVAL};
 use crate::config::{IrohConfig, MAX_RELAYS};
 use crate::cooldown::Cooldown;
 use crate::error::NetworkError;
@@ -162,6 +163,10 @@ struct Inner {
     /// Validators this host must hold unicast connectivity to.
     wanted_validators: ArcSwap<BTreeSet<ValidatorId>>,
     bootstrap_peers: Vec<EndpointAddr>,
+    bootstrap_domains: Vec<String>,
+    /// The peers each bootstrap domain last resolved to, in the order of
+    /// `bootstrap_domains`.
+    resolved_bootstrap: Mutex<Vec<Vec<EndpointAddr>>>,
     /// Endpoints with a dial in flight.
     dialing: DashSet<EndpointId>,
     /// Backoff of every endpoint dialed and not yet bound, so the sweep
@@ -286,6 +291,8 @@ impl IrohAdapter {
             lookup,
             wanted_validators: ArcSwap::from_pointee(BTreeSet::new()),
             bootstrap_peers: config.bootstrap_peers,
+            resolved_bootstrap: Mutex::new(vec![Vec::new(); config.bootstrap_domains.len()]),
+            bootstrap_domains: config.bootstrap_domains,
             dialing: DashSet::new(),
             dial_backoff: Mutex::new(HashMap::new()),
             unbound: UnboundSlots::default(),
@@ -703,6 +710,9 @@ async fn build_endpoint(
         .address_lookup(lookup)
         .portmapper_config(port_mapping)
         .transport_config(transport.build());
+    if let Some(resolver) = &config.dns_resolver {
+        builder = builder.dns_resolver(resolver.clone());
+    }
     for addr in &config.external_addrs {
         builder = builder.external_addr(*addr);
     }
@@ -1031,12 +1041,51 @@ impl Inner {
     async fn maintenance_loop(self: Arc<Self>) {
         let mut tick = interval(MAINTENANCE_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut next_resolve = Instant::now();
         loop {
             tick.tick().await;
-            for target in &self.bootstrap_peers {
-                self.dial(target.clone());
+            if !self.bootstrap_domains.is_empty() && Instant::now() >= next_resolve {
+                self.resolve_bootstrap_domains().await;
+                next_resolve = Instant::now() + RESOLVE_INTERVAL;
+            }
+            let resolved: Vec<EndpointAddr> = self
+                .resolved_bootstrap
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
+            for target in self.bootstrap_peers.iter().cloned().chain(resolved) {
+                self.dial(target);
             }
             self.dial_wanted();
+        }
+    }
+
+    /// Look the bootstrap domains up, keeping a domain's last peers when its
+    /// lookup fails.
+    async fn resolve_bootstrap_domains(&self) {
+        let resolver = match self.endpoint.dns_resolver() {
+            Ok(resolver) => resolver.clone(),
+            Err(err) => {
+                warn!(%err, "No DNS resolver for the bootstrap domains");
+                return;
+            }
+        };
+        let found =
+            bootstrap::resolve(&resolver, &self.bootstrap_domains, self.endpoint.id()).await;
+        let mut held = self
+            .resolved_bootstrap
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (slot, peers) in held.iter_mut().zip(found) {
+            if let Some(peers) = peers {
+                for peer in &peers {
+                    self.lookup.add_endpoint_info(peer.clone());
+                }
+                *slot = peers;
+            }
         }
     }
 }

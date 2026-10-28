@@ -14,6 +14,7 @@
 mod address_book;
 mod bind;
 mod bind_gate;
+mod bootstrap;
 mod config;
 mod cooldown;
 mod deferred;
@@ -37,6 +38,7 @@ mod unbound;
 
 pub use address_book::{AddressBook, IngestOutcome};
 pub use bind::LocalVnodeIdentity;
+pub use bootstrap::{BootstrapEntry, parse_bootstrap_entry};
 pub use config::{
     IrohConfig, MAX_RELAYS, VersionInteroperabilityMode, format_endpoint_addr, parse_endpoint_addr,
 };
