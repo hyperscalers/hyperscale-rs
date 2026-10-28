@@ -15730,7 +15730,6 @@ mod tests {
             mempool.on_transaction_gossip(
                 &split,
                 Arc::new(Verified::new_unchecked_for_test(tx.clone())),
-                false,
                 LocalTimestamp::ZERO,
             );
         }
@@ -21791,7 +21790,6 @@ mod tests {
             mempool.on_transaction_gossip(
                 schedule.head(),
                 Arc::new(Verified::new_unchecked_for_test(tx.clone())),
-                false,
                 LocalTimestamp::ZERO,
             );
         }

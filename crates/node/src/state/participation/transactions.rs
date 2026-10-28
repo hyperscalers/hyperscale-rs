@@ -52,10 +52,12 @@ impl ShardParticipation {
         }
     }
 
-    /// Hand a validated gossip transaction to the canonical mempool. Mempool
-    /// emits `Continuation(TransactionsAdmitted)` for whatever it admits;
-    /// that arm latches the proposal-retry — no need to do it optimistically
-    /// here.
+    /// Hand a validated transaction to the canonical mempool: one a client
+    /// of this node submitted through the submission path, which records
+    /// its `Pending` status for the client's lookup, and a peer's through
+    /// the gossip path. Mempool emits `Continuation(TransactionsAdmitted)`
+    /// for whatever it admits; that arm latches the proposal-retry — no
+    /// need to do it optimistically here.
     fn on_transaction_validated(
         &mut self,
         sched: &TopologySchedule,
@@ -66,12 +68,13 @@ impl ShardParticipation {
             return vec![];
         }
 
-        self.mempool_coordinator.on_transaction_gossip(
-            sched.head(),
-            tx,
-            submitted_locally,
-            self.now,
-        )
+        if submitted_locally {
+            self.mempool_coordinator
+                .on_submit_transaction(sched.head(), tx, self.now)
+        } else {
+            self.mempool_coordinator
+                .on_transaction_gossip(sched.head(), tx, self.now)
+        }
     }
 
     /// Admit a batch of fetch-delivered transactions through mempool. The

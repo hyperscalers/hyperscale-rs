@@ -197,7 +197,6 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
     let actions = coord.on_transaction_gossip(
         &topology_snapshot,
         Arc::new(verified(tx)),
-        false,
         LocalTimestamp::ZERO,
     );
     assert!(actions.is_empty(), "tombstoned tx must not be re-accepted");
