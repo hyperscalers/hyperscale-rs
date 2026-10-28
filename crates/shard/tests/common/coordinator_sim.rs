@@ -549,8 +549,10 @@ impl ShardCoordinatorSim {
             sks.push(sk);
 
             let storage = fresh_store(shard);
-            let pending_chain =
-                Arc::new(PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT));
+            let pending_chain = Arc::new(PendingChain::new(
+                Arc::clone(&storage),
+                BlockHeight::GENESIS,
+            ));
             pending_chains.push(pending_chain);
             storages.push(storage);
 
@@ -559,6 +561,7 @@ impl ShardCoordinatorSim {
                 shard,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
+                WeightedTimestamp::ZERO,
             );
             let _ = coord.attach_signer(&topology_schedule, id, None, Round::INITIAL);
             // Genesis proposer is arbitrary but shared across
@@ -684,12 +687,13 @@ impl ShardCoordinatorSim {
             self.shard,
             ShardConsensusConfig::default(),
             recovered,
+            WeightedTimestamp::ZERO,
         );
         let record = self.storages[idx].safe_vote_registers(replica);
         let _ = coord.attach_signer(&self.topology_schedule, replica, record, persisted_qc_round);
         self.pending_chains[idx] = Arc::new(PendingChain::new(
             Arc::clone(&self.storages[idx]),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ));
         self.tx_pools[idx].clear();
         // Re-seed the chain tip the way boot does; the genesis block is

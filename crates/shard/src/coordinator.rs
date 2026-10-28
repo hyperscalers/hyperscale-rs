@@ -732,7 +732,7 @@ pub struct ShardCoordinator {
     local_shard: ShardId,
 
     /// The chain's origin — genesis height plus start-time anchor.
-    /// `ChainOrigin::ROOT` for chains born at network genesis; a child
+    /// [`ChainOrigin::root`] for chains born at network genesis; a child
     /// chain created by a shard split continues the parent's height line
     /// and clock. Genesis-fallback QCs reconstructed here must byte-match
     /// the chain's real genesis QC.
@@ -884,6 +884,10 @@ impl ShardCoordinator {
     /// [`Self::attach_signer`]. Use `RecoveredState::default()` for a
     /// fresh start.
     ///
+    /// `genesis` is the network's genesis instant, which anchors the
+    /// chain when the store records no origin of its own: a chain born at
+    /// network genesis.
+    ///
     /// # Panics
     ///
     /// Panics if a block the store handed back cannot be assembled. The
@@ -896,7 +900,11 @@ impl ShardCoordinator {
         local_shard: ShardId,
         config: ShardConsensusConfig,
         recovered: RecoveredState,
+        genesis: WeightedTimestamp,
     ) -> Self {
+        let chain_origin = recovered
+            .chain_origin
+            .unwrap_or_else(|| ChainOrigin::root(genesis));
         // Rounds increase per block, so the first block we propose sits one
         // round past the highest QC we recovered (the genesis QC's round 0 on
         // a fresh start).
@@ -982,10 +990,7 @@ impl ShardCoordinator {
             halt_harvest_progress: None,
             signers: BTreeMap::new(),
             commits: CommitPipeline::new(),
-            verification: VerificationPipeline::new(
-                recovered.committed_height,
-                recovered.chain_origin,
-            ),
+            verification: VerificationPipeline::new(recovered.committed_height, chain_origin),
             block_sync: BlockSyncManager::new(),
             sync_claims: SyncClaims::default(),
             proposal: ProposalTracker::new(),
@@ -1010,7 +1015,7 @@ impl ShardCoordinator {
             // fresh chain's first ones do.
             eager_through: recovered.committed_height.next(),
             local_shard,
-            chain_origin: recovered.chain_origin,
+            chain_origin,
             precut: Precut::adopted(local_shard, &recovered.predecessors),
             precut_generation: 0,
             fence_seen: (0, 0, 0, 0),
@@ -1461,7 +1466,7 @@ impl ShardCoordinator {
             mirror: &self.mirror,
             proven_anchors: &self.proven_anchors,
             precut: &self.precut,
-            cut: self.chain_origin.anchor_wt,
+            cut: self.chain_origin.cut(),
             local_shard: self.local_shard,
         }
     }
@@ -1710,7 +1715,7 @@ impl ShardCoordinator {
     /// where [`Self::precut_rule_live`] would be circular.
     #[must_use]
     pub(crate) fn precut_window_open(&self) -> bool {
-        self.chain_origin.anchor_wt > WeightedTimestamp::ZERO
+        !self.chain_origin.born_at_network_genesis()
             && self.high_qc().weighted_timestamp()
                 < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
     }
@@ -1785,7 +1790,7 @@ impl ShardCoordinator {
         if !self.precut_rule_live() {
             return Vec::new();
         }
-        let cut = self.chain_origin.anchor_wt;
+        let cut = self.chain_origin.cut();
         let awaiting_vote = self
             .pending_blocks
             .values()
@@ -2594,7 +2599,7 @@ impl ShardCoordinator {
             local_shard: self.local_shard,
             anchor,
             parent,
-            chain_origin: self.chain_origin.anchor_wt,
+            chain_origin: self.chain_origin.cut(),
             chain,
             dedup: &self.dedup_index,
             parent_settled_frontier,
@@ -9954,7 +9959,7 @@ impl ShardCoordinator {
     }
 
     /// The chain's origin — the height its first block sits at, and the
-    /// clock that block anchors to. `ChainOrigin::ROOT` for a chain born
+    /// clock that block anchors to. `ChainOrigin::root` for a chain born
     /// at network genesis; a reshape child continues its parent's height
     /// line, so no block below `genesis_height` exists on this chain.
     #[must_use]
@@ -10419,6 +10424,7 @@ mod tests {
             ShardId::ROOT,
             config,
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         (state, TopologySchedule::single(Arc::new(topology_snapshot)))
@@ -10455,10 +10461,10 @@ mod tests {
     ) -> ShardCoordinator {
         test_utils::install_stub_protocol_statics();
         let mut recovered = RecoveredState {
-            chain_origin: ChainOrigin {
+            chain_origin: Some(ChainOrigin {
                 genesis_height: BlockHeight::new(10),
                 anchor_wt: cut,
-            },
+            }),
             predecessors,
             ..RecoveredState::default()
         };
@@ -10477,6 +10483,7 @@ mod tests {
             local_shard,
             ShardConsensusConfig::default(),
             recovered,
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0))
     }
@@ -11354,7 +11361,7 @@ mod tests {
         );
         let chain = Arc::new(PendingChain::new(
             Arc::new(storage.clone()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ));
         let built = build_proposal(
             &chain.view_at_persisted_tip(),
@@ -11370,7 +11377,7 @@ mod tests {
             &Capped::new(payload.transactions.clone()).expect("a list written out in a test"),
             Capped::new(payload.finalizations.clone()).expect("a list written out in a test"),
             ShardId::ROOT,
-            ChainOrigin::ROOT.anchor_wt,
+            ChainOrigin::root(WeightedTimestamp::ZERO).anchor_wt,
             &committee,
             Capped::empty(),
             Capped::empty(),
@@ -11627,7 +11634,10 @@ mod tests {
         schedule: &TopologySchedule,
     ) -> StateRoot {
         install_complete_block(voter, block);
-        let mut pipeline = VerificationPipeline::new(voter_store.jmt_height(), ChainOrigin::ROOT);
+        let mut pipeline = VerificationPipeline::new(
+            voter_store.jmt_height(),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         pipeline.initiate_state_root_verification(
             block.hash(),
             block,
@@ -13702,6 +13712,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0))
     }
@@ -14022,6 +14033,7 @@ mod tests {
                 members: Some(live.member_rows().clone()),
                 ..RecoveredState::default()
             },
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -14845,10 +14857,7 @@ mod tests {
             &storage,
             BlockHeight::new(4),
             tip_anchor,
-            ChainOrigin {
-                genesis_height: BlockHeight::new(1),
-                anchor_wt: WeightedTimestamp::ZERO,
-            },
+            BlockHeight::new(1),
         );
         let restarted = CommitDedupIndex::seeded(&window, tip_anchor);
 
@@ -15294,6 +15303,7 @@ mod tests {
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -15357,6 +15367,7 @@ mod tests {
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -15408,6 +15419,7 @@ mod tests {
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -15479,6 +15491,7 @@ mod tests {
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         state.committed_height = BlockHeight::new(4);
@@ -15566,6 +15579,7 @@ mod tests {
                 committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(ED - 1)),
                 ..RecoveredState::default()
             },
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -15675,6 +15689,7 @@ mod tests {
                 committed_tip: Some(CommittedTip::GENESIS),
                 ..RecoveredState::default()
             },
+            WeightedTimestamp::ZERO,
         )
         .signed_by(split.proposer_for(local, round));
         state.set_time(LocalTimestamp::from_millis(ED));
@@ -15965,6 +15980,7 @@ mod tests {
             shard,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
 
@@ -16444,7 +16460,11 @@ mod tests {
         BlockHeader::new(BlockHeaderParts {
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: ValidatorId::new(height.inner() % 4),
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round,
@@ -16600,7 +16620,11 @@ mod tests {
         let header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(1),
             parent_block_hash: committed_hash,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: ValidatorId::new(round % 4),
             timestamp: ProposerTimestamp::from_millis(100_000),
             round: Round::new(round),
@@ -16762,7 +16786,11 @@ mod tests {
             let header = BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
                 parent_block_hash: committed_hash,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 proposer: ValidatorId::new(1),
                 timestamp: ProposerTimestamp::from_millis(100_000),
                 round: Round::new(1),
@@ -16803,7 +16831,11 @@ mod tests {
             let header = BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
                 parent_block_hash: committed_hash,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 proposer: ValidatorId::new(round % 4),
                 timestamp: ProposerTimestamp::from_millis(100_000),
                 round: Round::new(round),
@@ -17749,7 +17781,7 @@ mod tests {
                 &net,
                 shard,
                 round,
-                QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+                QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO)),
                 ValidatorId::new(voter),
                 &BlsSigner::generate(),
             )
@@ -17798,7 +17830,7 @@ mod tests {
             &net,
             shard,
             far,
-            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO)),
             ValidatorId::new(1),
             &BlsSigner::generate(),
         )
@@ -18094,7 +18126,8 @@ mod tests {
     /// genesis QC.
     fn genesis_reporting_shares(keys: &[BlsSigner], round: u64) -> Vec<Verified<Timeout>> {
         let net = NetworkDefinition::simulator();
-        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let genesis =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         (1..=3)
             .map(|idx| {
                 Verified::<Timeout>::sign_local(
@@ -18113,7 +18146,8 @@ mod tests {
     /// A certificate for `round` from `keys[1..=3]`, each reporting the
     /// genesis QC.
     fn certificate_at(keys: &[BlsSigner], round: u64) -> TimeoutCertificate {
-        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let genesis =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         let shares = genesis_reporting_shares(keys, round);
         let positioned: Vec<(usize, &Verified<Timeout>)> = (1..=3).zip(&shares).collect();
         Verified::<TimeoutCertificate>::from_verified_timeouts(
@@ -18141,7 +18175,7 @@ mod tests {
             &net,
             ShardId::ROOT,
             Round::new(1),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO)),
             ValidatorId::new(1),
             &keys[1],
         )
@@ -18195,7 +18229,8 @@ mod tests {
         // raised view stands in for one the committee certified.
         let _ = state.refresh_pacemaker_at_tip(&topology_schedule);
         state.view_change.advance_to(Round::new(4));
-        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let genesis =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         let net = NetworkDefinition::simulator();
         let below = |voter: usize, tc: TimeoutCertificate| {
             Verified::<Timeout>::sign_local(
@@ -18241,6 +18276,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         );
         let record = SafeVoteRegisters {
             high_tc: Some(tc),
@@ -18273,7 +18309,8 @@ mod tests {
     fn a_skipping_proposal_carries_the_certificate_for_the_round_before() {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
         let committee = Arc::clone(topology_schedule.head());
-        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let genesis =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         state.high_tc = Some(Arc::new(Verified::new_unchecked_for_test(certificate_at(
             &keys, 4,
         ))));
@@ -18303,7 +18340,7 @@ mod tests {
             &NetworkDefinition::simulator(),
             ShardId::ROOT,
             Round::new(4),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO)),
             ValidatorId::new(1),
             &keys[1],
         )
@@ -18458,6 +18495,7 @@ mod tests {
                 shard,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
+                WeightedTimestamp::ZERO,
             )
             .signed_by(ValidatorId::new(4));
             state.set_time(LocalTimestamp::from_millis(100_000));
@@ -19420,6 +19458,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         state.set_time(LocalTimestamp::from_millis(3 * CLAIM_ED));
@@ -19939,7 +19978,7 @@ mod tests {
                 &net,
                 shard,
                 round,
-                QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+                QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO)),
                 ValidatorId::new(voter),
                 &BlsSigner::generate(),
             )
@@ -19984,7 +20023,7 @@ mod tests {
                 &net,
                 shard,
                 round,
-                QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+                QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO)),
                 ValidatorId::new(2),
                 &BlsSigner::generate(),
             )
@@ -20907,7 +20946,7 @@ mod tests {
             state.local_shard,
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let _ = state.initialize_genesis(&genesis, 4_096);
 
@@ -21452,6 +21491,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(u64::from(local_idx)));
         (
@@ -21773,7 +21813,7 @@ mod tests {
 
         let tip = header(
             2,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO)),
             tip_in_flight,
         );
         state.committed_height = tip.height();
@@ -22053,7 +22093,7 @@ mod tests {
 
         let tip = header(
             2,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO)),
         );
         state.committed_height = tip.height();
         state.committed_hash = tip.hash();
@@ -23203,6 +23243,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         state.set_time(LocalTimestamp::from_millis(100_000));
@@ -23277,6 +23318,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         state.committed_height = BlockHeight::new(3);
@@ -23914,6 +23956,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         state.set_time(LocalTimestamp::from_millis(100_000));
@@ -24522,7 +24565,10 @@ mod tests {
             &topology_schedule,
             &block,
             block_hash,
-            &QuorumCertificate::genesis(block.header().shard_id(), ChainOrigin::ROOT),
+            &QuorumCertificate::genesis(
+                block.header().shard_id(),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            ),
             WeightedTimestamp::from_millis(1000),
         );
     }
@@ -25392,6 +25438,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             recovered,
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0))
     }
@@ -25655,6 +25702,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0))
     }
@@ -26395,7 +26443,7 @@ mod tests {
         fn over(store: SimShardStorage) -> Self {
             let chain = Arc::new(PendingChain::new(
                 Arc::new(store.clone()),
-                ChainOrigin::ROOT,
+                BlockHeight::GENESIS,
             ));
             Self {
                 source: Racing {
@@ -26863,6 +26911,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(99));
         state.committed_height = BlockHeight::GENESIS;
@@ -26890,6 +26939,7 @@ mod tests {
                 ShardId::ROOT,
                 ShardConsensusConfig::default(),
                 RecoveredState::default(),
+                WeightedTimestamp::ZERO,
             );
             if let Some(signer) = signer {
                 state = state.signed_by(signer);
@@ -27535,7 +27585,11 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(30_000));
         let tip = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(2),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             round: Round::new(2),
             ..Default::default()
         });
@@ -27718,7 +27772,8 @@ mod tests {
 
         let (mut state, schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
-        let parent_qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let parent_qc =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         let synced = bare_block(
             BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
@@ -28189,6 +28244,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         );
         let carried = SafeVoteRegisters {
             locked_round: Round::new(5),
@@ -28427,6 +28483,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         );
         let _ = restarted.attach_signer(
             &schedule,
@@ -28513,7 +28570,8 @@ mod tests {
                 WeightedTimestamp::from_millis(100_000),
             )
         };
-        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let genesis =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         let first = SafeVoteRegisters {
             locked_round: Round::new(5),
             last_voted_round: Round::new(5),
@@ -28537,6 +28595,7 @@ mod tests {
                 )),
                 ..RecoveredState::default()
             },
+            WeightedTimestamp::ZERO,
         );
         let floor = Round::new(2);
         let _ = state.attach_signer(&schedule, ValidatorId::new(1), Some(first), floor);
@@ -28583,6 +28642,7 @@ mod tests {
                 latest_qc: Some(qc.clone()),
                 ..RecoveredState::default()
             },
+            WeightedTimestamp::ZERO,
         );
         let proposer = schedule.head().proposer_for(ShardId::ROOT, state.view());
 
@@ -28614,6 +28674,7 @@ mod tests {
                 latest_qc: Some(qc.clone()),
                 ..RecoveredState::default()
             },
+            WeightedTimestamp::ZERO,
         );
         state.precut_generation += 1;
         assert!(!state.take_fence_evidence_advanced());
@@ -28647,6 +28708,7 @@ mod tests {
                     latest_qc: Some(make_test_qc(BlockHash::ZERO, BlockHeight::new(2))),
                     ..RecoveredState::default()
                 },
+                WeightedTimestamp::ZERO,
             );
             state.set_time(LocalTimestamp::from_millis(40_000));
             state
@@ -29800,6 +29862,7 @@ mod tests {
             ShardId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
+            WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0));
         fresh.set_time(offered_at);

@@ -224,7 +224,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         BlockHeader, BlockHeaderParts, BlockManifest, ChainOrigin, ConsensusSignature, Hash,
-        QuorumCertificate, ShardId, ValidatorId,
+        QuorumCertificate, ShardId, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -235,7 +235,11 @@ mod tests {
         let header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(height),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             ..Default::default()
         });
         let manifest = BlockManifest::default();

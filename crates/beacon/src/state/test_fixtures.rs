@@ -118,7 +118,7 @@ pub fn genesis_boundary() -> ShardBoundary {
 }
 
 pub fn empty_state() -> BeaconState {
-    BeaconState::empty(BeaconChainConfig::default())
+    BeaconState::empty(BeaconChainConfig::at_unix_epoch())
 }
 
 /// Build a state with one shard, one pool, and `n_active` validators

@@ -145,8 +145,9 @@ pub struct Vintage {
     /// The prefix the tree is rooted at — a split child's, or the trie
     /// root for a merged parent.
     pub prefix: NibblePath,
-    /// The origin the chain recorded.
-    pub origin: ChainOrigin,
+    /// The origin the chain recorded; `None` for a chain born at network
+    /// genesis.
+    pub origin: Option<ChainOrigin>,
 }
 
 /// A subtree the tree holds at this store's prefix: the version its
@@ -232,7 +233,7 @@ pub fn adopt_plan(
         ));
     }
     let genesis_version = origin.genesis_height.inner();
-    if vintage.version == genesis_version && vintage.origin == origin {
+    if vintage.version == genesis_version && vintage.origin == Some(origin) {
         return Ok(Adoption::Recorded(vintage.root));
     }
     let adoption = match source {
@@ -519,7 +520,12 @@ mod tests {
         path
     }
 
-    fn vintage(version: u64, root: StateRoot, prefix: NibblePath, origin: ChainOrigin) -> Vintage {
+    fn vintage(
+        version: u64,
+        root: StateRoot,
+        prefix: NibblePath,
+        origin: Option<ChainOrigin>,
+    ) -> Vintage {
         Vintage {
             version,
             root,
@@ -539,7 +545,7 @@ mod tests {
         let origin = origin_at(10);
         let held = root(b"held");
         let genesis = genesis_naming(root(b"anything"), origin);
-        let vintage = vintage(10, held, child_prefix(), origin);
+        let vintage = vintage(10, held, child_prefix(), Some(origin));
         for source in [
             AdoptSource::ParentSubtree,
             AdoptSource::FollowedTip,
@@ -560,7 +566,7 @@ mod tests {
         let origin = origin_at(10);
         let followed = root(b"followed");
         let genesis = genesis_naming(followed, origin);
-        let below = vintage(8, followed, child_prefix(), ChainOrigin::ROOT);
+        let below = vintage(8, followed, child_prefix(), None);
         assert_eq!(
             adopt_plan(&below, origin, &genesis, AdoptSource::FollowedTip, no_slot),
             Ok(Adoption::Repoint(Some(Subtree {
@@ -568,13 +574,13 @@ mod tests {
                 root: followed
             }))),
         );
-        let at = vintage(10, followed, child_prefix(), ChainOrigin::ROOT);
+        let at = vintage(10, followed, child_prefix(), None);
         assert!(
             adopt_plan(&at, origin, &genesis, AdoptSource::FollowedTip, no_slot)
                 .unwrap_err()
                 .contains("followed adoption vintage mismatch")
         );
-        let empty = vintage(3, StateRoot::ZERO, child_prefix(), ChainOrigin::ROOT);
+        let empty = vintage(3, StateRoot::ZERO, child_prefix(), None);
         let empty_genesis = genesis_naming(StateRoot::ZERO, origin);
         assert_eq!(
             adopt_plan(
@@ -596,7 +602,7 @@ mod tests {
         let origin = origin_at(10);
         let slot = root(b"child slot");
         let genesis = genesis_naming(slot, origin);
-        let coasted = vintage(13, root(b"parent"), child_prefix(), ChainOrigin::ROOT);
+        let coasted = vintage(13, root(b"parent"), child_prefix(), None);
         let read = |version: u64| {
             assert_eq!(version, 13, "the slot is read at the checkpoint's version");
             Ok(Some(Subtree {
@@ -617,7 +623,7 @@ mod tests {
                 .unwrap_err()
                 .contains("does not match the genesis state root")
         );
-        let at_root = vintage(13, root(b"parent"), NibblePath::empty(), ChainOrigin::ROOT);
+        let at_root = vintage(13, root(b"parent"), NibblePath::empty(), None);
         assert!(
             adopt_plan(
                 &at_root,
@@ -637,12 +643,12 @@ mod tests {
         let origin = origin_at(10);
         let union = root(b"union");
         let genesis = genesis_naming(union, origin);
-        let built = vintage(10, union, NibblePath::empty(), ChainOrigin::ROOT);
+        let built = vintage(10, union, NibblePath::empty(), None);
         assert_eq!(
             adopt_plan(&built, origin, &genesis, AdoptSource::InPlace, no_slot),
             Ok(Adoption::InPlace(union)),
         );
-        let short = vintage(9, union, NibblePath::empty(), ChainOrigin::ROOT);
+        let short = vintage(9, union, NibblePath::empty(), None);
         assert!(
             adopt_plan(&short, origin, &genesis, AdoptSource::InPlace, no_slot)
                 .unwrap_err()

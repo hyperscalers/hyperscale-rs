@@ -92,8 +92,8 @@ mod tests {
         StubVmStatics, install_stub_protocol_statics, stub_transaction,
     };
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin,
-        PrincipalAddr, TimestampRange, Transaction, Verifiable, WeightedTimestamp,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, PrincipalAddr,
+        TimestampRange, Transaction, Verifiable, WeightedTimestamp,
     };
 
     use super::*;
@@ -162,7 +162,7 @@ mod tests {
             &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
-        let pending_chain = Arc::new(PendingChain::new(storage, ChainOrigin::ROOT));
+        let pending_chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
 
         let served = serve_provision_request(
             &pending_chain,

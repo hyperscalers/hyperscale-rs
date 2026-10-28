@@ -299,6 +299,7 @@ pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCl
         |c, probes| {
             let state = c.beacon_state().expect("a committed beacon state");
             let epoch_ms = state.chain_config.epoch_duration_ms;
+            let state_windows = state.chain_config.epoch_windows();
             let Some(PendingReshape::Split { admitted, .. }) =
                 state.pending_reshapes.get(&splitter)
             else {
@@ -328,9 +329,7 @@ pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCl
             );
             // Observed now, so it landed no later than now: below the
             // floor a stall of `k` skips would slide the window to.
-            let slid_floor = WeightedTimestamp::from_millis(
-                (stalled_at.inner() + k) * epoch_ms - RETENTION_HORIZON.as_secs() * 1000,
-            );
+            let slid_floor = state_windows.settled_window_floor(Epoch::new(stalled_at.inner() + k));
             let observed = clock(c);
             assert!(
                 observed < slid_floor,

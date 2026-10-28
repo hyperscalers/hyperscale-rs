@@ -230,7 +230,7 @@ fn test_fold(
         id: pool_id,
         total_stake: Stake::from_quanta(n as u128 * MIN_STAKE_FLOOR.quanta()),
     }];
-    let chain_config = BeaconChainConfig::default();
+    let chain_config = BeaconChainConfig::at_unix_epoch();
     let beacon_count = n.min(chain_config.beacon_committee_size as usize);
     let initial_beacon_committee: Vec<_> = (0..beacon_count)
         .map(|i| committee.validator_id(i))
@@ -238,7 +238,7 @@ fn test_fold(
     // The genesis ROOT committee holds every validator.
     let initial_shard_committee: Vec<_> = (0..n).map(|i| committee.validator_id(i)).collect();
     let config = BeaconGenesisConfig {
-        chain_config: BeaconChainConfig::default(),
+        chain_config: BeaconChainConfig::at_unix_epoch(),
         initial_validators,
         initial_pools,
         initial_beacon_committee,

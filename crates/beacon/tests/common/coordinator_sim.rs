@@ -273,9 +273,10 @@ impl CoordinatorSim {
         let sks = committee.signers();
 
         let pool_id = test_pool(0);
+        // Every replica's clock starts at zero, so the chain does too.
         let chain_config = BeaconChainConfig {
             shard_size: u32::try_from(pool_n).expect("pool_n fits in u32"),
-            ..BeaconChainConfig::default()
+            ..BeaconChainConfig::at_unix_epoch()
         };
         let config = BeaconGenesisConfig {
             chain_config,
@@ -1008,8 +1009,13 @@ impl CoordinatorSim {
             .try_into()
             .expect("SKIP_TIMEOUT fits in u64 millis");
         for coord in &mut self.coordinators {
-            let next = coord.current_state().current_epoch.next().inner();
-            let boundary = next * coord.current_state().chain_config.epoch_duration_ms;
+            let state = coord.current_state();
+            let boundary = state
+                .chain_config
+                .epoch_windows()
+                .window_of(state.current_epoch.next())
+                .start
+                .as_millis();
             coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));
         }
     }

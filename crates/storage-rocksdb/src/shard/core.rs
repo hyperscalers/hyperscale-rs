@@ -27,9 +27,8 @@ use hyperscale_storage::{
     SubstateStore, Substates, SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
-    SafeVoteRegisters, SettledWrites, StateRoot, SubstateKey, ValidatorId, Verified,
-    entry_leaf_key,
+    Block, BlockHeight, EntryLeaf, ProtocolHasher, QuorumCertificate, SettledWrites, StateRoot,
+    SubstateKey, ValidatorId, Verified, entry_leaf_key,
 };
 use hyperscale_vm_types::{Address, CollectionId, SweepBucket};
 use rocksdb::{
@@ -43,7 +42,7 @@ use super::column_families::{
     ALL_COLUMN_FAMILIES, CfHandles, CrossingIndexCf, EntriesCf, EntriesHistoryCf,
     HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF,
     StaleEntriesHistoryCf, StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
-    SubstateBytesCf, SweepIndexCf,
+    SubstateBytesCf, SweepIndexCf, TaggedRegisters,
 };
 use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -99,7 +98,7 @@ pub struct RocksDbShardStorage {
     /// `persist_vote_position`, keeping concurrent writes monotone
     /// and letting a write that raises nothing (e.g. a timeout
     /// retransmit) skip the fsync entirely.
-    pub(crate) vote_registers: Arc<Mutex<HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>>>,
+    pub(crate) vote_registers: Arc<Mutex<HashMap<ValidatorId, TaggedRegisters>>>,
 
     /// The oldest version this node's own readers still name; `u64::MAX`
     /// until one holds. Process-local rather than a column: a restarted

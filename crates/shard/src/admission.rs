@@ -150,8 +150,9 @@ pub(crate) struct Committed<'a> {
     /// proof, since every voter reads that state through its own
     /// anchored view.
     pub(crate) parent: Anchor,
-    /// Where this chain began; content anchored before it belongs to a
-    /// predecessor.
+    /// This chain's [`cut`](hyperscale_types::ChainOrigin::cut): content
+    /// anchored before it belongs to a predecessor. Zero for a chain born
+    /// at network genesis, which has none.
     pub(crate) chain_origin: WeightedTimestamp,
     /// What the QC chain above the parent carries.
     pub(crate) chain: &'a QcChainSets,

@@ -110,7 +110,7 @@ mod tests {
         let crossing = header_at(
             parent,
             BlockHeight::new(8),
-            QuorumCertificate::genesis(parent, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(parent, ChainOrigin::root(WeightedTimestamp::ZERO)),
             pair.composed_root(),
             Some(pair),
         );
@@ -148,7 +148,7 @@ mod tests {
         let terminal = header_at(
             parent,
             BlockHeight::new(9),
-            QuorumCertificate::genesis(parent, ChainOrigin::ROOT),
+            QuorumCertificate::genesis(parent, ChainOrigin::root(WeightedTimestamp::ZERO)),
             StateRoot::from_raw(Hash::from_bytes(b"a different root")),
             Some(pair),
         );

@@ -18,8 +18,8 @@ use hyperscale_storage::{
     SafeVoteRegisterStore, SubstateStore, Substates, recent_headers, replay_window,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, SettledWrites,
-    ShardId, StateRoot, SubstateKey, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, ShardId,
+    StateRoot, SubstateKey, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 use im::{OrdMap, OrdSet};
@@ -196,11 +196,13 @@ impl SimShardStorage {
         read_or_recover(&self.state).retention_floor
     }
 
-    /// Where this store's own chain begins; every height below the
-    /// origin's genesis is its predecessor's.
+    /// The height this store's own chain begins at; every height below
+    /// it is its predecessor's.
     #[must_use]
-    pub fn chain_origin(&self) -> ChainOrigin {
-        read_or_recover(&self.consensus).chain_origin
+    pub fn genesis_height(&self) -> BlockHeight {
+        read_or_recover(&self.consensus)
+            .chain_origin
+            .map_or(BlockHeight::GENESIS, |origin| origin.genesis_height)
     }
 
     /// Clear all data (useful for testing).
@@ -281,13 +283,13 @@ impl SimShardStorage {
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
                 BlockHeight::new(self.retention_floor()),
-                chain_origin,
+                chain_origin.map_or(BlockHeight::GENESIS, |origin| origin.genesis_height),
             ),
             dedup: DedupWindow::from_reader(
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
-                chain_origin,
+                chain_origin.map_or(BlockHeight::GENESIS, |origin| origin.genesis_height),
             ),
             retained_provisions,
             committed_hash,

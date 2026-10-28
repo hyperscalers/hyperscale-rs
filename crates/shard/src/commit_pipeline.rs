@@ -80,7 +80,7 @@ mod tests {
             ShardId::ROOT,
             ValidatorId::new(tag),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let qc = QuorumCertificate::new(
             block.hash(),
@@ -155,7 +155,7 @@ mod properties {
             ShardId::ROOT,
             ValidatorId::new(tag),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let qc = QuorumCertificate::new(
             block.hash(),

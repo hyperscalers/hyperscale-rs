@@ -1163,7 +1163,7 @@ mod tests {
     fn a_safety_bearing_action_naming_an_unattached_signer_is_dropped() {
         let committee = [validator(1), validator(2), validator(3)];
         let announcement = |signer| Action::SignAndBroadcastQcAnnouncement {
-            qc: QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
+            qc: QuorumCertificate::genesis(SHARD, ChainOrigin::root(WeightedTimestamp::ZERO)),
             recipients: Vec::new(),
             signer,
         };

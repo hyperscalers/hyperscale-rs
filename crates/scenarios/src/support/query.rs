@@ -1188,6 +1188,14 @@ pub(crate) fn epoch_windows<C: Cluster>(c: &C) -> Option<EpochWindows> {
         .map(|state| state.chain_config.epoch_windows())
 }
 
+/// How far into its epoch window the instant `at_ms` falls, in
+/// milliseconds.
+#[must_use]
+pub(crate) const fn into_epoch_ms(windows: EpochWindows, at_ms: u64) -> u64 {
+    let at = WeightedTimestamp::from_millis(at_ms);
+    at_ms.saturating_sub(windows.window_of(windows.epoch_for(at)).start.as_millis())
+}
+
 /// The clock of the boundary the beacon last recorded for `shard`.
 #[must_use]
 pub(crate) fn boundary_clock<C: Cluster + ?Sized>(

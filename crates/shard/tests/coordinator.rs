@@ -13,7 +13,8 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BlockHeight, IDLE_PROPOSAL_INTERVAL, LocalTimestamp, Round, SafeVoteRegisters, ShardId,
-    TopologySchedule, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, VotePosition, shard_prefix_path,
+    TopologySchedule, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, VotePosition, WeightedTimestamp,
+    shard_prefix_path,
 };
 
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
@@ -40,6 +41,7 @@ fn signed_by(
         ShardId::ROOT,
         config,
         RecoveredState::default(),
+        WeightedTimestamp::ZERO,
     );
     let _ = coordinator.attach_signer(topology_schedule, me, None, Round::INITIAL);
     coordinator
@@ -261,6 +263,7 @@ fn unsigned_coordinator_with_topology(
         ShardId::ROOT,
         config,
         RecoveredState::default(),
+        WeightedTimestamp::ZERO,
     );
     (coordinator, topology_schedule)
 }

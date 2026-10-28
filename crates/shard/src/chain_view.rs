@@ -302,7 +302,11 @@ mod tests {
         BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1000),
             state_root: StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
             provision_tx_roots: Capped::default(),
@@ -359,7 +363,7 @@ mod tests {
     ) -> R {
         let view = ChainView {
             local_shard: ShardId::ROOT,
-            chain_origin: ChainOrigin::ROOT,
+            chain_origin: ChainOrigin::root(WeightedTimestamp::ZERO),
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,

@@ -415,7 +415,11 @@ pub fn make_live_block(
         shard_id,
         height,
         parent_block_hash: BlockHash::ZERO,
-        parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+        parent_qc: QuorumCertificate::genesis(
+            ShardId::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        )
+        .into(),
         proposer,
         timestamp: ProposerTimestamp::from_millis(timestamp_ms),
         provision_tx_roots: Capped::default(),
@@ -657,7 +661,8 @@ pub fn rebound(mut block: Block) -> Block {
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let block = stamp_parent_qc_weighted_timestamp(block, weighted_timestamp_ms);
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let __qc =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_id(),
@@ -802,7 +807,8 @@ pub(crate) fn fork_header(
         shard_id: shard,
         height,
         parent_block_hash,
-        parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+        parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO))
+            .into(),
         timestamp: ProposerTimestamp::from_millis(salt),
         round,
         provision_tx_roots: Capped::default(),

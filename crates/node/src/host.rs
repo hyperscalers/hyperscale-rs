@@ -822,7 +822,7 @@ fn build_shard_io<S: ShardStorage>(
     // beneath that line exist on no chain here.
     let pending_chain = Arc::new(PendingChain::new(
         Arc::clone(&storage),
-        replica.shard_coordinator().chain_origin(),
+        replica.shard_coordinator().chain_origin().genesis_height,
     ));
     // The replica asks its crossing questions of this chain's persisted
     // tip, now that the chain is open.

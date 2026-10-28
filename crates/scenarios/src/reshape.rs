@@ -11,7 +11,7 @@ use hyperscale_types::{
 
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::query::{
-    clock, committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
+    clock, committee_size, epoch_windows, live_shards, scheduled_terminal_epoch,
 };
 use crate::support::tx::{
     LEFT_PROBE_SENDER, build_probe_transfer_tx, build_probe_transfer_tx_from, validity_around,
@@ -331,12 +331,12 @@ fn pick_replay(
 /// genesis (nothing predates that, so the probe would not be pre-cut), or
 /// if the built window no longer contains the current clock.
 fn build_precut_probe(c: &impl Cluster, successor: ShardId, payer: u8) -> Arc<Transaction> {
-    let cut = c
+    let origin = c
         .chain_origin(successor)
-        .expect("the successor is live, so it reports the origin it started at")
-        .anchor_wt;
+        .expect("the successor is live, so it reports the origin it started at");
+    let cut = origin.anchor_wt;
     assert!(
-        cut > WeightedTimestamp::ZERO,
+        !origin.born_at_network_genesis(),
         "{successor} was born at network genesis, so no window can open before it \
          and the admission assertion would be vacuous",
     );
@@ -551,7 +551,15 @@ pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
 
     let world = probe_world(c);
     let mut charges = Charges::default();
-    let probe = build_post_cut_probe(c, root);
+    let (probe, opens) = build_post_cut_probe(c, root);
+    // A pool refuses a window opening past its reach, so the probe goes in
+    // once the cut is that close, with slack for the committed clock
+    // trailing the cluster's.
+    assert!(
+        c.run_until(epochs(2), |c| clock(c).plus(MAX_VALIDITY_RANGE)
+            >= opens.plus(PROBE_REACH_SLACK)),
+        "the cluster's clock must come within reach of the cut",
+    );
     let hash = charges.record(&probe);
     c.submit(probe);
 
@@ -578,7 +586,8 @@ pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
 }
 
 /// A probe whose validity window opens after `parent`'s scheduled cut, so
-/// the parent admits it and can never include it.
+/// the parent admits it and can never include it, and the instant it
+/// opens.
 ///
 /// Built from the cut the beacon has stamped rather than from a lead
 /// guessed off the admitting epoch: a reshape runs however many epochs
@@ -588,18 +597,21 @@ pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
 /// # Panics
 ///
 /// Panics if the beacon has not scheduled `parent`'s cut yet.
-fn build_post_cut_probe(c: &impl Cluster, parent: ShardId) -> Arc<Transaction> {
+fn build_post_cut_probe(
+    c: &impl Cluster,
+    parent: ShardId,
+) -> (Arc<Transaction>, WeightedTimestamp) {
     let terminal = scheduled_terminal_epoch(c, parent).expect("the cut is scheduled");
-    let epoch_ms = epoch_duration_ms(c).expect("a scheduled cut implies a committed beacon");
+    let windows = epoch_windows(c).expect("a scheduled cut implies a committed beacon");
     // The epoch after the parent's last: its chain has ended by then, and
     // its successors are the only thing that can include this.
-    let opens = terminal.inner().saturating_add(1).saturating_mul(epoch_ms);
-    let range = TimestampRange::new(
-        WeightedTimestamp::from_millis(opens),
-        WeightedTimestamp::from_millis(opens).plus(POST_CUT_PROBE_LIFE),
-    );
-    Arc::new(build_probe_transfer_tx(range))
+    let opens = windows.window_of(terminal).end;
+    let range = TimestampRange::new(opens, opens.plus(POST_CUT_PROBE_LIFE));
+    (Arc::new(build_probe_transfer_tx(range)), opens)
 }
+
+/// How far inside a pool's reach the post-cut probe is submitted.
+const PROBE_REACH_SLACK: Duration = Duration::from_secs(15);
 
 /// How long [`build_post_cut_probe`]'s window stays open — the validity
 /// budget less the slack a window needs to stay well formed against an

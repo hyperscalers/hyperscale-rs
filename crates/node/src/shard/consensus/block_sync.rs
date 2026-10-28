@@ -613,7 +613,11 @@ mod tests {
         BlockHeader::new(BlockHeaderParts {
             height: HEIGHT,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_000),
             provision_tx_roots: Capped::default(),
             ..Default::default()
@@ -801,7 +805,11 @@ mod tests {
         BlockHeader::new(BlockHeaderParts {
             height: HEIGHT,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_000),
             provision_tx_roots: Capped::default(),
             body_root: SectionRoots {
@@ -837,7 +845,11 @@ mod tests {
             header: BlockHeader::new(BlockHeaderParts {
                 height: HEIGHT,
                 parent_block_hash: BlockHash::ZERO,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 provision_tx_roots: Capped::default(),
                 body_root: SectionRoots {
@@ -1154,7 +1166,11 @@ mod tests {
             header: BlockHeader::new(BlockHeaderParts {
                 height: HEIGHT,
                 parent_block_hash: BlockHash::ZERO,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 provision_tx_roots: Capped::default(),
                 body_root: SectionRoots {
@@ -1211,7 +1227,11 @@ mod tests {
             header: BlockHeader::new(BlockHeaderParts {
                 height: HEIGHT,
                 parent_block_hash: BlockHash::ZERO,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 provision_tx_roots: Capped::default(),
                 body_root: SectionRoots {

@@ -87,7 +87,7 @@ fn verified_recovered_state(
     }
     Ok(RecoveredState {
         substate_bytes,
-        chain_origin: origin,
+        chain_origin: Some(origin),
         predecessors,
         read_frontier,
         members: Some(members),
@@ -135,7 +135,7 @@ mod tests {
         )
         .expect("matches");
         assert_eq!(recovered.substate_bytes, 4_096);
-        assert_eq!(recovered.chain_origin, origin());
+        assert_eq!(recovered.chain_origin, Some(origin()));
         assert_eq!(recovered.read_frontier, read_frontier);
     }
 

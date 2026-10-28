@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
-    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey, Finalization,
+    CertifiedBlockHeader, ConsensusReceipt, DeclaredRange, EntryKey, Finalization,
     FinalizationHash, GlobalReceiptHash, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
     ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket, SweepFrontier, Transaction,
     TxHash, Verifiable, Verified, WeightedTimestamp, local_settled_tx_hashes,
@@ -126,8 +126,8 @@ pub struct ChainEntry {
 /// impossible by construction.
 pub struct PendingChain<S> {
     base: Arc<S>,
-    /// Where this chain begins, which is not generally height zero: a
-    /// reshape successor continues its predecessor's height line.
+    /// The height this chain's genesis sits at, which is not generally
+    /// zero: a reshape successor continues its predecessor's height line.
     ///
     /// A committed-tail walk that runs below it has reached the bottom of
     /// the chain, not a hole — nothing beneath was ever committed here, so
@@ -136,7 +136,7 @@ pub struct PendingChain<S> {
     /// child younger than the retention horizon reads its own origin as a
     /// gap. `host.rs` floors the block-sync watermark on the same value
     /// for the same reason.
-    origin: ChainOrigin,
+    genesis_height: BlockHeight,
     entries: RwLock<HashMap<BlockHash, ChainEntry>>,
     /// Certified blocks whose commit is still pending, attached by
     /// [`Self::attach_certified_uncommitted`] as soon as a QC verifies
@@ -179,16 +179,16 @@ impl<S> PendingChain<S>
 where
     S: SubstateStore + TreeReader + ShardChainReader + Sync + 'static,
 {
-    /// Create a new empty `PendingChain` over the given base storage,
-    /// beginning at `origin`.
+    /// Create a new empty `PendingChain` over the given base storage, for
+    /// a chain whose genesis sits at `genesis_height`.
     ///
-    /// The origin is stated rather than defaulted: a wrong one turns a
+    /// The height is stated rather than defaulted: a wrong one turns a
     /// window walk's verdict from "short" to "whole" or the reverse, and
     /// both directions are silent.
-    pub fn new(base: Arc<S>, origin: ChainOrigin) -> Self {
+    pub fn new(base: Arc<S>, genesis_height: BlockHeight) -> Self {
         Self {
             base,
-            origin,
+            genesis_height,
             entries: RwLock::new(HashMap::new()),
             certified_uncommitted: RwLock::new(HashMap::new()),
             settled_window_memo: RwLock::new(None),
@@ -224,7 +224,7 @@ where
     /// the store cannot answer for is a hole, and every full-history
     /// replica folds a block this one does not.
     const fn coverage_at(&self, height: BlockHeight) -> WindowCoverage {
-        if height.inner() <= self.origin.genesis_height.inner() {
+        if height.inner() <= self.genesis_height.inner() {
             WindowCoverage::Whole
         } else {
             WindowCoverage::Short { at: height }
@@ -1681,7 +1681,7 @@ mod tests {
     fn empty_chain() -> Arc<PendingChain<StubStore>> {
         Arc::new(PendingChain::new(
             Arc::new(StubStore::default()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ))
     }
 
@@ -1691,10 +1691,7 @@ mod tests {
     fn chain_from(origin_height: u64, stub: StubStore) -> Arc<PendingChain<StubStore>> {
         Arc::new(PendingChain::new(
             Arc::new(stub),
-            ChainOrigin {
-                genesis_height: BlockHeight::new(origin_height),
-                anchor_wt: WeightedTimestamp::ZERO,
-            },
+            BlockHeight::new(origin_height),
         ))
     }
 
@@ -1703,7 +1700,7 @@ mod tests {
         for b in blocks {
             stub = stub.with_block(b);
         }
-        Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT))
+        Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS))
     }
 
     /// The committed tip's hash and height are one read. A persist that
@@ -1717,7 +1714,7 @@ mod tests {
             head: (BlockHeight::new(5), Some(tip)),
             ..StubStore::default()
         };
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS));
         chain.insert(
             tip,
             entry_at(bh(b"parent"), BlockHeight::new(5), &StateWrites::default()),
@@ -2145,7 +2142,7 @@ mod tests {
         // than expand the stub, exercise just the pending arm here. The
         // persisted fall-through is covered by integration tests in the
         // node crate where a real ShardChainReader is wired in.
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS));
         // No pending entry — pending arm misses, base arm returns None
         // because StubStore::get_block_for_sync is the trait default
         // (None). Documenting the boundary here.
@@ -2327,7 +2324,7 @@ mod tests {
                 BlockHeight::new(2),
                 settled_sync_block(BlockHeight::new(2), 9_999, &below_floor),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         chain.insert(
             parent,
@@ -2431,7 +2428,7 @@ mod tests {
                 committed_sync_block(BlockHeight::new(1), 9_999, &[14]),
             );
         let store = Arc::new(stub);
-        let chain = Arc::new(PendingChain::new(Arc::clone(&store), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::clone(&store), BlockHeight::GENESIS));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         chain.insert(
             parent,
@@ -2478,7 +2475,7 @@ mod tests {
             BlockHeight::new(3),
             committed_sync_block(BlockHeight::new(3), anchor.as_millis(), &[10]),
         );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         chain.insert(
             parent,
@@ -2662,7 +2659,7 @@ mod tests {
                 BlockHeight::new(2),
                 settled_sync_block(BlockHeight::new(2), 9_999, &early_settled),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS));
         let (set, _) = chain.settled_txs_in_window(
             ShardId::ROOT,
             BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
@@ -2699,7 +2696,7 @@ mod tests {
                 BlockHeight::new(4),
                 settled_sync_block(BlockHeight::new(4), 3_000, &w4),
             );
-        let chain = Arc::new(PendingChain::new(Arc::new(stub), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::new(stub), BlockHeight::GENESIS));
         let at = |h: u64| {
             chain
                 .settled_txs_in_window(

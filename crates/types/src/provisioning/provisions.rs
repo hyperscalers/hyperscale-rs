@@ -563,11 +563,18 @@ mod tests {
 
         fn header_with_state_root(state_root: StateRoot) -> Verified<CertifiedBlockHeader> {
             let shard = SOURCE;
-            let header =
-                BlockHeader::genesis(shard, ValidatorId::new(0), state_root, ChainOrigin::ROOT);
+            let header = BlockHeader::genesis(
+                shard,
+                ValidatorId::new(0),
+                state_root,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            );
             Verified::<CertifiedBlockHeader>::new_unchecked_for_test(CertifiedBlockHeader::new(
                 header,
-                Verified::<QuorumCertificate>::genesis(shard, ChainOrigin::ROOT),
+                Verified::<QuorumCertificate>::genesis(
+                    shard,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                ),
             ))
         }
 

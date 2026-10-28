@@ -169,7 +169,7 @@ impl ShardParticipation {
         };
         let live = self.shard_coordinator.precut_rule_live();
         let keys = if live {
-            let cut = self.shard_coordinator.chain_origin().anchor_wt;
+            let cut = self.shard_coordinator.chain_origin().cut();
             let candidates = self.mempool_coordinator.pending_opening_before(cut);
             self.shard_coordinator
                 .outstanding_precut_queries(candidates)
@@ -271,7 +271,10 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardId::leaf(1, 1), ChainOrigin::ROOT),
+                QuorumCertificate::genesis(
+                    ShardId::leaf(1, 1),
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                ),
             )));
         let _ = node.handle(
             LocalTimestamp::ZERO,

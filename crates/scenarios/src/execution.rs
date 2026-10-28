@@ -96,7 +96,7 @@ pub fn nullifier_race_admits_exactly_one(c: &mut impl Cluster) {
     );
     let mut charges = Charges::default();
 
-    let request = payment_request(requester, REQUEST);
+    let request = payment_request(requester, REQUEST, c.now());
     let window = validity_around(c.now());
     let mut hashes = Vec::new();
     let mut prices = Vec::new();

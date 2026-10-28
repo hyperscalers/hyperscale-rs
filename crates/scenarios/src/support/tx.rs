@@ -755,20 +755,20 @@ pub(crate) const fn scenario_header(validity: TimestampRange) -> IntentHeader {
     }
 }
 
-/// The terms a standing offer is signed under.
+/// The terms a standing offer signed at `now` is signed under.
 ///
 /// The scenario network, and a window far wider than any transaction's —
 /// which is the point of an offer: its signer is not composing it now
 /// and does not know when a composer will. The composition's own window
-/// is what narrows it.
+/// is what narrows it. It opens where [`validity_around`] does and runs
+/// the cap.
 #[must_use]
-pub(crate) const fn offer_header() -> IntentHeader {
+pub(crate) fn offer_header(now: Duration) -> IntentHeader {
+    let opens = validity_around(now).start_timestamp_inclusive;
     IntentHeader {
         network: SCENARIO_NETWORK,
-        validity_start_ms: 0,
-        // The cap in milliseconds, which a `u64` holds with room: the
-        // constant is days and the type counts to half a billion years.
-        validity_end_ms: MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000,
+        validity_start_ms: opens.as_millis(),
+        validity_end_ms: opens.plus(MAX_INTENT_VALIDITY_RANGE).as_millis(),
         discriminator: 0,
     }
 }
@@ -2921,10 +2921,10 @@ pub(crate) fn build_stake_tx(
 /// A declaration and nothing else — no envelope, no fee terms, no
 /// composer. Its hash is a function of this content alone, which is what
 /// lets the signer sign it before any composer exists and lets two
-/// composers bind the identical declaration afterwards.
+/// composers bind the identical declaration afterwards. Signed at `now`.
 #[must_use]
-pub(crate) fn payment_request(signer: PrincipalAddr, amount: u128) -> Intent {
-    declaration(signer, |b| {
+pub(crate) fn payment_request(signer: PrincipalAddr, amount: u128, now: Duration) -> Intent {
+    declaration(signer, now, |b| {
         let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
     })
@@ -3063,9 +3063,10 @@ fn graph(
 /// As [`graph`].
 fn declaration(
     signer: PrincipalAddr,
+    now: Duration,
     write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>,
 ) -> Intent {
-    declaration_under(signer, offer_header(), write)
+    declaration_under(signer, offer_header(now), write)
 }
 
 /// [`declaration`] for a signer who names its own terms.

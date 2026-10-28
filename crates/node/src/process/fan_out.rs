@@ -366,8 +366,8 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, test_key};
     use hyperscale_types::{
         BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
-        ChainOrigin, GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees,
-        ValidatorId, WitnessSources,
+        GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ValidatorId,
+        WitnessSources,
     };
 
     use super::*;
@@ -438,7 +438,7 @@ mod tests {
             })
             .collect();
         let root = commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
-        let chain = Arc::new(PendingChain::new(storage, ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
         let response = serve_cells_request(
             &chain,
             &GetCellsRequest::new(ask.keys.clone(), ask.ranges.clone()),
@@ -703,7 +703,7 @@ mod tests {
             &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
-        let chain = Arc::new(PendingChain::new(storage, ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
 
         let fetched = gather(
             &asks,

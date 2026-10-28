@@ -968,7 +968,7 @@ impl Cluster for SimCluster {
     }
 
     fn now(&self) -> Duration {
-        self.runner.now()
+        self.runner.chain_now()
     }
 
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight> {
@@ -1115,9 +1115,15 @@ impl Cluster for SimCluster {
         // seated past genesis recovers no origin at all, reading network
         // genesis whatever cut its chain began at. The store seeded at
         // the cut carries the latest anchor, whichever height it is at.
+        let genesis = WeightedTimestamp::from_millis(self.runner.genesis_ms());
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| store.load_recovered_state(shard).chain_origin)
+            .map(|store| {
+                store
+                    .load_recovered_state(shard)
+                    .chain_origin
+                    .unwrap_or_else(|| ChainOrigin::root(genesis))
+            })
             .max_by_key(|origin| origin.anchor_wt)
     }
 
@@ -1373,7 +1379,7 @@ impl FaultableCluster for SimCluster {
     ) {
         let a: Vec<NodeIndex> = group_a.iter().map(|&h| host_index(h)).collect();
         let b: Vec<NodeIndex> = group_b.iter().map(|&h| host_index(h)).collect();
-        let now = self.now();
+        let now = self.runner.now();
         let windows: Vec<Range<Duration>> = windows
             .iter()
             .map(|window| now + window.start..now + window.end)

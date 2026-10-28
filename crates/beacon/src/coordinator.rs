@@ -990,7 +990,7 @@ mod tests {
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -2209,7 +2209,7 @@ mod tests {
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
         let config = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -2289,7 +2289,7 @@ mod tests {
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
         let config = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -4231,7 +4231,8 @@ mod tests {
         let beacon_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves));
         let range_proof = compute_range_proof(&leaves, lo_i, hi_i);
 
-        let parent_qc = QuorumCertificate::genesis(shard, ChainOrigin::ROOT);
+        let parent_qc =
+            QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO));
         let parent_block_hash = BlockHash::ZERO;
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: shard,

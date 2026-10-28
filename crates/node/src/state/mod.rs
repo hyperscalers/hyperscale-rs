@@ -110,6 +110,7 @@ impl NodeStateMachine {
             local_shard,
             shard_config,
             recovered,
+            schedule.windows().origin(),
             mempool_config,
             provision_config,
             persisted_base,

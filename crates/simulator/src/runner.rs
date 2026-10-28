@@ -89,11 +89,11 @@ impl Simulator {
         network_config.accounts = accounts.all_genesis_balances(config.initial_balance);
         let runner = SimulationRunner::new(&network_config, config.seed);
 
-        // Workload generators must anchor validity ranges on simulated time,
-        // not wall clock — chain-side `weighted_timestamp` mirrors the
-        // simulation's millisecond counter (starting near zero), so
-        // wall-clock-anchored windows would land far in the future and the
-        // proposer would filter every tx out as expired.
+        // Workload generators must anchor validity ranges on simulated chain
+        // time, not wall clock — chain-side `weighted_timestamp` follows the
+        // simulated hosts' clocks, so wall-clock-anchored windows would land
+        // anywhere relative to it and the proposer would filter every tx out
+        // as expired.
         let sim_now_ms = Arc::new(AtomicU64::new(0));
         let validity_clock: ValidityClock = {
             let clock = Arc::clone(&sim_now_ms);
@@ -207,7 +207,7 @@ impl Simulator {
         while self.runner.now() < submission_end_time {
             let current_time = self.runner.now();
             self.sim_now_ms.store(
-                u64::try_from(current_time.as_millis()).unwrap_or(u64::MAX),
+                u64::try_from(self.runner.chain_now().as_millis()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
             let batch =

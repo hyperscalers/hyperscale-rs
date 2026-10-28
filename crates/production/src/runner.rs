@@ -453,7 +453,7 @@ impl ProductionRunnerBuilder {
         // validators follow the beacon on the beacon loop until that join seats
         // them. A validator routing still names on a live shard resumes
         // there too, as a running host keeps it seated.
-        let now = consensus_clock(chain_config.genesis_timestamp_ms);
+        let now = wall_clock_local();
         let routing = boot_routing(self.beacon_storage.as_ref(), &beacon_network, now);
         let plan = plan_seats(
             &beacon_state,
@@ -653,7 +653,6 @@ impl ProductionRunnerBuilder {
             engine_bootstrap,
             participation_tx,
             chain_config.epoch_duration_ms,
-            chain_config.genesis_timestamp_ms,
             beacon_event_rx,
             vnode_keys.clone(),
         );
@@ -1339,24 +1338,6 @@ pub fn wall_clock_local() -> LocalTimestamp {
     LocalTimestamp::from_millis(ms)
 }
 
-/// The chain's consensus clock: [`wall_clock_local`] measured relative to
-/// the genesis instant (`BeaconChainConfig::genesis_timestamp_ms`).
-///
-/// Weighted-time and the synthetic beacon epoch clock are anchored at
-/// `epoch × epoch_duration_ms` from zero, so the state machine must be fed
-/// a `now` that also starts near zero at genesis (`Epoch::GENESIS`).
-/// Subtracting the genesis instant puts the runner in the same small-`now`
-/// regime the simulator runs in; the beacon then paces one epoch at a time
-/// instead of trying to cascade through every epoch since the Unix epoch.
-/// The default offset of zero leaves the clock at raw wall-clock.
-pub fn consensus_clock(genesis_offset_ms: u64) -> LocalTimestamp {
-    LocalTimestamp::from_millis(
-        wall_clock_local()
-            .as_millis()
-            .saturating_sub(genesis_offset_ms),
-    )
-}
-
 /// Per-shard pinned-thread configuration.
 pub struct ShardLoopConfig {
     pub(crate) timer_tx: Sender<HostEvent>,
@@ -1379,10 +1360,6 @@ pub struct ShardLoopConfig {
     /// racing on the same `ArcSwap` lose at most one second of
     /// staleness on their slot.
     pub(crate) publishers: RpcPublishers,
-    /// Genesis instant (ms since the Unix epoch) the consensus clock is
-    /// measured against, from `BeaconChainConfig::genesis_timestamp_ms`.
-    /// Zero leaves the loop on raw wall-clock.
-    pub(crate) genesis_offset_ms: u64,
 }
 
 /// Drive one shard's [`ShardLoop`] on its pinned thread. Blocks until
@@ -1422,7 +1399,7 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
             break;
         }
 
-        let now = consensus_clock(config.genesis_offset_ms);
+        let now = wall_clock_local();
         shard_loop.set_time(now);
 
         let event = 'recv: {
@@ -1478,12 +1455,12 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
             };
             // The wait may have outlasted the stamp taken before it: a
             // timer due now is handled at now, not before its deadline.
-            shard_loop.set_time(consensus_clock(config.genesis_offset_ms));
+            shard_loop.set_time(wall_clock_local());
             let output = shard_loop.run_step(input);
             apply_step_output(shard, output, &config, &mut timer_mgr);
         }
 
-        shard_loop.flush_expired_batches(consensus_clock(config.genesis_offset_ms));
+        shard_loop.flush_expired_batches(wall_clock_local());
 
         // Per-shard prometheus emission + RPC status writes. Process-wide
         // pool and peer gauges are emitted from the runner's tokio tick.
@@ -1510,7 +1487,7 @@ fn apply_shard_control(
     timer_mgr: &mut ProdTimerManager,
     control: ShardControl,
 ) {
-    shard_loop.set_time(consensus_clock(config.genesis_offset_ms));
+    shard_loop.set_time(wall_clock_local());
     match control {
         ShardControl::Attach(validator, signer) => {
             let output = shard_loop.attach_signer(validator, signer);
@@ -1669,8 +1646,6 @@ pub struct BeaconLoopConfig {
     /// Placement deltas the participants surface (their own seat
     /// triggers), forwarded to the runner's reconfiguration loop.
     pub(crate) participation_tx: mpsc::UnboundedSender<ParticipationChange>,
-    /// Genesis instant the consensus clock is measured against.
-    pub(crate) genesis_offset_ms: u64,
     /// Where each step's reported headers are summarised and kept.
     pub(crate) headers: Arc<HeaderRing>,
     /// Where each step's observation is published.
@@ -1737,7 +1712,6 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         beacon_rx,
         shutdown_rx,
         participation_tx,
-        genesis_offset_ms,
         headers,
         observations,
         genesis,
@@ -1751,7 +1725,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
     // scratch into ops this thread never sees. Re-arming is idempotent
     // (replace at the table, identical durations), so arm-and-drain
     // unconditionally.
-    let now = consensus_clock(genesis_offset_ms);
+    let now = wall_clock_local();
     beacon.set_time(now);
     let startup = beacon.startup_output();
     apply_beacon_step_output(&mut deadlines, &participation_tx, now, startup);
@@ -1762,7 +1736,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
             info!("Beacon event loop received shutdown signal");
             return;
         }
-        let now = consensus_clock(genesis_offset_ms);
+        let now = wall_clock_local();
         beacon.set_time(now);
 
         // Fire due timers: each fire re-enters the loop as its owner's
@@ -1785,7 +1759,7 @@ fn drive_beacon_loop(beacon: &mut ProdBeaconLoop, config: BeaconLoopConfig) {
         // The select blocks until the wake; re-read the clock so the step
         // and the deadlines its re-arms produce measure from the wake, not
         // the pre-sleep instant.
-        let now = consensus_clock(genesis_offset_ms);
+        let now = wall_clock_local();
         beacon.set_time(now);
         // A timer wake fires at the loop top; a stray non-beacon envelope
         // is dropped.

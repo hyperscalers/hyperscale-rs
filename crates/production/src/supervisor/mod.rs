@@ -46,8 +46,8 @@ use tracing::warn;
 
 use crate::rpc::RpcPublishers;
 use crate::runner::{
-    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, consensus_clock,
-    spawn_shard_loop,
+    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, spawn_shard_loop,
+    wall_clock_local,
 };
 
 mod membership;
@@ -269,11 +269,6 @@ pub struct ShardSupervisor {
     /// Beacon epoch length, for the keeper's deterministic merged-genesis
     /// cut derivation. Matches the beacon's own chain config.
     epoch_duration_ms: u64,
-    /// Genesis instant (ms since the Unix epoch) the consensus clock is
-    /// measured against, from `BeaconChainConfig::genesis_timestamp_ms`.
-    /// Threaded into every shard the supervisor seats so a runtime join
-    /// shares the runner's clock origin.
-    genesis_offset_ms: u64,
     /// Shards whose teardown is parked on the off-loop thread join, each
     /// with its thread's handle until that join takes it. A `Join`
     /// arriving meanwhile queues in [`Self::pending_joins`]. The handle
@@ -334,7 +329,6 @@ impl ShardSupervisor {
         engine_bootstrap: EngineBootstrap,
         participation_tx: mpsc::UnboundedSender<ParticipationChange>,
         epoch_duration_ms: u64,
-        genesis_offset_ms: u64,
         beacon_event_rx: Receiver<HostEvent>,
         vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
     ) -> Self {
@@ -355,7 +349,6 @@ impl ShardSupervisor {
             storage_dir,
             engine_bootstrap,
             participation_tx,
-            genesis_offset_ms,
             shards: BTreeMap::new(),
             bootstrapping: HashMap::new(),
             rebuilding: HashMap::new(),
@@ -426,7 +419,7 @@ impl ShardSupervisor {
         channels: ShardChannels,
         start: LoopStart<'_>,
     ) {
-        shard_loop.set_time(consensus_clock(self.genesis_offset_ms));
+        shard_loop.set_time(wall_clock_local());
         let initial_timer_ops = match start {
             LoopStart::Genesis(genesis) => shard_loop.install_genesis(genesis),
             LoopStart::Resume(recovered) => shard_loop.resume_committed(recovered),
@@ -501,7 +494,6 @@ impl ShardSupervisor {
             participation_tx: self.participation_tx.clone(),
             supervisor_tx: self.events_tx.clone(),
             publishers: self.publishers.clone(),
-            genesis_offset_ms: self.genesis_offset_ms,
         }
     }
 }

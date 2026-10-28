@@ -92,7 +92,7 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
             from,
             recipient(index),
             100,
-            validity_around(runner.now()),
+            validity_around(runner.chain_now()),
         );
         runner.schedule_initial_event(
             0,

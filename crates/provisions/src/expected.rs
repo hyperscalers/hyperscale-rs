@@ -157,10 +157,14 @@ impl ExpectedProvisionTracker {
     /// commit.
     ///
     /// Remote headers can arrive (and register expectations) on a fresh
-    /// chain while the clock still reads zero; without retro-stamping,
-    /// every such entry would report a ~57-year age on the next commit and
-    /// trigger a fallback fetch storm.
-    pub(crate) fn record_block_committed(&mut self, ts: WeightedTimestamp) {
+    /// chain while the clock still reads zero or the `genesis` instant;
+    /// without retro-stamping, every such entry would report its age since
+    /// then on the next commit and trigger a fallback fetch storm.
+    pub(crate) fn record_block_committed(
+        &mut self,
+        ts: WeightedTimestamp,
+        genesis: WeightedTimestamp,
+    ) {
         let first_commit = !self.committed_once;
         self.committed_once = true;
         // The shard coordinator's commit has already advanced the shared
@@ -170,7 +174,7 @@ impl ExpectedProvisionTracker {
 
         if first_commit {
             for expected in self.expected.values_mut() {
-                if expected.discovered_at == WeightedTimestamp::ZERO {
+                if expected.discovered_at <= genesis {
                     expected.discovered_at = ts;
                 }
             }
@@ -191,9 +195,6 @@ impl ExpectedProvisionTracker {
     /// provisions are outstanding; this catches entries that would
     /// otherwise leak indefinitely.
     pub(crate) fn cleanup_orphans(&mut self, cutoff: WeightedTimestamp) -> Vec<Key> {
-        if cutoff <= WeightedTimestamp::ZERO {
-            return Vec::new();
-        }
         let mut dropped = Vec::new();
         self.expected.retain(|key, exp| {
             if exp.source_block_ts >= cutoff {
@@ -303,13 +304,13 @@ mod tests {
     #[test]
     fn the_local_clock_does_not_run_backwards() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(9_000));
+        t.record_block_committed(ts(9_000), WeightedTimestamp::ZERO);
         assert_eq!(t.local_ts(), ts(9_000));
 
-        t.record_block_committed(ts(4_000));
+        t.record_block_committed(ts(4_000), WeightedTimestamp::ZERO);
         assert_eq!(t.local_ts(), ts(9_000), "a regressed anchor holds it");
 
-        t.record_block_committed(ts(11_000));
+        t.record_block_committed(ts(11_000), WeightedTimestamp::ZERO);
         assert_eq!(t.local_ts(), ts(11_000), "and it still advances");
     }
 
@@ -370,7 +371,7 @@ mod tests {
         // Before any commit, an immediate timeout sweep at a non-zero `now`
         // would fire — the entry's discovered_at is still ZERO. The
         // record_block_committed retro-stamp closes that gap.
-        t.record_block_committed(ts(1_000));
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
 
         // Now sweep at the same instant: no firings (we just registered).
         let effects = t.check_timeouts(ts(1_000));
@@ -380,7 +381,7 @@ mod tests {
     #[test]
     fn timeout_emits_effect_after_threshold() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000));
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -415,7 +416,7 @@ mod tests {
     #[test]
     fn verified_before_timeout_never_emits() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000));
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -435,7 +436,7 @@ mod tests {
     #[test]
     fn flush_all_bypasses_timeout() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000));
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -459,7 +460,7 @@ mod tests {
     #[test]
     fn cleanup_orphans_drops_aged_entries() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000));
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
         t.register(
             ShardId::leaf(2, 1),
             BlockHeight::new(10),
@@ -470,7 +471,7 @@ mod tests {
         // Advance well past RETENTION_HORIZON.
         let far_future =
             ts(1_000 + 2 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
-        t.record_block_committed(far_future);
+        t.record_block_committed(far_future, WeightedTimestamp::ZERO);
 
         let cutoff = far_future.minus(RETENTION_HORIZON);
         let dropped = t.cleanup_orphans(cutoff);
@@ -488,7 +489,7 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
 
         // Register while the local clock lags far behind the source block.
-        t.record_block_committed(ts(1_000));
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
         let recent_source =
             ts(1_000 + 2 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
         t.register(
@@ -501,7 +502,7 @@ mod tests {
         // Catch up: the cutoff now predates the stale `discovered_at` (1_000)
         // but not the recent source block.
         let now = ts(1_000 + 3 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
-        t.record_block_committed(now);
+        t.record_block_committed(now, WeightedTimestamp::ZERO);
         let cutoff = now.minus(RETENTION_HORIZON);
         assert!(
             cutoff > ts(1_000),

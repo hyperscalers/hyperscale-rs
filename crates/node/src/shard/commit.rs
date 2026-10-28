@@ -1116,7 +1116,10 @@ mod tests {
         );
         let block_hash = block.hash();
         let qc = {
-            let __qc = QuorumCertificate::genesis(block.header().shard_id(), ChainOrigin::ROOT);
+            let __qc = QuorumCertificate::genesis(
+                block.header().shard_id(),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            );
             QuorumCertificate::new(
                 block_hash,
                 __qc.shard_id(),
@@ -2069,7 +2072,8 @@ mod tests {
     }
 
     fn linked_qc(block_hash: BlockHash, wt_ms: u64) -> QuorumCertificate {
-        let g = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let g =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         QuorumCertificate::new(
             block_hash,
             g.shard_id(),
@@ -2380,7 +2384,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(4),
         );
-        let pending_chain = Arc::new(PendingChain::new(Arc::clone(&store), ChainOrigin::ROOT));
+        let pending_chain = Arc::new(PendingChain::new(Arc::clone(&store), BlockHeight::GENESIS));
         let prepared_commits = Arc::new(Mutex::new(PreparedCommitMap::new()));
         let prepped = run_qc_only_prep(
             &pending_chain,
@@ -2500,7 +2504,7 @@ mod tests {
             WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS + 1),
         );
         run_qc_only_prep(
-            &Arc::new(PendingChain::new(store, ChainOrigin::ROOT)),
+            &Arc::new(PendingChain::new(store, BlockHeight::GENESIS)),
             &Arc::new(Mutex::new(PreparedCommitMap::new())),
             &QcOnlyCommit {
                 certified: Arc::new(Verified::new_unchecked_for_test(

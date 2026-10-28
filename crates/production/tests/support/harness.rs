@@ -40,7 +40,8 @@ use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation,
     GenesisValidators, ShardId, StateRoot, SubstateKey, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    shard_prefix_path,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -227,11 +228,8 @@ impl Harness {
         } = spec;
         assert!(!hosts.is_empty(), "cluster needs at least one host");
 
-        // Anchor the consensus clock for every host to one shared genesis
-        // instant captured now, so weighted-time and the beacon epoch clock
-        // start near zero (epoch 0) instead of ~1.7e12 ms into the Unix
-        // epoch. All hosts subtracting the same offset keeps their relative
-        // clocks consistent.
+        // Every host shares one genesis instant captured now, so epoch 0
+        // opens as the cluster starts rather than paced from a fixed date.
         let mut chain_config = beacon_chain_config;
         chain_config.genesis_timestamp_ms = now_millis();
 
@@ -406,7 +404,15 @@ impl Harness {
                         shard_prefix_path(shard),
                     )
                     .expect("open the store the genesis installs into");
-                    let _ = network_genesis_block(&store, shard, &topology, &config);
+                    let _ = network_genesis_block(
+                        &store,
+                        shard,
+                        &topology,
+                        &config,
+                        WeightedTimestamp::from_millis(
+                            self.build.beacon_chain_config.genesis_timestamp_ms,
+                        ),
+                    );
                 }
             }
             Replacement::ParentClone(parent) => {
@@ -670,7 +676,14 @@ impl Harness {
     /// consensus state. `None` if no host serves `shard`.
     pub fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
         let store = self.store_for(shard)?;
-        Some(store.load_recovered_state(shard).chain_origin)
+        let genesis =
+            WeightedTimestamp::from_millis(self.build.beacon_chain_config.genesis_timestamp_ms);
+        Some(
+            store
+                .load_recovered_state(shard)
+                .chain_origin
+                .unwrap_or_else(|| ChainOrigin::root(genesis)),
+        )
     }
 
     /// The work `shard`'s committed tip leaves owing against the drain,
@@ -1055,7 +1068,7 @@ fn copy_dir_except(from: &Path, to: &Path, skip: &[PathBuf]) -> std::io::Result<
 }
 
 /// Wall-clock milliseconds since the Unix epoch — the shared genesis
-/// instant the cluster anchors every host's consensus clock to.
+/// instant the cluster opens epoch 0 at.
 fn now_millis() -> u64 {
     u64::try_from(
         std::time::SystemTime::now()

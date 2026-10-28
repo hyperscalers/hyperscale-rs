@@ -178,7 +178,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::BlockIntent;
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, ChainOrigin, Hash,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, Hash,
         MerkleInclusionProof, SettledWrites, ShardId, StateRoot, WeightedTimestamp,
     };
 
@@ -190,7 +190,7 @@ mod tests {
     fn chain_with_a_retired_provision() -> PendingChain<SimShardStorage> {
         PendingChain::new(
             Arc::new(store_with_a_retired_provision()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         )
     }
 
@@ -319,7 +319,7 @@ mod tests {
     fn a_height_beneath_the_chain_floor_is_answered_below_floor() {
         let storage = store_with_a_retired_provision();
         storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(2));
-        let chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
         for intent in [BlockIntent::Execute, BlockIntent::History] {
             let response = serve_block_request(
                 &chain,
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn a_history_answer_sheds_bodies_the_walk_will_not_keep() {
         let storage = Arc::new(SimShardStorage::default());
-        let chain = PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT);
+        let chain = PendingChain::new(Arc::clone(&storage), BlockHeight::GENESIS);
         let block = live_block_with_a_provision(BlockHeight::new(1));
         let hash = block.hash();
         chain.insert(
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn a_named_request_is_answered_by_the_named_block_only() {
         let storage = Arc::new(SimShardStorage::default());
-        let chain = PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT);
+        let chain = PendingChain::new(Arc::clone(&storage), BlockHeight::GENESIS);
         let loser = make_test_block(BlockHeight::new(1));
         let winner = make_test_block_with_anchor_wt(BlockHeight::new(1), 5);
         let (loser_hash, winner_hash) = (loser.hash(), winner.hash());

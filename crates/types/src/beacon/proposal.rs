@@ -466,12 +466,16 @@ mod tests {
     use super::*;
     use crate::{
         ChainOrigin, PcValueElement, PcVector, PcVoteRound, ShardId, SpcView, ValidatorId,
+        WeightedTimestamp,
     };
 
     fn sample_boundary_qcs() -> BTreeMap<ShardId, Option<QuorumCertificate>> {
         std::iter::once((
             ShardId::ROOT,
-            Some(QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT)),
+            Some(QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )),
         ))
         .collect()
     }

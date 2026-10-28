@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_types::BlockHeight;
 use hyperscale_types::network::response::{
     GetBlockResponse, GetStateRangeResponse, GetWitnessHistoryResponse,
 };
-use hyperscale_types::{BlockHeight, ChainOrigin};
 
 use super::BootstrapRequest;
 use super::state_range_serve::serve_state_range_request;
@@ -45,9 +45,9 @@ impl<S: ShardStorage> StoreResponder<S> {
     #[must_use]
     pub fn new(storage: Arc<S>) -> Self {
         Self {
-            // The origin only floors committed-window walks, and the
+            // The genesis height only floors committed-window walks, and the
             // serve functions read single heights, never a window.
-            chain: PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT),
+            chain: PendingChain::new(Arc::clone(&storage), BlockHeight::GENESIS),
             storage,
             // History blocks are served sealed, so no provision body is
             // ever looked up.

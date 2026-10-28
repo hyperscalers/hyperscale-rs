@@ -244,8 +244,11 @@ impl Default for BlockHeaderParts {
             shard_id: ShardId::ROOT,
             height: BlockHeight::GENESIS,
             parent_block_hash: BlockHash::from_raw(Hash::ZERO),
-            parent_qc: Verified::<QuorumCertificate>::genesis(ShardId::ROOT, ChainOrigin::ROOT)
-                .into(),
+            parent_qc: Verified::<QuorumCertificate>::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -330,7 +333,7 @@ impl BlockHeader {
     /// Create a genesis block header with the given proposer and JMT
     /// state. The [`ChainOrigin`] supplies the genesis height and the
     /// chain's start-time anchor (see [`QuorumCertificate::genesis`]):
-    /// [`ChainOrigin::ROOT`] for chains born at network genesis; a child
+    /// [`ChainOrigin::root`] for chains born at network genesis; a child
     /// chain created by a shard split continues the parent's height line
     /// and clock.
     #[must_use]
@@ -894,7 +897,7 @@ mod tests {
             ShardId::ROOT,
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         )
     }
 
@@ -1139,8 +1142,10 @@ mod tests {
     fn with_verified_parent_qc_upgrades_matching_header() {
         let mut header = sample_header();
         header.parent_qc = header.parent_qc.as_unverified().clone().into();
-        let verified_qc =
-            Verified::<QuorumCertificate>::genesis(header.shard_id(), ChainOrigin::ROOT);
+        let verified_qc = Verified::<QuorumCertificate>::genesis(
+            header.shard_id(),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let verified = Verified::<BlockHeader>::with_verified_parent_qc(header, verified_qc)
             .expect("matching parent_qc accepted");
         assert!(verified.parent_qc_verified().is_genesis());
@@ -1152,7 +1157,10 @@ mod tests {
     fn with_verified_parent_qc_rejects_mismatched_witness() {
         let header = sample_header();
         let other_shard = ShardId::from_heap_index(header.shard_id().inner() + 1);
-        let mismatched = Verified::<QuorumCertificate>::genesis(other_shard, ChainOrigin::ROOT);
+        let mismatched = Verified::<QuorumCertificate>::genesis(
+            other_shard,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let err = Verified::<BlockHeader>::with_verified_parent_qc(header, mismatched)
             .expect_err("mismatched parent_qc rejected");
         assert_eq!(err, BlockHeaderParentQcMismatch);

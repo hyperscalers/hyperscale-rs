@@ -350,10 +350,10 @@ pub struct ConsensusState {
     /// Mirrors the production `provisions` CF: a stored block keeps only
     /// the hashes, so this is what a replay reads the bodies back from.
     pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
-    /// The chain's origin — `ChainOrigin::ROOT` except for a split
-    /// child's adopted store, where recovery must reconstruct the
-    /// continued height line and clock.
-    pub(crate) chain_origin: ChainOrigin,
+    /// The origin a reshape successor's adopted store records, where
+    /// recovery must reconstruct the continued height line and clock.
+    /// `None` for a chain born at network genesis.
+    pub(crate) chain_origin: Option<ChainOrigin>,
     /// The height of the genesis this store installed: the network
     /// genesis ceremony's, or a reshape successor's adopted at its flip.
     pub(crate) installed_genesis: Option<BlockHeight>,
@@ -363,7 +363,8 @@ pub struct ConsensusState {
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
     /// tag differs from the current `chain_origin`.
-    pub(crate) safe_vote_registers: OrdMap<ValidatorId, (ChainOrigin, Arc<SafeVoteRegisters>)>,
+    pub(crate) safe_vote_registers:
+        OrdMap<ValidatorId, (Option<ChainOrigin>, Arc<SafeVoteRegisters>)>,
     /// Blocks written beside a validator's safe-vote registers, keyed by
     /// height then hash and tagged with the chain origin that wrote them.
     /// Mirrors the production `voted_blocks` CF: the uncommitted chain
@@ -372,7 +373,7 @@ pub struct ConsensusState {
     /// on every commit — the hash in the key keeps a fork sibling from
     /// displacing its rival before then — and, like the registers,
     /// ignored by reads once the tag no longer matches.
-    pub(crate) voted_blocks: OrdMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
+    pub(crate) voted_blocks: OrdMap<(BlockHeight, BlockHash), (Option<ChainOrigin>, Arc<Block>)>,
     /// What the credits of the blocks this store committed burned past
     /// `u128::MAX`, by cell: each block's counted once, where it lands.
     pub(crate) credit_burns: CreditBurns,
@@ -391,7 +392,7 @@ impl ConsensusState {
             consensus_receipts: OrdMap::new(),
             beacon_witnesses: OrdMap::new(),
             provisions: OrdMap::new(),
-            chain_origin: ChainOrigin::ROOT,
+            chain_origin: None,
             installed_genesis: None,
             chain_floor: BlockHeight::GENESIS,
             safe_vote_registers: OrdMap::new(),

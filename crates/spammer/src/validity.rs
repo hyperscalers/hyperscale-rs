@@ -1,10 +1,9 @@
 //! Helper for building per-tx `TimestampRange` values on the chain's clock.
 //!
 //! The chain enforces validity windows against the parent QC's
-//! `WeightedTimestamp` — a BFT-authenticated millisecond clock that counts
-//! from the network's genesis instant, not from the Unix epoch. Submitters
-//! read their own wall clock and subtract that instant; the 60s default
-//! range absorbs sub-second skew between submitter and chain.
+//! `WeightedTimestamp` — a BFT-authenticated clock in Unix milliseconds.
+//! Submitters read their own wall clock; the 60s default range absorbs
+//! sub-second skew between submitter and chain.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -49,26 +48,27 @@ mod tests {
 
     use super::*;
 
-    /// A window opens at the chain time the node judges it by, which counts
-    /// from genesis: one stamped in Unix milliseconds would open decades
-    /// past every block's anchor and never be proposed.
+    /// A window opens at the wall clock's Unix reading of now, which is
+    /// the time the node judges it by, whatever the network's genesis.
     #[test]
     fn a_window_opens_at_the_chains_reading_of_now() {
-        let genesis_timestamp_ms = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap()
-            - 42_000;
-
-        let range = chain_clock(genesis_timestamp_ms)();
+        let unix_ms = || {
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        };
+        let before = unix_ms();
+        let range = chain_clock(before - 42_000)();
+        let after = unix_ms();
 
         let opened = range.start_timestamp_inclusive.as_millis();
         assert!(
-            (42_000..42_000 + 60_000).contains(&opened),
-            "the window opens about 42 s into the chain, at {opened} ms"
+            (before..=after).contains(&opened),
+            "the window opens at now, {before}..={after} ms, not at {opened} ms"
         );
         assert_eq!(
             range.end_timestamp_exclusive,

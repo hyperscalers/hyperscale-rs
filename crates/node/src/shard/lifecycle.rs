@@ -21,7 +21,8 @@ use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, RecoveredState, ShardStorage};
 use hyperscale_types::{
-    Block, CertifiedBlock, ChainOrigin, ShardId, StateRoot, TopologySnapshot, ValidatorId, Verified,
+    Block, CertifiedBlock, ChainOrigin, ShardId, StateRoot, TopologySnapshot, ValidatorId,
+    Verified, WeightedTimestamp,
 };
 
 use crate::host::{NodeHost, ShardGenesis};
@@ -85,11 +86,13 @@ where
         S: GenesisCommit,
     {
         let topology_snapshot = self.process.topology_snapshot.load_full();
+        let genesis = self.process.topology_schedule().windows().origin();
         let block = network_genesis_block(
             self.shard_io(shard).storage.as_ref(),
             shard,
             &topology_snapshot,
             config,
+            genesis,
         );
         self.initialize_shard_genesis(&block);
         self.flush_all_batches();
@@ -124,9 +127,9 @@ const GENESIS_PROPOSER: ValidatorId = ValidatorId::new(0);
 ///
 /// This is the ceremony every member of a network-genesis shard ran at
 /// birth. `config` is the
-/// network's genesis config, so every store that runs this builds the
-/// same block, and block sync extends it with the chain the members
-/// committed since.
+/// network's genesis config and `genesis` its genesis instant, so every
+/// store that runs this builds the same block, and block sync extends it
+/// with the chain the members committed since.
 ///
 /// `topology_snapshot` places the genesis accounts: a store holds only
 /// the ones whose address falls in `shard`'s range, which is the same
@@ -145,6 +148,7 @@ pub fn network_genesis_block<S: GenesisCommit>(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     config: &GenesisConfig,
+    genesis: WeightedTimestamp,
 ) -> Block {
     // A per-shard store holds only its own shard's accounts:
     // prefix-rooting (each store roots its JMT at the shard's prefix)
@@ -162,16 +166,26 @@ pub fn network_genesis_block<S: GenesisCommit>(
     let jmt_writes =
         filter_genesis_writes_for_shard(&merged, owned_by(shard, topology_snapshot.shard_trie()));
     let state_root = storage.install_genesis(&merged, &jmt_writes);
-    installed_network_genesis_block(shard, state_root)
+    installed_network_genesis_block(shard, state_root, genesis)
 }
 
 /// The network genesis block of a store that already installed it.
 ///
-/// `state_root` is the genesis root the store holds, so this is the block
+/// `state_root` is the genesis root the store holds and `genesis` the
+/// network's genesis instant, so this is the block
 /// [`network_genesis_block`] built at the install. A store that crashed
 /// before committing past its genesis resumes from it rather than
 /// installing again.
 #[must_use]
-pub fn installed_network_genesis_block(shard: ShardId, state_root: StateRoot) -> Block {
-    Block::genesis(shard, GENESIS_PROPOSER, state_root, ChainOrigin::ROOT)
+pub fn installed_network_genesis_block(
+    shard: ShardId,
+    state_root: StateRoot,
+    genesis: WeightedTimestamp,
+) -> Block {
+    Block::genesis(
+        shard,
+        GENESIS_PROPOSER,
+        state_root,
+        ChainOrigin::root(genesis),
+    )
 }

@@ -103,7 +103,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::{BlockHash, ProposerTimestamp};
+    use crate::{BlockHash, ProposerTimestamp, WeightedTimestamp};
 
     #[test]
     fn test_message_type_id() {
@@ -124,11 +124,18 @@ mod tests {
             shard_id: ShardId::leaf(1, 1),
             height: BlockHeight::new(42),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::leaf(1, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             ..Default::default()
         });
-        let qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
+        let qc = QuorumCertificate::genesis(
+            ShardId::leaf(1, 0),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
 
         let gossip = CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
@@ -154,7 +161,10 @@ mod tests {
             height: BlockHeight::new(42),
             ..Default::default()
         });
-        let qc = QuorumCertificate::genesis(ShardId::leaf(1, qc_shard), ChainOrigin::ROOT);
+        let qc = QuorumCertificate::genesis(
+            ShardId::leaf(1, qc_shard),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
             sender: ValidatorId::new(sender),

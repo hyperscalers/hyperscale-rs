@@ -746,7 +746,10 @@ impl DbCodec<ValidatorId> for ValidatorIdCodec {
 }
 
 /// Value codec for a record bound to a chain incarnation: a 16-byte
-/// chain origin followed by the HBOR-encoded value.
+/// chain origin followed by the HBOR-encoded value. A chain born at
+/// network genesis records no origin, and its tag is sixteen zero bytes,
+/// which no recorded origin encodes to: a reshape successor's genesis
+/// height is never zero.
 ///
 /// The origin stays a raw prefix so a record's incarnation reads without
 /// decoding the rest, which is what lets a store adopted from a parent
@@ -763,31 +766,42 @@ impl<T> Default for OriginTaggedCodec<T> {
 /// Bytes the [`ChainOrigin`] prefix occupies in an origin-tagged record.
 const CHAIN_ORIGIN_BYTES: usize = 16;
 
-impl<T: HborEncode> DbEncode<(ChainOrigin, T)> for OriginTaggedCodec<T> {
-    fn encode_to(&self, value: &(ChainOrigin, T), buf: &mut Vec<u8>) {
-        ChainOriginCodec.encode_to(&value.0, buf);
+impl<T: HborEncode> DbEncode<(Option<ChainOrigin>, T)> for OriginTaggedCodec<T> {
+    fn encode_to(&self, value: &(Option<ChainOrigin>, T), buf: &mut Vec<u8>) {
+        match &value.0 {
+            Some(origin) => ChainOriginCodec.encode_to(origin, buf),
+            None => buf.extend_from_slice(&[0; CHAIN_ORIGIN_BYTES]),
+        }
         HborCodec::<T>::default().encode_to(&value.1, buf);
     }
 }
 
-impl<T: HborEncode + HborDecode> DbCodec<(ChainOrigin, T)> for OriginTaggedCodec<T> {
-    fn decode(&self, bytes: &[u8]) -> (ChainOrigin, T) {
+impl<T: HborEncode + HborDecode> DbCodec<(Option<ChainOrigin>, T)> for OriginTaggedCodec<T> {
+    fn decode(&self, bytes: &[u8]) -> (Option<ChainOrigin>, T) {
         assert!(
             bytes.len() > CHAIN_ORIGIN_BYTES,
             "an origin-tagged record must carry an origin and a value"
         );
-        let origin = ChainOriginCodec.decode(&bytes[..CHAIN_ORIGIN_BYTES]);
+        let tag = &bytes[..CHAIN_ORIGIN_BYTES];
+        let origin = tag
+            .iter()
+            .any(|byte| *byte != 0)
+            .then(|| ChainOriginCodec.decode(tag));
         let value = HborCodec::<T>::default().decode(&bytes[CHAIN_ORIGIN_BYTES..]);
         (origin, value)
     }
 }
+
+/// A validator's safe-vote registers tagged with the chain incarnation
+/// that wrote them.
+pub type TaggedRegisters = (Option<ChainOrigin>, SafeVoteRegisters);
 
 /// Durable safe-vote registers per validator; see [`SAFE_VOTE_REGISTERS_CF`].
 pub struct SafeVoteRegistersCf;
 impl TypedCf for SafeVoteRegistersCf {
     const NAME: &'static str = SAFE_VOTE_REGISTERS_CF;
     type Key = ValidatorId;
-    type Value = (ChainOrigin, SafeVoteRegisters);
+    type Value = TaggedRegisters;
     type KeyCodec = ValidatorIdCodec;
     type ValueCodec = OriginTaggedCodec<SafeVoteRegisters>;
     type Handles<'a> = CfHandles<'a>;
@@ -829,7 +843,7 @@ pub struct VotedBlocksCf;
 impl TypedCf for VotedBlocksCf {
     const NAME: &'static str = VOTED_BLOCKS_CF;
     type Key = (BlockHeight, BlockHash);
-    type Value = (ChainOrigin, Block);
+    type Value = (Option<ChainOrigin>, Block);
     type KeyCodec = VotedBlockKeyCodec;
     type ValueCodec = OriginTaggedCodec<Block>;
     type Handles<'a> = CfHandles<'a>;
