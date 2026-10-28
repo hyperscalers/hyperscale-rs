@@ -90,28 +90,34 @@ struct Envelope {
 enum SimEvent {
     PcVote1 {
         from: ValidatorId,
+        epoch: Epoch,
         view: SpcView,
         vote: PcVote1,
     },
     PcVote2 {
         from: ValidatorId,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote2>,
     },
     PcVote3 {
         from: ValidatorId,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote3>,
     },
     SpcNewView {
+        epoch: Epoch,
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
     },
     SpcNewCommit {
+        epoch: Epoch,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
     },
     SpcEmptyView {
+        epoch: Epoch,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     },
     BeaconProposal {
@@ -1208,23 +1214,25 @@ impl CoordinatorSim {
 
     fn deliver(&mut self, env: Envelope) -> Vec<Action> {
         match env.event {
-            SimEvent::PcVote1 { view, vote, .. } => {
-                self.coordinators[env.to_idx].on_pc_vote1_received(view, vote)
+            SimEvent::PcVote1 {
+                epoch, view, vote, ..
+            } => self.coordinators[env.to_idx].on_pc_vote1_received(epoch, view, vote),
+            SimEvent::PcVote2 {
+                epoch, view, vote, ..
+            } => self.coordinators[env.to_idx].on_pc_vote2_received(epoch, view, vote),
+            SimEvent::PcVote3 {
+                epoch, view, vote, ..
+            } => self.coordinators[env.to_idx].on_pc_vote3_received(epoch, view, vote),
+            SimEvent::SpcNewView {
+                epoch,
+                from,
+                proposal,
+            } => self.coordinators[env.to_idx].on_spc_new_view_received(epoch, from, proposal),
+            SimEvent::SpcNewCommit { epoch, from, msg } => {
+                self.coordinators[env.to_idx].on_spc_new_commit_received(epoch, from, msg)
             }
-            SimEvent::PcVote2 { view, vote, .. } => {
-                self.coordinators[env.to_idx].on_pc_vote2_received(view, vote)
-            }
-            SimEvent::PcVote3 { view, vote, .. } => {
-                self.coordinators[env.to_idx].on_pc_vote3_received(view, vote)
-            }
-            SimEvent::SpcNewView { from, proposal } => {
-                self.coordinators[env.to_idx].on_spc_new_view_received(from, proposal)
-            }
-            SimEvent::SpcNewCommit { from, msg } => {
-                self.coordinators[env.to_idx].on_spc_new_commit_received(from, msg)
-            }
-            SimEvent::SpcEmptyView { msg } => {
-                self.coordinators[env.to_idx].on_unverified_spc_empty_view_received(msg)
+            SimEvent::SpcEmptyView { epoch, msg } => {
+                self.coordinators[env.to_idx].on_unverified_spc_empty_view_received(epoch, msg)
             }
             SimEvent::BeaconProposal {
                 from,
@@ -1390,7 +1398,7 @@ impl CoordinatorSim {
                     v_in.clone(),
                 )
                 .expect("sign");
-                self.queue_pc_vote1(emitter_idx, me, &recipients, view, vote);
+                self.queue_pc_vote1(emitter_idx, me, &recipients, epoch, view, vote);
                 // Byzantine equivocation at round 1: sign and broadcast
                 // a second vote over a perturbed `v_in` so the same
                 // signer attests to two distinct vectors at the same
@@ -1411,7 +1419,14 @@ impl CoordinatorSim {
                         conflicting_v_in,
                     )
                     .expect("sign");
-                    self.queue_pc_vote1(emitter_idx, me, &recipients, view, conflicting_vote);
+                    self.queue_pc_vote1(
+                        emitter_idx,
+                        me,
+                        &recipients,
+                        epoch,
+                        view,
+                        conflicting_vote,
+                    );
                 }
             }
             Action::SignAndBroadcastPcVote2 {
@@ -1429,7 +1444,7 @@ impl CoordinatorSim {
                     *qc1,
                 )
                 .expect("sign");
-                self.queue_pc_vote2(emitter_idx, me, &recipients, view, Box::new(vote));
+                self.queue_pc_vote2(emitter_idx, me, &recipients, epoch, view, Box::new(vote));
             }
             Action::SignAndBroadcastPcVote3 {
                 epoch,
@@ -1446,7 +1461,7 @@ impl CoordinatorSim {
                     *qc2,
                 )
                 .expect("sign");
-                self.queue_pc_vote3(emitter_idx, me, &recipients, view, Box::new(vote));
+                self.queue_pc_vote3(emitter_idx, me, &recipients, epoch, view, Box::new(vote));
             }
             Action::SignAndBroadcastEmptyView {
                 epoch,
@@ -1470,17 +1485,18 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::SpcEmptyView {
+                            epoch,
                             msg: Arc::clone(&msg),
                         },
                     });
                 }
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::SpcEmptyView { msg },
+                    event: SimEvent::SpcEmptyView { epoch, msg },
                 });
             }
             Action::BroadcastSpcNewView {
-                epoch: _,
+                epoch,
                 proposal,
                 recipients,
             } => {
@@ -1490,6 +1506,7 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::SpcNewView {
+                            epoch,
                             from: me,
                             proposal: Arc::clone(&proposal),
                         },
@@ -1497,7 +1514,7 @@ impl CoordinatorSim {
                 }
             }
             Action::BroadcastSpcNewCommit {
-                epoch: _,
+                epoch,
                 msg,
                 recipients,
             } => {
@@ -1507,6 +1524,7 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::SpcNewCommit {
+                            epoch,
                             from: me,
                             msg: Arc::clone(&msg),
                         },
@@ -1914,6 +1932,7 @@ impl CoordinatorSim {
         emitter_idx: usize,
         me: ValidatorId,
         recipients: &[ValidatorId],
+        epoch: Epoch,
         view: SpcView,
         vote: PcVote1,
     ) {
@@ -1923,6 +1942,7 @@ impl CoordinatorSim {
                 to_idx,
                 event: SimEvent::PcVote1 {
                     from: me,
+                    epoch,
                     view,
                     vote: vote.clone(),
                 },
@@ -1932,6 +1952,7 @@ impl CoordinatorSim {
             to_idx: emitter_idx,
             event: SimEvent::PcVote1 {
                 from: me,
+                epoch,
                 view,
                 vote,
             },
@@ -1943,6 +1964,7 @@ impl CoordinatorSim {
         emitter_idx: usize,
         me: ValidatorId,
         recipients: &[ValidatorId],
+        epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote2>,
     ) {
@@ -1952,6 +1974,7 @@ impl CoordinatorSim {
                 to_idx,
                 event: SimEvent::PcVote2 {
                     from: me,
+                    epoch,
                     view,
                     vote: vote.clone(),
                 },
@@ -1961,6 +1984,7 @@ impl CoordinatorSim {
             to_idx: emitter_idx,
             event: SimEvent::PcVote2 {
                 from: me,
+                epoch,
                 view,
                 vote,
             },
@@ -1972,6 +1996,7 @@ impl CoordinatorSim {
         emitter_idx: usize,
         me: ValidatorId,
         recipients: &[ValidatorId],
+        epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote3>,
     ) {
@@ -1981,6 +2006,7 @@ impl CoordinatorSim {
                 to_idx,
                 event: SimEvent::PcVote3 {
                     from: me,
+                    epoch,
                     view,
                     vote: vote.clone(),
                 },
@@ -1990,6 +2016,7 @@ impl CoordinatorSim {
             to_idx: emitter_idx,
             event: SimEvent::PcVote3 {
                 from: me,
+                epoch,
                 view,
                 vote,
             },

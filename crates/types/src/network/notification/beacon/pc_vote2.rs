@@ -4,19 +4,23 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::{MessageClass, NetworkMessage, PcVote2, SpcView, Verifiable};
+use crate::{Epoch, MessageClass, NetworkMessage, PcVote2, SpcView, Verifiable};
 
 /// PC round-2 vote sent via unicast to peers in the slot's committee.
 ///
 /// The inner [`PcVote2`] is self-authenticating — it carries the signer
 /// id, one signature per prefix of `x`, the round-1 QC the signer
 /// is building on, and a length attestation pinning `|x|`. The wrapping
-/// `view` rides alongside because PC votes don't carry their SPC view
-/// internally. Wire decode lands the wrapper as `Verifiable::Unverified`;
+/// `epoch` and `view` ride alongside because PC votes don't carry their
+/// scope internally. Wire decode lands the wrapper as `Verifiable::Unverified`;
 /// local-dispatched sends from a colocated voter preserve
 /// `Verifiable::Verified`.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct PcVote2Notification {
+    /// Epoch whose SPC instance produced this vote. Bound into the
+    /// vote's signing scope, so a vote relabelled across epochs fails
+    /// verification.
+    pub epoch: Epoch,
     /// SPC view whose inner PC produced this vote.
     pub view: SpcView,
     /// The vote.
@@ -27,8 +31,9 @@ impl PcVote2Notification {
     /// Wrap a [`PcVote2`] for notification. Accepts a raw vote or a
     /// `Verified<PcVote2>`.
     #[must_use]
-    pub fn new(view: SpcView, vote: impl Into<Arc<Verifiable<PcVote2>>>) -> Self {
+    pub fn new(epoch: Epoch, view: SpcView, vote: impl Into<Arc<Verifiable<PcVote2>>>) -> Self {
         Self {
+            epoch,
             view,
             vote: vote.into(),
         }
@@ -90,8 +95,11 @@ mod tests {
 
     #[test]
     fn hbor_round_trip() {
-        let n =
-            PcVote2Notification::new(SpcView::new(2), Arc::new(Verifiable::from(sample_vote())));
+        let n = PcVote2Notification::new(
+            Epoch::new(3),
+            SpcView::new(2),
+            Arc::new(Verifiable::from(sample_vote())),
+        );
         let bytes = hbor_to_vec(&n).unwrap();
         let decoded: PcVote2Notification = hbor_from_slice(&bytes).unwrap();
         assert_eq!(n, decoded);

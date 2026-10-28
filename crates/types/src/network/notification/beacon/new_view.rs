@@ -63,6 +63,12 @@ impl SpcNewViewNotification {
         }
     }
 
+    /// Epoch whose SPC instance the message belongs to.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
     /// Get the inner proposal object (raw view, regardless of
     /// verification state).
     #[must_use]

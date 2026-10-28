@@ -88,9 +88,14 @@ where
             };
             ctx.network.notify(
                 &recipients,
-                &PcVote1Notification::new(view, Arc::new(Verifiable::from(verified.clone()))),
+                &PcVote1Notification::new(
+                    epoch,
+                    view,
+                    Arc::new(Verifiable::from(verified.clone())),
+                ),
             );
             ctx.notify_protocol(ProtocolEvent::VerifiedPcVote1Received {
+                epoch,
                 view,
                 vote: verified,
             });
@@ -116,9 +121,14 @@ where
             };
             ctx.network.notify(
                 &recipients,
-                &PcVote2Notification::new(view, Arc::new(Verifiable::from(verified.clone()))),
+                &PcVote2Notification::new(
+                    epoch,
+                    view,
+                    Arc::new(Verifiable::from(verified.clone())),
+                ),
             );
             ctx.notify_protocol(ProtocolEvent::VerifiedPcVote2Received {
+                epoch,
                 view,
                 vote: Box::new(verified),
             });
@@ -144,9 +154,14 @@ where
             };
             ctx.network.notify(
                 &recipients,
-                &PcVote3Notification::new(view, Arc::new(Verifiable::from(verified.clone()))),
+                &PcVote3Notification::new(
+                    epoch,
+                    view,
+                    Arc::new(Verifiable::from(verified.clone())),
+                ),
             );
             ctx.notify_protocol(ProtocolEvent::VerifiedPcVote3Received {
+                epoch,
                 view,
                 vote: Box::new(verified),
             });
@@ -182,6 +197,7 @@ where
                 ),
             );
             ctx.notify_protocol(ProtocolEvent::VerifiedSpcEmptyViewReceived {
+                epoch,
                 msg: Box::new(verified),
             });
         }

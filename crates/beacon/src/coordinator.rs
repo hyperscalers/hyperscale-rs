@@ -404,53 +404,72 @@ impl BeaconCoordinator {
     }
 
     /// A peer's round-1 PC vote arrived.
-    pub fn on_pc_vote1_received(&mut self, view: SpcView, vote: PcVote1) -> Vec<Action> {
-        self.drive(|p, _| p.on_pc_vote1_received(view, vote))
+    pub fn on_pc_vote1_received(
+        &mut self,
+        epoch: Epoch,
+        view: SpcView,
+        vote: PcVote1,
+    ) -> Vec<Action> {
+        self.drive(|p, _| p.on_pc_vote1_received(epoch, view, vote))
     }
 
     /// A peer's round-2 PC vote arrived.
-    pub fn on_pc_vote2_received(&mut self, view: SpcView, vote: Box<PcVote2>) -> Vec<Action> {
-        self.drive(|p, _| p.on_pc_vote2_received(view, vote))
+    pub fn on_pc_vote2_received(
+        &mut self,
+        epoch: Epoch,
+        view: SpcView,
+        vote: Box<PcVote2>,
+    ) -> Vec<Action> {
+        self.drive(|p, _| p.on_pc_vote2_received(epoch, view, vote))
     }
 
     /// A peer's round-3 PC vote arrived.
-    pub fn on_pc_vote3_received(&mut self, view: SpcView, vote: Box<PcVote3>) -> Vec<Action> {
-        self.drive(|p, _| p.on_pc_vote3_received(view, vote))
+    pub fn on_pc_vote3_received(
+        &mut self,
+        epoch: Epoch,
+        view: SpcView,
+        vote: Box<PcVote3>,
+    ) -> Vec<Action> {
+        self.drive(|p, _| p.on_pc_vote3_received(epoch, view, vote))
     }
 
     /// A peer's SPC `new-view` arrived.
     pub fn on_spc_new_view_received(
         &mut self,
+        epoch: Epoch,
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
     ) -> Vec<Action> {
-        self.drive(|p, _| p.on_spc_new_view_received(from, proposal))
+        self.drive(|p, _| p.on_spc_new_view_received(epoch, from, proposal))
     }
 
     /// A peer's SPC `new-commit` arrived.
     pub fn on_spc_new_commit_received(
         &mut self,
+        epoch: Epoch,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
     ) -> Vec<Action> {
-        self.drive(|p, _| p.on_spc_new_commit_received(from, msg))
+        self.drive(|p, _| p.on_spc_new_commit_received(epoch, from, msg))
     }
 
     /// A peer's SPC `empty-view` attestation arrived.
     pub fn on_unverified_spc_empty_view_received(
         &mut self,
+        epoch: Epoch,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        self.drive(|p, _| p.on_unverified_spc_empty_view_received(msg))
+        self.drive(|p, _| p.on_unverified_spc_empty_view_received(epoch, msg))
     }
 
     /// A locally-signed empty-view attestation arrived via the
     /// self-loopback path.
     pub fn on_verified_spc_empty_view_received(
         &mut self,
+        epoch: Epoch,
         msg: Box<Verified<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_verified_spc_empty_view_received(fold, msg))
+        self.drive(|p, fold| p.on_verified_spc_empty_view_received(fold, epoch, msg))
     }
 
     /// Result of an [`Action::VerifySpcNewView`] dispatch.
@@ -522,28 +541,31 @@ impl BeaconCoordinator {
     /// A round-1 PC vote received already verified.
     pub fn on_verified_pc_vote1_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Verified<PcVote1>,
     ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_verified_pc_vote1_received(fold, view, vote))
+        self.drive(|p, fold| p.on_verified_pc_vote1_received(fold, epoch, view, vote))
     }
 
     /// A round-2 PC vote received already verified.
     pub fn on_verified_pc_vote2_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
     ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_verified_pc_vote2_received(fold, view, vote))
+        self.drive(|p, fold| p.on_verified_pc_vote2_received(fold, epoch, view, vote))
     }
 
     /// A round-3 PC vote received already verified.
     pub fn on_verified_pc_vote3_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
     ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_verified_pc_vote3_received(fold, view, vote))
+        self.drive(|p, fold| p.on_verified_pc_vote3_received(fold, epoch, view, vote))
     }
 
     /// `TimerId::BeaconSpcView` fired.
@@ -1871,7 +1893,11 @@ mod tests {
             PcVector::empty(),
             Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
-        let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
+        let actions = coord.on_pc_vote1_received(
+            coord.current_state().current_epoch.next(),
+            SpcView::new(1),
+            vote,
+        );
         assert!(actions.is_empty());
     }
 
@@ -1888,7 +1914,11 @@ mod tests {
             PcVector::empty(),
             Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
-        let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
+        let actions = coord.on_pc_vote1_received(
+            coord.current_state().current_epoch.next(),
+            SpcView::new(1),
+            vote,
+        );
         assert!(actions.is_empty());
         assert_eq!(coord.verifications_in_flight(), 0);
     }
@@ -1906,7 +1936,11 @@ mod tests {
             PcVector::empty(),
             Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
-        let actions = coord.on_pc_vote1_received(SpcView::new(6), vote);
+        let actions = coord.on_pc_vote1_received(
+            coord.current_state().current_epoch.next(),
+            SpcView::new(6),
+            vote,
+        );
         assert!(actions.is_empty());
         assert_eq!(coord.verifications_in_flight(), 0);
     }
@@ -1923,7 +1957,11 @@ mod tests {
             PcVector::empty(),
             Capped::from_array([ConsensusSignature::new([0u8; 96])]),
         );
-        let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
+        let actions = coord.on_pc_vote1_received(
+            coord.current_state().current_epoch.next(),
+            SpcView::new(1),
+            vote,
+        );
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::VerifyPcVote1 { .. }));
         assert_eq!(coord.verifications_in_flight(), 1);

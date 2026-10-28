@@ -456,21 +456,36 @@ impl BeaconParticipant {
     /// A peer's round-1 PC vote arrived. Gate, dedup, and dispatch the
     /// signature check via the [`SpcDriver`]. Admission happens in
     /// [`Self::on_pc_vote1_verified`] when the result lands.
-    pub fn on_pc_vote1_received(&mut self, view: SpcView, vote: PcVote1) -> Vec<Action> {
+    pub fn on_pc_vote1_received(
+        &mut self,
+        epoch: Epoch,
+        view: SpcView,
+        vote: PcVote1,
+    ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        self.spc.on_pc_vote1_received(view, vote, skip)
+        self.spc.on_pc_vote1_received(epoch, view, vote, skip)
     }
 
     /// A peer's round-2 PC vote arrived.
-    pub fn on_pc_vote2_received(&mut self, view: SpcView, vote: Box<PcVote2>) -> Vec<Action> {
+    pub fn on_pc_vote2_received(
+        &mut self,
+        epoch: Epoch,
+        view: SpcView,
+        vote: Box<PcVote2>,
+    ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        self.spc.on_pc_vote2_received(view, vote, skip)
+        self.spc.on_pc_vote2_received(epoch, view, vote, skip)
     }
 
     /// A peer's round-3 PC vote arrived.
-    pub fn on_pc_vote3_received(&mut self, view: SpcView, vote: Box<PcVote3>) -> Vec<Action> {
+    pub fn on_pc_vote3_received(
+        &mut self,
+        epoch: Epoch,
+        view: SpcView,
+        vote: Box<PcVote3>,
+    ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        self.spc.on_pc_vote3_received(view, vote, skip)
+        self.spc.on_pc_vote3_received(epoch, view, vote, skip)
     }
 
     /// A peer's SPC `new-view` arrived. Gate on instance/skip-quorum,
@@ -479,30 +494,35 @@ impl BeaconParticipant {
     /// when the result lands.
     pub fn on_spc_new_view_received(
         &mut self,
+        epoch: Epoch,
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        self.spc.on_spc_new_view_received(from, proposal, skip)
+        self.spc
+            .on_spc_new_view_received(epoch, from, proposal, skip)
     }
 
     /// A peer's SPC `new-commit` arrived.
     pub fn on_spc_new_commit_received(
         &mut self,
+        epoch: Epoch,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        self.spc.on_spc_new_commit_received(from, msg, skip)
+        self.spc.on_spc_new_commit_received(epoch, from, msg, skip)
     }
 
     /// A peer's SPC `empty-view` attestation arrived.
     pub fn on_unverified_spc_empty_view_received(
         &mut self,
+        epoch: Epoch,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        self.spc.on_unverified_spc_empty_view_received(msg, skip)
+        self.spc
+            .on_unverified_spc_empty_view_received(epoch, msg, skip)
     }
 
     /// A locally-signed empty-view attestation arrived via the
@@ -511,10 +531,13 @@ impl BeaconParticipant {
     pub fn on_verified_spc_empty_view_received(
         &mut self,
         fold: &BeaconFold,
+        epoch: Epoch,
         msg: Box<Verified<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        let effects = self.spc.on_verified_spc_empty_view_received(msg, skip);
+        let effects = self
+            .spc
+            .on_verified_spc_empty_view_received(epoch, msg, skip);
         self.lift_from_spc(fold, effects)
     }
 
@@ -619,11 +642,14 @@ impl BeaconParticipant {
     pub fn on_verified_pc_vote1_received(
         &mut self,
         fold: &BeaconFold,
+        epoch: Epoch,
         view: SpcView,
         vote: Verified<PcVote1>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        let effects = self.spc.on_verified_pc_vote1_received(view, vote, skip);
+        let effects = self
+            .spc
+            .on_verified_pc_vote1_received(epoch, view, vote, skip);
         self.lift_from_spc(fold, effects)
     }
 
@@ -631,11 +657,14 @@ impl BeaconParticipant {
     pub fn on_verified_pc_vote2_received(
         &mut self,
         fold: &BeaconFold,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        let effects = self.spc.on_verified_pc_vote2_received(view, vote, skip);
+        let effects = self
+            .spc
+            .on_verified_pc_vote2_received(epoch, view, vote, skip);
         self.lift_from_spc(fold, effects)
     }
 
@@ -643,11 +672,14 @@ impl BeaconParticipant {
     pub fn on_verified_pc_vote3_received(
         &mut self,
         fold: &BeaconFold,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
     ) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
-        let effects = self.spc.on_verified_pc_vote3_received(view, vote, skip);
+        let effects = self
+            .spc
+            .on_verified_pc_vote3_received(epoch, view, vote, skip);
         self.lift_from_spc(fold, effects)
     }
 

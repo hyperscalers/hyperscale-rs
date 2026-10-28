@@ -889,6 +889,8 @@ pub enum ProtocolEvent {
     /// checked. Produced by the gossip handler — wire decode lands the
     /// wrapper as `Verifiable::Unverified`.
     UnverifiedPcVote1Received {
+        /// Epoch whose SPC instance the vote was signed for.
+        epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// The vote. Self-identifying via `vote.validator()`.
@@ -898,6 +900,8 @@ pub enum ProtocolEvent {
     /// Round-2 PC vote received whose signature still needs to be
     /// checked.
     UnverifiedPcVote2Received {
+        /// Epoch whose SPC instance the vote was signed for.
+        epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// The vote. Self-identifying via `vote.validator()`.
@@ -907,6 +911,8 @@ pub enum ProtocolEvent {
     /// Round-3 PC vote received whose signature still needs to be
     /// checked.
     UnverifiedPcVote3Received {
+        /// Epoch whose SPC instance the vote was signed for.
+        epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// The vote. Self-identifying via `vote.validator()`.
@@ -921,6 +927,8 @@ pub enum ProtocolEvent {
     ///
     /// [`Action::VerifyPcVote1`]: crate::Action::VerifyPcVote1
     VerifiedPcVote1Received {
+        /// Epoch whose SPC instance the vote was signed for.
+        epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// Verified vote, sealed via [`Verified::<PcVote1>::sign_local`].
@@ -933,6 +941,8 @@ pub enum ProtocolEvent {
     ///
     /// [`Action::VerifyPcVote2`]: crate::Action::VerifyPcVote2
     VerifiedPcVote2Received {
+        /// Epoch whose SPC instance the vote was signed for.
+        epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// Verified vote, sealed via [`Verified::<PcVote2>::sign_local`].
@@ -945,6 +955,8 @@ pub enum ProtocolEvent {
     ///
     /// [`Action::VerifyPcVote3`]: crate::Action::VerifyPcVote3
     VerifiedPcVote3Received {
+        /// Epoch whose SPC instance the vote was signed for.
+        epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// Verified vote, sealed via [`Verified::<PcVote3>::sign_local`].
@@ -958,6 +970,8 @@ pub enum ProtocolEvent {
     /// decode lands the wrapper as `Unverified`; locally-relayed
     /// notifications preserve the `Verified` marker.
     SpcNewViewReceived {
+        /// Epoch whose SPC instance the message was signed for.
+        epoch: Epoch,
         /// Sender id (transport-level).
         from: ValidatorId,
         /// Proposal object backing the entry.
@@ -968,6 +982,8 @@ pub enum ProtocolEvent {
     /// Self-authenticating via the embedded `proof`; the sender label
     /// is carried for verification-pipeline bookkeeping only.
     SpcNewCommitReceived {
+        /// Epoch whose SPC instance the message was signed for.
+        epoch: Epoch,
         /// Sender id (transport-level).
         from: ValidatorId,
         /// Committed-low message.
@@ -978,6 +994,8 @@ pub enum ProtocolEvent {
     /// The signer is carried inside `msg`; no separate transport-level
     /// sender id is needed.
     UnverifiedSpcEmptyViewReceived {
+        /// Epoch whose SPC instance the message was signed for.
+        epoch: Epoch,
         /// The empty-view attestation.
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     },
@@ -989,6 +1007,8 @@ pub enum ProtocolEvent {
     ///
     /// [`Action::VerifySpcEmptyView`]: crate::Action::VerifySpcEmptyView
     VerifiedSpcEmptyViewReceived {
+        /// Epoch whose SPC instance the message was signed for.
+        epoch: Epoch,
         /// Verified empty-view attestation, sealed via
         /// [`Verified::<SpcEmptyViewMsg>::sign_local`].
         msg: Box<Verified<SpcEmptyViewMsg>>,

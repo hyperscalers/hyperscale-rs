@@ -577,44 +577,52 @@ where
     #[allow(clippy::too_many_lines)] // single dispatch over the participant's ProtocolEvent variants
     fn on_participant_event(&mut self, validator: ValidatorId, event: ProtocolEvent) {
         match event {
-            ProtocolEvent::UnverifiedPcVote1Received { view, vote } => {
-                self.drive(validator, |p, _| p.on_pc_vote1_received(view, vote));
+            ProtocolEvent::UnverifiedPcVote1Received { epoch, view, vote } => {
+                self.drive(validator, |p, _| p.on_pc_vote1_received(epoch, view, vote));
             }
-            ProtocolEvent::UnverifiedPcVote2Received { view, vote } => {
-                self.drive(validator, |p, _| p.on_pc_vote2_received(view, vote));
+            ProtocolEvent::UnverifiedPcVote2Received { epoch, view, vote } => {
+                self.drive(validator, |p, _| p.on_pc_vote2_received(epoch, view, vote));
             }
-            ProtocolEvent::UnverifiedPcVote3Received { view, vote } => {
-                self.drive(validator, |p, _| p.on_pc_vote3_received(view, vote));
+            ProtocolEvent::UnverifiedPcVote3Received { epoch, view, vote } => {
+                self.drive(validator, |p, _| p.on_pc_vote3_received(epoch, view, vote));
             }
-            ProtocolEvent::VerifiedPcVote1Received { view, vote } => {
+            ProtocolEvent::VerifiedPcVote1Received { epoch, view, vote } => {
                 self.drive(validator, |p, fold| {
-                    p.on_verified_pc_vote1_received(fold, view, vote)
+                    p.on_verified_pc_vote1_received(fold, epoch, view, vote)
                 });
             }
-            ProtocolEvent::VerifiedPcVote2Received { view, vote } => {
+            ProtocolEvent::VerifiedPcVote2Received { epoch, view, vote } => {
                 self.drive(validator, |p, fold| {
-                    p.on_verified_pc_vote2_received(fold, view, vote)
+                    p.on_verified_pc_vote2_received(fold, epoch, view, vote)
                 });
             }
-            ProtocolEvent::VerifiedPcVote3Received { view, vote } => {
+            ProtocolEvent::VerifiedPcVote3Received { epoch, view, vote } => {
                 self.drive(validator, |p, fold| {
-                    p.on_verified_pc_vote3_received(fold, view, vote)
+                    p.on_verified_pc_vote3_received(fold, epoch, view, vote)
                 });
             }
-            ProtocolEvent::SpcNewViewReceived { from, proposal } => {
-                self.drive(validator, |p, _| p.on_spc_new_view_received(from, proposal));
-            }
-            ProtocolEvent::SpcNewCommitReceived { from, msg } => {
-                self.drive(validator, |p, _| p.on_spc_new_commit_received(from, msg));
-            }
-            ProtocolEvent::UnverifiedSpcEmptyViewReceived { msg } => {
+            ProtocolEvent::SpcNewViewReceived {
+                epoch,
+                from,
+                proposal,
+            } => {
                 self.drive(validator, |p, _| {
-                    p.on_unverified_spc_empty_view_received(msg)
+                    p.on_spc_new_view_received(epoch, from, proposal)
                 });
             }
-            ProtocolEvent::VerifiedSpcEmptyViewReceived { msg } => {
+            ProtocolEvent::SpcNewCommitReceived { epoch, from, msg } => {
+                self.drive(validator, |p, _| {
+                    p.on_spc_new_commit_received(epoch, from, msg)
+                });
+            }
+            ProtocolEvent::UnverifiedSpcEmptyViewReceived { epoch, msg } => {
+                self.drive(validator, |p, _| {
+                    p.on_unverified_spc_empty_view_received(epoch, msg)
+                });
+            }
+            ProtocolEvent::VerifiedSpcEmptyViewReceived { epoch, msg } => {
                 self.drive(validator, |p, fold| {
-                    p.on_verified_spc_empty_view_received(fold, msg)
+                    p.on_verified_spc_empty_view_received(fold, epoch, msg)
                 });
             }
             ProtocolEvent::UnverifiedRatifyVoteReceived { vote } => {

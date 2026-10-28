@@ -178,12 +178,13 @@ impl SpcDriver {
     /// happens in [`Self::on_pc_vote1_verified`] when the result lands.
     pub(crate) fn on_pc_vote1_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: PcVote1,
         skip_quorum: bool,
     ) -> Vec<Action> {
         let validator = vote.validator();
-        let Some((epoch, committee)) = self.admission_ctx(validator, view, "PcVote", skip_quorum)
+        let Some(committee) = self.admission_ctx(epoch, validator, view, "PcVote", skip_quorum)
         else {
             return Vec::new();
         };
@@ -204,12 +205,13 @@ impl SpcDriver {
     /// A peer's round-2 PC vote arrived.
     pub(crate) fn on_pc_vote2_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote2>,
         skip_quorum: bool,
     ) -> Vec<Action> {
         let validator = vote.validator();
-        let Some((epoch, committee)) = self.admission_ctx(validator, view, "PcVote", skip_quorum)
+        let Some(committee) = self.admission_ctx(epoch, validator, view, "PcVote", skip_quorum)
         else {
             return Vec::new();
         };
@@ -230,12 +232,13 @@ impl SpcDriver {
     /// A peer's round-3 PC vote arrived.
     pub(crate) fn on_pc_vote3_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote3>,
         skip_quorum: bool,
     ) -> Vec<Action> {
         let validator = vote.validator();
-        let Some((epoch, committee)) = self.admission_ctx(validator, view, "PcVote", skip_quorum)
+        let Some(committee) = self.admission_ctx(epoch, validator, view, "PcVote", skip_quorum)
         else {
             return Vec::new();
         };
@@ -257,13 +260,13 @@ impl SpcDriver {
     /// dispatch the cert signature check.
     pub(crate) fn on_spc_new_view_received(
         &mut self,
+        epoch: Epoch,
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
         skip_quorum: bool,
     ) -> Vec<Action> {
         let view = proposal.view;
-        let Some((epoch, committee)) = self.admission_ctx(from, view, "NewView", skip_quorum)
-        else {
+        let Some(committee) = self.admission_ctx(epoch, from, view, "NewView", skip_quorum) else {
             return Vec::new();
         };
         if !self
@@ -284,12 +287,13 @@ impl SpcDriver {
     /// and dispatch the embedded QC3's signature check.
     pub(crate) fn on_spc_new_commit_received(
         &mut self,
+        epoch: Epoch,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
         skip_quorum: bool,
     ) -> Vec<Action> {
         let view = msg.view;
-        let Some((epoch, committee)) = self.admission_ctx(from, view, "NewCommit", skip_quorum)
+        let Some(committee) = self.admission_ctx(epoch, from, view, "NewCommit", skip_quorum)
         else {
             return Vec::new();
         };
@@ -312,12 +316,13 @@ impl SpcDriver {
     /// check.
     pub(crate) fn on_unverified_spc_empty_view_received(
         &mut self,
+        epoch: Epoch,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
         skip_quorum: bool,
     ) -> Vec<Action> {
         let signer = msg.signer;
         let view = msg.view;
-        let Some((epoch, committee)) = self.admission_ctx(signer, view, "EmptyView", skip_quorum)
+        let Some(committee) = self.admission_ctx(epoch, signer, view, "EmptyView", skip_quorum)
         else {
             return Vec::new();
         };
@@ -341,12 +346,13 @@ impl SpcDriver {
     /// directly into the FSM without the verify round-trip.
     pub(crate) fn on_verified_spc_empty_view_received(
         &mut self,
+        epoch: Epoch,
         msg: Box<Verified<SpcEmptyViewMsg>>,
         skip_quorum: bool,
     ) -> Vec<SpcEffect> {
         let signer = msg.signer;
         if self
-            .admission_ctx(signer, msg.view, "VerifiedEmptyView", skip_quorum)
+            .admission_ctx(epoch, signer, msg.view, "VerifiedEmptyView", skip_quorum)
             .is_none()
         {
             return Vec::new();
@@ -588,18 +594,19 @@ impl SpcDriver {
     /// routes straight into the FSM.
     pub(crate) fn on_verified_pc_vote1_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Verified<PcVote1>,
         skip_quorum: bool,
     ) -> Vec<SpcEffect> {
         let signer = vote.validator();
-        let Some((epoch, _)) = self.admission_ctx(signer, view, "PcVote", skip_quorum) else {
-            return Vec::new();
-        };
-        self.clear_pc_vote(epoch, view, signer, PcVoteRound::Vote1);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+        if self
+            .admission_ctx(epoch, signer, view, "PcVote", skip_quorum)
+            .is_none()
+        {
             return Vec::new();
         }
+        self.clear_pc_vote(epoch, view, signer, PcVoteRound::Vote1);
         self.dispatch(
             self.me,
             SpcEvent::PcVote1Verified { view, vote },
@@ -610,18 +617,19 @@ impl SpcDriver {
     /// A round-2 PC vote the coordinator received already verified.
     pub(crate) fn on_verified_pc_vote2_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
         skip_quorum: bool,
     ) -> Vec<SpcEffect> {
         let signer = vote.validator();
-        let Some((epoch, _)) = self.admission_ctx(signer, view, "PcVote", skip_quorum) else {
-            return Vec::new();
-        };
-        self.clear_pc_vote(epoch, view, signer, PcVoteRound::Vote2);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+        if self
+            .admission_ctx(epoch, signer, view, "PcVote", skip_quorum)
+            .is_none()
+        {
             return Vec::new();
         }
+        self.clear_pc_vote(epoch, view, signer, PcVoteRound::Vote2);
         self.dispatch(
             self.me,
             SpcEvent::PcVote2Verified { view, vote },
@@ -632,18 +640,19 @@ impl SpcDriver {
     /// A round-3 PC vote the coordinator received already verified.
     pub(crate) fn on_verified_pc_vote3_received(
         &mut self,
+        epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
         skip_quorum: bool,
     ) -> Vec<SpcEffect> {
         let signer = vote.validator();
-        let Some((epoch, _)) = self.admission_ctx(signer, view, "PcVote", skip_quorum) else {
-            return Vec::new();
-        };
-        self.clear_pc_vote(epoch, view, signer, PcVoteRound::Vote3);
-        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+        if self
+            .admission_ctx(epoch, signer, view, "PcVote", skip_quorum)
+            .is_none()
+        {
             return Vec::new();
         }
+        self.clear_pc_vote(epoch, view, signer, PcVoteRound::Vote3);
         self.dispatch(
             self.me,
             SpcEvent::PcVote3Verified { view, vote },
@@ -664,26 +673,33 @@ impl SpcDriver {
         self.dispatch(self.me, SpcEvent::TimerExpired { view }, skip_quorum)
     }
 
-    /// Common gating for the receive entries: returns `(epoch, committee)`
-    /// if admissible, else logs and returns `None`. Four gates, all cheap
-    /// and applied before the verify dispatch so a flood can't mint slots:
+    /// Common gating for the receive entries: returns the committee to
+    /// verify against if admissible, else logs and returns `None`. Five
+    /// gates, all cheap and applied before the verify dispatch so a flood
+    /// can't mint slots:
     ///
     /// 1. The local SPC instance is bootstrapped.
-    /// 2. Skip-quorum hasn't been reached at the local tip (`skip_quorum`).
-    /// 3. `signer` (which keys the verification slot) is a current
+    /// 2. `epoch`, the epoch the message was signed for, is the
+    ///    instance's. A `Verified` marker does not name the scope it
+    ///    held under, so without this gate a message outliving its epoch
+    ///    — a local vote whose signing finished after the next epoch
+    ///    bootstrapped — would join a quorum of another PC run.
+    /// 3. Skip-quorum hasn't been reached at the local tip (`skip_quorum`).
+    /// 4. `signer` (which keys the verification slot) is a current
     ///    committee member.
-    /// 4. `view` is within `[current_view, current_view +
+    /// 5. `view` is within `[current_view, current_view +
     ///    MAX_PENDING_EMPTY_VIEW_AHEAD]`.
     ///
-    /// Gates 3 and 4 bound the `(signer, view)` slot key to
+    /// Gates 4 and 5 bound the `(signer, view)` slot key to
     /// `committee_size × window`.
     fn admission_ctx(
         &self,
+        epoch: Epoch,
         signer: ValidatorId,
         view: SpcView,
         kind: &'static str,
         skip_quorum: bool,
-    ) -> Option<(Epoch, Vec<(ValidatorId, ConsensusPublicKey)>)> {
+    ) -> Option<Vec<(ValidatorId, ConsensusPublicKey)>> {
         let Some(spc) = self.spc.as_ref() else {
             trace!(
                 ?signer,
@@ -691,6 +707,16 @@ impl SpcDriver {
             );
             return None;
         };
+        if epoch != spc.epoch() {
+            trace!(
+                ?signer,
+                kind,
+                epoch = epoch.inner(),
+                instance_epoch = spc.epoch().inner(),
+                "SPC message for another epoch — dropping before dispatch",
+            );
+            return None;
+        }
         if skip_quorum {
             trace!(
                 ?signer,
@@ -717,7 +743,7 @@ impl SpcDriver {
             );
             return None;
         }
-        Some((spc.epoch(), spc.committee().to_vec()))
+        Some(spc.committee().to_vec())
     }
 
     /// Drive `event` through the instance and return its effects. Drops
@@ -760,7 +786,8 @@ impl SpcDriver {
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
-        NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcScope, PcValueElement, Signer, sign_vote1,
+        NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcScope, PcValueElement, Signer,
+        sign_vote1,
     };
 
     use super::*;
@@ -836,7 +863,8 @@ mod tests {
     #[test]
     fn admissible_pc_vote_dispatches_verification() {
         let mut driver = bootstrapped();
-        let actions = driver.on_pc_vote1_received(SpcView::new(1), vote1(1, 1), false);
+        let actions =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(1), vote1(1, 1), false);
         assert_dispatches(&actions, 1);
     }
 
@@ -844,21 +872,28 @@ mod tests {
     fn pc_vote_admitted_at_window_upper_edge() {
         let mut driver = bootstrapped();
         let edge = 1 + MAX_PENDING_EMPTY_VIEW_AHEAD;
-        let actions = driver.on_pc_vote1_received(SpcView::new(edge), vote1(1, edge), false);
+        let actions = driver.on_pc_vote1_received(
+            Epoch::new(EPOCH),
+            SpcView::new(edge),
+            vote1(1, edge),
+            false,
+        );
         assert_dispatches(&actions, edge);
     }
 
     #[test]
     fn pc_vote_dropped_when_no_instance_bootstrapped() {
         let mut driver = SpcDriver::new(Arc::new(BlsVerifier), ValidatorId::new(0));
-        let actions = driver.on_pc_vote1_received(SpcView::new(1), vote1(1, 1), false);
+        let actions =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(1), vote1(1, 1), false);
         assert!(actions.is_empty());
     }
 
     #[test]
     fn pc_vote_dropped_once_skip_quorum_reached() {
         let mut driver = bootstrapped();
-        let actions = driver.on_pc_vote1_received(SpcView::new(1), vote1(1, 1), true);
+        let actions =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(1), vote1(1, 1), true);
         assert!(actions.is_empty());
     }
 
@@ -866,7 +901,16 @@ mod tests {
     fn pc_vote_from_non_committee_signer_dropped() {
         let mut driver = bootstrapped();
         // Id 99 sits outside the `0..MIN_BEACON_COMMITTEE_SIZE` committee.
-        let actions = driver.on_pc_vote1_received(SpcView::new(1), vote1(99, 1), false);
+        let actions =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(1), vote1(99, 1), false);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn pc_vote_for_another_epoch_dropped() {
+        let mut driver = bootstrapped();
+        let actions =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH + 1), SpcView::new(1), vote1(1, 1), false);
         assert!(actions.is_empty());
     }
 
@@ -874,7 +918,8 @@ mod tests {
     fn pc_vote_below_current_view_dropped() {
         let mut driver = bootstrapped();
         assert_eq!(driver.current_view(), Some(SpcView::new(1)));
-        let actions = driver.on_pc_vote1_received(SpcView::new(0), vote1(1, 0), false);
+        let actions =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(0), vote1(1, 0), false);
         assert!(actions.is_empty());
     }
 
@@ -882,17 +927,125 @@ mod tests {
     fn pc_vote_beyond_window_dropped() {
         let mut driver = bootstrapped();
         let beyond = 1 + MAX_PENDING_EMPTY_VIEW_AHEAD + 1;
-        let actions = driver.on_pc_vote1_received(SpcView::new(beyond), vote1(1, beyond), false);
+        let actions = driver.on_pc_vote1_received(
+            Epoch::new(EPOCH),
+            SpcView::new(beyond),
+            vote1(1, beyond),
+            false,
+        );
         assert!(actions.is_empty());
     }
 
     #[test]
     fn duplicate_in_flight_pc_vote_not_redispatched() {
         let mut driver = bootstrapped();
-        let first = driver.on_pc_vote1_received(SpcView::new(1), vote1(1, 1), false);
+        let first =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(1), vote1(1, 1), false);
         assert_eq!(first.len(), 1);
         // Same (epoch, view, signer, round) slot is still in flight.
-        let second = driver.on_pc_vote1_received(SpcView::new(1), vote1(1, 1), false);
+        let second =
+            driver.on_pc_vote1_received(Epoch::new(EPOCH), SpcView::new(1), vote1(1, 1), false);
         assert!(second.is_empty());
+    }
+
+    /// Every committee member's round-3 vote at `scope`, each over the
+    /// round-2 QC a full-committee run over `fill` certifies.
+    fn vote3s(scope: PcScope, fill: u8) -> Vec<Verified<PcVote3>> {
+        let net = NetworkDefinition::simulator();
+        let members = committee(MIN_BEACON_COMMITTEE_SIZE as u64);
+        let v_in =
+            PcVector::new((0..3).map(|_| PcValueElement::new([fill; PC_VALUE_ELEMENT_BYTES])));
+        let signers: Vec<u64> = (0..MIN_BEACON_COMMITTEE_SIZE as u64).collect();
+        let v1s: Vec<Verified<PcVote1>> = signers
+            .iter()
+            .map(|&i| {
+                Verified::<PcVote1>::sign_local(
+                    &bls_sk(i),
+                    ValidatorId::new(i),
+                    &net,
+                    scope,
+                    v_in.clone(),
+                )
+                .expect("sign")
+            })
+            .collect();
+        let qc1 = Verified::<PcQc1>::from_verified_votes(
+            &BlsVerifier,
+            &v1s.iter().collect::<Vec<_>>(),
+            &members,
+        );
+        let v2s: Vec<Verified<PcVote2>> = signers
+            .iter()
+            .map(|&i| {
+                Verified::<PcVote2>::sign_local(
+                    &bls_sk(i),
+                    ValidatorId::new(i),
+                    &net,
+                    scope,
+                    qc1.clone(),
+                )
+                .expect("sign")
+            })
+            .collect();
+        let qc2 = Verified::<PcQc2>::from_verified_votes(
+            &BlsVerifier,
+            &v2s.iter().collect::<Vec<_>>(),
+            &members,
+        );
+        signers
+            .iter()
+            .map(|&i| {
+                Verified::<PcVote3>::sign_local(
+                    &bls_sk(i),
+                    ValidatorId::new(i),
+                    &net,
+                    scope,
+                    qc2.clone(),
+                )
+                .expect("sign")
+            })
+            .collect()
+    }
+
+    /// The local round-3 vote signed for the epoch the driver just left
+    /// lands after the next epoch's instance is up. It must stay out of
+    /// that instance's quorum: its `x_p` comes from another PC run, and
+    /// a quorum mixing the two has no common extension to certify.
+    #[test]
+    fn local_vote_signed_for_a_settled_epoch_stays_out_of_the_next() {
+        let mut driver = bootstrapped();
+        let view = SpcView::new(1);
+        let settled = Epoch::new(EPOCH);
+        let next = settled.next();
+        let stale = vote3s(
+            PcScope {
+                epoch: settled,
+                view,
+            },
+            0xAA,
+        )
+        .swap_remove(0);
+        driver.clear();
+        driver.bootstrap(next, committee(MIN_BEACON_COMMITTEE_SIZE as u64));
+
+        let mut fresh = vote3s(PcScope { epoch: next, view }, 0xBB);
+        let own = fresh.remove(0);
+        let mut effects =
+            driver.on_verified_pc_vote3_received(settled, view, Box::new(stale), false);
+        for vote in fresh.drain(..fresh.len() - 1) {
+            let signer = vote.validator();
+            effects.extend(driver.on_pc_vote3_verified(next, view, signer, Ok(vote), false));
+        }
+        assert!(effects.is_empty(), "two fresh votes are short of a quorum");
+
+        // The node's own vote for the running epoch completes the quorum
+        // cleanly: the stale one never took its slot.
+        let effects = driver.on_verified_pc_vote3_received(next, view, Box::new(own), false);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, SpcEffect::BroadcastNewView { .. })),
+            "the running epoch's quorum decides; got {effects:?}",
+        );
     }
 }

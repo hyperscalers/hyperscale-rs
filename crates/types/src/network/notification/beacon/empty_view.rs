@@ -48,6 +48,12 @@ impl SpcEmptyViewMsgNotification {
         }
     }
 
+    /// Epoch whose SPC instance the message belongs to.
+    #[must_use]
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
     /// Get the inner empty-view message (raw view, regardless of
     /// verification state).
     #[must_use]

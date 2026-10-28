@@ -770,20 +770,23 @@ where
 
         // ── beacon.pc.vote1/2/3 → Unverified/VerifiedPcVote{N}Received ──
         //
-        // PC votes carry the wrapping `view` because the inner vote
-        // doesn't encode its SPC view; the receiver routes by view.
+        // PC votes carry the wrapping `epoch` and `view` because the inner
+        // vote doesn't encode its scope; the receiver routes by both.
         macro_rules! register_pc_vote_handler {
             ($note_ty:ty, $unv:ident, $ver:ident, $vote_ty:ty $(, $box:tt)?) => {{
                 let beacon_tx = self.process.beacon_event_sender.clone();
                 self.process.network.register_notification_handler::<$note_ty>(
                     move |gossip: $note_ty| -> Verdict {
+                        let epoch = gossip.epoch;
                         let view = gossip.view;
                         let event = match Arc::unwrap_or_clone(gossip.vote).into_verified() {
                             Ok(verified) => ProtocolEvent::$ver {
+                                epoch,
                                 view,
                                 vote: register_pc_vote_handler!(@wrap $($box)? verified),
                             },
                             Err(unverified) => ProtocolEvent::$unv {
+                                epoch,
                                 view,
                                 vote: register_pc_vote_handler!(@wrap $($box)? unverified.into()),
                             },
@@ -844,9 +847,9 @@ where
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
-                    let from = gossip.sender;
                     let event = ProtocolEvent::SpcNewViewReceived {
-                        from,
+                        epoch: gossip.epoch(),
+                        from: gossip.sender,
                         proposal: gossip.proposal,
                     };
                     let _ = beacon_tx.send(HostEvent::beacon(event));
@@ -873,9 +876,9 @@ where
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
-                    let from = gossip.sender;
                     let event = ProtocolEvent::SpcNewCommitReceived {
-                        from,
+                        epoch: gossip.epoch(),
+                        from: gossip.sender,
                         msg: gossip.msg,
                     };
                     let _ = beacon_tx.send(HostEvent::beacon(event));
@@ -912,11 +915,14 @@ where
                             return verdict;
                         }
                     }
+                    let epoch = gossip.epoch();
                     let event = match Arc::unwrap_or_clone(gossip.msg).into_verified() {
                         Ok(upgraded) => ProtocolEvent::VerifiedSpcEmptyViewReceived {
+                            epoch,
                             msg: Box::new(upgraded),
                         },
                         Err(unverified) => ProtocolEvent::UnverifiedSpcEmptyViewReceived {
+                            epoch,
                             msg: Arc::new(unverified.into()),
                         },
                     };
