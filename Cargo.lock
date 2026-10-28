@@ -2412,6 +2412,7 @@ dependencies = [
  "hyperscale-storage",
  "hyperscale-storage-memory",
  "hyperscale-storage-rocksdb",
+ "hyperscale-transactions",
  "hyperscale-types",
  "opentelemetry",
  "opentelemetry-otlp",

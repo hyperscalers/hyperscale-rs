@@ -140,6 +140,19 @@ impl TimestampRange {
         (start < end).then(|| Self::new(start, end))
     }
 
+    /// Whether a block anchored no later than [`MAX_VALIDITY_RANGE`] past
+    /// `now` could include a transaction with this range, short of its
+    /// having expired: ordered, no longer than the cap, and open by then.
+    ///
+    /// A range that fails this is one no block will carry for longer than
+    /// a transaction may stand in a pool, so admission refuses it rather
+    /// than hold it for its end to pass.
+    #[must_use]
+    pub fn opens_in_reach(&self, now: WeightedTimestamp) -> bool {
+        self.is_well_formed_length(MAX_VALIDITY_RANGE)
+            && self.start_timestamp_inclusive <= now.plus(MAX_VALIDITY_RANGE)
+    }
+
     /// Validate the range against a block's anchoring weighted timestamp:
     /// `start < end`, length within cap, and forward edge within cap of
     /// the anchor. The anchor is the parent QC's `weighted_timestamp` —
@@ -190,6 +203,30 @@ mod tests {
     fn length_of_inverted_range_saturates_to_zero() {
         let r = TimestampRange::new(ts(200), ts(100));
         assert_eq!(r.length(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_range_opening_within_the_cap_is_in_reach() {
+        let now = ts(1_000_000);
+        let opens = now.plus(MAX_VALIDITY_RANGE);
+        assert!(TimestampRange::new(opens, opens.plus(Duration::from_secs(1))).opens_in_reach(now));
+    }
+
+    #[test]
+    fn a_range_opening_past_the_cap_is_out_of_reach() {
+        let now = ts(1_000_000);
+        let opens = now.plus(MAX_VALIDITY_RANGE).plus(Duration::from_millis(1));
+        assert!(
+            !TimestampRange::new(opens, opens.plus(Duration::from_secs(1))).opens_in_reach(now)
+        );
+    }
+
+    #[test]
+    fn a_malformed_range_is_out_of_reach() {
+        let now = ts(1_000_000);
+        assert!(!TimestampRange::new(now, now).opens_in_reach(now));
+        let long = now.plus(MAX_VALIDITY_RANGE).plus(Duration::from_millis(1));
+        assert!(!TimestampRange::new(now, long).opens_in_reach(now));
     }
 
     #[test]

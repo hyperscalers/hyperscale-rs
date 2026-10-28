@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -29,7 +30,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use hex::{decode as hex_decode, encode as hex_encode};
-use hyperscale_engine::PreviewOutcome;
+use hyperscale_engine::{PreviewOutcome, declared_of};
 use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_metrics::{
     record_transaction_rejected, record_tx_ingress_rejected_pending_limit,
@@ -37,7 +38,8 @@ use hyperscale_metrics::{
 };
 use hyperscale_metrics_prometheus::encode_metrics;
 use hyperscale_types::{
-    Hash, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    Hash, MAX_VALIDITY_RANGE, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, WeightedTimestamp,
 };
 use tokio::task::spawn_blocking;
 
@@ -207,6 +209,9 @@ pub async fn submit_transaction_handler(
     };
 
     let hash = hex_encode(transaction.hash().as_bytes());
+    if let Some(rejection) = check_validity_reach(&state, &transaction, &hash) {
+        return rejection;
+    }
     let tx_arc = Arc::new(transaction);
 
     // Compute the touched-shard fanout on this tokio worker and push
@@ -374,6 +379,44 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
     }
 
     None
+}
+
+/// Refuse a transaction whose validity window no block will reach: one
+/// the mempool would refuse on every shard, told to the submitter here
+/// rather than left to never appear.
+fn check_validity_reach(
+    state: &RpcState,
+    transaction: &Transaction,
+    hash: &str,
+) -> Option<(StatusCode, Json<SubmitTransactionResponse>)> {
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    let now = WeightedTimestamp::from_millis(unix_ms.saturating_sub(state.genesis_timestamp_ms));
+    // An envelope whose declaration does not read is the node's to
+    // refuse, on the same path as one arriving by gossip.
+    let window = declared_of(transaction.body()).ok()?.effective_window;
+    if window.opens_in_reach(now) {
+        return None;
+    }
+    record_transaction_rejected("validity_out_of_reach");
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(SubmitTransactionResponse {
+            accepted: false,
+            hash: hash.to_owned(),
+            error: Some(format!(
+                "validity window [{}, {}) ms is malformed or opens more than {} s past the \
+                 chain's now ({} ms)",
+                window.start_timestamp_inclusive.as_millis(),
+                window.end_timestamp_exclusive.as_millis(),
+                MAX_VALIDITY_RANGE.as_secs(),
+                now.as_millis()
+            )),
+        }),
+    ))
 }
 
 /// Hex- and wire-decode a submitted transaction, recording metrics on failure.
@@ -793,5 +836,77 @@ mod tests {
 
         // Should be accepted (202)
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    /// A window that opens long past the chain's now is refused to the
+    /// submitter, who would otherwise wait on a transaction no block takes.
+    #[tokio::test]
+    async fn a_window_out_of_reach_is_refused_at_submission() {
+        use std::time::Duration;
+
+        use hyperscale_transactions::{Ceilings, Client, Terms};
+        use hyperscale_types::test_utils::test_principal;
+        use hyperscale_types::{Ed25519PrivateKey, NetworkId, TimestampRange};
+
+        let submitted = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&submitted);
+        let tx_submission_tx: TxSubmissionSender = Arc::new(move |_tx| {
+            seen.store(true, Ordering::SeqCst);
+            true
+        });
+        let state = RpcState {
+            ready: Arc::new(AtomicBool::new(true)),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status_with(0)))),
+            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
+            tx_submission_tx,
+            preview_tx: Arc::new(|_tx| None),
+            start_time: Instant::now(),
+            tx_status: Arc::new(TxStatusCache::new()),
+            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
+            sync_backpressure_threshold: Some(10),
+            genesis_timestamp_ms: 0,
+        };
+        let app = Router::new()
+            .route("/tx", post(submit_transaction_handler))
+            .with_state(state);
+
+        let opens = WeightedTimestamp::from_millis(u64::MAX / 2);
+        let payer = Ed25519PrivateKey::from_bytes(&[0x11; 32]).expect("fixture key");
+        let tx = Client::genesis(NetworkId(242))
+            .transfer(
+                &payer,
+                test_principal(2),
+                1,
+                TimestampRange::new(opens, opens.plus(Duration::from_secs(60))),
+                Terms {
+                    max_fee: 1_000_000,
+                    ceilings: Ceilings::Guessed,
+                    priority_bp: 0,
+                    message: Vec::new(),
+                },
+            )
+            .expect("the stdlib account answers a transfer");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        to_string(&SubmitTransactionRequest {
+                            transaction_hex: hex_encode(hbor_to_vec(&tx).unwrap()),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !submitted.load(Ordering::SeqCst),
+            "a refused window never reaches a shard"
+        );
     }
 }

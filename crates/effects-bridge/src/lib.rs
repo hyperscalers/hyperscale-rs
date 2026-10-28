@@ -23,8 +23,8 @@ pub use staking::witness_from_event;
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};
 pub use vm_statics::{
     BridgeStatics, CallEnvelope, DeclaredVector, PROTOCOL_RESOURCE, account_address, attestations,
-    declared_vector, decode_tree, draw_key, encode_tree, envelope_bytes, envelope_identity,
-    is_protocol_vault, validator_key, vault_key,
+    declared_of, declared_vector, decode_tree, draw_key, encode_tree, envelope_bytes,
+    envelope_identity, is_protocol_vault, validator_key, vault_key,
 };
 
 #[cfg(test)]
