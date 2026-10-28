@@ -95,6 +95,9 @@ SEED_HEX=$(printf '%064x' 12345)
 echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
 PUBLIC_KEY=$("$KEYGEN_BIN" "$SEED_HEX")
 echo "  Public Key: ${PUBLIC_KEY:0:16}..."
+NETWORK_KEY_FILE="$DATA_DIR/validator/network.key"
+ENDPOINT_ID=$("$KEYGEN_BIN" --network-key "$NETWORK_KEY_FILE")
+echo "  Endpoint: $ENDPOINT_ID"
 
 # Generate Config
 CONFIG_FILE="$DATA_DIR/validator/config.toml"
@@ -112,11 +115,11 @@ validator_id = 0
 key_path = "$KEY_FILE"
 
 [network]
-listen_addr = "/ip4/0.0.0.0/udp/$BASE_PORT/quic-v1"
+listen_addr = "0.0.0.0:$BASE_PORT"
+network_key_path = "$NETWORK_KEY_FILE"
 version_interop_mode = "relaxed"
 bootstrap_peers = []
 upnp_enabled = true
-max_message_size = 10485760
 
 [threads]
 consensus_threads = 0
@@ -148,7 +151,7 @@ echo ""
 echo "Launching bootstrap node..."
 echo "  RPC: http://localhost:$RPC_PORT"
 echo "  P2P: UDP/$BASE_PORT (QUIC)"
+echo "  Bootstrap entry: $ENDPOINT_ID@<this host's address>:$BASE_PORT"
 
 # Run validator
-# libp2p_gossipsub=error to suppress noise
-RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE"
+RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL" "$VALIDATOR_BIN" --config "$CONFIG_FILE"

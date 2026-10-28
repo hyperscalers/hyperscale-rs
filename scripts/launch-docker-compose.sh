@@ -101,25 +101,23 @@ fi
 
 # --- 3. Key & Genesis ---
 declare -a PUBLIC_KEYS
-declare -a PEER_IDS
+declare -a ENDPOINT_IDS
 for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     NODE_DIR="$DATA_DIR/validator-$i"
     mkdir -p "$NODE_DIR"
     SEED_HEX=$(printf '%064x' $((12345 + i)))
     echo "$SEED_HEX" | xxd -r -p > "$NODE_DIR/signing.key"
     
-    OUTPUT=$("$KEY_BIN" "$SEED_HEX")
-    PUBLIC_KEYS[$i]=$(echo "$OUTPUT" | cut -d' ' -f1)
-    PEER_IDS[$i]=$(echo "$OUTPUT" | cut -d' ' -f2)
+    PUBLIC_KEYS[$i]=$("$KEY_BIN" "$SEED_HEX")
+    ENDPOINT_IDS[$i]=$("$KEY_BIN" --network-key "$NODE_DIR/network.key")
 done
 
 BOOTSTRAP_PEERS=""
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     first_v=$((shard * VALIDATORS_PER_SHARD))
     IP="172.99.0.$((10 + first_v))"
-    PEER_ID="${PEER_IDS[$first_v]}"
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/9000/quic-v1/p2p/$PEER_ID\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"${ENDPOINT_IDS[$first_v]}@$IP:9000\""
 done
 
 GENESIS_VALIDATORS="[genesis]"
@@ -158,7 +156,8 @@ data_dir = "/home/hyperscalers/data"
 validator_id = $i
 key_path = "/home/hyperscalers/signing.key"
 [network]
-listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
+listen_addr = "0.0.0.0:9000"
+network_key_path = "/home/hyperscalers/network.key"
 upnp_enabled = false
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 version_interop_mode = "relaxed"
@@ -212,7 +211,7 @@ $CAP_OPTS
 $USER_OPTS
 $ENTRY_OPTS
     environment:
-      - RUST_LOG=warn,hyperscale=$LOG_LEVEL,libp2p_gossipsub=error
+      - RUST_LOG=warn,hyperscale=$LOG_LEVEL
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/metrics"]
       interval: 5s

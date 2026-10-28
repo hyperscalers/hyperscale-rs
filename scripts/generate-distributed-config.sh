@@ -178,7 +178,7 @@ mkdir -p "$OUT_DIR"
 # 1. Generate Keys
 echo "Generating keys..."
 declare -a PUBLIC_KEYS
-declare -a PEER_IDS
+declare -a ENDPOINT_IDS
 
 # Flattened list of nodes for easier iterating later
 # Structure: NODE_HOST_IPS[id] = IP, NODE_P2P_PORTS[id] = BASE_PORT + offset
@@ -209,13 +209,11 @@ for i in "${!HOST_IPS[@]}"; do
         fi
         echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
         
-        # Keygen outputs: PUBKEY_HEX PEER_ID
-        OUTPUT=$("$KEYGEN_BIN" "$SEED_HEX")
-        PUBKEY=$(echo "$OUTPUT" | cut -d' ' -f1)
-        PEER_ID=$(echo "$OUTPUT" | cut -d' ' -f2)
-        
+        PUBKEY=$("$KEYGEN_BIN" "$SEED_HEX")
+        ENDPOINT_ID=$("$KEYGEN_BIN" --network-key "$NODE_DIR/network.key")
+
         PUBLIC_KEYS[$NODE_ID]=$PUBKEY
-        PEER_IDS[$NODE_ID]=$PEER_ID
+        ENDPOINT_IDS[$NODE_ID]=$ENDPOINT_ID
         
         NODE_HOST_IPS[$NODE_ID]=$IP
         
@@ -223,9 +221,9 @@ for i in "${!HOST_IPS[@]}"; do
         NODE_P2P_PORTS[$NODE_ID]=$((BASE_PORT + v))
         
         if [ -n "$NODE_NAMES" ]; then
-            echo "  Host $i ($IP) Node $v '$NODE_NAME' (Global ID $NODE_ID): ${PUBKEY:0:16}... PeerID: $PEER_ID"
+            echo "  Host $i ($IP) Node $v '$NODE_NAME' (Global ID $NODE_ID): ${PUBKEY:0:16}... Endpoint: $ENDPOINT_ID"
         else
-            echo "  Host $i ($IP) Node $v (Global ID $NODE_ID): ${PUBKEY:0:16}... PeerID: $PEER_ID"
+            echo "  Host $i ($IP) Node $v (Global ID $NODE_ID): ${PUBKEY:0:16}... Endpoint: $ENDPOINT_ID"
         fi
     done
 done
@@ -256,7 +254,6 @@ public_key = \"${PUBLIC_KEYS[$id]}\""
 done
 
 # 4. Build Bootstrap Peer List
-# 4. Build Bootstrap Peer List
 BOOTSTRAP_PEERS=""
 # Only use the first node as bootstrap peer to avoid a full mesh connection storm
 # and ensure O(N) connections instead of O(N^2)
@@ -268,12 +265,12 @@ for id in $(seq 0 $((TOTAL_NODES - 1))); do
     fi
 
     IP="${NODE_HOST_IPS[$id]}"
-    PID="${PEER_IDS[$id]}"
+    EID="${ENDPOINT_IDS[$id]}"
     PORT="${NODE_P2P_PORTS[$id]}"
     
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
 
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$PORT/quic-v1/p2p/$PID\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"$EID@$IP:$PORT\""
 done
 
 # 5. Generate Config Files
@@ -313,13 +310,13 @@ key_path = "./distributed-cluster-data/host-$i/node-$v/signing.key"
 
 [network]
 # bind to all interfaces
-listen_addr = "/ip4/0.0.0.0/udp/$P2P_PORT/quic-v1"
+listen_addr = "0.0.0.0:$P2P_PORT"
+network_key_path = "./distributed-cluster-data/host-$i/node-$v/network.key"
 version_interop_mode = "relaxed"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
-max_message_size = 16_777_216
-idle_connection_timeout_ms = 30000
-keep_alive_interval_ms = 5000
+path_idle_timeout_ms = 30000
+path_keep_alive_ms = 5000
 
 [threads]
 consensus_threads = $CONSENSUS_THREADS
