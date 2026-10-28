@@ -259,7 +259,7 @@ fn pooled_at<C: Cluster>(c: &C, shard: ShardId) -> BlockHeight {
 /// Panics if the leg never ends, if a second transaction the payer's
 /// chain committed never ends, if a shard stops committing, or if the
 /// protocol resource is not conserved across the pair.
-pub fn a_payer_spends_beside_its_pending_leg<C: Cluster>(
+pub fn a_payer_spends_beside_its_pending_leg<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
     ceiling: Ceiling,
@@ -321,7 +321,11 @@ pub fn a_payer_spends_beside_its_pending_leg<C: Cluster>(
         "the spend's price does not turn on its amount",
     );
     let pooled = pooled_at(c, PAYER_SHARD);
-    let spend_hash = charges.submit(c, spend_tx);
+    // Every member of the payer's committee holds the spend at once: the
+    // window it is measured in is the two blocks after the leg's, and a
+    // spend that reached the next proposers only by gossip would arrive a
+    // hop and a dwell behind wherever the leg's proposer sat.
+    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, spend_tx);
 
     let context = format!(
         "a {spend:?} spend of {amount} beside a pending leg of {reserved} under a {ceiling:?} \
@@ -381,7 +385,7 @@ pub enum RoutePayer {
 /// never ends, if a second transaction the payer's chain committed never
 /// ends, if a venue's shard stops committing, or if either side of the
 /// pair is not conserved across it.
-pub fn a_payer_spends_beside_its_routes_pending_core<C: Cluster>(
+pub fn a_payer_spends_beside_its_routes_pending_core<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
     payer: RoutePayer,
@@ -454,7 +458,10 @@ pub fn a_payer_spends_beside_its_routes_pending_core<C: Cluster>(
         "the spend's price does not turn on its amount",
     );
     let pooled = pooled_at(c, FIRST_VENUE_SHARD);
-    let spend_hash = charges.submit(c, spend_tx);
+    // At every member of the payer's committee at once, so the next
+    // proposer holds it after its own dwell rather than a gossip hop
+    // later: the window it is measured in is a few blocks wide.
+    let spend_hash = charges.submit_to_committee(c, FIRST_VENUE_SHARD, spend_tx);
 
     let context = format!(
         "a {spend:?} spend of {amount} beside a route's pending core reserving {reserved} of its \
@@ -496,7 +503,7 @@ pub fn a_payer_spends_beside_its_routes_pending_core<C: Cluster>(
 /// Panics if the transfer never ends, if a publish the payer's chain
 /// committed never ends, if a shard stops committing, or if the protocol
 /// resource is not conserved across the pair.
-pub fn a_payer_publishes_beside_its_unsettled_spend<C: Cluster>(
+pub fn a_payer_publishes_beside_its_unsettled_spend<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
     between: impl FnOnce(&mut C, TxHash),
@@ -532,12 +539,16 @@ pub fn a_payer_publishes_beside_its_unsettled_spend<C: Cluster>(
     );
     let artifact = artifact_kept_on(c, PAYER_SHARD);
 
-    let spend_hash = charges.submit(c, spend);
+    // Both at every member of the payer's committee at once, so the next
+    // proposer holds each after its own dwell rather than a gossip hop
+    // later: the window the publish is measured in is a few blocks wide,
+    // and two submitted together reach the same proposer together.
+    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, spend);
     between(c, spend_hash);
     let publish = build_publish_tx(&payer_key, artifact, validity_around(c.now()));
     let publish_price = declared_price(c, &publish);
     let pooled = pooled_at(c, PAYER_SHARD);
-    let publish_hash = charges.submit(c, publish);
+    let publish_hash = charges.submit_to_committee(c, PAYER_SHARD, publish);
 
     let context = "a publish beside an unsettled spend";
     await_pair(

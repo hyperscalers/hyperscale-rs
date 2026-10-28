@@ -30,7 +30,7 @@ use super::query::{
     declared_price, held, held_at, locked_at, owed_at, owning_shard, stands_at, unclaimable_at,
 };
 use super::tx::{LEFT_PROBE_SENDER, recipient, sender};
-use super::{Budget, Cluster};
+use super::{Budget, Cluster, FaultableCluster};
 
 /// How long a settled world is held settled before it is asserted.
 ///
@@ -409,6 +409,23 @@ impl Charges {
         let tx = Arc::new(tx);
         let hash = self.record(&tx);
         c.submit(tx);
+        hash
+    }
+
+    /// Record `tx` and submit it at every host of `shard`'s committee, so
+    /// whichever member proposes next holds it as soon as its own dwell
+    /// allows rather than a gossip hop and a second dwell later.
+    pub fn submit_to_committee<C: FaultableCluster + ?Sized>(
+        &mut self,
+        c: &mut C,
+        shard: ShardId,
+        tx: Transaction,
+    ) -> TxHash {
+        let tx = Arc::new(tx);
+        let hash = self.record(&tx);
+        for host in c.committee_hosts(shard) {
+            c.submit_at_host(host, Arc::clone(&tx));
+        }
         hash
     }
 
