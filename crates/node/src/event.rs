@@ -565,6 +565,9 @@ pub enum BeaconOwner {
     /// A registered chain's loop, asking for the records and code its
     /// envelopes and commits name.
     Chain(ChainRegistration),
+    /// The host's own submissions, waiting on the beacon loop for the
+    /// records they name.
+    Submissions,
 }
 
 /// What a chain's loop reports to the host's beacon loop: what its
@@ -726,6 +729,13 @@ pub enum BeaconScopedInput {
         artifacts: Vec<(Hash, Vec<u8>)>,
     },
 
+    /// A submission this host could not derive, to hold until the records
+    /// it names arrive and then route through the fan-out it never got.
+    SubmissionWantsRecords {
+        /// What is waiting, and what it waits for.
+        deferred: DeferredTransaction,
+    },
+
     /// Package artifacts the loop's off-thread install has seated, so the
     /// metadata derivation reads is there to be read. Reported from
     /// inside the install, after the cache holds it.
@@ -785,6 +795,7 @@ impl BeaconScopedInput {
             | Self::InstanceRecordsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
             | Self::PackagesInstalled { .. }
+            | Self::SubmissionWantsRecords { .. }
             | Self::Shard { .. }
             | Self::Register { .. }
             | Self::Deregister(_) => EventPriority::Internal,

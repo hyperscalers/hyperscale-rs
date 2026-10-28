@@ -21,7 +21,7 @@ use hyperscale_types::{Address, Hash, LocalTimestamp, Transaction, TxHash, Unres
 use crate::beacon_loop::custodian;
 use crate::event::{BeaconInput, BeaconScopedInput, HostEvent};
 use crate::shard::ShardLoop;
-use crate::shard::mempool::{DeferredOrigin, DeferredTransaction, Orphaned};
+use crate::shard::mempool::{DeferredTransaction, Orphaned};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -147,29 +147,14 @@ where
                 }));
     }
 
-    /// Offer every envelope `arrived` releases back to the door it came
-    /// in by.
+    /// Offer every envelope `arrived` releases back to validation.
     ///
     /// A record and a package release alike: each is named by an
-    /// address, and what an envelope was waiting on says nothing about
-    /// how it re-enters.
+    /// address the wait is indexed by.
     pub(crate) fn release_deferred(&mut self, arrived: &[Address]) {
-        let mut unplaced: Vec<TxHash> = Vec::new();
-        for (tx, origin) in self.io.mempool.deferred_records.release(arrived) {
-            match origin {
-                DeferredOrigin::Validation => self.queue_validation(tx),
-                // Back through the fan-out it never got: its source
-                // shard, its passive co-hosts and its outbound gossip
-                // are all decisions the routing it can now derive makes.
-                DeferredOrigin::Submission => {
-                    self.io.mempool.pending_validation.remove(&tx.hash());
-                    if !self.process.submit_transaction(&tx) {
-                        unplaced.push(tx.hash());
-                    }
-                }
-            }
+        for tx in self.io.mempool.deferred_records.release(arrived) {
+            self.queue_validation(tx);
         }
-        self.settle_deferred(&unplaced);
     }
 
     /// Retire the asks of the envelopes admission has answered for.

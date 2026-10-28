@@ -62,10 +62,12 @@ use crate::event::{
 };
 use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Release};
 use crate::process::ProcessIo;
+use crate::shard::mempool::DeferredForRecords;
 use crate::shard::{FetchTicker, StepOutput, TimerOp, TimerOwner};
 use crate::sync::SyncOutput;
 
 mod records;
+mod submissions;
 
 pub(crate) use records::custodian;
 use records::{InstanceRecordBinding, PackageArtifactBinding};
@@ -136,8 +138,12 @@ where
     /// Where the fetches' answers return: the host's beacon channel.
     reply: BeaconReply,
 
-    /// The one fetch tick that retries both the fetches and the sync.
+    /// The one fetch tick that retries both the fetches and the sync, and
+    /// sweeps the held submissions.
     fetch_tick: FetchTicker,
+
+    /// The host's own submissions waiting on the records they name.
+    submissions: DeferredForRecords,
 }
 
 /// One identity's beacon participation on the loop.
@@ -182,6 +188,7 @@ where
             fetches: BeaconFetchState::new(config),
             interest: Interest::default(),
             fetch_tick: FetchTicker::default(),
+            submissions: DeferredForRecords::new(),
         }
     }
 
@@ -424,11 +431,11 @@ where
                 }
             }
             BeaconScopedInput::Continuation {
-                owner: BeaconOwner::Chain(_),
+                owner: BeaconOwner::Chain(_) | BeaconOwner::Submissions,
                 event,
             } => warn!(
                 event = event.type_name(),
-                "BeaconLoop: a chain dispatches no beacon action — dropping"
+                "BeaconLoop: only the fold and participants dispatch beacon actions — dropping"
             ),
             BeaconScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
                 self.on_sync_response(epoch, block);
@@ -447,6 +454,10 @@ where
                 self.drive_fetch::<InstanceRecordBinding>(FetchInput::Tick);
                 self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
                 self.on_sync_tick();
+                self.sweep_submissions();
+            }
+            BeaconScopedInput::SubmissionWantsRecords { deferred } => {
+                self.hold_submission(deferred);
             }
             BeaconScopedInput::InstanceRecordsFetched { records } => {
                 self.on_instance_records_fetched(records);
@@ -1035,7 +1046,7 @@ where
                         duration,
                     });
                 }
-                BeaconOwner::Fold | BeaconOwner::Chain(_) => {
+                BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => {
                     warn!(
                         ?id,
                         "BeaconLoop: only a participant arms a timer — dropping"
@@ -1049,7 +1060,7 @@ where
                         id,
                     });
                 }
-                BeaconOwner::Fold | BeaconOwner::Chain(_) => {
+                BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => {
                     warn!(
                         ?id,
                         "BeaconLoop: only a participant arms a timer — dropping"
@@ -1075,7 +1086,7 @@ where
                 BeaconOwner::Participant(attachment) => {
                     self.dispatch_participant_action(attachment.validator, other);
                 }
-                BeaconOwner::Fold | BeaconOwner::Chain(_) => warn!(
+                BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => warn!(
                     action = other.type_name(),
                     "BeaconLoop: a participant action from another owner — dropping"
                 ),
@@ -1321,9 +1332,12 @@ where
     }
 
     /// Keep the loop's one fetch tick armed exactly while its fetches or
-    /// its catch-up sync have work pending.
+    /// its catch-up sync have work pending, or a submission waits to be
+    /// swept at its window's end.
     fn update_fetch_tick_timer(&mut self) {
-        let pending = self.fetches.has_pending() || beacon::has_pending(&self.beacon_block);
+        let pending = self.fetches.has_pending()
+            || beacon::has_pending(&self.beacon_block)
+            || !self.submissions.is_empty();
         if let Some(op) = self
             .fetch_tick
             .refresh(TimerOwner::Beacon, self.now, pending)
@@ -1340,7 +1354,7 @@ where
         let topology = self.process.topology_snapshot.load();
         let asker = match owner {
             BeaconOwner::Participant(attachment) => Some(attachment.validator),
-            BeaconOwner::Fold | BeaconOwner::Chain(_) => None,
+            BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => None,
         };
         preferred
             .and_then(
@@ -1638,12 +1652,13 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
         BlockVote, CertifiedBlock, CertifiedBlockHeader, Hash, ProposerTimestamp,
         QuorumCertificate, RatifyCert, RatifyRound, Round, SignerBitfield, TopologySchedule,
-        VrfProof, WeightedTimestamp, shard_prefix_path,
+        Unresolved, VrfProof, WeightedTimestamp, shard_prefix_path,
     };
     use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
     use super::*;
     use crate::HostedChain;
+    use crate::shard::mempool::DeferredTransaction;
     use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
     use crate::shard::{ShardScopedInput, ThreadShardLoop};
 
@@ -3214,6 +3229,50 @@ mod tests {
             Some(SHARD),
             "the published topology releases the submission to the shard it routes to",
         );
+    }
+
+    /// A host seated nowhere holds a submission naming a record it lacks,
+    /// asks for the record, and publishes the submission once the record
+    /// lands: the wait is the host's, with no shard loop to hold it.
+    #[test]
+    fn a_host_seated_nowhere_holds_a_submission_until_its_record_arrives() {
+        let fix = Fixture::new();
+        let (mut host, _events) = fix.host_over_history(advanced_history(&fix, 0), far_future());
+        let (instance, record) = record_on_shard(&host);
+        let _ = host.network().drain_outbox();
+        let tx = Arc::new(test_transaction(1));
+        let _ = host.step(HostEvent::Beacon(
+            BeaconScopedInput::SubmissionWantsRecords {
+                deferred: DeferredTransaction::new(
+                    Arc::clone(&tx),
+                    Unresolved {
+                        instances: vec![instance],
+                        packages: Vec::new(),
+                    },
+                ),
+            },
+        ));
+        let published = |host: &Host| {
+            host.network()
+                .drain_outbox()
+                .iter()
+                .any(|entry| entry.message_type() == "transaction.gossip")
+        };
+        assert!(!published(&host), "the submission waits for its record");
+        assert_eq!(records_asked(&host), vec![vec![instance]]);
+        assert_eq!(
+            host.beacon.interest.records[&instance],
+            BTreeSet::from([BeaconOwner::Submissions]),
+        );
+
+        let _ = host.step(HostEvent::Beacon(
+            BeaconScopedInput::InstanceRecordsFetched {
+                records: vec![(instance, record)],
+            },
+        ));
+        assert!(published(&host), "the arrival routes the submission");
+        assert!(host.beacon.submissions.is_empty());
+        assert_eq!(host.beacon.fetches.instance_record.pending_count(), 0);
     }
 
     /// A component record whose prefix `SHARD` owns, and its leaf bytes.

@@ -8,7 +8,9 @@
 //! would arrive with nothing left to admit.
 //!
 //! So the envelope waits here while the fetch runs, indexed by what it
-//! is waiting for, and is offered to validation again when that lands.
+//! is waiting for, and is offered again when that lands: to validation
+//! from a shard loop's queue, and through the fan-out from the queue the
+//! host's beacon loop holds its own submissions in.
 //! A record and a package are indexed alike: each is named by an
 //! address, so one arrival path releases both. Re-admission needs nothing undone: a derivation memoizes only
 //! its successes, so the second attempt reads the registry the fetch just
@@ -20,7 +22,7 @@ use std::sync::Arc;
 use hyperscale_engine::Executor;
 use hyperscale_types::{Address, Hash, MAX_TXS_PER_BLOCK, Transaction, TxHash, Unresolved};
 
-/// How many envelopes one shard holds back at once.
+/// How many envelopes one queue holds back at once.
 ///
 /// Anyone can gossip an envelope naming a component that does not exist,
 /// and each one costs a fetch that will never be answered — so the wait
@@ -29,19 +31,6 @@ use hyperscale_types::{Address, Hash, MAX_TXS_PER_BLOCK, Transaction, TxHash, Un
 /// records is not going to include them all in the block the fetch lands
 /// for either.
 pub const MAX_DEFERRED_FOR_RECORDS: usize = MAX_TXS_PER_BLOCK;
-
-/// Which door an envelope came in by, and so which one it goes back
-/// through once its records land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeferredOrigin {
-    /// Offered to this shard's validation pipeline — gossip, or a body
-    /// fetched to vote on a block.
-    Validation,
-    /// Submitted to this node, its cross-shard fan-out never computed.
-    /// Re-entering by validation would admit it on one shard and gossip
-    /// it to none, so it goes back through the fan-out instead.
-    Submission,
-}
 
 /// An envelope this node cannot yet derive, and what it needs.
 #[derive(Debug, Clone)]
@@ -55,21 +44,18 @@ pub struct DeferredTransaction {
     /// by: a component by its own, a package by the one its content
     /// address derives.
     pub(crate) awaited: Vec<Address>,
-    /// Where it came from.
-    pub(crate) origin: DeferredOrigin,
 }
 
 impl DeferredTransaction {
     /// Hold `tx` for `wanted`, indexing the wait by the addresses that
     /// name it.
     #[must_use]
-    pub(crate) fn new(tx: Arc<Transaction>, wanted: Unresolved, origin: DeferredOrigin) -> Self {
+    pub(crate) fn new(tx: Arc<Transaction>, wanted: Unresolved) -> Self {
         let awaited = wanted.awaited(|package| Executor::package_artifact_key(package).owner);
         Self {
             tx,
             wanted,
             awaited,
-            origin,
         }
     }
 }
@@ -241,10 +227,7 @@ impl DeferredForRecords {
     /// its other asks stand, because admission has not said yet whether
     /// it wants them — only that it is no longer waiting here, which is
     /// what leaving the index says.
-    pub(crate) fn release(
-        &mut self,
-        arrived: &[Address],
-    ) -> Vec<(Arc<Transaction>, DeferredOrigin)> {
+    pub(crate) fn release(&mut self, arrived: &[Address]) -> Vec<Arc<Transaction>> {
         let mut released = Vec::new();
         for name in arrived {
             let Some(hashes) = self.waiting.remove(name) else {
@@ -258,7 +241,7 @@ impl DeferredForRecords {
                     continue;
                 }
                 held.reoffered = true;
-                released.push((Arc::clone(&held.deferred.tx), held.deferred.origin));
+                released.push(Arc::clone(&held.deferred.tx));
             }
         }
         self.forget_dropped();
@@ -367,7 +350,6 @@ mod tests {
                 instances,
                 packages: Vec::new(),
             },
-            DeferredOrigin::Validation,
         )
     }
 
@@ -407,9 +389,9 @@ mod tests {
 
         let released = wait.release(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
-        assert_eq!(released[0].0.hash(), first.hash());
+        assert_eq!(released[0].hash(), first.hash());
         assert_eq!(
-            wait.release(&[instance(0xB2)])[0].0.hash(),
+            wait.release(&[instance(0xB2)])[0].hash(),
             second.hash(),
             "the other envelope is still waiting on its own record",
         );
@@ -508,7 +490,7 @@ mod tests {
         );
         let released = wait.release(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
-        assert_eq!(released[0].0.hash(), lasting.hash());
+        assert_eq!(released[0].hash(), lasting.hash());
     }
 
     /// An envelope whose re-admission fails outright leaves no ask
@@ -577,7 +559,7 @@ mod tests {
             1,
             "and the envelope admission holds is not offered twice"
         );
-        assert_eq!(second[0].0.hash(), expiring.hash());
+        assert_eq!(second[0].hash(), expiring.hash());
 
         let (expired, orphaned) = wait.sweep_expired(10_000);
         assert_eq!(expired, vec![expiring.hash()]);
