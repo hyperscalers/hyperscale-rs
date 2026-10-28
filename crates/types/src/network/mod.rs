@@ -166,26 +166,14 @@ pub trait NetworkMessage: Send + Sync + Sized + HborEncode + HborDecode {
     /// Used by the network adaptor for queue ordering and backpressure.
     #[must_use]
     fn class() -> MessageClass;
-
-    /// Get the gossipsub topic for this message type.
-    #[must_use]
-    fn topic() -> String {
-        format!("hyperscale/{}/1.0.0", Self::message_type_id())
-    }
 }
 
-/// Topic scope for a gossip message type.
-///
-/// Determines topic subscription in production:
-/// - `Shard` → `hyperscale/{type_id}/shard-{shard}/1.0.0` (one per hosted shard)
-/// - `Global` → `hyperscale/{type_id}/1.0.0` (single topic)
-///
-/// Ignored in simulation (delivery is controlled by the harness).
+/// Who a gossip message type reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopicScope {
-    /// Shard-local topic. Only peers subscribed to the local shard receive it.
+pub enum GossipScope {
+    /// The peers serving the shard it is published to.
     Shard,
-    /// Global topic. All connected peers receive it.
+    /// Every host, whichever shards it serves.
     Global,
 }
 
@@ -215,15 +203,15 @@ pub enum TopicScope {
 /// the second-and-later arrivals at the receive boundary.
 pub trait GossipMessage: NetworkMessage + Clone {
     /// Whether this message lives on a per-shard topic or a single
-    /// global topic. See [`TopicScope`].
-    const SCOPE: TopicScope;
+    /// global topic. See [`GossipScope`].
+    const SCOPE: GossipScope;
 
-    /// For [`TopicScope::Global`] messages, the shard the message
+    /// For [`GossipScope::Global`] messages, the shard the message
     /// originates from. The framework filters this shard out when
     /// fanning into hosted shards.
     ///
     /// Returns `None` for messages with no inherent source shard, or
-    /// for [`TopicScope::Shard`] messages where the topic already pins
+    /// for [`GossipScope::Shard`] messages where the topic already pins
     /// the shard.
     #[must_use]
     fn source_shard(&self) -> Option<ShardId> {

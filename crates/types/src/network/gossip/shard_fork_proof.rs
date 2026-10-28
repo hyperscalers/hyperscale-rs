@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::{MessageClass, NetworkMessage, ShardForkProof, ShardId};
 
 /// Gossips a shard fork proof globally.
@@ -32,7 +32,7 @@ impl NetworkMessage for ShardForkProofGossip {
 }
 
 impl GossipMessage for ShardForkProofGossip {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 
     fn source_shard(&self) -> Option<ShardId> {
         Some(self.proof.shard())

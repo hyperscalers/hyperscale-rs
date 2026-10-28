@@ -130,7 +130,6 @@ pub struct Metrics {
 
     // === Cross-Shard Message Delivery ===
     pub dispatch_failures: CounterVec,
-    pub gossipsub_publish_failures: CounterVec,
     pub network_request_retries: CounterVec,
     pub early_votes_refused: Counter,
     pub backpressure_events: CounterVec,
@@ -243,8 +242,6 @@ pub struct Metrics {
     pub request_slots_in_flight: GaugeVec,
     /// `acquire_slot` wait time histogram, per class.
     pub request_slot_wait: HistogramVec,
-    /// Gossipsub validation outcomes (accept / reject / ignore).
-    pub gossipsub_validations: CounterVec,
     /// Inbound serving stream count, per protocol.
     pub inbound_streams_in_use: GaugeVec,
 }
@@ -728,13 +725,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            gossipsub_publish_failures: register_counter_vec!(
-                "hyperscale_gossipsub_publish_failures_total",
-                "Gossipsub publish failures by topic type",
-                &["topic_type"]
-            )
-            .unwrap(),
-
             network_request_retries: register_counter_vec!(
                 "hyperscale_network_request_retries_total",
                 "Network request retries due to timeout (likely packet loss)",
@@ -1069,13 +1059,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            gossipsub_validations: register_counter_vec!(
-                "hyperscale_gossipsub_validations_total",
-                "Gossipsub validation outcomes (accept / reject / ignore)",
-                &["outcome"]
-            )
-            .unwrap(),
-
             inbound_streams_in_use: register_gauge_vec!(
                 "hyperscale_inbound_streams_in_use",
                 "Inbound serving streams in flight, per protocol",
@@ -1298,14 +1281,6 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .libp2p_bandwidth_out_bytes
             .inc_by(bytes_out as f64);
-    }
-
-    fn record_gossipsub_publish_failure(&self, topic: &str) {
-        let topic_type = topic.rsplit('/').next().unwrap_or("unknown");
-        self.metrics
-            .gossipsub_publish_failures
-            .with_label_values(&[topic_type])
-            .inc();
     }
 
     fn record_request_retry(&self, request_type: &str) {
@@ -1561,13 +1536,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .request_slot_wait
             .with_label_values(&[class])
             .observe(wait_secs);
-    }
-
-    fn record_gossipsub_validation(&self, outcome: &str) {
-        self.metrics
-            .gossipsub_validations
-            .with_label_values(&[outcome])
-            .inc();
     }
 
     fn set_inbound_streams_in_use(&self, protocol: &str, count: usize) {

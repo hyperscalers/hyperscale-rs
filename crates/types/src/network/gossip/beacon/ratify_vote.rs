@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor};
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
 use crate::{MessageClass, NetworkMessage, RatifyVote, Verifiable};
 
@@ -95,7 +95,7 @@ impl NetworkMessage for RatifyVoteGossip {
 }
 
 impl GossipMessage for RatifyVoteGossip {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 }
 
 #[cfg(test)]
@@ -148,6 +148,6 @@ mod tests {
 
     #[test]
     fn scope_is_global() {
-        assert!(matches!(RatifyVoteGossip::SCOPE, TopicScope::Global));
+        assert!(matches!(RatifyVoteGossip::SCOPE, GossipScope::Global));
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::{
     CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage, ConsensusSignature, Hash,
     MessageClass, NetworkDefinition, NetworkMessage, ShardId, Signed, ValidatorId, Verifiable,
@@ -78,7 +78,7 @@ impl NetworkMessage for CertifiedBlockHeaderGossip {
 }
 
 impl GossipMessage for CertifiedBlockHeaderGossip {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 
     fn source_shard(&self) -> Option<ShardId> {
         Some(self.certified_header.header().shard_id())

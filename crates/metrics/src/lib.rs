@@ -161,9 +161,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record libp2p bandwidth.
     fn record_libp2p_bandwidth(&self, bytes_in: u64, bytes_out: u64) {}
 
-    /// Record a gossipsub publish failure.
-    fn record_gossipsub_publish_failure(&self, topic: &str) {}
-
     /// Record a network request retry.
     fn record_request_retry(&self, request_type: &str) {}
 
@@ -403,12 +400,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// cap is biting; spikes on hot classes mean the global pool is
     /// saturated.
     fn record_request_slot_wait(&self, class: &str, wait_secs: f64) {}
-
-    /// Record a gossipsub validation outcome (`accept` / `reject` /
-    /// `ignore`). Reject spikes mean peers are sending invalid data;
-    /// `ignore` spikes typically mean handler panics or unregistered
-    /// topics.
-    fn record_gossipsub_validation(&self, outcome: &str) {}
 
     /// Set the inbound serving stream count for a protocol
     /// (`request` / `notify`). Approaching `MAX_INBOUND_CONCURRENT`
@@ -797,12 +788,6 @@ pub fn record_libp2p_bandwidth(bytes_in: u64, bytes_out: u64) {
     recorder().record_libp2p_bandwidth(bytes_in, bytes_out);
 }
 
-/// Record a gossipsub publish failure.
-#[inline]
-pub fn record_gossipsub_publish_failure(topic: &str) {
-    recorder().record_gossipsub_publish_failure(topic);
-}
-
 /// Record a network request retry.
 #[inline]
 pub fn record_request_retry(request_type: &str) {
@@ -1047,12 +1032,6 @@ pub fn set_request_slots_in_flight(class: &str, count: usize) {
 #[inline]
 pub fn record_request_slot_wait(class: &str, wait_secs: f64) {
     recorder().record_request_slot_wait(class, wait_secs);
-}
-
-/// Record a gossipsub validation outcome.
-#[inline]
-pub fn record_gossipsub_validation(outcome: &str) {
-    recorder().record_gossipsub_validation(outcome);
 }
 
 /// Set the inbound serving stream count for a protocol.

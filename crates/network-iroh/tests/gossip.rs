@@ -19,8 +19,8 @@ use hyperscale_network_iroh::{
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees, ShardId,
-    TopicScope, TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
+    GossipMessage, GossipScope, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees,
+    ShardId, TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
 };
 use iroh::{EndpointAddr, SecretKey};
 use tokio::runtime::Handle;
@@ -61,7 +61,7 @@ impl NetworkMessage for BeaconBlock {
 }
 
 impl GossipMessage for BeaconBlock {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 }
 
 /// A committed block header, as far as the transport is concerned: a
@@ -83,7 +83,7 @@ impl NetworkMessage for CommittedHeader {
 }
 
 impl GossipMessage for CommittedHeader {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 }
 
 /// One copy of some content several senders publish, as committee members
@@ -107,7 +107,7 @@ impl NetworkMessage for Copy {
 }
 
 impl GossipMessage for Copy {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 
     fn dedup_key(&self) -> Option<u64> {
         Some(self.seq)
@@ -190,7 +190,7 @@ impl NetworkMessage for Transactions {
 }
 
 impl GossipMessage for Transactions {
-    const SCOPE: TopicScope = TopicScope::Shard;
+    const SCOPE: GossipScope = GossipScope::Shard;
 }
 
 fn vid(index: u32) -> ValidatorId {

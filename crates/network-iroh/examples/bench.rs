@@ -52,9 +52,9 @@ use hyperscale_network_iroh::{
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
-    ConsensusSignature, GenesisValidators, GossipMessage, MessageClass, NetworkDefinition,
-    NetworkMessage, Request, RoutingCommittees, ShardId, Signer, TopicScope, TopologySnapshot,
-    ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
+    ConsensusSignature, GenesisValidators, GossipMessage, GossipScope, MessageClass,
+    NetworkDefinition, NetworkMessage, Request, RoutingCommittees, ShardId, Signer,
+    TopologySnapshot, ValidatorAddressMessage, ValidatorId, Verifier, signed_bytes,
 };
 use iroh::RelayMode;
 use iroh::endpoint::{Builder, presets};
@@ -374,7 +374,7 @@ impl NetworkMessage for Committed {
 }
 
 impl GossipMessage for Committed {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 }
 
 /// One committee member's copy of a committed header: the content key
@@ -399,7 +399,7 @@ impl NetworkMessage for HeaderCopy {
 }
 
 impl GossipMessage for HeaderCopy {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 
     fn dedup_key(&self) -> Option<u64> {
         Some(self.seq)

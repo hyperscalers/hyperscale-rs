@@ -17,8 +17,8 @@ use hyperscale_network_iroh::{
     RedialBudget, RequestManager, RequestManagerConfig, RequestPool, RequestStreams,
 };
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, Request, RoutingCommittees,
-    ShardId, TopicScope, TopologySnapshot, ValidatorId,
+    GossipMessage, GossipScope, MessageClass, NetworkDefinition, NetworkMessage, Request,
+    RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -72,7 +72,7 @@ impl NetworkMessage for Backfill {
 }
 
 impl GossipMessage for Backfill {
-    const SCOPE: TopicScope = TopicScope::Shard;
+    const SCOPE: GossipScope = GossipScope::Shard;
 }
 
 #[derive(Debug, Clone, Hbor)]
