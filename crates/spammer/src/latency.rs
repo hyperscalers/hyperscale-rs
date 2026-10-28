@@ -180,12 +180,19 @@ impl LatencyTracker {
         self.stats.tracked.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Finalize tracking and generate a report.
+    /// Finalize tracking and generate a report, once every tracked
+    /// transaction has finished or `timeout` has passed.
     ///
     /// Any transactions still in-flight are counted as timed out.
     pub async fn finalize(mut self, timeout: Duration) -> LatencyReport {
-        // Wait for any in-flight transactions to complete
-        sleep(timeout).await;
+        let deadline = Instant::now() + timeout;
+        while !self.in_flight.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            sleep(self.poll_interval.min(left)).await;
+        }
 
         // Stop the polling task
         self.stop_polling();
@@ -325,5 +332,29 @@ impl LatencyReport {
         } else {
             println!("\nNo latency measurements recorded.");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POLL: Duration = Duration::from_millis(10);
+
+    #[tokio::test]
+    async fn finalize_returns_once_nothing_is_in_flight() {
+        let tracker = LatencyTracker::new(Vec::new(), POLL);
+        let started = Instant::now();
+        let report = tracker.finalize(Duration::from_secs(30)).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(report.stats.timed_out, 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_counts_what_is_still_in_flight_at_the_timeout() {
+        let tracker = LatencyTracker::new(Vec::new(), POLL);
+        tracker.track("pending".to_owned(), 0);
+        let report = tracker.finalize(Duration::from_millis(50)).await;
+        assert_eq!(report.stats.timed_out, 1);
     }
 }
