@@ -81,9 +81,9 @@ pub struct Metrics {
     pub storage_transactions_persisted: Counter,
 
     // === Network ===
-    pub libp2p_peers_connected: Gauge,
-    pub libp2p_bandwidth_in_bytes: Counter,
-    pub libp2p_bandwidth_out_bytes: Counter,
+    pub network_peers_connected: Gauge,
+    pub network_bandwidth_in_bytes: Counter,
+    pub network_bandwidth_out_bytes: Counter,
 
     // === Sync ===
     //
@@ -499,21 +499,21 @@ impl Metrics {
             .unwrap(),
 
             // Network
-            libp2p_peers_connected: register_gauge!(
-                "hyperscale_libp2p_peers_connected",
-                "Number of connected libp2p peers"
+            network_peers_connected: register_gauge!(
+                "hyperscale_network_peers_connected",
+                "Number of connected network peers"
             )
             .unwrap(),
 
-            libp2p_bandwidth_in_bytes: register_counter!(
-                "hyperscale_libp2p_bandwidth_in_bytes_total",
-                "Total bytes received via libp2p"
+            network_bandwidth_in_bytes: register_counter!(
+                "hyperscale_network_bandwidth_in_bytes_total",
+                "Total bytes received over the network"
             )
             .unwrap(),
 
-            libp2p_bandwidth_out_bytes: register_counter!(
-                "hyperscale_libp2p_bandwidth_out_bytes_total",
-                "Total bytes sent via libp2p"
+            network_bandwidth_out_bytes: register_counter!(
+                "hyperscale_network_bandwidth_out_bytes_total",
+                "Total bytes sent over the network"
             )
             .unwrap(),
 
@@ -1270,16 +1270,16 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.network_messages_received.inc();
     }
 
-    fn set_libp2p_peers(&self, count: usize) {
-        self.metrics.libp2p_peers_connected.set(count as f64);
+    fn set_network_peers(&self, count: usize) {
+        self.metrics.network_peers_connected.set(count as f64);
     }
 
-    fn record_libp2p_bandwidth(&self, bytes_in: u64, bytes_out: u64) {
+    fn record_network_bandwidth(&self, bytes_in: u64, bytes_out: u64) {
         self.metrics
-            .libp2p_bandwidth_in_bytes
+            .network_bandwidth_in_bytes
             .inc_by(bytes_in as f64);
         self.metrics
-            .libp2p_bandwidth_out_bytes
+            .network_bandwidth_out_bytes
             .inc_by(bytes_out as f64);
     }
 

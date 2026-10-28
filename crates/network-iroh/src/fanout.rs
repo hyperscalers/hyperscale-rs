@@ -51,7 +51,7 @@ use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::{
-    record_invalid_message, record_libp2p_bandwidth, record_network_message_received,
+    record_invalid_message, record_network_bandwidth, record_network_message_received,
     record_network_message_sent,
 };
 use hyperscale_network::compression::{compress, decompress};
@@ -579,7 +579,7 @@ impl Fanout {
             };
             let (type_id, compressed, wire_bytes) =
                 framing::read_typed_frame_compressed(&mut recv, MAX_FRAME_SIZE).await?;
-            record_libp2p_bandwidth((scope.encode().len() + wire_bytes) as u64, 0);
+            record_network_bandwidth((scope.encode().len() + wire_bytes) as u64, 0);
             // An item may be deferred, and a peer has only so many waited
             // on at once.
             let waiting = self

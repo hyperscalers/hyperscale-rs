@@ -155,11 +155,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a network message received.
     fn record_network_message_received(&self) {}
 
-    /// Set the libp2p peer count gauge.
-    fn set_libp2p_peers(&self, count: usize) {}
+    /// Set the connected network peer count gauge.
+    fn set_network_peers(&self, count: usize) {}
 
-    /// Record libp2p bandwidth.
-    fn record_libp2p_bandwidth(&self, bytes_in: u64, bytes_out: u64) {}
+    /// Record bytes received and sent over the network.
+    fn record_network_bandwidth(&self, bytes_in: u64, bytes_out: u64) {}
 
     /// Record a network request retry.
     fn record_request_retry(&self, request_type: &str) {}
@@ -776,16 +776,16 @@ pub fn record_network_message_received() {
     recorder().record_network_message_received();
 }
 
-/// Set the libp2p peer count gauge.
+/// Set the connected network peer count gauge.
 #[inline]
-pub fn set_libp2p_peers(count: usize) {
-    recorder().set_libp2p_peers(count);
+pub fn set_network_peers(count: usize) {
+    recorder().set_network_peers(count);
 }
 
-/// Record libp2p bandwidth.
+/// Record bytes received and sent over the network.
 #[inline]
-pub fn record_libp2p_bandwidth(bytes_in: u64, bytes_out: u64) {
-    recorder().record_libp2p_bandwidth(bytes_in, bytes_out);
+pub fn record_network_bandwidth(bytes_in: u64, bytes_out: u64) {
+    recorder().record_network_bandwidth(bytes_in, bytes_out);
 }
 
 /// Record a network request retry.
