@@ -1803,7 +1803,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg by (shard) (hyperscale_libp2p_peers_connected)",
+          "expr": "avg by (shard) (hyperscale_network_peers_connected)",
           "legendFormat": "Shard {{shard}}",
           "refId": "A"
         }
@@ -1894,7 +1894,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(hyperscale_libp2p_bandwidth_in_bytes_total[1m]))",
+          "expr": "sum(rate(hyperscale_network_bandwidth_in_bytes_total[1m]))",
           "legendFormat": "Inbound (cluster)",
           "refId": "A"
         },
@@ -1903,7 +1903,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(hyperscale_libp2p_bandwidth_out_bytes_total[1m]))",
+          "expr": "sum(rate(hyperscale_network_bandwidth_out_bytes_total[1m]))",
           "legendFormat": "Outbound (cluster)",
           "refId": "B"
         }

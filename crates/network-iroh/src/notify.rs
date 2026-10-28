@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use hyperscale_metrics::record_libp2p_bandwidth;
+use hyperscale_metrics::record_network_bandwidth;
 use hyperscale_network::stream_backoff::StreamFailure;
 use hyperscale_types::MessageClass;
 use iroh::EndpointId;
@@ -209,7 +209,7 @@ async fn run_stream(
             }
             match stream.write_all(&frame.bytes).await {
                 Ok(()) => {
-                    record_libp2p_bandwidth(0, frame.bytes.len() as u64);
+                    record_network_bandwidth(0, frame.bytes.len() as u64);
                     failures = 0;
                 }
                 Err(error) => {

@@ -30,7 +30,7 @@ use std::{fmt, io};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
+use hyperscale_metrics::{record_network_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -324,7 +324,7 @@ impl InboundRouter {
                     }
                     Err(e) => return Err(StreamError::Frame(e)),
                 };
-            record_libp2p_bandwidth(wire_bytes as u64, 0);
+            record_network_bandwidth(wire_bytes as u64, 0);
             if class == MessageClass::Consensus {
                 self.paths.note_consensus(peer.endpoint);
             }
@@ -431,7 +431,7 @@ impl InboundRouter {
                 framing::read_typed_frame(&mut recv, MAX_FRAME_SIZE)
                     .await
                     .map_err(StreamError::Frame)?;
-            record_libp2p_bandwidth((header.len() + wire_bytes) as u64, 0);
+            record_network_bandwidth((header.len() + wire_bytes) as u64, 0);
             Ok::<_, StreamError>((class, shard, type_id, payload))
         })
         .await
@@ -496,7 +496,7 @@ impl InboundRouter {
         })
         .await
         .map_err(|_| StreamError::Timeout)??;
-        record_libp2p_bandwidth(0, 1 + wire_bytes as u64);
+        record_network_bandwidth(0, 1 + wire_bytes as u64);
         Ok(())
     }
 }

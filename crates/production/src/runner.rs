@@ -34,7 +34,7 @@ use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, PreviewGrants};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths, set_shard_channel_depths};
+use hyperscale_metrics::{set_network_peers, set_pool_queue_depths, set_shard_channel_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_network_iroh::{IrohAdapter, IrohConfig, IrohNetwork, NetworkError};
@@ -1151,7 +1151,7 @@ impl ProductionRunner {
 
         // ── Peer count ───────────────────────────────────────────────────
         let peer_count = self.network.cached_peer_count();
-        set_libp2p_peers(peer_count);
+        set_network_peers(peer_count);
 
         // ── Update RPC status with peer count + live shard count ─────────
         if let Some(ref rpc_status) = self.publishers.node_status {

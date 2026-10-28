@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use hyperscale_metrics::record_libp2p_bandwidth;
+use hyperscale_metrics::record_network_bandwidth;
 use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::uses_relaxed_retry;
@@ -263,7 +263,7 @@ async fn exchange(
         .await
         .map_err(stream_io)?;
     send.finish().map_err(stream_io)?;
-    record_libp2p_bandwidth(0, (header.len() + wire_bytes) as u64);
+    record_network_bandwidth(0, (header.len() + wire_bytes) as u64);
 
     let mut status = [0u8; 1];
     AsyncReadExt::read_exact(&mut recv, &mut status)
@@ -293,7 +293,7 @@ async fn exchange(
     let response = framing::read_frame(&mut recv, MAX_FRAME_SIZE)
         .await
         .map_err(|e| NetworkError::StreamIo(e.to_string()))?;
-    record_libp2p_bandwidth(response.len() as u64, 0);
+    record_network_bandwidth(response.len() as u64, 0);
     Ok(response)
 }
 
