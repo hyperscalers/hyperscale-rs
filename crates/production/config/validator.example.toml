@@ -35,21 +35,32 @@ key_path = "./keys/validator.key"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [network]
-# Listen address (multiaddr format)
-# QUIC transport for low-latency, multiplexed connections
-listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
+# UDP socket the QUIC endpoint binds. Unset binds every interface on a free port.
+listen_addr = "0.0.0.0:9000"
 
-# Bootstrap peers to connect to on startup
-# Format: /ip4/<addr>/udp/<port>/quic-v1/p2p/<peer_id>
+# This host's network key. Unset means data_dir/network.key; generated on
+# first start if absent. `hyperscale-keygen --network-key <path>` creates it
+# ahead of time and prints the endpoint id other hosts bootstrap to.
+# network_key_path = "./keys/network.key"
+
+# Hosts to connect to on startup, each as
+# <endpoint id>@<address>[,<address>...], an address being a socket address
+# or a relay URL.
 bootstrap_peers = [
-    # "/ip4/10.0.0.1/udp/9000/quic-v1/p2p/12D3KooW...",
+    # "<endpoint id>@10.0.0.1:9000,https://relay.example",
 ]
 
-# Maximum message size (bytes)
-max_message_size = 65536
+# Relays this host homes on, at most two. A peer behind a NAT neither side
+# can traverse is reached through one.
+relays = [
+    # "https://relay.example",
+]
 
-# Gossipsub heartbeat interval (milliseconds)
-gossipsub_heartbeat_ms = 100
+# Addresses at which this host is known to be reachable from outside.
+external_addrs = []
+
+# Ask the local router for a port mapping (UPnP, NAT-PMP or PCP).
+upnp_enabled = true
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Thread Pool Configuration

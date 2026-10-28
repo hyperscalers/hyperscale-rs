@@ -25,7 +25,7 @@ NUM_SHARDS=2                                    # Number of shards
 VALIDATORS_PER_SHARD=4                          # Minimum 4 required for BFT (3 validators can't tolerate any delays)
 VNODES_PER_HOST=1                               # Validators bundled into each host process. Must divide VALIDATORS_PER_SHARD.
 CROSS_SHARD_PACK=false                          # Stripe one vnode from every shard into each host process.
-BASE_PORT=9000                                  # libp2p port
+BASE_PORT=9000                                  # QUIC port
 BASE_RPC_PORT=8080                              # HTTP RPC port
 DATA_DIR="./cluster-data"                       # Data directory
 CLEAN=false                                     # Clean data directories first
@@ -360,9 +360,16 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
 
     # Derive the actual public key from the seed using our keygen tool
-    # keygen outputs "public_key_hex peer_id" - we only need the public key
-    PUBLIC_KEYS[$i]=$("$KEYGEN_BIN" "$SEED_HEX" | awk '{print $1}')
+    PUBLIC_KEYS[$i]=$("$KEYGEN_BIN" "$SEED_HEX")
     echo "  Validator $i: public_key=${PUBLIC_KEYS[$i]:0:16}..."
+done
+
+# Each host's network key, kept beside the signing keys so a cleaned data
+# dir keeps its endpoint id; bootstrap entries name hosts by it.
+echo "Generating host network keys..."
+declare -a ENDPOINT_IDS
+for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
+    ENDPOINT_IDS[$host_idx]=$("$KEYGEN_BIN" --network-key "$DATA_DIR/keys/host-$host_idx.network.key")
 done
 
 # Generate genesis balances for spammer accounts. Genesis is single-shard:
@@ -388,7 +395,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     if [ -n "$BOOTSTRAP_PEERS" ]; then
         BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"
     fi
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/127.0.0.1/udp/$quic_port/quic-v1\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"${ENDPOINT_IDS[$bootstrap_host_idx]}@127.0.0.1:$quic_port\""
 done
 
 # Build the [[genesis.validators]] section once — it's identical across hosts,
@@ -469,11 +476,11 @@ data_dir = "$NODE_DATA_DIR"
 $VNODE_BLOCKS
 
 [network]
-listen_addr = "/ip4/0.0.0.0/udp/$quic_port/quic-v1"
+listen_addr = "0.0.0.0:$quic_port"
+network_key_path = "$DATA_DIR/keys/host-$host_idx.network.key"
 version_interop_mode = "relaxed"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
-max_message_size = 10485760
 
 [threads]
 consensus_threads = 0
@@ -532,7 +539,7 @@ for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
 
     # Tracing output goes to log_file (configured in TOML) with ANSI disabled.
     # Stderr redirect captures panics/crash output only.
-    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" 2>> "$HOST_DIR/crash.log" &
+    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL" "$VALIDATOR_BIN" --config "$CONFIG_FILE" 2>> "$HOST_DIR/crash.log" &
     PID=$!
     HOST_PIDS[$host_idx]=$PID
     echo "$PID" >> "$PID_FILE"

@@ -1,13 +1,17 @@
 //! Simple tool to generate validator keys and print public keys.
 //!
 //! Usage:
-//!   `keygen <seed_hex>`      - Print BLS public key for given 32-byte seed (hex)
-//!   `keygen --generate`      - Generate new random BLS keypair and print
+//!   `keygen <seed_hex>`             - Print BLS public key for given 32-byte seed (hex)
+//!   `keygen --generate`             - Generate new random BLS keypair and print
+//!   `keygen --network-key <path>`   - Print the endpoint id of the network key at
+//!                                     `path`, generating the key there if absent
 
 use std::env;
+use std::path::Path;
 
 use hex::{decode, encode};
 use hyperscale_crypto_bls::{bls_keypair_from_seed, generate_bls_keypair};
+use hyperscale_network_iroh::load_or_generate_secret_key;
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -19,11 +23,23 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: keygen <seed_hex> | keygen --generate");
+        eprintln!("Usage: keygen <seed_hex> | keygen --generate | keygen --network-key <path>");
         std::process::exit(1);
     }
 
-    if args[1] == "--generate" {
+    if args[1] == "--network-key" {
+        let Some(path) = args.get(2) else {
+            eprintln!("Usage: keygen --network-key <path>");
+            std::process::exit(1);
+        };
+        match load_or_generate_secret_key(Path::new(path)) {
+            Ok(key) => println!("{}", key.public()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    } else if args[1] == "--generate" {
         // Generate random BLS keypair
         let keypair = generate_bls_keypair();
         let public_key = keypair.public_key();
