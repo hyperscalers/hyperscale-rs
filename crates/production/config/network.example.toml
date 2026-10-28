@@ -1,0 +1,54 @@
+# Hyperscale Network File
+#
+# One network's definition, shared unchanged by every host on it. Each host's
+# validator.toml names it with `node.network_file`.
+
+# Which network: mainnet, testnet or simulator. Bound into every signed
+# consensus message to prevent cross-network replay.
+network = "simulator"
+
+# Hosts to dial first, each as <endpoint id>@<address>[,<address>...], an
+# address being a socket address or a relay URL. A host leaves itself out.
+# `hyperscale-keygen --network-key <path>` prints a host's endpoint id.
+bootstrap_peers = [
+    "e7b6b05b9dc032b9f2c688eb21e0fb0f99c7bb0a1d8d72305e8bf6aa31895f7d@10.0.0.1:9000",
+]
+
+# Relays the network's hosts share, at most two, for hosts that cannot be
+# dialled directly.
+relays = [
+    # "https://relay.example",
+]
+
+[chain]
+# When the network's epoch clock starts, in Unix milliseconds. Every host
+# must agree on it, and a genesis far behind the hosts' clocks never commits:
+# set it to the moment the network is launched.
+genesis_timestamp_ms = 1767225600000
+
+# Epoch length. Unset uses the production epoch.
+# epoch_duration_ms = 300000
+
+# Seats on a shard, the genesis shard included. Unset uses the production size.
+# shard_size = 4
+
+[genesis]
+# Validators seated on the genesis shard. `hyperscale-keygen <seed hex>`
+# prints the BLS public key of a 32-byte seed.
+[[genesis.validators]]
+id = 0
+public_key = "850e1b31deb8cf7202b3a060f79ba72d107688cda71f2fa78016c29395e148cb192904c7dfa7d64a2a09b7c95ef5168b"
+
+# Funded accounts.
+#
+# [[genesis.accounts]]
+# address = "0123456789abcdef..." # 64 hex chars
+# balance = "1000000"
+
+# Staking pools seated at genesis. Every genesis validator belongs to pool
+# number 0, and genesis fills each pool's founding members from the validator
+# set. A network that seats no pool 0 gets one no key operates.
+#
+# [[genesis.pools]]
+# number = 0
+# operator = "0123456789abcdef..." # 64 hex chars, the account given the pool's owner badge

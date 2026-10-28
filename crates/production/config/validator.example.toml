@@ -10,9 +10,10 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [node]
-# Network this node is configured for (mainnet, testnet, simulator).
-# Bound into every BLS-signed consensus message to prevent cross-network replay.
-network = "simulator"
+# The network file of the network this host joins: which network, its chain
+# parameters, its genesis, and its bootstrap peers and relays. Every host on a
+# network shares one. See network.example.toml.
+network_file = "./network.toml"
 
 # Directory for RocksDB storage. Per-shard instances open at data_dir/shard-{N}/db.
 data_dir = "./data"
@@ -42,19 +43,6 @@ listen_addr = "0.0.0.0:9000"
 # first start if absent. `hyperscale-keygen --network-key <path>` creates it
 # ahead of time and prints the endpoint id other hosts bootstrap to.
 # network_key_path = "./keys/network.key"
-
-# Hosts to connect to on startup, each as
-# <endpoint id>@<address>[,<address>...], an address being a socket address
-# or a relay URL.
-bootstrap_peers = [
-    # "<endpoint id>@10.0.0.1:9000,https://relay.example",
-]
-
-# Relays this host homes on, at most two. A peer behind a NAT neither side
-# can traverse is reached through one.
-relays = [
-    # "https://relay.example",
-]
 
 # Addresses at which this host is known to be reachable from outside.
 external_addrs = []
@@ -170,37 +158,3 @@ enabled = false
 
 # Service name for traces
 service_name = "hyperscale-validator"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Genesis Configuration
-#
-# Define the validator set for the network.
-# For development/testing, you can leave this empty for single-validator mode.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-[genesis]
-# Example validator set for a 4-validator network:
-#
-# [[genesis.validators]]
-# id = 0
-# public_key = "0123456789abcdef..." # 64 hex chars (32 bytes Ed25519)
-#
-# [[genesis.validators]]
-# id = 1
-# public_key = "fedcba9876543210..."
-#
-# [[genesis.validators]]
-# id = 2
-# public_key = "abcdef0123456789..."
-#
-# [[genesis.validators]]
-# id = 3
-# public_key = "9876543210abcdef..."
-#
-# Staking pools seated at genesis. Every genesis validator belongs to pool
-# number 0, and genesis fills each pool's founding members from the validator
-# set. A network that seats no pool 0 gets one no key operates.
-#
-# [[genesis.pools]]
-# number = 0
-# operator = "0123456789abcdef..." # 64 hex chars, the account given the pool's owner badge

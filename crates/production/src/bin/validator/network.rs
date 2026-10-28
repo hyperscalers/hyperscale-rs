@@ -3,11 +3,11 @@
 //! ```toml
 //! [network]
 //! listen_addr = "0.0.0.0:9000"
-//! relays = ["https://relay-a.example", "https://relay-b.example"]
-//! bootstrap_peers = ["<endpoint id>@203.0.113.7:9000,https://relay-a.example"]
+//! external_addrs = ["203.0.113.7:9000"]
 //! ```
 //!
-//! The host's network key is read from `network_key_path`, by default
+//! Bootstrap peers and relays are the network's, and come from its network
+//! file. The host's network key is read from `network_key_path`, by default
 //! `network.key` in the data directory, and generated there on first start.
 
 use std::net::SocketAddr;
@@ -19,7 +19,7 @@ use hyperscale_network_iroh::{
     IrohConfig, RedialBudget, RedialSchedule, VersionInteroperabilityMode,
     load_or_generate_secret_key,
 };
-use hyperscale_production::network_file::iroh_config;
+use hyperscale_production::NetworkFile;
 use serde::Deserialize;
 use tracing::info;
 
@@ -31,15 +31,6 @@ pub struct NetworkConfig {
     /// Socket to bind, e.g. "0.0.0.0:9000". Unset binds every interface on
     /// a free port.
     pub listen_addr: Option<String>,
-
-    /// Hosts to connect to at start, each as
-    /// `<endpoint id>@<address>[,<address>...]`.
-    #[serde(default)]
-    pub bootstrap_peers: Vec<String>,
-
-    /// Relays this host homes on, at most two.
-    #[serde(default)]
-    pub relays: Vec<String>,
 
     /// Addresses at which this host is known to be reachable from outside.
     #[serde(default)]
@@ -89,7 +80,7 @@ const fn default_upnp_enabled() -> bool {
 }
 
 /// Build network configuration from TOML config.
-pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
+pub fn build_network_config(config: &ValidatorConfig, file: &NetworkFile) -> Result<IrohConfig> {
     let network = &config.network;
     let key_path = network
         .network_key_path
@@ -106,7 +97,7 @@ pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
                 .with_context(|| format!("Invalid listen address: {addr}"))
         })
         .transpose()?;
-    let defaults = iroh_config(secret_key, &network.bootstrap_peers, &network.relays)?;
+    let defaults = file.iroh_transport(secret_key)?;
     Ok(IrohConfig {
         bind_addr,
         external_addrs: network.external_addrs.clone(),

@@ -18,6 +18,7 @@
 //!
 //! ```toml
 //! [node]
+//! network_file = "./network.toml"
 //! data_dir = "./data"
 //!
 //! [[vnode]]
@@ -26,7 +27,6 @@
 //!
 //! [network]
 //! listen_addr = "0.0.0.0:9000"
-//! bootstrap_peers = []
 //!
 //! [threads]
 //! consensus_threads = 2
@@ -37,6 +37,10 @@
 //! enabled = true
 //! listen_addr = "0.0.0.0:9090"
 //! ```
+//!
+//! The network file is the network's, shared by every host on it: which
+//! network, its chain parameters, its genesis and its bootstrap peers and
+//! relays (see [`NetworkFile`]). This file holds only what is the host's own.
 //!
 //! A host can run multiple validators in one process by listing additional
 //! `[[vnode]]` blocks. Validators on one shard attach as signers to that
@@ -59,18 +63,14 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_dispatch_pooled::ThreadPoolConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::VersionInteroperabilityMode;
-use hyperscale_production::network_file::{Genesis, network_name};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
-    DEFAULT_BLOCK_CACHE_MB, LocalValidator, Node, NodeSetup, TelemetryConfig, TelemetryGuard,
-    for_core_count, init_telemetry,
+    DEFAULT_BLOCK_CACHE_MB, LocalValidator, NetworkFile, Node, NodeSetup, TelemetryConfig,
+    TelemetryGuard, for_core_count, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
-use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{CompressionType as RocksCompressionType, RocksDbConfig};
-use hyperscale_types::{
-    BeaconChainConfig, ConsensusPublicKey, NetworkDefinition, Signer, ValidatorId,
-};
+use hyperscale_types::{ConsensusPublicKey, Signer, ValidatorId};
 use serde::Deserialize;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
@@ -172,10 +172,6 @@ pub(crate) struct ValidatorConfig {
     #[serde(default)]
     pub telemetry: TelemetryConfigToml,
 
-    /// Genesis configuration (validators in the network)
-    #[serde(default)]
-    pub genesis: Genesis,
-
     /// Mempool configuration
     #[serde(default)]
     pub(crate) mempool: MempoolConfig,
@@ -193,21 +189,13 @@ pub(crate) struct ValidatorConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NodeConfig {
-    /// Network this node is configured for. Bound into every
-    /// signed consensus message to prevent cross-network replay.
-    /// Parsed from a network name (`"mainnet"`, `"testnet"`,
-    /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`](std::str::FromStr::from_str).
-    #[serde(default = "default_network", with = "network_name")]
-    pub(crate) network: NetworkDefinition,
+    /// The network file of the network this host joins.
+    pub(crate) network_file: PathBuf,
 
     /// Data directory for storage. Per-shard `RocksDB` instances are
     /// opened at `data_dir/shard-{N}/db`.
     #[serde(default = "default_data_dir")]
     pub(crate) data_dir: PathBuf,
-}
-
-fn default_network() -> NetworkDefinition {
-    NetworkDefinition::simulator()
 }
 
 /// One hosted validator's identity inputs.
@@ -436,10 +424,6 @@ impl ValidatorConfig {
 
         if let Some(ref metrics_addr) = cli.metrics_addr {
             self.metrics.listen_addr.clone_from(metrics_addr);
-        }
-
-        if !cli.bootstrap.is_empty() {
-            self.network.bootstrap_peers.extend(cli.bootstrap.clone());
         }
 
         if cli.no_upnp {
@@ -719,16 +703,21 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         );
     }
 
-    let thread_config = build_thread_pool_config(&config.threads);
-    let shard_config = ShardConsensusConfig::default();
-    let network_config = build_network_config(&config)?;
-    let beacon_chain_config = BeaconChainConfig::production();
-    let rocksdb_config = build_rocksdb_config(&config.storage);
+    let file_path = &config.node.network_file;
+    let text = fs::read_to_string(file_path)
+        .with_context(|| format!("Failed to read network file: {}", file_path.display()))?;
+    let mut network_file = NetworkFile::from_toml(&text)
+        .with_context(|| format!("Failed to parse network file: {}", file_path.display()))?;
+    network_file
+        .bootstrap_peers
+        .extend(cli.bootstrap.iter().cloned());
+    info!(
+        network = ?network_file.network,
+        genesis_timestamp_ms = network_file.chain.genesis_timestamp_ms,
+        "Loaded network file"
+    );
 
-    // Pass 1: load every hosted vnode's signing keypair so the topology builder
-    // can substitute trusted local public keys for genesis-hex pubkeys.
-    // Ordered Vec — single-validator mode picks the first entry, so source
-    // order must be the same as config.vnodes.
+    // Ordered as config.vnodes: the first entry is the host's primary vnode.
     let mut hosted_signers: Vec<(ValidatorId, Arc<BlsSigner>)> =
         Vec::with_capacity(config.vnodes.len());
     for entry in &config.vnodes {
@@ -741,17 +730,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         hosted_signers.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));
     }
 
-    // Build the host's genesis validators. Genesis is always a single ROOT
-    // shard; the network grows to its target topology by splitting under load.
-    // The runner projects the host's topology snapshot from this.
-    let local_keys: Vec<(ValidatorId, ConsensusPublicKey)> = hosted_signers
-        .iter()
-        .map(|(validator_id, signer)| (*validator_id, signer.public_key()))
-        .collect();
-    let genesis_validators = config
-        .genesis
-        .validators(config.node.network.clone(), &local_keys)?;
-
     // The validators this host runs. Shard participation is not named here —
     // the runner derives each validator's seat (or pool membership) from the
     // committed beacon state and opens any seated shard's storage itself.
@@ -763,22 +741,23 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         })
         .collect();
 
-    let mut node = Node::start(NodeSetup {
-        data_dir: config.node.data_dir.clone(),
+    // The network file fixes the chain and its genesis; this host's own
+    // settings replace the defaults for everything else.
+    let transport = build_network_config(&config, &network_file)?;
+    let setup = NodeSetup::from_network(
+        config.node.data_dir.clone(),
         validators,
-        genesis: genesis_validators,
-        engine_genesis: config
-            .genesis
-            .engine()
-            .context("Failed to parse genesis configuration")?,
-        beacon_chain: beacon_chain_config,
-        shard_consensus: shard_config,
+        &network_file,
+        transport,
+    )
+    .with_context(|| format!("Network file {} refused", file_path.display()))?;
+    let mut node = Node::start(NodeSetup {
         mempool: config.mempool.clone(),
         provisions: config.provisions,
-        transport: network_config,
-        threads: thread_config,
+        threads: build_thread_pool_config(&config.threads),
         io_threads: config.threads.io_threads,
-        storage: rocksdb_config,
+        storage: build_rocksdb_config(&config.storage),
+        ..setup
     })
     .context("Failed to start the node")?;
 
