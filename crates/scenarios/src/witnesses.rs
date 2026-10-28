@@ -17,27 +17,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_engine::genesis::{OWNER_BADGE_ID, pool_owner_badge, stake_unit};
 use hyperscale_types::{
-    ComponentAddr, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, SPC_VIEW_TIMEOUT,
-    ShardId, Stake, StakePoolId, Transaction, TransactionDecision, TransactionStatus,
-    UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus, validator_possession_proof_sign,
+    ComponentAddr, ConsensusPublicKey, ConsensusSignature, Epoch, MIN_STAKE_FLOOR,
+    NetworkDefinition, SPC_VIEW_TIMEOUT, ShardId, Stake, StakePoolId, Transaction,
+    TransactionDecision, TransactionStatus, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
+    validator_possession_proof_sign,
 };
 use hyperscale_vm_types::PrincipalAddr;
 
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    beacon_epoch, epoch_duration_ms, live_shards, pool_effective_stake, pool_total_stake,
-    validator_pubkey, validator_status,
+    beacon_epoch, epoch_duration_ms, held, holds_instance, live_shards, pool_effective_stake,
+    pool_total_stake, validator_pubkey, validator_status,
 };
 use crate::support::tx::{
-    GENESIS_POOL, HEIR_FUNDING, SECOND_POOL, STAKE_POOL, badge_buyer, build_badge_sale_tx,
-    build_deactivate_tx, build_register_tx, build_reshape_threshold_vote_tx,
-    build_sponsored_unjail_tx, build_stake_tx, build_transfer_tx, build_unjail_tx,
-    build_unstake_tx, delegator, pool_at, pool_heir, pool_id, pool_operator, pool_vault_cell,
-    validity_around,
+    FOUNDER_FUNDING, GENESIS_POOL, SECOND_POOL, STAKE_POOL, badge_buyer, build_badge_sale_tx,
+    build_deactivate_tx, build_found_tx, build_founded_stake_tx, build_join_tx, build_register_tx,
+    build_reshape_threshold_vote_tx, build_sponsored_unjail_tx, build_stake_tx, build_transfer_tx,
+    build_unjail_tx, build_unstake_tx, delegator, founded_at, founded_id, newcomer_founder,
+    pool_at, pool_id, pool_operator, pool_vault_cell, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
-use crate::support::{Cluster, Crash, CrashableCluster, epochs, register_staged_handing_to};
+use crate::support::{Cluster, Crash, CrashableCluster, epochs, found_staged};
 
 /// The single genesis stake pool every genesis validator belongs to.
 /// Warm the cluster until the beacon folds its first epoch — the precondition a
@@ -130,7 +132,6 @@ fn register<C: Cluster>(
             validator,
             &keypair.public_key(),
             &proof,
-            None,
             validity_around(c.now()),
         ),
     );
@@ -715,6 +716,270 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "four registrations against three");
 }
 
+/// A newcomer founds its own pool in one sponsored transaction.
+///
+/// The newcomer signs it and the desk funds and pays for it: the pool's
+/// bring-up stakes the desk's funds and registers the newcomer's validator
+/// in the node that makes the pool actual, the beacon folds both under
+/// the pool's address, and the pool's owner badge lands in the newcomer's
+/// account.
+///
+/// # Panics
+///
+/// Panics if the founding does not commit, the beacon never pools the
+/// validator under the founded pool's address with the founding stake, or
+/// the badge is not in the founder's account.
+pub fn a_newcomer_founds_its_own_pool(c: &mut impl Cluster) {
+    warm_up(c);
+    let (_, founder) = newcomer_founder();
+    let pool = founded_id(founder);
+    let validator = ValidatorId::new(1000);
+    assert_eq!(
+        pool_total_stake(c, pool),
+        None,
+        "no pool stands at the founder's address before it founds one",
+    );
+    let world = pool_world(c, [founded_at(founder)]);
+    let mut charges = Charges::default();
+
+    let founding = found(c, &mut charges, 9, validator);
+    await_pooled(c, validator, "the founded pool's first validator");
+    let record = c
+        .beacon_state()
+        .and_then(|s| s.validators.get(&validator).map(|r| r.pool));
+    assert_eq!(
+        record,
+        Some(pool),
+        "the validator is the founded pool's, keyed by its address",
+    );
+    assert_eq!(
+        pool_total_stake(c, pool),
+        Some(Stake::from_quanta(founding)),
+        "the founded pool holds the founding stake",
+    );
+    assert!(
+        holds_instance(
+            c,
+            founder.address(),
+            pool_owner_badge(founded_at(founder)),
+            OWNER_BADGE_ID,
+        ),
+        "the founded pool's owner badge is in the founder's account",
+    );
+    world.assert_settles_within(c, &charges, epochs(4), "a founding");
+}
+
+/// A founded pool's second validator joins with the desk's top-up.
+///
+/// The founder's declaration presents its badge and registers, and the
+/// desk's stake ahead of it is what covers the second seat. The desk
+/// keeps the units its stake bought.
+///
+/// # Panics
+///
+/// Panics if the founding or the join does not commit, the beacon never
+/// pools the second validator, or the pool's stake is not the founding
+/// plus the top-up.
+pub fn a_second_validator_joins_with_the_desks_top_up(c: &mut impl Cluster) {
+    warm_up(c);
+    let (_, founder) = newcomer_founder();
+    let pool = founded_id(founder);
+    let world = pool_world(c, [founded_at(founder)]);
+    let mut charges = Charges::default();
+    let founding = found(c, &mut charges, 9, ValidatorId::new(1000));
+    await_pooled(
+        c,
+        ValidatorId::new(1000),
+        "the founded pool's first validator",
+    );
+
+    let second = ValidatorId::new(1001);
+    let top_up = shortfall(c, pool, 2);
+    assert!(top_up > 0, "the founding covers one seat, not two");
+    join(c, &mut charges, 10, second, top_up);
+    await_pooled(c, second, "the second validator");
+    assert_eq!(
+        pool_total_stake(c, pool),
+        Some(Stake::from_quanta(founding + top_up)),
+        "the pool holds the founding and the desk's top-up",
+    );
+    let (_, desk) = delegator();
+    assert!(
+        held(c, desk.address(), stake_unit(founded_at(founder))) > 0,
+        "the desk keeps the units its top-up bought",
+    );
+    world.assert_settles_within(c, &charges, epochs(4), "a founding and a topped up join");
+}
+
+/// A founded pool's third validator joins only once the pool's own stake
+/// covers it.
+///
+/// A join with no top-up into a pool covering two seats commits and is
+/// refused at the beacon's capacity gate, and once a delegation covers a
+/// third seat the next join takes.
+///
+/// # Panics
+///
+/// Panics if any transaction does not commit, if the uncovered join
+/// creates a validator record, or if the covered one never pools.
+pub fn a_third_validator_joins_once_the_pools_stake_covers_it(c: &mut impl Cluster) {
+    warm_up(c);
+    let (_, founder) = newcomer_founder();
+    let pool = founded_id(founder);
+    let world = pool_world(c, [founded_at(founder)]);
+    let mut charges = Charges::default();
+    found(c, &mut charges, 9, ValidatorId::new(1000));
+    await_pooled(
+        c,
+        ValidatorId::new(1000),
+        "the founded pool's first validator",
+    );
+    let top_up = shortfall(c, pool, 2);
+    join(c, &mut charges, 10, ValidatorId::new(1001), top_up);
+    await_pooled(c, ValidatorId::new(1001), "the second validator");
+
+    // The join itself commits: the pool registers whoever its badge
+    // holder names, and what refuses the seat is the beacon's gate.
+    let uncovered = ValidatorId::new(1002);
+    join(c, &mut charges, 11, uncovered, 0);
+    c.run_until(epochs(5), |_| false);
+    assert_eq!(
+        validator_status(c, uncovered),
+        None,
+        "a join the pool's stake cannot cover must not create a validator record",
+    );
+
+    // The control: once the pool's stake covers a third seat, a join
+    // with no top-up takes. A fresh id, because the refused join spent
+    // its own in the pool's record.
+    let covering = shortfall(c, pool, 3);
+    let expected = pool_total_stake(c, pool)
+        .unwrap_or(Stake::ZERO)
+        .saturating_add(Stake::from_quanta(covering));
+    let (key, from) = delegator();
+    submit_committed(
+        c,
+        &mut charges,
+        build_founded_stake_tx(&key, from, founder, covering, validity_around(c.now())),
+    );
+    assert!(
+        c.run_until(epochs(8), |c| pool_total_stake(c, pool) == Some(expected)),
+        "the delegation never folded; pool stake = {:?}",
+        pool_total_stake(c, pool),
+    );
+    let covered = ValidatorId::new(1003);
+    join(c, &mut charges, 12, covered, 0);
+    await_pooled(c, covered, "the covered third validator");
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(4),
+        "a founding, three joins and a delegation",
+    );
+}
+
+/// [`newcomer_founder`]'s founding of its own pool with `validator`, keyed
+/// by `seed`, staked one seat at the price the beacon holds now, plus
+/// [`seat_slack`]; returns the founding stake.
+fn found<C: Cluster>(c: &mut C, charges: &mut Charges, seed: u8, validator: ValidatorId) -> u128 {
+    let (founder_key, founder) = newcomer_founder();
+    let (desk, _) = delegator();
+    let (pubkey, proof) = founded_validator(c, seed, validator, founder);
+    let amount = shortfall(c, founded_id(founder), 1);
+    submit_committed(
+        c,
+        charges,
+        build_found_tx(
+            &desk,
+            &founder_key,
+            validator,
+            &pubkey,
+            &proof,
+            amount,
+            validity_around(c.now()),
+        ),
+    );
+    amount
+}
+
+/// [`newcomer_founder`]'s join of `validator`, keyed by `seed`, to the pool
+/// it founded, with the desk staking `top_up` ahead of it.
+fn join<C: Cluster>(
+    c: &mut C,
+    charges: &mut Charges,
+    seed: u8,
+    validator: ValidatorId,
+    top_up: u128,
+) {
+    let (founder_key, founder) = newcomer_founder();
+    let (desk, _) = delegator();
+    let (pubkey, proof) = founded_validator(c, seed, validator, founder);
+    submit_committed(
+        c,
+        charges,
+        build_join_tx(
+            &desk,
+            &founder_key,
+            validator,
+            &pubkey,
+            &proof,
+            top_up,
+            validity_around(c.now()),
+        ),
+    );
+}
+
+/// The key `seed` derives under the cluster's scheme and its proof of
+/// possession as `validator` of `founder`'s founded pool.
+fn founded_validator(
+    c: &impl Cluster,
+    seed: u8,
+    validator: ValidatorId,
+    founder: PrincipalAddr,
+) -> (ConsensusPublicKey, ConsensusSignature) {
+    let keypair = c.signer_from_seed(&[seed; 32]);
+    let proof = validator_possession_proof_sign(
+        keypair.as_ref(),
+        &NetworkDefinition::simulator(),
+        validator,
+        founded_id(founder),
+    )
+    .expect("sign");
+    (keypair.public_key(), proof)
+}
+
+/// What `pool` lacks to cover `seats` at the `min_stake` the beacon holds
+/// now, plus [`seat_slack`].
+fn shortfall(c: &impl Cluster, pool: StakePoolId, seats: u128) -> u128 {
+    let price = c
+        .beacon_state()
+        .expect("a committed beacon state")
+        .min_stake();
+    let held = pool_effective_stake(c, pool).unwrap_or(Stake::ZERO);
+    (price.quanta() * seats + seat_slack(price)).saturating_sub(held.quanta())
+}
+
+/// What a founded pool is staked past the seats it covers: a tenth of a
+/// seat, so a `min_stake` that moves between reading it and the fold
+/// still finds every seat covered, and never a whole further seat.
+const fn seat_slack(price: Stake) -> u128 {
+    price.quanta() / 10
+}
+
+/// Wait until the beacon pools `validator`.
+///
+/// # Panics
+///
+/// Panics if it never does within budget.
+fn await_pooled<C: Cluster>(c: &mut C, validator: ValidatorId, what: &str) {
+    assert!(
+        c.run_until(epochs(8), |c| validator_status(c, validator)
+            == Some(ValidatorStatus::Pooled)),
+        "{what} never reached the pool; status = {:?}",
+        validator_status(c, validator),
+    );
+}
+
 /// A newcomer seated and signing whose host then goes away for good
 /// is jailed, and the network carries on without it.
 ///
@@ -786,20 +1051,20 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
 
 /// A timed out newcomer is let back in from its own host, seated nowhere.
 ///
-/// Its registration handed the pool to an account of its own; that account
+/// It founded its own pool from an account of its own; that account
 /// signs the unjail, and the newcomer's host submits it.
 ///
 /// # Panics
 ///
-/// As [`time_out_a_newcomer_handing_to`], or if the unjail never returns the
+/// As [`time_out_a_founding_newcomer`], or if the unjail never returns the
 /// newcomer to the pool.
 pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: CrashableCluster>(c: &mut C) {
-    let (heir_key, heir) = pool_heir();
-    let (newcomer, host) = time_out_a_newcomer_handing_to(c, heir, true);
+    let (founder_key, founder) = newcomer_founder();
+    let (newcomer, host) = time_out_a_founding_newcomer(c, true);
     let attempt = |c: &mut C| {
         let unjail = build_unjail_tx(
-            &heir_key,
-            pool_at(STAKE_POOL),
+            &founder_key,
+            founded_at(founder),
             newcomer,
             validity_around(c.now()),
         );
@@ -813,17 +1078,17 @@ pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: CrashableCluster
 ///
 /// # Panics
 ///
-/// As [`time_out_a_newcomer_handing_to`], or if the sponsored unjail never
+/// As [`time_out_a_founding_newcomer`], or if the sponsored unjail never
 /// returns the newcomer to the pool.
 pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableCluster>(c: &mut C) {
-    let (heir_key, heir) = pool_heir();
-    let (newcomer, _) = time_out_a_newcomer_handing_to(c, heir, false);
+    let (founder_key, founder) = newcomer_founder();
+    let (newcomer, _) = time_out_a_founding_newcomer(c, false);
     let (sponsor_key, _) = delegator();
     let attempt = |c: &mut C| {
         let unjail = build_sponsored_unjail_tx(
             &sponsor_key,
-            &heir_key,
-            pool_at(STAKE_POOL),
+            &founder_key,
+            founded_at(founder),
             newcomer,
             validity_around(c.now()),
         );
@@ -832,30 +1097,30 @@ pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableClu
     let_back_in(c, newcomer, attempt);
 }
 
-/// Seat the staged newcomer with its registration handing the staging pool
-/// to `heir`, funded for its own fees when `funded`; crash its host until
-/// it is jailed; bring the host back; and wait until its time-out is over
-/// and the host, its loop retired, is seated nowhere. Returns the newcomer
-/// and its host.
+/// Seat the staged newcomer in the pool it founds, its founder funded for
+/// its own fees when `funded`; crash its host until it is jailed; bring the
+/// host back; and wait until its time-out is over and the host, its loop
+/// retired, is seated nowhere. Returns the newcomer and its host.
 ///
 /// # Panics
 ///
 /// Panics if the newcomer is never seated ready, is not jailed while its
 /// host is down, its host never comes back or keeps a shard loop, or its
 /// time-out never ends.
-fn time_out_a_newcomer_handing_to(
+fn time_out_a_founding_newcomer(
     c: &mut impl CrashableCluster,
-    heir: PrincipalAddr,
     funded: bool,
 ) -> (ValidatorId, usize) {
-    let newcomer = seat_the_staged_newcomer_handing_to(c, Some(heir));
+    let (_, founder) = newcomer_founder();
+    let pool = founded_id(founder);
+    let newcomer = seat_the_staged_newcomer(c);
     if funded {
         let (key, from) = delegator();
         c.submit(Arc::new(build_transfer_tx(
             &key,
             from,
-            heir,
-            HEIR_FUNDING,
+            founder,
+            FOUNDER_FUNDING,
             validity_around(c.now()),
         )));
     }
@@ -874,12 +1139,12 @@ fn time_out_a_newcomer_handing_to(
         "the newcomer's host never came back",
     );
     assert!(
-        c.run_until(epochs(40), |c| c.beacon_state().is_some_and(|s| s
-            .unjail_refusal(newcomer, pool_id(STAKE_POOL))
-            .is_none())),
+        c.run_until(epochs(40), |c| c
+            .beacon_state()
+            .is_some_and(|s| s.unjail_refusal(newcomer, pool).is_none())),
         "the newcomer's time-out never ended; refusal = {:?}",
         c.beacon_state()
-            .and_then(|s| s.unjail_refusal(newcomer, pool_id(STAKE_POOL))),
+            .and_then(|s| s.unjail_refusal(newcomer, pool)),
     );
     // The placement scan retires the jailed newcomer's loop; from then on
     // its host is seated nowhere.
@@ -967,18 +1232,10 @@ pub fn a_restarted_genesis_host_resumes_beside_a_newcomer(
     }
 }
 
-/// Register the cluster's one staged validator, wait until it is seated
-/// ready, and let it sign a few epochs; returns its id.
+/// Seat the cluster's one staged validator in the pool it founds from
+/// [`newcomer_founder`]'s account, wait until it is seated ready, and let
+/// it sign a few epochs; returns its id.
 fn seat_the_staged_newcomer(c: &mut impl Cluster) -> ValidatorId {
-    seat_the_staged_newcomer_handing_to(c, None)
-}
-
-/// [`seat_the_staged_newcomer`], its registration handing the staging pool
-/// to `hand_to`'s account.
-fn seat_the_staged_newcomer_handing_to(
-    c: &mut impl Cluster,
-    hand_to: Option<PrincipalAddr>,
-) -> ValidatorId {
     warm_up(c);
     let staged = c.staged_validators();
     let [(newcomer, _)] = staged[..] else {
@@ -987,7 +1244,7 @@ fn seat_the_staged_newcomer_handing_to(
             staged.len()
         );
     };
-    register_staged_handing_to(c, hand_to);
+    found_staged(c, &newcomer_founder().0);
     assert!(
         c.run_until(epochs(60), |c| matches!(
             validator_status(c, newcomer),

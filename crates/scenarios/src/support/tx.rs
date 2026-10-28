@@ -6,10 +6,11 @@
 //!
 //! [`Cluster::submit`]: crate::Cluster::submit
 
+use std::slice;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use hyperscale_effects_bridge::genesis::{GenesisPackages, genesis_world_with_pools};
+use hyperscale_effects_bridge::genesis::{GenesisPackages, founded_pool, genesis_world_with_pools};
 use hyperscale_effects_bridge::vm_statics::{package_key, principal_for};
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{OWNER_BADGE_ID, pool_owner_badge, stake_unit};
@@ -2299,7 +2300,7 @@ pub fn build_sponsored_swap_tx(
     build_venues_tx(
         payer,
         Some(sponsor),
-        std::slice::from_ref(venue),
+        slice::from_ref(venue),
         validity,
         &|pools, b| {
             let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
@@ -2380,7 +2381,7 @@ fn build_venue_tx(
     build_venues_tx(
         payer,
         None,
-        std::slice::from_ref(venue),
+        slice::from_ref(venue),
         validity,
         &|pools, b| leg(&pools[0], b),
     )
@@ -2674,7 +2675,6 @@ pub(crate) fn build_register_tx(
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
-    hand_to: Option<PrincipalAddr>,
     validity: TimestampRange,
 ) -> Transaction {
     let graph = client()
@@ -2684,7 +2684,6 @@ pub(crate) fn build_register_tx(
             validator,
             pubkey,
             possession_proof,
-            hand_to,
         )
         .expect("a registration types against the pool's signature");
     Transaction::new(envelope(graph, operator, validity))
@@ -2759,17 +2758,132 @@ pub(crate) fn build_sponsored_unjail_tx(
         .expect("a declaration with no sockets or gives composes")
 }
 
-/// The account a registration hands the staging pool to, holding nothing
-/// of its own.
+/// The account a newcomer founds its own pool from, holding nothing of
+/// its own: the desk pays for every join it signs.
 #[must_use]
-pub(crate) fn pool_heir() -> (Ed25519PrivateKey, PrincipalAddr) {
+pub(crate) fn newcomer_founder() -> (Ed25519PrivateKey, PrincipalAddr) {
     let key = signer_from_seed(182);
     let account = account_address(&key.public_key().0);
     (key, account)
 }
 
-/// What a heir signing its own transactions is given to pay with.
-pub(crate) const HEIR_FUNDING: u128 = MAX_FEE * 8;
+/// What a founder signing its own transactions is given to pay with.
+pub(crate) const FOUNDER_FUNDING: u128 = MAX_FEE * 8;
+
+/// Where `founder`'s founded pool lives.
+#[must_use]
+pub(crate) fn founded_at(founder: PrincipalAddr) -> ComponentAddr {
+    founded_pool(founder).address(&ProtocolHasher)
+}
+
+/// The identifier the beacon folds `founder`'s founded pool under: its
+/// address.
+#[must_use]
+pub(crate) fn founded_id(founder: PrincipalAddr) -> StakePoolId {
+    StakePoolId::of(founded_at(founder))
+}
+
+/// The fee terms a desk pays a sponsored join under.
+const fn desk_terms() -> Terms {
+    Terms {
+        max_fee: MAX_FEE,
+        ceilings: Ceilings::Guessed,
+        priority_bp: 0,
+        message: Vec::new(),
+    }
+}
+
+/// `founder`'s founding of its own pool, staked with `amount` and
+/// registering `validator` under the key it will be known by and the
+/// proof it holds that key: one declaration `founder` signs, which
+/// `desk` funds from its own account and pays for. The pool's owner
+/// badge lands with `founder`.
+#[must_use]
+pub(crate) fn build_found_tx(
+    desk: &Ed25519PrivateKey,
+    founder: &Ed25519PrivateKey,
+    validator: ValidatorId,
+    pubkey: &ConsensusPublicKey,
+    possession_proof: &ConsensusSignature,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let founder_account = account_address(&founder.public_key().0);
+    let header = scenario_header(validity);
+    let declaration = client()
+        .found_declaration(founder_account, header, validator, pubkey, possession_proof)
+        .expect("a founding declares against the staking package");
+    client()
+        .found_and_join(
+            sign_intent(declaration, founder),
+            founder_account,
+            desk,
+            header,
+            desk_terms(),
+            amount,
+        )
+        .expect("the desk composes a founding")
+}
+
+/// `founder`'s registration of `validator` in the pool it founded,
+/// presenting the owner badge it holds, which `desk` composes and pays
+/// for after first staking `top_up` into the pool from its own account
+/// and keeping the units. A `top_up` of 0 stakes nothing.
+#[must_use]
+pub(crate) fn build_join_tx(
+    desk: &Ed25519PrivateKey,
+    founder: &Ed25519PrivateKey,
+    validator: ValidatorId,
+    pubkey: &ConsensusPublicKey,
+    possession_proof: &ConsensusSignature,
+    top_up: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let founder_account = account_address(&founder.public_key().0);
+    let header = scenario_header(validity);
+    let declaration = client()
+        .join_declaration(founder_account, header, validator, pubkey, possession_proof)
+        .expect("a join declares against the founder's pool");
+    client()
+        .join(
+            sign_intent(declaration, founder),
+            founder_account,
+            desk,
+            header,
+            desk_terms(),
+            top_up,
+        )
+        .expect("the desk composes a join")
+}
+
+/// [`build_stake_tx`] into `founder`'s founded pool, which no genesis
+/// seats, so the delegation types over the pool's own record.
+#[must_use]
+pub(crate) fn build_founded_stake_tx(
+    delegator: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    founder: PrincipalAddr,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let client = client();
+    let chain = client.records();
+    let pool = founded_pool(founder);
+    let composed = Composed::new(&chain, slice::from_ref(&pool), &ProtocolHasher);
+    let mut b = TypedBuilder::new(
+        &composed,
+        &ProtocolHasher,
+        account_address(&delegator.public_key().0),
+    );
+    let funds = account::withdraw(&mut b, from, *PROTOCOL_RESOURCE, amount)
+        .expect("an account answers a withdrawal");
+    let units = staking::Staking::at(pool.address(&ProtocolHasher))
+        .stake(&mut b, funds)
+        .expect("a founded pool takes a delegation");
+    account::deposit(&mut b, from, units).expect("an account answers a deposit");
+    let graph = b.build().expect("every output is consumed");
+    Transaction::new(envelope(graph, delegator, validity))
+}
 
 /// The principal the staking scenario's pool admits on its operator
 /// surface, and the key that satisfies it.

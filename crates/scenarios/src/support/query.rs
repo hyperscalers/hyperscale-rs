@@ -16,16 +16,17 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::{ShardChainReader, member_row_leaf};
 use hyperscale_types::{
-    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
-    ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, PendingReshape, RETENTION_HORIZON, ResourceAddr, ShardId, ShardTrie, Stake,
-    StakePool, StakePoolId, StateClaim, StateRoot, SubstateKey, TickLine, TimestampRange,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, VIEW_CHANGE_TIMEOUT_MAX,
-    ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
-    verdict_leaf,
+    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
+    DeclaredRange, Epoch, ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, RETENTION_HORIZON,
+    ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim, StateRoot,
+    SubstateKey, TickLine, TimestampRange, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorStatus, Verified, WeightedTimestamp,
+    Window, sweep_admits_block, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms,
+    holdings_collection,
 };
 
 use super::{Budget, Cluster};
@@ -139,6 +140,26 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
         .map_or(0, |bytes| {
             <[u8; 16]>::try_from(bytes.as_slice()).map_or(0, u128::from_le_bytes)
         })
+}
+
+/// Whether `holder`'s account holds the instance `id` of the
+/// non-fungible `resource`, on the shard owning its prefix.
+pub(crate) fn holds_instance<C: Cluster + ?Sized>(
+    c: &C,
+    holder: Address,
+    resource: ResourceAddr,
+    id: u64,
+) -> bool {
+    let order = u128::from(id);
+    let range = DeclaredRange {
+        owner: holder,
+        collection: holdings_collection(&ProtocolHasher, holder, resource),
+        lo: order,
+        hi: order,
+        cap: 1,
+    };
+    c.entries(owning_shard(c, holder), range)
+        .is_some_and(|entries| entries.iter().any(|(at, _)| *at == order))
 }
 
 /// Whether any value stands at `cell`, on the shard owning its prefix.

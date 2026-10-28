@@ -8,10 +8,10 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_storage::RowState;
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Epoch, Event, Heard, PriceTable,
-    ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, TopologySnapshot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
-    WeightedTimestamp,
+    Address, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation, Epoch, Event, Heard,
+    PriceTable, ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    ValidatorId, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -176,6 +176,17 @@ pub trait Cluster {
     /// committed state, and nothing a transaction carries comes from here.
     fn substate(&self, shard: ShardId, owner: Address, local: [u8; 16]) -> Option<Vec<u8>> {
         let _ = (shard, owner, local);
+        None
+    }
+
+    /// The committed entries of one collection interval on `shard`, read
+    /// straight from a hosted store, ascending by order key. `None` when
+    /// no host serves `shard`.
+    ///
+    /// The same observation seam as [`substate`](Self::substate), for
+    /// what a collection holds rather than what a cell does.
+    fn entries(&self, shard: ShardId, range: DeclaredRange) -> Option<Vec<(u128, Vec<u8>)>> {
+        let _ = (shard, range);
         None
     }
 

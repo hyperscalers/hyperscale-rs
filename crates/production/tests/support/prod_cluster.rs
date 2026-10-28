@@ -23,10 +23,10 @@ use hyperscale_scenarios::{
 };
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, LocalKey,
-    NetworkDefinition, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId, ValidatorSet,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation,
+    LocalKey, NetworkDefinition, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot,
+    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, ValidatorId, ValidatorSet,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::sleep;
@@ -447,6 +447,10 @@ impl Cluster for ProdCluster {
                 local: LocalKey(local),
             },
         )
+    }
+
+    fn entries(&self, shard: ShardId, range: DeclaredRange) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.inner.entries(shard, range)
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {

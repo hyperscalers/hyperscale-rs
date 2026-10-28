@@ -43,10 +43,10 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    ConsensusReceipt, Derivation, Epoch, Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds,
-    ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified,
-    WeightedTimestamp, shard_prefix_path,
+    ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard, LocalKey, PrincipalAddr,
+    ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
+    Verified, WeightedTimestamp, shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -1028,6 +1028,15 @@ impl Cluster for SimCluster {
             local: LocalKey(local),
         };
         store.get_substate_at_height(key, height)?
+    }
+
+    fn entries(&self, shard: ShardId, range: DeclaredRange) -> Option<Vec<(u128, Vec<u8>)>> {
+        let store = self
+            .live_committee_hosts(shard)
+            .into_iter()
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| store.jmt_height())?;
+        store.get_entries_at_height(range, store.jmt_height())
     }
 
     fn preview(

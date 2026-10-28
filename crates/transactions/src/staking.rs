@@ -1,19 +1,24 @@
 //! Staking: the graphs a pool's delegators and its operator build.
 //!
-//! A pool is an instance its network's genesis seats, so a client calls it
-//! only over a world that seats it: [`Client::with_pools`]. Delegating is a
-//! withdrawal into the pool; registering and retiring a validator present
-//! the pool's owner badge, which genesis gives the operator's account.
+//! A pool is an instance its network's genesis seats or an account founds
+//! (see [`join`](crate::join)), so a client calls a seated pool over a world
+//! that seats it, [`Client::with_pools`], and an operator's own founded pool
+//! over any world. Delegating is a withdrawal into the pool; registering,
+//! retiring and lifting a validator's time-out present the pool's owner
+//! badge, which genesis gives a seat's operator and a founding gives its
+//! founder.
+
+use std::slice;
 
 use hyperscale_effects_bridge::genesis::{
-    GenesisPackages, OWNER_BADGE_ID, genesis_world_with_pools, pool_address as seat_address,
-    pool_owner_badge, staking_artifact,
+    GenesisPackages, OWNER_BADGE_ID, founded_pool, genesis_world_with_pools,
+    pool_address as seat_address, pool_owner_badge, staking_artifact,
 };
 use hyperscale_effects_bridge::{PROTOCOL_RESOURCE, ProtocolHasher};
 use hyperscale_types::{
     ComponentAddr, ConsensusPublicKey, ConsensusSignature, NetworkId, StakePoolSeat, ValidatorId,
 };
-use hyperscale_vm_effects::{ManifestGraph, package_hash};
+use hyperscale_vm_effects::{Composed, ManifestGraph, package_hash};
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, staking};
 use hyperscale_vm_types::PrincipalAddr;
@@ -64,12 +69,6 @@ impl Client {
     /// key it will be known by and the proof it holds that key, composed by
     /// `operator`, whose account holds the pool's owner badge.
     ///
-    /// With `hand_to`, the same transaction then moves the owner badge to
-    /// that account, so the validator is never registered under an operator
-    /// who keeps the pool. The new owner pays for nothing it signs when its
-    /// actions are declarations another account composes and pays for
-    /// ([`Client::sponsor`]).
-    ///
     /// # Errors
     ///
     /// [`TypedError`] if the operator's account or the pool does not
@@ -81,28 +80,15 @@ impl Client {
         validator: ValidatorId,
         key: &ConsensusPublicKey,
         proof: &ConsensusSignature,
-        hand_to: Option<PrincipalAddr>,
     ) -> Result<ManifestGraph, TypedError> {
-        self.as_operator(
-            operator,
-            pool,
-            |b| {
-                staking::Staking::at(pool).register_validator(
-                    b,
-                    validator.inner(),
-                    *key.as_bytes(),
-                    *proof.as_bytes(),
-                )
-            },
-            |b| {
-                let Some(owner) = hand_to else {
-                    return Ok(());
-                };
-                let badge =
-                    account::withdraw_nf(b, operator, pool_owner_badge(pool), &[OWNER_BADGE_ID])?;
-                account::deposit_nf(b, owner, badge)
-            },
-        )
+        self.as_operator(operator, pool, |b| {
+            staking::Staking::at(pool).register_validator(
+                b,
+                validator.inner(),
+                *key.as_bytes(),
+                *proof.as_bytes(),
+            )
+        })
     }
 
     /// The graph retiring `validator` from `pool`, composed by `operator`.
@@ -116,12 +102,9 @@ impl Client {
         pool: ComponentAddr,
         validator: ValidatorId,
     ) -> Result<ManifestGraph, TypedError> {
-        self.as_operator(
-            operator,
-            pool,
-            |b| staking::Staking::at(pool).deactivate_validator(b, validator.inner()),
-            |_| Ok(()),
-        )
+        self.as_operator(operator, pool, |b| {
+            staking::Staking::at(pool).deactivate_validator(b, validator.inner())
+        })
     }
 
     /// The graph lifting `validator`'s time-out in `pool`, composed by
@@ -138,30 +121,29 @@ impl Client {
         pool: ComponentAddr,
         validator: ValidatorId,
     ) -> Result<ManifestGraph, TypedError> {
-        self.as_operator(
-            operator,
-            pool,
-            |b| staking::Staking::at(pool).unjail(b, validator.inner()),
-            |_| Ok(()),
-        )
+        self.as_operator(operator, pool, |b| {
+            staking::Staking::at(pool).unjail(b, validator.inner())
+        })
     }
 
     /// `call` under the pool's owner badge, presented from `operator`'s
-    /// account: the whole of an operator action's authority. `after` runs
-    /// once the presentation has closed.
+    /// account: the whole of an operator action's authority. The
+    /// operator's own founded pool is typed whether or not this client's
+    /// world holds it, as [`operator_declaration`](Self::operator_declaration)
+    /// types it.
     fn as_operator(
         &self,
         operator: PrincipalAddr,
         pool: ComponentAddr,
         call: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>,
-        after: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>,
     ) -> Result<ManifestGraph, TypedError> {
         let chain = self.records();
-        let mut b = self.builder(&chain, operator);
+        let founded = founded_pool(operator);
+        let composed = Composed::new(&chain, slice::from_ref(&founded), &ProtocolHasher);
+        let mut b = TypedBuilder::new(&composed, &ProtocolHasher, operator);
         let badge =
             account::present_instance(&mut b, operator, pool_owner_badge(pool), OWNER_BADGE_ID)?;
         b.presenting(badge, call)?;
-        after(&mut b)?;
         b.build()
     }
 }
@@ -199,7 +181,6 @@ mod tests {
                     ValidatorId::new(1000),
                     &ConsensusPublicKey::ZERO,
                     &ConsensusSignature::ZERO,
-                    None,
                 )
                 .is_ok()
         );
@@ -210,28 +191,21 @@ mod tests {
         );
     }
 
-    /// A registration that hands the pool over builds in one graph beside
-    /// the registration, and the new owner's unjail builds on its own.
+    /// A founder's own pool is reached over a world that does not seat
+    /// it: its retirement and its unjail build alike.
     #[test]
-    fn a_registration_hands_the_pool_over_and_its_new_owner_unjails() {
-        let client = Client::with_pools(&[seat(0)], NETWORK);
-        let pool = pool_address(&seat(0));
-        let (operator, owner) = (test_principal(7), test_principal(8));
+    fn a_founders_own_pool_takes_its_operator_actions() {
+        let client = Client::with_pools(&[], NETWORK);
+        let founder = test_principal(8);
+        let pool = founded_pool(founder).address(&ProtocolHasher);
         assert!(
             client
-                .register_validator_graph(
-                    operator,
-                    pool,
-                    ValidatorId::new(1000),
-                    &ConsensusPublicKey::ZERO,
-                    &ConsensusSignature::ZERO,
-                    Some(owner),
-                )
+                .deactivate_validator_graph(founder, pool, ValidatorId::new(1000))
                 .is_ok()
         );
         assert!(
             client
-                .unjail_validator_graph(owner, pool, ValidatorId::new(1000))
+                .unjail_validator_graph(founder, pool, ValidatorId::new(1000))
                 .is_ok()
         );
     }

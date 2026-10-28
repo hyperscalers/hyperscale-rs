@@ -12,16 +12,17 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_engine::account_address;
 use hyperscale_types::{
-    Epoch, NetworkDefinition, NetworkParams, ShardId, Stake, StakePoolId, Transaction,
-    ValidatorStatus, validator_possession_proof_sign,
+    ConsensusSignature, Ed25519PrivateKey, Epoch, NetworkDefinition, NetworkParams, ShardId,
+    Signer, Stake, StakePoolId, Transaction, ValidatorId, ValidatorStatus,
+    validator_possession_proof_sign,
 };
-use hyperscale_vm_types::PrincipalAddr;
 
 use super::query::{beacon_epoch, live_shards, pool_total_stake, validator_status};
 use super::tx::{
-    ParamBallot, STAKE_POOL, build_param_vote_tx, build_register_tx, build_stake_tx, delegator,
-    pool_at, pool_id, pool_operator, validity_around,
+    ParamBallot, STAKE_POOL, build_found_tx, build_join_tx, build_param_vote_tx, build_register_tx,
+    build_stake_tx, delegator, founded_id, pool_at, pool_id, pool_operator, validity_around,
 };
 use super::{Budget, Cluster, epochs};
 
@@ -138,27 +139,13 @@ pub fn grow_and_hold(c: &mut impl Cluster, target: u32, split_bytes: u64) {
 ///
 /// Panics if the delegation or a registration does not fold within budget.
 pub fn register_staged(c: &mut impl Cluster) {
-    register_staged_handing_to(c, None);
-}
-
-/// [`register_staged`], each registration also handing the staging pool's
-/// owner badge to `hand_to`'s account.
-///
-/// # Panics
-///
-/// As [`register_staged`].
-pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<PrincipalAddr>) {
     let staged = c.staged_validators();
     if staged.is_empty() {
         return;
     }
     let pool = pool_at(STAKE_POOL);
     let seats = u128::try_from(staged.len() + 1).expect("staged count fits u128");
-    let price = c
-        .beacon_state()
-        .expect("a committed beacon state")
-        .min_stake();
-    let capacity = Stake::from_quanta(price.quanta() * seats);
+    let capacity = Stake::from_quanta(seat_price(c).quanta() * seats);
     let (key, from) = delegator();
     land(
         c,
@@ -169,13 +156,7 @@ pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<Principa
     let (operator, _) = pool_operator();
     for (validator, signer) in &staged {
         let validator = *validator;
-        let proof = validator_possession_proof_sign(
-            signer.as_ref(),
-            &NetworkDefinition::simulator(),
-            validator,
-            StakePoolId::of(pool),
-        )
-        .expect("a possession proof signs");
+        let proof = possession_proof(signer.as_ref(), validator, pool_id(STAKE_POOL));
         let pubkey = signer.public_key();
         land(
             c,
@@ -186,23 +167,92 @@ pub fn register_staged_handing_to(c: &mut impl Cluster, hand_to: Option<Principa
                     validator,
                     &pubkey,
                     &proof,
-                    hand_to,
                     validity_around(now),
                 )
             },
-            |c| {
-                matches!(
-                    validator_status(c, validator),
-                    Some(
-                        ValidatorStatus::Pooled
-                            | ValidatorStatus::Observing { .. }
-                            | ValidatorStatus::OnShard { .. }
-                    )
-                )
-            },
+            |c| registered(c, validator),
             &format!("staged validator {validator}'s registration"),
         );
     }
+}
+
+/// Seat every validator [`Cluster::staged_validators`] names in a pool
+/// `founder` founds for them, and wait until the beacon holds each one.
+///
+/// The first founds the pool and the rest join it, every join sponsored
+/// by the delegator's account, which funds the pool for one more seat
+/// than it takes at the `min_stake` the beacon holds when it does: as in
+/// [`register_staged`], the price of a seat accrues as the chain runs.
+///
+/// # Panics
+///
+/// Panics if a founding or a join does not fold within budget.
+pub fn found_staged(c: &mut impl Cluster, founder: &Ed25519PrivateKey) {
+    let (desk, _) = delegator();
+    let pool = founded_id(account_address(&founder.public_key().0));
+    for (index, (validator, signer)) in c.staged_validators().iter().enumerate() {
+        let validator = *validator;
+        let proof = possession_proof(signer.as_ref(), validator, pool);
+        let pubkey = signer.public_key();
+        let price = seat_price(c).quanta();
+        land(
+            c,
+            |now| {
+                if index == 0 {
+                    build_found_tx(
+                        &desk,
+                        founder,
+                        validator,
+                        &pubkey,
+                        &proof,
+                        price * 2,
+                        validity_around(now),
+                    )
+                } else {
+                    build_join_tx(
+                        &desk,
+                        founder,
+                        validator,
+                        &pubkey,
+                        &proof,
+                        price,
+                        validity_around(now),
+                    )
+                }
+            },
+            |c| registered(c, validator),
+            &format!("staged validator {validator}'s join"),
+        );
+    }
+}
+
+/// The `min_stake` the beacon holds now: what one seat costs.
+fn seat_price(c: &impl Cluster) -> Stake {
+    c.beacon_state()
+        .expect("a committed beacon state")
+        .min_stake()
+}
+
+/// `signer`'s proof that it holds its key, as `validator` of `pool`.
+fn possession_proof(
+    signer: &dyn Signer,
+    validator: ValidatorId,
+    pool: StakePoolId,
+) -> ConsensusSignature {
+    validator_possession_proof_sign(signer, &NetworkDefinition::simulator(), validator, pool)
+        .expect("a possession proof signs")
+}
+
+/// Whether the beacon holds `validator` as a member of a pool.
+fn registered(c: &impl Cluster, validator: ValidatorId) -> bool {
+    matches!(
+        validator_status(c, validator),
+        Some(
+            ValidatorStatus::Pooled
+                | ValidatorStatus::Observing { .. }
+                | ValidatorStatus::OnShard { .. }
+        )
+    )
 }
 
 /// Submit `build`'s transaction until `folded` reads true, re-signing it

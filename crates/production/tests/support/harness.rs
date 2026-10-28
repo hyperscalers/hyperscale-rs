@@ -37,9 +37,9 @@ use hyperscale_storage::{
 };
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, GenesisValidators,
-    ShardId, StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
+    BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation,
+    GenesisValidators, ShardId, StateRoot, SubstateKey, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -616,6 +616,25 @@ impl Harness {
             })
             .max_by_key(|store| store.jmt_height())?;
         store.get_substate_at_height(key, store.jmt_height())?
+    }
+
+    /// The committed entries of `range` on `shard`, read off the
+    /// furthest-along live store any host holds for it, as
+    /// [`substate`](Self::substate) reads a cell. `None` when no host
+    /// serves `shard` or the height is unavailable.
+    pub fn entries(&self, shard: ShardId, range: DeclaredRange) -> Option<Vec<(u128, Vec<u8>)>> {
+        let store = self
+            .hosts
+            .iter()
+            .filter_map(|h| {
+                h.stores
+                    .lock()
+                    .expect("store registry")
+                    .get(&shard)
+                    .and_then(Weak::upgrade)
+            })
+            .max_by_key(|store| store.jmt_height())?;
+        store.get_entries_at_height(range, store.jmt_height())
     }
 
     /// A live handle to host `host`'s `RocksDbShardStorage` for `shard`, or
