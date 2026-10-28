@@ -5,7 +5,7 @@
 //! ordering. Concrete messages live in submodules grouped by transport
 //! semantics:
 //!
-//! - [`gossip`]: best-effort one-to-many fanout via gossipsub.
+//! - [`gossip`]: best-effort one-to-many fan-out.
 //! - [`notification`]: targeted one-way pushes that don't expect a reply.
 //! - [`request`] / [`response`]: paired request-reply messages used by the
 //!   per-payload fetch protocols.
@@ -196,14 +196,14 @@ pub enum GossipScope {
 ///   the gossip path.
 ///
 /// Single-publisher messages (one validator originates each logical
-/// message; gossipsub disseminates) need only `SCOPE`. Multi-publisher
+/// message; the transport fans it out) need only `SCOPE`. Multi-publisher
 /// messages (every committee member emits an equivalent copy with its
 /// own sender field) additionally implement
 /// [`dedup_key`](Self::dedup_key) so the framework can short-circuit
 /// the second-and-later arrivals at the receive boundary.
 pub trait GossipMessage: NetworkMessage + Clone {
-    /// Whether this message lives on a per-shard topic or a single
-    /// global topic. See [`GossipScope`].
+    /// Whether this message reaches one shard's committee or every host.
+    /// See [`GossipScope`].
     const SCOPE: GossipScope;
 
     /// For [`GossipScope::Global`] messages, the shard the message
@@ -211,8 +211,8 @@ pub trait GossipMessage: NetworkMessage + Clone {
     /// fanning into hosted shards.
     ///
     /// Returns `None` for messages with no inherent source shard, or
-    /// for [`GossipScope::Shard`] messages where the topic already pins
-    /// the shard.
+    /// for [`GossipScope::Shard`] messages, whose publication already
+    /// names the shard.
     #[must_use]
     fn source_shard(&self) -> Option<ShardId> {
         let _ = self;
@@ -226,8 +226,8 @@ pub trait GossipMessage: NetworkMessage + Clone {
     /// circuits the second-and-later arrivals.
     ///
     /// `None` (default) disables dedup. Appropriate for single-publisher
-    /// types: gossipsub's bytes-id dedup already covers mesh-redundant
-    /// re-delivery of one publisher's copy.
+    /// types: the transport already recognises a repeated copy of one
+    /// publisher's bytes and delivers it once.
     #[must_use]
     fn dedup_key(&self) -> Option<u64> {
         let _ = self;

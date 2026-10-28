@@ -1,12 +1,10 @@
 //! Transaction gossip message.
 //!
 //! Each gossip message carries a batch of transactions for a single
-//! destination shard topic. Batching at this layer trades a small
-//! tail-latency cost (the batch window) for substantially less wire
-//! work: per-message gossipsub overhead, IHAVE digest size, and `mcache`
-//! pressure all scale with message *count*, not bytes — and at gossipsub
-//! v1.2's IDONTWANT threshold larger messages activate cross-mesh dedup
-//! that single-tx messages were too small to trigger.
+//! destination shard. Batching at this layer trades a small tail-latency
+//! cost (the batch window) for substantially less wire work: a frame per
+//! recipient, a dedup entry and a handler dispatch are paid per message,
+//! so they scale with message *count*, not bytes.
 
 use std::sync::Arc;
 
@@ -81,7 +79,7 @@ impl NetworkMessage for TransactionGossip {
 
 // Transactions are filtered to shards that have state touched by the batch.
 // Single-publisher per batch (the host that received the tx via RPC),
-// so gossipsub's bytes-id dedup covers the mesh-redundancy path — no
+// so the transport's own dedup of repeated bytes covers re-delivery — no
 // content-key dedup needed here.
 impl GossipMessage for TransactionGossip {
     const SCOPE: GossipScope = GossipScope::Shard;

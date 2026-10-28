@@ -1,12 +1,11 @@
 # Running a Distributed Hyperscale Cluster
 
-This guide explains how to run a `hyperscale` cluster across multiple physical machines or VMs using raw binaries (process-based). You can run multiple validators per host, but each validator must run on a different port. The configs will be generated for you locally, and you will need to copy them to the target machines. If one of your nodes is behind NAT, you can enable UPnP to forward the ports automatically. Make sure that the ports are whitelisted in your firewall with the correct protocol (UDP/TCP). Use the distributed monitoring script to set up a Prometheus / Grafana stack to monitor your distributed cluster. The monitoring host will have to scrape the target RPC ports (8080, 8081, 808x...) on your validator node hosts.
+This guide explains how to run a `hyperscale` cluster across multiple physical machines or VMs using raw binaries (process-based). You can run multiple validators per host, but each validator must run on a different port. The configs will be generated for you locally, and you will need to copy them to the target machines. If one of your nodes is behind NAT, you can enable port mapping (UPnP, NAT-PMP or PCP) to forward the port automatically, or give the network relays to fall back on. Make sure that the ports are whitelisted in your firewall for UDP. Use the distributed monitoring script to set up a Prometheus / Grafana stack to monitor your distributed cluster. The monitoring host will have to scrape the target RPC ports (8080, 8081, 808x...) on your validator node hosts.
 
 ## Prerequisites
 - Rust and build tools installed on your local machine (to generate configs).
 - SSH access to all target machines.
-- **Port 9000 (UDP/TCP)** open between all machines (P2P).
-- **Port 30500 (TCP)** open between all machines (TCP fallback - only if enabled).
+- **Port 9000 (UDP)** open between all machines (P2P, QUIC).
 - **Port 8080 (TCP)** open to query metrics/RPC remotely.
 
 ## Step 1: Generate Configuration
@@ -69,5 +68,5 @@ Access the dashboards:
 
 ## Troubleshooting
 
-- **Connection Refused**: Check your firewall rules (ufw/iptables) to ensure ports 9000-9100 range and 30500+ range are open.
-- **Logs**: Check output to see if they are connecting. You should see "New peer connected" or similar libp2p events.
+- **Connection Refused**: Check your firewall rules (ufw/iptables) to ensure the UDP ports 9000-9100 are open.
+- **Logs**: Check output to see if they are connecting. You should see "iroh network adapter bound" and, once peers bind, no repeated "No bound peer" warnings.

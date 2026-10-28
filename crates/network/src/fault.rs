@@ -10,7 +10,7 @@
 //! Faults are **host-granular**: co-hosted vnodes share one transport, so a
 //! fault targets a [`HostId`], not a validator. Both harnesses map their native
 //! routing id to it — the in-memory sim's `NodeIndex` is numerically identical,
-//! the libp2p gate keeps a `PeerId ↔ HostId` map.
+//! the iroh gate keeps an `EndpointId ↔ HostId` map.
 
 #[cfg(feature = "test-utils")]
 mod engine;
@@ -21,8 +21,8 @@ pub use engine::{DropSpec, Engine, FaultBuilder, Rewrite, RuleBuilder, RuleHandl
 /// A cluster host — the granularity at which faults apply.
 ///
 /// Co-hosted vnodes share one transport, so a fault targets the host, not a
-/// validator. The sim's `NodeIndex` maps here one to one; the libp2p gate keeps
-/// a `PeerId ↔ HostId` map.
+/// validator. The sim's `NodeIndex` maps here one to one; the iroh gate keeps
+/// an `EndpointId ↔ HostId` map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostId(pub u32);
 

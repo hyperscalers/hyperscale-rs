@@ -291,9 +291,8 @@ pub trait Network: Send + Sync + 'static {
     /// The implementation decodes the raw network payload into `M` before
     /// calling the handler. Decode errors are logged and the message is dropped.
     ///
-    /// In production, this also auto-subscribes to the corresponding
-    /// gossipsub topic(s); the scope (shard / global) is read from
-    /// [`GossipMessage::SCOPE`].
+    /// The scope (shard / global) the transport delivers it under is read
+    /// from [`GossipMessage::SCOPE`].
     ///
     /// Called during node initialization — once per message type.
     fn register_gossip_handler<M: GossipMessage + 'static>(&self, handler: impl GossipHandler<M>);
@@ -320,7 +319,8 @@ pub trait Network: Send + Sync + 'static {
     ///
     /// `R: Send` and `R::Response: Send` are required so the registry can
     /// also install a typed local-dispatch path — same-host requests
-    /// bypass libp2p and preserve `Arc`-shared payloads on the response.
+    /// bypass the transport and preserve `Arc`-shared payloads on the
+    /// response.
     fn register_request_handler<R: Request + Send + 'static>(
         &self,
         shard: ShardId,
@@ -348,8 +348,7 @@ pub trait Network: Send + Sync + 'static {
 
     /// Begin serving `shard`: include it in gossip fan-out and accept
     /// per-shard request-handler registrations for it. Transports with
-    /// per-shard wire state (gossipsub topics, request stream
-    /// protocols) bring that up as well.
+    /// per-shard wire state bring that up as well.
     fn subscribe_shard(&self, shard: ShardId);
 
     /// Stop serving `shard`: exclude it from gossip fan-out, drop every

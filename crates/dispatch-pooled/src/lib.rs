@@ -441,8 +441,8 @@ impl Dispatch for PooledDispatch {
             });
         } else {
             // DispatchPool::Io — route to tokio's blocking pool. Sized for
-            // work that doesn't yield (fsync, network sends behind sync
-            // libp2p adapters, GC). Non-blocking ops tolerate it fine; the
+            // work that doesn't yield (fsync, network sends behind a
+            // synchronous adapter, GC). Non-blocking ops tolerate it fine; the
             // blocking pool just runs them straight through.
             self.tokio_handle.spawn_blocking(move || {
                 let start = std::time::Instant::now();

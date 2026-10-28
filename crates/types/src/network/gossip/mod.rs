@@ -1,7 +1,7 @@
-//! Gossip messages broadcast via pubsub.
+//! Gossip messages, fanned out one to many.
 //!
-//! These messages use gossipsub for one-to-many broadcast and are
-//! forwarded by the mesh to all subscribed peers.
+//! The transport sends each to the audience its scope names: a shard's
+//! committee, or every host for a global message.
 
 pub mod beacon;
 

@@ -131,7 +131,7 @@ pub struct DropSpec {
     /// Active window (start inclusive, end exclusive); unset means unbounded.
     ///
     /// Not portable across harnesses: the clock origin differs — the sim
-    /// measures from its genesis-relative logical clock, the libp2p gate from
+    /// measures from its genesis-relative logical clock, the iroh gate from
     /// wall-clock at gate construction. A windowed rule means different things
     /// on each, so the portable scenario surface never exposes one.
     pub window: Option<Range<Duration>>,

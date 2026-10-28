@@ -14,7 +14,7 @@ mod traffic;
 
 // Faults are host-granular and the sim's `NodeIndex` is the host index, so it
 // wraps into `HostId`; the engine itself lives in `hyperscale-network` under
-// `test-utils` (shared with the libp2p transport) and sim code reaches it there.
+// `test-utils` (shared with the iroh transport) and sim code reaches it there.
 pub use geography::RegionPlan;
 pub use hyperscale_network::fault::HostId;
 pub use network::{
@@ -30,5 +30,6 @@ pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 /// Type alias for deterministic node indexing in simulation.
 ///
 /// This is a simulation-only concept for routing between in-process nodes.
-/// Production code uses `ValidatorId` (from message signatures) and `PeerId` (libp2p).
+/// Production code uses `ValidatorId` (from message signatures) and the iroh
+/// `EndpointId` a validator binds as.
 pub type NodeIndex = u32;

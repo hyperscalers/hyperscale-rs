@@ -344,8 +344,8 @@ pub struct HandlerRegistry {
     local_notification: ArcSwap<HashMap<TypeId, Arc<dyn LocalNotificationDispatcher>>>,
     /// Typed request dispatchers keyed by `(TypeId, ShardId)` for
     /// in-process request serving. Used when a host carries a vnode in
-    /// the target shard — bypasses libp2p and preserves `Arc`-shared
-    /// payloads on the response.
+    /// the target shard — bypasses the transport and preserves
+    /// `Arc`-shared payloads on the response.
     local_request: ArcSwap<HashMap<(TypeId, ShardId), Arc<dyn LocalRequestDispatcher>>>,
     /// Typed host-level gossip dispatchers keyed by message `TypeId` for
     /// zero-encode local delivery (counterpart to [`Self::host_gossip`]).
@@ -697,7 +697,7 @@ impl HandlerRegistry {
     /// local delivery for messages they publish. `shard` is the
     /// broadcast target shard for shard-scoped publishes and `None`
     /// for global publishes — the handler receives the same value the
-    /// inbound libp2p path supplies.
+    /// inbound transport path supplies.
     #[must_use]
     pub fn local_dispatch_gossip<M>(&self, msg: &M, shard: Option<ShardId>) -> Option<Verdict>
     where
