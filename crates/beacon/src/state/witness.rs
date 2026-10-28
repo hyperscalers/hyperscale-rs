@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     Admission, BeaconProposal, BeaconState, BlockHeader, Epoch, Hash, JailReason, MAX_SHARDS,
-    MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_FLOOR, MergeHalf, NetworkDefinition, PendingReshape,
-    PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake,
-    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
+    MISSED_PROPOSAL_JAIL_FLOOR, MergeHalf, NetworkDefinition, PendingReshape, PendingWithdrawal,
+    RESHAPE_TRIGGER_TTL_EPOCHS, Settling, ShardId, ShardWitnessPayload, Stake, StakePool,
+    ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, byzantine_threshold,
     missed_turn_limit, validator_possession_proof_verify, verify_shard_vote_equivocation,
     verify_vote_equivocation,
 };
@@ -307,13 +307,11 @@ pub(super) fn apply_shard_payload(
 ) -> Option<HostEvent> {
     match payload {
         ShardWitnessPayload::StakeDeposit { pool_id, amount } => {
-            // A pool opens on its first deposit, and only one of at least
-            // `MIN_STAKE_FLOOR`: anyone may found a pool, so the floor is
-            // what bounds how many the beacon holds. Later deposits
-            // accumulate into `total_stake` whatever their size.
-            if !state.pools.contains_key(pool_id) && *amount < MIN_STAKE_FLOOR {
-                return None;
-            }
+            // A pool opens on its first deposit, whatever its size, and
+            // every later deposit accumulates into `total_stake`. What
+            // bounds a pool is the seat price: it seats no validator its
+            // stake cannot cover at `min_stake`, which never falls below
+            // `MIN_STAKE_FLOOR`.
             let pool = state.pools.entry(*pool_id).or_insert_with(|| StakePool {
                 id: *pool_id,
                 total_stake: Stake::ZERO,
@@ -1076,26 +1074,6 @@ mod tests {
         let pool = state.pools.get(&test_pool(7)).unwrap();
         assert_eq!(pool.total_stake, Stake::from_whole_tokens(floor + 50));
         assert_eq!(applied_count(&state, 0), 2);
-    }
-
-    /// A first deposit under `MIN_STAKE_FLOOR` opens no pool, so dust
-    /// cannot fill the beacon with pools; it is consumed all the same.
-    #[test]
-    fn a_first_deposit_under_the_floor_opens_no_pool() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let under = Stake::from_quanta(MIN_STAKE_FLOOR.quanta() - 1);
-        apply_witness_chunk(
-            &mut state,
-            0,
-            vec![ShardWitnessPayload::StakeDeposit {
-                pool_id: test_pool(7),
-                amount: under,
-            }],
-        );
-
-        assert!(!state.pools.contains_key(&test_pool(7)));
-        assert_eq!(applied_count(&state, 0), 1);
     }
 
     /// `StakeWithdraw` appends a `PendingWithdrawal` tagged with the

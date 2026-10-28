@@ -200,10 +200,9 @@ pub fn delegation_folds_into_beacon_state(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a delegation");
 }
 
-/// What the staking scenario delegates: enough to open a pool, which a
-/// first deposit under `MIN_STAKE_FLOOR` does not, plus a remainder that
-/// keeps the folded stake from reading as the floor itself, and well
-/// inside the delegator's genesis funding.
+/// What the staking scenario delegates: `MIN_STAKE_FLOOR` plus a
+/// remainder that keeps the folded stake from reading as the floor
+/// itself, and well inside the delegator's genesis funding.
 const DELEGATION: u128 = MIN_STAKE_FLOOR.quanta() + 250_000;
 
 /// Registering a validator against a funded pool seats it in the pool.
@@ -243,10 +242,9 @@ pub fn register_validator_pools_a_node(c: &mut impl Cluster) {
 pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
     warm_up(c);
 
-    // A pool opens only at `MIN_STAKE_FLOOR` and `min_stake` is never below
-    // it, so a pool short of one seat cannot exist. One short of a second
-    // seat can: funded for one and a half, the first registration takes
-    // and the second is the one the capacity gate must refuse.
+    // Funded for one and a half seats at the current price, the first
+    // registration takes and the second is the one the capacity gate
+    // must refuse.
     let seated = ValidatorId::new(1999);
     let newcomer = ValidatorId::new(2000);
     let world = pool_world(c, [pool_at(STAKE_POOL)]);
