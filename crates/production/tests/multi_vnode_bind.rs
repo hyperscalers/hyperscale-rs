@@ -14,10 +14,10 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_types::ValidatorId;
 use serial_test::serial;
 use support::build_runner;
-use support::transport::{TestFixtures, bootstrap_addr, peer_key};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
@@ -39,7 +39,7 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
     );
 
     // Bind host 1 to host 0's address.
-    let host0_addr = bootstrap_addr(&adapter0).await;
+    let host0_addr = adapter0.endpoint_addr();
 
     let (mut runner1, _dir1, _) = build_runner(&fixtures, &[2, 3], vec![host0_addr], None);
     let adapter1 = Arc::clone(runner1.network());
@@ -78,10 +78,10 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
     // Every remote validator id on host 0 resolves to host 1's single peer,
     // and vice versa — this is the load-bearing multi-vnode bind property.
     for resolved in host0_sees {
-        assert_eq!(resolved, Some(peer_key(&adapter1)));
+        assert_eq!(resolved, Some(adapter1.local_endpoint_id()));
     }
     for resolved in host1_sees {
-        assert_eq!(resolved, Some(peer_key(&adapter0)));
+        assert_eq!(resolved, Some(adapter0.local_endpoint_id()));
     }
 
     drop(shutdown0);

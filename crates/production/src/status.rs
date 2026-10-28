@@ -9,7 +9,7 @@ use serde::Serialize;
 ///
 /// Each hosted shard maintains its own block-sync FSM; this type
 /// exposes every shard's view side by side. `sync_peers` is the only
-/// process-level field — derived from the libp2p adapter's connected
+/// process-level field — derived from the iroh adapter's connected
 /// peer set, not per-shard.
 ///
 /// The map is keyed by [`hyperscale_types::ShardId::inner`] (a
@@ -20,6 +20,6 @@ pub struct SyncStatus {
     /// Per-hosted-shard sync state, keyed by shard id.
     pub(crate) shards: HashMap<u64, BlockSyncStatus>,
     /// Number of connected peers capable of sync. Process-level — the
-    /// libp2p adapter is shared across hosted shards.
+    /// iroh adapter is shared across hosted shards.
     pub(crate) sync_peers: usize,
 }

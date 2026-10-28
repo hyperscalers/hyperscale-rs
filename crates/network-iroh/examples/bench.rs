@@ -1,22 +1,21 @@
-//! Loopback comparison of the iroh and libp2p backends.
+//! Loopback measurements of the iroh transport.
 //!
-//! Each measurement stands up a cluster of hosts in this process on one
-//! backend, drives the same traffic through the [`Network`] trait, and
-//! prints one JSON object. Loopback has no latency, loss or NAT: the
-//! numbers compare what the two stacks cost on the same machine, not how
-//! either behaves between home connections.
+//! Each measurement stands up a cluster of hosts in this process, drives
+//! traffic through the [`Network`] trait, and prints one JSON object.
+//! Loopback has no latency, loss or NAT: the numbers say what the stack
+//! costs on one machine, not how it behaves between home connections.
 //!
 //! ```text
-//! bench notify    --backend iroh|libp2p --peers 1|127
-//! bench range     --backend iroh|libp2p
-//! bench committee --backend iroh|libp2p --size 32
-//! bench idle      --backend iroh|libp2p --connections 150
+//! bench notify    --peers 1|127
+//! bench range    
+//! bench committee --size 32
+//! bench idle      --connections 150
 //! bench delayed-idle --rtt-ms 40 --connections 500
 //! bench reject-flood --rate 1000 --forged-per-signed 7 [--follower]
 //! bench refused-flood --rate 1000 --verdict reject|ignore
 //! bench forged-flood --rate 1000 --verdict accept|defer
 //! bench bind-flood --validators 4 --dialers 16
-//! bench garbage-responder --backend iroh|libp2p --requests 2000
+//! bench garbage-responder --requests 2000
 //! ```
 //!
 //! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
@@ -27,7 +26,6 @@
 //! peers, so that it re-dials them itself, and `--redial-burst` and
 //! `--redial-refill-ms` set the host-wide re-dial budget.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -51,12 +49,6 @@ use hyperscale_network_iroh::{
     EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind,
     RequestManager as IrohRequestManager, RequestManagerConfig as IrohRequestManagerConfig,
     RequestPool, RequestStreams,
-};
-use hyperscale_network_libp2p::test_utils::TestFixtures as Libp2pFixtures;
-use hyperscale_network_libp2p::{
-    Libp2pAdapter, Libp2pAdapterArgs, Libp2pConfig, Libp2pNetwork,
-    RequestManager as Libp2pRequestManager, RequestManagerConfig as Libp2pRequestManagerConfig,
-    RequestStreamPool,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -116,29 +108,14 @@ const COMMITTEE_WINDOW: Duration = Duration::from_secs(30);
 const IDLE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
-#[command(about = "Loopback comparison of the iroh and libp2p backends")]
+#[command(about = "Loopback measurements of the iroh transport")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Backend {
-    Iroh,
-    Libp2p,
-}
-
-impl Backend {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Iroh => "iroh",
-            Self::Libp2p => "libp2p",
-        }
-    }
-}
-
-/// Path timers of the iroh endpoints. Unset fields keep the backend's
-/// defaults; the libp2p backend has no such timers.
+/// Path timers of the iroh endpoints. Unset fields keep the transport's
+/// defaults.
 #[derive(Args, Clone, Copy, Default)]
 struct PathTimers {
     /// Idle time after which a path is abandoned, in milliseconds.
@@ -193,29 +170,20 @@ impl PathTimers {
 enum Command {
     /// Round trip of a header out and a vote back, with other peers active.
     Notify {
-        #[arg(long)]
-        backend: Backend,
         /// Peers exchanging headers and votes with the measuring host.
         #[arg(long, default_value_t = 1)]
         peers: u32,
     },
     /// Throughput of a state range fetched in parallel sub-ranges.
-    Range {
-        #[arg(long)]
-        backend: Backend,
-    },
+    Range,
     /// Process CPU of a committee exchanging headers and votes.
     Committee {
-        #[arg(long)]
-        backend: Backend,
         #[arg(long, default_value_t = 32)]
         size: u32,
     },
-    /// Process CPU, and bytes where the backend counts them, of one host
-    /// holding idle connections.
+    /// Process CPU and bytes on the wire of one host holding idle
+    /// connections.
     Idle {
-        #[arg(long)]
-        backend: Backend,
         #[arg(long, default_value_t = 150)]
         connections: u32,
         #[command(flatten)]
@@ -259,8 +227,6 @@ enum Command {
     },
     /// One of a shard's responders answers every request with garbage.
     GarbageResponder {
-        #[arg(long, value_enum)]
-        backend: Backend,
         /// Requests the asker needs answered.
         #[arg(long, default_value_t = 2000)]
         requests: u64,
@@ -581,21 +547,10 @@ fn incompressible(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Bytes a backend has sent and received on the wire, where it counts them.
-#[derive(Clone, Copy)]
-struct Wire {
-    sent: u64,
-    received: u64,
-}
-
-/// One host of a cluster, behind what both backends offer.
-struct Host<N> {
-    network: Arc<N>,
-    /// Whether this host is bound to the host carrying a validator.
-    bound: Box<dyn Fn(ValidatorId) -> bool + Send + Sync>,
-    /// Bytes on the wire so far, for a backend that counts them.
-    wire: Box<dyn Fn() -> Option<Wire> + Send + Sync>,
-    _adapter: Box<dyn Any + Send + Sync>,
+/// One host of a cluster.
+struct Host {
+    network: Arc<IrohNetwork>,
+    adapter: Arc<IrohAdapter>,
 }
 
 /// What a cluster is built with. Host `i` carries validator `i`.
@@ -645,9 +600,9 @@ fn shards_of(spec: &ClusterSpec, index: u32) -> Vec<ShardId> {
     }
 }
 
-async fn iroh_cluster(spec: &ClusterSpec) -> Vec<Host<IrohNetwork>> {
+async fn iroh_cluster(spec: &ClusterSpec) -> Vec<Host> {
     let fixtures = IrohFixtures::with_surplus(SEED, spec.seated, spec.hosts - spec.seated);
-    let mut hosts: Vec<Host<IrohNetwork>> = Vec::new();
+    let mut hosts: Vec<Host> = Vec::new();
     let mut first: Option<EndpointAddr> = None;
     for index in 0..spec.hosts {
         let (adapter, network) = iroh_host(
@@ -663,97 +618,24 @@ async fn iroh_cluster(spec: &ClusterSpec) -> Vec<Host<IrohNetwork>> {
         if spec.meshed {
             network.update_routing_committees(root_committee(spec));
         }
-        let (bound, wire) = (Arc::clone(&adapter), Arc::clone(&adapter));
-        hosts.push(Host {
-            network,
-            bound: Box::new(move |validator| bound.peer_for_validator(validator).is_some()),
-            wire: Box::new(move || {
-                let traffic = wire.traffic();
-                Some(Wire {
-                    sent: traffic.sent,
-                    received: traffic.received,
-                })
-            }),
-            _adapter: Box::new(adapter),
-        });
-    }
-    hosts
-}
-
-async fn libp2p_cluster(spec: &ClusterSpec) -> Vec<Host<Libp2pNetwork>> {
-    let fixtures = Libp2pFixtures::with_surplus(SEED, spec.seated, spec.hosts - spec.seated);
-    let mut hosts: Vec<Host<Libp2pNetwork>> = Vec::new();
-    let mut first = None;
-    for index in 0..spec.hosts {
-        let shards = shards_of(spec, index);
-        let config = Libp2pConfig {
-            listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-            bootstrap_peers: first.iter().cloned().collect(),
-            ..Default::default()
-        };
-        let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
-        let adapter = Libp2pAdapter::new(Libp2pAdapterArgs {
-            config,
-            network: NetworkDefinition::simulator(),
-            keypair: fixtures.ed25519_keypair(index),
-            vnodes: vec![(vid(index), fixtures.signer(index))],
-            local_shards: shards.iter().copied().collect::<HashSet<_>>(),
-            registry: Arc::clone(&registry),
-            validator_keys: fixtures.validator_key_map(),
-            verifier: Arc::new(BlsVerifier),
-        })
-        .expect("the host binds");
-        if first.is_none() {
-            first = timeout(Duration::from_secs(10), async {
-                loop {
-                    if let Some(addr) = adapter.listen_addresses().await.into_iter().next() {
-                        return addr;
-                    }
-                    sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .ok();
-        }
-
-        let pool = Arc::new(RequestStreamPool::new(
-            Arc::clone(&adapter),
-            Handle::current(),
-            Duration::ZERO,
-        ));
-        let network = Arc::new(Libp2pNetwork::new(
-            Arc::clone(&adapter),
-            Arc::new(Libp2pRequestManager::new(
-                pool,
-                Libp2pRequestManagerConfig::default(),
-            )),
-            Handle::current(),
-            registry,
-            topology(fixtures.genesis_validators()),
-            Duration::ZERO,
-        ));
-        if spec.meshed {
-            network.update_routing_committees(root_committee(spec));
-        }
-        let bound = Arc::clone(&adapter);
-        hosts.push(Host {
-            network,
-            bound: Box::new(move |validator| bound.peer_for_validator(validator).is_some()),
-            wire: Box::new(|| None),
-            _adapter: Box::new(adapter),
-        });
+        hosts.push(Host { network, adapter });
     }
     hosts
 }
 
 /// Wait until every `(from, to)` pair of hosts is bound. Returns how long
 /// it took and how many pairs were still unbound when the budget ran out.
-async fn await_links<N: Network>(hosts: &[Host<N>], pairs: &[(u32, u32)]) -> (Duration, usize) {
+async fn await_links(hosts: &[Host], pairs: &[(u32, u32)]) -> (Duration, usize) {
     let start = Instant::now();
     loop {
         let unbound = pairs
             .iter()
-            .filter(|(from, to)| !(hosts[*from as usize].bound)(vid(*to)))
+            .filter(|(from, to)| {
+                hosts[*from as usize]
+                    .adapter
+                    .peer_for_validator(vid(*to))
+                    .is_none()
+            })
             .count();
         if unbound == 0 || start.elapsed() >= MESH_BUDGET {
             return (start.elapsed(), unbound);
@@ -803,10 +685,7 @@ fn percentile(sorted: &[u64], per_mille: usize) -> u64 {
 
 /// Have every host but the first answer a header with a vote to the
 /// validators `recipients` names for it.
-fn vote_on_headers<N: Network>(
-    hosts: &[Host<N>],
-    recipients: fn(&Header, u32) -> Vec<ValidatorId>,
-) {
+fn vote_on_headers(hosts: &[Host], recipients: fn(&Header, u32) -> Vec<ValidatorId>) {
     for (index, host) in hosts.iter().enumerate() {
         let network = Arc::clone(&host.network);
         let index = u32::try_from(index).expect("a cluster fits in u32");
@@ -823,7 +702,7 @@ fn vote_on_headers<N: Network>(
     }
 }
 
-async fn notify<N: Network>(backend: Backend, hosts: Vec<Host<N>>, peers: u32) {
+async fn notify(hosts: Vec<Host>, peers: u32) {
     let (link_time, unbound) = await_links(&hosts, &star_pairs(peers + 1)).await;
     vote_on_headers(&hosts, |_, _| vec![vid(0)]);
 
@@ -906,7 +785,6 @@ async fn notify<N: Network>(backend: Backend, hosts: Vec<Host<N>>, peers: u32) {
         "{}",
         json!({
             "measurement": "notify round trip",
-            "backend": backend.name(),
             "active_peers": peers,
             "links_unbound": unbound,
             "link_secs": link_time.as_secs_f64(),
@@ -921,7 +799,7 @@ async fn notify<N: Network>(backend: Backend, hosts: Vec<Host<N>>, peers: u32) {
     );
 }
 
-async fn range<N: Network>(backend: Backend, hosts: Vec<Host<N>>) {
+async fn range(hosts: Vec<Host>) {
     let asker = RANGE_SERVERS;
     let pairs: Vec<(u32, u32)> = (0..RANGE_SERVERS).map(|server| (asker, server)).collect();
     let (link_time, unbound) = await_links(&hosts, &pairs).await;
@@ -985,7 +863,6 @@ async fn range<N: Network>(backend: Backend, hosts: Vec<Host<N>>) {
         "{}",
         json!({
             "measurement": "state range transfer",
-            "backend": backend.name(),
             "links_unbound": unbound,
             "link_secs": link_time.as_secs_f64(),
             "chunk_bytes": CHUNK_BYTES,
@@ -1002,7 +879,7 @@ async fn range<N: Network>(backend: Backend, hosts: Vec<Host<N>>) {
 /// The asker of a range cluster needs `requests` small chunks, each asked
 /// until a good answer lands, while the first server answers every request
 /// with a chunk the asker rejects. Counts what each server was asked.
-async fn garbage_responder<N: Network>(backend: Backend, hosts: Vec<Host<N>>, requests: u64) {
+async fn garbage_responder(hosts: Vec<Host>, requests: u64) {
     const GOOD: usize = 64;
     let asker = RANGE_SERVERS;
     let pairs: Vec<(u32, u32)> = (0..RANGE_SERVERS).map(|server| (asker, server)).collect();
@@ -1068,7 +945,6 @@ async fn garbage_responder<N: Network>(backend: Backend, hosts: Vec<Host<N>>, re
         "{}",
         json!({
             "measurement": "garbage responder",
-            "backend": backend.name(),
             "links_unbound": unbound,
             "link_secs": link_time.as_secs_f64(),
             "requests": requests,
@@ -1080,7 +956,7 @@ async fn garbage_responder<N: Network>(backend: Backend, hosts: Vec<Host<N>>, re
     );
 }
 
-async fn committee<N: Network>(backend: Backend, hosts: Vec<Host<N>>, size: u32) {
+async fn committee(hosts: Vec<Host>, size: u32) {
     let (link_time, unbound) = await_links(&hosts, &mesh_pairs(size)).await;
     // A vote goes to the round's proposer and the next two, as consensus
     // sends it.
@@ -1129,7 +1005,6 @@ async fn committee<N: Network>(backend: Backend, hosts: Vec<Host<N>>, size: u32)
         "{}",
         json!({
             "measurement": "committee traffic",
-            "backend": backend.name(),
             "committee": size,
             "links_unbound": unbound,
             "link_secs": link_time.as_secs_f64(),
@@ -1142,33 +1017,26 @@ async fn committee<N: Network>(backend: Backend, hosts: Vec<Host<N>>, size: u32)
     );
 }
 
-async fn idle<N: Network>(
-    backend: Backend,
-    hosts: Vec<Host<N>>,
-    connections: u32,
-    timers: PathTimers,
-) {
+async fn idle(hosts: Vec<Host>, connections: u32, timers: PathTimers) {
     let (link_time, unbound) = await_links(&hosts, &star_pairs(connections + 1)).await;
     // Let handshakes and address exchange settle before watching.
     sleep(Duration::from_secs(10)).await;
 
-    let wire_before = (hosts[0].wire)();
+    let wire_before = hosts[0].adapter.traffic();
     let start = (Instant::now(), cpu_time());
     sleep(IDLE_WINDOW).await;
     let cpu = cpu_time().saturating_sub(start.1);
     let wall = start.0.elapsed();
-    let wire_after = (hosts[0].wire)();
+    let wire_after = hosts[0].adapter.traffic();
 
     #[allow(clippy::cast_precision_loss)] // rates for a report
-    let hub_bytes_per_sec = wire_before.zip(wire_after).map(|(before, after)| {
-        ((after.sent - before.sent) + (after.received - before.received)) as f64
-            / wall.as_secs_f64()
-    });
+    let hub_bytes_per_sec = ((wire_after.sent - wire_before.sent)
+        + (wire_after.received - wire_before.received)) as f64
+        / wall.as_secs_f64();
     println!(
         "{}",
         json!({
             "measurement": "idle connections",
-            "backend": backend.name(),
             "timers": timers.report(),
             "connections": connections,
             "links_unbound": unbound,
@@ -1177,7 +1045,7 @@ async fn idle<N: Network>(
             "process_cpu_cores": cpu.as_secs_f64() / wall.as_secs_f64(),
             "hub_bytes_per_sec": hub_bytes_per_sec,
             "hub_bytes_per_sec_per_connection":
-                hub_bytes_per_sec.map(|rate| rate / f64::from(connections)),
+                hub_bytes_per_sec / f64::from(connections),
         })
     );
 }
@@ -1256,7 +1124,6 @@ async fn delayed_idle(
         "{}",
         json!({
             "measurement": "idle connections with delay",
-            "backend": "iroh",
             "timers": timers.report(),
             "connections": connections,
             "linked_direct": linked_direct,
@@ -1415,7 +1282,6 @@ async fn reject_flood(rate: u32, forged_per_signed: u32, watch: Duration, follow
         "{}",
         json!({
             "measurement": "reject flood",
-            "backend": "iroh",
             "receiver_serves_a_shard": !follower,
             "forged_per_signed": forged_per_signed,
             "secs": wall,
@@ -1493,7 +1359,6 @@ async fn refused_flood(rate: u32, refusal: Refusal, watch: Duration) {
         "{}",
         json!({
             "measurement": "refused flood",
-            "backend": "iroh",
             "verdict": match refusal {
                 Refusal::Reject => "reject",
                 Refusal::Ignore => "ignore",
@@ -1585,7 +1450,6 @@ async fn notify_flood(rate: u32, judged: Judged, watch: Duration) {
         "{}",
         json!({
             "measurement": "notify flood",
-            "backend": "iroh",
             "verdict": match judged {
                 Judged::Accept => "accept",
                 Judged::Reject => "reject",
@@ -1669,7 +1533,6 @@ async fn shadow_flood(rate: u32, watch: Duration) {
         "{}",
         json!({
             "measurement": "shadow flood",
-            "backend": "iroh",
             "secs": wall,
             "headers": sent,
             "false_copies_judged": false_copies.load(Ordering::Relaxed),
@@ -1754,7 +1617,6 @@ async fn bind_flood(validators: u32, dialers: u32, watch: Duration) {
         "{}",
         json!({
             "measurement": "bind flood",
-            "backend": "iroh",
             "validators": validators,
             "dialers": dialers,
             "secs": wall,
@@ -1886,7 +1748,6 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
         "{}",
         json!({
             "measurement": "forged flood",
-            "backend": "iroh",
             "verdict": match checked {
                 Checked::Accept => "accept",
                 Checked::Defer => "defer",
@@ -1960,7 +1821,6 @@ async fn certificate_flood(rate: u32, checks: Checks, watch: Duration) {
         "{}",
         json!({
             "measurement": "certificate flood",
-            "backend": "iroh",
             "checks": match checks {
                 Checks::Signature => "signature",
                 Checks::Both => "both",
@@ -2070,7 +1930,6 @@ async fn request_flood(in_flight: u32, watch: Duration) {
         "{}",
         json!({
             "measurement": "request flood",
-            "backend": "iroh",
             "in_flight": in_flight,
             "secs": wall,
             "handled_per_sec": per_sec(handled),
@@ -2082,27 +1941,11 @@ async fn request_flood(in_flight: u32, watch: Duration) {
     );
 }
 
-/// Run `measure` over a cluster on `backend`.
-macro_rules! on_backend {
-    ($backend:expr, $spec:expr, |$hosts:ident| $measure:expr) => {
-        match $backend {
-            Backend::Iroh => {
-                let $hosts = iroh_cluster(&$spec).await;
-                $measure
-            }
-            Backend::Libp2p => {
-                let $hosts = libp2p_cluster(&$spec).await;
-                $measure
-            }
-        }
-    };
-}
-
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // one arm per subcommand
 async fn main() {
     match Cli::parse().command {
-        Command::Notify { backend, peers } => {
+        Command::Notify { peers } => {
             let spec = ClusterSpec {
                 hosts: peers + 1,
                 seated: peers + 1,
@@ -2110,13 +1953,15 @@ async fn main() {
                 meshed: false,
                 timers: PathTimers::default(),
             };
-            on_backend!(backend, spec, |hosts| notify(backend, hosts, peers).await);
+            let hosts = iroh_cluster(&spec).await;
+            notify(hosts, peers).await;
         }
-        Command::Range { backend } => {
+        Command::Range => {
             let spec = range_cluster();
-            on_backend!(backend, spec, |hosts| range(backend, hosts).await);
+            let hosts = iroh_cluster(&spec).await;
+            range(hosts).await;
         }
-        Command::Committee { backend, size } => {
+        Command::Committee { size } => {
             let spec = ClusterSpec {
                 hosts: size,
                 seated: size,
@@ -2124,10 +1969,10 @@ async fn main() {
                 meshed: true,
                 timers: PathTimers::default(),
             };
-            on_backend!(backend, spec, |hosts| committee(backend, hosts, size).await);
+            let hosts = iroh_cluster(&spec).await;
+            committee(hosts, size).await;
         }
         Command::Idle {
-            backend,
             connections,
             timers,
         } => {
@@ -2138,13 +1983,8 @@ async fn main() {
                 meshed: false,
                 timers,
             };
-            on_backend!(backend, spec, |hosts| idle(
-                backend,
-                hosts,
-                connections,
-                timers
-            )
-            .await);
+            let hosts = iroh_cluster(&spec).await;
+            idle(hosts, connections, timers).await;
         }
         Command::DelayedIdle {
             connections,
@@ -2172,12 +2012,10 @@ async fn main() {
         } => {
             reject_flood(rate, forged_per_signed, Duration::from_secs(secs), follower).await;
         }
-        Command::GarbageResponder { backend, requests } => {
+        Command::GarbageResponder { requests } => {
             let spec = range_cluster();
-            on_backend!(backend, spec, |hosts| garbage_responder(
-                backend, hosts, requests
-            )
-            .await);
+            let hosts = iroh_cluster(&spec).await;
+            garbage_responder(hosts, requests).await;
         }
         Command::BindFlood {
             validators,

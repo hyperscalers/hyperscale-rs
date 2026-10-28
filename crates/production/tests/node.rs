@@ -37,7 +37,6 @@ fn free_port() -> u16 {
 }
 
 /// Where a host listens and what another host dials to reach it.
-#[cfg(feature = "iroh")]
 mod net {
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -66,35 +65,6 @@ mod net {
         IrohConfig {
             bootstrap_peers,
             ..IrohConfig::for_testing(listen.key, listen.at)
-        }
-    }
-}
-
-/// Where a host listens and what another host dials to reach it.
-#[cfg(not(feature = "iroh"))]
-mod net {
-    use hyperscale_network_libp2p::Libp2pConfig;
-    pub use hyperscale_network_libp2p::test_utils::TestFixtures;
-    use libp2p::Multiaddr;
-
-    pub type Listen = Multiaddr;
-    pub type Dial = Multiaddr;
-
-    pub fn listen(port: u16) -> Listen {
-        format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
-            .parse()
-            .expect("a QUIC multiaddr")
-    }
-
-    pub fn dial(listen: &Listen) -> Dial {
-        listen.clone()
-    }
-
-    pub fn config(listen: Listen, bootstrap_peers: Vec<Dial>) -> Libp2pConfig {
-        Libp2pConfig {
-            listen_addresses: vec![listen],
-            bootstrap_peers,
-            ..Default::default()
         }
     }
 }

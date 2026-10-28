@@ -45,7 +45,6 @@ iroh-relay = { workspace = true, features = ["server"], optional = true }
 
 [dev-dependencies]
 arc-swap.workspace = true
-hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
 rand_chacha.workspace = true
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 hyperscale-crypto-bls.workspace = true

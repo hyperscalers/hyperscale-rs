@@ -201,7 +201,7 @@ impl std::fmt::Debug for TestCommittee {
 
 /// Mixing constant for this fixture's consensus-key derivation.
 ///
-/// Deliberately different from the one `hyperscale-network-libp2p`'s
+/// Deliberately different from the one `hyperscale-network-iroh`'s
 /// test fixtures use: the two are independent families, and the same
 /// `(seed, index)` must not name the same key in both.
 const KEY_DERIVATION_MIX: u64 = 0x517c_c1b7_2722_0a95;

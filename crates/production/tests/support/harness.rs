@@ -21,9 +21,10 @@ use arc_swap::ArcSwap;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
 use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
+use hyperscale_network_iroh::fault::{DropSpec, HostId, Rewrite, RuleHandle};
+use hyperscale_network_iroh::{EndpointAddr, EndpointId, IrohAdapter, SecretKey};
 use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
-use hyperscale_production::transport::TransportAdapter;
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShardCommand, ShutdownHandle, StorageFactory,
     shard_data_dir,
@@ -46,11 +47,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::{Instant, sleep, timeout};
 
-use super::temp_storage_dir;
-use super::transport::{
-    Bootstrap, DropSpec, HostId, HostKey, PeerKey, Rewrite, RuleHandle, bootstrap_addr,
-    new_host_key, peer_key, test_config,
-};
+use super::{temp_storage_dir, test_config};
 
 /// Per-host registry of every `RocksDbShardStorage` the host has opened —
 /// the startup shards plus any the supervisor opens at a reshape flip or a
@@ -150,8 +147,8 @@ struct Host {
     /// on a restart.
     validators: Vec<LocalValidator>,
     /// What a restart rebuilds the host's network identity from.
-    key: HostKey,
-    adapter: Arc<TransportAdapter>,
+    key: SecretKey,
+    adapter: Arc<IrohAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
     beacon_storage: Arc<RocksDbBeaconStorage>,
     /// Submit a transaction into this host's process (the production
@@ -242,22 +239,22 @@ impl Harness {
         let mut built = Vec::with_capacity(hosts.len());
 
         // Build host 0 first so the rest can bootstrap to its address.
-        let mut bootstrap: Option<Bootstrap> = None;
+        let mut bootstrap: Option<EndpointAddr> = None;
         for (idx, host) in hosts.into_iter().enumerate() {
             let temp_dir = TempDir::new().expect("temp dir");
-            let bootstrap_peers: Vec<Bootstrap> = bootstrap.iter().cloned().collect();
+            let bootstrap_peers: Vec<EndpointAddr> = bootstrap.iter().cloned().collect();
             let built_host = build_host(BuildHostArgs {
                 temp_dir: &temp_dir,
                 genesis: &genesis,
                 validators: host.validators,
                 beacon_chain_config: chain_config,
                 genesis_config: genesis_config.clone(),
-                key: new_host_key(),
+                key: SecretKey::generate(),
                 bootstrap_peers,
                 simulated_outbound_latency,
             });
             if idx == 0 {
-                bootstrap = Some(bootstrap_addr(&built_host.adapter).await);
+                bootstrap = Some(built_host.adapter.endpoint_addr());
             }
             temp_dirs.push(temp_dir);
             built.push(built_host);
@@ -380,7 +377,7 @@ impl Harness {
         let peer = (0..self.hosts.len())
             .find(|&i| i != host)
             .expect("a restart bootstraps to another host");
-        let bootstrap = bootstrap_addr(&self.hosts[peer].adapter).await;
+        let bootstrap = self.hosts[peer].adapter.endpoint_addr();
 
         let mut old = self.hosts.remove(host);
         if let Some(s) = old.shutdown.take() {
@@ -778,11 +775,11 @@ impl Harness {
     /// `HostId` map, so partition and gossip filtering resolve peers. Call once
     /// before installing faults.
     pub fn fault_configure_all(&self) {
-        let map: Vec<(PeerKey, HostId)> = self
+        let map: Vec<(EndpointId, HostId)> = self
             .hosts
             .iter()
             .enumerate()
-            .map(|(i, h)| (peer_key(&h.adapter), host_id(i)))
+            .map(|(i, h)| (h.adapter.local_endpoint_id(), host_id(i)))
             .collect();
         for (i, host) in self.hosts.iter().enumerate() {
             host.adapter.fault_configure(host_id(i), map.clone());
@@ -910,8 +907,8 @@ struct BuiltHost {
     validator_ids: Vec<ValidatorId>,
     validators: Vec<LocalValidator>,
     runner: ProductionRunner,
-    key: HostKey,
-    adapter: Arc<TransportAdapter>,
+    key: SecretKey,
+    adapter: Arc<IrohAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
     beacon_storage: Arc<RocksDbBeaconStorage>,
     tx_submission: TxSubmissionSender,
@@ -927,8 +924,8 @@ struct BuildHostArgs<'a> {
     validators: Vec<LocalValidator>,
     beacon_chain_config: BeaconChainConfig,
     genesis_config: Option<GenesisConfig>,
-    key: HostKey,
-    bootstrap_peers: Vec<Bootstrap>,
+    key: SecretKey,
+    bootstrap_peers: Vec<EndpointAddr>,
     simulated_outbound_latency: Duration,
 }
 

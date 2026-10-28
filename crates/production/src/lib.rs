@@ -4,7 +4,7 @@
 //! validator runs: one pinned `std::thread` per hosted shard, each driving
 //! that shard's [`ShardLoop`] and draining a (timer, callback, shutdown)
 //! channel triple in priority order, plus a shared tokio runtime carrying
-//! libp2p, the RPC server, the per-shard timer sleep tasks, and the
+//! the iroh transport, the RPC server, the per-shard timer sleep tasks, and the
 //! per-host metrics + JMT GC ticks.
 //!
 //! Runtime shard membership — beacon-driven joins and leaves, reshape
@@ -53,10 +53,9 @@ mod runner;
 mod status;
 mod supervisor;
 mod telemetry;
-pub mod transport;
+mod transport;
 pub use arc_swap::ArcSwap;
 pub use hyperscale_engine::PreviewReport;
-#[cfg(feature = "iroh")]
 pub use hyperscale_network_iroh::{RelayUrl, SecretKey, load_or_generate_secret_key};
 pub use hyperscale_node::TxStatusCache;
 pub use hyperscale_storage::BeaconChainReader;

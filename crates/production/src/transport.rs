@@ -1,50 +1,86 @@
-//! The network backend the production runner is built on.
-//!
-//! One backend is compiled into a build. libp2p is the default; the `iroh`
-//! cargo feature replaces it with the iroh transport. Each backend module
-//! exports the same names, so the rest of the crate is written once.
+//! Stands a host's iroh networking up.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_network::ValidatorKeyMap;
+use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
+use hyperscale_network_iroh::{
+    IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, NetworkError, RequestManager,
+    RequestManagerConfig, RequestPool, RequestStreams,
+};
 use hyperscale_node::SharedTopologySnapshot;
 use hyperscale_types::{NetworkDefinition, ShardId, Signer, ValidatorId, Verifier};
+use tokio::runtime::Handle as TokioHandle;
+use tokio::task::block_in_place;
 
-#[cfg(all(not(feature = "iroh"), not(feature = "libp2p")))]
-compile_error!("hyperscale-production needs a network backend: enable `libp2p` or `iroh`");
-
-#[cfg_attr(feature = "iroh", path = "transport/iroh.rs")]
-#[cfg_attr(not(feature = "iroh"), path = "transport/libp2p.rs")]
-mod backend;
-
-pub(crate) use backend::build_network_stack;
-pub use backend::{
-    ProdNetwork, TransportAdapter, TransportConfig, TransportError, VersionInteroperabilityMode,
-};
-
-/// Everything a backend needs to stand a host's networking up.
-pub(crate) struct NetworkBuildArgs {
-    pub(crate) network_config: TransportConfig,
+/// What a host's networking is built from.
+pub struct NetworkBuildArgs {
+    pub network_config: IrohConfig,
     /// Network identity, bound into signed bind handshake messages so a
     /// signature collected on one network can't validate on another.
-    pub(crate) network: NetworkDefinition,
+    pub network: NetworkDefinition,
     /// Shards hosted by this host.
-    pub(crate) local_shards: BTreeSet<ShardId>,
+    pub local_shards: BTreeSet<ShardId>,
     /// One `(validator_id, signer)` per hosted vnode. The bind handshake
     /// attests as every entry.
-    pub(crate) bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
-    pub(crate) initial_validator_keys: Arc<ValidatorKeyMap>,
+    pub bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
+    pub initial_validator_keys: Arc<ValidatorKeyMap>,
     /// Scheme verifier for signed gossip and bind attestations.
-    pub(crate) verifier: Arc<dyn Verifier>,
+    pub verifier: Arc<dyn Verifier>,
     /// Topology snapshot shared with the network for shard-based peer
     /// resolution on outbound requests.
-    pub(crate) topology_snapshot: SharedTopologySnapshot,
+    pub topology_snapshot: SharedTopologySnapshot,
 }
 
 /// A host's networking: the adapter the runner drives and reads, and the
 /// [`Network`](hyperscale_network::Network) the node sends through.
-pub(crate) struct NetworkStack {
-    pub(crate) adapter: Arc<TransportAdapter>,
-    pub(crate) network: ProdNetwork,
+pub struct NetworkStack {
+    pub adapter: Arc<IrohAdapter>,
+    pub network: IrohNetwork,
+}
+
+/// Stand the host's networking up. The endpoint binds as the network key in
+/// the configuration, so the identity is whatever the caller keeps.
+///
+/// Binding the endpoint is asynchronous and the runner is built
+/// synchronously, so this blocks its thread until the endpoint is bound. It
+/// must be called from within a multi-threaded tokio runtime.
+pub fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, NetworkError> {
+    let registry = Arc::new(HandlerRegistry::new(
+        args.local_shards.iter().copied().collect(),
+    ));
+    let simulated_outbound_latency = args.network_config.simulated_outbound_latency;
+    let runtime = TokioHandle::current();
+
+    let adapter = block_in_place(|| {
+        runtime.block_on(IrohAdapter::bind(IrohAdapterArgs {
+            config: args.network_config,
+            network: args.network,
+            vnodes: args.bind_vnodes,
+            local_shards: args.local_shards.into_iter().collect(),
+            registry: Arc::clone(&registry),
+            validator_keys: args.initial_validator_keys,
+            verifier: args.verifier,
+        }))
+    })?;
+
+    let request_pool: Arc<dyn RequestPool> = Arc::new(RequestStreams::new(
+        Arc::clone(&adapter),
+        simulated_outbound_latency,
+    ));
+    let request_manager = Arc::new(RequestManager::new(
+        request_pool,
+        RequestManagerConfig::default(),
+    ));
+
+    let network = IrohNetwork::new(
+        Arc::clone(&adapter),
+        request_manager,
+        runtime,
+        registry,
+        args.topology_snapshot,
+        simulated_outbound_latency,
+    );
+
+    Ok(NetworkStack { adapter, network })
 }

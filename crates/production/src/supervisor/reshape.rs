@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
+use hyperscale_network_iroh::IrohNetwork;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
 use hyperscale_node::reshape::observer::observer_ready_signal;
@@ -40,7 +41,6 @@ use tracing::{info, warn};
 
 use super::{ShardSupervisor, SupervisorEvent};
 use crate::runner::wall_clock_local;
-use crate::transport::ProdNetwork;
 
 /// One reshape io result fed back into the orchestrator's pump. The io
 /// callbacks (network responses, off-loop store work) push these onto the
@@ -478,7 +478,7 @@ impl ShardSupervisor {
     /// fallback when the walked shard isn't co-hosted locally — a merge
     /// keeper's sibling child.
     fn network_headers(
-        network: &Arc<ProdNetwork>,
+        network: &Arc<IrohNetwork>,
         events: &mpsc::UnboundedSender<SupervisorEvent>,
         duty: ShardId,
         from: ShardId,
@@ -502,7 +502,7 @@ impl ShardSupervisor {
     /// Request one reshape state range from `from`'s committee, answering with a
     /// [`ReshapeIo`]. The fallback when a duty's source isn't co-hosted locally.
     fn network_state_range(
-        network: &Arc<ProdNetwork>,
+        network: &Arc<IrohNetwork>,
         events: &mpsc::UnboundedSender<SupervisorEvent>,
         duty: ShardId,
         from: ShardId,

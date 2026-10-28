@@ -6,7 +6,7 @@ license.workspace = true
 description = "Shared network protocol logic: Network trait, compression, topics, handler registry"
 
 [features]
-# Portable fault-injection engine, shared by the sim and libp2p test harnesses.
+# Portable fault-injection engine, shared by the sim and iroh test harnesses.
 # Never enabled by the production binary.
 test-utils = ["dep:parking_lot", "dep:rand_chacha"]
 

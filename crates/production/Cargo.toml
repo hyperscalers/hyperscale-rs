@@ -14,12 +14,6 @@ name = "hyperscale-keygen"
 path = "src/bin/keygen.rs"
 
 [features]
-default = ["libp2p"]
-# The libp2p network backend.
-libp2p = ["dep:hyperscale-network-libp2p", "dep:igd-next", "dep:libp2p"]
-# The iroh network backend, in place of libp2p. Build with
-# `--no-default-features --features iroh` to leave libp2p out of the build.
-iroh = ["dep:hyperscale-network-iroh"]
 # Run the portable scenario suite on a fast 30s beacon epoch instead of the
 # 5-minute production one, matching the simulation harness's local default.
 # For quick local checks; a parity run leaves it off.
@@ -43,15 +37,7 @@ hyperscale-node.workspace = true
 hyperscale-provisions.workspace = true
 hyperscale-types.workspace = true
 hyperscale-network.workspace = true
-
-# Network backends; a build compiles one in.
-hyperscale-network-iroh = { workspace = true, optional = true }
-hyperscale-network-libp2p = { workspace = true, optional = true }
-# Used directly by the validator and keygen binaries for multiaddrs and peer ids.
-libp2p = { workspace = true, optional = true }
-
-# UPnP
-igd-next = { version = "0.17.1", features = ["aio_tokio"], optional = true }
+hyperscale-network-iroh.workspace = true
 
 # Serialization
 hyperscale-hbor.workspace = true
@@ -102,9 +88,7 @@ hyperscale-dispatch-sync.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
-hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
 hyperscale-scenarios.workspace = true
-libp2p.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }

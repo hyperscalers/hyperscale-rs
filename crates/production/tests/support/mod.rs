@@ -9,12 +9,14 @@
 
 pub mod harness;
 pub mod prod_cluster;
-pub mod transport;
 
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_network_iroh::test_utils::TestFixtures;
+use hyperscale_network_iroh::{EndpointAddr, IrohConfig, SecretKey};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, StorageDirResolver, StorageFactory, shard_data_dir,
 };
@@ -25,11 +27,25 @@ use hyperscale_types::{BeaconChainConfig, ShardId, ValidatorId, shard_prefix_pat
 #[allow(unused_imports)] // the lifecycle binaries compile support but never drive the adaptor
 pub use prod_cluster::ProdCluster;
 use tempfile::TempDir;
-use transport::{Bootstrap, TestFixtures, new_host_key, test_config};
 
 /// Budget for a transport connection / validator-bind handshake to complete
 /// over localhost QUIC.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A loopback configuration bootstrapped to `bootstrap_peers`: no relay
+/// and no port mapping, every host at a socket address the others are
+/// told.
+pub fn test_config(
+    key: &SecretKey,
+    bootstrap_peers: Vec<EndpointAddr>,
+    simulated_outbound_latency: Duration,
+) -> IrohConfig {
+    IrohConfig {
+        bootstrap_peers,
+        simulated_outbound_latency,
+        ..IrohConfig::for_testing(key.clone(), (Ipv4Addr::LOCALHOST, 0).into())
+    }
+}
 
 /// Build a one-host production runner hosting `validators` (indices into
 /// `fixtures`' deterministic keys), bootstrapped to `bootstrap_peers`. The
@@ -40,11 +56,11 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn build_runner(
     fixtures: &TestFixtures,
     validators: &[u32],
-    bootstrap_peers: Vec<Bootstrap>,
+    bootstrap_peers: Vec<EndpointAddr>,
     beacon_chain_config: Option<BeaconChainConfig>,
 ) -> (ProductionRunner, TempDir, Arc<RocksDbBeaconStorage>) {
     let temp_dir = TempDir::new().expect("temp dir");
-    let network_config = test_config(&new_host_key(), bootstrap_peers, Duration::ZERO);
+    let network_config = test_config(&SecretKey::generate(), bootstrap_peers, Duration::ZERO);
     let beacon_storage = Arc::new(
         RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).expect("open beacon db"),
     );
