@@ -16,7 +16,7 @@ use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
     Answerers, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, ResponseVerdict, compression,
+    RequestHandler, ResponseVerdict, Verdict, VerdictKey, compression,
 };
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, ValidatorId,
@@ -223,6 +223,10 @@ impl Network for SimNetworkAdapter {
         *self.routing_committees.lock().unwrap() = committees;
     }
 
+    fn settle(&self, key: VerdictKey, verdict: Verdict) {
+        self.registry.settle(key, &verdict);
+    }
+
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         // Tee to in-process subscribers — the harness's `accept_gossip`
         // skips the publisher's own node (the production fan-out never sends
@@ -328,13 +332,19 @@ impl Network for SimNetworkAdapter {
         let request_bytes =
             hbor_to_vec(&request).expect("SimNetworkAdapter: failed to encode request");
 
-        // Wrap the typed callback: decode raw response bytes → R::Response
+        // Wrap the typed callback: decode raw response bytes → R::Response.
+        // An answer that does not decode is the peer's fault whatever the
+        // caller makes of the error, so it counts as rejected.
         let typed_callback: Box<
             dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send,
         > = Box::new(move |result| match result {
             Ok(bytes) => match hbor_from_slice::<R::Response>(&bytes) {
                 Ok(response) => on_response(Ok(response)),
-                Err(e) => on_response(Err(RequestError::PeerError(format!("decode error: {e:?}")))),
+                Err(e) => {
+                    let _ =
+                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))));
+                    ResponseVerdict::Reject
+                }
             },
             Err(e) => on_response(Err(e)),
         });
