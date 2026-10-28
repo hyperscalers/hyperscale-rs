@@ -41,8 +41,8 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, CrossingId, IntentHeader, Kind,
-    Terms as CrossingTerms, fee_hold_key, holdings_collection, instance_data_key, package_hash,
-    resource_record_key,
+    SignedIntent, Terms as CrossingTerms, fee_hold_key, holdings_collection, instance_data_key,
+    package_hash, resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
@@ -2337,23 +2337,57 @@ fn one_transaction_founds_a_pool_that_stakes_and_registers() {
     );
 }
 
-/// The founder's join of `validator` to its pool, with `top_up` staked
-/// into it first, funded and paid for by the sponsor.
-fn joining(validator: ValidatorId, top_up: u128) -> Transaction {
+/// The founder's join of `validator` to its pool, paid for by the
+/// sponsor.
+fn joining(validator: ValidatorId) -> Transaction {
     let founder = account_of(FOUNDER);
-    let declaration = client()
-        .join_declaration(founder, HEADER, validator, &key_bytes(), &proof_bytes())
-        .expect("the join builds");
     client()
         .join(
-            sign_intent(declaration, &key_of(FOUNDER)),
+            joining_declaration(validator),
             founder,
             &key_of(SPONSOR),
             HEADER,
             terms(1_000),
-            top_up,
         )
         .expect("the sponsor composes the join")
+}
+
+/// The founder's signed declaration registering `validator` in its pool.
+fn joining_declaration(validator: ValidatorId) -> SignedIntent {
+    let declaration = client()
+        .join_declaration(
+            account_of(FOUNDER),
+            HEADER,
+            validator,
+            &key_bytes(),
+            &proof_bytes(),
+        )
+        .expect("the join builds");
+    sign_intent(declaration, &key_of(FOUNDER))
+}
+
+/// The founder's join of `validator` adopted under a root of the
+/// sponsor's own that first stakes `amount` into the founder's pool and
+/// keeps the units.
+fn staking_ahead_of(validator: ValidatorId, amount: u128) -> Transaction {
+    let chain = client().records();
+    let pool = founded_pool(account_of(FOUNDER));
+    let composed = Composed::new(&chain, std::slice::from_ref(&pool), &ProtocolHasher);
+    let sponsor = account_of(SPONSOR);
+    let mut root = IntentBuilder::new(&composed, &ProtocolHasher, sponsor, HEADER);
+    let funds = account::withdraw(&mut root, sponsor, *PROTOCOL_RESOURCE, amount)
+        .expect("the sponsor withdraws");
+    let units = staking::Staking::at(pool.address(&ProtocolHasher))
+        .stake(&mut root, funds)
+        .expect("the founded pool takes a delegation");
+    account::deposit(&mut root, sponsor, units).expect("the sponsor keeps the units");
+    let adopted = root
+        .adopt(joining_declaration(validator))
+        .expect("the sponsor adopts the join");
+    adopted.sockets.none().expect("a join declares no sockets");
+    adopted.gives.none().expect("a join gives nothing");
+    let tree = root.build().expect("the tree builds");
+    Transaction::new(client().sign_tree(&tree, &[&key_of(SPONSOR)], terms(1_000)))
 }
 
 /// What `validator` registering in the founder's pool tells the beacon.
@@ -2367,19 +2401,19 @@ fn registration(validator: ValidatorId) -> BeaconWitnessEvent {
 }
 
 /// A later join presents the badge the founding left with the founder,
-/// and the sponsor's top-up runs ahead of it: the root is the tree's
-/// first intent and takes nothing from the declaration, so the pool holds
-/// the seat's stake by the time its registration is read. Once the pool's
-/// own stake covers a seat, a join stakes nothing and says only the
-/// registration.
+/// and says only the registration. A stake composed ahead of it in the
+/// same transaction reaches the beacon first: the root is the tree's
+/// first intent and takes nothing from the declaration, so its deposit
+/// is emitted before the registration, and the beacon judges the seat
+/// against the pool with the deposit in it.
 #[test]
-fn a_second_validator_joins_with_the_sponsors_top_up() {
+fn a_stake_ahead_of_a_join_in_one_transaction_reaches_the_beacon_first() {
     let (executor, mut store) = founding_world();
     let founded = run_on(&executor, &store, founding(FOUNDING));
     absorb(&mut store, &founded, &executor);
 
     let second = ValidatorId::new(4);
-    let joined = run_on(&executor, &store, joining(second, FOUNDING));
+    let joined = run_on(&executor, &store, staking_ahead_of(second, FOUNDING));
     assert_eq!(
         witnesses(&joined),
         vec![
@@ -2393,7 +2427,7 @@ fn a_second_validator_joins_with_the_sponsors_top_up() {
     absorb(&mut store, &joined, &executor);
 
     let third = ValidatorId::new(5);
-    let covered = run_on(&executor, &store, joining(third, 0));
+    let covered = run_on(&executor, &store, joining(third));
     assert_eq!(witnesses(&covered), vec![registration(third)]);
 }
 

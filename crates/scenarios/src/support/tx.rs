@@ -2759,7 +2759,7 @@ pub(crate) fn build_sponsored_unjail_tx(
 }
 
 /// The account a newcomer founds its own pool from, holding nothing of
-/// its own: the desk pays for every join it signs.
+/// its own: a sponsor pays for every join it signs.
 #[must_use]
 pub(crate) fn newcomer_founder() -> (Ed25519PrivateKey, PrincipalAddr) {
     let key = signer_from_seed(182);
@@ -2783,8 +2783,8 @@ pub(crate) fn founded_id(founder: PrincipalAddr) -> StakePoolId {
     StakePoolId::of(founded_at(founder))
 }
 
-/// The fee terms a desk pays a sponsored join under.
-const fn desk_terms() -> Terms {
+/// The fee terms a sponsor pays a join under.
+const fn sponsor_terms() -> Terms {
     Terms {
         max_fee: MAX_FEE,
         ceilings: Ceilings::Guessed,
@@ -2796,11 +2796,11 @@ const fn desk_terms() -> Terms {
 /// `founder`'s founding of its own pool, staked with `amount` and
 /// registering `validator` under the key it will be known by and the
 /// proof it holds that key: one declaration `founder` signs, which
-/// `desk` funds from its own account and pays for. The pool's owner
+/// `sponsor` funds from its own account and pays for. The pool's owner
 /// badge lands with `founder`.
 #[must_use]
 pub(crate) fn build_found_tx(
-    desk: &Ed25519PrivateKey,
+    sponsor: &Ed25519PrivateKey,
     founder: &Ed25519PrivateKey,
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
@@ -2817,26 +2817,23 @@ pub(crate) fn build_found_tx(
         .found_and_join(
             sign_intent(declaration, founder),
             founder_account,
-            desk,
+            sponsor,
             header,
-            desk_terms(),
+            sponsor_terms(),
             amount,
         )
-        .expect("the desk composes a founding")
+        .expect("the sponsor composes a founding")
 }
 
 /// `founder`'s registration of `validator` in the pool it founded,
-/// presenting the owner badge it holds, which `desk` composes and pays
-/// for after first staking `top_up` into the pool from its own account
-/// and keeping the units. A `top_up` of 0 stakes nothing.
+/// presenting the owner badge it holds, which `sponsor` pays for.
 #[must_use]
 pub(crate) fn build_join_tx(
-    desk: &Ed25519PrivateKey,
+    sponsor: &Ed25519PrivateKey,
     founder: &Ed25519PrivateKey,
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
-    top_up: u128,
     validity: TimestampRange,
 ) -> Transaction {
     let founder_account = account_address(&founder.public_key().0);
@@ -2848,12 +2845,11 @@ pub(crate) fn build_join_tx(
         .join(
             sign_intent(declaration, founder),
             founder_account,
-            desk,
+            sponsor,
             header,
-            desk_terms(),
-            top_up,
+            sponsor_terms(),
         )
-        .expect("the desk composes a join")
+        .expect("the sponsor composes a join")
 }
 
 /// [`build_stake_tx`] into `founder`'s founded pool, which no genesis

@@ -197,9 +197,8 @@ pub use venue::{
     wide_swapper_shards,
 };
 pub use witnesses::{
+    a_founded_pool_seats_another_validator_once_its_stake_covers_it,
     a_newcomer_founds_its_own_pool, a_restarted_genesis_host_resumes_beside_a_newcomer,
-    a_second_validator_joins_with_the_desks_top_up,
-    a_third_validator_joins_once_the_pools_stake_covers_it,
     a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
     a_timed_out_newcomer_is_let_back_in_from_its_own_host,
     an_offline_newcomer_leaves_the_network_live, delegation_folds_into_beacon_state,

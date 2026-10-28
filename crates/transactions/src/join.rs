@@ -5,8 +5,8 @@
 //! founding stake and registers the validator in the one node that makes
 //! the pool actual, so the account signs a single declaration and the
 //! sponsor fills its funds socket. Every later join presents the owner
-//! badge the account already holds, and the sponsor may stake into the
-//! pool ahead of it.
+//! badge the account already holds, and seats only where the pool's
+//! stake already covers it.
 
 use std::slice;
 
@@ -115,14 +115,7 @@ impl Client {
     }
 
     /// `signed`, `founder`'s [`join_declaration`](Self::join_declaration),
-    /// composed under a root of `payer`'s own that first stakes `top_up` of the
-    /// protocol resource into the owner's pool, keeping the stake units,
-    /// in a transaction `payer` signs and pays for under `terms`. A
-    /// `top_up` of 0 stakes nothing.
-    ///
-    /// The root is the tree's first intent and takes nothing from the
-    /// declaration, so its stake runs ahead of the registration and the
-    /// pool holds the seat's stake when the beacon reads it.
+    /// in a transaction `payer` signs and pays for under `terms`.
     ///
     /// # Errors
     ///
@@ -135,19 +128,11 @@ impl Client {
         payer: &S,
         root: IntentHeader,
         terms: Terms,
-        top_up: u128,
     ) -> Result<Transaction, IntentError> {
         let chain = self.records();
         let pool = founded_pool(founder);
         let composed = Composed::new(&chain, slice::from_ref(&pool), &ProtocolHasher);
-        let sponsor = principal_of(payer);
-        let mut builder = IntentBuilder::new(&composed, &ProtocolHasher, sponsor, root);
-        if top_up > 0 {
-            let funds = account::withdraw(&mut builder, sponsor, *PROTOCOL_RESOURCE, top_up)?;
-            let units =
-                staking::Staking::at(pool.address(&ProtocolHasher)).stake(&mut builder, funds)?;
-            account::deposit(&mut builder, sponsor, units)?;
-        }
+        let mut builder = IntentBuilder::new(&composed, &ProtocolHasher, principal_of(payer), root);
         let interface = builder.adopt(signed)?;
         interface.sockets.none()?;
         interface.gives.none()?;
@@ -231,9 +216,8 @@ mod tests {
     }
 
     /// A sponsor composes a founding into a transaction it pays for, and
-    /// a join with or without a top-up the same way; each composes alike
-    /// from the same inputs, so whoever rebuilds one holds the same
-    /// transaction.
+    /// a join the same way; each composes alike from the same inputs, so
+    /// whoever rebuilds one holds the same transaction.
     #[test]
     fn a_sponsor_composes_a_founding_and_a_join_alike() {
         let client = Client::with_pools(&[], NETWORK);
@@ -250,16 +234,14 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(composed_founding(), composed_founding());
-        for top_up in [0, 7] {
-            let joined = || {
-                let join = client
-                    .join_declaration(founder, header(2), VALIDATOR, &key(), &proof())
-                    .unwrap();
-                client
-                    .join(signed(join), founder, &sponsor, header(11), terms(), top_up)
-                    .unwrap()
-            };
-            assert_eq!(joined(), joined());
-        }
+        let joined = || {
+            let join = client
+                .join_declaration(founder, header(2), VALIDATOR, &key(), &proof())
+                .unwrap();
+            client
+                .join(signed(join), founder, &sponsor, header(11), terms())
+                .unwrap()
+        };
+        assert_eq!(joined(), joined());
     }
 }

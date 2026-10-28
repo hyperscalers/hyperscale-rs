@@ -22,11 +22,10 @@ use hyperscale_scenarios::{
     ScenarioConfig, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
+    a_founded_pool_seats_another_validator_once_its_stake_covers_it,
     a_healed_network_delivers_past_the_old_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline, a_newcomer_founds_its_own_pool,
-    a_second_validator_joins_with_the_desks_top_up,
-    a_skip_deferred_split_keeps_every_settlement_in_its_window,
-    a_third_validator_joins_once_the_pools_stake_covers_it, abort_converges,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window, abort_converges,
     beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
@@ -646,19 +645,10 @@ fn a_newcomer_founds_its_own_pool_prod() {
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn a_second_validator_joins_with_the_desks_top_up_prod() {
-    let mut cluster =
-        ProdCluster::start_with_accounts(&witness_config(4), 0x70B, EPOCH_MS, Vec::new());
-    a_second_validator_joins_with_the_desks_top_up(&mut cluster);
-}
-
-#[test]
-#[serial]
-#[ignore = "real-QUIC production scenario; run with -- --ignored"]
-fn a_third_validator_joins_once_the_pools_stake_covers_it_prod() {
+fn a_founded_pool_seats_another_validator_once_its_stake_covers_it_prod() {
     let mut cluster =
         ProdCluster::start_with_accounts(&witness_config(4), 0x3D5, EPOCH_MS, Vec::new());
-    a_third_validator_joins_once_the_pools_stake_covers_it(&mut cluster);
+    a_founded_pool_seats_another_validator_once_its_stake_covers_it(&mut cluster);
 }
 
 #[test]

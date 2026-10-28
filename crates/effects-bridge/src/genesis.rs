@@ -208,8 +208,8 @@ pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> Instance
 }
 
 /// The pool `founder` founds: the one an account's join brings up, at an
-/// address the account alone fixes, so the app and the desk derive it
-/// without anything stored.
+/// address the account alone fixes, so anyone who knows the account
+/// derives it without anything stored.
 #[must_use]
 pub fn founded_pool(founder: PrincipalAddr) -> InstanceMeta {
     staking_instance(
