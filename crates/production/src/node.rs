@@ -17,6 +17,7 @@ use arc_swap::ArcSwap;
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig, ThreadPoolError};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
+use hyperscale_network_iroh::IrohConfig;
 use hyperscale_node::TxStatusCache;
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -33,7 +34,6 @@ use tokio::task::{JoinError, JoinHandle};
 use crate::network_file::{NetworkFile, NetworkFileError};
 use crate::observe::{HeaderRing, HeaderSummary, Importing, Observation};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, PreviewSender, TxSubmissionSender};
-use crate::transport::TransportConfig;
 use crate::{
     LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageDirResolver,
     StorageFactory, SyncStatus, shard_data_dir,
@@ -60,9 +60,8 @@ pub struct NodeSetup {
     pub mempool: MempoolConfig,
     /// Limits on the provisions cross-shard execution waits for.
     pub provisions: ProvisionConfig,
-    /// The network backend's configuration; its type follows the `libp2p` or
-    /// `iroh` feature.
-    pub transport: TransportConfig,
+    /// The iroh transport's configuration.
+    pub transport: IrohConfig,
     /// Consensus and throughput pool sizes.
     pub threads: ThreadPoolConfig,
     /// Worker threads of the host's own tokio runtime, which carries its
@@ -104,7 +103,7 @@ impl NodeSetup {
         data_dir: PathBuf,
         validators: Vec<LocalValidator>,
         network: &NetworkFile,
-        transport: TransportConfig,
+        transport: IrohConfig,
     ) -> Result<Self, NetworkFileError> {
         let local: Vec<(ValidatorId, ConsensusPublicKey)> = validators
             .iter()

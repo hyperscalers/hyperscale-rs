@@ -38,7 +38,7 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 | [`metrics-memory`](crates/metrics-memory) | In-memory metrics backend for tests and simulation assertions |
 | [`metrics-prometheus`](crates/metrics-prometheus) | Prometheus metrics backend with counters, gauges, and histograms |
 | [`network`](crates/network) | Shared network protocol logic: Network trait, handler registry, wire framing |
-| [`network-libp2p`](crates/network-libp2p) | Production libp2p transport with gossipsub broadcast and QUIC/TCP streams |
+| [`network-iroh`](crates/network-iroh) | Production iroh transport: direct QUIC paths between validators, relay fallback, fan-out gossip |
 | [`network-memory`](crates/network-memory) | Deterministic in-memory network for simulation with configurable latency and partitions |
 | [`node`](crates/node) | The host: one shard replica (`NodeStateMachine`) per hosted shard and the beacon loop |
 | [`production`](crates/production) | Production runner: async event loop, RPC server, telemetry |

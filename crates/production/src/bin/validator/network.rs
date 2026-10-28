@@ -1,4 +1,4 @@
-//! The validator's network settings on the iroh backend.
+//! The validator's network settings.
 //!
 //! ```toml
 //! [network]

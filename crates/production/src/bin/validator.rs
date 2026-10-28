@@ -25,7 +25,7 @@
 //! key_path = "./keys/v0.key"
 //!
 //! [network]
-//! listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
+//! listen_addr = "0.0.0.0:9000"
 //! bootstrap_peers = []
 //!
 //! [threads]
@@ -42,7 +42,7 @@
 //! `[[vnode]]` blocks. Validators on one shard attach as signers to that
 //! shard's one replica, which verifies, executes and commits the chain
 //! once for the host; validators on different shards share only the
-//! libp2p peer, the beacon loop and the dispatch pools.
+//! network endpoint, the beacon loop and the dispatch pools.
 
 use std::fs;
 use std::io::Write;
@@ -58,9 +58,9 @@ use hex::{decode as hex_decode, encode as hex_encode};
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_dispatch_pooled::ThreadPoolConfig;
 use hyperscale_mempool::MempoolConfig;
+use hyperscale_network_iroh::VersionInteroperabilityMode;
 use hyperscale_production::network_file::{Genesis, network_name};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
-use hyperscale_production::transport::VersionInteroperabilityMode;
 use hyperscale_production::{
     DEFAULT_BLOCK_CACHE_MB, LocalValidator, Node, NodeSetup, TelemetryConfig, TelemetryGuard,
     for_core_count, init_telemetry,
@@ -82,8 +82,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::never;
 use tracing_subscriber::{EnvFilter, fmt};
 
-#[cfg_attr(feature = "iroh", path = "validator/network_iroh.rs")]
-#[cfg_attr(not(feature = "iroh"), path = "validator/network_libp2p.rs")]
+#[path = "validator/network.rs"]
 mod network;
 
 use network::{NetworkConfig, build_network_config};
@@ -108,7 +107,8 @@ struct Cli {
     #[arg(long)]
     metrics_addr: Option<String>,
 
-    /// Bootstrap peer multiaddresses (can be specified multiple times)
+    /// Bootstrap peers as `<endpoint id>@<addr>[,<relay url>]` (can be
+    /// specified multiple times)
     #[arg(long)]
     bootstrap: Vec<String>,
 
@@ -711,9 +711,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     }
 
     fs::create_dir_all(&config.node.data_dir)?;
-
-    #[cfg(not(feature = "iroh"))]
-    network::setup_upnp(&config.network).await;
 
     if config.vnodes.is_empty() {
         bail!(

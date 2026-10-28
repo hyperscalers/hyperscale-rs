@@ -54,7 +54,7 @@ One `NodeHost<Storage, Network, Dispatch>` is generic over its three I/O seams; 
 | Seam | Production | Simulation |
 |---|---|---|
 | Storage | RocksDB (`storage-rocksdb`) | In-memory persistent structures (`storage-memory`) |
-| Network | libp2p: gossipsub + QUIC request/response (`network-libp2p`) | In-memory mesh with seeded latency/jitter/loss and fault rules (`network-memory`) |
+| Network | iroh: QUIC paths with relay fallback, fan-out gossip and request/response (`network-iroh`) | In-memory mesh with seeded latency/jitter/loss and fault rules (`network-memory`) |
 | Dispatch | Rayon thread pools, consensus work isolated from bulk throughput work (`dispatch-pooled`) | Inline, sequential (`dispatch-sync`) |
 | Time/events | Tokio timers; one pinned thread per hosted shard owning its replica, and one for the host's beacon loop (no mutex on consensus state) | A single global event queue under one total deterministic order, time first; time advances only by draining it |
 

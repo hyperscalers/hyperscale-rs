@@ -7,10 +7,10 @@
 //! resources (`Arc<ProcessIo>`: network adapter, dispatch pool, tx
 //! validator, topology snapshot) are cloned across every shard thread.
 //!
-//! The tokio runtime handles libp2p, the RPC server (which invokes the
+//! The tokio runtime handles the iroh transport, the RPC server (which invokes the
 //! [`TxSubmissionSender`] closure synchronously), the per-shard
 //! `ProdTimerManager`s' `sleep` tasks, and the per-host metrics + GC
-//! tick. Inbound libp2p events and dispatch callbacks land on the
+//! tick. Inbound network messages and dispatch callbacks land on the
 //! addressed shard's callback channel; RPC submissions fan out via
 //! [`ProcessIo::compute_submit_fanout`] into the relevant shards'
 //! callback channels.
@@ -37,6 +37,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths, set_shard_channel_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::ValidatorKeyMap;
+use hyperscale_network_iroh::{IrohAdapter, IrohConfig, IrohNetwork, NetworkError};
 use hyperscale_node::beacon_loop::BeaconLoop;
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::shard::{
@@ -72,10 +73,7 @@ use crate::status::SyncStatus;
 use crate::supervisor::{
     LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
 };
-use crate::transport::{
-    NetworkBuildArgs, NetworkStack, ProdNetwork, TransportAdapter, TransportConfig, TransportError,
-    build_network_stack,
-};
+use crate::transport::{NetworkBuildArgs, NetworkStack, build_network_stack};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -93,7 +91,7 @@ pub enum RunnerError {
     BeaconLoopExited,
     /// Underlying network backend error.
     #[error("Network error: {0}")]
-    NetworkError(#[from] TransportError),
+    NetworkError(#[from] NetworkError),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -133,7 +131,7 @@ impl Drop for ShutdownHandle {
 ///
 /// A [`ProductionRunner`] hosts a `Vec<VnodeConfig>` alongside a single
 /// `Arc<TopologySnapshot>` shared across every shard loop. Entries mapped to
-/// the same `local_shard` share one `NodeHost`, one libp2p peer, one
+/// the same `local_shard` share one `NodeHost`, one network endpoint, one
 /// `ShardIo` and one replica, each attached to it as a signer with its own
 /// signing key.
 #[derive(Clone)]
@@ -201,7 +199,7 @@ pub struct LocalValidator {
 ///   built from; the initial [`TopologySnapshot`] is projected from that
 ///   genesis state and seeded into the `ProcessIo`'s `ArcSwap`.
 /// - `shard_config` - Consensus configuration parameters
-/// - `network` - libp2p configuration for peer-to-peer communication
+/// - `network` - iroh configuration for peer-to-peer communication
 /// - `storage_factory` - Opens a shard's storage (at startup for a derived
 ///   seat, and at runtime for a beacon-driven join).
 ///
@@ -213,7 +211,7 @@ pub struct ProductionRunnerBuilder {
     genesis_validators: GenesisValidators,
     shard_config: ShardConsensusConfig,
     beacon_storage: Arc<dyn BeaconStorage>,
-    network_config: TransportConfig,
+    network_config: IrohConfig,
     dispatch: Option<Arc<PooledDispatch>>,
     channel_capacity: usize,
     /// Opens a runtime-joined shard's `RocksDB` storage.
@@ -250,7 +248,7 @@ impl ProductionRunnerBuilder {
         genesis_validators: GenesisValidators,
         shard_config: ShardConsensusConfig,
         beacon_storage: Arc<dyn BeaconStorage>,
-        network_config: TransportConfig,
+        network_config: IrohConfig,
         storage_factory: StorageFactory,
         storage_dir: StorageDirResolver,
     ) -> Self {
@@ -359,13 +357,13 @@ impl ProductionRunnerBuilder {
     /// infrastructure. The `NodeHost` is held in an `Option` so it can be moved
     /// to the pinned thread when `run()` is called.
     ///
-    /// Must be called from within a tokio runtime context — the libp2p adapter
+    /// Must be called from within a tokio runtime context — the iroh adapter
     /// and request manager capture `Handle::current()`.
     ///
     /// # Errors
     ///
     /// Returns [`RunnerError::SendError`] if dispatch initialization fails,
-    /// or [`RunnerError::NetworkError`] if libp2p setup fails.
+    /// or [`RunnerError::NetworkError`] if the endpoint fails to bind.
     #[allow(clippy::too_many_lines)] // straight-line construction; further splits add no clarity
     pub fn build(self) -> Result<ProductionRunner, RunnerError> {
         // Install the Prometheus metrics backend before anything records metrics.
@@ -725,7 +723,7 @@ pub struct ProductionRunner {
 
     /// Network adapter: the host's connections, shared with the
     /// [`Network`](hyperscale_network::Network) the node sends through.
-    network: Arc<TransportAdapter>,
+    network: Arc<IrohAdapter>,
     /// Network topology snapshot (lock-free `ArcSwap`, updated on topology changes).
     topology_snapshot: SharedTopologySnapshot,
     /// Per-shard `RocksDB` handles for the JMT GC tick and storage
@@ -770,7 +768,7 @@ impl ProductionRunner {
         genesis_validators: GenesisValidators,
         shard_config: ShardConsensusConfig,
         beacon_storage: Arc<dyn BeaconStorage>,
-        network_config: TransportConfig,
+        network_config: IrohConfig,
         storage_factory: StorageFactory,
         storage_dir: StorageDirResolver,
     ) -> ProductionRunnerBuilder {
@@ -793,7 +791,7 @@ impl ProductionRunner {
 
     /// Get a reference to the network adapter.
     #[must_use]
-    pub const fn network(&self) -> &Arc<TransportAdapter> {
+    pub const fn network(&self) -> &Arc<IrohAdapter> {
         &self.network
     }
 
@@ -1167,7 +1165,7 @@ impl ProductionRunner {
             }
         }
 
-        // ── Update sync_peers on the sync status (only runner has Libp2pNetwork) ──
+        // ── Update sync_peers on the sync status (only runner has the adapter) ──
         if let Some(ref sync_status) = self.publishers.sync_status {
             let current = sync_status.load();
             if current.sync_peers != peer_count {
@@ -1212,10 +1210,10 @@ impl ProductionRunner {
 }
 
 /// Concrete `NodeHost` type for the production runner.
-type ProdHost = NodeHost<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
+type ProdHost = NodeHost<RocksDbShardStorage, IrohNetwork, PooledDispatch>;
 
 /// Concrete `ShardLoop` type for the production runner.
-pub type ProdShardLoop = ShardLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
+pub type ProdShardLoop = ShardLoop<RocksDbShardStorage, IrohNetwork, PooledDispatch>;
 
 /// Per-shard receivers driving a single shard's pinned thread. Built
 /// during construction and consumed when [`ProductionRunner::run`]
@@ -1655,7 +1653,7 @@ pub fn spawn_shard_loop(
 }
 
 /// Concrete `BeaconLoop` type for the production runner.
-pub type ProdBeaconLoop = BeaconLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
+pub type ProdBeaconLoop = BeaconLoop<RocksDbShardStorage, IrohNetwork, PooledDispatch>;
 
 /// Configuration for a host's pinned beacon thread — the sibling of
 /// [`ShardLoopConfig`]. The beacon loop runs no shard consensus, so there

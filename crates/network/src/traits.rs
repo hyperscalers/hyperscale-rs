@@ -1,6 +1,6 @@
 //! Network trait for typed message passing.
 //!
-//! Defines the `Network` interface implemented by both production (`network-libp2p`)
+//! Defines the `Network` interface implemented by both production (`network-iroh`)
 //! and simulation (`network-memory`) backends.
 //!
 //! Handler registration is fully typed: `register_gossip_handler<M>` accepts a

@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 
 use hex::decode as hex_decode;
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
-#[cfg(feature = "iroh")]
 use hyperscale_network_iroh::{
     EndpointAddr, IrohConfig, RelayUrl, SecretKey, VersionInteroperabilityMode, parse_endpoint_addr,
 };
@@ -405,7 +404,6 @@ impl NetworkFile {
     /// # Errors
     ///
     /// When a peer or relay is malformed.
-    #[cfg(feature = "iroh")]
     pub fn iroh_transport(&self, secret_key: SecretKey) -> Result<IrohConfig, NetworkFileError> {
         iroh_config(secret_key, &self.bootstrap_peers, &self.relays)
     }
@@ -417,7 +415,6 @@ impl NetworkFile {
 /// # Errors
 ///
 /// When a peer or relay is malformed.
-#[cfg(feature = "iroh")]
 pub fn iroh_config(
     secret_key: SecretKey,
     peers: &[String],
@@ -657,7 +654,6 @@ mod tests {
 
     /// The iroh transport dials the file's peers less the host itself,
     /// through its relays, with versions held strictly.
-    #[cfg(feature = "iroh")]
     #[test]
     fn the_iroh_transport_leaves_the_host_out_of_its_peers() {
         let me = SecretKey::generate();

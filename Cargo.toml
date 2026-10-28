@@ -20,7 +20,6 @@ members = [
     "crates/metrics-prometheus",
     "crates/network",
     "crates/network-iroh",
-    "crates/network-libp2p",
     "crates/network-memory",
     "crates/node",
     "crates/production",
@@ -64,7 +63,6 @@ hyperscale-metrics-memory = { path = "crates/metrics-memory" }
 hyperscale-metrics-prometheus = { path = "crates/metrics-prometheus" }
 hyperscale-network = { path = "crates/network" }
 hyperscale-network-iroh = { path = "crates/network-iroh" }
-hyperscale-network-libp2p = { path = "crates/network-libp2p" }
 hyperscale-network-memory = { path = "crates/network-memory" }
 hyperscale-node = { path = "crates/node" }
 hyperscale-provisions = { path = "crates/provisions" }
@@ -97,8 +95,6 @@ im = "15.1.0"
 indexmap = "2.14.2"
 iroh = "=1.4.1"
 iroh-relay = { version = "=1.4.1", default-features = false }
-libp2p = { version = "0.57.1", features = ["gossipsub", "kad", "quic", "tokio", "macros", "identify"] }
-libp2p-stream = "0.5.0-alpha"
 ml-dsa = "0.1.1"
 opentelemetry = "0.33.1"
 opentelemetry_sdk = "0.33.1"
