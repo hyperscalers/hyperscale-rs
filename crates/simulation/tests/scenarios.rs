@@ -14,8 +14,6 @@ use std::time::Duration;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
-#[cfg(not(feature = "production-epochs"))]
-use hyperscale_scenarios::PAYER_SHARD;
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
@@ -31,8 +29,8 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
-    LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend,
-    VENUE_SHARD, WIDE_VENUE_SHARD, a_consumer_never_committing_declines_a_pushed_record,
+    LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, PAYER_SHARD, Pair, RoutePayer, ScenarioConfig,
+    Spend, VENUE_SHARD, WIDE_VENUE_SHARD, a_consumer_never_committing_declines_a_pushed_record,
     a_core_stated_at_a_halt_is_accepted_on_both_venues,
     a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
@@ -1026,10 +1024,6 @@ fn a_spend_beside_a_transfer_leg_that_took_the_balance_pays_in_full_or_waits_sim
 /// The control for the two below it: the sponsor's spend moves one unit
 /// beside the route's pending member, which the vault covers whichever
 /// settles first.
-///
-/// The window between the member's tick and its verdict is a few blocks
-/// wide, and the spend lands inside it at the short epoch's pacing alone.
-#[cfg(not(feature = "production-epochs"))]
 #[test]
 fn a_sponsor_spends_dust_beside_its_routes_pending_core_sim() {
     let mut cluster = route_cluster();
@@ -1049,10 +1043,6 @@ fn a_sponsor_spends_dust_beside_its_routes_pending_core_sim() {
 /// nothing of it, so the spend's tick reads the vault whole, under the
 /// route's fee hold: the spend is refused and pays its price, and the
 /// route's burn settles beside it.
-///
-/// The window between the member's tick and its verdict is a few blocks
-/// wide, and the spend lands inside it at the short epoch's pacing alone.
-#[cfg(not(feature = "production-epochs"))]
 #[test]
 fn a_sponsor_spends_its_balance_beside_its_routes_pending_core_sim() {
     let mut cluster = route_cluster();
@@ -1158,11 +1148,6 @@ fn a_payer_publishes_in_the_block_of_its_spend_sim() {
 /// spend, which moves everything the vault holds but its own price: the
 /// publish pays in full, or is not committed until the spend has
 /// settled.
-///
-/// The window between the spend's commit and its settlement is a few
-/// blocks wide, and the publish reaches a proposer inside it at the
-/// short epoch's pacing alone.
-#[cfg(not(feature = "production-epochs"))]
 #[test]
 fn a_payer_publishes_behind_its_unsettled_spend_sim() {
     let mut cluster = publish_beside_spend_cluster();
