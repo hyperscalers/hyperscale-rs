@@ -582,9 +582,11 @@ impl MempoolCoordinator {
         Some(cross_shard)
     }
 
-    /// RPC submit path. Emits `EmitTransactionStatus` for the client
-    /// regardless of dedup, plus `Continuation(TransactionsAdmitted)` when
-    /// the tx is newly admitted.
+    /// Local submission path: a transaction a client of this node
+    /// submitted, post-validation. Emits `EmitTransactionStatus` regardless
+    /// of dedup, so the client's status lookup answers `Pending` from the
+    /// moment the pool holds it, plus `Continuation(TransactionsAdmitted)`
+    /// when the tx is newly admitted.
     #[instrument(skip(self, topology_snapshot, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_submit_transaction(
         &mut self,
@@ -624,24 +626,18 @@ impl MempoolCoordinator {
         }
     }
 
-    /// Gossip path (or validated RPC submission, post-validation). Silent
-    /// on dedup; emits `Continuation(TransactionsAdmitted)` when the tx is
+    /// Gossip path: a peer's transaction, post-validation. Silent on
+    /// dedup and emits no status, since no client of this node is waiting
+    /// on it; emits `Continuation(TransactionsAdmitted)` when the tx is
     /// newly admitted.
     #[instrument(skip(self, topology_snapshot, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_transaction_gossip(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         tx: Arc<Verified<Transaction>>,
-        submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
-        match self.admit_internal(
-            topology_snapshot,
-            &tx,
-            Offered::Unbidden,
-            submitted_locally,
-            now,
-        ) {
+        match self.admit_internal(topology_snapshot, &tx, Offered::Unbidden, false, now) {
             Some(_) => {
                 tracing::trace!(
                     tx_hash = ?tx.hash(),
@@ -1739,7 +1735,6 @@ mod tests {
                     .on_transaction_gossip(
                         &topology_snapshot,
                         Arc::new(verified(test_transaction(seed))),
-                        false,
                         LocalTimestamp::ZERO,
                     )
                     .is_empty(),
@@ -1751,12 +1746,7 @@ mod tests {
         let over = Arc::new(verified(test_transaction(3)));
         assert!(
             mempool
-                .on_transaction_gossip(
-                    &topology_snapshot,
-                    Arc::clone(&over),
-                    false,
-                    LocalTimestamp::ZERO,
-                )
+                .on_transaction_gossip(&topology_snapshot, Arc::clone(&over), LocalTimestamp::ZERO)
                 .is_empty(),
             "gossip past the ceiling is refused"
         );
@@ -1879,7 +1869,6 @@ mod tests {
         mempool.on_transaction_gossip(
             &topology_snapshot,
             Arc::new(verified(tx)),
-            false,
             LocalTimestamp::ZERO,
         );
         assert_eq!(mempool.pending_expected_count(), 0);
@@ -2232,7 +2221,6 @@ mod tests {
         mempool.on_transaction_gossip(
             &topology_snapshot,
             Arc::new(verified(tx)),
-            false,
             LocalTimestamp::ZERO,
         );
 
@@ -2558,7 +2546,6 @@ mod tests {
         let actions = mempool.on_transaction_gossip(
             &topology_snapshot,
             Arc::new(verified(tx)),
-            false,
             LocalTimestamp::ZERO,
         );
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
@@ -3176,7 +3163,6 @@ mod tests {
         let actions = mempool.on_transaction_gossip(
             &topology_snapshot,
             Arc::clone(&tx),
-            false,
             LocalTimestamp::ZERO,
         );
         assert!(actions.is_empty());
@@ -3194,12 +3180,7 @@ mod tests {
         let tx = tx_with_end(1, 1_000);
 
         let mut fresh = MempoolCoordinator::new(ShardId::ROOT);
-        fresh.on_transaction_gossip(
-            &topology_snapshot,
-            Arc::clone(&tx),
-            false,
-            LocalTimestamp::ZERO,
-        );
+        fresh.on_transaction_gossip(&topology_snapshot, Arc::clone(&tx), LocalTimestamp::ZERO);
         assert!(
             fresh.status(&tx.hash()).is_some(),
             "the vacuous gate this seeding exists to close",
@@ -3208,12 +3189,7 @@ mod tests {
         let mut seeded = MempoolCoordinator::new(ShardId::ROOT);
         seeded.seed_committed(BlockHeight::new(42));
         seeded.clock = CommittedClock::seeded(WeightedTimestamp::from_millis(2_000));
-        seeded.on_transaction_gossip(
-            &topology_snapshot,
-            Arc::clone(&tx),
-            false,
-            LocalTimestamp::ZERO,
-        );
+        seeded.on_transaction_gossip(&topology_snapshot, Arc::clone(&tx), LocalTimestamp::ZERO);
         assert!(seeded.status(&tx.hash()).is_none());
     }
 
@@ -3483,7 +3459,7 @@ mod tests {
         let owners: Vec<PrincipalAddr> = (0..8u8).map(|i| test_principal(0x40 + i)).collect();
         for owner in &owners {
             let tx = stub_vm(*owner, &[owner.address()]);
-            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+            mempool.on_transaction_gossip(&topology, tx, LocalTimestamp::ZERO);
         }
         let now = LocalTimestamp::from_millis(1_000);
 
@@ -3539,12 +3515,7 @@ mod tests {
         let mut mempool = MempoolCoordinator::new(local);
         let hashes = (swap.hash(), free.hash());
         for tx in [swap, free] {
-            mempool.on_transaction_gossip(
-                topology,
-                Arc::new(verified(tx)),
-                false,
-                LocalTimestamp::ZERO,
-            );
+            mempool.on_transaction_gossip(topology, Arc::new(verified(tx)), LocalTimestamp::ZERO);
         }
         mempool.on_engagement_evidence(topology.shard_trie(), paying, [hashes.0]);
         (mempool, hashes.0, hashes.1, route, owed)
@@ -3626,7 +3597,7 @@ mod tests {
         let mut pool = |seed: u8, priority_bp: u32| {
             let tx = Arc::new(verified(test_transaction_at_priority(seed, priority_bp)));
             let hash = tx.hash();
-            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+            mempool.on_transaction_gossip(&topology, tx, LocalTimestamp::ZERO);
             hash
         };
         let carried: HashSet<TxHash> = (0..3).map(|seed| pool(seed, 500)).collect();
@@ -3690,7 +3661,7 @@ mod tests {
                 vec![heavy],
                 test_validity_range(),
             )));
-            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+            mempool.on_transaction_gossip(&topology, tx, LocalTimestamp::ZERO);
         }
         let now = LocalTimestamp::from_millis(1_000);
         let offered = mempool.ready_transactions(100, &IntakeView::idle(trie), now, |_| true);
@@ -3758,7 +3729,7 @@ mod tests {
                 .collect();
             let tx = stub_vm(payer, &owners);
             let hash = tx.hash();
-            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+            mempool.on_transaction_gossip(&topology, tx, LocalTimestamp::ZERO);
             hash
         };
         let pooled = |pool: &mut dyn FnMut(PrincipalAddr, Option<PrincipalAddr>) -> TxHash,
@@ -3835,7 +3806,7 @@ mod tests {
                 .collect();
             let tx = stub_vm(payer, &owners);
             let hash = tx.hash();
-            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+            mempool.on_transaction_gossip(&topology, tx, LocalTimestamp::ZERO);
             hash
         };
         let pooled = |pool: &mut dyn FnMut(PrincipalAddr, Option<PrincipalAddr>) -> TxHash,
@@ -3912,7 +3883,7 @@ mod tests {
         let mut mempool = MempoolCoordinator::new(local);
         for seed in (0..40u8).step_by(4) {
             let tx = Arc::new(verified(test_cross_shard_transaction(seed)));
-            mempool.on_transaction_gossip(&split, tx, false, LocalTimestamp::ZERO);
+            mempool.on_transaction_gossip(&split, tx, LocalTimestamp::ZERO);
         }
         assert_eq!(mempool.pool.len(), 10);
 
@@ -3973,7 +3944,7 @@ mod tests {
 
         let parked = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let parked_hash = parked.hash();
-        mempool.on_transaction_gossip(&before, Arc::clone(&parked), false, LocalTimestamp::ZERO);
+        mempool.on_transaction_gossip(&before, Arc::clone(&parked), LocalTimestamp::ZERO);
         assert_eq!(mempool.parked_count(), 1);
 
         // Before the cut, the shard that holds the prefix releases it.
@@ -4013,7 +3984,7 @@ mod tests {
         let payer_owner = test_principal(0x81);
         let parked = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let parked_hash = parked.hash();
-        mempool.on_transaction_gossip(&topology, Arc::clone(&parked), false, LocalTimestamp::ZERO);
+        mempool.on_transaction_gossip(&topology, Arc::clone(&parked), LocalTimestamp::ZERO);
 
         // Pooled and reported Pending, but outside contention.
         assert_eq!(mempool.parked_count(), 1);
@@ -4032,12 +4003,7 @@ mod tests {
         // the parked transaction holds no claim on their shared key.
         let local_leg = stub_vm(local_owner, &[local_owner.address()]);
         let local_hash = local_leg.hash();
-        mempool.on_transaction_gossip(
-            &topology,
-            Arc::clone(&local_leg),
-            false,
-            LocalTimestamp::ZERO,
-        );
+        mempool.on_transaction_gossip(&topology, Arc::clone(&local_leg), LocalTimestamp::ZERO);
         let ready: Vec<TxHash> = mempool
             .ready_transactions(
                 10,
@@ -4088,7 +4054,7 @@ mod tests {
         let hash = tx.hash();
 
         mempool.on_engagement_evidence(topology.shard_trie(), payer_shard, [hash]);
-        mempool.on_transaction_gossip(&topology, Arc::clone(&tx), false, LocalTimestamp::ZERO);
+        mempool.on_transaction_gossip(&topology, Arc::clone(&tx), LocalTimestamp::ZERO);
 
         assert_eq!(mempool.parked_count(), 0);
         let ready: Vec<TxHash> = mempool

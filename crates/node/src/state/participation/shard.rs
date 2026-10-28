@@ -1291,4 +1291,44 @@ mod tests {
         );
         assert_eq!(node.mempool_coordinator().status(&tx_hash), None);
     }
+
+    /// A transaction this node's client submitted reports `Pending` the
+    /// moment the pool admits it, so the client's status lookup finds it
+    /// while it waits for a block; a peer's gossiped one reports nothing.
+    #[test]
+    fn a_local_submission_reports_pending_on_admission() {
+        let reports_pending = |submitted_locally: bool| {
+            let TestNode { mut node, .. } = TestNode::new();
+            let raw_tx = test_transaction(1);
+            let tx_hash = raw_tx.hash();
+            let actions = node.handle(
+                LocalTimestamp::ZERO,
+                ProtocolEvent::TransactionValidated {
+                    tx: Arc::new(Verified::new_unchecked_for_test(raw_tx)),
+                    submitted_locally,
+                },
+            );
+            assert_eq!(
+                node.mempool_coordinator().status(&tx_hash),
+                Some(TransactionStatus::Pending),
+            );
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::EmitTransactionStatus {
+                        tx_hash: reported,
+                        status: TransactionStatus::Pending,
+                        submitted_locally: true,
+                        ..
+                    } if *reported == tx_hash
+                )
+            })
+        };
+
+        assert!(reports_pending(true), "a local submission reports Pending");
+        assert!(
+            !reports_pending(false),
+            "a gossiped transaction reports nothing"
+        );
+    }
 }
