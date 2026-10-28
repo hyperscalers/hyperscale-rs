@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::ValueEnum;
+use iroh::dns::DnsResolver;
 use iroh::tls::CaTlsConfig;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,16 @@ pub struct IrohConfig {
     /// arrived.
     pub bootstrap_peers: Vec<EndpointAddr>,
 
+    /// Domains whose `_hyperscale` TXT records each name one more bootstrap
+    /// peer, in the [`parse_endpoint_addr`] form. They are looked up at
+    /// start and again periodically; a failed lookup keeps the peers the
+    /// last one found.
+    pub bootstrap_domains: Vec<String>,
+
+    /// Resolver the bootstrap domains are looked up with. `None` reads the
+    /// host system's DNS configuration.
+    pub dns_resolver: Option<DnsResolver>,
+
     /// Whether to ask the local router for a port mapping.
     pub port_mapping: bool,
 
@@ -125,6 +136,8 @@ impl IrohConfig {
             relay_address_discovery: true,
             external_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
+            bootstrap_domains: Vec::new(),
+            dns_resolver: None,
             port_mapping: true,
             path_idle_timeout: PATH_IDLE_TIMEOUT,
             path_keep_alive: PATH_KEEP_ALIVE,
