@@ -339,10 +339,10 @@ mod tests {
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeader,
-        BlockHeaderParts, BlockHeight, Epoch, Hash, Inclusion, LeafRoot, MerkleInclusionProof,
-        NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Round, SectionRoots, ShardAnchor,
-        SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TopologySnapshot,
-        ValidatorSet, WitnessSources,
+        BlockHeaderParts, BlockHeight, Epoch, EpochWindows, Hash, Inclusion, LeafRoot,
+        MerkleInclusionProof, NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Round,
+        SectionRoots, ShardAnchor, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
+        SubstateKey, TopologySnapshot, ValidatorSet, WitnessSources,
     };
 
     use super::*;
@@ -472,7 +472,11 @@ mod tests {
                 ),
             )
         };
-        let mut schedule = TopologySchedule::new(1_000_000, Epoch::GENESIS, snapshot(None));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000_000),
+            Epoch::GENESIS,
+            snapshot(None),
+        );
         for (at, boundary) in boundaries.iter().enumerate() {
             schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
         }

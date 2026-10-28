@@ -1598,7 +1598,7 @@ mod tests {
         let (state, claims, record, credit) = returning_at_a_boundary();
         let producing = ShardId::leaf(1, 0);
         let (left, right) = producing.children();
-        let windows = EpochWindows::new(0);
+        let windows = EpochWindows::new(0, 0);
         let fresh = WeightedTimestamp::ZERO.plus(RETENTION_HORIZON);
         let credited = |cells: &BTreeMap<SubstateKey, Option<Vec<u8>>>| {
             cells
@@ -1791,7 +1791,7 @@ mod tests {
     ) -> (BTreeMap<SubstateKey, Option<Vec<u8>>>, CreditBurns) {
         use hyperscale_types::EpochWindows;
 
-        let windows = EpochWindows::new(0);
+        let windows = EpochWindows::new(0, 0);
         let frontier = FrontierInputs::of_block(block, windows);
         let settled = settled_block_at(
             block.certificates(),
@@ -1825,7 +1825,7 @@ mod tests {
             state,
             block,
             &[],
-            &FrontierInputs::of_block(block, EpochWindows::new(0)),
+            &FrontierInputs::of_block(block, EpochWindows::new(0, 0)),
             &shard_prefix_path(half),
         )
         .cells()

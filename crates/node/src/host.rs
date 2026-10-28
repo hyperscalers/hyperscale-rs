@@ -859,18 +859,13 @@ fn build_shard_io<S: ShardStorage>(
                     terminal: header.settled_txs_root().is_some(),
                 }
             });
-        // The chain's epoch duration, read from the projected
-        // schedule (sourced from the folded `BeaconState`'s chain
-        // config) — never from node-local configuration, which
-        // could silently diverge from the chain the beacon fold
-        // actually runs.
-        let epoch_duration_ms = replica.schedule().epoch_duration_ms();
+        // The chain's epoch grid, read from the projected schedule
+        // (sourced from the folded `BeaconState`'s chain config) —
+        // never from node-local configuration, which could silently
+        // diverge from the chain the beacon fold actually runs.
+        let windows = replica.schedule().windows();
         let pins = Arc::clone(&boundary_pins);
-        block_commit.set_boundary_trigger(
-            epoch_duration_ms,
-            Arc::new(move |height| pins.pin(height)),
-            seed,
-        );
+        block_commit.set_boundary_trigger(windows, Arc::new(move |height| pins.pin(height)), seed);
     }
     let handles = ShardDispatchHandles {
         storage: Arc::clone(&storage),

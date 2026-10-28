@@ -187,10 +187,10 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Block, BlockHash,
-        BlockHeight, CertifiedBeaconBlock, ChainOrigin, Epoch, LocalTimestamp, NetworkDefinition,
-        PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RatifyCert, RatifyRound, Round,
-        ShardId, SignerBitfield, SpcCert, SpcView, StateRoot, TopologySchedule, ValidatorId,
-        Verifiable, beacon_reveal_sign,
+        BlockHeight, CertifiedBeaconBlock, ChainOrigin, Epoch, EpochWindows, LocalTimestamp,
+        NetworkDefinition, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RatifyCert,
+        RatifyRound, Round, ShardId, SignerBitfield, SpcCert, SpcView, StateRoot, TopologySchedule,
+        ValidatorId, Verifiable, beacon_reveal_sign,
     };
 
     use super::*;
@@ -563,7 +563,7 @@ mod tests {
         let node = child_replica_over(1000, merged_with_terminal_record);
         let anchor = in_window(&node, 1000);
         let evicted = TopologySchedule::new(
-            epoch_ms(&node),
+            EpochWindows::new(0, epoch_ms(&node)),
             Epoch::new(1001),
             Arc::clone(node.node.schedule.head()),
         );
@@ -742,8 +742,16 @@ mod tests {
                 .collect(),
             ),
         );
-        let mut before = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
-        let mut after = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
+        let mut before = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&halted),
+        );
+        let mut after = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&halted),
+        );
         for epoch in 1..=110 {
             before.insert(Epoch::new(epoch), Arc::clone(&halted));
             let seated = if epoch < 101 { &halted } else { &fresh };

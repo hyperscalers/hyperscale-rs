@@ -66,7 +66,7 @@ pub fn resumed_schedule<B: Borrow<BeaconState>>(
     // reinstate the head so the latest epoch shares its handle.
     let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
     let mut schedule = TopologySchedule::new(
-        latest.chain_config.epoch_duration_ms,
+        latest.chain_config.epoch_windows(),
         latest_epoch,
         Arc::clone(&head),
     );

@@ -776,7 +776,7 @@ impl BeaconFold {
             .on_verified_source_header(Arc::clone(certified_header));
         self.shard_source.observe_crossing(
             certified_header.header().shard_id(),
-            self.state.chain_config.epoch_duration_ms,
+            self.state.chain_config.epoch_windows(),
         );
     }
 

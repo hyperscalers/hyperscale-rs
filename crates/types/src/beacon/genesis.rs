@@ -148,7 +148,7 @@ impl BeaconChainConfig {
     /// performs.
     #[must_use]
     pub const fn epoch_windows(&self) -> EpochWindows {
-        EpochWindows::new(self.epoch_duration_ms)
+        EpochWindows::new(self.genesis_timestamp_ms, self.epoch_duration_ms)
     }
 
     /// Epochs between committee-rotation events — the trickle shuffle's

@@ -4458,7 +4458,11 @@ mod tests {
                 ),
             )
         };
-        let mut schedule = TopologySchedule::new(1_000_000, Epoch::GENESIS, snapshot(None));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000_000),
+            Epoch::GENESIS,
+            snapshot(None),
+        );
         for (at, boundary) in boundaries.iter().enumerate() {
             schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
         }
@@ -4546,7 +4550,7 @@ mod tests {
             anchors.record(fresh);
             assert!(
                 counterparts
-                    .probe(&trie, now, &[], EpochWindows::new(0))
+                    .probe(&trie, now, &[], EpochWindows::new(0, 0))
                     .is_empty(),
                 "an answer asks nothing at a fresh header",
             );
@@ -4702,7 +4706,7 @@ mod tests {
             state_root: StateRoot::from_raw(Hash::ZERO),
             ts: end,
         });
-        let asked = producer.probe(&trie, end, &[], EpochWindows::new(0));
+        let asked = producer.probe(&trie, end, &[], EpochWindows::new(0, 0));
         assert!(
             asked_at(&asked)
                 .iter()
@@ -5577,7 +5581,7 @@ mod tests {
                 )
                 .with_boundaries(records.into_iter().collect()),
             );
-            TopologySchedule::new(1_000_000, Epoch::GENESIS, snapshot)
+            TopologySchedule::new(EpochWindows::new(0, 1_000_000), Epoch::GENESIS, snapshot)
         };
 
         let (terminal, _) = boundary_of(90, 300_000, &[], &[]);
@@ -6423,7 +6427,7 @@ mod tests {
     #[test]
     fn a_recovered_producers_owed_record_is_not_kept_under_its_standing_taken() {
         const EPOCH_MS: u64 = 300_000;
-        let windows = EpochWindows::new(EPOCH_MS);
+        let windows = EpochWindows::new(0, EPOCH_MS);
         let deadline = Deadline::of(WeightedTimestamp::from_millis(EPOCH_MS + 36_000));
         let record = record_of(0, deadline);
         let id = producer_crossing(0, deadline);
@@ -6756,7 +6760,7 @@ mod tests {
                 ReadFrontier::default(),
             );
             counterparts.derive_asks(&trie);
-            let asked = counterparts.probe(&trie, now, &[], EpochWindows::new(0));
+            let asked = counterparts.probe(&trie, now, &[], EpochWindows::new(0, 0));
             assert!(
                 asked.is_empty(),
                 "nothing is fetched of this shard's own state"
@@ -6816,7 +6820,7 @@ mod tests {
             counterparts.derive_asks(&trie);
             assert!(
                 counterparts
-                    .probe(&trie, deadline.at(), &[], EpochWindows::new(0))
+                    .probe(&trie, deadline.at(), &[], EpochWindows::new(0, 0))
                     .is_empty(),
                 "nothing is fetched of this shard's own state",
             );
@@ -7571,7 +7575,7 @@ mod tests {
         assert!(named(&consumer).is_empty(), "each rides as an arrival");
 
         let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
-        let _ = consumer.probe(&trie, now, &[], EpochWindows::new(0));
+        let _ = consumer.probe(&trie, now, &[], EpochWindows::new(0, 0));
         consumer.cap_held_unsolicited();
         assert_eq!(
             offered_keys(&consumer),
@@ -7793,7 +7797,7 @@ mod tests {
             record,
             ..
         } = answering();
-        let windows = EpochWindows::new(0);
+        let windows = EpochWindows::new(0, 0);
         let beside = producer_record(0x77);
         let held = holding_the_record(3, record, &[beside], &[]);
         let alone = holding_the_record(4, record, &[], &[]);
@@ -7843,7 +7847,7 @@ mod tests {
             record,
             ..
         } = answering();
-        let windows = EpochWindows::new(0);
+        let windows = EpochWindows::new(0, 0);
         let question = SeatQuestion {
             shard: PRODUCER,
             waiting: TxHash::from(Hash::from_bytes(&[2; 32])),
@@ -7897,7 +7901,7 @@ mod tests {
             record,
             ..
         } = answering();
-        let windows = EpochWindows::new(0);
+        let windows = EpochWindows::new(0, 0);
         let beside = producer_record(0x77);
         let bare = proven_claim(PRODUCER, 3, &[beside], &[record, beside]);
         let mixed = holding_the_record(3, record, &[beside], &[]);
@@ -8406,7 +8410,7 @@ mod tests {
 
     /// A grid of ten-second epochs, on which the anchors below are
     /// marked: ten heights to an epoch.
-    const GRID: EpochWindows = EpochWindows::new(10_000);
+    const GRID: EpochWindows = EpochWindows::new(0, 10_000);
 
     /// A second sibling of the consumer's rows.
     const OTHER: ShardId = ShardId::leaf(2, 3);

@@ -5138,7 +5138,7 @@ mod tests {
             },
         );
         TopologySchedule::new(
-            1_000,
+            EpochWindows::new(0, 1_000),
             Epoch::GENESIS,
             Arc::new(
                 TopologySnapshot::new(
@@ -5598,7 +5598,11 @@ mod tests {
 
         // Second-long windows, with only epoch 0 recorded: a tick anchored
         // at 5000ms falls in epoch 5, which the schedule cannot answer for.
-        let unresolvable = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        let unresolvable = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&snapshot),
+        );
         let mut resolved = unresolvable.clone();
         resolved.insert(Epoch::new(5), Arc::clone(&snapshot));
 
@@ -7405,7 +7409,11 @@ mod tests {
         } else {
             plain
         });
-        let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(19), Arc::clone(&snapshot));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, epoch_ms),
+            Epoch::new(19),
+            Arc::clone(&snapshot),
+        );
         for epoch in 20..=21 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
         }
@@ -8372,7 +8380,8 @@ mod tests {
         let (snap_b, keys_b) = committee_snapshot(&[4, 5, 6, 7]);
         assert_ne!(keys_a, keys_b, "committees must have distinct keys");
 
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::new(snap_a));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
         let mut coord = make_test_state();
@@ -8414,7 +8423,8 @@ mod tests {
         let (snap_a, _keys_a) = committee_snapshot(&[0, 1, 2, 3]);
         let (snap_b, _keys_b) = committee_snapshot(&[4, 5, 6, 7]);
         let committee_b: Vec<ValidatorId> = snap_b.committee_for_shard(shard).to_vec();
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::new(snap_a));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
         // Local node is a committee-B member; commit a local-only tick anchored
@@ -8550,7 +8560,7 @@ mod tests {
         // Schedule head is epoch 0; an EC anchored in epoch 5 is ahead of this
         // node's beacon and can't resolve yet.
         let behind = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(0),
             Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
         );
@@ -8588,7 +8598,7 @@ mod tests {
         let shard = ShardId::ROOT;
 
         let behind = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(0),
             Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
         );
@@ -8839,7 +8849,8 @@ mod tests {
                 .clone()
                 .with_pending_recoveries(recoveries),
         );
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(2), snap(&old));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(2), snap(&old));
         schedule.insert(Epoch::new(21), Arc::clone(&fresh_snap));
         schedule.set_head(fresh_snap);
         (schedule, old, fresh)
@@ -9069,7 +9080,7 @@ mod tests {
         use crate::ticks::VOTE_RETRY_TIMEOUT;
         // One-second windows retained from epoch 5 on.
         let head = Arc::clone(make_test_topology().head());
-        let schedule = TopologySchedule::new(1_000, Epoch::new(5), head);
+        let schedule = TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(5), head);
         let mut state = make_test_state();
         state.committed_ts = WeightedTimestamp::from_millis(5_500);
         let ahead = TickId::new(ShardId::ROOT, BlockHeight::new(2));
@@ -9533,7 +9544,11 @@ mod tests {
                 },
             )])),
         );
-        let mut sched = TopologySchedule::new(epoch_duration_ms, Epoch::new(0), final_window);
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, epoch_duration_ms),
+            Epoch::new(0),
+            final_window,
+        );
         sched.insert(Epoch::new(1), post_split);
         sched
     }
@@ -9694,7 +9709,11 @@ mod tests {
             2,
             ValidatorSet::new(validators),
         ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&one_shard));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(0),
+            Arc::clone(&one_shard),
+        );
         sched.set_head(two_shards);
 
         let block_at = |height: u64, anchor_ms: u64| {
@@ -9754,7 +9773,11 @@ mod tests {
             2,
             ValidatorSet::new(validators),
         ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&pre_split));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(0),
+            Arc::clone(&pre_split),
+        );
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
@@ -9811,7 +9834,8 @@ mod tests {
         };
         // One window, two snapshots of it: what the block's committee
         // carried, and what a node further along the fold holds.
-        let mut sched = TopologySchedule::new(ED, Epoch::GENESIS, seeded(0xA1));
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::GENESIS, seeded(0xA1));
         sched.set_head(seeded(0xB2));
 
         let block = make_live_block(
@@ -9841,7 +9865,7 @@ mod tests {
         // that nobody projected would have answered with.
         assert_eq!(
             env.windows,
-            EpochWindows::new(ED),
+            EpochWindows::new(0, ED),
             "the tick resolves its clock on the chain's epoch grid",
         );
     }
@@ -12164,7 +12188,7 @@ mod tests {
     fn home_terminating_schedule(epoch_duration_ms: u64) -> TopologySchedule {
         let (left, right) = HOME.children();
         let mut sched = TopologySchedule::new(
-            epoch_duration_ms,
+            EpochWindows::new(0, epoch_duration_ms),
             Epoch::new(0),
             leaves_snap(&[HOME, PEER], &[(HOME, 0)]),
         );
@@ -13755,7 +13779,7 @@ mod tests {
             record_asks(
                 &state
                     .counterparts
-                    .probe(&trie, before, &wanted, EpochWindows::new(0)),
+                    .probe(&trie, before, &wanted, EpochWindows::new(0, 0)),
                 record_key
             )
             .is_empty(),
@@ -13768,7 +13792,7 @@ mod tests {
             record_asks(
                 &state
                     .counterparts
-                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
                 record_key
             ),
             vec![first],
@@ -13778,7 +13802,7 @@ mod tests {
             record_asks(
                 &state
                     .counterparts
-                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
                 record_key
             )
             .is_empty(),
@@ -13792,7 +13816,7 @@ mod tests {
             record_asks(
                 &state
                     .counterparts
-                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
                 record_key
             )
             .is_empty(),
@@ -13804,7 +13828,7 @@ mod tests {
             record_asks(
                 &state
                     .counterparts
-                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
                 record_key
             ),
             vec![third],
@@ -13821,7 +13845,7 @@ mod tests {
             record_asks(
                 &state
                     .counterparts
-                    .probe(&trie, armed, &wanted, EpochWindows::new(0)),
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
                 record_key
             )
             .is_empty(),
@@ -13932,7 +13956,7 @@ mod tests {
                 record_asks(
                     &state
                         .counterparts
-                        .probe(&trie, now, &wanted, EpochWindows::new(0)),
+                        .probe(&trie, now, &wanted, EpochWindows::new(0, 0)),
                     record_key
                 )
                 .is_empty(),
@@ -14773,7 +14797,7 @@ mod tests {
     ) -> TopologySchedule {
         let (left, right) = PEER.children();
         let mut sched = TopologySchedule::new(
-            epoch_duration_ms,
+            EpochWindows::new(0, epoch_duration_ms),
             Epoch::new(0),
             leaves_snap(&[HOME, PEER], &[(PEER, 0)]),
         );
@@ -14794,7 +14818,7 @@ mod tests {
     ) -> (ExecutionCoordinator, TopologySchedule) {
         let (left, right) = PEER.children();
         let mut sched = TopologySchedule::new(
-            1_000,
+            EpochWindows::new(0, 1_000),
             Epoch::new(0),
             leaves_snap(&[HOME, PEER], &[(PEER, 0)]),
         );
@@ -15026,7 +15050,7 @@ mod tests {
         let (upper_left, upper_right) = UPPER.children();
         let (lower_left, lower_right) = LOWER.children();
         let mut sched = TopologySchedule::new(
-            epoch_duration_ms,
+            EpochWindows::new(0, epoch_duration_ms),
             Epoch::new(0),
             leaves_snap(&[HOME, UPPER, LOWER], &[(UPPER, 0)]),
         );

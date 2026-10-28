@@ -1034,7 +1034,11 @@ pub fn admit_finalization_over(
 ) -> Result<(), String> {
     use hyperscale_types::{Epoch, StateRoot, WindowLookup};
 
-    let schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot.clone()));
+    let schedule = TopologySchedule::new(
+        EpochWindows::new(0, u64::MAX / 2),
+        Epoch::GENESIS,
+        Arc::new(snapshot.clone()),
+    );
     let WindowLookup::Window(window) = schedule.lookup(WeightedTimestamp::ZERO) else {
         panic!("the one window spans every anchor");
     };
@@ -1630,10 +1634,10 @@ pub(crate) mod fixtures {
     use hyperscale_storage::{MemberIndex, MemberRow, RowState, TickRow};
     use hyperscale_types::test_utils::stub_abort_charge;
     use hyperscale_types::{
-        Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch, Finalization,
-        GlobalReceiptHash, Hash, Joins, NetworkDefinition, Owes, Settlement, ShardAnchor, ShardId,
-        StateRoot, TickHalf, TopologySchedule, TopologySnapshot, ValidatorSet, Verifiable,
-        WeightedTimestamp, WindowLookup,
+        Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch, EpochWindows,
+        Finalization, GlobalReceiptHash, Hash, Joins, NetworkDefinition, Owes, Settlement,
+        ShardAnchor, ShardId, StateRoot, TickHalf, TopologySchedule, TopologySnapshot,
+        ValidatorSet, Verifiable, WeightedTimestamp, WindowLookup,
     };
 
     use super::{Committed, QcChainSets};
@@ -1729,8 +1733,11 @@ pub(crate) mod fixtures {
         /// Admission under `snapshot`, whose one window spans every
         /// anchor a test sets.
         pub fn window(snapshot: TopologySnapshot) -> Self {
-            let schedule =
-                TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot.clone()));
+            let schedule = TopologySchedule::new(
+                EpochWindows::new(0, u64::MAX / 2),
+                Epoch::GENESIS,
+                Arc::new(snapshot.clone()),
+            );
             Self::schedule(snapshot, schedule)
         }
 
@@ -1831,8 +1838,11 @@ pub(crate) mod fixtures {
             })
             .collect();
         let after = window(survivors, boundaries);
-        let mut sched =
-            TopologySchedule::new(cut_ms, Epoch::new(0), window(departed, BTreeMap::new()));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, cut_ms),
+            Epoch::new(0),
+            window(departed, BTreeMap::new()),
+        );
         for epoch in 1..=20u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&after));
         }
@@ -1853,10 +1863,11 @@ mod state_claim_tests {
         proven_claim, state_and_proof, state_and_proof_holding, stub_abort_charge, test_key,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, GlobalReceiptHash, Hash,
-        Inclusion, MerkleInclusionProof, NetworkDefinition, Owes, RETENTION_HORIZON,
-        RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, StateClaim, Stated, SubstateKey,
-        TopologySchedule, TopologySnapshot, TxHash, ValidatorSet, WeightedTimestamp, verdict_leaf,
+        Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, EpochWindows,
+        GlobalReceiptHash, Hash, Inclusion, MerkleInclusionProof, NetworkDefinition, Owes,
+        RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, StateClaim,
+        Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash, ValidatorSet,
+        WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2395,7 +2406,11 @@ mod state_claim_tests {
                 },
             )]));
         }
-        let mut schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::GENESIS,
+            Arc::new(snapshot.clone()),
+        );
         for epoch in 1..=400 {
             schedule.insert(Epoch::new(epoch), Arc::new(snapshot.clone()));
         }
@@ -2510,7 +2525,11 @@ mod state_claim_tests {
             )
         };
         let (earlier, later) = (window(0), window(LATER_LIFE));
-        let mut schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::clone(&earlier));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::GENESIS,
+            Arc::clone(&earlier),
+        );
         for epoch in 1..=20 {
             let snapshot = if epoch < LATER_LIFE { &earlier } else { &later };
             schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));

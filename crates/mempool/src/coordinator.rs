@@ -1566,7 +1566,7 @@ mod tests {
         test_transaction_with_prefixes, test_validity_range,
     };
     use hyperscale_types::{
-        Address, AddressClass, AnswerDelta, Epoch, Hash, MAX_BLOCK_COMPUTE,
+        Address, AddressClass, AnswerDelta, Epoch, EpochWindows, Hash, MAX_BLOCK_COMPUTE,
         MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, PrincipalAddr, RoutePrefix,
         StandingAnswers, StandingToward, TickLine, TopologySchedule, TxsInFlight, Verified,
         WeightedTimestamp, WitnessSources,
@@ -3857,7 +3857,7 @@ mod tests {
 
         let ending = |shard: ShardId| {
             TopologySchedule::new(
-                1_000,
+                EpochWindows::new(0, 1_000),
                 Epoch::new(5),
                 Arc::new(
                     topology
@@ -3868,7 +3868,7 @@ mod tests {
         };
         let draining = |shard: ShardId| {
             TopologySchedule::new(
-                1_000,
+                EpochWindows::new(0, 1_000),
                 Epoch::new(5),
                 Arc::new(
                     topology

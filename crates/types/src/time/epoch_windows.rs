@@ -20,7 +20,7 @@
 use std::ops::Range;
 
 use super::timestamp::WeightedTimestamp;
-use crate::{Epoch, TERMINAL_EVIDENCE_EPOCHS};
+use crate::{Epoch, RETENTION_HORIZON, TERMINAL_EVIDENCE_EPOCHS};
 
 /// The chain's epoch-window grid: weighted time partitioned into fixed
 /// `epoch_duration_ms` windows, one per [`Epoch`].
@@ -29,14 +29,25 @@ use crate::{Epoch, TERMINAL_EVIDENCE_EPOCHS};
 /// timestamp folds to [`Epoch::GENESIS`] and no boundary crossing exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochWindows {
+    origin_ms: u64,
     epoch_duration_ms: u64,
 }
 
 impl EpochWindows {
-    /// Build a grid with the given window length in milliseconds.
+    /// Build a grid whose genesis window opens at `origin_ms` and whose
+    /// windows are `epoch_duration_ms` long.
     #[must_use]
-    pub const fn new(epoch_duration_ms: u64) -> Self {
-        Self { epoch_duration_ms }
+    pub const fn new(origin_ms: u64, epoch_duration_ms: u64) -> Self {
+        Self {
+            origin_ms,
+            epoch_duration_ms,
+        }
+    }
+
+    /// The instant the genesis window opens.
+    #[must_use]
+    pub const fn origin(self) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(self.origin_ms)
     }
 
     /// Window length in milliseconds. Zero means a single fixed window.
@@ -67,6 +78,16 @@ impl EpochWindows {
             .saturating_add(1)
             .saturating_mul(self.epoch_duration_ms);
         WeightedTimestamp::from_millis(start)..WeightedTimestamp::from_millis(end)
+    }
+
+    /// A terminating leaf's settled-transaction window floor: the opening
+    /// of the epoch its reshape was admitted, backed off by
+    /// [`RETENTION_HORIZON`] to cover a tick that finalized against the
+    /// fence just after it armed but executed up to a full tick lifetime
+    /// earlier.
+    #[must_use]
+    pub fn settled_window_floor(self, admitted: Epoch) -> WeightedTimestamp {
+        self.window_of(admitted).start.minus(RETENTION_HORIZON)
     }
 
     /// The instant terminal evidence anchored at `anchor` stops being
@@ -189,7 +210,7 @@ mod tests {
 
     #[test]
     fn epoch_for_floors_and_owns_the_boundary_instant() {
-        let w = EpochWindows::new(DUR);
+        let w = EpochWindows::new(0, DUR);
         assert_eq!(w.epoch_for(wt(0)), Epoch::GENESIS);
         assert_eq!(w.epoch_for(wt(999)), Epoch::GENESIS);
         // The boundary instant belongs to the later window.
@@ -199,7 +220,7 @@ mod tests {
 
     #[test]
     fn window_of_brackets_the_epoch() {
-        let w = EpochWindows::new(DUR);
+        let w = EpochWindows::new(0, DUR);
         let g = w.window_of(Epoch::GENESIS);
         assert_eq!(g.start, wt(0));
         assert_eq!(g.end, wt(1_000));
@@ -213,7 +234,7 @@ mod tests {
 
     #[test]
     fn boundary_below_is_strictly_below() {
-        let w = EpochWindows::new(DUR);
+        let w = EpochWindows::new(0, DUR);
         assert_eq!(w.boundary_below(wt(0)), None);
         // Inside the genesis window there is no boundary below.
         assert_eq!(w.boundary_below(wt(999)), None);
@@ -241,7 +262,7 @@ mod tests {
 
     #[test]
     fn crossing_is_strict_at_the_boundary_instant() {
-        let w = EpochWindows::new(DUR);
+        let w = EpochWindows::new(0, DUR);
         // The footgun: a block sitting exactly on the boundary with its parent
         // inside the prior window has NOT crossed. A naive `epoch_for(parent)
         // != epoch_for(qc)` test would diverge here (0 != 1 → crossing), so it
@@ -261,7 +282,7 @@ mod tests {
 
     #[test]
     fn zero_duration_folds_to_genesis_with_no_boundaries() {
-        let w = EpochWindows::new(0);
+        let w = EpochWindows::new(0, 0);
         assert_eq!(w.epoch_for(wt(123_456)), Epoch::GENESIS);
         assert_eq!(w.boundary_below(wt(123_456)), None);
         assert!(!w.is_crossing(wt(0), wt(123_456)));

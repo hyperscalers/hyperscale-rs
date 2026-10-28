@@ -42,8 +42,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    EpochWindows, NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness, SeedRing,
-    SettledTxsRoot, ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
+    EpochWindows, NetworkDefinition, QuorumCertificate, Randomness, SeedRing, SettledTxsRoot,
+    ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
     WeightedTimestamp,
 };
 
@@ -2175,24 +2175,16 @@ impl BeaconState {
     }
 
     /// Each terminating leaf's settled-transaction window floor as state stands
-    /// right now: the start of the epoch its reshape was admitted (split)
-    /// or paired (merge), backed off by [`RETENTION_HORIZON`] to cover a
-    /// tick that finalized against the fence just after it armed but
-    /// executed up to a full tick lifetime earlier. Sourced from
+    /// right now: [`EpochWindows::settled_window_floor`] of the epoch its
+    /// reshape was admitted (split) or paired (merge). Sourced from
     /// `pending_reshapes` while the record lives and from the boundary
     /// stamp once the reshape executes (the coast). The value the next
     /// promotion freezes into [`FrozenWindow::settled_window_floors`], and what
     /// the lookahead snapshot projects.
     #[must_use]
     pub fn live_settled_window_floors(&self) -> BTreeMap<ShardId, WeightedTimestamp> {
-        let floor = |admitted: Epoch| {
-            WeightedTimestamp::from_millis(
-                admitted
-                    .inner()
-                    .saturating_mul(self.chain_config.epoch_duration_ms)
-                    .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
-            )
-        };
+        let windows = self.chain_config.epoch_windows();
+        let floor = |admitted: Epoch| windows.settled_window_floor(admitted);
         let mut floors: BTreeMap<ShardId, WeightedTimestamp> = self
             .boundaries
             .iter()

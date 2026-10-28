@@ -146,7 +146,7 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, BlockHeight, Epoch, GlobalReceiptRoot, NetworkDefinition,
+        AggregateSignature, BlockHeight, Epoch, EpochWindows, GlobalReceiptRoot, NetworkDefinition,
         RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, Signer, SignerBitfield, TickId,
         TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
@@ -212,7 +212,8 @@ mod tests {
             }
             Arc::new(snapshot)
         };
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(2), snap(&old));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(2), snap(&old));
         schedule.insert(Epoch::new(21), snap(&fresh));
         schedule.set_head(snap(&fresh));
         let keys_of = |committee: &[ValidatorId]| -> Vec<ConsensusPublicKey> {

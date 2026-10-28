@@ -221,7 +221,7 @@ fn rows_of(sim: &ExecutionSim) -> MemberIndex {
                     records: block.abandonment_records(),
                     claims: block.state_claims(),
                 },
-                EpochWindows::new(0),
+                EpochWindows::new(0, 0),
                 terms,
             )
         });

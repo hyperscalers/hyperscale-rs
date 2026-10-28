@@ -2119,7 +2119,7 @@ fn block_reading(height: u64, producer: ShardId, read_at: u64) -> (Block, Fronti
         make_test_block(BlockHeight::new(height)),
         vec![proven_claim(producer, read_at, &[], &[asked]).naming([(asked, id)])],
     );
-    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(0, FRONTIER_WINDOW_MS));
     (block, inputs)
 }
 
@@ -2357,7 +2357,7 @@ impl Settling {
             make_test_block_with_anchor_wt(BlockHeight::new(height), Self::BLOCK_ANCHOR_MS),
             vec![boundary, retiring],
         );
-        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(0, FRONTIER_WINDOW_MS));
         (block, inputs)
     }
 }
@@ -3276,7 +3276,7 @@ impl Owed {
             presences: vec![Reading {
                 key: self.record(),
                 shard: anchor.shard,
-                mark: ReadMark::of(&anchor, EpochWindows::new(FRONTIER_WINDOW_MS)),
+                mark: ReadMark::of(&anchor, EpochWindows::new(0, FRONTIER_WINDOW_MS)),
             }],
             absences: Vec::new(),
             deletions: Vec::new(),
@@ -3298,7 +3298,7 @@ fn owed_block(
         |writes| push_certificate(make_test_block(height), settling(height, writes)),
     );
     let block = with_state_claims(base, claims);
-    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(0, FRONTIER_WINDOW_MS));
     (block, inputs)
 }
 
@@ -3513,7 +3513,7 @@ pub fn test_receipt_credits_past_u128_land_one_root_on_every_path<S>(
     let two = push_certificate(two, settling(BlockHeight::new(2), credit(6)));
     let (next, _) = owed_block(3, Vec::new(), Some(credit(6)));
     for block in [seeding, two, next] {
-        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(0, FRONTIER_WINDOW_MS));
         let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
         assert_eq!(committed, prepared);
         let whole_root = whole.follow_block_writes(&block, &[], &inputs).unwrap();
@@ -3937,7 +3937,7 @@ pub fn test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary<S>(
         make_test_block_with_anchor_wt(BlockHeight::new(4), past.as_millis()),
         vec![boundary, exited],
     );
-    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(0, FRONTIER_WINDOW_MS));
     assert!(inputs.marks.is_empty(), "a boundary claim raises nothing");
     follow(&(block, inputs));
     assert!(
@@ -6615,7 +6615,7 @@ pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore 
         "the tree's leaf holds the hash a reader derives from its own row",
     );
 
-    let windows = EpochWindows::new(FRONTIER_WINDOW_MS);
+    let windows = EpochWindows::new(0, FRONTIER_WINDOW_MS);
     let mut rows = MemberIndex::empty(reader);
     rows.advance(&running(reader, writer));
     rows.advance(&settling(reader, 2, TickHalf::Stated));
@@ -6793,7 +6793,7 @@ pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + Tree
         verdict_claim_at(storage, writer, tx, &keys, height, state_root)
     };
 
-    let windows = EpochWindows::new(FRONTIER_WINDOW_MS);
+    let windows = EpochWindows::new(0, FRONTIER_WINDOW_MS);
     let mut rows = MemberIndex::empty(reader);
     rows.advance(&core_run_at_one(reader, writer, tx, deadline));
     rows.advance(&core_settled_of_one(reader, 2, TickHalf::Stated, tx));

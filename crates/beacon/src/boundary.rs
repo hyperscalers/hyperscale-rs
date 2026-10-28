@@ -570,7 +570,7 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconChainConfig, BeaconWitnessLeafCount, BlockHeaderParts,
-        BlockHeight, BlockVote, CertifiedBlockHeader, Epoch, Hash, ProposerTimestamp,
+        BlockHeight, BlockVote, CertifiedBlockHeader, Epoch, EpochWindows, Hash, ProposerTimestamp,
         RecoveryBinding, RecoveryCause, Round, SettledTxsRoot, ShardBoundary, ShardRecovery,
         SignerBitfield, VrfProof, WeightedTimestamp,
     };
@@ -691,7 +691,7 @@ mod tests {
         let mut tracker = ShardSourceTracker::new();
         for header in headers {
             tracker.on_verified_source_header(held(header));
-            tracker.observe_crossing(SHARD, ED);
+            tracker.observe_crossing(SHARD, EpochWindows::new(0, ED));
         }
         tracker
     }
@@ -714,7 +714,11 @@ mod tests {
     /// `committee` for its first two epochs.
     fn live_shard(committee: &TestCommittee) -> (BeaconState, TopologySchedule) {
         let snapshot = Arc::new(committee.topology_snapshot(1));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(1),
+            Arc::clone(&snapshot),
+        );
         schedule.insert(Epoch::new(0), snapshot);
         let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
@@ -777,7 +781,7 @@ mod tests {
         let committee_a = TestCommittee::new(4, 1);
         let committee_b = TestCommittee::new(4, 2);
         let mut schedule = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(2),
             Arc::new(committee_b.topology_snapshot(1)),
         );
@@ -834,7 +838,7 @@ mod tests {
         let committee_a = TestCommittee::new(4, 1);
         let committee_b = TestCommittee::new(4, 2);
         let mut schedule = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(2),
             Arc::new(committee_b.topology_snapshot(1)),
         );
@@ -1035,7 +1039,11 @@ mod tests {
     fn a_boundary_qc_dated_past_its_committed_certificate_is_inadmissible() {
         let committee = TestCommittee::new(4, 1);
         let snapshot = Arc::new(committee.topology_snapshot(1));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(1),
+            Arc::clone(&snapshot),
+        );
         schedule.insert(Epoch::new(0), snapshot);
         let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
@@ -1077,7 +1085,7 @@ mod tests {
         shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(child, child_qc),
         )));
-        shard_source.observe_crossing(SHARD, ED);
+        shard_source.observe_crossing(SHARD, EpochWindows::new(0, ED));
         assert!(shard_source.commit_established(SHARD, &block));
         assert!(
             shard_source.latest_crossing(SHARD).is_none(),
@@ -1223,10 +1231,10 @@ mod tests {
         let mut followed_the_chain = following(&[&boundary, &kept, &above]);
         for header in [&kept, &above] {
             handed_the_orphan.on_verified_source_header(held(header));
-            handed_the_orphan.observe_crossing(SHARD, ED);
+            handed_the_orphan.observe_crossing(SHARD, EpochWindows::new(0, ED));
         }
         followed_the_chain.on_verified_source_header(held(&orphan));
-        followed_the_chain.observe_crossing(SHARD, ED);
+        followed_the_chain.observe_crossing(SHARD, EpochWindows::new(0, ED));
         for tracker in [&handed_the_orphan, &followed_the_chain] {
             assert!(admits(tracker, &state, &schedule, &committed_qc));
             assert!(!admits(tracker, &state, &schedule, &orphaned_qc));
@@ -1266,7 +1274,7 @@ mod tests {
         assert!(tracker.latest_crossing(SHARD).is_none());
 
         tracker.on_verified_source_header(held(&kept));
-        tracker.observe_crossing(SHARD, ED);
+        tracker.observe_crossing(SHARD, EpochWindows::new(0, ED));
         assert!(admits(&tracker, &state, &schedule, &committed_qc));
         assert!(!admits(&tracker, &state, &schedule, &orphaned_qc));
     }
@@ -1511,7 +1519,8 @@ mod tests {
                 .with_recoveries(iter::once((SHARD, bindings)).collect())
                 .with_pending_recoveries(pending.into_iter().map(|r| (SHARD, r)).collect()),
         );
-        let mut schedule = TopologySchedule::new(ED, head_epoch, Arc::clone(&head));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), head_epoch, Arc::clone(&head));
         for (committee, windows) in eras {
             let snapshot = Arc::new(committee.topology_snapshot(1));
             for epoch in windows.clone() {

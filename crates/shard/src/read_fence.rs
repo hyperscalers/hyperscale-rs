@@ -132,7 +132,7 @@ mod tests {
     }
 
     fn offered() -> Offered {
-        let windows = EpochWindows::new(1_000_000);
+        let windows = EpochWindows::new(0, 1_000_000);
         let producer = ShardId::leaf(1, 1);
         let id = CrossingId {
             producer: Address::new([0xAA; 31], AddressClass::Component),
@@ -181,7 +181,7 @@ mod tests {
         let kept = drop_refused(
             vec![offered.claim.clone()],
             &offered.fence,
-            EpochWindows::new(1_000_000),
+            EpochWindows::new(0, 1_000_000),
             &ReadFrontier::default(),
         );
         assert_eq!(kept.refused, 0);
@@ -203,7 +203,7 @@ mod tests {
         let dropped = drop_refused(
             vec![offered.claim],
             &offered.fence,
-            EpochWindows::new(1_000_000),
+            EpochWindows::new(0, 1_000_000),
             &raised,
         );
         assert_eq!(dropped.refused, 1, "the presence");
@@ -306,7 +306,7 @@ mod tests {
                 0..8,
             ),
         ) {
-            let windows = EpochWindows::new(DRAWN_WINDOW_MS);
+            let windows = EpochWindows::new(0, DRAWN_WINDOW_MS);
             let claims: Vec<StateClaim> = drawn.into_iter().map(drawn_claim).collect();
             let fence = read_fence(&claims, windows);
             let fresh = WeightedTimestamp::from_millis(3 * DRAWN_WINDOW_MS);

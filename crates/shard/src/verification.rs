@@ -2179,7 +2179,7 @@ mod tests {
         make_settling_finalization, test_transaction,
     };
     use hyperscale_types::{
-        AggregateSignature, DeclaredWork, ReadFence, TransactionDecision, Verifiable,
+        AggregateSignature, DeclaredWork, EpochWindows, ReadFence, TransactionDecision, Verifiable,
         WitnessSources,
     };
 
@@ -2246,7 +2246,11 @@ mod tests {
     /// never reach a per-ancestor committee resolution (the walk stops at
     /// the missing parent), so the grid contents are immaterial.
     fn dummy_schedule(snapshot: &TopologySnapshot) -> TopologySchedule {
-        TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()))
+        TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::GENESIS,
+            Arc::new(snapshot.clone()),
+        )
     }
 
     /// A header stating `substate_bytes` as the total behind its parent —

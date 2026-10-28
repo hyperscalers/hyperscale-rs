@@ -171,7 +171,7 @@ fn the_half_execution_builds_settles_the_rows_its_manifest_folds_to() {
             records: &[],
             claims: &[],
         },
-        EpochWindows::new(0),
+        EpochWindows::new(0, 0),
         Vec::new(),
     ));
     assert_eq!(standing(&after, true), Vec::<TxHash>::new());

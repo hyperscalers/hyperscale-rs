@@ -3226,7 +3226,7 @@ mod tests {
             Action::TopologyChanged {
                 epoch,
                 schedule: Arc::new(TopologySchedule::new(
-                    fix.genesis_state().chain_config.epoch_duration_ms,
+                    fix.genesis_state().chain_config.epoch_windows(),
                     newest.next(),
                     Arc::new(live),
                 )),

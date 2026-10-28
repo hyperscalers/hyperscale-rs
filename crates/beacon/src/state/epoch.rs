@@ -3794,7 +3794,11 @@ mod tests {
         let head = Arc::new(fresh.topology_snapshot(1).with_recoveries(
             std::iter::once((ShardId::ROOT, vec![completed_binding()])).collect(),
         ));
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(11), Arc::clone(&head));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(11),
+            Arc::clone(&head),
+        );
         let old = Arc::new(replaced.topology_snapshot(1));
         for epoch in 0..10 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&old));
@@ -5545,7 +5549,11 @@ mod tests {
         );
 
         let snapshot = Arc::new(state.derive_topology_snapshot(net()));
-        let schedule = TopologySchedule::new(1_000, Epoch::new(2), Arc::clone(&snapshot));
+        let schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(2),
+            Arc::clone(&snapshot),
+        );
         let at_terminal = snapshot
             .boundary(left)
             .expect("the terminal record projects")
@@ -6094,7 +6102,7 @@ mod tests {
             );
         };
         let mut schedule = TopologySchedule::new(
-            EPOCH_MS,
+            EpochWindows::new(0, EPOCH_MS),
             state.current_epoch,
             Arc::new(state.derive_topology_snapshot(net())),
         );

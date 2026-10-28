@@ -259,9 +259,9 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Hash, NetworkDefinition,
-        ShardAnchor, ShardId, Signer, StateRoot, TopologySchedule, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows, Hash,
+        NetworkDefinition, ShardAnchor, ShardId, Signer, StateRoot, TopologySchedule,
+        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
 
     use super::ReshapeView;
@@ -270,7 +270,7 @@ mod tests {
     /// long.
     fn windowed(snapshot: TopologySnapshot, epoch_duration_ms: u64) -> TopologySchedule {
         TopologySchedule::new(
-            epoch_duration_ms,
+            EpochWindows::new(0, epoch_duration_ms),
             Epoch::GENESIS,
             std::sync::Arc::new(snapshot),
         )

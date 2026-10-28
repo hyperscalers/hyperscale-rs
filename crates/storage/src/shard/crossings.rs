@@ -1983,7 +1983,7 @@ mod tests {
     /// nothing and retires the standing record again.
     #[test]
     fn a_recovered_producers_owed_record_is_credited_once() {
-        let windows = EpochWindows::new(EPOCH_MS);
+        let windows = EpochWindows::new(0, EPOCH_MS);
         let id = crossing(0x31);
         let record = id.record_key(&ProtocolHasher);
         let taken = id.answer_key(&ProtocolHasher, Answered::Taken);

@@ -495,8 +495,7 @@ impl ShardSourceTracker {
     /// the crossed epoch and retained past header pruning (bounded by
     /// [`MAX_RETAINED_CROSSINGS_PER_SHARD`]), so the proposer can report
     /// it well after its headers leave the window.
-    pub fn observe_crossing(&mut self, shard: ShardId, epoch_duration_ms: u64) {
-        let windows = EpochWindows::new(epoch_duration_ms);
+    pub fn observe_crossing(&mut self, shard: ShardId, windows: EpochWindows) {
         let found: Vec<(Epoch, ObservedCrossing)> = {
             let Some(headers) = self.shard_headers.get(&shard) else {
                 return;
@@ -889,7 +888,7 @@ mod tests {
     /// Record a verified header and detect any crossing it completes.
     fn note(t: &mut ShardSourceTracker, h: &Arc<Verified<CertifiedBlockHeader>>, dur: u64) {
         t.on_verified_source_header(Arc::clone(h));
-        t.observe_crossing(h.header().shard_id(), dur);
+        t.observe_crossing(h.header().shard_id(), EpochWindows::new(0, dur));
     }
 
     /// `n` distinct deposit payloads — content the chunk helpers can hash

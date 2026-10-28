@@ -570,7 +570,7 @@ mod tests {
     const WINDOW_MS: u64 = 1_000_000;
 
     fn windows() -> EpochWindows {
-        EpochWindows::new(WINDOW_MS)
+        EpochWindows::new(0, WINDOW_MS)
     }
 
     /// A parent state of cells and collection entries, each entry's

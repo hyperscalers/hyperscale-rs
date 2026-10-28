@@ -195,8 +195,11 @@ mod tests {
     /// `None` holds the evidence window open.
     fn peer_terminated_stamped(handoff_complete: Option<Epoch>) -> TopologySchedule {
         let (left, right) = PEER.children();
-        let mut sched =
-            TopologySchedule::new(EPOCH_MS, Epoch::new(0), snap(&[LOCAL, PEER], &[(PEER, 0)]));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, EPOCH_MS),
+            Epoch::new(0),
+            snap(&[LOCAL, PEER], &[(PEER, 0)]),
+        );
         // Retained well past the whole evidence window, so an anchor inside
         // it resolves a window rather than falling off the head.
         let post = snap_departed(&[LOCAL, left, right], &[], &[(PEER, handoff_complete)]);
@@ -231,7 +234,7 @@ mod tests {
 
         let handoff = Epoch::new(2);
         let stamped = peer_terminated_stamped(Some(handoff));
-        let expiry = EpochWindows::new(EPOCH_MS).handoff_evidence_expiry(handoff);
+        let expiry = EpochWindows::new(0, EPOCH_MS).handoff_evidence_expiry(handoff);
         assert_eq!(
             partner_evidence(&stamped, PEER, wt(expiry.as_millis())),
             Evidence::Readable,
@@ -311,8 +314,11 @@ mod tests {
             partner_evidence(&peer_terminated(), PEER, wt(CUT_MS)),
             Evidence::Readable,
         );
-        let closing_only =
-            TopologySchedule::new(EPOCH_MS, Epoch::new(0), snap(&[LOCAL, PEER], &[(PEER, 0)]));
+        let closing_only = TopologySchedule::new(
+            EpochWindows::new(0, EPOCH_MS),
+            Epoch::new(0),
+            snap(&[LOCAL, PEER], &[(PEER, 0)]),
+        );
         assert_eq!(
             partner_evidence(&closing_only, PEER, wt(CUT_MS)),
             Evidence::Unknown,

@@ -10632,8 +10632,11 @@ mod tests {
         let mut boundaries = BTreeMap::new();
         boundaries.insert(PARENT, anchor);
         let head = live(&children, boundaries);
-        let mut sched =
-            TopologySchedule::new(10_000, Epoch::new(0), live(&[PARENT], BTreeMap::new()));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 10_000),
+            Epoch::new(0),
+            live(&[PARENT], BTreeMap::new()),
+        );
         sched.insert(Epoch::new(1), Arc::clone(&head));
         sched.set_head(head);
         sched
@@ -10760,7 +10763,7 @@ mod tests {
         // A schedule whose only entry is epoch 5 has no committee for the
         // tip's epoch 0, so resolution returns `None` and the gate stalls.
         let snapshot = Arc::clone(full.head());
-        let stalled = TopologySchedule::new(300_000, Epoch::new(5), snapshot);
+        let stalled = TopologySchedule::new(EpochWindows::new(0, 300_000), Epoch::new(5), snapshot);
         assert!(
             !state.is_current_proposer(&stalled),
             "absent committee must stall the proposer gate, not fall back to head",
@@ -11156,7 +11159,11 @@ mod tests {
                     attested_frontier: BlockHeight::GENESIS,
                 },
             )]));
-        let mut recovered = TopologySchedule::new(1_000, Epoch::new(3), Arc::new(head.clone()));
+        let mut recovered = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(3),
+            Arc::new(head.clone()),
+        );
         for epoch in 0..=3 {
             recovered.insert(Epoch::new(epoch), Arc::new(head.clone()));
         }
@@ -11281,7 +11288,7 @@ mod tests {
     ) -> SimShardStorage {
         let storage = SimShardStorage::default();
         for block in chain {
-            let inputs = MemberInputs::of(block, EpochWindows::new(0));
+            let inputs = MemberInputs::of(block, EpochWindows::new(0, 0));
             let state = storage.snapshot();
             let rows = member_writes(&state, &inputs);
             let writes = with_fee_holds(
@@ -12689,7 +12696,11 @@ mod tests {
         let leaving = window_over(true, BTreeMap::new())
             .with_scheduled_terminals(BTreeMap::from([(HEARD_SIBLING, departs)]))
             .with_formed(first_life.clone());
-        let mut schedule = TopologySchedule::new(1_000, departs, Arc::new(leaving.clone()));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            departs,
+            Arc::new(leaving.clone()),
+        );
         schedule.insert_lookahead(departs, Arc::new(leaving));
         for window in DEPARTS + 1..LIVE_AGAIN {
             let published_by = window - 1;
@@ -14143,7 +14154,8 @@ mod tests {
             let window = (*head).clone().with_scheduled_terminals(
                 leaving.iter().map(|&shard| (shard, final_epoch)).collect(),
             );
-            let schedule = TopologySchedule::new(1_000, final_epoch, Arc::new(window));
+            let schedule =
+                TopologySchedule::new(EpochWindows::new(0, 1_000), final_epoch, Arc::new(window));
             let judged = state.check_tick_manifest(&schedule, schedule.head(), &leaving_out);
             if owed {
                 assert!(
@@ -14240,7 +14252,7 @@ mod tests {
             certificates: &[],
             records: &[],
             claims: &[],
-            windows: EpochWindows::new(0),
+            windows: EpochWindows::new(0, 0),
             manifest: &manifest,
             committed: &manifest.committed,
         };
@@ -14577,7 +14589,7 @@ mod tests {
                 records: &[],
                 claims: &[],
             },
-            EpochWindows::new(0),
+            EpochWindows::new(0, 0),
             derived_terms(&committee, local, [&standing]),
         ));
         assert_eq!(rows.members[&standing.hash()].state, RowState::Pending);
@@ -15052,7 +15064,11 @@ mod tests {
     fn a_commit_whose_committee_window_is_not_held_parks_for_the_beacon() {
         let (mut state, full) = make_test_state();
         let head = Arc::clone(full.head());
-        let mut behind = TopologySchedule::new(5_000, Epoch::GENESIS, Arc::clone(&head));
+        let mut behind = TopologySchedule::new(
+            EpochWindows::new(0, 5_000),
+            Epoch::GENESIS,
+            Arc::clone(&head),
+        );
         let from = BlockHash::from_raw(Hash::from_bytes(b"tip before the window"));
         state.committed_height = BlockHeight::GENESIS;
         state.committed_hash = from;
@@ -15269,7 +15285,8 @@ mod tests {
         // validator the split is invisible, which is the second condition the
         // stall needs and why most runs cross a cut without one.
         let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut state = ShardCoordinator::new(
@@ -15332,7 +15349,8 @@ mod tests {
         let shard = ShardId::ROOT;
 
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
-        let schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
@@ -15381,7 +15399,8 @@ mod tests {
 
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
         let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut state = ShardCoordinator::new(
@@ -15451,7 +15470,8 @@ mod tests {
 
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
         let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut state = ShardCoordinator::new(
@@ -15528,7 +15548,8 @@ mod tests {
 
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
         let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         // A tip that is an epoch's first block: its own anchor sits at the cut,
@@ -15624,7 +15645,8 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let split = Arc::clone(two_shards().head());
         let whole = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&whole));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(1), Arc::clone(&whole));
         schedule.insert(Epoch::new(0), Arc::clone(&split));
 
         let tip = BlockHash::from_raw(Hash::from_bytes(b"tip_before_the_cut"));
@@ -15931,7 +15953,11 @@ mod tests {
         const ED: u64 = 1_000;
         let shard = ShardId::ROOT;
         let committee = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&committee));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(1),
+            Arc::clone(&committee),
+        );
         schedule.insert(Epoch::new(0), Arc::clone(&committee));
 
         let mut state = ShardCoordinator::new(
@@ -17220,8 +17246,11 @@ mod tests {
         // The committee's window is committed, but not the window the
         // block's own anchor (99s) lies in.
         let snapshot = Arc::clone(single.head());
-        let mut topology_schedule =
-            TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        let mut topology_schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&snapshot),
+        );
         topology_schedule.set_head(Arc::clone(&snapshot));
         state.set_time(LocalTimestamp::from_millis(100_000));
 
@@ -18411,7 +18440,11 @@ mod tests {
                 .map(|id| (id, BlsSigner::generate()))
                 .collect();
             let epoch0 = Arc::new(committee_snapshot_over(&keys, &[2, 4, 5, 10]));
-            let mut schedule = TopologySchedule::new(CUT_ED, Epoch::new(0), Arc::clone(&epoch0));
+            let mut schedule = TopologySchedule::new(
+                EpochWindows::new(0, CUT_ED),
+                Epoch::new(0),
+                Arc::clone(&epoch0),
+            );
             let seated = epoch1.is_some();
             let epoch1 = Arc::new(committee_snapshot_over(
                 &keys,
@@ -19374,7 +19407,11 @@ mod tests {
             [12, 13, 14, 15],
         ]
         .map(|ids| Arc::new(committee_snapshot_over(&keys, &ids)));
-        let mut schedule = TopologySchedule::new(CLAIM_ED, Epoch::new(0), Arc::clone(&epochs[0]));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, CLAIM_ED),
+            Epoch::new(0),
+            Arc::clone(&epochs[0]),
+        );
         schedule.insert(Epoch::new(1), Arc::clone(&epochs[1]));
         schedule.insert(Epoch::new(2), Arc::clone(&epochs[2]));
         schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
@@ -19516,7 +19553,11 @@ mod tests {
     #[test]
     fn a_claim_refuted_while_the_beacon_lags_is_retried_once_it_catches_up() {
         let (mut state, full, keys, epochs) = claim_epochs();
-        let mut partial = TopologySchedule::new(CLAIM_ED, Epoch::new(0), Arc::clone(&epochs[0]));
+        let mut partial = TopologySchedule::new(
+            EpochWindows::new(0, CLAIM_ED),
+            Epoch::new(0),
+            Arc::clone(&epochs[0]),
+        );
         partial.insert(Epoch::new(1), Arc::clone(&epochs[1]));
         let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
         let view = state.view();
@@ -19570,7 +19611,11 @@ mod tests {
     #[test]
     fn a_walk_skips_a_window_seating_a_committee_already_tried() {
         let (mut state, _, keys, epochs) = claim_epochs();
-        let mut schedule = TopologySchedule::new(CLAIM_ED, Epoch::new(0), Arc::clone(&epochs[0]));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, CLAIM_ED),
+            Epoch::new(0),
+            Arc::clone(&epochs[0]),
+        );
         schedule.insert(Epoch::new(1), Arc::clone(&epochs[1]));
         schedule.insert(Epoch::new(2), Arc::clone(&epochs[3]));
         schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
@@ -19594,7 +19639,11 @@ mod tests {
     #[test]
     fn a_walk_without_a_tip_anchor_reaches_the_oldest_retained_window() {
         let (mut state, _, keys, epochs) = claim_epochs();
-        let mut schedule = TopologySchedule::new(CLAIM_ED, Epoch::new(1), Arc::clone(&epochs[1]));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, CLAIM_ED),
+            Epoch::new(1),
+            Arc::clone(&epochs[1]),
+        );
         schedule.insert(Epoch::new(2), Arc::clone(&epochs[2]));
         schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
         let unheld = qc_signed_by(&keys, &epochs[0], 5, 100);
@@ -20199,7 +20248,7 @@ mod tests {
         // Seated at epoch 2 with one-second windows: the bridge window
         // opens at 3000ms.
         let head = with_pending_halt_recovery(&schedule, vec![ValidatorId::new(9)], Epoch::new(2));
-        let schedule = TopologySchedule::new(1_000, Epoch::new(3), head);
+        let schedule = TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(3), head);
         state.anchor_qc = Some(QuorumCertificate::genesis(
             ShardId::ROOT,
             state.chain_origin,
@@ -20419,7 +20468,7 @@ mod tests {
         // opens at 3000ms, and a QC stamped past it is the fresh
         // committee's own.
         let head = with_pending_halt_recovery(&schedule, vec![ValidatorId::new(9)], Epoch::new(2));
-        let schedule = TopologySchedule::new(1_000, Epoch::new(3), head);
+        let schedule = TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(3), head);
         state.set_time(LocalTimestamp::from_millis(5_000));
         let high_qc_stamped_at = |ms: u64| {
             // SAFETY: synthetic test fixture, no real signature.
@@ -20462,7 +20511,11 @@ mod tests {
     /// 3000ms, and a QC stamped below it is the halted chain's.
     fn bridged_halt_schedule(schedule: &TopologySchedule) -> TopologySchedule {
         let head = with_pending_halt_recovery(schedule, vec![ValidatorId::new(1)], Epoch::new(2));
-        let mut bridged = TopologySchedule::new(1_000, Epoch::new(3), Arc::clone(&head));
+        let mut bridged = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(3),
+            Arc::clone(&head),
+        );
         for epoch in 0..3 {
             bridged.insert(Epoch::new(epoch), Arc::clone(&head));
         }
@@ -22955,7 +23008,11 @@ mod tests {
             2,
             ValidatorSet::new(validators),
         ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&pre_split));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(0),
+            Arc::clone(&pre_split),
+        );
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
@@ -23139,7 +23196,7 @@ mod tests {
         // without a network re-fetch.
         const ED: u64 = 1_000;
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), epoch0);
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
@@ -23213,7 +23270,7 @@ mod tests {
         // revive it — so the shard wedges on a view-change loop.
         const ED: u64 = 1_000;
         let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), epoch0);
 
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
@@ -25000,7 +25057,8 @@ mod tests {
             )
             .with_scheduled_terminals(BTreeMap::from([(ShardId::ROOT, Epoch::new(0))])),
         );
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(0), final_window);
         sched.insert(Epoch::new(1), root_departed_window(validators, None));
         sched
     }
@@ -25100,7 +25158,7 @@ mod tests {
         };
 
         let unscheduled = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(0),
             Arc::new(
                 TopologySnapshot::new(NetworkDefinition::simulator(), 1, ValidatorSet::new(vec![]))
@@ -25123,7 +25181,7 @@ mod tests {
             })
             .collect();
         let mut scheduled = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(0),
             Arc::new(
                 TopologySnapshot::new(
@@ -26951,7 +27009,11 @@ mod tests {
     ) -> (ShardCoordinator, TopologySchedule, Block) {
         let (mut state, single) = make_multi_validator_state_at(seat);
         let snapshot = Arc::clone(single.head());
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&snapshot),
+        );
         schedule.set_head(Arc::clone(&snapshot));
         for epoch in 1..=100 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
@@ -27618,7 +27680,11 @@ mod tests {
         assert_eq!(eager_on(&state, &schedule, &qc), None);
 
         // The QC sits in epoch 1 of a 20 s grid; the committed anchor in 0.
-        let gridded = TopologySchedule::new(20_000, Epoch::new(1), Arc::clone(schedule.head()));
+        let gridded = TopologySchedule::new(
+            EpochWindows::new(0, 20_000),
+            Epoch::new(1),
+            Arc::clone(schedule.head()),
+        );
         assert_eq!(eager_on(&state, &gridded, &qc), Some(EagerReason::Epoch));
         state.committed_block_anchor_wt = WeightedTimestamp::from_millis(25_000);
         assert_eq!(eager_on(&state, &gridded, &qc), None);
@@ -27713,7 +27779,11 @@ mod tests {
         );
 
         // The cut is 100 ms past the QC; no delay is measured yet.
-        let gridded = TopologySchedule::new(30_100, Epoch::GENESIS, Arc::clone(schedule.head()));
+        let gridded = TopologySchedule::new(
+            EpochWindows::new(0, 30_100),
+            Epoch::GENESIS,
+            Arc::clone(schedule.head()),
+        );
         let (mut state, _, qc) = leading_after(|_| {}, WitnessSources::empty());
         assert_eq!(
             state.idle_until(&gridded, state.view_change.view, qc.weighted_timestamp()),
@@ -27925,7 +27995,11 @@ mod tests {
             watermark_after_committing(&schedule, 600, |parts| parts.round = Round::new(3)),
             moved
         );
-        let mut gridded = TopologySchedule::new(1_000, Epoch::new(1), Arc::clone(schedule.head()));
+        let mut gridded = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(1),
+            Arc::clone(schedule.head()),
+        );
         gridded.insert(Epoch::GENESIS, Arc::clone(schedule.head()));
         assert_eq!(watermark_after_committing(&gridded, 900, |_| {}), unmoved);
         assert_eq!(watermark_after_committing(&gridded, 1_500, |_| {}), moved);
@@ -29209,7 +29283,11 @@ mod tests {
         retained: &[u64],
     ) -> TopologySchedule {
         let snapshot = with_pending_recovery(schedule, cause, ids(retained), Epoch::new(2));
-        let mut recovering = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&snapshot));
+        let mut recovering = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&snapshot),
+        );
         recovering.set_head(Arc::clone(&snapshot));
         for epoch in 1..=100 {
             recovering.insert(Epoch::new(epoch), Arc::clone(&snapshot));
@@ -29283,8 +29361,16 @@ mod tests {
                 .collect(),
             ),
         );
-        let mut before = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
-        let mut after = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&halted));
+        let mut before = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&halted),
+        );
+        let mut after = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&halted),
+        );
         for epoch in 1..=110 {
             before.insert(Epoch::new(epoch), Arc::clone(&halted));
             let seated = if epoch < 101 { &halted } else { &fresh };
@@ -29399,7 +29485,11 @@ mod tests {
         let (mut state, single, keys) = make_multi_validator_state_with_keys(0);
         state.detach_signer(ValidatorId::new(0));
         let head = with_pending_halt_recovery(&single, ids(retained), Epoch::new(2));
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(0), Arc::clone(&head));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(0),
+            Arc::clone(&head),
+        );
         schedule.set_head(Arc::clone(&head));
         for epoch in 1..=300 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&head));

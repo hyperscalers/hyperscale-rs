@@ -17,7 +17,7 @@ use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::{ShardChainReader, member_row_leaf};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
-    DeclaredRange, Epoch, ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY,
+    DeclaredRange, Epoch, EpochWindows, ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, RETENTION_HORIZON,
     ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim, StateRoot,
     SubstateKey, TickLine, TimestampRange, Transaction, TransactionDecision, TransactionStatus,
@@ -1178,6 +1178,14 @@ pub fn scheduled_terminal_epoch<C: Cluster>(c: &C, parent: ShardId) -> Option<Ep
 pub(crate) fn epoch_duration_ms<C: Cluster>(c: &C) -> Option<u64> {
     c.beacon_state()
         .map(|state| state.chain_config.epoch_duration_ms)
+}
+
+/// The beacon's epoch-window grid, off its own chain config — what maps
+/// an epoch number to its window and a clock reading to its epoch.
+#[must_use]
+pub(crate) fn epoch_windows<C: Cluster>(c: &C) -> Option<EpochWindows> {
+    c.beacon_state()
+        .map(|state| state.chain_config.epoch_windows())
 }
 
 /// The clock of the boundary the beacon last recorded for `shard`.

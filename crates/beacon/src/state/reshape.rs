@@ -785,10 +785,11 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
-        Address, AddressClass, Admission, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence,
-        Formed, HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding, RecoveryCause, ReshapeKind,
-        SettledTxsRoot, Settling, ShardFullness, ShardWitnessPayload, SplitChildRoots, Stake,
-        StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule, partner_evidence,
+        Address, AddressClass, Admission, Block, BlockHeader, BlockHeaderParts, Epoch,
+        EpochWindows, Evidence, Formed, HALT_THRESHOLD_EPOCHS, Hash, RecoveryBinding,
+        RecoveryCause, ReshapeKind, SettledTxsRoot, Settling, ShardFullness, ShardWitnessPayload,
+        SplitChildRoots, Stake, StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
+        partner_evidence,
     };
 
     use super::*;
@@ -3003,7 +3004,7 @@ mod tests {
         // the reunified parent.
         let active = Arc::new(state.derive_topology_snapshot(net()));
         let lookahead = Arc::new(state.derive_next_topology_snapshot(net()));
-        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), active);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(5), active);
         schedule.insert_lookahead(Epoch::new(6), lookahead);
         let routing = schedule.routing_committees();
 
@@ -3243,7 +3244,7 @@ mod tests {
         let next = state.current_epoch.next();
         let opening = state.chain_config.epoch_windows().window_of(next).start;
         let mut schedule = TopologySchedule::new(
-            state.chain_config.epoch_duration_ms,
+            state.chain_config.epoch_windows(),
             next,
             Arc::new(published.clone()),
         );
@@ -3485,7 +3486,7 @@ mod tests {
         let windows = state.chain_config.epoch_windows();
         let bound = dropping_fold(state.current_epoch).inner() + 5;
         let mut schedule = TopologySchedule::new(
-            windows.epoch_duration_ms(),
+            windows,
             state.current_epoch,
             Arc::new(state.derive_topology_snapshot(net())),
         );
@@ -3708,7 +3709,7 @@ mod tests {
         let epoch = state.current_epoch;
         let frozen = Arc::new(state.derive_topology_snapshot(net()));
         let mut schedule = TopologySchedule::new(
-            state.chain_config.epoch_duration_ms,
+            state.chain_config.epoch_windows(),
             epoch,
             Arc::clone(&frozen),
         );

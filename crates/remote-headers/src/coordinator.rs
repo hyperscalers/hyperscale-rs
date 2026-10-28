@@ -1990,9 +1990,10 @@ impl RemoteHeaderCoordinator {
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch, Hash,
-        NetworkDefinition, ProposerTimestamp, QuorumCertificate, RecoveryBinding, Round, ShardId,
-        Signer, SignerBitfield, ValidatorId, ValidatorInfo, ValidatorSet,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch,
+        EpochWindows, Hash, NetworkDefinition, ProposerTimestamp, QuorumCertificate,
+        RecoveryBinding, Round, ShardId, Signer, SignerBitfield, ValidatorId, ValidatorInfo,
+        ValidatorSet,
     };
 
     use super::*;
@@ -2165,7 +2166,8 @@ mod tests {
             .map(|v| epoch0.public_key(*v).unwrap())
             .collect();
 
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
@@ -2210,7 +2212,8 @@ mod tests {
             .map(|v| epoch0.public_key(*v).unwrap())
             .collect();
 
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
@@ -2251,7 +2254,8 @@ mod tests {
             .map(|v| epoch0.public_key(*v).unwrap())
             .collect();
 
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
@@ -2313,7 +2317,8 @@ mod tests {
             .map(|v| epoch0.public_key(*v).unwrap())
             .collect();
 
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
@@ -2376,7 +2381,7 @@ mod tests {
                 .collect()
         };
         let (expected0, expected1) = (keys_of(&epoch0), keys_of(&epoch1));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), epoch0);
         schedule.insert(Epoch::new(1), epoch1);
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
@@ -2447,7 +2452,7 @@ mod tests {
             .iter()
             .map(|v| head.public_key(*v).unwrap())
             .collect();
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), head);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), head);
         schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
@@ -2468,7 +2473,7 @@ mod tests {
         const ED: u64 = 1_000;
         let local = ShardId::leaf(1, 0);
         let sched = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(0),
             Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
         );
@@ -2539,7 +2544,7 @@ mod tests {
                 },
             );
             let snapshot = shard_snapshot(2, &[0, 1, 2, 3], 0).with_boundaries(boundaries);
-            TopologySchedule::new(ED, Epoch::new(0), Arc::new(snapshot))
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::new(snapshot))
         };
 
         let mut coord = RemoteHeaderCoordinator::new(local);
@@ -2611,7 +2616,8 @@ mod tests {
         let (left, right) = ShardId::ROOT.children();
         let pre = Arc::new(shard_snapshot(1, &[0, 1, 2, 3], 0)); // ROOT only
         let post = Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)); // both children
-        let mut sched = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&pre));
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&pre));
         sched.insert(Epoch::new(1), Arc::clone(&post));
         sched.set_head(post);
 
@@ -2654,7 +2660,7 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let remote = ShardId::leaf(1, 1);
         let sched = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(5),
             Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
         );
@@ -2691,7 +2697,7 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let remote = ShardId::leaf(1, 1);
         let sched = TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(5),
             Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
         );
@@ -2793,7 +2799,7 @@ mod tests {
         let snapshot = || shard_snapshot(2, &[0, 1, 2, 3], 0);
         let mut coord = RemoteHeaderCoordinator::new(local);
         coord.refresh_expected(&TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(5),
             Arc::new(snapshot()),
         ));
@@ -2819,7 +2825,7 @@ mod tests {
             terminal_epoch: None,
         };
         coord.refresh_expected(&TopologySchedule::new(
-            ED,
+            EpochWindows::new(0, ED),
             Epoch::new(5),
             Arc::new(snapshot().with_boundaries(BTreeMap::from([(remote, boundary)]))),
         ));
@@ -2853,7 +2859,7 @@ mod tests {
                 terminal_epoch: None,
             };
             TopologySchedule::new(
-                ED,
+                EpochWindows::new(0, ED),
                 Epoch::new(5),
                 Arc::new(
                     shard_snapshot(2, &[0, 1, 2, 3], 0)
@@ -2958,7 +2964,11 @@ mod tests {
 
         // Schedule head is epoch 0; a header anchored in epoch 5 is ahead of
         // this node's beacon and can't resolve yet.
-        let behind = TopologySchedule::new(ED, Epoch::new(0), Arc::new(shard_snapshot(2, &ids, 0)));
+        let behind = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = anchored_header(&mut coord, remote, BlockHeight::new(5), 5 * ED); // parent WT in epoch 5
 
@@ -2987,8 +2997,11 @@ mod tests {
         // Schedule retains only epoch 5; a header anchored in epoch 0 sits
         // below the floor — unresolvable forever, so it must not occupy a
         // buffer slot a Byzantine sender could use to evict honest entries.
-        let schedule =
-            TopologySchedule::new(ED, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
+        let schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(5),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = anchored_header(&mut coord, remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
@@ -3020,7 +3033,7 @@ mod tests {
         let snap = || Arc::new(shard_snapshot(2, &ids, 0));
 
         // Epoch 0 is in the schedule when the headers arrive.
-        let present = TopologySchedule::new(ED, Epoch::new(0), snap());
+        let present = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), snap());
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
         let header = anchored_header(&mut coord, remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
@@ -3033,7 +3046,7 @@ mod tests {
 
         // The first candidate's verification fails, and the schedule no longer
         // covers epoch 0 (every consumer frontier passed it).
-        let evicted = TopologySchedule::new(ED, Epoch::new(5), snap());
+        let evicted = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(5), snap());
         let after_fail = coord.on_remote_header_qc_verified(
             &evicted,
             &header,
@@ -3962,7 +3975,7 @@ mod tests {
         let remote = ShardId::leaf(2, 1);
         let mut coord = RemoteHeaderCoordinator::new(local);
         let recovered = TopologySchedule::new(
-            1_000,
+            EpochWindows::new(0, 1_000),
             Epoch::new(11),
             Arc::new(
                 shard_snapshot(2, &[0, 1, 2, 3], 0).with_recoveries(
@@ -4036,7 +4049,7 @@ mod tests {
             completed: false,
         };
         let pending = TopologySchedule::new(
-            1_000,
+            EpochWindows::new(0, 1_000),
             Epoch::new(11),
             Arc::new(
                 shard_snapshot(2, &[0, 1, 2, 3], 0)
@@ -4132,7 +4145,8 @@ mod tests {
     /// A schedule of second-long epochs headed by `head` at epoch 11,
     /// every earlier epoch seating the same committee.
     fn schedule_under(head: TopologySnapshot) -> TopologySchedule {
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(11), Arc::new(head));
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(11), Arc::new(head));
         for epoch in 0..11 {
             schedule.insert(
                 Epoch::new(epoch),
