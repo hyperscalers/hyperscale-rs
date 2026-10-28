@@ -124,7 +124,8 @@ impl Spammer {
                 .await;
         }
 
-        self.print_progress(start.elapsed());
+        let elapsed = start.elapsed();
+        self.print_progress(elapsed);
 
         match self.accounts.save_nonces_default() {
             Ok(n) => info!(saved = n, "Saved account nonces to file"),
@@ -142,12 +143,12 @@ impl Spammer {
         };
 
         SpammerReport {
-            duration: start.elapsed(),
+            duration: elapsed,
             total_submitted: self.stats.submitted.load(Ordering::SeqCst),
             total_accepted: self.stats.accepted.load(Ordering::SeqCst),
             total_rejected: self.stats.rejected.load(Ordering::SeqCst),
             total_errors: self.stats.errors.load(Ordering::SeqCst),
-            avg_tps: self.stats.tps(start),
+            avg_tps: self.stats.tps(elapsed),
             latency_report,
         }
     }
@@ -302,7 +303,6 @@ impl Spammer {
                     print_progress_static(
                         &stats_for_progress,
                         start.elapsed(),
-                        start,
                         latency_tracker_for_progress.as_ref(),
                     );
                     last_progress = Instant::now();
@@ -438,7 +438,6 @@ pub async fn wait_for_ready(clients: &[RpcClient], timeout: Duration) -> Result<
 fn print_progress_static(
     stats: &SpammerStats,
     elapsed: Duration,
-    start: Instant,
     latency_tracker: Option<&LatencyTracker>,
 ) {
     let submitted = stats.submitted.load(Ordering::SeqCst);
@@ -446,7 +445,7 @@ fn print_progress_static(
     let rejected = stats.rejected.load(Ordering::SeqCst);
     let errors = stats.errors.load(Ordering::SeqCst);
 
-    let tps = stats.tps(start);
+    let tps = stats.tps(elapsed);
 
     let in_flight_info = latency_tracker.map_or_else(String::new, |tracker| {
         let count = tracker.in_flight_count();
@@ -714,11 +713,11 @@ impl Default for SpammerStats {
 }
 
 impl SpammerStats {
-    /// Calculate current transactions per second.
+    /// Transactions submitted per second over `elapsed`.
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // headline TPS for human-readable summary
-    pub fn tps(&self, start: Instant) -> f64 {
-        let elapsed = start.elapsed().as_secs_f64();
+    pub fn tps(&self, elapsed: Duration) -> f64 {
+        let elapsed = elapsed.as_secs_f64();
         if elapsed > 0.0 {
             self.submitted.load(Ordering::SeqCst) as f64 / elapsed
         } else {
