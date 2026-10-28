@@ -20,7 +20,8 @@ use hyperscale_types::{
 /// One variant per binding, which is not quite one per
 /// [`crate::FetchRequest`]: a payload the node fetches without a request
 /// variant of its own — a package artifact, an instance record — still
-/// has ids to release, and so still has a variant here.
+/// has ids to release, and so still has a variant here, under
+/// [`BeaconFetchIds`] when the host's beacon loop is what fetches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchIds {
     /// Transactions by hash.
@@ -46,17 +47,13 @@ pub enum FetchIds {
     /// Block proposals a committee member's vote named and this replica
     /// never received, by block hash.
     Proposals(Vec<BlockHash>),
-    /// The beacon fetches the host's beacon loop drives. No replica
-    /// emits them.
+    /// The fetches the host's beacon loop drives. No replica emits them.
     Beacon(BeaconFetchIds),
-    /// Package artifacts by content address.
-    PackageArtifacts(Vec<Hash>),
-    /// Component instance records by address.
-    InstanceRecords(Vec<Address>),
 }
 
-/// The ids of the fetches the host's beacon loop drives, for its fold and
-/// its participants.
+/// The ids of the fetches the host's beacon loop drives: for its fold and
+/// its participants, and the records and code every loop on the host
+/// shares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconFetchIds {
     /// Missing beacon proposals as `(epoch, validator)`.
@@ -67,4 +64,8 @@ pub enum BeaconFetchIds {
     /// Beacon-witness leaf runs as `(source_shard, block_height,
     /// committed_block_hash, lo, hi)`.
     Witnesses(Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>),
+    /// Package artifacts by content address.
+    PackageArtifacts(Vec<Hash>),
+    /// Component instance records by address.
+    InstanceRecords(Vec<Address>),
 }

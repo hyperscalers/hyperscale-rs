@@ -535,11 +535,20 @@ impl Executor {
         );
     }
 
-    /// Whether this node answers for the component at `instance`.
+    /// Whether this node answers for the component at `instance`: the
+    /// question derivation asks of the same view, the stores the node
+    /// keeps on disk included.
     #[must_use]
     pub fn instance_known(&self, instance: Address) -> bool {
-        CallTarget::try_from(instance)
-            .is_ok_and(|target| self.world.instances.record(target).is_some())
+        CallTarget::try_from(instance).is_ok_and(|target| self.records().instance(target).is_some())
+    }
+
+    /// Whether derivation reads `package`'s metadata on this node.
+    #[must_use]
+    pub fn package_known(&self, package: Hash) -> bool {
+        self.records()
+            .package(PackageHash(package.as_hash32()))
+            .is_some()
     }
 
     /// Derive one transaction's invocations, effect set, and nullifiers

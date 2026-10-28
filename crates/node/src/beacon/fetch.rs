@@ -7,7 +7,9 @@
 //! windowed beacon-witness commitment). The host's beacon loop carries
 //! the one [`BeaconFetchState`]: its participants' proposal and candidate
 //! asks go past the host, and the fold's witness asks try the host's own
-//! stores first.
+//! stores first. Beside them it carries the host's record and code
+//! fetches (`instance_record`, `package_artifact`), which every loop on
+//! the host asks through it.
 //!
 //! The generic engine, the [`FetchBinding`] trait, and the shared
 //! `partition_solicited` helper live in [`crate::fetch`].
@@ -18,18 +20,21 @@ use hyperscale_network::{Network, RequestError};
 use hyperscale_types::network::request::beacon::{
     GetBeaconCandidateRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
+use hyperscale_types::network::request::{
+    MAX_INSTANCE_RECORDS_PER_REQUEST, MAX_PACKAGE_ARTIFACTS_PER_REQUEST,
+};
 use hyperscale_types::network::response::beacon::{
     GetBeaconCandidateResponse, GetBeaconProposalResponse, GetShardWitnessesResponse,
 };
 use hyperscale_types::{
-    BeaconBlockHash, BlockHash, BlockHeight, Epoch, LeafIndex, ShardId, ValidatorId,
+    Address, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash, LeafIndex, ShardId, ValidatorId,
 };
 
 use crate::config::NodeConfig;
 use crate::event::BeaconScopedInput;
 use crate::fetch::{
-    Fetch, FetchBinding, FetchOwner, FetchReply, FetchedBy, Refusal, Route, ScopedAnswer,
-    defers_to_the_tick, dispatch_scoped,
+    Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, Refusal, Route,
+    ScopedAnswer, defers_to_the_tick, dispatch_scoped,
 };
 use crate::shard::HostEvent;
 
@@ -46,8 +51,13 @@ pub type BeaconProposalFetch = Fetch<(Epoch, ValidatorId)>;
 /// candidate hash the pool prevoted that the local member never held.
 pub type BeaconCandidateFetch = Fetch<(Epoch, BeaconBlockHash)>;
 
+/// Per-component record fetch, keyed by the address the record derives.
+pub type InstanceRecordFetch = Fetch<Address>;
+/// Per-package artifact fetch, keyed by content address.
+pub type PackageArtifactFetch = Fetch<Hash>;
+
 /// Beacon fetch state: the id-keyed fetches the host's beacon loop
-/// drives for its fold and its participants.
+/// drives for its fold, its participants and its chains.
 pub struct BeaconFetchState {
     /// Cross-shard beacon-witness fetch (rotates through source committee).
     pub(crate) shard_witness: ShardWitnessFetch,
@@ -55,6 +65,11 @@ pub struct BeaconFetchState {
     pub(crate) beacon_proposal: BeaconProposalFetch,
     /// Ratify-candidate fetch (asks the members that prevoted it).
     pub(crate) beacon_candidate: BeaconCandidateFetch,
+    /// Component records, from the committee of the shard owning each
+    /// one's prefix.
+    pub(crate) instance_record: InstanceRecordFetch,
+    /// Package artifacts, from the committee of each one's custodian.
+    pub(crate) package_artifact: PackageArtifactFetch,
 }
 
 impl BeaconFetchState {
@@ -79,6 +94,22 @@ impl BeaconFetchState {
                 "beacon_candidate",
                 config.beacon_proposal_fetch.clone(),
             ),
+            instance_record: InstanceRecordFetch::new(
+                "instance_record",
+                clamped(
+                    &config.instance_record_fetch,
+                    MAX_INSTANCE_RECORDS_PER_REQUEST,
+                ),
+            ),
+            // The wire caps the batch far below the generic default: an
+            // artifact runs to a transaction's whole byte budget.
+            package_artifact: PackageArtifactFetch::new(
+                "package_artifact",
+                clamped(
+                    &config.package_artifact_fetch,
+                    MAX_PACKAGE_ARTIFACTS_PER_REQUEST,
+                ),
+            ),
         }
     }
 
@@ -90,7 +121,16 @@ impl BeaconFetchState {
         self.shard_witness.has_pending()
             || self.beacon_proposal.has_pending()
             || self.beacon_candidate.has_pending()
+            || self.instance_record.has_pending()
+            || self.package_artifact.has_pending()
     }
+}
+
+/// `config` with its batch clamped to what one request may carry.
+fn clamped(config: &FetchConfig, cap: usize) -> FetchConfig {
+    let mut config = config.clone();
+    config.max_ids_per_request = config.max_ids_per_request.min(cap);
+    config
 }
 
 impl FetchOwner for BeaconFetchState {
@@ -102,7 +142,7 @@ impl FetchOwner for BeaconFetchState {
 pub struct BeaconReply(pub(crate) Sender<HostEvent>);
 
 impl BeaconReply {
-    fn push(&self, input: BeaconScopedInput) {
+    pub(crate) fn push(&self, input: BeaconScopedInput) {
         let _ = self.0.send(HostEvent::Beacon(input));
     }
 }

@@ -83,7 +83,9 @@ impl TestNode {
                 }
                 BeaconInput::CommitProven { .. }
                 | BeaconInput::ForkProof(_)
-                | BeaconInput::VoteEquivocation { .. } => {}
+                | BeaconInput::VoteEquivocation { .. }
+                | BeaconInput::RecordsWanted { .. }
+                | BeaconInput::RecordsAbandoned { .. } => {}
             }
         }
     }

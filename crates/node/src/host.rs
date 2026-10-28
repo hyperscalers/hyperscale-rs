@@ -48,9 +48,7 @@ use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::{BlockSyncInput, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
 use crate::shard::crossing_index::ChainCrossings;
-use crate::shard::instances::InstancesState;
 use crate::shard::mempool::MempoolState;
-use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
     DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
@@ -890,8 +888,6 @@ fn build_shard_io<S: ShardStorage>(
         consensus: ConsensusState::new(config),
         cross_shard: CrossShardState::new(config),
         mempool: MempoolState::new(config),
-        packages: PackagesState::new(config),
-        instances: InstancesState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
         floor_pins: None,
