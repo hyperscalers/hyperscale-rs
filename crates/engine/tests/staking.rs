@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
-use hyperscale_effects_bridge::genesis::{genesis_world_with_pools, seat_pool};
+use hyperscale_effects_bridge::genesis::{founded_pool, genesis_world_with_pools, seat_pool};
 use hyperscale_effects_bridge::records::committed_instance;
 use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
@@ -26,15 +26,16 @@ use hyperscale_storage::{
     member_row_leaf, owed_credits, unclaimed_declines,
 };
 use hyperscale_storage_memory::SimBeaconStorage;
-use hyperscale_transactions::{Ceilings, Client, Terms};
+use hyperscale_transactions::{Ceilings, Client, Terms, sign_intent};
 use hyperscale_types::test_utils::state_and_proof_holding;
 use hyperscale_types::{
-    Anchor, BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt,
-    Deadline, Ed25519PrivateKey, EntryKey, EscrowedValue, EventExt, EventRoot, ExecutionOutcome,
-    GlobalReceipt, Hash, Inclusion, Issuer, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof,
-    NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId,
-    ShardTrie, Stake, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry,
-    SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
+    Anchor, BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusPublicKey,
+    ConsensusReceipt, ConsensusSignature, Deadline, Ed25519PrivateKey, EntryKey, EscrowedValue,
+    EventExt, EventRoot, ExecutionOutcome, GlobalReceipt, Hash, Inclusion, Issuer,
+    MAX_INTENT_VALIDITY_RANGE, MIN_STAKE_FLOOR, MerkleInclusionProof, NetworkId, PriceTable,
+    PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId, ShardTrie, Stake,
+    StakePoolId, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry,
+    SubstateKey, TimestampRange, Transaction, TxHash, ValidatorId, Verified, WeightedTimestamp,
     absorb_committed_cells, answer_hashes, compute_merkle_root, receipt_hash_of, witness_root,
     writes_root,
 };
@@ -71,6 +72,18 @@ const DELEGATOR: u8 = 7;
 const OPERATOR: u8 = 8;
 /// The signing seed of a funded account that operates nothing.
 const OUTSIDER: u8 = 9;
+/// The signing seed of an account that founds its own pool, funded by a
+/// sponsor and holding nothing itself.
+const FOUNDER: u8 = 10;
+/// The signing seed of the sponsor that funds and pays for a founding.
+const SPONSOR: u8 = 11;
+
+/// What a pool comes up holding: enough for the seat its founding takes on.
+const FOUNDING: u128 = MIN_STAKE_FLOOR.quanta();
+/// What the operator holds: enough to bring a pool up and pay for it.
+const OPERATOR_FUNDS: u128 = FOUNDING + 10_000;
+/// What the sponsor holds: a founding and a top-up, and the fees.
+const SPONSOR_FUNDS: u128 = 2 * FOUNDING + 10_000;
 
 /// A snapshot over the flattened genesis updates.
 struct MapDb {
@@ -157,6 +170,20 @@ fn pool_at(id: u32) -> ComponentAddr {
     pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat(id))
 }
 
+/// The validator a founding takes on.
+const FOUNDED_VALIDATOR: ValidatorId = ValidatorId::new(3);
+
+/// A consensus key's bytes, as a registration carries them; the engine
+/// relays them and the beacon judges them.
+const fn key_bytes() -> ConsensusPublicKey {
+    ConsensusPublicKey::new([1; 48])
+}
+
+/// A possession proof's bytes, carried through unjudged here.
+const fn proof_bytes() -> ConsensusSignature {
+    ConsensusSignature::new([2; 96])
+}
+
 /// The client this binary builds through.
 ///
 /// Its world seats every pool the file names, which is not the same world
@@ -235,7 +262,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     let store = MapDb::genesis(
         &[
             (delegator(), 10_000),
-            (account_of(OPERATOR), 10_000),
+            (account_of(OPERATOR), OPERATOR_FUNDS),
             (account_of(OUTSIDER), 10_000),
         ],
         &[seat(POOL_ID), seat(99)],
@@ -297,7 +324,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
     let sealed_here = seat(55);
     let executor = seated(std::slice::from_ref(&genesis_seated), ExecutionMode::Serial);
     let mut store = MapDb::genesis(
-        &[(account_of(OPERATOR), 10_000)],
+        &[(account_of(OPERATOR), OPERATOR_FUNDS)],
         std::slice::from_ref(&genesis_seated),
     );
     let trie = ShardTrie::single();
@@ -374,7 +401,10 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     // the holder's alone — the way two processes would hold it.
     let reader = holder.peer(ExecutionMode::Serial);
     let mut store = MapDb::genesis(
-        &[(account_of(OPERATOR), 10_000), (delegator(), 10_000)],
+        &[
+            (account_of(OPERATOR), OPERATOR_FUNDS),
+            (delegator(), 10_000),
+        ],
         std::slice::from_ref(&seat(POOL_ID)),
     );
     let trie = ShardTrie::single();
@@ -471,7 +501,10 @@ fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
     let unseated = seat(56);
     let holder = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
     let mut store = MapDb::genesis(
-        &[(account_of(OPERATOR), 10_000), (delegator(), 10_000)],
+        &[
+            (account_of(OPERATOR), OPERATOR_FUNDS),
+            (delegator(), 10_000),
+        ],
         std::slice::from_ref(&seat(POOL_ID)),
     );
     let trie = ShardTrie::single();
@@ -557,12 +590,13 @@ fn absorb(store: &mut MapDb, executed: &ExecutedTx, executor: &Executor) {
 }
 
 /// One envelope that brings an unseated pool up: it presents the pool's
-/// instance record, seals it as the configured founder, and files the
-/// owner badge the seal minted in that founder's account.
+/// instance record, seals it as the configured founder with the founding
+/// stake withdrawn from that founder's account and a validator taken on,
+/// and files the owner badge the seal minted in the founder's account.
 ///
 /// One transaction, because bringing up is one invocation: the seal, the
-/// record of each mark the pool issues, and the one issuance a body may
-/// hold all sit in the node that makes the component actual.
+/// record of each mark the pool issues, the founding stake and the first
+/// validator all sit in the node that makes the component actual.
 fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     let key = key_of(seed);
     let from = account_address(&key.public_key().0);
@@ -577,21 +611,34 @@ fn signed_instantiate(seed: u8, seat: &StakePoolSeat) -> Transaction {
     // yields filed where the founder keeps it. Which method seals and
     // which of those nodes exist are the package's own declaration to
     // say.
-    instantiate(&mut root, pool, ()).expect("a derivable pool answers its seal");
+    let funds = account::withdraw(&mut root, from, *PROTOCOL_RESOURCE, FOUNDING)
+        .expect("the founder withdraws the founding stake");
+    instantiate(
+        &mut root,
+        pool,
+        (
+            funds,
+            FOUNDED_VALIDATOR.inner(),
+            *key_bytes().as_bytes(),
+            *proof_bytes().as_bytes(),
+        ),
+    )
+    .expect("a derivable pool answers its seal");
     let tree = root
         .build_presenting(vec![meta], Vec::new())
         .expect("the intent declares no hole");
     Transaction::new(client().sign_tree(&tree, &[&key], terms(1_000)))
 }
 
-/// A pool nobody seated brings itself up, and the cells it ends holding
-/// are the cells genesis writes for a seated one, byte for byte — two
-/// writers of one object, held to each other.
+/// A pool nobody seated brings itself up holding the cells genesis writes
+/// for a seated one, byte for byte — two writers of one object, held to
+/// each other — plus what its founding adds: its first validator's leaf,
+/// and the founding stake moved into its vault.
 #[test]
 fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     let unseated = seat(55);
     let executor = seated(&[], ExecutionMode::Serial);
-    let mut store = MapDb::genesis(&[(account_of(OPERATOR), 10_000)], &[]);
+    let mut store = MapDb::genesis(&[(account_of(OPERATOR), OPERATOR_FUNDS)], &[]);
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
@@ -605,10 +652,11 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
     let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
-    let executed = executor
+    let executed_tx = executor
         .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
-        .expect("the harness engine holds every package it runs");
-    absorb(&mut store, &executed[0], &executor);
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
+    absorb(&mut store, &executed_tx, &executor);
 
     let (genesis_cells, genesis_entries) = genesis_writes(
         &[],
@@ -629,10 +677,11 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         assert!(genesis_cells.contains_key(&key), "genesis writes the cell");
         assert_eq!(store.cells.get(&key), genesis_cells[&key].as_ref());
     }
-    // And nothing beside them, either way. The list above says what the
-    // two writers agree on; this says neither writes a cell the other
-    // does not — which is the half a named list cannot check, and the
-    // half that catches a drift when one side grows a cell.
+    // And nothing else beside them. The list above says what the two
+    // writers agree on; this says the bring-up writes every cell genesis
+    // does, alike, and exactly the founding's own besides — the half a
+    // named list cannot check, and the half that catches a drift when
+    // one side grows a cell.
     let under_pool = |cells: &BTreeMap<SubstateKey, Option<Vec<u8>>>| {
         cells
             .iter()
@@ -647,12 +696,35 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         .filter(|(key, _)| key.owner == pool.address())
         .map(|(key, value)| (*key, Some(value.clone())))
         .collect();
+    for (key, value) in &seeded {
+        assert_eq!(
+            executed.get(key),
+            Some(value),
+            "an instantiated pool holds every cell a seated one does, alike",
+        );
+    }
+    let mut founded = executed.iter().filter(|(key, _)| !seeded.contains_key(key));
+    let (_, leaf) = founded
+        .next()
+        .expect("the bring-up writes its first validator's leaf");
     assert_eq!(
-        seeded.keys().collect::<Vec<_>>(),
-        executed.keys().collect::<Vec<_>>(),
-        "a seated pool and an instantiated one hold the same cells",
+        leaf.as_deref(),
+        Some(&key_bytes().as_bytes()[..]),
+        "the one cell beside a seated pool's is the validator's leaf, holding its key",
     );
-    assert_eq!(seeded, executed, "and the same bytes in each");
+    assert!(founded.next().is_none(), "and no other cell");
+    // The founding stake is a movement into the pool's vault rather than
+    // a cell the transaction states outright.
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed_tx.consensus else {
+        panic!("the bring-up settles");
+    };
+    assert!(
+        writes
+            .movements
+            .iter()
+            .any(|(key, _)| key.owner == pool.address()),
+        "the founding stake moves into the pool's vault",
+    );
     let entry = EntryKey {
         owner: unseated.operator.address(),
         collection: holdings_collection(&ProtocolHasher, unseated.operator, badge),
@@ -1907,7 +1979,10 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
     let sealed = seat(56);
     let executor = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
     let mut store = MapDb::genesis(
-        &[(account_of(OPERATOR), 10_000), (delegator(), 10_000)],
+        &[
+            (account_of(OPERATOR), OPERATOR_FUNDS),
+            (delegator(), 10_000),
+        ],
         std::slice::from_ref(&seat(POOL_ID)),
     );
     let trie = ShardTrie::single();
@@ -2178,5 +2253,201 @@ fn a_receipt_without_witness_events_keeps_its_hash() {
             writes_root(writes),
         )
         .receipt_hash(),
+    );
+}
+
+/// What the sponsor runs a founding over: a network seating one pool, the
+/// sponsor holding a founding and a top-up, and the founder nothing.
+fn founding_world() -> (Executor, MapDb) {
+    let executor = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
+    let store = MapDb::genesis(
+        &[(account_of(SPONSOR), SPONSOR_FUNDS)],
+        std::slice::from_ref(&seat(POOL_ID)),
+    );
+    (executor, store)
+}
+
+/// `raw` executed alone on the one shard of a single-shard network.
+fn run_on(executor: &Executor, store: &MapDb, raw: Transaction) -> ExecutedTx {
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
+    };
+    raw.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    executor
+        .execute_batch(&ctx, PriceTable::GENESIS, store, std::slice::from_ref(&tx))
+        .expect("the harness engine holds every package it runs")
+        .remove(0)
+}
+
+/// The founder's pool, as the beacon names it.
+fn founders_pool() -> StakePoolId {
+    StakePoolId::of(founded_pool(account_of(FOUNDER)).address(&ProtocolHasher))
+}
+
+/// The founder's founding of its own pool holding `amount`, funded and
+/// paid for by the sponsor.
+fn founding(amount: u128) -> Transaction {
+    let founder = account_of(FOUNDER);
+    let declaration = client()
+        .found_declaration(
+            founder,
+            HEADER,
+            FOUNDED_VALIDATOR,
+            &key_bytes(),
+            &proof_bytes(),
+        )
+        .expect("the founding builds");
+    client()
+        .found_and_join(
+            sign_intent(declaration, &key_of(FOUNDER)),
+            founder,
+            &key_of(SPONSOR),
+            HEADER,
+            terms(1_000),
+            amount,
+        )
+        .expect("the sponsor composes the founding")
+}
+
+/// The pool a join brings up stakes and registers in the one node that
+/// makes it actual, so a transaction it seals speaks: its facts reach the
+/// beacon under the pool's address, the deposit ahead of the
+/// registration the beacon admits against it.
+#[test]
+fn one_transaction_founds_a_pool_that_stakes_and_registers() {
+    let (executor, store) = founding_world();
+    let founded = run_on(&executor, &store, founding(FOUNDING));
+    assert_eq!(
+        witnesses(&founded),
+        vec![
+            BeaconWitnessEvent::StakeDeposit {
+                pool_id: founders_pool(),
+                amount: Stake::from_quanta(FOUNDING),
+            },
+            registration(FOUNDED_VALIDATOR),
+        ],
+    );
+}
+
+/// The founder's join of `validator` to its pool, with `top_up` staked
+/// into it first, funded and paid for by the sponsor.
+fn joining(validator: ValidatorId, top_up: u128) -> Transaction {
+    let founder = account_of(FOUNDER);
+    let declaration = client()
+        .join_declaration(founder, HEADER, validator, &key_bytes(), &proof_bytes())
+        .expect("the join builds");
+    client()
+        .join(
+            sign_intent(declaration, &key_of(FOUNDER)),
+            founder,
+            &key_of(SPONSOR),
+            HEADER,
+            terms(1_000),
+            top_up,
+        )
+        .expect("the sponsor composes the join")
+}
+
+/// What `validator` registering in the founder's pool tells the beacon.
+fn registration(validator: ValidatorId) -> BeaconWitnessEvent {
+    BeaconWitnessEvent::RegisterValidator {
+        pool_id: founders_pool(),
+        validator_id: validator,
+        pubkey: key_bytes(),
+        possession_proof: proof_bytes(),
+    }
+}
+
+/// A later join presents the badge the founding left with the founder,
+/// and the sponsor's top-up runs ahead of it: the root is the tree's
+/// first intent and takes nothing from the declaration, so the pool holds
+/// the seat's stake by the time its registration is read. Once the pool's
+/// own stake covers a seat, a join stakes nothing and says only the
+/// registration.
+#[test]
+fn a_second_validator_joins_with_the_sponsors_top_up() {
+    let (executor, mut store) = founding_world();
+    let founded = run_on(&executor, &store, founding(FOUNDING));
+    absorb(&mut store, &founded, &executor);
+
+    let second = ValidatorId::new(4);
+    let joined = run_on(&executor, &store, joining(second, FOUNDING));
+    assert_eq!(
+        witnesses(&joined),
+        vec![
+            BeaconWitnessEvent::StakeDeposit {
+                pool_id: founders_pool(),
+                amount: Stake::from_quanta(FOUNDING),
+            },
+            registration(second),
+        ],
+    );
+    absorb(&mut store, &joined, &executor);
+
+    let third = ValidatorId::new(5);
+    let covered = run_on(&executor, &store, joining(third, 0));
+    assert_eq!(witnesses(&covered), vec![registration(third)]);
+}
+
+/// The founding stake is the protocol resource: the bring-up takes its
+/// funds carrying the pool's staked resource, so a founding fed anything
+/// else is refused before it runs — here, stake units of another pool,
+/// which a sponsor holds and could otherwise pass off as stake.
+#[test]
+fn a_founding_fed_another_resource_is_refused() {
+    let (executor, _) = founding_world();
+    let founder = account_of(FOUNDER);
+    let chain = client().records();
+    let pool = founded_pool(founder);
+    let composed = Composed::new(&chain, std::slice::from_ref(&pool), &ProtocolHasher);
+
+    let mut decl = IntentBuilder::new(&composed, &ProtocolHasher, founder, HEADER);
+    let funds = decl.declare(stake_unit(pool_at(POOL_ID)), []);
+    instantiate(
+        &mut decl,
+        pool.address(&ProtocolHasher),
+        (
+            funds,
+            FOUNDED_VALIDATOR.inner(),
+            *key_bytes().as_bytes(),
+            *proof_bytes().as_bytes(),
+        ),
+    )
+    .expect("the builder types the call; the denomination is admission's to judge");
+    let signed = sign_intent(
+        decl.into_decl().expect("the declaration builds"),
+        &key_of(FOUNDER),
+    );
+
+    let sponsor = account_of(SPONSOR);
+    let mut root = IntentBuilder::new(&composed, &ProtocolHasher, sponsor, HEADER);
+    let socket = root
+        .adopt(signed)
+        .expect("the sponsor adopts the founding")
+        .sockets
+        .one()
+        .expect("one funds socket");
+    let staked = account::withdraw(&mut root, sponsor, *PROTOCOL_RESOURCE, FOUNDING)
+        .expect("the sponsor withdraws");
+    let units = staking::Staking::at(pool_at(POOL_ID))
+        .stake(&mut root, staked)
+        .expect("the genesis pool takes a delegation");
+    root.bind(socket, units)
+        .expect("the units fill the socket they were declared for");
+    let tree = root
+        .build_presenting(vec![pool], Vec::new())
+        .expect("the tree builds");
+    let raw = Transaction::new(client().sign_tree(&tree, &[&key_of(SPONSOR)], terms(1_000)));
+    assert!(
+        raw.try_derived(executor.derivation().as_ref()).is_err(),
+        "a bring-up fed stake units is refused before it runs"
     );
 }

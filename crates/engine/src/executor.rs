@@ -37,8 +37,8 @@ use hyperscale_types::{
     staged_yes_bytes, whole_work, witness_root, writes_root,
 };
 use hyperscale_vm_effects::{
-    Admitted, Answered, ChainRecords, CrossingId, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, fee_hold_key, legs_of, package_hash,
+    Admitted, Answered, ChainRecords, Composed, CrossingId, Declaration, DeclaredAccess,
+    InstanceMeta, IntentRecord, PackageHash, fee_hold_key, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
@@ -88,6 +88,10 @@ pub struct PreparedTx {
     /// The owners this shard judges — with the job's plan, the one part
     /// of an entry that differs per participant.
     pub(crate) judges: OwnerSet,
+    /// The instance records the envelope carries: what a component this
+    /// transaction seals is known by before any commit holds it, so the
+    /// witness lift can tell a pool sealed here from any other emitter.
+    pub(crate) presented: Arc<[InstanceMeta]>,
 }
 
 /// The component address a record's own contents derive, or `None` for
@@ -640,6 +644,7 @@ impl Executor {
         // order capability materialization walks.
         let declaration = admitted.declaration().clone();
         let calls = admitted.calls().to_vec();
+        let presented: Arc<[InstanceMeta]> = call.tree.instances.iter().cloned().collect();
         Ok((
             PreparedTx {
                 // Whole until the batch pipeline plans the member for its
@@ -654,6 +659,7 @@ impl Executor {
                 event_bytes,
                 work,
                 judges: OwnerSet::whole(),
+                presented,
             },
             admitted,
         ))
@@ -1244,15 +1250,31 @@ struct BatchInputs<'a> {
     staking_package: PackageHash,
 }
 
+/// What one member assembles from: the receipt the kernel ran it to, its
+/// payer and the charge set apart for it, the input its block froze, and
+/// the instance records its envelope carries.
+#[derive(Clone, Copy)]
+struct MemberInputs<'a> {
+    vm_tx: TxHash,
+    receipt: &'a Receipt,
+    fee: Option<(PayerFee, u128)>,
+    input: Option<&'a TickTxInput<'a>>,
+    presented: &'a [InstanceMeta],
+}
+
 fn assemble_executed_tx(
     ctx: &TickBatchContext<'_>,
     inputs: BatchInputs<'_>,
     fold: &mut FoldState,
-    vm_tx: TxHash,
-    receipt: &Receipt,
-    fee: Option<(PayerFee, u128)>,
-    input: Option<&TickTxInput<'_>>,
+    member_inputs: MemberInputs<'_>,
 ) -> ExecutedTx {
+    let MemberInputs {
+        vm_tx,
+        receipt,
+        fee,
+        input,
+        presented,
+    } = member_inputs;
     let member = input.map(|input| &input.member);
     let BatchInputs { base, locality, .. } = inputs;
     let tx_hash = vm_tx;
@@ -1335,11 +1357,17 @@ fn assemble_executed_tx(
         // reach, and read from the whole union rather than one shard's
         // share so every participant derives the same set — which shard
         // keeps a fact is settled once, at projection, by the same rule
-        // that settles which shard keeps the event.
+        // that settles which shard keeps the event. An emitter resolves
+        // through the chain first and then through the records the
+        // envelope carries, each keyed at the address its contents
+        // derive: every participant holds the same envelope, so a pool
+        // this transaction seals speaks here and is read alike
+        // everywhere.
+        let records = Composed::new(inputs.instances, presented, &ProtocolHasher);
         let witnesses: Vec<(Address, BeaconWitnessEvent)> = events
             .iter()
             .filter_map(|event| {
-                witness_from_event(event, inputs.instances, inputs.staking_package)
+                witness_from_event(event, &records, inputs.staking_package)
                     .map(|witness| (event.emitter, witness))
             })
             .collect();
@@ -1786,10 +1814,15 @@ impl Executor {
                     staking_package: self.world.staking_package,
                 },
                 &mut fold,
-                *vm_tx,
-                receipt,
-                fee_by_tx.get(vm_tx).map(|payer| (*payer, apart(vm_tx))),
-                shapes.get(vm_tx).copied(),
+                MemberInputs {
+                    vm_tx: *vm_tx,
+                    receipt,
+                    fee: fee_by_tx.get(vm_tx).map(|payer| (*payer, apart(vm_tx))),
+                    input: shapes.get(vm_tx).copied(),
+                    presented: prepared
+                        .get(vm_tx)
+                        .map_or(&[][..], |entry| &entry.presented),
+                },
             );
             folded.insert(*vm_tx, executed);
         }
@@ -2155,6 +2188,7 @@ mod tests {
             event_bytes: vec![4_321],
             work: DeclaredWork::ZERO,
             judges: OwnerSet::whole(),
+            presented: Arc::from(Vec::new()),
         };
         let entry = batch_entry(
             TxHash::from(Hash::from_bytes(b"entry")),

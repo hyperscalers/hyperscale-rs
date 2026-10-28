@@ -5,14 +5,16 @@
 //! declaration's attestation answers its own account's gates wherever it
 //! is composed, and its nullifier spends it once.
 
+use std::slice;
+
 use hyperscale_effects_bridge::ProtocolHasher;
-use hyperscale_effects_bridge::genesis::{OWNER_BADGE_ID, pool_owner_badge};
+use hyperscale_effects_bridge::genesis::{OWNER_BADGE_ID, founded_pool, pool_owner_badge};
 use hyperscale_effects_bridge::vm_statics::principal_for;
 use hyperscale_hbor::{DecodeError, EncodeError, from_slice_with_depth, to_vec};
 use hyperscale_types::{
     AccountSigner, ComponentAddr, ProtocolVerifier, SchemeVerifier, Transaction,
 };
-use hyperscale_vm_effects::{Intent, IntentHeader, SignedIntent, TREE_WIRE_DEPTH};
+use hyperscale_vm_effects::{Composed, Intent, IntentHeader, SignedIntent, TREE_WIRE_DEPTH};
 use hyperscale_vm_manifest_builder::{IntentBuilder, IntentError, TypedBuilder, TypedError};
 use hyperscale_vm_stdlib::account;
 use hyperscale_vm_types::PrincipalAddr;
@@ -25,7 +27,10 @@ impl Client {
     /// action on the pool, under `header`.
     ///
     /// The same inputs build the same declaration, so a composer can
-    /// rebuild it to see exactly what it is asked to pay for.
+    /// rebuild it to see exactly what it is asked to pay for. The owner's
+    /// own founded pool is typed whether or not this client's world holds
+    /// it yet, so an action on a pool founded after genesis builds the
+    /// same way as one on a pool genesis seats.
     ///
     /// # Errors
     ///
@@ -39,7 +44,9 @@ impl Client {
         call: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>,
     ) -> Result<Intent, IntentError> {
         let chain = self.records();
-        let mut decl = IntentBuilder::new(&chain, &ProtocolHasher, owner, header);
+        let founded = founded_pool(owner);
+        let composed = Composed::new(&chain, slice::from_ref(&founded), &ProtocolHasher);
+        let mut decl = IntentBuilder::new(&composed, &ProtocolHasher, owner, header);
         let badge =
             account::present_instance(&mut decl, owner, pool_owner_badge(pool), OWNER_BADGE_ID)?;
         decl.presenting(badge, call)?;

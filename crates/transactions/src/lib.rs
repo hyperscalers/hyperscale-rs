@@ -17,6 +17,7 @@
 //! and can never produce one the chain would wrongly accept.
 
 mod intents;
+mod join;
 mod staking;
 
 use std::sync::LazyLock;

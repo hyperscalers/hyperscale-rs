@@ -46,9 +46,9 @@ use crate::support::tx::{
     build_publish_tx, build_securify_tx, build_stake_tx, build_swap_tx, build_transfer_at_ceilings,
     build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
     cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
-    payment_request, payment_request_for, pool_at, recipient, remote_delegator, securify_cast,
-    sender, shared_recipient_cast, storm_artifact, storm_publishers, unbound_payer_cast,
-    unbound_remote_payer_cast, validity_around,
+    payment_request, payment_request_for, pool_at, pool_vault_cell, published_instance, recipient,
+    remote_delegator, securify_cast, sender, shared_recipient_cast, storm_artifact,
+    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_folds, await_height, await_tx_terminal};
 use crate::support::{Cluster, committees_on_separate_hosts, epochs};
@@ -3136,7 +3136,15 @@ pub fn a_published_package_runs_where_it_was_never_committed(c: &mut impl Cluste
     let package = package_hash(&ProtocolHasher, &artifact);
     let cell = package_key(package);
 
-    let world = World::open(c, *PROTOCOL_RESOURCE, [publisher.address()], []);
+    // The instance's vault is in the world: its bring-up takes its
+    // founding stake from the publisher.
+    let instance = published_instance(&artifact, CALLER_SALT, *publisher).address(&ProtocolHasher);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [publisher.address()],
+        [pool_vault_cell(instance)],
+    );
     let mut charges = Charges::default();
     let publish = build_publish_tx(key, artifact.clone(), validity_around(c.now()));
     let publish_hash = charges.submit(c, publish);

@@ -32,9 +32,9 @@ use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
     GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
-    MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
-    RETENTION_HORIZON, SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites,
-    Stated, SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
+    MIN_STAKE_FLOOR, MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr,
+    ProvisionalHolds, RETENTION_HORIZON, SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot,
+    StateWrites, Stated, SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
     WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_effects::{
@@ -4002,12 +4002,25 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     };
     let component = meta.address(&ProtocolHasher);
 
-    // The seal answers its gate from the founder's own signature, and
-    // the owner badge it mints is filed in that same account: bringing up
-    // is one node, and the supply a component comes up holding leaves
-    // with whoever composed it.
+    // The seal answers its gate from the founder's own signature, takes
+    // the founding stake the founder withdraws, and the owner badge it
+    // mints is filed in that same account: bringing up is one node, and
+    // the supply a component comes up holding leaves with whoever
+    // composed it.
+    let founding = MIN_STAKE_FLOOR.quanta();
     let mut b = GraphBuilder::new();
-    let [badge] = b.call_signed(payer, component, "instantiate", ());
+    let [funds] = b.call_signed(payer, payer, "withdraw", (*PROTOCOL_RESOURCE, founding));
+    let [badge] = b.call_signed(
+        payer,
+        component,
+        "instantiate",
+        (
+            funds.resource_is(*PROTOCOL_RESOURCE),
+            3u64,
+            [1u8; 48],
+            [2u8; 96],
+        ),
+    );
     let owner_badge = issued_resource(
         &ProtocolHasher,
         component,
@@ -4045,8 +4058,9 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     // compiled package — waiting out the compile if it is still in
     // flight — and the leaf holds the record the address derives from.
     let call = Transaction::new(client().sign_tree(&tree, &[&key], terms(TRANSFER_FEE)));
+    let funded = [(payer, founding + 1_000)];
     let executed = execute_on(
-        &[(payer, 1_000)],
+        &funded,
         &executor,
         &[Arc::new(Verified::<Transaction>::from_persisted(call))],
     );
@@ -4057,7 +4071,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         );
     };
     assert_eq!(
-        settled(writes, &[(payer, 1_000)])
+        settled(writes, &funded)
             .cells()
             .get(&config_key(component))
             .cloned()

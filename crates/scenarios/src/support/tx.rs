@@ -2049,19 +2049,23 @@ pub(crate) fn storm_publishers() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
 ///
 /// Publishing is priced per artifact byte, so a publisher needs orders
 /// more than a payment sender: the balances the transfer scenarios use
-/// would not cover one deploy.
+/// would not cover one deploy. Each also holds the founding stake an
+/// instance of the published pool comes up holding.
 #[must_use]
 pub fn storm_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     storm_publishers()
         .into_iter()
-        .map(|(_, address)| (address, STORM_FUNDING))
+        .map(|(_, address)| (address, STORM_FUNDING + PUBLISHED_FOUNDING))
         .collect()
 }
 
-/// What a storm publisher is funded with, and the ceiling each publish
-/// signs. Placeholder pricing, sized to cover the stdlib-shaped artifact
-/// the storm deploys.
+/// What a storm publisher is funded with for its deploys. Placeholder
+/// pricing, sized to cover the stdlib-shaped artifact the storm deploys.
 pub(crate) const STORM_FUNDING: u128 = 100_000_000;
+
+/// The stake an instance of a published pool comes up holding: enough
+/// for the seat its bring-up takes on.
+pub(crate) const PUBLISHED_FOUNDING: u128 = MIN_STAKE_FLOOR.quanta();
 pub(crate) const PUBLISH_MAX_FEE: u128 = 1_000_000;
 
 /// The `nonce`-th distinct publishable artifact.
@@ -2489,11 +2493,30 @@ pub(crate) fn build_instance_instantiate_tx(
     let meta = published_instance(artifact, salt, founder);
     let component = meta.address(&ProtocolHasher);
 
-    // Bringing up is one node: the seal mints the owner badge the
-    // component comes up holding, answering its gate from the founder's
-    // own signature, and that edge is filed in the founder's account.
+    // Bringing up is one node: the seal takes the founding stake the
+    // founder withdraws and mints the owner badge the component comes up
+    // holding, answering its gate from the founder's own signature, and
+    // that edge is filed in the founder's account. The validator it takes
+    // on is never a beacon fact: the published package is not the
+    // protocol's staking package.
     let mut b = GraphBuilder::new();
-    let [badge] = b.call_signed(founder, component, "instantiate", ());
+    let [funds] = b.call_signed(
+        founder,
+        founder,
+        "withdraw",
+        (*PROTOCOL_RESOURCE, PUBLISHED_FOUNDING),
+    );
+    let [badge] = b.call_signed(
+        founder,
+        component,
+        "instantiate",
+        (
+            funds.resource_is(*PROTOCOL_RESOURCE),
+            1u64,
+            [1u8; 48],
+            [2u8; 96],
+        ),
+    );
     let owner_badge = issued_resource(
         &ProtocolHasher,
         component,
