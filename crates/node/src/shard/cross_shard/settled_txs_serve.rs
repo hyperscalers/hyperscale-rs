@@ -207,7 +207,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
         ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Role, Round, SectionRoots,
         SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId,
@@ -331,7 +331,7 @@ mod tests {
             parent = commit_block(&storage, h, parent, 1_000 * h, &[finalization(h)]);
         }
         let terminal = parent;
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
 
         let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
         let response =
@@ -358,7 +358,7 @@ mod tests {
         let mut parent = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalization(1)]);
         parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[finalization(2)]);
         let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[finalization(3)]);
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
         let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
 
         // Anchor-only floor: the early settlement falls outside the window.
@@ -385,7 +385,7 @@ mod tests {
     fn wrong_terminal_hash_serves_not_found() {
         let storage = SimShardStorage::default();
         let _ = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalization(1)]);
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
         let req = GetSettledTxsRequest::new(
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
@@ -449,7 +449,7 @@ mod tests {
             &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
 
         let req = GetSettledTxsRequest::new(BlockHeight::new(1), hash);
         assert!(
@@ -472,7 +472,7 @@ mod tests {
         for h in 1..=3 {
             parent = commit_block(&storage, h, parent, 1_000 * h, &[finalization(h)]);
         }
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
         let cache = SettledTxsCache::default();
         let req = GetSettledTxsRequest::new(BlockHeight::new(3), parent);
 
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn unheld_height_serves_not_found() {
         let storage = Arc::new(SimShardStorage::default());
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
         let req = GetSettledTxsRequest::new(BlockHeight::new(7), BlockHash::ZERO);
         assert!(
             serve_settled_txs_request(&pending_chain, &SettledTxsCache::default(), None, &req)

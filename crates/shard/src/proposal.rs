@@ -1541,7 +1541,7 @@ pub fn assemble_build_action(
     let parent_qc_raw = parent_qc.into_inner();
     let action = Action::BuildProposal {
         shard_id: local_shard,
-        chain_origin: chain.chain_origin().anchor_wt,
+        chain_origin: chain.chain_origin().cut(),
         proposer: me,
         height,
         round,

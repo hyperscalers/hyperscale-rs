@@ -722,7 +722,7 @@ mod tests {
         schedule.insert(Epoch::new(0), snapshot);
         let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
-            ..BeaconChainConfig::default()
+            ..BeaconChainConfig::at_unix_epoch()
         });
         state.boundaries.insert(SHARD, genesis_boundary());
         (state, schedule)
@@ -1047,7 +1047,7 @@ mod tests {
         schedule.insert(Epoch::new(0), snapshot);
         let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
-            ..BeaconChainConfig::default()
+            ..BeaconChainConfig::at_unix_epoch()
         });
         state.boundaries.insert(SHARD, genesis_boundary());
 

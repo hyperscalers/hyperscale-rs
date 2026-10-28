@@ -204,8 +204,7 @@ fn a_committed_marker_stands_until_the_clock_proves_the_exit() {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        ChainOrigin, Hash, Inclusion, SWEEP_BUCKET_MS, Said, SweepFrontier, said_at,
-        shard_prefix_path,
+        Hash, Inclusion, SWEEP_BUCKET_MS, Said, SweepFrontier, said_at, shard_prefix_path,
     };
     use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
@@ -255,7 +254,7 @@ fn a_committed_marker_stands_until_the_clock_proves_the_exit() {
             .follow_block_writes(&block, &committed, &FrontierInputs::still(parent))
             .expect("the block commits");
         assert!(store.cell(marker).is_some(), "{holder:?} holds the marker");
-        let view = Arc::new(PendingChain::new(Arc::clone(&store), ChainOrigin::ROOT))
+        let view = Arc::new(PendingChain::new(Arc::clone(&store), BlockHeight::GENESIS))
             .view_at_persisted_tip();
 
         let mut first_swept = None;

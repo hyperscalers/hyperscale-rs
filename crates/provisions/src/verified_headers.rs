@@ -109,7 +109,11 @@ mod tests {
             shard_id: shard,
             height,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::leaf(1, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(0),
             provision_tx_roots: Capped::default(),
             ..Default::default()

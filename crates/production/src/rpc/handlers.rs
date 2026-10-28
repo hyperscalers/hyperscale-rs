@@ -209,7 +209,7 @@ pub async fn submit_transaction_handler(
     };
 
     let hash = hex_encode(transaction.hash().as_bytes());
-    if let Some(rejection) = check_validity_reach(&state, &transaction, &hash) {
+    if let Some(rejection) = check_validity_reach(&transaction, &hash) {
         return rejection;
     }
     let tx_arc = Arc::new(transaction);
@@ -385,7 +385,6 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
 /// the mempool would refuse on every shard, told to the submitter here
 /// rather than left to never appear.
 fn check_validity_reach(
-    state: &RpcState,
     transaction: &Transaction,
     hash: &str,
 ) -> Option<(StatusCode, Json<SubmitTransactionResponse>)> {
@@ -394,7 +393,7 @@ fn check_validity_reach(
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
-    let now = WeightedTimestamp::from_millis(unix_ms.saturating_sub(state.genesis_timestamp_ms));
+    let now = WeightedTimestamp::from_millis(unix_ms);
     // An envelope whose declaration does not read is the node's to
     // refuse, on the same path as one arriving by gossip.
     let window = declared_of(transaction.body()).ok()?.effective_window;

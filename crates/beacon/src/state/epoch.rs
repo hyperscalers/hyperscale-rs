@@ -6821,7 +6821,11 @@ mod tests {
             shard_id: shard,
             height: BlockHeight::new(9),
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                shard,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             round: Round::new(3),
             state_root: pair.composed_root(),
             split_child_roots: Some(pair),

@@ -469,10 +469,10 @@ mod tests {
             ring.since(ROOT, BlockHeight::new(0))[0].proposed_at,
             chain.proposed_wall_time(block.header().timestamp()),
         );
-        assert!(
-            ring.since(ROOT, BlockHeight::new(0))[0].proposed_at
-                >= UNIX_EPOCH + Duration::from_millis(chain.genesis_timestamp_ms),
-            "a header's time counts from genesis, not from 1970"
+        assert_eq!(
+            ring.since(ROOT, BlockHeight::new(0))[0].proposed_at,
+            UNIX_EPOCH + Duration::from_millis(block.header().timestamp().as_millis()),
+            "a header's time is Unix time, whatever the genesis"
         );
     }
 

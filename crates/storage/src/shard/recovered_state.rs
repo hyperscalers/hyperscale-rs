@@ -171,13 +171,14 @@ pub struct RecoveredState {
     /// Zero on a fresh start.
     pub substate_bytes: u64,
 
-    /// The chain's origin — genesis height plus start-time anchor (see
-    /// `ChainOrigin`). `ChainOrigin::ROOT` for chains born at network
-    /// genesis; a child chain created by a shard split continues the
-    /// parent's height line and clock. The coordinator reconstructs
-    /// genesis-fallback QCs from this value, so it must byte-match the
-    /// chain's real genesis QC.
-    pub chain_origin: ChainOrigin,
+    /// The origin the store recorded — genesis height plus start-time
+    /// anchor (see `ChainOrigin`) of a chain a reshape produced, which
+    /// continues its predecessor's height line and clock. `None` for a
+    /// chain born at network genesis, whose origin is `ChainOrigin::root`
+    /// at the network's genesis instant, known to the node rather than the
+    /// store. The coordinator reconstructs genesis-fallback QCs from the
+    /// origin, so it must byte-match the chain's real genesis QC.
+    pub chain_origin: Option<ChainOrigin>,
 
     /// The read frontier the committed state holds: how far along each
     /// producer this shard has read, which bounds the record presences
@@ -251,18 +252,14 @@ impl RecoveredState {
         // A genesis boundary header carries the chain's origin outright —
         // a straggler joining a split child at its first anchor recovers
         // the continued height line and clock from it. A later boundary
-        // on a child chain still reads `ROOT` here: the origin feeds
+        // on a child chain records none here: the origin feeds
         // genesis-QC reconstruction, which a joiner that far past genesis
         // never performs, and the replay's lower bound, which the history
         // walk already draws at the chain's first block.
-        let chain_origin = if boundary_header.is_genesis() {
-            ChainOrigin {
-                genesis_height: boundary_header.height(),
-                anchor_wt: committed_ts,
-            }
-        } else {
-            ChainOrigin::ROOT
-        };
+        let chain_origin = boundary_header.is_genesis().then(|| ChainOrigin {
+            genesis_height: boundary_header.height(),
+            anchor_wt: committed_ts,
+        });
         Self {
             committed_height: anchor.height,
             replay: replay_window(
@@ -270,7 +267,7 @@ impl RecoveredState {
                 anchor.height,
                 committed_ts,
                 anchor.height,
-                chain_origin,
+                chain_origin.map_or(BlockHeight::GENESIS, |origin| origin.genesis_height),
             ),
             // The dedup window starts empty, and the tail sync above the
             // anchor fills it as it commits.

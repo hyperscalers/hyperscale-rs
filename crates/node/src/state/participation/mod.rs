@@ -35,7 +35,9 @@ use hyperscale_provisions::{
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::{BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, Verifier};
+use hyperscale_types::{
+    BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, Verifier, WeightedTimestamp,
+};
 
 /// The coordinators a replica runs on its shard.
 ///
@@ -120,6 +122,7 @@ impl ShardParticipation {
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
         recovered: &RecoveredState,
+        genesis: WeightedTimestamp,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
         persisted_base: BlockHeight,
@@ -137,6 +140,7 @@ impl ShardParticipation {
             local_shard,
             shard_config.clone(),
             recovered.clone(),
+            genesis,
         );
         // One committed clock, seeded at the recovered tip and advanced by
         // the shard's commit, and one fork fence, which only this machine

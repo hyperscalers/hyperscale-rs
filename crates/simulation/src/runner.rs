@@ -473,6 +473,8 @@ pub struct SimulationRunner {
     /// Epoch window length from the beacon chain config, retained so a
     /// merge keeper's flip can recompute the cut the children crossed.
     epoch_duration_ms: u64,
+    /// The network's genesis instant, which simulated zero reads as.
+    genesis_ms: u64,
 
     /// Each host's pending wake at its nearest batch deadline, re-armed
     /// after every step it takes.
@@ -622,6 +624,10 @@ impl SimulationRunner {
         let processing = network_config
             .processing
             .unwrap_or_else(|| ProcessingTimes::disk(seed));
+        let genesis_ms = network_config
+            .beacon_chain_config
+            .unwrap_or_default()
+            .genesis_timestamp_ms;
         let clocks: Vec<HostClock> = (0..num_hosts)
             .map(|host| {
                 HostClock::drawn(
@@ -630,6 +636,7 @@ impl SimulationRunner {
                     network_config.clock_skew,
                     network_config.clock_drift_ppm,
                 )
+                .from(genesis_ms)
             })
             .collect();
 
@@ -914,6 +921,7 @@ impl SimulationRunner {
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
+            genesis_ms,
             batch_wakes: vec![None; num_hosts],
             reshape,
             reshape_stores: HashMap::new(),
@@ -1095,6 +1103,19 @@ impl SimulationRunner {
     #[must_use]
     pub const fn now(&self) -> Duration {
         self.now
+    }
+
+    /// The network's genesis instant, in Unix milliseconds.
+    #[must_use]
+    pub const fn genesis_ms(&self) -> u64 {
+        self.genesis_ms
+    }
+
+    /// The chain time at the current simulation time: Unix time, the
+    /// network's genesis instant at simulated zero.
+    #[must_use]
+    pub fn chain_now(&self) -> Duration {
+        Duration::from_millis(self.genesis_ms) + self.now
     }
 
     /// The replica of the first shard `index` hosts.
@@ -1821,8 +1842,9 @@ impl SimulationRunner {
     }
 }
 
-/// One host's clock: a fixed offset from simulated time and a drift rate,
-/// both drawn from the seed within the configured bounds.
+/// One host's clock: Unix milliseconds from the network's genesis instant
+/// at simulated zero, with a fixed offset from simulated time and a drift
+/// rate, both drawn from the seed within the configured bounds.
 ///
 /// The drift is the host's oscillator, so it paces the host's timers as
 /// well as the time it reads: a production node's local clock advances
@@ -1830,6 +1852,7 @@ impl SimulationRunner {
 /// fires before its own clock has advanced the armed duration.
 #[derive(Debug, Clone, Copy)]
 struct HostClock {
+    origin_ms: u64,
     offset_ms: i64,
     drift_ppm: i64,
 }
@@ -1851,16 +1874,23 @@ impl HostClock {
             i64::try_from(raw % span).expect("within the span") - bound
         };
         Self {
+            origin_ms: 0,
             offset_ms: draw(0, i64::try_from(skew.as_millis()).unwrap_or(i64::MAX / 4)),
             drift_ppm: draw(8, i64::from(drift_ppm)),
         }
+    }
+
+    /// This clock reading `origin_ms` at simulated zero.
+    const fn from(self, origin_ms: u64) -> Self {
+        Self { origin_ms, ..self }
     }
 
     /// What this host's clock reads, in milliseconds, at simulated `now`.
     fn read(self, now: Duration) -> u64 {
         let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX / 4);
         let drifted = now_ms + now_ms * self.drift_ppm / 1_000_000;
-        u64::try_from((drifted + self.offset_ms).max(0)).unwrap_or(0)
+        self.origin_ms
+            .saturating_add_signed(drifted + self.offset_ms)
     }
 
     /// The simulated instant a timer armed at `now` for `duration` fires:

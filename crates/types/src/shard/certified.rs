@@ -428,7 +428,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let qc = QuorumCertificate::new(
             block.hash(),
@@ -459,7 +459,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let block_hash = block.hash();
         let qc = QuorumCertificate::new(
@@ -490,7 +490,7 @@ mod tests {
             ShardId::leaf(1, 1),
             ValidatorId::new(1),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let other_qc_raw = QuorumCertificate::new(
             other_block.hash(),
@@ -518,10 +518,13 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let block_hash = block.hash();
-        let raw_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
+        let raw_qc = QuorumCertificate::genesis(
+            ShardId::leaf(1, 0),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             raw_qc.shard_id(),

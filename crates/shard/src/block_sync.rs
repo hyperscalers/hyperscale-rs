@@ -975,7 +975,11 @@ mod tests {
             header: BlockHeader::new(BlockHeaderParts {
                 height,
                 parent_block_hash: parent,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 timestamp: ProposerTimestamp::from_millis(u64::from(tag[0])),
                 ..Default::default()
             }),

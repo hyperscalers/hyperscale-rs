@@ -65,7 +65,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight,
-        ChainOrigin, FrontierInputs, ResourceAddr, SweepFrontier, SyncHint,
+        FrontierInputs, ResourceAddr, SweepFrontier, SyncHint,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher, Terms, TxHash};
 
@@ -108,7 +108,7 @@ mod tests {
         );
         let chain = Arc::new(PendingChain::new(
             Arc::new(store.clone()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ));
         let index = ChainCrossings(Arc::clone(&chain));
         let rows = |index: &ChainCrossings<SimShardStorage>| match index
@@ -193,7 +193,7 @@ mod tests {
         let store = SimShardStorage::default();
         let chain = Arc::new(PendingChain::new(
             Arc::new(store.clone()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ));
         let index = ChainCrossings(Arc::clone(&chain));
         let whole = || match index.crossing_changes(ShardId::ROOT, None).0 {
@@ -270,7 +270,7 @@ mod tests {
         store.hold_retention_at(BlockHeight::new(0));
         let chain = Arc::new(PendingChain::new(
             Arc::new(store.clone()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ));
         let index = ChainCrossings(Arc::clone(&chain));
         let done = std::sync::atomic::AtomicBool::new(false);

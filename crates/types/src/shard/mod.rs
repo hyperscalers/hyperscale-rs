@@ -115,7 +115,11 @@ mod tests {
             shard_id: ShardId::leaf(1, 0),
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::leaf(1, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             provision_tx_roots: Capped::default(),
             ..Default::default()
@@ -132,7 +136,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
 
         assert!(genesis.is_genesis());
@@ -141,7 +145,10 @@ mod tests {
         assert_eq!(genesis.header().body_root(), BodyRoot::ZERO);
         assert_eq!(
             genesis.header().parent_qc(),
-            &QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT)
+            &QuorumCertificate::genesis(
+                ShardId::leaf(1, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO)
+            )
         );
     }
 
@@ -267,7 +274,7 @@ mod tests {
                 ShardId::ROOT,
                 ValidatorId::new(0),
                 StateRoot::ZERO,
-                ChainOrigin::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
             )
         };
         let entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 1);
@@ -304,7 +311,7 @@ mod tests {
             ShardId::leaf(1, 0),
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         )
         .into_sealed()
         .into_live(Arc::new(Capped::empty()));
@@ -328,7 +335,10 @@ mod tests {
                 ..Default::default()
             });
         }
-        let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
+        let genesis_qc = QuorumCertificate::genesis(
+            ShardId::leaf(1, 0),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let bytes = hbor_to_vec(&CertifiedBlockWire {
             block: bad_block,
             qc: genesis_qc,

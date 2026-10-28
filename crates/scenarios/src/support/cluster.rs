@@ -103,9 +103,9 @@ pub trait Cluster {
     /// poll loop while reshape advances organically via the supervisor.
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool;
 
-    /// Elapsed time since genesis on the cluster's own clock — for building
-    /// transaction validity windows. Sim returns its logical now; production
-    /// returns wall-clock since start.
+    /// Chain time on the cluster's own clock, as Unix time — for building
+    /// transaction validity windows. Sim returns its logical clock from the
+    /// network's genesis instant; production returns the wall clock.
     fn now(&self) -> Duration;
 
     /// The highest committed block height on `shard`, if any host serves it.
@@ -221,7 +221,7 @@ pub trait Cluster {
     /// time anchor that is the cut a reshape successor judges pre-cut
     /// content against.
     ///
-    /// [`ChainOrigin::ROOT`] for a chain born at network genesis, so a
+    /// [`ChainOrigin::root`] for a chain born at network genesis, so a
     /// scenario reading it before a reshape sees "nothing predates this".
     /// `None` when no host serves `shard`.
     ///

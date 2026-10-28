@@ -138,7 +138,7 @@ impl SimShardStorage {
         consensus.committed_height = genesis.height();
         consensus.committed_hash = Some(genesis.hash());
         consensus.committed_qc = None;
-        consensus.chain_origin = origin;
+        consensus.chain_origin = Some(origin);
         consensus.installed_genesis = Some(genesis.height());
     }
 }
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(recovered.committed_height, BlockHeight::new(10));
         assert_eq!(recovered.committed_hash, Some(genesis.hash()));
         assert_eq!(recovered.jmt_root, Some(root));
-        assert_eq!(recovered.chain_origin, origin);
+        assert_eq!(recovered.chain_origin, Some(origin));
         assert_eq!(recovered.substate_bytes, 2);
     }
 
@@ -496,7 +496,7 @@ mod tests {
             let recovered = child.load_recovered_state(child_of(side));
             assert_eq!(recovered.committed_height, BlockHeight::new(10));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
-            assert_eq!(recovered.chain_origin, origin_at_10());
+            assert_eq!(recovered.chain_origin, Some(origin_at_10()));
             assert_eq!(recovered.substate_bytes, if side == 0 { 2 } else { 1 });
 
             assert_eq!(

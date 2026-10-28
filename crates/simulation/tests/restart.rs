@@ -1289,16 +1289,16 @@ fn voted_root(
 /// is still uncertified.
 fn assert_ran_alike(c: &mut SimCluster, shard: ShardId, replica: usize, peer: usize, tx: TxHash) {
     const STEP: Duration = Duration::from_millis(10);
-    let deadline = c.now() + Duration::from_millis(EPOCH_MS * 4);
+    let deadline = c.runner().now() + Duration::from_millis(EPOCH_MS * 4);
     let (mut ran, mut incumbent) = (None, None);
     loop {
         ran = ran.or_else(|| voted_root(c, replica, shard, tx));
         incumbent = incumbent.or_else(|| voted_root(c, peer, shard, tx));
-        if (ran.is_some() && incumbent.is_some()) || c.now() >= deadline {
+        if (ran.is_some() && incumbent.is_some()) || c.runner().now() >= deadline {
             break;
         }
         c.runner_mut().topology_step();
-        let next = c.now() + STEP;
+        let next = c.runner().now() + STEP;
         c.runner_mut().run_until(next);
     }
     assert!(
@@ -1637,13 +1637,13 @@ fn offers_legs(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool 
 fn await_legs_offered(c: &mut SimCluster, host: usize, shard: ShardId, tx: TxHash) -> bool {
     const STEP: Duration = Duration::from_millis(10);
     c.clear_drops();
-    let deadline = c.now() + Duration::from_millis(EPOCH_MS * 8);
-    while c.now() < deadline {
+    let deadline = c.runner().now() + Duration::from_millis(EPOCH_MS * 8);
+    while c.runner().now() < deadline {
         if offers_legs(c, host, shard, tx) {
             return true;
         }
         c.runner_mut().topology_step();
-        let next = c.now() + STEP;
+        let next = c.runner().now() + STEP;
         c.runner_mut().run_until(next);
     }
     false

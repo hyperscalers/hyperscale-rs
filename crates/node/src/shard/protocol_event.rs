@@ -158,8 +158,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight,
-        ChainOrigin, ShardAnchor, StandingAnswers, StateRoot, SubstateKey, WeightedTimestamp,
-        shard_prefix_path,
+        ShardAnchor, StandingAnswers, StateRoot, SubstateKey, WeightedTimestamp, shard_prefix_path,
     };
     use hyperscale_vm_effects::Answered;
 
@@ -201,7 +200,7 @@ mod tests {
             Self {
                 chain: Arc::new(PendingChain::new(
                     Arc::new(storage.clone()),
-                    ChainOrigin::ROOT,
+                    BlockHeight::GENESIS,
                 )),
                 follow: None,
             }

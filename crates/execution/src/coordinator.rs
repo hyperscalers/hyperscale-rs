@@ -3201,9 +3201,10 @@ impl ExecutionCoordinator {
     /// is contiguous, the block's own anchor across a gap. The restart's
     /// replay commits this way, since no event carries its anchors.
     ///
-    /// "First commit" means the chain has never committed, not that the
-    /// clock reads zero: a root chain's first blocks genuinely anchor at
-    /// zero, and their zero is a carriable parent anchor, not a gap.
+    /// "First commit" means the chain has never committed past its
+    /// genesis: a root chain's first blocks genuinely anchor at the
+    /// network's genesis instant, and that anchor is a carriable parent
+    /// anchor, not a gap.
     fn commit_block_carrying(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -3212,7 +3213,7 @@ impl ExecutionCoordinator {
     ) -> CommitEffects {
         let height = certified.block().height();
         let first_commit = self.committed_height == BlockHeight::GENESIS
-            && self.committed_ts == WeightedTimestamp::ZERO;
+            && self.committed_ts <= topology_schedule.windows().origin();
         let committee_anchor = if !first_commit && height == self.committed_height.next() {
             self.committed_ts
         } else {

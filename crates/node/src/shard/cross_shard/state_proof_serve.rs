@@ -244,7 +244,7 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, Inclusion, ProposerTimestamp,
+        BlockHeader, BlockHeaderParts, BlockHeight, Inclusion, ProposerTimestamp,
         QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, StateRoot,
         SubstateKey, Transaction, Verifiable, WeightedTimestamp, WitnessSources,
     };
@@ -324,7 +324,7 @@ mod tests {
             }
         }
         (
-            Arc::new(PendingChain::new(Arc::new(storage), ChainOrigin::ROOT)),
+            Arc::new(PendingChain::new(Arc::new(storage), BlockHeight::GENESIS)),
             first_root,
         )
     }
@@ -456,7 +456,7 @@ mod tests {
             })
             .collect();
         commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
-        let chain = Arc::new(PendingChain::new(storage, ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
         let key = entry_key(OWNER_SEED, 0);
         let whole_space = |cap: u32| CellRange {
             owner: key.owner,
@@ -524,7 +524,7 @@ mod tests {
             .map(|order| (order, Some(vec![0xAB; WIDTH])))
             .collect();
         commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
-        let chain = Arc::new(PendingChain::new(storage, ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
         let key = entry_key(OWNER_SEED, 0);
         let whole = |cap: u32| CellRange {
             owner: key.owner,
@@ -574,7 +574,7 @@ mod tests {
             })
             .collect();
         let root = commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
-        let chain = Arc::new(PendingChain::new(storage, ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
         let height = BlockHeight::new(1);
         let owner = entry_key(OWNER_SEED, 0).owner;
         let collection = entry_key(OWNER_SEED, 0).collection;

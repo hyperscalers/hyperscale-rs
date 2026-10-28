@@ -400,9 +400,9 @@ impl TopologySchedule {
         }
     }
 
-    /// Epoch whose window contains `wt` — `floor(wt / epoch_duration_ms)`,
-    /// genesis-relative. A zero duration (single-committee schedule) folds
-    /// every timestamp to genesis.
+    /// Epoch whose window contains `wt` — `floor((wt − genesis) /
+    /// epoch_duration_ms)`. A zero duration (single-committee schedule)
+    /// folds every timestamp to genesis.
     #[must_use]
     pub const fn epoch_for(&self, wt: WeightedTimestamp) -> Epoch {
         self.windows().epoch_for(wt)
@@ -1325,7 +1325,7 @@ impl TopologySchedule {
         shard: ShardId,
         origin_wt: WeightedTimestamp,
     ) -> Vec<Anchor> {
-        if origin_wt == WeightedTimestamp::ZERO {
+        if origin_wt <= self.windows.origin() {
             // The network's first chain. Nothing ran before it, so nothing
             // offered to it can open before it began.
             return Vec::new();

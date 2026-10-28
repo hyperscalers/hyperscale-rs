@@ -1409,7 +1409,11 @@ pub mod tests {
         BlockHeader::new(BlockHeaderParts {
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: ValidatorId::new(height.inner() % 4),
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round: Round::new(0),
@@ -1958,7 +1962,11 @@ pub mod tests {
             header: BlockHeader::new(BlockHeaderParts {
                 height,
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 proposer: ValidatorId::new(height.inner() % 4),
                 timestamp: ProposerTimestamp::from_millis(100_000),
                 round: Round::new(0),

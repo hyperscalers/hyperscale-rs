@@ -562,14 +562,14 @@ mod tests {
                 child.substate_bytes_at_version(10),
                 Some(if side == 0 { 2 } else { 1 }),
             );
-            assert_eq!(read_chain_origin(&*child.db), origin_at_10());
+            assert_eq!(read_chain_origin(&*child.db), Some(origin_at_10()));
             // The adoption batch records the genesis as the committed
             // tip, with no inherited latest QC.
             let recovered = child.load_recovered_state(child_of(side));
             assert_eq!(recovered.committed_height, BlockHeight::new(10));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert!(recovered.latest_qc.is_none());
-            assert_eq!(recovered.chain_origin, origin_at_10());
+            assert_eq!(recovered.chain_origin, Some(origin_at_10()));
             assert_eq!(
                 child.installed_genesis(),
                 Some(BlockHeight::new(10)),
@@ -818,7 +818,7 @@ mod tests {
             .unwrap();
         assert_eq!(adopted, root);
         assert_eq!(storage.read_jmt_metadata(), (10, root));
-        assert_eq!(read_chain_origin(&*storage.db), origin);
+        assert_eq!(read_chain_origin(&*storage.db), Some(origin));
         // Idempotent re-run returns the recorded adoption.
         assert_eq!(
             storage
@@ -971,7 +971,7 @@ mod tests {
             assert_eq!(adopted, followed_root);
             assert_eq!(store.read_jmt_metadata(), (9, followed_root));
             assert!(store.substate_bytes_at_version(9).is_some());
-            assert_eq!(read_chain_origin(&*store.db), origin);
+            assert_eq!(read_chain_origin(&*store.db), Some(origin));
             let recovered = store.load_recovered_state(ShardId::ROOT);
             assert_eq!(recovered.committed_height, BlockHeight::new(9));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));

@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hyperscale_engine::GenesisConfig;
 use hyperscale_engine::genesis::GenesisPackages;
@@ -66,8 +66,6 @@ pub struct ProdCluster {
     runtime: Runtime,
     inner: Harness,
     epoch_ms: u64,
-    /// Wall-clock instant captured at genesis, the origin `now` measures from.
-    started: Instant,
     /// Every validator's signer, by validator id, able to withhold its
     /// shard consensus when a scenario asks it to.
     withholding: Vec<Arc<WithholdingSigner>>,
@@ -128,7 +126,6 @@ impl ProdCluster {
         // Every `ProdCluster` claims it, so all prod scenario tests — fault or
         // not — run on the in-memory recorder; only fault runs read it back.
         let _ = global_recorder();
-        let started = Instant::now();
         let inner = runtime.block_on(Harness::start(spec));
         // Every cluster's fault gates know the hosts from the start, so a
         // scenario that installs a fault without `run_faultable` still
@@ -138,7 +135,6 @@ impl ProdCluster {
             runtime,
             inner,
             epoch_ms,
-            started,
             withholding,
             staged,
             member_rules: Vec::new(),
@@ -395,7 +391,9 @@ impl Cluster for ProdCluster {
     }
 
     fn now(&self) -> Duration {
-        self.started.elapsed()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the wall clock reads past the Unix epoch")
     }
 
     fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {

@@ -70,7 +70,8 @@ pub use constants::{
     missed_turn_limit,
 };
 pub use genesis::{
-    BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash,
+    BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, SIM_GENESIS_MS,
+    genesis_config_hash,
 };
 pub use limits::{
     MAX_BEACON_COMMITTEE, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER,

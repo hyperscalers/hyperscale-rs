@@ -119,7 +119,9 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_key;
-    use crate::{BlockHeader, BlockHeaderParts, ChainOrigin, QuorumCertificate, ShardId};
+    use crate::{
+        BlockHeader, BlockHeaderParts, ChainOrigin, QuorumCertificate, ShardId, WeightedTimestamp,
+    };
 
     #[test]
     fn test_hbor_roundtrip() {
@@ -136,7 +138,10 @@ mod tests {
                 MerkleInclusionProof::new(vec![1, 2, 3]),
                 CertifiedBlockHeader::new(
                     BlockHeader::new(BlockHeaderParts::default()),
-                    QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::default()),
+                    QuorumCertificate::genesis(
+                        ShardId::ROOT,
+                        ChainOrigin::root(WeightedTimestamp::ZERO),
+                    ),
                 ),
             ),
         ] {

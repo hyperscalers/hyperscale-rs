@@ -97,7 +97,11 @@ mod tests {
             shard_id: shard,
             height: BlockHeight::new(height),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                shard,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: ValidatorId::new(2),
             round: Round::new(7),
             state_root,
@@ -209,7 +213,11 @@ mod tests {
             shard_id: shard,
             height: BlockHeight::new(height),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                shard,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: ValidatorId::new(2),
             round: Round::new(7),
             state_root: StateRoot::from_raw(Hash::from_bytes(tag)),

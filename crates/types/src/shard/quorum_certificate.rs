@@ -68,7 +68,7 @@ impl QuorumCertificate {
     /// clock reads its floor from `parent_qc.weighted_timestamp`, so a
     /// chain's first blocks anchor their validity windows and committee
     /// lookups here. Chains born at network genesis pass
-    /// [`ChainOrigin::ROOT`]; a child chain created by a shard split
+    /// [`ChainOrigin::root`]; a child chain created by a shard split
     /// continues the parent's height line and clock instead of resetting
     /// them mid-network-life.
     #[must_use]
@@ -471,7 +471,8 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let qc =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         assert!(qc.is_genesis());
         assert_eq!(qc.height(), BlockHeight::new(0));
         assert_eq!(qc.block_hash(), BlockHash::ZERO);

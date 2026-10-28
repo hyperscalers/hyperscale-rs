@@ -968,7 +968,7 @@ impl BeaconFold {
             .values()
             .map(|chain| chain.anchors.block)
             .max()
-            .filter(|&now| now != WeightedTimestamp::ZERO)
+            .filter(|&now| now > self.topology_schedule.windows().origin())
         else {
             return Vec::new();
         };
@@ -985,8 +985,8 @@ impl BeaconFold {
     /// participant settles an adoption; this only covers the resume gap
     /// from a freshly-built or just-loaded fold.
     ///
-    /// Fires at the next epoch's wall-clock boundary
-    /// (`next_epoch × chain_config.epoch_duration`), or immediately if
+    /// Fires at the next epoch's wall-clock boundary (the close of the
+    /// current epoch's window), or immediately if
     /// `now` is already past it. Tests that want fast beacon kickoff
     /// override `chain_config.epoch_duration_ms` in the genesis config.
     #[must_use]
@@ -1007,8 +1007,8 @@ impl BeaconFold {
     /// epoch's window. The beacon starts the next epoch's SPC only once `now`
     /// reaches this, so its synthetic per-epoch clock tracks wall-clock
     /// instead of racing ahead at SPC-round speed. The window's weighted-time
-    /// cut is the same instant on this validator's local clock — the synthetic
-    /// beacon clock is anchored to `epoch × epoch_duration_ms`.
+    /// cut is the same instant on this validator's local clock: both are Unix
+    /// milliseconds, so the cut reads as a local timestamp unchanged.
     pub(crate) const fn next_epoch_boundary(&self) -> LocalTimestamp {
         let cut = self
             .state

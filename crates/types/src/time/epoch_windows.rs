@@ -1,29 +1,34 @@
 //! Epoch-window arithmetic over the chain's weighted-time grid.
 //!
-//! One window length (`epoch_duration_ms`) partitions weighted time into fixed
-//! `[k·dur, (k+1)·dur)` windows, one per [`Epoch`]. Every consumer that maps
+//! One origin (the genesis instant) and one window length
+//! (`epoch_duration_ms`) partition weighted time into fixed
+//! `[origin + k·dur, origin + (k+1)·dur)` windows, one per [`Epoch`]. Every consumer that maps
 //! between a [`WeightedTimestamp`] and an [`Epoch`] — the topology schedule's
 //! committee lookup, the beacon fold's boundary detection, the merge/split cut
 //! composition, the wall-clock pacing — resolves it here, so the two edge
 //! semantics stay consistent:
 //!
 //! - **Window membership** ([`epoch_for`](EpochWindows::epoch_for)): the
-//!   boundary instant `k·dur` belongs to the *later* window `k`.
+//!   boundary instant `origin + k·dur` belongs to the *later* window `k`.
 //! - **Boundary crossing** ([`boundary_below`](EpochWindows::boundary_below) /
 //!   [`is_crossing`](EpochWindows::is_crossing)): a QC attested at exactly
-//!   `k·dur` has *not yet* crossed boundary `k` (strictly below).
+//!   `origin + k·dur` has *not yet* crossed boundary `k` (strictly below).
 //!
 //! These differ at the exact boundary instant, so a crossing test must never
 //! be rebuilt as `epoch_for(parent) != epoch_for(qc)` — it would diverge from
-//! the strictly-below form at `wt = k·dur`. That form, here, is canonical.
+//! the strictly-below form at `wt = origin + k·dur`. That form, here, is
+//! canonical.
+//!
+//! Timestamps are Unix milliseconds; the origin is the only place genesis
+//! enters epoch numbering. A timestamp before it is in the genesis window.
 
 use std::ops::Range;
 
 use super::timestamp::WeightedTimestamp;
 use crate::{Epoch, RETENTION_HORIZON, TERMINAL_EVIDENCE_EPOCHS};
 
-/// The chain's epoch-window grid: weighted time partitioned into fixed
-/// `epoch_duration_ms` windows, one per [`Epoch`].
+/// The chain's epoch-window grid: weighted time from the genesis instant
+/// partitioned into fixed `epoch_duration_ms` windows, one per [`Epoch`].
 ///
 /// A zero duration is the single-committee / pre-rotation case: every
 /// timestamp folds to [`Epoch::GENESIS`] and no boundary crossing exists.
@@ -56,27 +61,33 @@ impl EpochWindows {
         self.epoch_duration_ms
     }
 
-    /// Epoch whose window contains `wt` — `floor(wt / epoch_duration_ms)`.
-    /// A zero duration folds every timestamp to [`Epoch::GENESIS`].
+    /// Epoch whose window contains `wt` —
+    /// `floor((wt − origin) / epoch_duration_ms)`. A zero duration, or a
+    /// timestamp before the origin, folds to [`Epoch::GENESIS`].
     #[must_use]
     pub const fn epoch_for(self, wt: WeightedTimestamp) -> Epoch {
-        match wt.as_millis().checked_div(self.epoch_duration_ms) {
+        match self.since_origin(wt).checked_div(self.epoch_duration_ms) {
             Some(epoch) => Epoch::new(epoch),
             None => Epoch::GENESIS,
         }
     }
 
-    /// The half-open weighted-time window `[epoch·dur, (epoch+1)·dur)` that
-    /// `epoch` governs. `.start` is the window's opening instant; `.end` is
-    /// the cut at its close (the opening of the next window). Both saturate
-    /// at [`u64::MAX`].
+    /// The half-open weighted-time window
+    /// `[origin + epoch·dur, origin + (epoch+1)·dur)` that `epoch` governs.
+    /// `.start` is the window's opening instant; `.end` is the cut at its
+    /// close (the opening of the next window). Both saturate at
+    /// [`u64::MAX`].
     #[must_use]
     pub const fn window_of(self, epoch: Epoch) -> Range<WeightedTimestamp> {
-        let start = epoch.inner().saturating_mul(self.epoch_duration_ms);
-        let end = epoch
-            .inner()
-            .saturating_add(1)
-            .saturating_mul(self.epoch_duration_ms);
+        let start = self
+            .origin_ms
+            .saturating_add(epoch.inner().saturating_mul(self.epoch_duration_ms));
+        let end = self.origin_ms.saturating_add(
+            epoch
+                .inner()
+                .saturating_add(1)
+                .saturating_mul(self.epoch_duration_ms),
+        );
         WeightedTimestamp::from_millis(start)..WeightedTimestamp::from_millis(end)
     }
 
@@ -123,33 +134,38 @@ impl EpochWindows {
     }
 
     /// The largest epoch boundary strictly below `wt`, as `(epoch, cut)` where
-    /// `cut = epoch·dur` is the boundary instant and `epoch` is the window it
-    /// opens. `None` when no boundary lies below `wt` — it falls in the genesis
-    /// window, or the duration is zero.
+    /// `cut = origin + epoch·dur` is the boundary instant and `epoch` is the
+    /// window it opens. `None` when no boundary lies below `wt` — it falls in
+    /// the genesis window or before it, or the duration is zero.
     #[must_use]
     pub(crate) const fn boundary_below(
         self,
         wt: WeightedTimestamp,
     ) -> Option<(Epoch, WeightedTimestamp)> {
-        let wt = wt.as_millis();
-        if self.epoch_duration_ms == 0 || wt == 0 {
+        let since = self.since_origin(wt);
+        if self.epoch_duration_ms == 0 || since == 0 {
             return None;
         }
-        let k = (wt - 1) / self.epoch_duration_ms;
+        let k = (since - 1) / self.epoch_duration_ms;
         if k == 0 {
             None
         } else {
             Some((
                 Epoch::new(k),
-                WeightedTimestamp::from_millis(k * self.epoch_duration_ms),
+                WeightedTimestamp::from_millis(self.origin_ms + k * self.epoch_duration_ms),
             ))
         }
+    }
+
+    /// Milliseconds from the origin to `wt`, zero for a timestamp before it.
+    const fn since_origin(self, wt: WeightedTimestamp) -> u64 {
+        wt.as_millis().saturating_sub(self.origin_ms)
     }
 
     /// Whether a block certified at `qc_wt` is the first across an epoch
     /// boundary: a boundary lies at or below `qc_wt` that the block's parent
     /// (`parent_qc_wt`) sits at or before. The boundary instant itself counts
-    /// as *not yet crossed*, so a chain pausing exactly on `k·dur` crosses
+    /// as *not yet crossed*, so a chain pausing exactly on a cut crosses
     /// only once it produces a block past it.
     #[must_use]
     pub const fn is_crossing(
@@ -278,6 +294,33 @@ mod tests {
         // Both inside the same window: no crossing.
         assert!(!w.is_crossing(wt(1_100), wt(1_500)));
         assert_eq!(w.crossing_epoch(wt(1_100), wt(1_500)), None);
+    }
+
+    #[test]
+    fn the_origin_opens_the_genesis_window() {
+        const ORIGIN: u64 = 1_700_000_000_000;
+        let w = EpochWindows::new(ORIGIN, DUR);
+        // Before the origin is the genesis window; nothing underflows.
+        assert_eq!(w.epoch_for(wt(0)), Epoch::GENESIS);
+        assert_eq!(w.epoch_for(wt(ORIGIN - 1)), Epoch::GENESIS);
+        assert_eq!(w.epoch_for(wt(ORIGIN + 999)), Epoch::GENESIS);
+        assert_eq!(w.epoch_for(wt(ORIGIN + 1_000)), Epoch::new(1));
+        assert_eq!(w.window_of(Epoch::new(2)).start, wt(ORIGIN + 2_000));
+        assert_eq!(w.window_of(Epoch::new(2)).end, wt(ORIGIN + 3_000));
+        assert_eq!(w.boundary_below(wt(ORIGIN)), None);
+        assert_eq!(w.boundary_below(wt(ORIGIN - 5)), None);
+        assert_eq!(w.boundary_below(wt(ORIGIN + 1_000)), None);
+        assert_eq!(
+            w.boundary_below(wt(ORIGIN + 1_001)),
+            Some((Epoch::new(1), wt(ORIGIN + 1_000)))
+        );
+        assert!(!w.is_crossing(wt(ORIGIN + 999), wt(ORIGIN + 1_000)));
+        assert!(w.is_crossing(wt(ORIGIN + 1_000), wt(ORIGIN + 1_001)));
+        // Epoch numbering agrees with a genesis-relative grid at every instant.
+        let relative = EpochWindows::new(0, DUR);
+        for at in [0, 1, 999, 1_000, 1_001, 7_654_321] {
+            assert_eq!(w.epoch_for(wt(ORIGIN + at)), relative.epoch_for(wt(at)));
+        }
     }
 
     #[test]

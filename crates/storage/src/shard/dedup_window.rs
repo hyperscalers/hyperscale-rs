@@ -21,7 +21,7 @@
 //! one here, so the gap is reported instead of erasing the window.
 
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, DEDUP_WINDOW, Engagement, FinalizationHash, ProvisionHash,
+    Block, BlockHeight, DEDUP_WINDOW, Engagement, FinalizationHash, ProvisionHash,
     RETENTION_HORIZON, SubstateKey, TxHash, WeightedTimestamp,
 };
 
@@ -102,7 +102,7 @@ impl DedupWindow {
     /// it. Early is the conservative direction — a batch whose entry expired
     /// early is re-requested, not wrongly admitted.
     ///
-    /// `origin` is where this chain begins, which is not generally height
+    /// `genesis_height` is where this chain begins, which is not generally
     /// zero: a reshape successor continues its predecessor's height line.
     /// Reaching it makes the window whole, because what lies below is the
     /// predecessor's and is refused on validity rather than on dedup.
@@ -111,13 +111,13 @@ impl DedupWindow {
         reader: &R,
         committed_height: BlockHeight,
         committed_ts: WeightedTimestamp,
-        origin: ChainOrigin,
+        genesis_height: BlockHeight,
     ) -> Self {
         let floor = committed_ts.minus(DEDUP_WINDOW);
         let mut window = Self::default();
         let mut height = committed_height;
         loop {
-            if height < origin.genesis_height {
+            if height < genesis_height {
                 // The bottom of this chain. Nothing beneath it was ever
                 // committed *here*: a predecessor's finalizations and
                 // provisions reached their own chain, and every one of its

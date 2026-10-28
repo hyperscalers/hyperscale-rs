@@ -281,7 +281,8 @@ impl ProvisionCoordinator {
         let mut actions: Vec<Action> = Vec::new();
         let block = certified.block();
         let new_ts = certified.block().header().parent_qc().weighted_timestamp();
-        self.expected.record_block_committed(new_ts);
+        self.expected
+            .record_block_committed(new_ts, topology_schedule.windows().origin());
         let local_ts = self.expected.local_ts();
 
         // Drop provisions committed in this block from the proposer queue
@@ -2027,7 +2028,11 @@ mod tests {
             shard_id: shard,
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::leaf(2, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
             state_root: StateRoot::from_raw(Hash::from_bytes(
                 format!("root_{shard}_{height}").as_bytes(),
@@ -2061,7 +2066,7 @@ mod tests {
     /// block's `parent_qc` weighted timestamp, so fixtures anchor their time
     /// there while keeping the QC genesis-shaped (so `is_genesis()` holds).
     fn genesis_qc_at(shard: ShardId, weighted_ts_ms: u64) -> QuorumCertificate {
-        let g = QuorumCertificate::genesis(shard, ChainOrigin::ROOT);
+        let g = QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO));
         QuorumCertificate::new(
             g.block_hash(),
             g.shard_id(),
@@ -2097,7 +2102,10 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = {
-            let __qc = QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT);
+            let __qc = QuorumCertificate::genesis(
+                ShardId::leaf(2, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            );
             QuorumCertificate::new(
                 block.hash(),
                 __qc.shard_id(),

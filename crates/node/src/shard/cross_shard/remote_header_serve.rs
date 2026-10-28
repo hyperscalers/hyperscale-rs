@@ -133,9 +133,7 @@ mod tests {
         commit_settled_at, make_test_block, make_test_certified,
     };
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, ChainOrigin, HeaderFetchCount,
-    };
+    use hyperscale_types::{BeaconWitnessCommit, BeaconWitnessLeafCount, HeaderFetchCount};
 
     use super::*;
 
@@ -189,7 +187,7 @@ mod tests {
             );
         }
         storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(3));
-        let chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
         let ask = |from: u64| {
             serve_remote_headers_request(
                 &chain,

@@ -1822,7 +1822,7 @@ impl VerificationPipeline {
             block.certificates().iter().cloned().collect();
         let creations = committed_here(
             block.header().shard_id(),
-            chain.chain_origin().anchor_wt,
+            chain.chain_origin().cut(),
             block.transactions().iter().map(|tx| tx.as_unverified()),
         );
         Some(ReadyStateRootVerification {
@@ -2264,7 +2264,11 @@ mod tests {
         BlockHeader::new(BlockHeaderParts {
             height,
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(0),
             provision_tx_roots: Capped::default(),
             txs_in_flight: TxsInFlight::new(u64::from(in_flight)),
@@ -2332,7 +2336,11 @@ mod tests {
         let header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(100),
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(0),
             provision_tx_roots: Capped::default(),
             settled_tick_frontier: BlockHeight::new(frontier),
@@ -2428,7 +2436,7 @@ mod tests {
     ) -> ChainView<'a> {
         ChainView::new(
             ShardId::ROOT,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
             committed_height,
             committed_hash,
             StateRoot::ZERO,
@@ -2447,7 +2455,10 @@ mod tests {
 
     #[test]
     fn classify_vote_terms_skips_vote_when_locked() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
 
@@ -2465,7 +2476,10 @@ mod tests {
     fn classify_vote_terms_skips_vote_when_parent_pruned() {
         // A pruned parent resolves neither term: skip voting but still
         // keep verifying.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = block_with(BlockHeight::new(5), bh(b"parent"), 0, vec![]);
         let block_hash = block.hash();
 
@@ -2477,7 +2491,10 @@ mod tests {
     /// block claims: only a count that was resolved and differs aborts.
     #[test]
     fn classify_vote_terms_skips_vote_on_an_unresolved_drain() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = block_with(BlockHeight::new(5), bh(b"parent"), 9, vec![]);
         let block_hash = block.hash();
 
@@ -2488,7 +2505,10 @@ mod tests {
 
     #[test]
     fn classify_vote_terms_proceeds_when_the_block_claims_the_rows_standing() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
 
@@ -2505,7 +2525,10 @@ mod tests {
     #[test]
     fn classify_vote_terms_aborts_on_in_flight_mismatch() {
         // No row stands after the block, and it claims five.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
 
@@ -2525,7 +2548,10 @@ mod tests {
     /// tally of its transactions over its parent's total is refused.
     #[test]
     fn the_drain_states_the_rows_the_block_leaves() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let standing = Some(TxsInFlight::new(2));
         let classify = |vp: &mut VerificationPipeline, block: &Block| {
@@ -2567,7 +2593,10 @@ mod tests {
 
     #[test]
     fn drain_ready_state_root_verifications_returns_empty_when_nothing_ready() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
 
         assert!(vp.take_ready_state_root_verifications().is_empty());
     }
@@ -2576,7 +2605,10 @@ mod tests {
     fn drain_ready_state_root_verifications_enriches_from_chain_view() {
         // Parent is at GENESIS height ≤ last_persisted_height, so initiate
         // queues this entry directly into ready_state_root_verifications.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let parent_block_hash = bh(b"parent");
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
@@ -2629,7 +2661,10 @@ mod tests {
         // A sync-admitted block is never pending: its verification is
         // queued at admission and resolves its inputs off the certified
         // cache, so its tree lands in the overlay like a live block's.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let synced = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let synced_hash = synced.hash();
         let qc = QuorumCertificate::new(
@@ -2666,7 +2701,7 @@ mod tests {
         let certified = vp.verified_certified_blocks().clone();
         let chain = ChainView::new(
             ShardId::ROOT,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             StateRoot::ZERO,
@@ -2696,7 +2731,10 @@ mod tests {
         // A sibling verification can call `remove_pending_block` between
         // queue-up and drain. Drain must skip the orphaned entry rather than
         // dispatch with empty `finalizations` against the wrong inputs.
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let parent_block_hash = bh(b"parent");
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
@@ -2739,7 +2777,10 @@ mod tests {
     /// there, and a base above the parent derives none.
     #[test]
     fn a_named_base_counts_from_any_tip_between_it_and_the_parent() {
-        let vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let schedule = dummy_schedule(&TestCommittee::new(4, 7).topology_snapshot(1));
 
         // Heights 1..=3 over a committed genesis, none claiming a total —
@@ -2768,7 +2809,11 @@ mod tests {
             BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(4),
                 parent_block_hash: parent,
-                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                parent_qc: QuorumCertificate::genesis(
+                    ShardId::ROOT,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                )
+                .into(),
                 substate_base: Some(BlockHeight::new(base)),
                 ..Default::default()
             })
@@ -2924,7 +2969,10 @@ mod tests {
     fn beacon_witness_verification_defers_on_missing_ancestor() {
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -2966,7 +3014,10 @@ mod tests {
     fn deferred_beacon_witness_children_drain_by_parent_hash() {
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -3017,7 +3068,10 @@ mod tests {
 
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -3078,7 +3132,10 @@ mod tests {
     fn failed_beacon_witness_clears_dependent_children() {
         use crate::beacon_witnesses::BeaconWitnessAccumulator;
 
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let topology_snapshot = TestCommittee::new(4, 7).topology_snapshot(1);
         let accumulator = BeaconWitnessAccumulator::new();
         let pending = PendingBlocks::new();
@@ -3118,7 +3175,7 @@ mod tests {
             ShardId::ROOT,
             ValidatorId::new(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         )
     }
 
@@ -3141,7 +3198,10 @@ mod tests {
     /// `checked` before the QC completes the assembly.
     #[test]
     fn assembly_waits_for_every_outstanding_check() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = assembly_block();
         let block_hash = block.hash();
         let verified_qc =
@@ -3179,7 +3239,10 @@ mod tests {
     /// already fired.
     #[test]
     fn assembly_reads_checks_that_passed_before_it_was_tracked() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = assembly_block();
         let block_hash = block.hash();
         let verified_qc =
@@ -3209,7 +3272,11 @@ mod tests {
         let forged_header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(0),
             body_root: BodyRoot::from_raw(Hash::from_bytes(b"forged-body-root")),
             provision_tx_roots: Capped::default(),
@@ -3241,7 +3308,10 @@ mod tests {
     /// is a no-op returning `None`.
     #[test]
     fn record_qc_assembly_returns_none_for_unknown_block() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let block = assembly_block();
         let verified_qc =
             Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
@@ -3257,7 +3327,10 @@ mod tests {
     /// without this edge the round runs out its view-change timeout.
     #[test]
     fn substate_park_releases_when_the_ancestor_state_root_verifies() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let ancestor = bh(b"outstanding-delta");
 
         vp.defer_proposal_on_substate(ancestor);
@@ -3287,7 +3360,10 @@ mod tests {
     /// land for it — its commit is the release.
     #[test]
     fn substate_park_releases_when_the_ancestor_commits() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         let ancestor = bh(b"sync-admitted");
 
         vp.defer_proposal_on_substate(ancestor);
@@ -3304,7 +3380,10 @@ mod tests {
     /// reconcile releases the park unconditionally.
     #[test]
     fn substate_park_releases_when_the_frontier_reconciles() {
-        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let mut vp = VerificationPipeline::new(
+            BlockHeight::GENESIS,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
 
         vp.release_substate_park_on_reconcile();
         assert!(

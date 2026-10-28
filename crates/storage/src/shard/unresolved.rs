@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, ChainOrigin, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
+    BlockHeight, CertifiedBlock, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
     TRANSACTION_EVIDENCE_HORIZON, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
@@ -78,7 +78,7 @@ pub(crate) const REPLAY_REACH: Duration =
 /// committed — the reverse would drop a release whose registration had
 /// not happened yet.
 ///
-/// Bounded below by `origin`, the height this chain begins at. A split
+/// Bounded below by `genesis_height`, the height this chain begins at. A split
 /// child's `RocksDB` store is a hard-linked clone of its parent's and
 /// holds the parent's whole chain, so a walk measured in time alone
 /// reads the parent's blocks as this chain's and replays parts no peer
@@ -98,14 +98,14 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
-    origin: ChainOrigin,
+    genesis_height: BlockHeight,
 ) -> Option<BlockHeight> {
     let cutoff = replay_cutoff(committed_ts);
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;
     while let Some(previous) = oldest.prev() {
-        if previous < origin.genesis_height {
+        if previous < genesis_height {
             break;
         }
         match reader.get_block(previous) {
@@ -244,9 +244,11 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
     retention_floor: BlockHeight,
-    origin: ChainOrigin,
+    genesis_height: BlockHeight,
 ) -> ReplayWindow {
-    let Some(owed) = unresolved_replay_floor(reader, committed_height, committed_ts, origin) else {
+    let Some(owed) =
+        unresolved_replay_floor(reader, committed_height, committed_ts, genesis_height)
+    else {
         return ReplayWindow::default();
     };
     let dispatch_from = owed.max(retention_floor.next());
@@ -254,7 +256,7 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
         reader,
         committed_height,
         committed_ts,
-        origin,
+        genesis_height,
         owed,
         dispatch_from,
     );
@@ -307,12 +309,12 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
 /// record naming a member is reached too, since it carries every term
 /// abandoning the member takes. A member committed further down, or on
 /// no block of this chain's, is seated as far as the store reaches.
-/// Never below `origin`, nor beneath a block the store no longer holds.
+/// Never below `genesis_height`, nor beneath a block the store no longer holds.
 fn settled_reach<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
-    origin: ChainOrigin,
+    genesis_height: BlockHeight,
     owed: BlockHeight,
     dispatch_from: BlockHeight,
 ) -> BlockHeight {
@@ -353,7 +355,7 @@ fn settled_reach<R: ShardChainReader + ?Sized>(
             return floor;
         }
         match height.prev() {
-            Some(below) if below >= origin.genesis_height => height = below,
+            Some(below) if below >= genesis_height => height = below,
             _ => return floor.max(height),
         }
     }

@@ -290,7 +290,11 @@ impl ShardSupervisor {
         }
         self.bootstrapping.remove(&shard);
         if !fresh_store && recovered.committed_height == BlockHeight::GENESIS {
-            let genesis = installed_network_genesis_block(shard, storage.state_root());
+            let genesis = installed_network_genesis_block(
+                shard,
+                storage.state_root(),
+                self.process.topology_schedule().windows().origin(),
+            );
             info!(
                 shard = ?shard,
                 genesis_hash = ?genesis.hash(),
@@ -314,6 +318,7 @@ impl ShardSupervisor {
             shard,
             &topology_snapshot,
             &self.engine_bootstrap.config,
+            self.process.topology_schedule().windows().origin(),
         );
         info!(
             shard = ?shard,

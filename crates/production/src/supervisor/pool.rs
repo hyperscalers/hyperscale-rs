@@ -31,7 +31,6 @@ impl ShardSupervisor {
             beacon_rx: self.beacon_event_rx.clone(),
             shutdown_rx,
             participation_tx: self.participation_tx.clone(),
-            genesis_offset_ms: self.genesis_offset_ms,
             headers: Arc::clone(&self.publishers.headers),
             observations: self.publishers.observations.clone(),
             genesis: self.beacon_config_hash,

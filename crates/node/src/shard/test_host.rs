@@ -50,7 +50,7 @@ impl Fixture {
         let pool = test_pool(0);
         let ids: Vec<ValidatorId> = (0..4).map(|i| committee.validator_id(i)).collect();
         let config = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: (0..4)
                 .map(|i| GenesisValidator {
                     id: committee.validator_id(i),

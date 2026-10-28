@@ -288,7 +288,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         ShardId::ROOT,
         ChainOrigin {
             anchor_wt: WeightedTimestamp::from_millis(anchor_wt_ms),
-            ..ChainOrigin::ROOT
+            ..ChainOrigin::root(WeightedTimestamp::ZERO)
         },
     );
     Block::Live {
@@ -855,7 +855,11 @@ pub fn commit_block_with_witnesses(
         header: BlockHeader::new(BlockHeaderParts {
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(height.inner() * 1000),
             beacon_witness_root: root,
             beacon_witness_leaf_count: count,
@@ -912,7 +916,11 @@ pub fn commit_block_with_witness_window(
         header: BlockHeader::new(BlockHeaderParts {
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(height.inner() * 1000),
             beacon_witness_root: root,
             beacon_witness_leaf_count: count,
@@ -4271,7 +4279,7 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
     let chain_over = |store: &S| {
         Arc::new(PendingChain::new(
             Arc::new(store.clone()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ))
     };
 
@@ -4780,7 +4788,7 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
             storage,
             BlockHeight::new(4),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         Some(BlockHeight::new(2)),
         "the replay starts at the block committing what is still owed",
@@ -4809,7 +4817,7 @@ fn assert_replayed_window(storage: &(impl ShardChainReader + TestStore)) {
         BlockHeight::new(4),
         WeightedTimestamp::ZERO,
         BlockHeight::GENESIS,
-        ChainOrigin::ROOT,
+        BlockHeight::GENESIS,
     );
     let heights: Vec<BlockHeight> = window
         .blocks
@@ -4874,7 +4882,7 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
         BlockHeight::new(4),
         WeightedTimestamp::ZERO,
         BlockHeight::new(2),
-        ChainOrigin::ROOT,
+        BlockHeight::GENESIS,
     );
     assert_eq!(
         retired.blocks.len(),
@@ -4937,7 +4945,7 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
             BlockHeight::new(5),
             WeightedTimestamp::ZERO,
             BlockHeight::new(retention_floor),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         );
         let first = window
             .blocks
@@ -4950,7 +4958,7 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
             storage,
             BlockHeight::new(5),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         Some(BlockHeight::new(4)),
         "fixture precondition: only the open transaction is owed",
@@ -5029,7 +5037,7 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
             storage,
             BlockHeight::new(3),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         Some(BlockHeight::new(2)),
         "the replay opens at the record, which is where the entry comes from",
@@ -5057,7 +5065,7 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
             storage,
             BlockHeight::new(4),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         None,
         "a discharged record holds nothing down",
@@ -5118,7 +5126,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
             storage,
             BlockHeight::new(2),
             past_retention,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         Some(BlockHeight::new(1)),
         "past the retention horizon a whole entry is gone, but a leg entry \
@@ -5130,7 +5138,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
             storage,
             BlockHeight::new(2),
             past_horizon,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         None,
         "and past its own horizon nothing is owed, so nothing holds it down",
@@ -5188,7 +5196,7 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
             storage,
             BlockHeight::new(2),
             WeightedTimestamp::ZERO,
-            origin
+            origin.genesis_height
         ),
         Some(BlockHeight::new(2)),
         "the walk stops at the origin, so the predecessor's unresolved \
@@ -5199,7 +5207,7 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
             storage,
             BlockHeight::new(2),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ),
         Some(BlockHeight::new(1)),
         "and a chain that really does begin at the root reaches both",
@@ -5251,7 +5259,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
             storage,
             BlockHeight::new(2),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         Some(BlockHeight::new(1)),
         "a leg that succeeded is still unresolved, so its commit holds the floor",
@@ -5277,7 +5285,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
             storage,
             BlockHeight::new(3),
             WeightedTimestamp::ZERO,
-            ChainOrigin::ROOT
+            BlockHeight::GENESIS
         ),
         None,
         "a deciding finalization releases the floor",
@@ -6883,7 +6891,7 @@ where
         let deadline = Deadline::of_transaction(&transaction);
         let marker = committed_tx_cells(ShardId::ROOT, [&transaction]);
         let base = Arc::new(store);
-        let chain = Arc::new(PendingChain::new(Arc::clone(&base), ChainOrigin::ROOT));
+        let chain = Arc::new(PendingChain::new(Arc::clone(&base), BlockHeight::GENESIS));
         let mut blocks: Vec<Block> = Vec::new();
         let mut roots = vec![base.state_root()];
         let mut pending: Vec<Arc<JmtSnapshot>> = Vec::new();
@@ -7179,7 +7187,7 @@ pub fn test_pending_views_serve_random_leaf_chains<S>(
 
         for persisted in 0..=HEIGHTS {
             let base = Arc::new(fresh());
-            let chain = Arc::new(PendingChain::new(Arc::clone(&base), ChainOrigin::ROOT));
+            let chain = Arc::new(PendingChain::new(Arc::clone(&base), BlockHeight::GENESIS));
             let genesis_root = base.state_root();
             let land = |parent: Option<&RandomLeafBlock>,
                         height: u64,
@@ -7474,7 +7482,7 @@ pub fn test_the_floor_stops_at_the_lowest_block_held(
     let floor = chain_floor(
         storage,
         FloorInputs {
-            origin: ChainOrigin::ROOT,
+            origin: ChainOrigin::root(WeightedTimestamp::ZERO),
             oldest_pin: Some(BlockHeight::new(8)),
             settled_window_floor: None,
         },

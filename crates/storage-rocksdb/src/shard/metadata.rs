@@ -120,9 +120,8 @@ pub fn write_chain_origin(batch: &mut WriteBatch, origin: ChainOrigin) {
 
 /// Read the chain's origin — genesis height plus start-time anchor.
 ///
-/// Returns [`ChainOrigin::ROOT`] when no record exists: only split-child
-/// adoption writes one, so every store predating it is a chain born at
-/// network genesis.
-pub fn read_chain_origin(store: &impl ReadableStore) -> ChainOrigin {
-    typed_cf::meta_read::<ChainOriginEntry>(store).unwrap_or(ChainOrigin::ROOT)
+/// `None` when no record exists: only reshape adoption writes one, so a
+/// store without it holds a chain born at network genesis.
+pub fn read_chain_origin(store: &impl ReadableStore) -> Option<ChainOrigin> {
+    typed_cf::meta_read::<ChainOriginEntry>(store)
 }

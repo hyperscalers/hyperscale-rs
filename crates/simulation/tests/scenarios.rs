@@ -558,16 +558,18 @@ fn an_idle_member_down_for(seed: u64, down: Duration) -> bool {
     let host = cluster.host_of(victim).expect("the member runs a host");
     let others: Vec<usize> = (0..cluster.host_count()).filter(|h| *h != host).collect();
 
+    // Simulated time counts from genesis, so it divides into epochs as is.
     let epoch = Duration::from_millis(EPOCH_MS);
-    let window =
-        u32::try_from(cluster.now().as_millis() / u128::from(EPOCH_MS)).expect("a short run") + 1;
+    let window = u32::try_from(cluster.runner().now().as_millis() / u128::from(EPOCH_MS))
+        .expect("a short run")
+        + 1;
     let start = epoch * window + Duration::from_secs(5);
-    assert!(cluster.run_until(epochs(2), |c| c.now() >= start));
+    assert!(cluster.run_until(epochs(2), |c| c.runner().now() >= start));
     for type_id in SHARD_CONSENSUS_TYPES {
         let _ = cluster.drop_type_between(&[host], &others, type_id);
         let _ = cluster.drop_type_between(&others, &[host], type_id);
     }
-    assert!(cluster.run_until(epochs(1), |c| c.now() >= start + down));
+    assert!(cluster.run_until(epochs(1), |c| c.runner().now() >= start + down));
     cluster.clear_drops();
 
     let folded = u64::from(window) + 2;
@@ -883,7 +885,7 @@ const fn together(_: &mut SimCluster, _: TxHash) {}
 /// the slice a scenario's own waits advance by, which is several blocks.
 fn after(ms: u64) -> impl FnOnce(&mut SimCluster, TxHash) {
     move |c, _| {
-        let due = c.now() + Duration::from_millis(ms);
+        let due = c.runner().now() + Duration::from_millis(ms);
         c.runner_mut().run_until(due);
     }
 }
@@ -893,14 +895,17 @@ fn after(ms: u64) -> impl FnOnce(&mut SimCluster, TxHash) {
 /// blocks right after that tick.
 fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
     move |c, first| {
-        let limit = c.now() + Duration::from_millis(EPOCH_MS) * 16;
+        let limit = c.runner().now() + Duration::from_millis(EPOCH_MS) * 16;
         while !matches!(
             c.member_rows(shard)
                 .and_then(|rows| rows.get(&first).copied()),
             Some(RowState::InFlight { .. } | RowState::Stated { .. })
         ) {
-            assert!(c.now() < limit, "a tick must name the first of the pair");
-            let next = c.now() + Duration::from_millis(50);
+            assert!(
+                c.runner().now() < limit,
+                "a tick must name the first of the pair"
+            );
+            let next = c.runner().now() + Duration::from_millis(50);
             c.runner_mut().run_until(next);
         }
     }
@@ -911,13 +916,13 @@ fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
 /// blocks right after that commit.
 fn behind_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
     move |c, first| {
-        let limit = c.now() + Duration::from_millis(EPOCH_MS) * 16;
+        let limit = c.runner().now() + Duration::from_millis(EPOCH_MS) * 16;
         while c.chain_fate(shard, first).0.is_none() {
             assert!(
-                c.now() < limit,
+                c.runner().now() < limit,
                 "the payer's shard must commit the first of the pair",
             );
-            let next = c.now() + Duration::from_millis(50);
+            let next = c.runner().now() + Duration::from_millis(50);
             c.runner_mut().run_until(next);
         }
     }
@@ -1342,7 +1347,7 @@ fn once_certified_past_the_deadline_on(
     shard: ShardId,
 ) -> impl FnOnce(&mut SimCluster, WeightedTimestamp) {
     move |c, deadline| {
-        let limit = c.now() + Duration::from_millis(EPOCH_MS);
+        let limit = c.runner().now() + Duration::from_millis(EPOCH_MS);
         let certified_past = |c: &SimCluster| {
             let tip = c.committed_height(shard)?;
             let block = c
@@ -1353,10 +1358,10 @@ fn once_certified_past_the_deadline_on(
         };
         while certified_past(c) != Some(true) {
             assert!(
-                c.now() < limit,
+                c.runner().now() < limit,
                 "the member's shard must commit a block certified past its deadline",
             );
-            let next = c.now() + Duration::from_millis(50);
+            let next = c.runner().now() + Duration::from_millis(50);
             c.runner_mut().run_until(next);
         }
     }

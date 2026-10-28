@@ -88,7 +88,7 @@ mod tests {
     use hyperscale_storage::PendingChain;
     use hyperscale_storage::test_helpers::{commit_block_with_witnesses, stake_deposit};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::{BlockHash, BlockHeight, ChainOrigin, Hash, ShardWitnessPayload};
+    use hyperscale_types::{BlockHash, BlockHeight, Hash, ShardWitnessPayload};
 
     use super::*;
 
@@ -111,7 +111,7 @@ mod tests {
         let storage = SimShardStorage::default();
         let leaves: Vec<_> = (1u64..=5).map(stake_deposit).collect();
         let block_hash = commit_block_with_witnesses(&storage, BlockHeight::new(1), &leaves);
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
 
         let mut assembled: Vec<Hash> = Vec::new();
         loop {
@@ -134,7 +134,7 @@ mod tests {
         let storage = SimShardStorage::default();
         let leaves: Vec<_> = (1u64..=3).map(stake_deposit).collect();
         let block_hash = commit_block_with_witnesses(&storage, BlockHeight::new(1), &leaves);
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
 
         let unknown = request(99, block_hash, 0, 10);
         assert!(
@@ -161,7 +161,7 @@ mod tests {
         let storage = SimShardStorage::default();
         let leaves: Vec<_> = (1u64..=3).map(stake_deposit).collect();
         let block_hash = commit_block_with_witnesses(&storage, BlockHeight::new(1), &leaves);
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
 
         let req = request(1, block_hash, 4, 10);
         assert!(
@@ -175,7 +175,7 @@ mod tests {
     fn zero_leaf_history_serves_an_empty_final_page() {
         let storage = SimShardStorage::default();
         let block_hash = commit_block_with_witnesses(&storage, BlockHeight::new(1), &[]);
-        let pending_chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(Arc::new(storage), BlockHeight::GENESIS);
 
         let chunk = serve_witness_history_request(&pending_chain, &request(1, block_hash, 0, 10))
             .history

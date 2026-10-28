@@ -324,7 +324,7 @@ mod tests {
         for height in 1..=len {
             let parent_hash = blocks.last().map_or(BlockHash::ZERO, CertifiedBlock::hash);
             let parent_qc = if height == 1 {
-                QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT).into()
+                QuorumCertificate::genesis(SHARD, ChainOrigin::root(WeightedTimestamp::ZERO)).into()
             } else {
                 parent_qc_of(parent_hash, height * 1000)
             };

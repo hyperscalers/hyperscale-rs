@@ -184,7 +184,11 @@ mod tests {
             shard_id: SHARD,
             height,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                SHARD,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_000 * height.inner()),
             beacon_witness_root,
             beacon_witness_leaf_count,
@@ -265,7 +269,7 @@ mod tests {
             &window,
             None,
         );
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
         let root = pending_chain
             .certified_header(BlockHeight::new(1))
             .expect("committed anchor resolves")
@@ -300,7 +304,7 @@ mod tests {
             &leaves,
             BeaconWitnessLeafCount::ZERO,
         );
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
 
         // A strict sub-range: flanks are needed on the left, derived on
         // the right.
@@ -332,7 +336,7 @@ mod tests {
     #[test]
     fn fetch_against_unknown_block_height_returns_empty() {
         let storage = Arc::new(SimShardStorage::default());
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
         let req = GetShardWitnessesRequest::new(
             SHARD,
             BlockHeight::new(99),
@@ -394,7 +398,7 @@ mod tests {
             &leaves,
             BeaconWitnessLeafCount::ZERO,
         );
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
 
         let req = GetShardWitnessesRequest::new(
             SHARD,
@@ -422,7 +426,7 @@ mod tests {
             &leaves,
             BeaconWitnessLeafCount::ZERO,
         );
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
 
         let req = GetShardWitnessesRequest::new(
             SHARD,
@@ -454,7 +458,7 @@ mod tests {
             &leaves,
             BeaconWitnessLeafCount::ZERO,
         );
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
 
         let req = GetShardWitnessesRequest::new(
             SHARD,
@@ -477,7 +481,7 @@ mod tests {
             &[],
             BeaconWitnessLeafCount::ZERO,
         );
-        let pending_chain = PendingChain::new(storage, ChainOrigin::ROOT);
+        let pending_chain = PendingChain::new(storage, BlockHeight::GENESIS);
 
         let req = GetShardWitnessesRequest::new(
             SHARD,

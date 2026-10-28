@@ -102,10 +102,12 @@ mod tests {
     use super::*;
     use crate::{
         ChainOrigin, NetworkDefinition, ShardId, Timeout, ValidatorId, Verified, VoteCount,
+        WeightedTimestamp,
     };
 
     fn certificate_at(round: u64) -> TimeoutCertificate {
-        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let genesis =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         let shares: Vec<Verified<Timeout>> = (0..3u64)
             .map(|voter| {
                 Verified::<Timeout>::sign_local(

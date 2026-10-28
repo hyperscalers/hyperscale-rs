@@ -1241,7 +1241,7 @@ mod tests {
             SHARD,
             fix.committee.validator_id(0),
             state_root,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let _ = shard_loop.install_genesis(&genesis);
         shard_loop.dispatch_event(ProtocolEvent::BeaconBlockPersisted {
@@ -1382,7 +1382,7 @@ mod tests {
     fn timeout_at(signer: ValidatorId, round: u64) -> Action {
         Action::SignAndBroadcastTimeout {
             round: Round::new(round),
-            high_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
+            high_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::root(WeightedTimestamp::ZERO)),
             high_tc: None,
             recipients: Vec::new(),
             position: VotePosition {

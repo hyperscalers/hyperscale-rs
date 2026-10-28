@@ -1043,9 +1043,7 @@ mod tests {
             answer_leaf, commit_settled_at, make_test_block, make_test_certified,
         };
         use hyperscale_storage::{AnswerFollow, AnswerSource, CrossingJournal, PendingChain};
-        use hyperscale_types::{
-            BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, ChainOrigin,
-        };
+        use hyperscale_types::{BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash};
         use hyperscale_vm_effects::Answered;
 
         /// The store's chain, its journal read through a lock the test
@@ -1093,7 +1091,7 @@ mod tests {
         );
         let chain = Arc::new(PendingChain::new(
             Arc::new(storage.clone()),
-            ChainOrigin::ROOT,
+            BlockHeight::GENESIS,
         ));
         let under = NibblePath::empty();
         let mut follow = None;

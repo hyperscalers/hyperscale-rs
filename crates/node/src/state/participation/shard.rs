@@ -516,7 +516,10 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardId::leaf(1, 1), ChainOrigin::ROOT),
+                QuorumCertificate::genesis(
+                    ShardId::leaf(1, 1),
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                ),
             )));
 
         let pre_prov = node
@@ -1079,7 +1082,11 @@ mod tests {
             shard_id: ShardId::ROOT,
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"unknown parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             round,
             ..Default::default()
         });

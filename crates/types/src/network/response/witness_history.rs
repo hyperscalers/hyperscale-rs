@@ -85,7 +85,11 @@ mod tests {
         BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(7),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             beacon_witness_leaf_count: BeaconWitnessLeafCount::new(2),
             ..Default::default()

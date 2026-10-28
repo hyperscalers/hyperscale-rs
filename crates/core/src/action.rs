@@ -974,8 +974,9 @@ pub enum Action {
     BuildProposal {
         /// Local shard producing this proposal.
         shard_id: ShardId,
-        /// Where the shard's chain begins: a transaction whose range
-        /// opened before it is also judged by an inherited marker.
+        /// The shard chain's [`cut`](hyperscale_types::ChainOrigin::cut):
+        /// a transaction whose range opened before it is also judged by
+        /// an inherited marker.
         chain_origin: WeightedTimestamp,
         /// Validator id of the proposer (this node).
         proposer: ValidatorId,

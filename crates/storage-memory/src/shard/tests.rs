@@ -33,7 +33,7 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, ConsensusReceipt, Engagement, FrontierInputs, GlobalReceiptHash, Hash, LocalKey,
+    ConsensusReceipt, Engagement, FrontierInputs, GlobalReceiptHash, Hash, LocalKey,
     RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
     SweepFrontier, SyncHint, TimestampRange, Transaction, TxHash, ValidatorId, Verifiable,
     WeightedTimestamp, WitnessSources, shard_prefix_path,
@@ -176,7 +176,7 @@ fn safe_vote_registers_ignore_a_stale_chain_incarnation() {
     let storage = SimShardStorage::default();
     test_registers_ignore_a_stale_chain_incarnation(
         &storage,
-        |origin| storage.consensus.write().unwrap().chain_origin = origin,
+        |origin| storage.consensus.write().unwrap().chain_origin = Some(origin),
         || storage.load_recovered_state(ShardId::ROOT),
     );
 }
@@ -676,10 +676,7 @@ fn dedup_window_records_only_what_a_finalization_decided() {
         &storage,
         BlockHeight::new(1),
         WeightedTimestamp::from_millis(1_000),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::ZERO,
-        },
+        BlockHeight::new(1),
     );
 
     assert!(
@@ -712,10 +709,7 @@ fn dedup_window_reaching_the_height_its_chain_starts_at_is_whole() {
         &storage,
         BlockHeight::new(1),
         WeightedTimestamp::from_millis(1_000),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::from_millis(900),
-        },
+        BlockHeight::new(1),
     );
 
     assert!(
@@ -745,7 +739,7 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         &storage,
         BlockHeight::new(3),
         WeightedTimestamp::from_millis(400_003),
-        ChainOrigin::ROOT,
+        BlockHeight::GENESIS,
     );
 
     assert!(
@@ -787,10 +781,7 @@ fn dedup_window_stamps_each_batch_against_its_own_block() {
         &storage,
         BlockHeight::new(2),
         WeightedTimestamp::from_millis(newer_ms),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::ZERO,
-        },
+        BlockHeight::new(1),
     );
 
     let deadlines: Vec<WeightedTimestamp> = {
@@ -840,10 +831,7 @@ fn dedup_window_seeds_engagements_from_block_lists() {
         &storage,
         BlockHeight::new(2),
         WeightedTimestamp::from_millis(newer_ms),
-        ChainOrigin {
-            genesis_height: BlockHeight::new(1),
-            anchor_wt: WeightedTimestamp::ZERO,
-        },
+        BlockHeight::new(1),
     );
 
     let mut seeded = window.engagements;

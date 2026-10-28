@@ -46,15 +46,11 @@ pub struct BeaconChainConfig {
     /// must run the same values. Disabled by default.
     pub reshape_thresholds: ReshapeThresholds,
     /// Wall-clock instant (ms since the Unix epoch) at which the chain's
-    /// genesis epoch begins — the origin the consensus clock measures
-    /// against, so weighted-time and the synthetic beacon epoch clock
-    /// (`epoch × epoch_duration_ms`) both start near zero at `Epoch::GENESIS`
-    /// instead of ~1.7e12 ms into the Unix epoch. Without this anchor a
-    /// runner started against raw wall-clock would have to cascade through
-    /// every epoch between the Unix epoch and now before it could pace.
-    /// Consensus-critical and agreed across validators via the genesis
-    /// config hash. Zero (the default) leaves the clock at raw wall-clock —
-    /// correct for the simulator, whose logical clock already starts at zero.
+    /// genesis epoch begins: the origin of epoch numbering, read only
+    /// through [`Self::epoch_windows`], and the weighted timestamp the
+    /// genesis QC of a chain born at network genesis carries. Every other
+    /// timestamp is Unix milliseconds in its own right. Consensus-critical
+    /// and agreed across validators via the genesis config hash.
     pub genesis_timestamp_ms: u64,
     /// Epochs a placed validator may sit `OnShard { ready: false }` before
     /// the fold auto-flips it to `ready: true` — the network's
@@ -87,38 +83,43 @@ impl BeaconChainConfig {
         }
     }
 
+    /// [`Self::default`] with genesis at the Unix epoch, so a fixture's
+    /// literal timestamps count epochs from zero.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn at_unix_epoch() -> Self {
+        Self {
+            genesis_timestamp_ms: 0,
+            ..Self::default()
+        }
+    }
+
     /// `epoch_duration_ms` typed as a [`Duration`].
     #[must_use]
     pub const fn epoch_duration(&self) -> Duration {
         Duration::from_millis(self.epoch_duration_ms)
     }
 
-    /// The wall-clock instant of chain time `at`, which counts from
-    /// `genesis_timestamp_ms`.
+    /// The wall-clock instant of chain time `at`.
     #[must_use]
     pub fn wall_time(&self, at: WeightedTimestamp) -> SystemTime {
-        self.wall_time_of_ms(at.as_millis())
+        UNIX_EPOCH + Duration::from_millis(at.as_millis())
     }
 
     /// The wall-clock instant a proposer stamped into its header.
     #[must_use]
     pub fn proposed_wall_time(&self, at: ProposerTimestamp) -> SystemTime {
-        self.wall_time_of_ms(at.as_millis())
-    }
-
-    fn wall_time_of_ms(&self, chain_ms: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(self.genesis_timestamp_ms.saturating_add(chain_ms))
+        UNIX_EPOCH + Duration::from_millis(at.as_millis())
     }
 
     /// The chain time of wall-clock instant `at`, as a transaction's
-    /// validity range reads it. An instant before genesis is chain time
-    /// zero.
+    /// validity range reads it.
     #[must_use]
     pub fn chain_time(&self, at: SystemTime) -> WeightedTimestamp {
         let unix_ms = at.duration_since(UNIX_EPOCH).map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
-        WeightedTimestamp::from_millis(unix_ms.saturating_sub(self.genesis_timestamp_ms))
+        WeightedTimestamp::from_millis(unix_ms)
     }
 
     /// Epochs from the fold that latches a reshape's drain to the fold
@@ -263,18 +264,22 @@ impl BeaconChainConfig {
     }
 }
 
+/// The genesis instant a simulated network starts at: a real date, so a
+/// deterministic run keeps Unix time and time since genesis apart.
+pub const SIM_GENESIS_MS: u64 = 1_700_000_000_000;
+
 impl Default for BeaconChainConfig {
     /// Defaults: 5-minute epochs, shard size 4, beacon committee 4, ready
     /// timeout 8 — test-grade sizing (sims sync in one or two epochs; the
     /// timeout leaves slack over that without parking a wedged joiner for
-    /// long).
+    /// long) — starting at [`SIM_GENESIS_MS`].
     fn default() -> Self {
         Self {
             epoch_duration_ms: u64::try_from(EPOCH_DURATION.as_millis()).unwrap_or(u64::MAX),
             shard_size: u32::try_from(SHARD_CAPACITY).unwrap_or(u32::MAX),
             beacon_committee_size: u32::try_from(BEACON_SIGNER_COUNT).unwrap_or(u32::MAX),
             reshape_thresholds: ReshapeThresholds::DISABLED,
-            genesis_timestamp_ms: 0,
+            genesis_timestamp_ms: SIM_GENESIS_MS,
             ready_timeout_epochs: 8,
             impound_epochs: IMPOUND_EPOCHS_DEFAULT,
         }
@@ -390,23 +395,6 @@ mod tests {
 
     use super::*;
     use crate::test_utils::{test_pool, test_principal};
-
-    #[test]
-    fn chain_time_counts_from_genesis_both_ways() {
-        let config = BeaconChainConfig {
-            genesis_timestamp_ms: 1_800_000_000_000,
-            ..BeaconChainConfig::default()
-        };
-        let at = WeightedTimestamp::from_millis(90_000);
-        let wall = config.wall_time(at);
-        assert_eq!(wall, UNIX_EPOCH + Duration::from_secs(1_800_000_090));
-        assert_eq!(config.chain_time(wall), at);
-        assert_eq!(
-            config.chain_time(UNIX_EPOCH),
-            WeightedTimestamp::ZERO,
-            "before genesis is chain time zero"
-        );
-    }
 
     #[test]
     fn the_drain_deadline_covers_the_drain_span_at_30_s_and_300_s_epochs() {

@@ -353,7 +353,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::{stating, stub_stated_terms};
-    use crate::{ChainOrigin, Hash, ShardId, StateRoot, ValidatorId};
+    use crate::{ChainOrigin, Hash, ShardId, StateRoot, ValidatorId, WeightedTimestamp};
 
     /// A manifest mirrors its block's terms section byte for byte, and so
     /// does the stored metadata that holds the manifest, across an encode
@@ -366,7 +366,7 @@ mod tests {
                 ShardId::ROOT,
                 ValidatorId::new(0),
                 StateRoot::ZERO,
-                ChainOrigin::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
             ),
             vec![entry],
         );
@@ -377,7 +377,8 @@ mod tests {
             hbor_from_slice(&hbor_to_vec(&BlockManifest::from_block(&block)).unwrap()).unwrap();
         assert_eq!(hbor_to_vec(manifest.terms()).unwrap(), stated);
 
-        let qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let qc =
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::root(WeightedTimestamp::ZERO));
         let metadata: BlockMetadata =
             hbor_from_slice(&hbor_to_vec(&BlockMetadata::from_block(&block, qc)).unwrap()).unwrap();
         assert_eq!(hbor_to_vec(metadata.manifest().terms()).unwrap(), stated);

@@ -28,7 +28,7 @@ use hyperscale_vm_types::PrincipalAddr;
 
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
-    beacon_epoch, epoch_duration_ms, holds_instance, live_shards, pool_effective_stake,
+    beacon_epoch, epoch_windows, holds_instance, live_shards, pool_effective_stake,
     pool_total_stake, validator_pubkey, validator_status,
 };
 use crate::support::tx::{
@@ -946,7 +946,7 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
     // Every epoch the silent newcomer sits through commits within one SPC
     // view timeout of its start: its missing input costs the committee a
     // bounded wait, not a view.
-    let epoch_ms = epoch_duration_ms(c).expect("a committed beacon state");
+    let windows = epoch_windows(c).expect("a committed beacon state");
     while matches!(
         validator_status(c, newcomer),
         Some(ValidatorStatus::OnShard { .. })
@@ -959,7 +959,7 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
         }) {
             break;
         }
-        let start = Duration::from_millis(next * epoch_ms);
+        let start = Duration::from_millis(windows.window_of(Epoch::new(next)).start.as_millis());
         let lag = c.now().saturating_sub(start);
         assert!(
             lag < SPC_VIEW_TIMEOUT,

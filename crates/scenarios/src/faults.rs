@@ -24,7 +24,8 @@ use crate::straddler::{STRADDLER_PAYMENT, chain_settled, isolate_crossing_intake
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::{FaultableCluster, report_crossing_measures};
 use crate::support::query::{
-    beacon_epoch, clock, epoch_duration_ms, retirement_wait, vault_balance,
+    beacon_epoch, clock, epoch_duration_ms, epoch_windows, into_epoch_ms, retirement_wait,
+    vault_balance,
 };
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, HaltStraddlerSetup, HarvestedTickSetup, PaymentLeg, account_shard,
@@ -349,6 +350,7 @@ pub fn halted_shard_recovery_replays_a_sweep_its_suffix_walked<C: FaultableClust
     split_lifecycle(c);
 
     let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let windows = epoch_windows(c).expect("the beacon carries its epoch grid");
     let now_ms = |c: &C| clock(c).as_millis();
     let until = |c: &C, at_ms: u64| {
         let away = at_ms.saturating_sub(now_ms(c)) / epoch_ms + 2;
@@ -362,7 +364,7 @@ pub fn halted_shard_recovery_replays_a_sweep_its_suffix_walked<C: FaultableClust
     let boundary = (earliest / SWEEP_BUCKET_MS + 1..)
         .take(64)
         .map(|bucket| bucket * SWEEP_BUCKET_MS)
-        .find(|at| (epoch_ms / 3..2 * epoch_ms / 3).contains(&(at % epoch_ms)))
+        .find(|at| (epoch_ms / 3..2 * epoch_ms / 3).contains(&into_epoch_ms(windows, *at)))
         .expect("a bucket boundary falls mid-epoch within a few buckets");
     let validity_end = boundary - SWEEP_BUCKET_MS / 2 - COMMITTED_GRACE_MS;
 
@@ -609,14 +611,19 @@ fn answer_early_in_an_epoch<C: FaultableCluster>(
 ) -> (Vec<Probe>, BlockHeight) {
     let (halted, survivor) = ShardId::ROOT.children();
     let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let windows = epoch_windows(c).expect("the beacon carries its epoch grid");
     let now_ms = |c: &C| clock(c).as_millis();
     let opening = epoch_ms * ANSWERED_SUFFIX_OPENING_EIGHTHS / 8;
-    let next_start = (now_ms(c) / epoch_ms + 1) * epoch_ms + opening;
+    let next_start = windows
+        .window_of(windows.epoch_for(clock(c)).next())
+        .start
+        .as_millis()
+        + opening;
     assert!(
         c.run_until(epochs(2), |c| now_ms(c) >= next_start),
         "the cluster's clock must reach the next epoch's opening",
     );
-    let epoch_of_submission = now_ms(c) / epoch_ms;
+    let epoch_of_submission = windows.epoch_for(clock(c));
 
     let height = |c: &C| c.committed_height(halted).unwrap_or(BlockHeight::GENESIS);
     let probes: Vec<Probe> = setup
@@ -636,9 +643,10 @@ fn answer_early_in_an_epoch<C: FaultableCluster>(
     }
     let closing = epoch_ms * ANSWERED_SUFFIX_CLOSING_EIGHTHS / 8;
     assert!(
-        now_ms(c) / epoch_ms == epoch_of_submission && now_ms(c) % epoch_ms < closing,
+        windows.epoch_for(clock(c)) == epoch_of_submission
+            && into_epoch_ms(windows, now_ms(c)) < closing,
         "the answers must stand inside the epoch the transfers were submitted in, \
-         before its next boundary: submitted in epoch {epoch_of_submission}, at {}ms now",
+         before its next boundary: submitted in epoch {epoch_of_submission:?}, at {}ms now",
         now_ms(c),
     );
     assert!(

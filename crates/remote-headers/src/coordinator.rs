@@ -671,20 +671,21 @@ impl RemoteHeaderCoordinator {
 
         // Retro-stamp entries recorded before the first local commit: on a
         // fresh chain remote headers can arrive (and verify) while the
-        // clock still reads zero, which would otherwise make age
-        // computations report the full epoch on the very next commit and
-        // trigger a fallback storm.
+        // clock still reads zero or the genesis instant, which would
+        // otherwise make age computations report everything since genesis
+        // on the very next commit and trigger a fallback storm.
         if first_commit {
+            let genesis = topology_schedule.windows().origin();
             for expected in self.expected.values_mut() {
-                if expected.discovered_at == WeightedTimestamp::ZERO {
+                if expected.discovered_at <= genesis {
                     expected.discovered_at = new_ts;
                 }
-                if expected.last_verified_at == Some(WeightedTimestamp::ZERO) {
+                if expected.last_verified_at.is_some_and(|at| at <= genesis) {
                     expected.last_verified_at = Some(new_ts);
                 }
             }
             for wanted in self.wanted_proofs.values_mut() {
-                if wanted.registered_at == WeightedTimestamp::ZERO {
+                if wanted.registered_at <= genesis {
                     wanted.registered_at = new_ts;
                     wanted.requested_at = new_ts;
                 }
@@ -1073,7 +1074,7 @@ impl RemoteHeaderCoordinator {
     /// the schedule states, not one it fails to mention.
     fn retire_departed(&mut self, topology_schedule: &TopologySchedule) {
         let now = self.clock.now();
-        if now == WeightedTimestamp::ZERO {
+        if now <= topology_schedule.windows().origin() {
             return;
         }
         let departed: Vec<ShardId> = self
@@ -1112,9 +1113,6 @@ impl RemoteHeaderCoordinator {
     /// again only to lose it the same way.
     fn prune_shard_behind(&mut self, shard: ShardId, tip_ts: WeightedTimestamp) {
         let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
-        if cutoff == WeightedTimestamp::ZERO {
-            return;
-        }
         let horizon = tip_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
         // The walked frontier stays whatever its age: it is the parent the
         // next header's committee anchors on.
@@ -1948,18 +1946,19 @@ impl RemoteHeaderCoordinator {
     /// crossing keeps syncing to the beacon fold until the schedule evicts
     /// it. A fully-evicted shard resolves nothing and is skipped.
     ///
-    /// A zero `wt` is not a stale clock — it means no local block has
-    /// committed yet. A freshly seated member (a halt-recovery draw from the
-    /// pool, a merge keeper) opens on the beacon head fold that seated it,
-    /// so any shard the schedule still retains is fair to probe; resolving
-    /// the zero clock would land below every retained window (`Evicted`) and
-    /// suppress exactly the fetches that bootstrap the member.
+    /// A `wt` at or before the genesis instant is not a stale clock — it
+    /// means no local block has committed yet. A freshly seated member (a
+    /// halt-recovery draw from the pool, a merge keeper) opens on the beacon
+    /// head fold that seated it, so any shard the schedule still retains is
+    /// fair to probe; resolving the unset clock would land below every
+    /// retained window (`Evicted`) and suppress exactly the fetches that
+    /// bootstrap the member.
     fn shard_routable(
         topology_schedule: &TopologySchedule,
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> bool {
-        if wt == WeightedTimestamp::ZERO {
+        if wt <= topology_schedule.windows().origin() {
             return topology_schedule.routable_shards().contains(&shard);
         }
         matches!(
@@ -2017,7 +2016,11 @@ mod tests {
             shard_id: ShardId::leaf(2, 2),
             height: BlockHeight::new(5),
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::leaf(2, 0),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             ..Default::default()
         });

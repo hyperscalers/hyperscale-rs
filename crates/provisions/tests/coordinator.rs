@@ -37,7 +37,11 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         shard_id: ShardId::leaf(1, 0),
         height,
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-        parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+        parent_qc: QuorumCertificate::genesis(
+            ShardId::leaf(1, 0),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        )
+        .into(),
         provision_tx_roots: Capped::default(),
         ..Default::default()
     });
@@ -53,7 +57,10 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
+        let __qc = QuorumCertificate::genesis(
+            ShardId::leaf(1, 0),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        );
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_id(),
@@ -86,7 +93,11 @@ fn make_remote_header_targeting(
         shard_id: source_shard,
         height,
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+        parent_qc: QuorumCertificate::genesis(
+            ShardId::leaf(1, 0),
+            ChainOrigin::root(WeightedTimestamp::ZERO),
+        )
+        .into(),
         timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
         provision_tx_roots: Capped::new(provision_tx_roots).expect("a list written out in a test"),
         ..Default::default()

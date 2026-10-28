@@ -63,7 +63,7 @@ fn fixture() -> Fixture {
         })
         .collect();
     let config = BeaconGenesisConfig {
-        chain_config: BeaconChainConfig::default(),
+        chain_config: BeaconChainConfig::at_unix_epoch(),
         initial_validators,
         initial_pools: vec![GenesisPool {
             id: pool_id,

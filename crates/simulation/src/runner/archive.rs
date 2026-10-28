@@ -71,7 +71,7 @@ impl ChainArchive {
                 let from = walked
                     .next()
                     .max(store.chain_floor())
-                    .max(store.chain_origin().genesis_height);
+                    .max(store.genesis_height());
                 *walked = committed;
                 let archived = self.blocks.entry(shard).or_default();
                 let mut height = from;

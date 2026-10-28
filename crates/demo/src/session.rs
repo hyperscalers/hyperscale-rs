@@ -426,6 +426,10 @@ impl Session {
             beacon_chain_config: Some(BeaconChainConfig {
                 shard_size: config.shard_size,
                 epoch_duration_ms: EPOCH_MS,
+                // The timeline's x-axis is attested time and the page reads
+                // it as seconds into the run, so the demo network's genesis
+                // is the Unix epoch.
+                genesis_timestamp_ms: 0,
                 // Arm the split trigger unconditionally: the demo grows on
                 // demand rather than waiting for a shard to outgrow a byte
                 // threshold in real time.

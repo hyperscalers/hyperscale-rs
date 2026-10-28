@@ -788,7 +788,7 @@ mod tests {
             ShardId::ROOT,
             test.committee.validator_id(0),
             StateRoot::ZERO,
-            ChainOrigin::ROOT,
+            ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         let _ = test.node.initialize_genesis(at, &genesis, 0);
         test.node
@@ -798,7 +798,11 @@ mod tests {
         let header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(1),
             parent_block_hash: genesis.hash(),
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            parent_qc: QuorumCertificate::genesis(
+                ShardId::ROOT,
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            )
+            .into(),
             proposer: halted.head().proposer_for(ShardId::ROOT, round),
             timestamp: ProposerTimestamp::from_millis(1_000),
             round,

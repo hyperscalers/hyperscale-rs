@@ -131,7 +131,9 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                     state_root: StateRoot::ZERO,
                     block_hash: BlockHash::ZERO,
                     height: BlockHeight::GENESIS,
-                    weighted_timestamp: WeightedTimestamp::ZERO,
+                    weighted_timestamp: WeightedTimestamp::from_millis(
+                        config.chain_config.genesis_timestamp_ms,
+                    ),
                     witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     cumulative_fees: 0,
@@ -465,7 +467,7 @@ mod tests {
         let beacon_members: Vec<ValidatorId> =
             (0..n_beacon_members).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -644,7 +646,7 @@ mod tests {
             .collect();
         // Beacon committee supplied OUT of id order — builder sorts it.
         let cfg = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -678,7 +680,7 @@ mod tests {
     fn rejects_duplicate_validator_id() {
         let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: vec![
                 GenesisValidator {
                     id: ValidatorId::new(2),
@@ -706,7 +708,7 @@ mod tests {
     #[should_panic(expected = "declares pool Pool(00000063…) which is not in initial_pools")]
     fn rejects_validator_referencing_unknown_pool() {
         let cfg = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
                 pool: test_pool(99),
@@ -728,7 +730,7 @@ mod tests {
     fn rejects_pool_with_insufficient_stake() {
         let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: (0u64..4)
                 .map(|i| GenesisValidator {
                     id: ValidatorId::new(i),
@@ -753,7 +755,7 @@ mod tests {
     fn rejects_validator_listed_twice_in_shard_committee() {
         let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
                 pool: pool_id,
@@ -793,7 +795,7 @@ mod tests {
         // Default beacon_committee_size is 4 — pass 5 to overflow.
         let pool_id = test_pool(0);
         let cfg = BeaconGenesisConfig {
-            chain_config: BeaconChainConfig::default(),
+            chain_config: BeaconChainConfig::at_unix_epoch(),
             initial_validators: (0u64..5)
                 .map(|i| GenesisValidator {
                     id: ValidatorId::new(i),
@@ -823,7 +825,7 @@ mod tests {
             chain_config: BeaconChainConfig {
                 beacon_committee_size: u32::try_from(MAX_VOTE_VECTOR_LEN + 1)
                     .expect("cap + 1 fits in u32"),
-                ..BeaconChainConfig::default()
+                ..BeaconChainConfig::at_unix_epoch()
             },
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
