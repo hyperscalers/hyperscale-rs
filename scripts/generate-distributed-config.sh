@@ -397,6 +397,7 @@ for i in "${!HOST_IPS[@]}"; do
     echo "  Host $IP (ID $i):"
     echo "    1. Copy config dir:"
     echo "       scp -r $OUT_DIR/host-$i $IP:~/git/hyperscale-rs/distributed-cluster-data/"
+    echo "       scp $NETWORK_FILE $IP:~/git/hyperscale-rs/distributed-cluster-data/"
     echo "    2. Copy binary:"
     echo "       scp target/release/hyperscale-validator $IP:~/git/hyperscale-rs/"
     echo "    3. Run nodes:"
@@ -481,6 +482,7 @@ if [ "$COPY_TO_REMOTE" = true ]; then
         echo "    - Binary to $REMOTE_BIN_DIR"
 
         scp -r "$OUT_DIR/host-$i" "$REMOTE_USER@$IP:$REMOTE_PATH/"
+        scp "$NETWORK_FILE" "$REMOTE_USER@$IP:$REMOTE_PATH/"
         scp "target/release/hyperscale-validator" "$REMOTE_USER@$IP:$REMOTE_BIN_DIR/"
     done
 fi
