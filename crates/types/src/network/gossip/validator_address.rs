@@ -13,21 +13,21 @@ use crate::{
 /// decode and signature-verify work on unauthenticated input.
 pub const MAX_ANNOUNCED_ADDRESSES: usize = 16;
 
-/// Maximum encoded length of one announced multiaddr.
+/// Maximum encoded length of one announced address.
 pub const MAX_ANNOUNCED_ADDRESS_BYTES: usize = 256;
 
-/// Maximum encoded length of the announced libp2p peer id.
-pub const MAX_ANNOUNCED_PEER_ID_BYTES: usize = 64;
+/// Length of a network endpoint id: an ed25519 public key.
+pub const ENDPOINT_ID_LEN: usize = 32;
 
-/// The addresses one announcement carries: each a dialable multiaddr no
+/// The addresses one announcement carries: each a dialable address no
 /// longer than a receiver admits, and no more of them than one record
 /// names.
 pub type AnnouncedAddresses =
     Capped<Vec<Bytes<MAX_ANNOUNCED_ADDRESS_BYTES>>, MAX_ANNOUNCED_ADDRESSES>;
 
-/// Gossips a validator's own libp2p peer id and network addresses globally.
+/// Gossips a validator's own endpoint id and network addresses globally.
 ///
-/// Every node caches these records in a `ValidatorId → (PeerId, addresses)`
+/// Every node caches these records in a `ValidatorId → (endpoint, addresses)`
 /// book, which is what lets it dial a committee-relevant validator it has
 /// never connected to — a halt-recovery committee drawn cold from the pool
 /// being the canonical consumer. Unicast delivery (provisions, execution
@@ -35,21 +35,21 @@ pub type AnnouncedAddresses =
 /// without this book there is no path from a `ValidatorId` to a dialable
 /// address for a never-connected peer.
 ///
-/// The peer id and addresses travel as raw bytes: this crate carries no
-/// libp2p types, and the network adapter parses them at ingest. Their
-/// caps are the types', so a record past one is a record that does not
-/// decode.
+/// The endpoint id and addresses travel as raw bytes: this crate carries
+/// no transport types, and the network adapter parses them at ingest. The
+/// address caps are the types', so a record past one is a record that
+/// does not decode.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ValidatorAddressGossip {
     /// The validator this record names — also its signer: address records
     /// are only ever self-announced.
     pub validator: ValidatorId,
-    /// libp2p peer id bytes the validator currently binds as.
-    pub peer_id: Bytes<MAX_ANNOUNCED_PEER_ID_BYTES>,
-    /// Encoded multiaddrs the peer can be dialed at.
+    /// The endpoint id the validator currently binds as.
+    pub endpoint_id: [u8; ENDPOINT_ID_LEN],
+    /// Encoded addresses the endpoint can be dialed at.
     pub addresses: AnnouncedAddresses,
     /// Announce ordering: consumers keep the record with the highest
-    /// sequence per validator, so a re-announce after a peer-id or address
+    /// sequence per validator, so a re-announce after an endpoint or address
     /// change supersedes older records everywhere.
     pub sequence: u64,
     /// Signature over the domain-separated signing message, by
@@ -68,7 +68,7 @@ impl Signed for ValidatorAddressGossip {
 
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
-            &ValidatorAddressMessage::new(&self.peer_id, &self.addresses, self.sequence),
+            &ValidatorAddressMessage::new(&self.endpoint_id, &self.addresses, self.sequence),
             network,
         )
     }
@@ -118,15 +118,15 @@ mod tests {
 
     fn signed_record(sequence: u64) -> (ValidatorAddressGossip, ConsensusPublicKey) {
         let key = BlsSigner::from_seed(&[7u8; 32]);
-        let peer_id = Bytes::new(b"peer-id".to_vec()).expect("under the peer id cap");
+        let endpoint_id = [5u8; ENDPOINT_ID_LEN];
         let addresses = Capped::from_array([Bytes::from_array(*b"addr")]);
         let message = signed_bytes(
-            &ValidatorAddressMessage::new(&peer_id, &addresses, sequence),
+            &ValidatorAddressMessage::new(&endpoint_id, &addresses, sequence),
             &net(),
         );
         let gossip = ValidatorAddressGossip {
             validator: ValidatorId::new(3),
-            peer_id,
+            endpoint_id,
             addresses,
             sequence,
             signature: key.sign(&message).expect("sign"),

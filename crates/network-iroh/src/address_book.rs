@@ -139,9 +139,9 @@ pub fn sign_records(
     if addresses.is_empty() {
         return Vec::new();
     }
-    let peer_id = Bytes::from_array(*endpoint.id.as_bytes());
+    let endpoint_id = *endpoint.id.as_bytes();
     let message = signed_bytes(
-        &ValidatorAddressMessage::new(&peer_id, &addresses, sequence),
+        &ValidatorAddressMessage::new(&endpoint_id, &addresses, sequence),
         network,
     );
     vnodes
@@ -149,7 +149,7 @@ pub fn sign_records(
         .filter_map(|(validator, key)| match key.sign(&message) {
             Ok(signature) => Some(ValidatorAddressGossip {
                 validator: *validator,
-                peer_id: peer_id.clone(),
+                endpoint_id,
                 addresses: addresses.clone(),
                 sequence,
                 signature,
@@ -217,7 +217,7 @@ impl AddressBook {
             return (IngestOutcome::Invalid, None);
         }
 
-        let Ok(id) = EndpointId::try_from(&gossip.peer_id[..]) else {
+        let Ok(id) = EndpointId::from_bytes(&gossip.endpoint_id) else {
             return (IngestOutcome::Invalid, None);
         };
         let mut relays = 0;
@@ -537,8 +537,12 @@ mod tests {
         let vid = ValidatorId::new(4);
         let keys = keys_for(&[vid]);
 
-        // Three bytes are not an endpoint id, though the signature verifies.
-        let bogus_id = Bytes::from_array([1u8, 2, 3]);
+        // Bytes that are no ed25519 point name no endpoint, though the
+        // signature verifies.
+        let bogus_id = (0..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|bytes| EndpointId::from_bytes(bytes).is_err())
+            .expect("some repeated byte is no curve point");
         let addresses = announced_addresses(&endpoint(1));
         let signature = keypair()
             .sign(&signed_bytes(
@@ -548,7 +552,7 @@ mod tests {
             .expect("sign");
         let unparseable = ValidatorAddressGossip {
             validator: vid,
-            peer_id: bogus_id,
+            endpoint_id: bogus_id,
             addresses,
             sequence: 3,
             signature,
