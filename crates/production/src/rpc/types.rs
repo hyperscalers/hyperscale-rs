@@ -53,6 +53,9 @@ pub struct NodeStatusResponse {
     pub(crate) uptime_secs: u64,
     /// Version string.
     pub(crate) version: String,
+    /// The network's genesis instant (ms since the Unix epoch). Chain time,
+    /// which every validity window is judged on, counts from here.
+    pub(crate) genesis_timestamp_ms: u64,
     /// Per-signer status entries.
     pub(crate) vnodes: Vec<VnodeStatusEntry>,
 }

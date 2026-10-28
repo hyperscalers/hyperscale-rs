@@ -10,7 +10,8 @@ use hyperscale_spammer::accounts::{AccountPool, SelectionMode};
 use hyperscale_spammer::client::RpcClient;
 use hyperscale_spammer::config::SpammerConfig;
 use hyperscale_spammer::genesis::generate_genesis_toml;
-use hyperscale_spammer::runner::Spammer;
+use hyperscale_spammer::runner::{Spammer, wait_for_ready};
+use hyperscale_spammer::validity::chain_clock;
 use hyperscale_spammer::workloads::TransferWorkload;
 use hyperscale_types::ShardId;
 use rand::SeedableRng;
@@ -253,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Default to 1 worker if not specified (use --workers to enable multi-threading)
             let num_workers = workers.unwrap_or(1);
 
+            let clients: Vec<RpcClient> = endpoints.iter().map(RpcClient::new).collect();
             let mut config = SpammerConfig::new(endpoints)
                 .with_num_shards(num_shards)
                 .with_validators_per_shard(validators_per_shard)
@@ -273,13 +275,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_latency_finalization_timeout(*latency_timeout);
             }
 
-            let mut spammer = Spammer::new(config)?;
-
             if wait_ready {
                 println!("Waiting for nodes to be ready...");
-                spammer.wait_for_ready(Duration::from_mins(1)).await?;
+                wait_for_ready(&clients, Duration::from_mins(1)).await?;
                 println!("All nodes ready.");
             }
+            let genesis_timestamp_ms = clients[0].get_status().await?.genesis_timestamp_ms;
+
+            let mut spammer = Spammer::new(config, chain_clock(genesis_timestamp_ms))?;
 
             println!("Starting spammer for {:?}...", *duration);
             if measure_latency {
@@ -342,35 +345,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Wait for nodes to be ready if requested
             if wait_ready {
                 println!("Waiting for nodes to be ready...");
-                let start = Instant::now();
                 let ready_timeout: Duration = *timeout;
-
-                loop {
-                    if start.elapsed() > ready_timeout {
-                        eprintln!("ERROR: Cluster not ready within {ready_timeout:?}");
-                        eprintln!("  Nodes must be reachable and producing blocks (height > 0)");
-                        std::process::exit(1);
-                    }
-
-                    let mut all_ready = true;
-                    for client in &clients {
-                        match client.get_status().await {
-                            Ok(status) if status.vnode_count > 0 && status.min_block_height > 0 => {
-                            }
-                            _ => {
-                                all_ready = false;
-                                break;
-                            }
-                        }
-                    }
-
-                    if all_ready {
-                        println!("All nodes ready (producing blocks).");
-                        break;
-                    }
-
-                    sleep(Duration::from_millis(500)).await;
+                if wait_for_ready(&clients, ready_timeout).await.is_err() {
+                    eprintln!("ERROR: Cluster not ready within {ready_timeout:?}");
+                    eprintln!("  Nodes must be reachable and producing blocks (height > 0)");
+                    std::process::exit(1);
                 }
+                println!("All nodes ready (producing blocks).");
             }
 
             // Generate accounts (same as what's in genesis)
@@ -384,29 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Warning: failed to load nonces: {e}"),
             }
 
-            // Create a simple same-shard transfer targeting shard 0
-            // Using a specific shard ensures we know exactly which validators to submit to
-            let workload = TransferWorkload::new().with_cross_shard_ratio(0.0); // Same-shard for simplicity
-
-            // Use current time as seed to generate unique transactions each run
-            let seed = u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-            )
-            .unwrap_or(u64::MAX);
-            let mut rng = ChaCha8Rng::seed_from_u64(seed);
-
-            // Generate a transaction specifically for shard 0
             let target_shard: usize = 0;
-            let tx = workload
-                .generate_for_shard(
-                    &accounts,
-                    ShardId::leaf(num_shards.trailing_zeros(), target_shard as u64),
-                    &mut rng,
-                )
-                .expect("Failed to generate transaction for shard 0");
 
             // Pick the first endpoint serving shard 0 under the configured
             // packing layout. EndpointRouting honours --vnodes-per-host and
@@ -420,6 +379,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .routing();
             let client_idx = routing.range_for_shard(target_shard).start % clients.len();
             let client = &clients[client_idx];
+
+            let genesis_timestamp_ms = client
+                .get_status()
+                .await
+                .expect("Failed to read the node's status")
+                .genesis_timestamp_ms;
+
+            // Create a simple same-shard transfer targeting shard 0
+            // Using a specific shard ensures we know exactly which validators to submit to
+            let workload = TransferWorkload::new(chain_clock(genesis_timestamp_ms))
+                .with_cross_shard_ratio(0.0); // Same-shard for simplicity
+
+            // Use current time as seed to generate unique transactions each run
+            let seed = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX);
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+            // Generate a transaction specifically for shard 0
+            let tx = workload
+                .generate_for_shard(
+                    &accounts,
+                    ShardId::leaf(num_shards.trailing_zeros(), target_shard as u64),
+                    &mut rng,
+                )
+                .expect("Failed to generate transaction for shard 0");
 
             println!("Submitting transaction to shard {target_shard}...");
             let submit_start = Instant::now();

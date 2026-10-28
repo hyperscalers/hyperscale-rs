@@ -99,6 +99,7 @@ impl RpcClient {
             connected_peers: status.connected_peers,
             vnode_count: status.vnodes.len(),
             min_block_height,
+            genesis_timestamp_ms: status.genesis_timestamp_ms,
         })
     }
 

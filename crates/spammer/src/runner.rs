@@ -20,7 +20,7 @@ use crate::accounts::{
 use crate::client::{RpcClient, RpcError};
 use crate::config::{ConfigError, EndpointRouting, SpammerConfig};
 use crate::latency::{LatencyReport, LatencyTracker};
-use crate::validity::validity_range_for_now;
+use crate::validity::ValidityClock;
 use crate::workloads::{DEFAULT_TRANSFER_AMOUNT, TRANSFER_MAX_FEE, TransferWorkload};
 
 /// Transaction spammer that submits to real network endpoints.
@@ -41,17 +41,20 @@ pub struct Spammer {
     /// Round-robin counter for distributing load across validators within each shard.
     /// Indexed by shard number.
     shard_round_robin: Arc<Vec<AtomicU64>>,
+    /// Where every generated transaction's validity window comes from.
+    validity_clock: ValidityClock,
 }
 
 impl Spammer {
-    /// Create a new spammer with the given configuration.
+    /// Create a spammer with the given configuration, stamping windows
+    /// from `validity_clock`.
     ///
     /// # Errors
     ///
     /// Returns [`SpammerError::Config`] if the configuration is invalid, or
     /// [`SpammerError::AccountGeneration`] if the underlying account pool
     /// can't be constructed for the requested shard counts.
-    pub fn new(config: SpammerConfig) -> Result<Self, SpammerError> {
+    pub fn new(config: SpammerConfig, validity_clock: ValidityClock) -> Result<Self, SpammerError> {
         config.validate().map_err(SpammerError::Config)?;
 
         let accounts = AccountPool::generate(config.num_shards, config.accounts_per_shard)
@@ -83,6 +86,7 @@ impl Spammer {
             stats: Arc::new(SpammerStats::default()),
             latency_tracker,
             shard_round_robin: Arc::new(shard_round_robin),
+            validity_clock,
         })
     }
 
@@ -165,7 +169,7 @@ impl Spammer {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut latency_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
 
-        let workload = TransferWorkload::new()
+        let workload = TransferWorkload::new(Arc::clone(&self.validity_clock))
             .with_cross_shard_ratio(self.config.cross_shard_ratio)
             .with_selection_mode(self.config.selection_mode);
 
@@ -257,6 +261,7 @@ impl Spammer {
                 stats: Arc::clone(&self.stats),
                 shard_round_robin: Arc::clone(&self.shard_round_robin),
                 routing: self.config.routing(),
+                validity_clock: Arc::clone(&self.validity_clock),
                 latency_tracker: self
                     .latency_tracker
                     .as_ref()
@@ -395,38 +400,38 @@ impl Spammer {
     pub fn genesis_balances(&self, balance: u128) -> Vec<(PrincipalAddr, u128)> {
         self.accounts.all_genesis_balances(balance)
     }
+}
 
-    /// Wait for all RPC endpoints to be ready.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpammerError::NodesNotReady`] if any configured RPC
-    /// endpoint never reports a non-zero block height before the timeout.
-    pub async fn wait_for_ready(&self, timeout: Duration) -> Result<(), SpammerError> {
-        let start = Instant::now();
+/// Wait for every endpoint in `clients` to be producing blocks.
+///
+/// # Errors
+///
+/// Returns [`SpammerError::NodesNotReady`] if any endpoint never reports
+/// a non-zero block height before the timeout.
+pub async fn wait_for_ready(clients: &[RpcClient], timeout: Duration) -> Result<(), SpammerError> {
+    let start = Instant::now();
 
-        while start.elapsed() < timeout {
-            let mut all_ready = true;
+    while start.elapsed() < timeout {
+        let mut all_ready = true;
 
-            for client in self.clients.iter() {
-                match client.get_status().await {
-                    Ok(status) if status.vnode_count > 0 && status.min_block_height > 0 => {}
-                    _ => {
-                        all_ready = false;
-                        break;
-                    }
+        for client in clients {
+            match client.get_status().await {
+                Ok(status) if status.vnode_count > 0 && status.min_block_height > 0 => {}
+                _ => {
+                    all_ready = false;
+                    break;
                 }
             }
-
-            if all_ready {
-                return Ok(());
-            }
-
-            sleep(Duration::from_millis(500)).await;
         }
 
-        Err(SpammerError::NodesNotReady)
+        if all_ready {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(500)).await;
     }
+
+    Err(SpammerError::NodesNotReady)
 }
 
 /// Print progress from a static context (for multi-threaded mode).
@@ -479,6 +484,7 @@ struct Worker {
     stats: Arc<SpammerStats>,
     shard_round_robin: Arc<Vec<AtomicU64>>,
     routing: EndpointRouting,
+    validity_clock: ValidityClock,
     latency_tracker: Option<LatencyTracker>,
     config: WorkerConfig,
 }
@@ -500,7 +506,7 @@ impl Worker {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut latency_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
 
-        let workload = PartitionWorkload::new()
+        let workload = PartitionWorkload::new(Arc::clone(&self.validity_clock))
             .with_cross_shard_ratio(self.config.cross_shard_ratio)
             .with_selection_mode(self.config.selection_mode);
 
@@ -571,16 +577,18 @@ struct PartitionWorkload {
     cross_shard_ratio: f64,
     selection_mode: SelectionMode,
     amount: u128,
+    validity_clock: ValidityClock,
     /// The world every built transfer resolves its accounts in.
     client: Client,
 }
 
 impl PartitionWorkload {
-    fn new() -> Self {
+    fn new(validity_clock: ValidityClock) -> Self {
         Self {
             cross_shard_ratio: 0.0,
             selection_mode: SelectionMode::NoContention,
             amount: DEFAULT_TRANSFER_AMOUNT,
+            validity_clock,
             client: Client::genesis(NetworkId::from(&NetworkDefinition::simulator())),
         }
     }
@@ -667,7 +675,7 @@ impl PartitionWorkload {
                 &from.keypair,
                 to.address,
                 self.amount,
-                validity_range_for_now(),
+                (self.validity_clock)(),
                 Terms {
                     max_fee: TRANSFER_MAX_FEE,
                     ceilings: Ceilings::Guessed,

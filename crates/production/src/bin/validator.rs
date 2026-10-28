@@ -772,6 +772,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             })?,
             metrics_enabled: true,
             sync_backpressure_threshold: Some(10),
+            genesis_timestamp_ms: network_file.chain.genesis_timestamp_ms,
         };
 
         let rpc_server = RpcServer::with_state(
