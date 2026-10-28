@@ -33,8 +33,8 @@ pub type RatifyProof = Capped<Vec<Arc<Verifiable<RatifyVote>>>, MAX_SIGNERS>;
 /// The inner [`RatifyVote`] is self-authenticating — it carries the
 /// signer id and a signature. Each validator publishes a distinct
 /// vote with their own signature, so per-publisher bytes differ and
-/// gossipsub's bytes-id dedup handles accidental re-publications
-/// without an explicit content-key dedup.
+/// the transport's dedup of repeated bytes handles accidental
+/// re-publications without an explicit content-key dedup.
 ///
 /// Wire decode lands the wrapper as `Verifiable::Unverified`;
 /// locally-dispatched sends from a colocated signer preserve

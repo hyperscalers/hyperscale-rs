@@ -15,7 +15,8 @@ use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 /// in [`CertifiedBeaconBlock::cert`] — verifiers check it under the
 /// epoch's committee (resolved from the previous epoch's `BeaconState`).
 /// No outer sender signature is needed; multiple publishers broadcasting
-/// the same canonical bytes collapse via gossipsub's bytes-id dedup.
+/// the same canonical bytes collapse in the transport's dedup of repeated
+/// bytes.
 ///
 /// Wire decode lands the wrapper as `Verifiable::Unverified`;
 /// locally-dispatched sends from a colocated commit path preserve

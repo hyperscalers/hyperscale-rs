@@ -41,7 +41,7 @@ use crate::venue::grind_onto;
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
 ///
-/// The feasibility check for the libp2p gate: on the sim the drop is total at
+/// The feasibility check for the iroh gate: on the sim the drop is total at
 /// delivery; on production the inbound `Ignore` filter suppresses the gossip on
 /// every host, so a submitted transaction reaches the committee only by the
 /// fetch fallback.
@@ -3060,7 +3060,7 @@ pub fn cross_shard_header_fetch_fallback(c: &mut impl FaultableCluster) {
 ///
 /// The 50% loss is exercised per attempt on both harnesses: the sim draws from
 /// the engine's own seeded RNG at the request-drain site, and production
-/// consults the same gate in the libp2p request pool per send, surfacing a
+/// consults the same gate in the iroh request streams per send, surfacing a
 /// dropped leg as the timeout the retry loop rolls again.
 ///
 /// Returns the cluster-wide `provision.request` drop count. Engagement is

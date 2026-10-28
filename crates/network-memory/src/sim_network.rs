@@ -225,8 +225,8 @@ impl Network for SimNetworkAdapter {
 
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         // Tee to in-process subscribers — the harness's `accept_gossip`
-        // skips the publisher's own node (matching gossipsub's no-loop
-        // semantics), so the host's own shard loops would otherwise miss
+        // skips the publisher's own node (the production fan-out never sends
+        // a host its own publication), so the host's own shard loops would otherwise miss
         // its broadcasts. The registry computes the per-shard fan-out
         // from `hosted_shards`.
         let _ = self.registry.local_dispatch_gossip(message, Some(shard));
@@ -271,8 +271,8 @@ impl Network for SimNetworkAdapter {
 
     fn notify<M: NetworkMessage + 'static>(&self, recipients: &[ValidatorId], message: &M) {
         // Note: compression happens here at send-time, then accept_notifications()
-        // decompresses before queueing for delivery. In production (Libp2pNetwork),
-        // compression happens inside the stream framing layer (write_typed_frame) instead.
+        // decompresses before queueing for delivery. In production the iroh
+        // transport's frame layer compresses instead.
         let data = compression::compress(
             &hbor_to_vec(message).expect("SimNetworkAdapter: failed to encode notification"),
         );

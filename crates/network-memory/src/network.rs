@@ -1,6 +1,6 @@
 //! Simulated in-memory network used by deterministic-replay tests.
 //!
-//! Implements the same [`Network`](hyperscale_network) trait as the libp2p
+//! Implements the same [`Network`](hyperscale_network) trait as the iroh
 //! transport but routes messages through a single-process priority queue
 //! ordered by `(deliver_at, sequence)`, so that a fixed seed always
 //! produces an identical event interleaving.
@@ -302,8 +302,8 @@ enum LegFate {
     Sent,
     /// Landed at the peer: the stream opened.
     Reached,
-    /// Taken by a fault rule before the transport saw it, as the libp2p
-    /// fault gate fails an attempt before it reaches the stream pool.
+    /// Taken by a fault rule before the transport saw it, as the iroh
+    /// fault gate fails an attempt before it opens a stream.
     Gated,
 }
 
@@ -549,7 +549,8 @@ pub struct SimulatedNetwork {
     /// hosting-mode formula in [`Self::validator_to_node`].
     validator_bindings: HashMap<ValidatorId, NodeIndex>,
     /// Per-node gossip dedup: tracks message IDs already delivered to each node.
-    /// Matches production gossipsub's content-based deduplication (hash of data + topic).
+    /// Matches the production fan-out's seen set, keyed on an item's scope,
+    /// type and payload.
     gossip_seen: Vec<HashSet<u64>>,
     /// Fault-injection state: per-message-type drop rules plus the partition
     /// block-set, layered on top of packet loss.
@@ -1186,8 +1187,8 @@ impl SimulatedNetwork {
     /// off: arm its timeout, and put the request leg on the wire unless a
     /// partition or a fault rule takes it. A lost packet delays the leg by a
     /// retransmission round trip rather than dropping it. Fault rules gate
-    /// the request leg only, as the libp2p gate in
-    /// `RequestStreamPool::send_request` does. With every candidate's stream
+    /// the request leg only, as the iroh gate in
+    /// `RequestStreams::send_request` does. With every candidate's stream
     /// backing off, the request settles [`RequestError::BackingOff`] at
     /// once, as the production request manager's does: the wait until the
     /// soonest stream reopens is the caller's pacing, and it is never zero.
@@ -1829,11 +1830,12 @@ impl SimulatedNetwork {
                 continue;
             }
 
-            // Gossipsub dedup: each node receives a given message at most once,
+            // Gossip dedup: each node receives a given message at most once,
             // regardless of how many validators broadcast it. Only a delivered
             // copy is seen: one lost to a partition, packet loss or a drop
             // rule leaves the node free to take another broadcaster's
-            // identical copy, as a mesh peer's forward would reach it.
+            // identical copy, as another publisher's or a forwarder's would
+            // reach it.
             if self.gossip_seen[to as usize].contains(&msg_id) {
                 stats.messages_deduplicated += 1;
                 continue;
@@ -1863,7 +1865,7 @@ impl SimulatedNetwork {
                     }
                     // As on the notification tier: a byzantine broadcaster
                     // publishes different bytes to different peers, and the
-                    // gossipsub dedup above keys on the honest message id, so
+                    // gossip dedup above keys on the honest message id, so
                     // each recipient still admits exactly one of them.
                     let payload = self.rewritten(from, to, message_type, Tier::Gossip, &payload);
                     self.gossip_seen[to as usize].insert(msg_id);
@@ -2076,12 +2078,11 @@ impl SimulatedNetwork {
     }
 }
 
-/// The content-based message id gossipsub dedups on, matching production's
-/// `message_id_fn`: hash(data || topic).
+/// The content-based message id gossip dedups on, matching the production
+/// fan-out's: a hash of the item's scope, type and bytes.
 ///
-/// Wire bytes (compressed) are the data; the topic is the message type and the
-/// shard it is published to, since a shard-scoped type has one topic per shard
-/// and a host serving two of them is owed the same batch once on each — a
+/// The scope includes the shard a shard-scoped item is published to, since a
+/// host serving two shards is owed the same batch once on each — a
 /// transaction touching both shards is published to both, and the second copy
 /// is what the other shard's loop admits from.
 fn gossip_message_id(entry: &OutboxEntry) -> u64 {
@@ -2853,7 +2854,7 @@ mod tests {
     }
 
     /// An attempt the fault gate takes times out without backing the
-    /// stream off, as the libp2p gate fails it before the stream pool.
+    /// stream off, as the iroh gate fails it before it opens a stream.
     #[test]
     fn a_fault_gated_timeout_leaves_the_stream_unbacked() {
         let mut network = sim_network(1, 3);

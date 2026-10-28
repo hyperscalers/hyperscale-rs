@@ -26,8 +26,8 @@ use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId, Ve
 /// agreement throughput until they show up or the view rotates.
 ///
 /// Unicast (not gossip) because the audience is exactly the beacon
-/// committee — bounded at `BEACON_SIGNER_COUNT`. Gossipsub's flood
-/// overhead isn't justified at that fanout.
+/// committee — bounded at `BEACON_SIGNER_COUNT`. A global gossip's
+/// forwarding to sampled hosts isn't justified at that fan-out.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BeaconProposalNotification {
     /// Claimed sender. The VRF reveal and body signature inside

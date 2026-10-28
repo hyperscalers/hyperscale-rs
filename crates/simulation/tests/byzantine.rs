@@ -6,9 +6,9 @@
 //! check. So these run against a host whose responses are rewritten in
 //! flight — the smallest thing that puts a forgery in front of a checker.
 //!
-//! Sim-only. The rewrite hooks the in-memory transport's response leg,
-//! which the libp2p gate has no counterpart for, so the portable
-//! `FaultableCluster` surface does not carry it.
+//! Sim-only. The rewrite hooks the in-memory transport's response leg, and
+//! the portable `FaultableCluster` surface does not carry response
+//! rewrites.
 
 mod support;
 

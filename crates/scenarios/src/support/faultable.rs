@@ -3,7 +3,7 @@
 //!
 //! Portable fault scenarios drive this surface. Hosts are addressed by index
 //! `0..host_count()`; each harness maps that index onto its native identity
-//! (the sim's `NodeIndex`, the libp2p gate's `HostId`). A [`drop_type`] rule
+//! (the sim's `NodeIndex`, the iroh gate's `HostId`). A [`drop_type`] rule
 //! returns a [`FaultHandle`] whose `fired()` count aggregates across every host
 //! the rule was installed on.
 //!
@@ -159,9 +159,9 @@ pub trait FaultableCluster: Cluster {
     /// Cuts A↔B only; any third group stays connected to both. The two
     /// harnesses agree only when there is no bridging group: the sim delivers
     /// gossip directly (no relay), so a host reachable from both halves never
-    /// bridges them, whereas production relays gossip through the gossipsub mesh
-    /// and enforces the cut against the immediate relay hop — so a bridging host
-    /// would carry gossip across the partition. Keep portable partition
+    /// bridges them, whereas production forwards global gossip on through
+    /// sampled hosts and enforces the cut against the immediate hop — so a
+    /// bridging host would carry global gossip across the partition. Keep portable partition
     /// scenarios to a full bipartition (or [`isolate`](Self::isolate)) with no
     /// host reachable from both sides.
     fn partition(&mut self, group_a: &[usize], group_b: &[usize]);

@@ -16,8 +16,8 @@ use crate::{CandidateBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 /// confers no commit authority: pool members that verify it prevote
 /// its hash, and only a
 /// [`RatifyCert`](crate::RatifyCert) commits the block. Multiple
-/// publishers broadcasting the same canonical bytes collapse via
-/// gossipsub's bytes-id dedup.
+/// publishers broadcasting the same canonical bytes collapse in the
+/// transport's dedup of repeated bytes.
 ///
 /// Wire decode lands the wrapper as `Verifiable::Unverified`;
 /// locally-dispatched sends from a colocated SPC commit path preserve

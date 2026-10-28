@@ -63,13 +63,12 @@ pub struct BatchConfig {
     pub certified_header_window: Duration,
 
     /// Max transactions in a per-shard outbound `TransactionGossip` batch.
-    /// Bounded so the encoded batch stays well under the gossipsub
-    /// max-message size (default 1 MiB) at typical tx sizes.
+    /// Bounded so the encoded batch stays well under the transport's frame
+    /// cap (`MAX_WIRE_MESSAGE_BYTES`) at typical tx sizes.
     pub tx_gossip_max: usize,
     /// Flush window for the per-shard outbound `TransactionGossip` batch.
     /// Trades a small tail-latency cost for substantially fewer wire
-    /// messages and larger per-message payloads (which activates
-    /// gossipsub v1.2 IDONTWANT dedup).
+    /// messages, each paying its per-message costs once.
     pub tx_gossip_window: Duration,
 }
 
