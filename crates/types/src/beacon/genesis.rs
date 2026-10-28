@@ -7,7 +7,7 @@
 //! beacon-side protocol constants (committee sizes, stake floors) and
 //! is not part of the consumer-facing type surface.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
@@ -15,9 +15,9 @@ use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use crate::{
     BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, Epoch, EpochWindows,
     GenesisConfigHash, Hash, IMPOUND_EPOCHS_DEFAULT, NetworkDefinition,
-    PRODUCTION_BEACON_COMMITTEE_SIZE, ProposerTimestamp, RESHAPE_DRAIN_SPAN, Randomness,
-    ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat,
-    ValidatorId, WeightedTimestamp, byzantine_threshold,
+    PRODUCTION_BEACON_COMMITTEE_SIZE, RESHAPE_DRAIN_SPAN, Randomness, ReshapeThresholds,
+    SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, StakePoolSeat, ValidatorId,
+    byzantine_threshold,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -98,28 +98,6 @@ impl BeaconChainConfig {
     #[must_use]
     pub const fn epoch_duration(&self) -> Duration {
         Duration::from_millis(self.epoch_duration_ms)
-    }
-
-    /// The wall-clock instant of chain time `at`.
-    #[must_use]
-    pub fn wall_time(&self, at: WeightedTimestamp) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(at.as_millis())
-    }
-
-    /// The wall-clock instant a proposer stamped into its header.
-    #[must_use]
-    pub fn proposed_wall_time(&self, at: ProposerTimestamp) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(at.as_millis())
-    }
-
-    /// The chain time of wall-clock instant `at`, as a transaction's
-    /// validity range reads it.
-    #[must_use]
-    pub fn chain_time(&self, at: SystemTime) -> WeightedTimestamp {
-        let unix_ms = at.duration_since(UNIX_EPOCH).map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        });
-        WeightedTimestamp::from_millis(unix_ms)
     }
 
     /// Epochs from the fold that latches a reshape's drain to the fold

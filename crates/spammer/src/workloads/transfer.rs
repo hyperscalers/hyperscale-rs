@@ -265,7 +265,7 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     use super::*;
-    use crate::validity::chain_clock;
+    use crate::validity::wall_clock;
 
     /// The shards a generated transfer touches, read off the envelope's
     /// own graph. The client never derives effect sets — it routes by the
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn test_generate_same_shard_transfer() {
         let accounts = AccountPool::generate(2, 10).unwrap();
-        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(0.0);
+        let workload = TransferWorkload::new(wall_clock()).with_cross_shard_ratio(0.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let tx = workload
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_generate_cross_shard_transfer() {
         let accounts = AccountPool::generate(2, 10).unwrap();
-        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(1.0);
+        let workload = TransferWorkload::new(wall_clock()).with_cross_shard_ratio(1.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let tx = workload
@@ -318,7 +318,7 @@ mod tests {
     fn test_generate_for_shard_same_shard() {
         let num_shards = 4u64;
         let accounts = AccountPool::generate(num_shards, 10).unwrap();
-        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(0.0);
+        let workload = TransferWorkload::new(wall_clock()).with_cross_shard_ratio(0.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let target_shard = ShardId::leaf(2, 2);
@@ -338,7 +338,7 @@ mod tests {
     fn test_generate_for_shard_cross_shard() {
         let num_shards = 4u64;
         let accounts = AccountPool::generate(num_shards, 10).unwrap();
-        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(1.0);
+        let workload = TransferWorkload::new(wall_clock()).with_cross_shard_ratio(1.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let target_shard = ShardId::leaf(2, 1);
@@ -359,7 +359,7 @@ mod tests {
     fn test_generate_batch_for_shard() {
         let num_shards = 4u64;
         let accounts = AccountPool::generate(num_shards, 10).unwrap();
-        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(0.5);
+        let workload = TransferWorkload::new(wall_clock()).with_cross_shard_ratio(0.5);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let target_shard = ShardId::leaf(2, 0);

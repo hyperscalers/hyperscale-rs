@@ -8,12 +8,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHash, BlockHeight, CertifiedBlockHeader, Epoch,
-    GenesisConfigHash, Round, ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects,
-    TopologySchedule, ValidatorId, Verified, WeightedTimestamp, missed_proposals_since_prev_commit,
+    BeaconState, BlockHash, BlockHeight, CertifiedBlockHeader, Epoch, GenesisConfigHash, Round,
+    ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects, TopologySchedule, ValidatorId,
+    Verified, WeightedTimestamp, missed_proposals_since_prev_commit,
 };
 use tokio::sync::watch;
 
@@ -186,7 +186,7 @@ impl Observer {
         while self.effects.len() > EFFECTS_KEPT {
             self.effects.pop_front();
         }
-        self.headers.admit(admitted, schedule, &state.chain_config);
+        self.headers.admit(admitted, schedule);
         let (tips, proposing) = self.headers.tips(schedule);
         let observation = Observation {
             genesis: self.genesis,
@@ -285,7 +285,6 @@ impl HeaderRing {
         &self,
         headers: Vec<Arc<Verified<CertifiedBlockHeader>>>,
         schedule: &TopologySchedule,
-        chain: &BeaconChainConfig,
     ) {
         if headers.is_empty() {
             return;
@@ -306,7 +305,7 @@ impl HeaderRing {
                 .and_then(|height| kept.get(&height))
                 .filter(|parent| parent.summary.block == header.parent_block_hash())
                 .map(|parent| parent.anchor);
-            let summary = summarise(&certified, parent_anchor, schedule, chain);
+            let summary = summarise(&certified, parent_anchor, schedule);
             let newest = summary.proposed_at;
             kept.insert(
                 summary.height,
@@ -333,7 +332,6 @@ fn summarise(
     certified: &CertifiedBlockHeader,
     parent_anchor: Option<WeightedTimestamp>,
     schedule: &TopologySchedule,
-    chain: &BeaconChainConfig,
 ) -> HeaderSummary {
     let header = certified.header();
     let qc = certified.qc();
@@ -370,7 +368,7 @@ fn summarise(
         height: header.height(),
         block: header.hash(),
         round: header.round(),
-        proposed_at: chain.proposed_wall_time(header.timestamp()),
+        proposed_at: UNIX_EPOCH + Duration::from_millis(header.timestamp().as_millis()),
         proposer: header.proposer(),
         signers,
         missed,
@@ -380,8 +378,6 @@ fn summarise(
 
 #[cfg(test)]
 mod tests {
-    use std::time::UNIX_EPOCH;
-
     use hyperscale_types::test_utils::{TestCommittee, make_live_block, signed_child_block};
     use hyperscale_types::{Block, TopologySnapshot};
 
@@ -435,11 +431,7 @@ mod tests {
         assert_eq!(members.len(), 4, "the committee signs the root shard");
         let ring = HeaderRing::default();
         let block = child(&committee, Round::INITIAL.next());
-        ring.admit(
-            vec![certified(&committee, &block, &[0, 2, 3])],
-            &schedule,
-            &BeaconChainConfig::default(),
-        );
+        ring.admit(vec![certified(&committee, &block, &[0, 2, 3])], &schedule);
 
         let kept = ring.since(ROOT, BlockHeight::new(0));
         assert_eq!(kept.len(), 1);
@@ -453,26 +445,14 @@ mod tests {
     #[test]
     fn a_summary_is_stamped_on_the_wall_clock() {
         let (committee, _, schedule) = setup();
-        let chain = BeaconChainConfig {
-            genesis_timestamp_ms: 1_800_000_000_000,
-            ..BeaconChainConfig::default()
-        };
         let ring = HeaderRing::default();
         let block = child(&committee, Round::INITIAL.next());
-        ring.admit(
-            vec![certified(&committee, &block, &[0, 1, 2])],
-            &schedule,
-            &chain,
-        );
+        ring.admit(vec![certified(&committee, &block, &[0, 1, 2])], &schedule);
 
         assert_eq!(
             ring.since(ROOT, BlockHeight::new(0))[0].proposed_at,
-            chain.proposed_wall_time(block.header().timestamp()),
-        );
-        assert_eq!(
-            ring.since(ROOT, BlockHeight::new(0))[0].proposed_at,
             UNIX_EPOCH + Duration::from_millis(block.header().timestamp().as_millis()),
-            "a header's time is Unix time, whatever the genesis"
+            "a header's time is Unix time"
         );
     }
 
@@ -481,11 +461,7 @@ mod tests {
         let (committee, snapshot, schedule) = setup();
         let ring = HeaderRing::default();
         let block = child(&committee, Round::new(3));
-        ring.admit(
-            vec![certified(&committee, &block, &[0, 1, 2])],
-            &schedule,
-            &BeaconChainConfig::default(),
-        );
+        ring.admit(vec![certified(&committee, &block, &[0, 1, 2])], &schedule);
 
         let expected = vec![
             snapshot.proposer_for(ROOT, Round::new(1)),
@@ -503,16 +479,8 @@ mod tests {
         let members = snapshot.consensus_committee_for_shard(ROOT).to_vec();
         let ring = HeaderRing::default();
         let block = child(&committee, Round::INITIAL.next());
-        ring.admit(
-            vec![certified(&committee, &block, &[0, 1, 2])],
-            &schedule,
-            &BeaconChainConfig::default(),
-        );
-        ring.admit(
-            vec![certified(&committee, &block, &[1, 2, 3])],
-            &schedule,
-            &BeaconChainConfig::default(),
-        );
+        ring.admit(vec![certified(&committee, &block, &[0, 1, 2])], &schedule);
+        ring.admit(vec![certified(&committee, &block, &[1, 2, 3])], &schedule);
 
         let kept = ring.since(ROOT, BlockHeight::new(0));
         assert_eq!(kept.len(), 1);
@@ -539,16 +507,8 @@ mod tests {
         let ring = HeaderRing::default();
         let first = child(&committee, Round::INITIAL.next());
         let second = child(&committee, Round::new(2));
-        ring.admit(
-            vec![certified(&committee, &first, &[0, 1, 2])],
-            &schedule,
-            &BeaconChainConfig::default(),
-        );
-        ring.admit(
-            vec![certified(&committee, &second, &[0, 1, 2])],
-            &schedule,
-            &BeaconChainConfig::default(),
-        );
+        ring.admit(vec![certified(&committee, &first, &[0, 1, 2])], &schedule);
+        ring.admit(vec![certified(&committee, &second, &[0, 1, 2])], &schedule);
 
         let kept = ring.since(ROOT, BlockHeight::new(0));
         assert_eq!(kept.len(), 1);
