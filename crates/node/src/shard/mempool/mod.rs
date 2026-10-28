@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use deferred::{DeferredForRecords, DeferredOrigin, DeferredTransaction, Orphaned};
+pub use deferred::{DeferredForRecords, DeferredTransaction, Orphaned};
 pub use fetch::{TransactionBinding, TransactionFetch};
 use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::{ShardId, Transaction, TxHash};

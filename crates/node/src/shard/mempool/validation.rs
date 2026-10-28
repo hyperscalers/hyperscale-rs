@@ -31,12 +31,15 @@ use hyperscale_types::{
     TransactionContext, TransactionVerifyError, TxHash, Unresolved, Verified, Verify,
 };
 
-use super::{DeferredOrigin, DeferredTransaction, TransactionBinding};
+use super::{DeferredTransaction, TransactionBinding};
 use crate::batch_accumulator::BatchAccumulator;
 use crate::fetch::FetchInput;
 use crate::host::NodeHost;
 use crate::process::SubmitFanout;
-use crate::shard::{HostEvent, ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{
+    BeaconScopedInput, HostEvent, ShardLoop, ShardScopedInput, push_protocol_event,
+    push_shard_input,
+};
 
 /// Byte budget one outbound gossip batch accumulates before it flushes:
 /// the fetch response's, since both answer with envelopes into one frame.
@@ -73,11 +76,7 @@ fn report_validation_outcomes(
         } else if gap.is_empty() {
             failed_hashes.push(tx.hash());
         } else {
-            wanted.push(DeferredTransaction::new(
-                tx,
-                gap,
-                DeferredOrigin::Validation,
-            ));
+            wanted.push(DeferredTransaction::new(tx, gap));
         }
     }
     if !wanted.is_empty() {
@@ -462,14 +461,10 @@ where
                         touched_shards,
                     });
             }
-            SubmitFanout::WantsRecords { host, wanted } => {
-                self.shard_loop_mut(host)
-                    .step(ShardScopedInput::RecordsWanted {
-                        wanted: vec![DeferredTransaction::new(
-                            Arc::clone(tx),
-                            wanted,
-                            DeferredOrigin::Submission,
-                        )],
+            SubmitFanout::WantsRecords { wanted } => {
+                self.beacon
+                    .dispatch_event(BeaconScopedInput::SubmissionWantsRecords {
+                        deferred: DeferredTransaction::new(Arc::clone(tx), wanted),
                     });
             }
             SubmitFanout::PublishDirect { touched_shards } => {

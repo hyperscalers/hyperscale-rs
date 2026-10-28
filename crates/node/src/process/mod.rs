@@ -37,9 +37,9 @@ use hyperscale_types::{
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
-use crate::event::{Attachment, HostEvent, ShardScopedInput};
+use crate::event::{Attachment, BeaconScopedInput, HostEvent, ShardScopedInput};
 use crate::shard::cross_shard::serve_cells_request;
-use crate::shard::mempool::{DeferredOrigin, DeferredTransaction};
+use crate::shard::mempool::DeferredTransaction;
 use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 
 /// Lock-free per-shard event-sender map.
@@ -322,13 +322,11 @@ where
             // A gap and a refusal read identically from the submitter's
             // side and are not the same thing. A gap names records this
             // node has not seen, and the same envelope derives wherever
-            // they landed, so it waits on a hosted shard while the fetch
-            // runs instead of being dropped at the door.
+            // they landed, so it waits on the host while the fetch runs
+            // instead of being dropped at the door.
             let wanted = error.unresolved().cloned().unwrap_or_default();
-            if !wanted.is_empty()
-                && let Some(host) = self.shard_event_senders.load().keys().copied().next()
-            {
-                return SubmitFanout::WantsRecords { host, wanted };
+            if !wanted.is_empty() {
+                return SubmitFanout::WantsRecords { wanted };
             }
             tracing::warn!(
                 reason = %error,
@@ -455,6 +453,12 @@ where
         // verdict.
         let tx = &self.canonical_txs.canonicalize(tx);
         let fanout = self.compute_submit_fanout(tx);
+        self.apply_submit_fanout(tx, fanout)
+    }
+
+    /// Carry out `fanout` for `tx`. Returns `false` only on shutdown (a
+    /// closed channel) or for an envelope that derives no routing.
+    pub(crate) fn apply_submit_fanout(&self, tx: &Arc<Transaction>, fanout: SubmitFanout) -> bool {
         let mut ok = true;
         match fanout {
             SubmitFanout::Admit {
@@ -500,18 +504,11 @@ where
             SubmitFanout::PublishDirect { touched_shards } => {
                 self.publish_direct(tx, &touched_shards);
             }
-            SubmitFanout::WantsRecords { host, wanted } => {
-                let env = HostEvent::shard(
-                    host,
-                    ShardScopedInput::RecordsWanted {
-                        wanted: vec![DeferredTransaction::new(
-                            Arc::clone(tx),
-                            wanted,
-                            DeferredOrigin::Submission,
-                        )],
-                    },
-                );
-                if self.shard_sender(host).send(env).is_err() {
+            SubmitFanout::WantsRecords { wanted } => {
+                let env = HostEvent::Beacon(BeaconScopedInput::SubmissionWantsRecords {
+                    deferred: DeferredTransaction::new(Arc::clone(tx), wanted),
+                });
+                if self.beacon_event_sender.send(env).is_err() {
                     ok = false;
                 }
             }
@@ -688,10 +685,10 @@ pub(crate) enum SubmitFanout {
     ///
     /// A gap rather than a verdict: the seals committed on the shards
     /// owning their prefixes, and the envelope derives on any node that
-    /// has them. It waits on `host` while that shard fetches the records.
+    /// has them. It waits on the host's beacon loop, which every host
+    /// runs seated or not, while that loop fetches the records; no shard
+    /// loop holds it, so none retiring loses it.
     WantsRecords {
-        /// A hosted shard to hold the envelope and run the fetch.
-        host: ShardId,
         /// What its derivation could not resolve.
         wanted: Unresolved,
     },

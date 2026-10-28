@@ -412,21 +412,24 @@ where
         }
     }
 
-    /// Tell `owner` what it asked for now resolves. Only a chain's loop
-    /// holds envelopes waiting on records; one that has closed since it
-    /// asked is told nothing.
-    fn notify_arrived(&self, owner: BeaconOwner, arrived: Vec<Address>) {
+    /// Tell `owner` what it asked for now resolves: a chain's loop over
+    /// its channel, unless it has closed since it asked, and this loop's
+    /// own submissions in place.
+    fn notify_arrived(&mut self, owner: BeaconOwner, arrived: Vec<Address>) {
         if arrived.is_empty() {
             return;
         }
-        let BeaconOwner::Chain(chain) = owner else {
-            return;
-        };
-        if let Some((shard, sender)) = self.shard_senders.get(&chain) {
-            let _ = sender.send(HostEvent::shard(
-                *shard,
-                ShardScopedInput::RecordsArrived { arrived },
-            ));
+        match owner {
+            BeaconOwner::Chain(chain) => {
+                if let Some((shard, sender)) = self.shard_senders.get(&chain) {
+                    let _ = sender.send(HostEvent::shard(
+                        *shard,
+                        ShardScopedInput::RecordsArrived { arrived },
+                    ));
+                }
+            }
+            BeaconOwner::Submissions => self.release_submissions(&arrived),
+            BeaconOwner::Fold | BeaconOwner::Participant(_) => {}
         }
     }
 }
