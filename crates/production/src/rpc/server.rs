@@ -41,6 +41,10 @@ pub struct RpcServerConfig {
     /// Set to `None` to disable sync-based backpressure.
     /// Default: 10 blocks
     pub sync_backpressure_threshold: Option<u64>,
+    /// The network's genesis instant (ms since the Unix epoch), reported on
+    /// `/api/v1/status` so a client can stamp validity windows on the chain
+    /// time they are judged by.
+    pub genesis_timestamp_ms: u64,
 }
 
 impl Default for RpcServerConfig {
@@ -49,6 +53,7 @@ impl Default for RpcServerConfig {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             metrics_enabled: true,
             sync_backpressure_threshold: Some(10),
+            genesis_timestamp_ms: 0,
         }
     }
 }
@@ -129,6 +134,7 @@ impl RpcServer {
         tx_status: Arc<TxStatusCache>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
+        let genesis_timestamp_ms = config.genesis_timestamp_ms;
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
@@ -139,6 +145,7 @@ impl RpcServer {
             tx_status,
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold,
+            genesis_timestamp_ms,
         };
 
         Self { config, state }
@@ -160,6 +167,7 @@ impl RpcServer {
         mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
+        let genesis_timestamp_ms = config.genesis_timestamp_ms;
         let state = RpcState {
             ready,
             sync_status,
@@ -170,6 +178,7 @@ impl RpcServer {
             tx_status,
             mempool_snapshot,
             sync_backpressure_threshold,
+            genesis_timestamp_ms,
         };
 
         Self { config, state }

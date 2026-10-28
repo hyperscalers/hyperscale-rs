@@ -81,6 +81,7 @@ mod tests {
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
+            genesis_timestamp_ms: 0,
         }
     }
 

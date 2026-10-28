@@ -55,6 +55,10 @@ pub struct NodeStatusResponse {
     pub uptime_secs: u64,
     #[serde(default)]
     pub version: String,
+    /// The network's genesis instant, ms since the Unix epoch: the origin
+    /// of the chain time validity windows are judged on. Required, since a
+    /// window built without it cannot be read on the chain's clock.
+    pub genesis_timestamp_ms: u64,
     #[serde(default)]
     pub(crate) vnodes: Vec<VnodeStatusEntry>,
 }
@@ -81,6 +85,7 @@ pub struct NodeStatus {
     pub connected_peers: usize,
     pub vnode_count: usize,
     pub min_block_height: u64,
+    pub genesis_timestamp_ms: u64,
 }
 
 /// Response from transaction status endpoint.

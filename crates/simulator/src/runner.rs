@@ -103,10 +103,9 @@ impl Simulator {
             })
         };
 
-        let workload = TransferWorkload::new()
+        let workload = TransferWorkload::new(validity_clock)
             .with_cross_shard_ratio(config.workload.cross_shard_ratio)
-            .with_selection_mode(config.workload.selection_mode)
-            .with_validity_clock(Arc::clone(&validity_clock));
+            .with_selection_mode(config.workload.selection_mode);
 
         let batch_size = config.workload.batch_size;
 

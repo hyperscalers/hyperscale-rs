@@ -7,7 +7,7 @@ use hyperscale_types::{NetworkDefinition, NetworkId, ShardId, Transaction};
 use rand::{Rng, RngExt};
 
 use crate::accounts::{AccountPool, FundedAccount, SelectionMode};
-use crate::validity::{ValidityClock, wall_clock};
+use crate::validity::ValidityClock;
 use crate::workloads::WorkloadGenerator;
 
 /// What a transfer moves when the caller sets no amount.
@@ -33,40 +33,27 @@ pub struct TransferWorkload {
     /// account counter from advancing faster than others.
     shard_counter: AtomicU64,
 
-    /// Source of validity ranges. Defaults to wall clock; the simulator
-    /// substitutes a simulated-clock anchor.
+    /// Source of validity ranges, read on the clock the chain judges them
+    /// by.
     validity_clock: ValidityClock,
 
     /// The world every built transfer resolves its accounts in.
     client: Client,
 }
 
-impl Default for TransferWorkload {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TransferWorkload {
-    /// Create a new transfer workload generator.
+    /// Create a transfer workload generator whose windows come from
+    /// `validity_clock`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(validity_clock: ValidityClock) -> Self {
         Self {
             cross_shard_ratio: 0.3,
             selection_mode: SelectionMode::default(),
             amount: DEFAULT_TRANSFER_AMOUNT,
             shard_counter: AtomicU64::new(0),
-            validity_clock: wall_clock(),
+            validity_clock,
             client: Client::genesis(NetworkId::from(&NetworkDefinition::simulator())),
         }
-    }
-
-    /// Override the source of validity ranges. The simulator uses this to
-    /// anchor windows on its simulated clock instead of the wall clock.
-    #[must_use]
-    pub fn with_validity_clock(mut self, clock: ValidityClock) -> Self {
-        self.validity_clock = clock;
-        self
     }
 
     /// Set the cross-shard transaction ratio (0.0 to 1.0).
@@ -278,6 +265,7 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     use super::*;
+    use crate::validity::chain_clock;
 
     /// The shards a generated transfer touches, read off the envelope's
     /// own graph. The client never derives effect sets — it routes by the
@@ -297,7 +285,7 @@ mod tests {
     #[test]
     fn test_generate_same_shard_transfer() {
         let accounts = AccountPool::generate(2, 10).unwrap();
-        let workload = TransferWorkload::new().with_cross_shard_ratio(0.0);
+        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(0.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let tx = workload
@@ -313,7 +301,7 @@ mod tests {
     #[test]
     fn test_generate_cross_shard_transfer() {
         let accounts = AccountPool::generate(2, 10).unwrap();
-        let workload = TransferWorkload::new().with_cross_shard_ratio(1.0);
+        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(1.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let tx = workload
@@ -330,7 +318,7 @@ mod tests {
     fn test_generate_for_shard_same_shard() {
         let num_shards = 4u64;
         let accounts = AccountPool::generate(num_shards, 10).unwrap();
-        let workload = TransferWorkload::new().with_cross_shard_ratio(0.0);
+        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(0.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let target_shard = ShardId::leaf(2, 2);
@@ -350,7 +338,7 @@ mod tests {
     fn test_generate_for_shard_cross_shard() {
         let num_shards = 4u64;
         let accounts = AccountPool::generate(num_shards, 10).unwrap();
-        let workload = TransferWorkload::new().with_cross_shard_ratio(1.0);
+        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(1.0);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let target_shard = ShardId::leaf(2, 1);
@@ -371,7 +359,7 @@ mod tests {
     fn test_generate_batch_for_shard() {
         let num_shards = 4u64;
         let accounts = AccountPool::generate(num_shards, 10).unwrap();
-        let workload = TransferWorkload::new().with_cross_shard_ratio(0.5);
+        let workload = TransferWorkload::new(chain_clock(0)).with_cross_shard_ratio(0.5);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let target_shard = ShardId::leaf(2, 0);
