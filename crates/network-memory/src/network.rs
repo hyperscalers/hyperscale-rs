@@ -1504,8 +1504,17 @@ impl SimulatedNetwork {
                     return 0;
                 };
                 let peer = open.attempts.peer();
+                let empty = (open.is_empty_response)(&bytes);
                 if (open.on_response)(Ok(bytes)) == ResponseVerdict::Reject {
-                    self.peer_health[requester as usize].record_rejected(peer);
+                    // An empty answer the caller rejects says the peer did
+                    // not hold what was asked; any other it rejects, or one
+                    // that does not decode, says the peer answered falsely.
+                    let health = &mut self.peer_health[requester as usize];
+                    if empty {
+                        health.record_rejected(peer);
+                    } else {
+                        health.record_invalid(peer, now);
+                    }
                 }
                 1
             }
