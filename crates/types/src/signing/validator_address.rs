@@ -4,10 +4,11 @@ use blake3::Hasher;
 use hyperscale_hbor::Hbor;
 
 use crate::Hash;
+use crate::network::gossip::ENDPOINT_ID_LEN;
 use crate::signing::NetworkId;
 
 /// What a validator address announcement's signature covers: the
-/// announcement sequence number plus a digest of the peer id and
+/// announcement sequence number plus a digest of the endpoint id and
 /// addresses.
 ///
 /// The digest keeps the signed message fixed-width while binding the
@@ -17,17 +18,20 @@ use crate::signing::NetworkId;
 pub struct ValidatorAddressMessage {
     /// Monotonic announcement sequence — receivers keep the highest.
     pub(crate) sequence: u64,
-    /// Digest over the length-framed peer id and addresses.
+    /// Digest over the endpoint id and the length-framed addresses.
     pub(crate) content_digest: Hash,
 }
 
 impl ValidatorAddressMessage {
     /// Assemble the message an address announcement signs.
     #[must_use]
-    pub fn new(peer_id_bytes: &[u8], addresses: &[impl AsRef<[u8]>], sequence: u64) -> Self {
+    pub fn new(
+        endpoint_id: &[u8; ENDPOINT_ID_LEN],
+        addresses: &[impl AsRef<[u8]>],
+        sequence: u64,
+    ) -> Self {
         let mut hasher = Hasher::new();
-        hasher.update(&frame_len(peer_id_bytes.len()));
-        hasher.update(peer_id_bytes);
+        hasher.update(endpoint_id);
         for addr in addresses {
             let addr = addr.as_ref();
             hasher.update(&frame_len(addr.len()));

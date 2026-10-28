@@ -380,7 +380,7 @@ fn address_record_naming(
         b"not this record".to_vec()
     } else {
         signed_bytes(
-            &ValidatorAddressMessage::new(&own.peer_id, &own.addresses, sequence),
+            &ValidatorAddressMessage::new(&own.endpoint_id, &own.addresses, sequence),
             &NetworkDefinition::simulator(),
         )
     };

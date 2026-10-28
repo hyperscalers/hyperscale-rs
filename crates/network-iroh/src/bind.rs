@@ -212,7 +212,7 @@ fn verify_bind(
 
     let message = signed_bytes(
         &ValidatorBindMessage {
-            peer_id: endpoint.as_bytes().to_vec(),
+            endpoint_id: *endpoint.as_bytes(),
             nonce: *nonce,
         },
         network,
@@ -266,7 +266,7 @@ impl BindContext {
     fn sign_all(&self, remote_nonce: &[u8; VALIDATOR_BIND_NONCE_LEN]) -> Attestations {
         let message = signed_bytes(
             &ValidatorBindMessage {
-                peer_id: self.local_endpoint.as_bytes().to_vec(),
+                endpoint_id: *self.local_endpoint.as_bytes(),
                 nonce: *remote_nonce,
             },
             &self.network,
@@ -483,7 +483,7 @@ mod tests {
     ) -> ConsensusSignature {
         key.sign(&signed_bytes(
             &ValidatorBindMessage {
-                peer_id: endpoint.as_bytes().to_vec(),
+                endpoint_id: *endpoint.as_bytes(),
                 nonce,
             },
             &NetworkDefinition::simulator(),

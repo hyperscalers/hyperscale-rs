@@ -1203,7 +1203,7 @@ fn address_record(
         b"not this record".to_vec()
     } else {
         signed_bytes(
-            &ValidatorAddressMessage::new(&record.peer_id, &record.addresses, sequence),
+            &ValidatorAddressMessage::new(&record.endpoint_id, &record.addresses, sequence),
             &NetworkDefinition::simulator(),
         )
     };
