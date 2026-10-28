@@ -1260,20 +1260,22 @@ pub fn a_sponsor_spends_its_balance_beside_its_held_cores_abort<C: FaultableClus
 /// the caller's execution votes are cut among its own committee, so its
 /// leg commits and cannot finalize: the escrowed record it would write
 /// stands unwritten. The venue waits on its input to the deadline, and its
-/// abandonment writes an unseen `Never`. The venue then asks for the
-/// record and carries its absence, read before any write; that absence
-/// alone deletes no unseen answer, so the `Never` stands. Once the votes
-/// return the leg finalizes and writes the record, the caller reads the
-/// `Never` and reclaims its input, and the `Never` goes on the record's
-/// absence. Both worlds are conserved with nothing locked.
+/// abandonment writes an unseen `Never`. The venue then asks the caller's
+/// boundaries for the record and reads it absent, before any write, beside
+/// the leg's member row still standing; a deletion reads that row absent
+/// too, so the reading deletes nothing and the `Never` stands. Once the
+/// votes return the leg finalizes and writes the record, the caller reads
+/// the `Never` and reclaims its input, and the `Never` goes on the
+/// record's absence. Both worlds are conserved with nothing locked.
 ///
 /// # Panics
 ///
 /// Panics if the venue does not abandon the swap while the leg is held,
-/// if the venue carries no absence of the record, if that absence
-/// deletes the `Never`, if the leg does not finalize once the votes
-/// return, if the record or the `Never` outlives the reclaim, if the
-/// input does not come home, or if either world is not conserved.
+/// if the venue does not ask two of the caller's boundaries for the
+/// record, if a reading there deletes the `Never`, if the leg does not
+/// finalize once the votes return, if the record or the `Never` outlives
+/// the reclaim, if the input does not come home, or if either world is
+/// not conserved.
 pub fn an_abandoned_never_outlives_a_late_record<C: FaultableCluster>(c: &mut C, budget: Budget) {
     let mut taken = Vec::new();
     let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
@@ -1309,13 +1311,14 @@ pub fn an_abandoned_never_outlives_a_late_record<C: FaultableCluster>(c: &mut C,
         stands_at(c, input.never) && !stands_at(c, input.record),
         "the abandonment writes a Never for a record not yet written",
     );
-    let absences = c.metric("fenced_claims_carried", Some("removed"));
-    assert!(
-        c.run_until(budget, |c| c
-            .metric("fenced_claims_carried", Some("removed"))
-            > absences),
-        "the venue must carry an absence of the unwritten record",
-    );
+    // A second boundary asked is one past the first's reading.
+    for _ in 0..2 {
+        let asked = c.metric("boundary_cells_asked", None);
+        assert!(
+            c.run_until(budget, |c| c.metric("boundary_cells_asked", None) > asked),
+            "the venue must ask the caller's boundary for the unwritten record",
+        );
+    }
     assert!(
         stands_at(c, input.never),
         "an absence read before the record was written deletes no unseen Never",
