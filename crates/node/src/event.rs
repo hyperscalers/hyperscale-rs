@@ -177,18 +177,6 @@ pub enum ShardScopedInput {
         batch: Vec<Arc<Transaction>>,
     },
 
-    /// Package artifacts delivered by the fetch protocol, already
-    /// verified: each hashed to a requested content address at the
-    /// response boundary.
-    PackageArtifactsFetched {
-        /// The verified artifacts, each beside the content address its
-        /// bytes hash to. The address is derived once, where the
-        /// response is verified, because deriving it is a hash over a
-        /// whole artifact and the shard loop is the one place that
-        /// should never pay for one.
-        artifacts: Vec<(Hash, Vec<u8>)>,
-    },
-
     /// Envelopes a derivation could not resolve, each beside what it
     /// wanted — component records, package artifacts, or both — so the
     /// fetch can ask the shards owning them and the envelopes can wait
@@ -198,25 +186,14 @@ pub enum ShardScopedInput {
         wanted: Vec<DeferredTransaction>,
     },
 
-    /// Package artifacts this node has finished installing, so the
-    /// metadata a derivation reads is there to be read.
-    ///
-    /// Reported from inside the install rather than beside it: an
-    /// envelope held for want of this package derives on the strength of
-    /// this, and the cache has to hold the metadata before that is true.
-    PackagesInstalled {
-        /// The installed packages, by content address.
-        packages: Vec<Hash>,
-    },
-
-    /// Instance records delivered by the fetch protocol, already
-    /// verified: each re-derived the component address it was asked
-    /// for, at the response boundary.
-    InstanceRecordsFetched {
-        /// The verified records, each beside the address its own
-        /// contents derive. Derived once, where the response is
-        /// verified, so the shard loop never pays for the hash.
-        records: Vec<(Address, Vec<u8>)>,
+    /// Records and code this loop asked the host's beacon loop for are
+    /// now what derivation reads, so the envelopes waiting on them can be
+    /// offered again.
+    RecordsArrived {
+        /// What arrived, each as the address a wait is indexed by: a
+        /// component by its own, a package by the one its content
+        /// address derives.
+        arrived: Vec<Address>,
     },
 
     /// Locally-submitted tx delivered to a passive co-host: a hosted
@@ -491,9 +468,7 @@ impl ShardScopedInput {
             Self::ProposalReceived { .. }
             | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
-            | Self::PackageArtifactsFetched { .. }
-            | Self::PackagesInstalled { .. }
-            | Self::InstanceRecordsFetched { .. }
+            | Self::RecordsArrived { .. }
             | Self::RecordsWanted { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. } => EventPriority::Network,
@@ -587,9 +562,13 @@ pub enum BeaconOwner {
     Fold,
     /// One attached identity's beacon participation.
     Participant(Attachment),
+    /// A registered chain's loop, asking for the records and code its
+    /// envelopes and commits name.
+    Chain(ChainRegistration),
 }
 
-/// What a replica reports to the host's beacon loop from one event.
+/// What a chain's loop reports to the host's beacon loop: what its
+/// replica saw, and what the loop wants the host to fetch.
 #[derive(Debug, Clone)]
 pub enum BeaconInput {
     /// The replica committed the block this certified header heads.
@@ -618,6 +597,21 @@ pub enum BeaconInput {
     VoteEquivocation {
         /// The proven pair.
         evidence: Box<ShardVoteEquivocation>,
+    },
+    /// The loop wants these records and this code, which derivation does
+    /// not read on this host yet.
+    RecordsWanted {
+        /// Component records, by address.
+        instances: Vec<Address>,
+        /// Package artifacts, by content address.
+        packages: Vec<Hash>,
+    },
+    /// Nothing on the loop waits on these any more.
+    RecordsAbandoned {
+        /// Component records, by address.
+        instances: Vec<Address>,
+        /// Package artifacts, by content address.
+        packages: Vec<Hash>,
     },
 }
 
@@ -717,6 +711,29 @@ pub enum BeaconScopedInput {
     /// sync's deferred epochs.
     FetchTick,
 
+    /// Instance records a fetch delivered, each already re-derived to the
+    /// address it was asked for at the response boundary, so the loop
+    /// never pays for the hash.
+    InstanceRecordsFetched {
+        /// The verified records, each beside the address it derives.
+        records: Vec<(Address, Vec<u8>)>,
+    },
+
+    /// Package artifacts a fetch delivered, each already hashed to the
+    /// content address it was asked for at the response boundary.
+    PackageArtifactsFetched {
+        /// The verified artifacts, each beside its content address.
+        artifacts: Vec<(Hash, Vec<u8>)>,
+    },
+
+    /// Package artifacts the loop's off-thread install has seated, so the
+    /// metadata derivation reads is there to be read. Reported from
+    /// inside the install, after the cache holds it.
+    PackagesInstalled {
+        /// The installed packages, by content address.
+        packages: Vec<Hash>,
+    },
+
     /// What the replica of the chain `chain` names reported.
     Shard {
         /// The reporting loop's registration.
@@ -765,6 +782,9 @@ impl BeaconScopedInput {
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::FetchFailed(_)
             | Self::FetchUnroutable(_)
+            | Self::InstanceRecordsFetched { .. }
+            | Self::PackageArtifactsFetched { .. }
+            | Self::PackagesInstalled { .. }
             | Self::Shard { .. }
             | Self::Register { .. }
             | Self::Deregister(_) => EventPriority::Internal,

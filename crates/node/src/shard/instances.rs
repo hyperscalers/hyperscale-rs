@@ -1,153 +1,27 @@
-//! Instance record acquisition: the fetch that lets a node resolve a
-//! component whose seal it never committed.
+//! Waiting on records: the envelopes a loop holds back until the host
+//! can resolve what they name.
 //!
-//! A component's record is committed on the shard owning its own prefix,
-//! so every other shard holds none of it — yet each has to resolve the
-//! target to say what a transaction naming it declares. What closes the
-//! gap is a fetch keyed by the component's address, verified by
-//! re-deriving that address from the record's own contents, and seated
-//! in the registry derivation reads.
-//!
-//! Discovery is demand-driven, unlike the artifact fetch beside it.
-//! Packages reconcile against the beacon's registry, which lists every
-//! one of them; components have no such registry and could not have one,
-//! so what a node asks for is what a derivation just told it was
-//! missing.
+//! A component's record is committed on the shard owning its own prefix
+//! and a package's artifact under its content address, so every other
+//! shard holds neither — yet each has to resolve a target to say what a
+//! transaction naming it declares, and run the code a committed block
+//! names. The host fetches both once, on its beacon loop, because the
+//! registry and the code it seats are the host's and not any one loop's.
+//! This loop asks it for what its derivations and commits name, holds the
+//! envelopes waiting, and offers them again when the beacon loop says
+//! what arrived.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_core::FetchIds;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::instance_of_record;
-use hyperscale_hbor::{Bytes, Capped};
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::request::{
-    GetInstanceRecordsRequest, MAX_INSTANCE_RECORDS_PER_REQUEST,
-};
-use hyperscale_types::{Address, Hash, LocalTimestamp, ShardId, Transaction, TxHash, Unresolved};
+use hyperscale_types::{Address, Hash, LocalTimestamp, Transaction, TxHash, Unresolved};
 
-use crate::config::NodeConfig;
-use crate::fetch::{
-    Fetch, FetchBinding, FetchInput, FetchedBy, Route, ShardReply, failed_chunk,
-    partition_solicited,
-};
+use crate::beacon_loop::custodian;
+use crate::event::{BeaconInput, BeaconScopedInput, HostEvent};
+use crate::shard::ShardLoop;
 use crate::shard::mempool::{DeferredOrigin, DeferredTransaction, Orphaned};
-use crate::shard::packages::PackageArtifactBinding;
-use crate::shard::{ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
-
-/// Per-component record fetch, keyed by the address the record derives.
-pub type InstanceRecordFetch = Fetch<Address>;
-
-/// Per-shard record-acquisition state: the record fetch instance.
-pub struct InstancesState {
-    pub(crate) fetch: InstanceRecordFetch,
-}
-
-impl InstancesState {
-    pub(crate) fn new(config: &NodeConfig) -> Self {
-        let mut fetch_config = config.instance_record_fetch.clone();
-        fetch_config.max_ids_per_request = fetch_config
-            .max_ids_per_request
-            .min(MAX_INSTANCE_RECORDS_PER_REQUEST);
-        Self {
-            fetch: InstanceRecordFetch::new("instance_record", fetch_config),
-        }
-    }
-
-    /// Whether the record fetch has work the tick loop should drive.
-    #[must_use]
-    pub(crate) fn has_pending(&self) -> bool {
-        self.fetch.has_pending()
-    }
-}
-
-/// Marker type for the instance record fetch.
-pub struct InstanceRecordBinding;
-
-impl FetchBinding for InstanceRecordBinding {
-    type Id = Address;
-
-    const NAME: &'static str = "instance_record";
-
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::InstanceRecords(ids)
-    }
-}
-
-impl<S: ShardStorage> FetchedBy<ShardIo<S>> for InstanceRecordBinding {
-    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Address> {
-        &mut shard.instances.fetch
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<Address>,
-        route: Route,
-        network: &N,
-        reply: &ShardReply,
-    ) {
-        let local_shard = reply.shard;
-        let sender = &reply.sender;
-        let es = sender.clone();
-        let requested = ids.clone();
-        route.request(
-            network,
-            GetInstanceRecordsRequest::new(
-                Capped::new(ids).expect("the fetch config clamps a chunk to the record cap"),
-            ),
-            Box::new(move |result| {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            failed_chunk(&error, Self::ids(requested)),
-                        );
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                // Re-deriving the address from the record is the
-                // whole verification: a component's address is the
-                // hash of its record, so bytes deriving anything
-                // else are dropped here, before the registry sees
-                // them. The address travels on beside the bytes, so
-                // nothing downstream derives it again.
-                let addressed: Vec<(Address, Vec<u8>)> = resp
-                    .records
-                    .into_iter()
-                    .map(Bytes::into_inner)
-                    .filter_map(|record| {
-                        instance_of_record(&record).map(|address| (address, record))
-                    })
-                    .collect();
-                let split = partition_solicited(addressed, &requested, |(address, _)| [*address]);
-                if !split.kept.is_empty() {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::InstanceRecordsFetched {
-                            records: split.kept,
-                        },
-                    );
-                }
-                if !split.missing.is_empty() {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
-                    );
-                }
-                if split.unsolicited > 0 || !split.missing.is_empty() {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
-    }
-}
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -155,32 +29,43 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Hold `wanted` back and ask for what each envelope's derivation
-    /// could not resolve: a component's record from the shard owning its
-    /// prefix, a package's artifact from the shard obliged to keep it.
+    /// Hold `wanted` back and ask the host for what each envelope's
+    /// derivation could not resolve.
     ///
     /// The envelopes wait rather than being dropped because the gap is
     /// this node's, not theirs: every node that could propose one has
     /// the same gap, so dropping them all would leave the arriving
     /// record with nothing to admit.
     ///
+    /// Derivation ran off the loop against a view pinned before it, so
+    /// what it named may have landed since. That much is offered again at
+    /// once rather than asked for: no arrival is coming for it. The check
+    /// is the question derivation asks of the same view, so an envelope
+    /// offered again on it derives past that name.
+    ///
     /// A record and the code it names are asked for in turn, not
     /// together: the record is what says which package a target runs, so
     /// what is missing behind one is only knowable once it lands. An
     /// envelope wanting both comes back here after the first arrival.
     pub(crate) fn defer_for_records(&mut self, wanted: Vec<DeferredTransaction>) {
+        let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let mut evicted: Vec<TxHash> = Vec::new();
         let mut instances: Vec<Address> = Vec::new();
         let mut packages: Vec<Hash> = Vec::new();
+        let mut landed: Vec<Address> = Vec::new();
         for deferred in wanted {
-            for instance in &deferred.wanted.instances {
-                if !instances.contains(instance) {
-                    instances.push(*instance);
+            for &instance in &deferred.wanted.instances {
+                if executor.instance_known(instance) {
+                    landed.push(instance);
+                } else if !instances.contains(&instance) {
+                    instances.push(instance);
                 }
             }
-            for package in &deferred.wanted.packages {
-                if !packages.contains(package) {
-                    packages.push(*package);
+            for &package in &deferred.wanted.packages {
+                if executor.package_known(package) {
+                    landed.push(custodian(package));
+                } else if !packages.contains(&package) {
+                    packages.push(package);
                 }
             }
             // Held under the same dedup guard a queued envelope is, so a
@@ -198,8 +83,10 @@ where
         // offer it again unless it is gossiped or fetched afresh, and
         // that has to find the dedup guard clear.
         self.handle_transaction_validations_failed(&evicted);
-        self.fetch_instance_records(instances);
-        self.fetch_wanted_packages(packages);
+        self.ask_host(instances, packages);
+        if !landed.is_empty() {
+            self.release_deferred(&landed);
+        }
     }
 
     /// What a transaction this node could not route is waiting on, or
@@ -212,61 +99,52 @@ where
             .and_then(|error| error.unresolved().cloned())
     }
 
-    /// Ask the shard owning each component's prefix for its record.
-    ///
-    /// Idempotent: a record is immutable once sealed and self-verifying
-    /// on arrival, so asking twice costs a round trip and settles the
-    /// same way.
-    pub(crate) fn fetch_instance_records(&mut self, instances: Vec<Address>) {
+    /// Ask the host for the records `instances` names that derivation
+    /// does not read here.
+    pub(crate) fn fetch_instance_records(&self, instances: Vec<Address>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
-        let snapshot = self.process.topology_snapshot.load();
-        let mut by_shard: BTreeMap<ShardId, Vec<Address>> = BTreeMap::new();
-        for instance in instances {
-            if executor.instance_known(instance) {
-                continue;
-            }
-            by_shard
-                .entry(snapshot.shard_trie().shard_for_prefix(instance))
-                .or_default()
-                .push(instance);
-        }
-        drop(snapshot);
-        for (shard, ids) in by_shard {
-            self.drive_fetch::<InstanceRecordBinding>(FetchInput::Request {
-                ids,
-                shard,
-                preferred: None,
-                class: None,
-            });
-        }
+        let wanted: Vec<Address> = instances
+            .into_iter()
+            .filter(|&instance| !executor.instance_known(instance))
+            .collect();
+        self.ask_host(wanted, Vec::new());
     }
 
-    /// Keep verified fetched records on disk and seat them in the
-    /// registry derivation reads, then offer the envelopes that were
-    /// waiting on them again.
+    /// Ask the host for the code `packages` names that this node holds no
+    /// bytes of.
     ///
-    /// Kept before they are seated, and durably: a transaction this node
-    /// routes on one of them can commit, and replaying that commit after
-    /// a restart — or deriving it again after the bounded registry lets
-    /// the record go — reads the record back from this copy. Nothing
-    /// else would bring it back; a committed block is not re-admitted,
-    /// and what it books is decided by the derivation its replay reaches.
-    ///
-    /// Runs on the loop rather than off it, unlike the artifact install
-    /// beside it: a record is small, and what follows it here is the
-    /// re-admission that has to see the registry it grew.
-    pub(crate) fn handle_instance_records_fetched(&mut self, records: Vec<(Address, Vec<u8>)>) {
+    /// A package reaches a node because something asked to run it: a
+    /// transaction admitted, a block committed, a tick waiting on it.
+    /// Filtered here, so the common transaction, whose code is long since
+    /// installed, sends nothing off the loop.
+    pub(crate) fn fetch_wanted_packages(&self, packages: Vec<Hash>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
-        let ids: Vec<Address> = records.iter().map(|(address, _)| *address).collect();
-        self.process
-            .dispatch_handles
-            .beacon_storage
-            .store_fetched_instances(&records);
-        for (instance, record) in records {
-            executor.install_instance(instance, &record);
+        let wanted: Vec<Hash> = packages
+            .into_iter()
+            .filter(|&package| executor.needs_artifact(package))
+            .collect();
+        self.ask_host(Vec::new(), wanted);
+    }
+
+    /// Send the host's beacon loop an ask under this loop's registration.
+    fn ask_host(&self, instances: Vec<Address>, packages: Vec<Hash>) {
+        if instances.is_empty() && packages.is_empty() {
+            return;
         }
-        self.drive_fetch::<InstanceRecordBinding>(FetchInput::Admitted { ids: ids.clone() });
-        self.release_deferred(&ids);
+        self.send_to_beacon(BeaconInput::RecordsWanted {
+            instances,
+            packages,
+        });
+    }
+
+    fn send_to_beacon(&self, input: BeaconInput) {
+        let _ =
+            self.process
+                .beacon_event_sender
+                .send(HostEvent::Beacon(BeaconScopedInput::Shard {
+                    chain: self.chain,
+                    input,
+                }));
     }
 
     /// Offer every envelope `arrived` releases back to the door it came
@@ -329,21 +207,15 @@ where
     /// an id no envelope names is one whose answer nobody would admit.
     /// The custodian may have none to give — an envelope naming a
     /// component that does not exist is one anyone can gossip — so
-    /// without this the ask is re-dispatched every fetch tick for the
-    /// life of the process.
-    pub(crate) fn retire_orphaned(&mut self, orphaned: Orphaned) {
+    /// without this the host re-asks for it every fetch tick for the life
+    /// of the process.
+    pub(crate) fn retire_orphaned(&self, orphaned: Orphaned) {
         if orphaned.is_empty() {
             return;
         }
-        if !orphaned.instances.is_empty() {
-            self.drive_fetch::<InstanceRecordBinding>(FetchInput::Abandoned {
-                ids: orphaned.instances,
-            });
-        }
-        if !orphaned.packages.is_empty() {
-            self.drive_fetch::<PackageArtifactBinding>(FetchInput::Abandoned {
-                ids: orphaned.packages,
-            });
-        }
+        self.send_to_beacon(BeaconInput::RecordsAbandoned {
+            instances: orphaned.instances,
+            packages: orphaned.packages,
+        });
     }
 }

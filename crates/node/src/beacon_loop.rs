@@ -43,9 +43,9 @@ use hyperscale_types::network::gossip::ShardVoteEquivocationGossip;
 use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
-    BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
+    Address, BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
     BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlockHeader, Epoch,
-    GenesisConfigHash, LeafIndex, LocalTimestamp, MessageClass, NetworkDefinition, ShardId,
+    GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MessageClass, NetworkDefinition, ShardId,
     ShardVoteEquivocation, Signer, SlotEffects, TopologySchedule, TopologySnapshot, ValidatorId,
     ValidatorStatus, Verifiable, Verified, Verifier, Verify, verify_shard_vote_equivocation,
 };
@@ -64,6 +64,11 @@ use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Release};
 use crate::process::ProcessIo;
 use crate::shard::{FetchTicker, StepOutput, TimerOp, TimerOwner};
 use crate::sync::SyncOutput;
+
+mod records;
+
+pub(crate) use records::custodian;
+use records::{InstanceRecordBinding, PackageArtifactBinding};
 
 /// The host's beacon driver.
 pub struct BeaconLoop<S, N, D>
@@ -221,10 +226,13 @@ where
     }
 
     /// Stop tracking the chain `token` names. The commit-proof asks its
-    /// loop held go to another registered loop.
+    /// loop held go to another registered loop, and what it asked for on
+    /// its own behalf is wanted by it no longer.
     pub(crate) fn deregister(&mut self, token: ChainRegistration) {
         self.fold.deregister_chain(token);
         self.shard_senders.remove(&token);
+        self.forget::<InstanceRecordBinding>(BeaconOwner::Chain(token));
+        self.forget::<PackageArtifactBinding>(BeaconOwner::Chain(token));
         let held: Vec<(ShardId, BlockHeight)> = self
             .proof_routes
             .iter()
@@ -415,6 +423,13 @@ where
                     self.on_participant_event(attachment.validator, *event);
                 }
             }
+            BeaconScopedInput::Continuation {
+                owner: BeaconOwner::Chain(_),
+                event,
+            } => warn!(
+                event = event.type_name(),
+                "BeaconLoop: a chain dispatches no beacon action — dropping"
+            ),
             BeaconScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
                 self.on_sync_response(epoch, block);
             }
@@ -429,7 +444,18 @@ where
                 self.drive_fetch::<ShardWitnessBinding>(FetchInput::Tick);
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Tick);
                 self.drive_fetch::<BeaconCandidateBinding>(FetchInput::Tick);
+                self.drive_fetch::<InstanceRecordBinding>(FetchInput::Tick);
+                self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
                 self.on_sync_tick();
+            }
+            BeaconScopedInput::InstanceRecordsFetched { records } => {
+                self.on_instance_records_fetched(records);
+            }
+            BeaconScopedInput::PackageArtifactsFetched { artifacts } => {
+                self.on_package_artifacts_fetched(artifacts);
+            }
+            BeaconScopedInput::PackagesInstalled { packages } => {
+                self.on_packages_installed(packages);
             }
             BeaconScopedInput::Shard { chain, input } => self.on_shard_input(chain, input),
             BeaconScopedInput::Register {
@@ -817,6 +843,14 @@ where
             BeaconInput::VoteEquivocation { evidence } => {
                 self.observe_vote_equivocation(evidence);
             }
+            BeaconInput::RecordsWanted {
+                instances,
+                packages,
+            } => self.want_records(BeaconOwner::Chain(chain), instances, packages),
+            BeaconInput::RecordsAbandoned {
+                instances,
+                packages,
+            } => self.abandon_records(BeaconOwner::Chain(chain), instances, packages),
         }
     }
 
@@ -979,6 +1013,7 @@ where
             }
             Action::TopologyChanged { epoch, schedule } => {
                 self.process.apply_topology(epoch, Arc::clone(&schedule));
+                self.reroute_record_asks();
                 for (shard, sender) in self.shard_senders.values() {
                     let _ = sender.send(HostEvent::protocol(
                         *shard,
@@ -1000,7 +1035,12 @@ where
                         duration,
                     });
                 }
-                BeaconOwner::Fold => warn!(?id, "BeaconLoop: the fold arms no timer — dropping"),
+                BeaconOwner::Fold | BeaconOwner::Chain(_) => {
+                    warn!(
+                        ?id,
+                        "BeaconLoop: only a participant arms a timer — dropping"
+                    );
+                }
             },
             Action::CancelTimer { id } => match owner {
                 BeaconOwner::Participant(attachment) => {
@@ -1009,7 +1049,12 @@ where
                         id,
                     });
                 }
-                BeaconOwner::Fold => warn!(?id, "BeaconLoop: the fold arms no timer — dropping"),
+                BeaconOwner::Fold | BeaconOwner::Chain(_) => {
+                    warn!(
+                        ?id,
+                        "BeaconLoop: only a participant arms a timer — dropping"
+                    );
+                }
             },
             Action::StartBeaconBlockSync { target } => {
                 self.start_sync(target);
@@ -1030,9 +1075,9 @@ where
                 BeaconOwner::Participant(attachment) => {
                     self.dispatch_participant_action(attachment.validator, other);
                 }
-                BeaconOwner::Fold => warn!(
+                BeaconOwner::Fold | BeaconOwner::Chain(_) => warn!(
                     action = other.type_name(),
-                    "BeaconLoop: a participant action from the fold — dropping"
+                    "BeaconLoop: a participant action from another owner — dropping"
                 ),
             },
             other => warn!(
@@ -1151,6 +1196,10 @@ where
                     warn!("BeaconLoop: no live shard with a committee to ask; dropping");
                 }
             }
+            // Where a record or an artifact is asked for follows from its
+            // name, whatever shard the asker named.
+            BeaconFetchIds::InstanceRecords(ids) => self.want_records(owner, ids, Vec::new()),
+            BeaconFetchIds::PackageArtifacts(ids) => self.want_records(owner, Vec::new(), ids),
         }
     }
 
@@ -1185,6 +1234,12 @@ where
             BeaconFetchIds::Proposals(ids) => self.abandon_for::<BeaconProposalBinding>(owner, ids),
             BeaconFetchIds::Candidates(ids) => {
                 self.abandon_for::<BeaconCandidateBinding>(owner, ids);
+            }
+            BeaconFetchIds::InstanceRecords(ids) => {
+                self.abandon_for::<InstanceRecordBinding>(owner, ids);
+            }
+            BeaconFetchIds::PackageArtifacts(ids) => {
+                self.abandon_for::<PackageArtifactBinding>(owner, ids);
             }
         }
     }
@@ -1230,6 +1285,12 @@ where
             BeaconFetchIds::Proposals(ids) => self.release_for::<BeaconProposalBinding>(ids, how),
             BeaconFetchIds::Candidates(ids) => {
                 self.release_for::<BeaconCandidateBinding>(ids, how);
+            }
+            BeaconFetchIds::InstanceRecords(ids) => {
+                self.release_for::<InstanceRecordBinding>(ids, how);
+            }
+            BeaconFetchIds::PackageArtifacts(ids) => {
+                self.release_for::<PackageArtifactBinding>(ids, how);
             }
         }
     }
@@ -1279,7 +1340,7 @@ where
         let topology = self.process.topology_snapshot.load();
         let asker = match owner {
             BeaconOwner::Participant(attachment) => Some(attachment.validator),
-            BeaconOwner::Fold => None,
+            BeaconOwner::Fold | BeaconOwner::Chain(_) => None,
         };
         preferred
             .and_then(
@@ -1377,6 +1438,8 @@ struct Interest {
     witnesses: Askers<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>,
     proposals: Askers<(Epoch, ValidatorId)>,
     candidates: Askers<(Epoch, BeaconBlockHash)>,
+    records: Askers<Address>,
+    packages: Askers<Hash>,
 }
 
 /// A beacon fetch the loop drives on behalf of several owners.
@@ -1558,13 +1621,16 @@ mod tests {
     use hyperscale_core::TimerId;
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_network_memory::{
-        BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, SimNetworkAdapter,
+        BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, PendingRequest, SimNetworkAdapter,
         SimulatedNetwork,
     };
     use hyperscale_storage::RecoveredState;
     use hyperscale_storage::test_helpers::commit_one;
+    use hyperscale_types::network::request::GetInstanceRecordsRequest;
     use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
+    use hyperscale_types::network::response::GetInstanceRecordsResponse;
     use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
     use hyperscale_types::test_utils::{certify, make_live_block, test_pool, test_transaction};
     use hyperscale_types::{
@@ -1574,6 +1640,7 @@ mod tests {
         QuorumCertificate, RatifyCert, RatifyRound, Round, SignerBitfield, TopologySchedule,
         VrfProof, WeightedTimestamp, shard_prefix_path,
     };
+    use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
     use super::*;
     use crate::HostedChain;
@@ -3147,5 +3214,193 @@ mod tests {
             Some(SHARD),
             "the published topology releases the submission to the shard it routes to",
         );
+    }
+
+    /// A component record whose prefix `SHARD` owns, and its leaf bytes.
+    fn record_on_shard(host: &Host) -> (Address, Vec<u8>) {
+        let topology = host.process.topology_snapshot.load();
+        (0u8..=u8::MAX)
+            .map(|salt| InstanceMeta {
+                package: PackageHash(Hash32([7; 32])),
+                config: Capped::empty(),
+                salt: Hash32([salt; 32]),
+            })
+            .find_map(|meta| {
+                let address = meta.address(&ProtocolHasher).address();
+                (topology.shard_trie().shard_for_prefix(address) == SHARD)
+                    .then(|| (address, meta.leaf_bytes().expect("a record encodes")))
+            })
+            .expect("some salt lands on the shard")
+    }
+
+    /// Register another chain for `SHARD`, returning its token and the
+    /// channel the beacon loop sends it on.
+    fn chain_on_shard(host: &mut Host) -> (ChainRegistration, Receiver<HostEvent>) {
+        let (sender, receiver) = unbounded();
+        let token = host
+            .beacon
+            .register(
+                SHARD,
+                LocalChainAnchors::GENESIS,
+                BlockHeight::GENESIS,
+                sender,
+            )
+            .token;
+        (token, receiver)
+    }
+
+    fn want_record(host: &mut Host, chain: ChainRegistration, instance: Address) {
+        report(
+            host,
+            chain,
+            BeaconInput::RecordsWanted {
+                instances: vec![instance],
+                packages: Vec::new(),
+            },
+        );
+    }
+
+    /// The records `chain`'s loop was told arrived, since the last call.
+    fn arrivals(receiver: &Receiver<HostEvent>) -> Vec<Address> {
+        receiver
+            .try_iter()
+            .flat_map(|event| match event {
+                HostEvent::Shard(_, ShardScopedInput::RecordsArrived { arrived }) => arrived,
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The record fetches `host` sent since the last call.
+    fn records_asked(host: &Host) -> Vec<Vec<Address>> {
+        host.network()
+            .drain_pending_requests()
+            .iter()
+            .filter_map(PendingRequest::request::<GetInstanceRecordsRequest>)
+            .map(|request| request.instances.into_inner())
+            .collect()
+    }
+
+    /// Two loops wanting one record cost the host one request, and both
+    /// stay askers of it.
+    #[test]
+    fn two_chains_wanting_one_record_ask_for_it_once() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let (instance, _) = record_on_shard(&host);
+        let (first, _) = chain_on_shard(&mut host);
+        let (second, _) = chain_on_shard(&mut host);
+        let _ = records_asked(&host);
+        want_record(&mut host, first, instance);
+        want_record(&mut host, second, instance);
+        assert_eq!(records_asked(&host), vec![vec![instance]]);
+        assert_eq!(
+            host.beacon.interest.records[&instance],
+            BTreeSet::from([BeaconOwner::Chain(first), BeaconOwner::Chain(second)]),
+        );
+    }
+
+    /// A loop that closes takes its interest with it, and the ask stands
+    /// while another loop still wants it. A rebuilt loop for the same
+    /// shard is another loop: the old one's late deregister leaves it be.
+    #[test]
+    fn a_closed_loops_record_interest_leaves_a_rebuilt_loops_standing() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let (instance, _) = record_on_shard(&host);
+        let (old, _) = chain_on_shard(&mut host);
+        let (rebuilt, _) = chain_on_shard(&mut host);
+        want_record(&mut host, old, instance);
+        want_record(&mut host, rebuilt, instance);
+        host.beacon.deregister(old);
+        assert_eq!(host.beacon.fetches.instance_record.pending_count(), 1);
+        assert_eq!(
+            host.beacon.interest.records[&instance],
+            BTreeSet::from([BeaconOwner::Chain(rebuilt)]),
+        );
+        host.beacon.deregister(rebuilt);
+        assert_eq!(
+            host.beacon.fetches.instance_record.pending_count(),
+            0,
+            "nobody wants the record once the last asker closes",
+        );
+    }
+
+    /// A record derivation already reads here is answered at once, with
+    /// no request: the ask was queued behind its own answer.
+    #[test]
+    fn a_record_the_host_holds_is_answered_without_a_request() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let (instance, record) = record_on_shard(&host);
+        host.process
+            .dispatch_handles
+            .executor
+            .install_instance(instance, &record);
+        let (chain, receiver) = chain_on_shard(&mut host);
+        let _ = records_asked(&host);
+        want_record(&mut host, chain, instance);
+        assert!(records_asked(&host).is_empty());
+        assert_eq!(arrivals(&receiver), vec![instance]);
+    }
+
+    /// A peer's record lands in the registry and on disk, and the loop
+    /// that asked is told; one deriving another address seats nothing and
+    /// the ask stands for another try.
+    #[test]
+    fn a_fetched_record_is_seated_only_under_the_address_it_derives() {
+        let fix = Fixture::new();
+        let (mut wire, mut host, events) = wired(&fix, SyncDispatch::new());
+        let (instance, record) = record_on_shard(&host);
+        let (elsewhere, other) = {
+            let meta = InstanceMeta {
+                package: PackageHash(Hash32([8; 32])),
+                config: Capped::empty(),
+                salt: Hash32([1; 32]),
+            };
+            (
+                meta.address(&ProtocolHasher).address(),
+                meta.leaf_bytes().expect("a record encodes"),
+            )
+        };
+        let honest = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving = Arc::clone(&honest);
+        wire.peer
+            .register_request_handler(SHARD, move |_: GetInstanceRecordsRequest| {
+                let bytes = if serving.load(Ordering::SeqCst) {
+                    record.clone()
+                } else {
+                    other.clone()
+                };
+                GetInstanceRecordsResponse::new(
+                    Capped::new(vec![Bytes::new(bytes).expect("a record fits a cell")])
+                        .expect("one record"),
+                )
+            });
+        let (chain, receiver) = chain_on_shard(&mut host);
+        want_record(&mut host, chain, instance);
+        wire.pump(&mut host, &events);
+        let executor = Arc::clone(&host.process.dispatch_handles.executor);
+        assert!(!executor.instance_known(instance));
+        assert!(!executor.instance_known(elsewhere));
+        assert!(arrivals(&receiver).is_empty());
+        assert_eq!(host.beacon.fetches.instance_record.pending_count(), 1);
+
+        honest.store(true, Ordering::SeqCst);
+        let later = host.beacon.now.plus(Duration::from_secs(1));
+        host.set_time(later);
+        let _ = host.step(HostEvent::beacon_fetch_tick());
+        wire.pump(&mut host, &events);
+        assert!(executor.instance_known(instance));
+        assert!(
+            host.process
+                .dispatch_handles
+                .beacon_storage
+                .fetched_instance(instance)
+                .is_some(),
+            "the record is kept on disk before it is seated",
+        );
+        assert_eq!(arrivals(&receiver), vec![instance]);
+        assert_eq!(host.beacon.fetches.instance_record.pending_count(), 0);
     }
 }

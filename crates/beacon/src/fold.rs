@@ -44,7 +44,7 @@ const fn cert_kind(cert: &BeaconCert) -> &'static str {
 
 /// A token naming one shard chain registered with the fold, unique
 /// within it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChainRegistration(u64);
 
 /// One shard chain registered with the fold, as the fold tracks it.

@@ -29,7 +29,6 @@ pub(crate) mod crossing_index;
 pub(crate) mod instances;
 pub(crate) mod io;
 pub(crate) mod mempool;
-pub(crate) mod packages;
 pub(crate) mod phase_times;
 pub(crate) mod verify;
 
@@ -698,18 +697,10 @@ where
             ShardScopedInput::TransactionsFetched { batch } => {
                 self.handle_fetched_txs_for_validation(batch);
             }
-            ShardScopedInput::PackageArtifactsFetched { artifacts } => {
-                self.handle_package_artifacts_fetched(artifacts);
-            }
-            ShardScopedInput::PackagesInstalled { packages } => {
-                self.handle_packages_installed(&packages);
-            }
             ShardScopedInput::RecordsWanted { wanted } => {
                 self.defer_for_records(wanted);
             }
-            ShardScopedInput::InstanceRecordsFetched { records } => {
-                self.handle_instance_records_fetched(records);
-            }
+            ShardScopedInput::RecordsArrived { arrived } => self.release_deferred(&arrived),
 
             // ── Certified header (gossip → signature verify → state machine) ──
             ShardScopedInput::CommittedBlockGossipReceived {
@@ -765,8 +756,8 @@ where
         //
         // A transaction that routes nowhere here names no code to ask
         // for: what it runs is behind the records it names, so those are
-        // what this asks the shards holding them for, and the code
-        // follows once they seat a derivation.
+        // what this asks the host for, and the code follows once they
+        // seat a derivation.
         if let ProtocolEvent::BlockCommitted { certified, .. } = &event {
             self.io
                 .block_commit

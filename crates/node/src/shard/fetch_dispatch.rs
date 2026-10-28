@@ -17,9 +17,7 @@ use crate::shard::cross_shard::{
     FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
     StateProofBinding, VerdictProofBinding,
 };
-use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
-use crate::shard::packages::PackageArtifactBinding;
 
 /// Every fetch binding a shard loop drives, by the [`FetchIds`] arm that
 /// carries its ids, handed to `$apply` as `Arm => Binding,` pairs. The
@@ -37,8 +35,6 @@ macro_rules! every_fetch_binding {
             VerdictProofs => VerdictProofBinding,
             SettledTxs => SettledTxsBinding,
             Proposals => ProposalBinding,
-            PackageArtifacts => PackageArtifactBinding,
-            InstanceRecords => InstanceRecordBinding,
         }
     };
 }
@@ -216,14 +212,12 @@ where
     D: Dispatch,
 {
     /// Refresh this shard's `FetchTick` timer based on whether any of its
-    /// subsystems (packages, instances, mempool, consensus block-sync,
-    /// cross-shard) has pending work. Each shard manages its own ticker
+    /// subsystems (mempool, consensus block-sync, cross-shard) has pending
+    /// work. Each shard manages its own ticker
     /// — a shard with idle fetches stops paying for the 200ms wake-up while
     /// busier shards keep ticking.
     pub(crate) fn update_fetch_tick_timer(&mut self) {
-        let any_pending = self.io.packages.has_pending()
-            || self.io.instances.has_pending()
-            || self.io.mempool.has_pending()
+        let any_pending = self.io.mempool.has_pending()
             || self.io.consensus.has_pending()
             || self.io.cross_shard.has_pending();
         if let Some(op) =
@@ -288,7 +282,9 @@ impl FetchTicker {
 mod tests {
     use hyperscale_core::BeaconFetchIds;
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::{BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash};
+    use hyperscale_types::{
+        Address, AddressClass, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash,
+    };
 
     use super::*;
     use crate::shard::test_host::{Fixture, Loop, loop_of};
@@ -340,12 +336,13 @@ mod tests {
             Epoch::new(1),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"candidate")),
         );
-        shard_loop.request_fetch(
-            FetchIds::Beacon(BeaconFetchIds::Candidates(vec![candidate])),
-            SHARD,
-            None,
-            None,
-        );
+        for ids in [
+            BeaconFetchIds::Candidates(vec![candidate]),
+            BeaconFetchIds::InstanceRecords(vec![Address::new([3; 31], AddressClass::Component)]),
+            BeaconFetchIds::PackageArtifacts(vec![Hash::from_bytes(b"package")]),
+        ] {
+            shard_loop.request_fetch(FetchIds::Beacon(ids), SHARD, None, None);
+        }
         shard_loop.handle_fetch_tick();
         shard_loop.pending_timer_ops.clear();
         shard_loop.update_fetch_tick_timer();
