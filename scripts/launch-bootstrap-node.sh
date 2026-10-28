@@ -104,10 +104,30 @@ CONFIG_FILE="$DATA_DIR/validator/config.toml"
 NODE_DATA_DIR="$DATA_DIR/validator/data"
 mkdir -p "$NODE_DATA_DIR"
 
+# The network this node starts: itself as its only validator, its epoch
+# clock starting now.
+NETWORK_FILE="$DATA_DIR/validator/network.toml"
+GENESIS_TIMESTAMP_MS="${GENESIS_TIMESTAMP_MS:-$(( $(date +%s) * 1000 ))}"
+cat > "$NETWORK_FILE" << EOF
+# Hyperscale Network File
+
+network = "simulator"
+bootstrap_peers = []
+
+[chain]
+genesis_timestamp_ms = $GENESIS_TIMESTAMP_MS
+
+[genesis]
+[[genesis.validators]]
+id = 0
+public_key = "$PUBLIC_KEY"
+EOF
+
 cat > "$CONFIG_FILE" << EOF
 # Hyperscale Bootstrap Node Configuration
 
 [node]
+network_file = "$NETWORK_FILE"
 data_dir = "$NODE_DATA_DIR"
 
 [[vnode]]
@@ -118,7 +138,6 @@ key_path = "$KEY_FILE"
 listen_addr = "0.0.0.0:$BASE_PORT"
 network_key_path = "$NETWORK_KEY_FILE"
 version_interop_mode = "relaxed"
-bootstrap_peers = []
 upnp_enabled = true
 
 [threads]
@@ -138,15 +157,9 @@ listen_addr = "0.0.0.0:$RPC_PORT"
 
 [telemetry]
 enabled = false
-
-[[genesis.validators]]
-id = 0
-public_key = "$PUBLIC_KEY"
-
-# No initial balances needed for bootstrap node specific logic yet
 EOF
 
-echo "Created config at $CONFIG_FILE"
+echo "Created config at $CONFIG_FILE and network file at $NETWORK_FILE"
 echo ""
 echo "Launching bootstrap node..."
 echo "  RPC: http://localhost:$RPC_PORT"

@@ -120,7 +120,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"${ENDPOINT_IDS[$first_v]}@$IP:9000\""
 done
 
-GENESIS_VALIDATORS="[genesis]"
+GENESIS_VALIDATORS=""
 for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     GENESIS_VALIDATORS="$GENESIS_VALIDATORS
 [[genesis.validators]]
@@ -131,6 +131,20 @@ done
 # Genesis is single-shard: every account is funded on ROOT, so every
 # container embeds the same full balance set.
 GENESIS_BALANCES=$("$SPAM_BIN" genesis --num-shards "$NUM_SHARDS" --accounts-per-shard "$ACCOUNTS_PER_SHARD" --balance "$INITIAL_BALANCE")
+
+# One network file, copied into every container's directory. The epoch clock
+# starts now unless GENESIS_TIMESTAMP_MS says otherwise.
+GENESIS_TIMESTAMP_MS="${GENESIS_TIMESTAMP_MS:-$(( $(date +%s) * 1000 ))}"
+NETWORK_FILE="$DATA_DIR/network.toml"
+cat > "$NETWORK_FILE" <<EOF
+network = "simulator"
+bootstrap_peers = [$BOOTSTRAP_PEERS]
+[chain]
+genesis_timestamp_ms = $GENESIS_TIMESTAMP_MS
+[genesis]
+$GENESIS_VALIDATORS
+$GENESIS_BALANCES
+EOF
 
 # --- 4. Write Compose & Configs ---
 cat > "$COMPOSE_FILE" <<EOF
@@ -149,8 +163,10 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     NODE_DIR="$DATA_DIR/validator-$i"
     IP="172.99.0.$((10 + i))"
 
+    cp "$NETWORK_FILE" "$NODE_DIR/network.toml"
     cat > "$NODE_DIR/config.toml" <<EOF
 [node]
+network_file = "/home/hyperscalers/network.toml"
 data_dir = "/home/hyperscalers/data"
 [[vnode]]
 validator_id = $i
@@ -159,13 +175,10 @@ key_path = "/home/hyperscalers/signing.key"
 listen_addr = "0.0.0.0:9000"
 network_key_path = "/home/hyperscalers/network.key"
 upnp_enabled = false
-bootstrap_peers = [$BOOTSTRAP_PEERS]
 version_interop_mode = "relaxed"
 [metrics]
 enabled = true
 listen_addr = "0.0.0.0:8080"
-$GENESIS_VALIDATORS
-$GENESIS_BALANCES
 EOF
 
     # Prepare optional configuration

@@ -644,6 +644,14 @@ mod tests {
         assert!(toml_from_str::<Genesis>(toml).is_err());
     }
 
+    /// The shipped example network file reads, so an operator's copy of it
+    /// does too.
+    #[test]
+    fn the_example_network_file_parses() {
+        NetworkFile::from_toml(include_str!("../config/network.example.toml"))
+            .expect("shipped example network file parses");
+    }
+
     #[test]
     fn an_empty_genesis_with_nothing_hosted_is_refused() {
         assert!(matches!(

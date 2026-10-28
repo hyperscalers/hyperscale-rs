@@ -273,7 +273,28 @@ for id in $(seq 0 $((TOTAL_NODES - 1))); do
     BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"$EID@$IP:$PORT\""
 done
 
-# 5. Generate Config Files
+# 5. Write the network file every node shares. Its epoch clock starts at
+# generation time unless GENESIS_TIMESTAMP_MS says otherwise: a genesis far
+# behind the nodes' clocks never commits, so set it to the launch moment when
+# the configs are deployed later.
+GENESIS_TIMESTAMP_MS="${GENESIS_TIMESTAMP_MS:-$(( $(date +%s) * 1000 ))}"
+NETWORK_FILE="$OUT_DIR/network.toml"
+cat > "$NETWORK_FILE" << EOF
+# Distributed Network File
+network = "simulator"
+bootstrap_peers = [$BOOTSTRAP_PEERS]
+
+[chain]
+genesis_timestamp_ms = $GENESIS_TIMESTAMP_MS
+
+[genesis]
+$GENESIS_VALIDATORS
+
+$GENESIS_BALANCES
+EOF
+echo "Created network file at $NETWORK_FILE (genesis $GENESIS_TIMESTAMP_MS)"
+
+# 6. Generate Config Files
 echo "Generating config files..."
 # Generate Prometheus targets string
 PROM_TARGETS=""
@@ -302,6 +323,7 @@ for i in "${!HOST_IPS[@]}"; do
 # Public IP: $IP
 
 [node]
+network_file = "./distributed-cluster-data/network.toml"
 data_dir = "./distributed-cluster-data/host-$i/node-$v/data"
 
 [[vnode]]
@@ -313,7 +335,6 @@ key_path = "./distributed-cluster-data/host-$i/node-$v/signing.key"
 listen_addr = "0.0.0.0:$P2P_PORT"
 network_key_path = "./distributed-cluster-data/host-$i/node-$v/network.key"
 version_interop_mode = "relaxed"
-bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
 path_idle_timeout_ms = 30000
 path_keep_alive_ms = 5000
@@ -343,16 +364,12 @@ listen_addr = "0.0.0.0:$RPC_PORT"
 
 [telemetry]
 enabled = false
-
-$GENESIS_VALIDATORS
-
-$GENESIS_BALANCES
 EOF
         echo "  Generated config for Host $i ($IP) Node $v (Port $RPC_PORT)"
     done
 done
 
-# 6. Generate Prometheus Configuration
+# 7. Generate Prometheus Configuration
 PROMETHEUS_CONFIG="$OUT_DIR/prometheus.yml"
 echo "Generating monitoring config at $PROMETHEUS_CONFIG..."
 
@@ -389,7 +406,7 @@ for i in "${!HOST_IPS[@]}"; do
     done
 done
 
-# 7. Copy to Remote if requested
+# 8. Copy to Remote if requested
 if [ "$COPY_TO_REMOTE" = true ]; then
     echo ""
     echo "=== Copying to Remote Hosts ==="
@@ -469,7 +486,7 @@ if [ "$COPY_TO_REMOTE" = true ]; then
 fi
 
 
-# 7. Print Spammer Command
+# 9. Print Spammer Command
 echo ""
 echo "------------------------------------------------------------------"
 echo "To run the spammer manually:"

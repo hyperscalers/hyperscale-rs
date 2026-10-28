@@ -398,9 +398,8 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"${ENDPOINT_IDS[$bootstrap_host_idx]}@127.0.0.1:$quic_port\""
 done
 
-# Build the [[genesis.validators]] section once — it's identical across hosts,
-# listing every validator across every shard so each host can verify cross-
-# shard messages.
+# The [[genesis.validators]] section lists every validator across every shard
+# so each host can verify cross-shard messages.
 GENESIS_VALIDATORS=""
 for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     if [ -n "$GENESIS_VALIDATORS" ]; then
@@ -411,6 +410,27 @@ for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
 id = $j
 public_key = \"${PUBLIC_KEYS[$j]}\""
 done
+
+# One network file every host shares. The epoch clock starts now: a genesis
+# far behind the hosts' clocks never commits.
+NETWORK_FILE="$DATA_DIR/network.toml"
+GENESIS_TIMESTAMP_MS=$(( $(date +%s) * 1000 ))
+cat > "$NETWORK_FILE" << EOF
+# Hyperscale Network File
+# Auto-generated for local cluster testing
+
+network = "simulator"
+bootstrap_peers = [$BOOTSTRAP_PEERS]
+
+[chain]
+genesis_timestamp_ms = $GENESIS_TIMESTAMP_MS
+
+[genesis]
+$GENESIS_VALIDATORS
+
+$GENESIS_BALANCES
+EOF
+echo "Created network file at $NETWORK_FILE (genesis $GENESIS_TIMESTAMP_MS)"
 
 # Generate one TOML per host. Packing strategy:
 #   - Same-shard: host h packs K consecutive same-shard validators starting at
@@ -471,6 +491,7 @@ key_path = \"${KEY_FILES[$vid]}\""
 # Host $host_idx: $SHARD_SUMMARY, vnodes [$HOSTED_LIST]
 
 [node]
+network_file = "$NETWORK_FILE"
 data_dir = "$NODE_DATA_DIR"
 
 $VNODE_BLOCKS
@@ -479,7 +500,6 @@ $VNODE_BLOCKS
 listen_addr = "0.0.0.0:$quic_port"
 network_key_path = "$DATA_DIR/keys/host-$host_idx.network.key"
 version_interop_mode = "relaxed"
-bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
 
 [threads]
@@ -505,10 +525,6 @@ enabled = $TRACING
 otlp_endpoint = "http://localhost:4317"
 service_name = "hyperscale-validator"
 log_file = "$HOST_DIR/output.log"
-
-$GENESIS_VALIDATORS
-
-$GENESIS_BALANCES
 EOF
 
     echo "  Created config for host $host_idx ($SHARD_SUMMARY, vnodes [$HOSTED_LIST], rpc port $rpc_port)"
