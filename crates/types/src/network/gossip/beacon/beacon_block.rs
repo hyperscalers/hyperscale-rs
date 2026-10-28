@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 
 /// Broadcasts a finalized [`CertifiedBeaconBlock`] globally for
@@ -63,7 +63,7 @@ impl NetworkMessage for BeaconBlockGossip {
 }
 
 impl GossipMessage for BeaconBlockGossip {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 }
 
 #[cfg(test)]
@@ -89,6 +89,6 @@ mod tests {
 
     #[test]
     fn scope_is_global() {
-        assert!(matches!(BeaconBlockGossip::SCOPE, TopicScope::Global));
+        assert!(matches!(BeaconBlockGossip::SCOPE, GossipScope::Global));
     }
 }

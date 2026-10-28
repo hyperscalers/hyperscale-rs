@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::{CandidateBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 
 /// Broadcasts an SPC-certified [`CandidateBeaconBlock`] to the active
@@ -68,7 +68,7 @@ impl NetworkMessage for BeaconCandidateGossip {
 }
 
 impl GossipMessage for BeaconCandidateGossip {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 }
 
 #[cfg(test)]
@@ -126,6 +126,6 @@ mod tests {
 
     #[test]
     fn scope_is_global() {
-        assert!(matches!(BeaconCandidateGossip::SCOPE, TopicScope::Global));
+        assert!(matches!(BeaconCandidateGossip::SCOPE, GossipScope::Global));
     }
 }

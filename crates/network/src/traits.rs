@@ -14,7 +14,7 @@ use std::time::Duration;
 use hyperscale_hbor::{HborEncode, to_vec as hbor_to_vec};
 // Re-export for back-compat call sites; the canonical definition lives in
 // `hyperscale_types`.
-pub use hyperscale_types::TopicScope;
+pub use hyperscale_types::GossipScope;
 use hyperscale_types::{
     ConsensusPublicKey, GossipMessage, Hash, MessageClass, NetworkMessage, Request,
     RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
@@ -202,9 +202,9 @@ pub enum ResponseVerdict {
 /// Called once per **target hosted shard** the framework decides this
 /// message should land in:
 ///
-/// - For [`TopicScope::Shard`] messages the target is the topic's shard
+/// - For [`GossipScope::Shard`] messages the target is the topic's shard
 ///   (filtered to the host's hosted shards).
-/// - For [`TopicScope::Global`] messages the framework fans the message
+/// - For [`GossipScope::Global`] messages the framework fans the message
 ///   out to every hosted shard except [`GossipMessage::source_shard`]
 ///   (which sees its own commits directly, not through gossip).
 ///
@@ -298,7 +298,7 @@ pub trait Network: Send + Sync + 'static {
     /// Called during node initialization — once per message type.
     fn register_gossip_handler<M: GossipMessage + 'static>(&self, handler: impl GossipHandler<M>);
 
-    /// Register a handler invoked once per host for a [`TopicScope::Global`],
+    /// Register a handler invoked once per host for a [`GossipScope::Global`],
     /// [`source_shard`](GossipMessage::source_shard) `None` gossip message,
     /// regardless of the hosted-shard set, so a host's beacon loop receives
     /// committed beacon blocks even on a host serving no shard.
@@ -508,7 +508,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use hyperscale_hbor::Hbor;
-        use hyperscale_types::{GossipMessage, NetworkMessage, TopicScope};
+        use hyperscale_types::{GossipMessage, GossipScope, NetworkMessage};
 
         #[derive(Debug, Clone, Hbor)]
         struct TestMsg(u32);
@@ -522,7 +522,7 @@ mod tests {
             }
         }
         impl GossipMessage for TestMsg {
-            const SCOPE: TopicScope = TopicScope::Shard;
+            const SCOPE: GossipScope = GossipScope::Shard;
         }
 
         let counter = Arc::new(AtomicUsize::new(0));

@@ -112,8 +112,8 @@ pub use hyperscale_vm_types::{
     Utilization, amount_cell, compatible, encode_amount, entry_leaf_key, read_amount,
 };
 pub use network::{
-    GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
-    TopicScope,
+    GossipMessage, GossipScope, MessageClass, NetworkMessage, Request, Signed, SignedContext,
+    SignedVerifyError,
 };
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};

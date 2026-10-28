@@ -20,7 +20,7 @@ use hyperscale_network::{
     RequestHandler, ResponseVerdict, ValidatorKeyMap, Verdict, VerdictKey,
 };
 use hyperscale_types::{
-    GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
+    GossipMessage, GossipScope, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId,
     TopologySnapshot, ValidatorId,
 };
 use iroh::EndpointId;
@@ -174,7 +174,7 @@ impl Network for IrohNetwork {
     fn broadcast_to_shard<M: GossipMessage + 'static>(&self, shard: ShardId, message: &M) {
         debug_assert_eq!(
             M::SCOPE,
-            TopicScope::Shard,
+            GossipScope::Shard,
             "broadcast_to_shard requires SCOPE = Shard"
         );
         // The transport never sends a publication back to its publisher,
@@ -186,7 +186,7 @@ impl Network for IrohNetwork {
     fn broadcast_global<M: GossipMessage + 'static>(&self, message: &M) {
         debug_assert_eq!(
             M::SCOPE,
-            TopicScope::Global,
+            GossipScope::Global,
             "broadcast_global requires SCOPE = Global"
         );
         let _ = self.registry.local_dispatch_gossip(message, None);

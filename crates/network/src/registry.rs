@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
-use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardId, TopicScope};
+use hyperscale_types::{GossipMessage, GossipScope, NetworkMessage, Request, ShardId};
 
 use crate::traits::{GossipHandler, NotificationHandler, RequestHandler, Verdict, VerdictKey};
 
@@ -41,7 +41,7 @@ pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<Verdict> 
 
 /// Type-erased host-level gossip handler: receives decompressed wire bytes.
 ///
-/// Invoked once per host for a [`TopicScope::Global`],
+/// Invoked once per host for a [`GossipScope::Global`],
 /// [`source_shard`](GossipMessage::source_shard) `None` gossip message to
 /// deliver it to a shard-less host. Fire and forget — the per-hosted-shard
 /// Global fan owns the forward verdict.
@@ -161,11 +161,11 @@ where
     fn target_shards(&self, msg: &M, topic_shard: Option<ShardId>) -> Vec<ShardId> {
         let hosted = self.hosted_shards.load();
         match M::SCOPE {
-            TopicScope::Shard => match topic_shard {
+            GossipScope::Shard => match topic_shard {
                 Some(s) if hosted.contains(&s) => vec![s],
                 _ => Vec::new(),
             },
-            TopicScope::Global => {
+            GossipScope::Global => {
                 let src = msg.source_shard();
                 hosted.iter().copied().filter(|s| Some(*s) != src).collect()
             }
@@ -314,9 +314,9 @@ where
 /// because the registry computes the per-vnode fan-out itself, using
 /// [`HandlerRegistry::hosted_shards`] supplied at construction:
 ///
-/// - [`TopicScope::Shard`] messages dispatch to the topic's shard if it
+/// - [`GossipScope::Shard`] messages dispatch to the topic's shard if it
 ///   is hosted, otherwise dropped with no verdict.
-/// - [`TopicScope::Global`] messages fan into every hosted shard except
+/// - [`GossipScope::Global`] messages fan into every hosted shard except
 ///   [`GossipMessage::source_shard`], so a vnode in a cross-shard pack
 ///   sees its peer's commits without the handler closure encoding any
 ///   routing logic.
@@ -465,7 +465,7 @@ impl HandlerRegistry {
         arcswap_insert(&self.local_gossip, TypeId::of::<M>(), typed);
     }
 
-    /// Register a handler invoked once per host for a [`TopicScope::Global`],
+    /// Register a handler invoked once per host for a [`GossipScope::Global`],
     /// [`source_shard`](GossipMessage::source_shard) `None` gossip message
     /// of type `M`, independent of the hosted-shard set.
     ///
@@ -667,7 +667,7 @@ impl HandlerRegistry {
     }
 
     /// Look up the host-level gossip handler for a message type (wire path).
-    /// A backend's inbound delivery for a [`TopicScope::Global`],
+    /// A backend's inbound delivery for a [`GossipScope::Global`],
     /// source-`None` message invokes this in addition to the per-shard fan
     /// so a shard-less host folds the message.
     #[must_use]
@@ -816,7 +816,7 @@ mod tests {
             }
         }
         impl GossipMessage for TestMsg {
-            const SCOPE: TopicScope = TopicScope::Shard;
+            const SCOPE: GossipScope = GossipScope::Shard;
         }
 
         let hosted = std::iter::once(ShardId::leaf(1, 0)).collect();
@@ -947,7 +947,7 @@ mod tests {
             }
         }
         impl GossipMessage for SwapMsg {
-            const SCOPE: TopicScope = TopicScope::Shard;
+            const SCOPE: GossipScope = GossipScope::Shard;
         }
 
         let shard_a = ShardId::leaf(1, 0);
@@ -999,7 +999,7 @@ mod tests {
             }
         }
         impl GossipMessage for FoldMsg {
-            const SCOPE: TopicScope = TopicScope::Global;
+            const SCOPE: GossipScope = GossipScope::Global;
         }
 
         let (a, b) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
@@ -1053,7 +1053,7 @@ mod tests {
     }
 
     impl GossipMessage for Copy {
-        const SCOPE: TopicScope = TopicScope::Global;
+        const SCOPE: GossipScope = GossipScope::Global;
 
         fn dedup_key(&self) -> Option<u64> {
             Some(u64::from(self.content))
@@ -1237,7 +1237,7 @@ mod tests {
             }
         }
         impl GossipMessage for TestMsg {
-            const SCOPE: TopicScope = TopicScope::Shard;
+            const SCOPE: GossipScope = GossipScope::Shard;
         }
 
         let registry = HandlerRegistry::default();
@@ -1272,7 +1272,7 @@ mod tests {
             }
         }
         impl GossipMessage for VTestMsg {
-            const SCOPE: TopicScope = TopicScope::Shard;
+            const SCOPE: GossipScope = GossipScope::Shard;
         }
 
         let hosted: BTreeSet<ShardId> = std::iter::once(ShardId::leaf(1, 0)).collect();
@@ -1325,7 +1325,7 @@ mod tests {
             }
         }
         impl GossipMessage for GlobalMsg {
-            const SCOPE: TopicScope = TopicScope::Global;
+            const SCOPE: GossipScope = GossipScope::Global;
         }
 
         // No hosted shards: the per-shard Global fan is empty.
@@ -1368,7 +1368,7 @@ mod tests {
             }
         }
         impl GossipMessage for GlobalMsg {
-            const SCOPE: TopicScope = TopicScope::Global;
+            const SCOPE: GossipScope = GossipScope::Global;
         }
 
         let registry = HandlerRegistry::default();

@@ -2,7 +2,7 @@
 
 use hyperscale_hbor::{Bytes, Capped, Hbor};
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::{
     ConsensusSignature, MessageClass, NetworkDefinition, NetworkMessage, ShardId, Signed,
     ValidatorAddressMessage, ValidatorId, signed_bytes,
@@ -85,7 +85,7 @@ impl NetworkMessage for ValidatorAddressGossip {
 }
 
 impl GossipMessage for ValidatorAddressGossip {
-    const SCOPE: TopicScope = TopicScope::Global;
+    const SCOPE: GossipScope = GossipScope::Global;
 
     fn source_shard(&self) -> Option<ShardId> {
         None

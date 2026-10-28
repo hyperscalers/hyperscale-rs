@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor};
 
-use crate::network::{GossipMessage, TopicScope};
+use crate::network::{GossipMessage, GossipScope};
 use crate::{MessageClass, NetworkMessage, Transaction};
 
 /// Cap on transactions accepted in a single gossip batch at decode time.
@@ -84,7 +84,7 @@ impl NetworkMessage for TransactionGossip {
 // so gossipsub's bytes-id dedup covers the mesh-redundancy path — no
 // content-key dedup needed here.
 impl GossipMessage for TransactionGossip {
-    const SCOPE: TopicScope = TopicScope::Shard;
+    const SCOPE: GossipScope = GossipScope::Shard;
 }
 
 #[cfg(test)]
