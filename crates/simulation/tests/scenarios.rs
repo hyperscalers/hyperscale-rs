@@ -53,9 +53,10 @@ use hyperscale_scenarios::{
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_lost_answer_push_is_read_at_the_consumers_boundary, a_mass_decline_brings_every_payment_home,
     a_merged_pair_returns_a_crossing_its_consumer_never_took,
-    a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
-    a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
-    a_payer_spends_beside_its_routes_pending_core, a_priority_is_charged_over_the_table_price,
+    a_native_post_quantum_account_pays_its_own_way, a_newcomer_founds_its_own_pool,
+    a_payer_cannot_spend_one_balance_twice, a_payer_publishes_beside_its_unsettled_spend,
+    a_payer_spends_beside_its_pending_leg, a_payer_spends_beside_its_routes_pending_core,
+    a_priority_is_charged_over_the_table_price,
     a_producer_that_read_a_discarded_credit_delivers_it_again,
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
@@ -80,6 +81,7 @@ use hyperscale_scenarios::{
     a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_route_unstated_past_its_stating_window_aborts_on_both_venues,
+    a_second_validator_joins_with_the_desks_top_up,
     a_shard_halted_across_an_abandon_window_settles_again,
     a_silent_sibling_holds_no_more_than_a_quarter, a_spent_nullifier_is_swept_once_unreachable,
     a_split_admitted_beside_a_counting_sibling_hands_it_its_cohort,
@@ -94,6 +96,7 @@ use hyperscale_scenarios::{
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
     a_swap_the_venue_refuses_gives_its_caller_back_its_leg,
+    a_third_validator_joins_once_the_pools_stake_covers_it,
     a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
     a_timed_out_newcomer_is_let_back_in_from_its_own_host,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
@@ -3521,6 +3524,27 @@ fn registered_validator_activates_onto_a_shard_sim() {
     let mut cluster =
         SimCluster::with_accounts(&witness_config(4), 0xAC11, &staking_genesis_accounts());
     registered_validator_activates_onto_a_shard(&mut cluster);
+}
+
+#[test]
+fn a_newcomer_founds_its_own_pool_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&witness_config(4), 0xF0D, &staking_genesis_accounts());
+    a_newcomer_founds_its_own_pool(&mut cluster);
+}
+
+#[test]
+fn a_second_validator_joins_with_the_desks_top_up_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&witness_config(4), 0x70B, &staking_genesis_accounts());
+    a_second_validator_joins_with_the_desks_top_up(&mut cluster);
+}
+
+#[test]
+fn a_third_validator_joins_once_the_pools_stake_covers_it_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&witness_config(4), 0x3D5, &staking_genesis_accounts());
+    a_third_validator_joins_once_the_pools_stake_covers_it(&mut cluster);
 }
 
 /// The devnet a home validator joins: five genesis validators on one
