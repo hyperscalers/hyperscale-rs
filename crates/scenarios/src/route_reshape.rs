@@ -24,7 +24,7 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, Admission, BeaconState, BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows,
+    Address, Admission, BeaconState, BlockHeight, Deadline, Ed25519PrivateKey, Epoch,
     HALT_THRESHOLD_EPOCHS, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, PendingReshape,
     PrincipalAddr, RESHAPE_READY_TTL_EPOCHS, ShardId, SubstateKey, TimestampRange, Transaction,
     TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
@@ -44,8 +44,9 @@ use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
     ChainMentions, anchor_seeded, answer_standing, beacon_epoch, clock, crossing_cells,
-    declared_price, epoch_duration_ms, escrowed_into, held, held_at, merge_keeper_count, owed_at,
-    owning_shard, scheduled_terminal_epoch, split_admitted, stands_at, terminal_height,
+    declared_price, epoch_duration_ms, epoch_windows, escrowed_into, held, held_at,
+    merge_keeper_count, owed_at, owning_shard, scheduled_terminal_epoch, split_admitted, stands_at,
+    terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -1327,8 +1328,10 @@ fn scheduled_cut<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> Weigh
         "the beacon must schedule {shard:?}'s reshape",
     );
     let terminal = scheduled_terminal_epoch(c, shard).expect("scheduled above");
-    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
-    EpochWindows::new(epoch_ms).window_of(terminal).end
+    epoch_windows(c)
+        .expect("the beacon carries its epoch grid")
+        .window_of(terminal)
+        .end
 }
 
 /// A window closing past `cut`, so no deadline ends a member before the

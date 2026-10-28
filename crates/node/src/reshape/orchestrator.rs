@@ -2156,10 +2156,10 @@ mod tests {
     };
     use hyperscale_types::{
         BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlockHeader,
-        ElidedCertifiedBlock, Epoch, Hash, Inventory, LocalTimestamp, NetworkDefinition,
-        PrincipalAddr, ReshapeSeat, Round, ShardAnchor, ShardId, Signer, SplitChildRoots,
-        StateRoot, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp,
+        ElidedCertifiedBlock, Epoch, EpochWindows, Hash, Inventory, LocalTimestamp,
+        NetworkDefinition, PrincipalAddr, ReshapeSeat, Round, ShardAnchor, ShardId, Signer,
+        SplitChildRoots, StateRoot, TimestampRange, TopologySchedule, TopologySnapshot,
+        Transaction, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp,
     };
 
     use super::{
@@ -2204,7 +2204,11 @@ mod tests {
 
     /// A schedule headed by `snapshot`, cut into one-second windows.
     fn windowed(snapshot: &TopologySnapshot) -> TopologySchedule {
-        TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()))
+        TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::GENESIS,
+            Arc::new(snapshot.clone()),
+        )
     }
 
     /// Project a snapshot with the given committees, observer cohort seats

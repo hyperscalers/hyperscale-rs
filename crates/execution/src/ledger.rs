@@ -1642,7 +1642,7 @@ mod tests {
     /// When a departure at `cut` stops answering, on the production epoch
     /// grid — the same derivation the commit path stamps departures with.
     fn expiry(cut: WeightedTimestamp) -> WeightedTimestamp {
-        EpochWindows::new(EPOCH_DURATION.as_secs() * 1000).terminal_evidence_expiry(cut)
+        EpochWindows::new(0, EPOCH_DURATION.as_secs() * 1000).terminal_evidence_expiry(cut)
     }
 
     fn commit(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>) {

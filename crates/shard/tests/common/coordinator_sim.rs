@@ -64,8 +64,8 @@ use hyperscale_types::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
     BlockHeaderParts, BlockHeight, BlockManifest, BlockVote, BodyRootContext, CertificateRoot,
     CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey, ConsensusReceipt,
-    ConsensusSignature, Epoch, Finalization, FrontierInputs, GossipMessage, Hash, HborSigned,
-    LocalReceiptRoot, LocalTimestamp, MessageClass, NetworkDefinition, NetworkMessage,
+    ConsensusSignature, Epoch, EpochWindows, Finalization, FrontierInputs, GossipMessage, Hash,
+    HborSigned, LocalReceiptRoot, LocalTimestamp, MessageClass, NetworkDefinition, NetworkMessage,
     ProposerTimestamp, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Request,
     Round, RoutingCommittees, SafeVoteRegisters, SectionRoots, SettledWrites, ShardId, ShardLoad,
@@ -486,8 +486,11 @@ impl ShardCoordinatorSim {
     ) -> Self {
         let mut sim = Self::with_schedule(n, seed, move |snapshot| {
             let head_epoch = Epoch::new(epochs);
-            let mut schedule =
-                TopologySchedule::new(epoch_duration_ms, head_epoch, Arc::clone(&snapshot));
+            let mut schedule = TopologySchedule::new(
+                EpochWindows::new(0, epoch_duration_ms),
+                head_epoch,
+                Arc::clone(&snapshot),
+            );
             for epoch in 0..epochs {
                 schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
             }

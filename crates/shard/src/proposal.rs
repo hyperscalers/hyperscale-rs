@@ -2581,7 +2581,11 @@ mod tests {
             .snapshot
             .clone()
             .with_boundaries(BTreeMap::from([(boundary.shard, recorded)]));
-        against.schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot));
+        against.schedule = TopologySchedule::new(
+            EpochWindows::new(0, u64::MAX / 2),
+            Epoch::GENESIS,
+            Arc::new(snapshot),
+        );
         against
     }
 
@@ -3264,7 +3268,11 @@ mod tests {
             })
             .collect();
         let snapshot = against.snapshot.clone().with_boundaries(recorded);
-        against.schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot));
+        against.schedule = TopologySchedule::new(
+            EpochWindows::new(0, u64::MAX / 2),
+            Epoch::GENESIS,
+            Arc::new(snapshot),
+        );
         against.anchor = past_the_boundary(1);
         let ctx = against.ctx();
         let (selected, _) = select_claims(
@@ -3383,7 +3391,11 @@ mod tests {
             })
             .collect();
         let snapshot = against.snapshot.clone().with_boundaries(recorded);
-        against.schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot));
+        against.schedule = TopologySchedule::new(
+            EpochWindows::new(0, u64::MAX / 2),
+            Epoch::GENESIS,
+            Arc::new(snapshot),
+        );
         against.anchor = past_the_boundary(1);
         let ctx = against.ctx();
         let (selected, _) = select_claims(
@@ -3794,7 +3806,7 @@ mod tests {
             });
             against.snapshot = snapshot.clone();
             against.schedule = TopologySchedule::new(
-                u64::MAX / 2,
+                EpochWindows::new(0, u64::MAX / 2),
                 Epoch::GENESIS,
                 Arc::new(snapshot.with_boundaries(BTreeMap::from(records))),
             );
@@ -3928,7 +3940,11 @@ mod tests {
             )
         };
         let (before, after) = (window(0), window(LATER_LIFE));
-        let mut schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::clone(&before));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::GENESIS,
+            Arc::clone(&before),
+        );
         for epoch in 1..=20 {
             let snapshot = if epoch < LATER_LIFE { &before } else { &after };
             schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));
@@ -4176,7 +4192,7 @@ mod tests {
             let window = Arc::new(snapshot.clone().with_scheduled_terminals(terminal));
             let mut against = Against::schedule(
                 snapshot.clone(),
-                TopologySchedule::new(1_000, Epoch::new(3), window),
+                TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(3), window),
             );
             against.local_shard = local;
             against.anchor = WeightedTimestamp::from_millis(3_500);
@@ -4856,7 +4872,7 @@ mod tests {
         };
         assert!(admitted(from_ref(&whole)).is_ok());
 
-        let windows = EpochWindows::new(1_000_000);
+        let windows = EpochWindows::new(0, 1_000_000);
         let raised = ReadFrontier::from_entries([(
             producer,
             ReadMark {
@@ -5186,7 +5202,7 @@ mod tests {
         use hyperscale_types::test_utils::test_key;
         use hyperscale_types::{EpochWindows, ReadFrontier};
 
-        let windows = EpochWindows::new(1_000_000);
+        let windows = EpochWindows::new(0, 1_000_000);
         let mut ctx = consuming_with_no_rows();
         ctx.members
             .members
@@ -5246,7 +5262,7 @@ mod tests {
     fn an_unsolicited_record_raises_no_floor_past_a_held_wanted_reading() {
         use hyperscale_types::{EpochWindows, ReadFrontier};
 
-        let windows = EpochWindows::new(1_000_000);
+        let windows = EpochWindows::new(0, 1_000_000);
         let ctx = consuming_with_no_rows();
         let (id, record, value) = escrowed_for_a_consumer_here(0x21);
         let unsolicited = [(record, value)];

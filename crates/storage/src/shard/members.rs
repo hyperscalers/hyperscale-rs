@@ -4789,7 +4789,7 @@ mod tests {
 
     /// The epoch grid the readings below are marked on.
     const GRID_MS: u64 = 1_000_000;
-    const GRID: EpochWindows = EpochWindows::new(GRID_MS);
+    const GRID: EpochWindows = EpochWindows::new(0, GRID_MS);
 
     /// A third shard, which no row below awaits.
     const THIRD: ShardId = ShardId::leaf(2, 2);
@@ -6723,7 +6723,7 @@ mod tests {
                     records: &[],
                     claims: &[],
                 },
-                EpochWindows::new(0),
+                EpochWindows::new(0, 0),
                 vec![stub_stated_terms(tx.hash(), 3)],
             )
         };

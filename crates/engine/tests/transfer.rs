@@ -455,7 +455,7 @@ fn sealed_env(byte: u8) -> TickEnvironment {
             BTreeMap::from([(SEAL_MATURITY_EPOCHS, [byte; 32])]),
             Some(SEAL_MATURITY_EPOCHS),
         ),
-        windows: EpochWindows::new(0),
+        windows: EpochWindows::new(0, 0),
     }
 }
 

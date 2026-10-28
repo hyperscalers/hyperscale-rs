@@ -911,7 +911,7 @@ impl<'w> Naming<'w> {
                 records: &[],
                 claims: &[],
             },
-            EpochWindows::new(0),
+            EpochWindows::new(0, 0),
             vec![StatedTerms {
                 tx: carried.hash(),
                 terms: terms_of_member(

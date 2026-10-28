@@ -268,10 +268,10 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
-        ConsensusSignature, Epoch, LocalTimestamp, NetworkDefinition, QuorumCertificate,
-        ReadySignal, ReshapeSeat, ReshapeTrigger, Round, SignerBitfield, Stake, StakePoolId,
-        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, VrfProof, WeightedTimestamp,
-        WitnessSources, compute_merkle_root,
+        ConsensusSignature, Epoch, EpochWindows, LocalTimestamp, NetworkDefinition,
+        QuorumCertificate, ReadySignal, ReshapeSeat, ReshapeTrigger, Round, SignerBitfield, Stake,
+        StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, VrfProof,
+        WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
 
     use super::*;
@@ -421,7 +421,7 @@ mod tests {
 
         let epoch0 = Arc::new(committee_of(&[0, 1, 2, 3]));
         let epoch1 = Arc::new(committee_of(&[10, 11, 12, 13]));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), epoch1);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(1), epoch1);
         schedule.insert(Epoch::new(0), Arc::clone(&epoch0));
 
         // Committed tip C, then A anchored below the cut, then P anchored

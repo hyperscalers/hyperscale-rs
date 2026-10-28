@@ -253,7 +253,7 @@ impl FrontierInputs {
     /// what a fixture hands a commit that raises nothing.
     #[must_use]
     pub fn still(local: ShardId) -> Self {
-        Self::for_block(&[], EpochWindows::new(0), WeightedTimestamp::ZERO, local)
+        Self::for_block(&[], EpochWindows::new(0, 0), WeightedTimestamp::ZERO, local)
     }
 }
 
@@ -445,7 +445,7 @@ mod tests {
     const WINDOW_MS: u64 = 1_000_000;
 
     fn windows() -> EpochWindows {
-        EpochWindows::new(WINDOW_MS)
+        EpochWindows::new(0, WINDOW_MS)
     }
 
     fn mark(epoch: u64, height: u64) -> ReadMark {
@@ -764,7 +764,7 @@ mod tests {
         table.advance(&FrontierInputs {
             local: ShardId::ROOT,
             anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
-            windows: EpochWindows::new(0),
+            windows: EpochWindows::new(0, 0),
             marks: BTreeMap::new(),
         });
         assert_eq!(table.entry(producer), Some(mark(0, 10)));

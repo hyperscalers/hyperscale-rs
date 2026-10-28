@@ -74,13 +74,13 @@ pub type RoutingCommittees = BTreeMap<ShardId, Vec<ValidatorId>>;
 /// every forward question reads that copy.
 ///
 /// A schedule built with [`single`](Self::single) carries one committee for
-/// all time (`epoch_duration_ms == 0` folds every timestamp to genesis) — the
+/// all time (a zero window length folds every timestamp to genesis) — the
 /// pre-rotation / single-epoch case used by tests and within-epoch callers.
 #[derive(Clone, Debug)]
 pub struct TopologySchedule {
-    /// Window length in milliseconds; `epoch = floor(wt / epoch_duration_ms)`.
-    /// Zero means a single fixed committee (every timestamp maps to genesis).
-    epoch_duration_ms: u64,
+    /// The chain's epoch-window grid. A zero window length means a single
+    /// fixed committee (every timestamp maps to genesis).
+    windows: EpochWindows,
     /// Active committee for routing / gossip ("who is in the committee now?").
     head: Arc<TopologySnapshot>,
     /// Committee snapshots keyed by the epoch each governs.
@@ -337,12 +337,12 @@ impl TopologySchedule {
     /// `head_epoch`. The beacon coordinator inserts the lookahead and any
     /// retained past epochs afterward via [`insert`](Self::insert).
     #[must_use]
-    pub fn new(epoch_duration_ms: u64, head_epoch: Epoch, head: Arc<TopologySnapshot>) -> Self {
+    pub fn new(windows: EpochWindows, head_epoch: Epoch, head: Arc<TopologySnapshot>) -> Self {
         let mut by_epoch = BTreeMap::new();
         by_epoch.insert(head_epoch, Arc::clone(&head));
         let lookahead = BTreeMap::new();
         Self {
-            epoch_duration_ms,
+            windows,
             head,
             by_epoch,
             lookahead,
@@ -369,7 +369,7 @@ impl TopologySchedule {
     /// epoch boundaries exist.
     #[must_use]
     pub const fn epoch_duration_ms(&self) -> u64 {
-        self.epoch_duration_ms
+        self.windows.epoch_duration_ms()
     }
 
     /// The schedule's epoch-window grid — for callers that need
@@ -377,7 +377,7 @@ impl TopologySchedule {
     /// just the [`epoch_for`](Self::epoch_for) lookup the schedule itself uses.
     #[must_use]
     pub const fn windows(&self) -> EpochWindows {
-        EpochWindows::new(self.epoch_duration_ms)
+        self.windows
     }
 
     /// A schedule of one committee for all time: every weighted timestamp
@@ -387,13 +387,13 @@ impl TopologySchedule {
     /// bridge is past it discards every height above its frontier.
     #[must_use]
     pub fn single(snapshot: Arc<TopologySnapshot>) -> Self {
-        // `epoch_duration_ms == 0` makes `epoch_for` fold every timestamp to
+        // A zero window length makes `epoch_for` fold every timestamp to
         // genesis, where the sole entry lives — so `at` always answers.
         let mut by_epoch = BTreeMap::new();
         by_epoch.insert(Epoch::GENESIS, Arc::clone(&snapshot));
         let lookahead = BTreeMap::new();
         Self {
-            epoch_duration_ms: 0,
+            windows: EpochWindows::new(0, 0),
             head: snapshot,
             by_epoch,
             lookahead,
@@ -1394,7 +1394,7 @@ impl TopologySchedule {
     /// definitive.
     #[must_use]
     pub fn split_at_next_boundary(&self, shard: ShardId, wt: WeightedTimestamp) -> SplitAtBoundary {
-        if self.epoch_duration_ms == 0 {
+        if self.windows.epoch_duration_ms() == 0 {
             return SplitAtBoundary::No;
         }
         let epoch = self.anchor_epoch_for(wt);
@@ -1440,7 +1440,7 @@ impl TopologySchedule {
     /// reads; `None` where the schedule does not hold that window.
     #[must_use]
     pub fn terminating_at(&self, wt: WeightedTimestamp) -> Option<Terminating<'_>> {
-        if self.epoch_duration_ms == 0 {
+        if self.windows.epoch_duration_ms() == 0 {
             return Some(Terminating::NONE);
         }
         let epoch = self.anchor_epoch_for(wt);
@@ -1458,7 +1458,7 @@ impl TopologySchedule {
     /// reader that cannot defer takes that as reshaping.
     #[must_use]
     pub fn reshaping_at(&self, wt: WeightedTimestamp) -> Option<Reshaping<'_>> {
-        if self.epoch_duration_ms == 0 {
+        if self.windows.epoch_duration_ms() == 0 {
             return Some(Reshaping::NONE);
         }
         let terminating = self.terminating_at(wt)?;
@@ -1610,7 +1610,7 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> Option<WeightedTimestamp> {
-        if self.epoch_duration_ms == 0 {
+        if self.windows.epoch_duration_ms() == 0 {
             return None;
         }
         self.forward_windows(wt)
@@ -1752,7 +1752,11 @@ mod tests {
         terminated: &[(ShardId, Option<SettledTxsRoot>)],
     ) -> TopologySchedule {
         let head = topology_with(after, terminated);
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), topology_with(before, &[]));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(0),
+            topology_with(before, &[]),
+        );
         sched.insert(Epoch::new(1), Arc::clone(&head));
         sched.set_head(head);
         sched
@@ -1908,7 +1912,8 @@ mod tests {
             )
             .with_settled_window_floors(BTreeMap::from([(ShardId::ROOT, floor)])),
         );
-        let mut sched = TopologySchedule::new(1000, Epoch::new(3), snapshot());
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(3), snapshot());
         sched.insert_lookahead(Epoch::new(5), terminating);
 
         // The floor answers from the governing window and from the epoch
@@ -1962,7 +1967,8 @@ mod tests {
 
         // The fold of 4 publishes its projection of 5, with the root's
         // split pending.
-        let mut behind = TopologySchedule::new(1000, Epoch::new(4), snapshot());
+        let mut behind =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(4), snapshot());
         behind.insert_lookahead(Epoch::new(5), projecting_a_split(&[ShardId::ROOT]));
         assert!(behind.termination_scheduled(ShardId::ROOT, in_window_four));
 
@@ -1988,7 +1994,7 @@ mod tests {
 
     #[test]
     fn epoch_for_floors_to_window() {
-        let sched = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        let sched = TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(5), snapshot());
         assert_eq!(
             sched.epoch_for(WeightedTimestamp::from_millis(0)),
             Epoch::new(0)
@@ -2028,7 +2034,8 @@ mod tests {
     #[test]
     fn at_returns_none_for_epochs_outside_the_window() {
         // The window holds the active epoch 5 and its lookahead 6.
-        let mut sched = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(5), snapshot());
         sched.insert(Epoch::new(6), snapshot());
         assert!(sched.at(WeightedTimestamp::from_millis(5500)).is_some());
         assert!(sched.at(WeightedTimestamp::from_millis(6500)).is_some());
@@ -2040,7 +2047,8 @@ mod tests {
 
     #[test]
     fn lookup_distinguishes_the_two_miss_reasons() {
-        let mut sched = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(5), snapshot());
         sched.insert(Epoch::new(6), snapshot());
         assert!(matches!(
             sched.lookup(WeightedTimestamp::from_millis(5500)),
@@ -2060,7 +2068,8 @@ mod tests {
     /// between two retained entries, or above them, is not.
     #[test]
     fn an_epoch_is_evicted_only_below_the_oldest_retained() {
-        let mut sched = TopologySchedule::new(1000, Epoch::new(4), snapshot());
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(4), snapshot());
         sched.insert(Epoch::new(8), snapshot());
         assert!(sched.evicted(WeightedTimestamp::from_millis(3500)));
         assert!(!sched.evicted(WeightedTimestamp::from_millis(4500)));
@@ -2070,7 +2079,8 @@ mod tests {
 
     #[test]
     fn evict_below_drops_only_epochs_below_the_floor() {
-        let mut sched = TopologySchedule::new(1000, Epoch::new(4), snapshot());
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(4), snapshot());
         sched.insert(Epoch::new(5), snapshot());
         sched.insert(Epoch::new(6), snapshot());
         sched.evict_below(Epoch::new(5));
@@ -2092,7 +2102,7 @@ mod tests {
         // cut at 6, so window 6 is the first entry carrying it; the fold
         // at 6 applies the split and window 7 carries the children.
         let mut sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[p, sibling], &[p], &[], &[]),
         );
@@ -2130,7 +2140,7 @@ mod tests {
         // yet seen the fold opening window 7 — answers identically, so
         // it never waits on that fold.
         let truncated = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(6),
             reshape_snap(&[p, sibling], &[p], &[], &[(p, 6)]),
         );
@@ -2163,7 +2173,7 @@ mod tests {
         let sibling = ShardId::leaf(1, 1);
         let (left, right) = p.children();
         let mut sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[p, sibling], &[p], &[], &[]),
         );
@@ -2206,7 +2216,7 @@ mod tests {
         let p = ShardId::leaf(1, 0);
         let sibling = ShardId::leaf(1, 1);
         let mut sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[p, sibling], &[p], &[], &[]),
         );
@@ -2251,7 +2261,7 @@ mod tests {
         let (left, right) = p.children();
         let final_window = reshape_snap(&[p, sibling], &[p], &[], &[(p, 6)]);
         let mut sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[p, sibling], &[p], &[], &[]),
         );
@@ -2288,7 +2298,7 @@ mod tests {
         // admitted but unscheduled — the fold opening window 7 cannot
         // schedule a cut at 6's end, so its absence changes nothing.
         let sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(6),
             reshape_snap(&[p, sibling], &[p], &[], &[]),
         );
@@ -2322,7 +2332,7 @@ mod tests {
         let sibling = ShardId::leaf(1, 1);
         let (left, right) = p.children();
         let mut sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(6),
             reshape_snap(&[p, sibling], &[], &[], &[]),
         );
@@ -2361,7 +2371,7 @@ mod tests {
         let (left, right) = p.children();
         // p's final window is 6; window 7 carries its children.
         let mut sched = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(6),
             reshape_snap(&[p, sibling], &[], &[], &[]),
         );
@@ -2437,7 +2447,8 @@ mod tests {
             2,
             set,
         ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), Arc::clone(&pre));
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(0), Arc::clone(&pre));
         sched.insert(Epoch::new(1), Arc::clone(&post));
         sched.set_head(post);
 
@@ -2487,7 +2498,8 @@ mod tests {
                 std::iter::once((recovering, halt_recovery(2, &retained))).collect(),
             ),
         );
-        let sched = TopologySchedule::new(1000, Epoch::new(3), Arc::clone(&head));
+        let sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(3), Arc::clone(&head));
 
         let routing = sched.routing_committees();
         let recovering_entry = routing.get(&recovering).expect("recovering shard routes");
@@ -2547,7 +2559,7 @@ mod tests {
         };
         let routing_with_crossing_at = |wt: u64| {
             let head = Arc::new(committee(&incoming).with_boundaries(crossed_at(wt)));
-            let mut sched = TopologySchedule::new(1000, Epoch::new(4), head);
+            let mut sched = TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(4), head);
             sched.insert(Epoch::new(3), Arc::new(committee(&outgoing)));
             sched.routing_committees()
         };
@@ -2603,7 +2615,11 @@ mod tests {
             Arc::new(snap(&fresh).as_ref().clone().with_pending_recoveries(
                 std::iter::once((shard, halt_recovery(20, &old))).collect(),
             ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            Arc::clone(&old_snap),
+        );
         sched.insert(Epoch::new(21), Arc::clone(&fresh_snap));
         sched.set_head(Arc::clone(&fresh_snap));
 
@@ -2686,7 +2702,11 @@ mod tests {
 
         // Without the recovery record, the live path is the plain lookup
         // and the retained-resolution predicate is inert.
-        let mut plain = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
+        let mut plain = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            Arc::clone(&old_snap),
+        );
         plain.insert(Epoch::new(21), snap(&fresh));
         assert_eq!(
             committee_of(plain.lookup_for_shard_live(shard, stale_anchor).0),
@@ -2727,7 +2747,11 @@ mod tests {
             Arc::new(snap(&fresh).as_ref().clone().with_pending_recoveries(
                 std::iter::once((shard, halt_recovery(20, &old))).collect(),
             ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
+        let mut sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            Arc::clone(&old_snap),
+        );
         sched.insert(Epoch::new(21), Arc::clone(&fresh_snap));
         sched.set_head(Arc::clone(&fresh_snap));
 
@@ -2758,7 +2782,11 @@ mod tests {
         assert!(!sched.recovery_suffix_band(shard, bridge_qc, bridge_qc));
 
         // Without a recovery nothing is replaced, whatever the anchor.
-        let mut plain = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
+        let mut plain = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            Arc::clone(&old_snap),
+        );
         plain.insert(Epoch::new(21), snap(&fresh));
         assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor));
         assert!(!plain.recovery_orphaned(shard, stale_anchor, BlockHeight::new(1)));
@@ -2859,7 +2887,8 @@ mod tests {
         };
 
         let healthy = || Arc::new(seating(&set, &old, Some(boundary)));
-        let mut before = TopologySchedule::new(epoch_ms, Epoch::new(5), healthy());
+        let mut before =
+            TopologySchedule::new(EpochWindows::new(0, epoch_ms), Epoch::new(5), healthy());
         before.insert(Epoch::new(6), healthy());
         before.set_head(healthy());
 
@@ -2931,7 +2960,8 @@ mod tests {
 
         let recording = Arc::new(seating(&set, &old, Some(boundary)));
         let moved_on = Arc::new(seating(&set, &old, None));
-        let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(5), recording);
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, epoch_ms), Epoch::new(5), recording);
         schedule.insert(Epoch::new(6), Arc::clone(&moved_on));
         schedule.set_head(moved_on);
         assert_eq!(
@@ -2971,7 +3001,8 @@ mod tests {
         };
         let last_window = Arc::new(seating(&set, &old, Some(scheduled)));
         let departed = Arc::new(seating(&set, &old, Some(terminal)));
-        let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(5), last_window);
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, epoch_ms), Epoch::new(5), last_window);
         schedule.insert(Epoch::new(6), Arc::clone(&departed));
         schedule.set_head(departed);
 
@@ -3027,7 +3058,8 @@ mod tests {
             let fresh_snap = Arc::new(snap(&fresh).as_ref().clone().with_pending_recoveries(
                 std::iter::once((shard, halt_recovery_at(20, &old, frontier))).collect(),
             ));
-            let mut sched = TopologySchedule::new(1000, Epoch::new(2), snap(&old));
+            let mut sched =
+                TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(2), snap(&old));
             sched.insert(Epoch::new(21), Arc::clone(&fresh_snap));
             sched.set_head(fresh_snap);
             sched
@@ -3050,7 +3082,8 @@ mod tests {
                     ),
                 )
             };
-            let mut sched = TopologySchedule::new(1000, Epoch::new(2), snap(&old));
+            let mut sched =
+                TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(2), snap(&old));
             sched.insert(Epoch::new(21), completed(&fresh));
             sched.insert(Epoch::new(23), completed(&shuffled));
             sched.set_head(completed(&shuffled));
@@ -3094,7 +3127,8 @@ mod tests {
         }
 
         // Without a record nothing is replaced or in a band.
-        let mut plain = TopologySchedule::new(1000, Epoch::new(2), snap(&old));
+        let mut plain =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(2), snap(&old));
         plain.insert(Epoch::new(21), snap(&fresh));
         for height in [frontier, above] {
             assert_eq!(
@@ -3156,7 +3190,8 @@ mod tests {
         // The recovery seated the fresh committee at epoch 20 (bridge 21);
         // its first crossing cleared the pending record, and a later fold
         // rotated the committee again in a newer entry.
-        let mut sched = TopologySchedule::new(1000, Epoch::new(2), snap(&old));
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(2), snap(&old));
         sched.insert(Epoch::new(21), completed(&fresh));
         sched.insert(Epoch::new(23), completed(&shuffled));
         sched.set_head(completed(&shuffled));
@@ -3249,7 +3284,7 @@ mod tests {
                         .collect(),
                 );
             }
-            TopologySchedule::new(1_000, Epoch::new(11), Arc::new(head))
+            TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(11), Arc::new(head))
         };
 
         let discarded = proof(&replaced, 5_000);
@@ -3318,7 +3353,8 @@ mod tests {
         let first_era_qc = WeightedTimestamp::from_millis(21_900);
 
         for second_completed in [false, true] {
-            let mut sched = TopologySchedule::new(1000, Epoch::new(2), snap(&old, None));
+            let mut sched =
+                TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(2), snap(&old, None));
             sched.insert(Epoch::new(21), snap(&first, None));
             let head = snap(&second, Some(second_completed));
             sched.insert(Epoch::new(41), Arc::clone(&head));
@@ -3399,7 +3435,11 @@ mod tests {
                         .collect(),
                 ),
         );
-        let sched = TopologySchedule::new(1000, Epoch::new(41), Arc::clone(&head));
+        let sched = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(41),
+            Arc::clone(&head),
+        );
         let at = |epoch: u64| WeightedTimestamp::from_millis(epoch * 1_000 + 100);
         let anchors = [19, 20, 21, 22, 39, 40, 41, 42];
 
@@ -3454,7 +3494,11 @@ mod tests {
                 );
             }
             let head = Arc::new(head);
-            let sched = TopologySchedule::new(1000, Epoch::new(21), Arc::clone(&head));
+            let sched = TopologySchedule::new(
+                EpochWindows::new(0, 1000),
+                Epoch::new(21),
+                Arc::clone(&head),
+            );
             assert!(sched.recovery_crossing(&head, shard, at(20), at(21)));
             assert!(sched.recovery_crossing(&head, shard, at(3), at(25)));
             for (parent, block) in [(2, 3), (3, 20), (20, 20), (21, 21), (21, 22), (22, 40)] {
@@ -3529,7 +3573,8 @@ mod tests {
             )
         };
 
-        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(5), snapshot());
         assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
         // The frozen window alone is not the published one.
         schedule.insert(Epoch::new(6), children(vec![recovered(3)]));
@@ -3613,7 +3658,8 @@ mod tests {
             &[(left, 1), (right, 1), (seated, 9), (sibling, 9)],
             &[],
         );
-        let mut schedule = TopologySchedule::new(1000, Epoch::new(7), snapshot());
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(7), snapshot());
         schedule.insert_lookahead(Epoch::new(8), published);
         schedule.insert(Epoch::new(8), frozen);
         assert!(
@@ -3664,7 +3710,8 @@ mod tests {
         let window =
             |formed: u64| formed_window(&[left, right], &[(left, formed), (right, 2)], &[]);
 
-        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(5), snapshot());
         assert_eq!(schedule.formed_as_published(left, wt), Err(Unpublished));
         schedule.insert(Epoch::new(6), window(3));
         assert_eq!(schedule.formed_as_published(left, wt), Err(Unpublished));
@@ -3731,7 +3778,7 @@ mod tests {
             &[(ShardId::ROOT, 5)],
         );
         let after = reshape_snap(&[left, right], &[], &[], &[]);
-        let mut schedule = TopologySchedule::new(1000, Epoch::new(4), before);
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(4), before);
         schedule.insert_lookahead(Epoch::new(5), last);
         schedule.insert_lookahead(Epoch::new(6), after);
         let at = WeightedTimestamp::from_millis;
@@ -3780,7 +3827,7 @@ mod tests {
         // scheduled cut says *whether*, `split_pending` says *which
         // reshape*. Neither reads window 6, which isn't inserted at all.
         let split = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(
                 &[ShardId::ROOT],
@@ -3802,7 +3849,7 @@ mod tests {
         // `terminates` fires even though `split_at_next_boundary` does not
         // — the case the split-only predicate missed.
         let merge = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(
                 &[left, right],
@@ -3819,7 +3866,7 @@ mod tests {
         // An admitted reshape carrying no cut does not terminate here —
         // definitive: the window's own entry carries the answer.
         let merge_pending = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[left, right], &[], &[left, right], &[]),
         );
@@ -3828,7 +3875,7 @@ mod tests {
             Some(false)
         );
         let split_pending = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[ShardId::ROOT], &[ShardId::ROOT], &[], &[]),
         );
@@ -3838,7 +3885,7 @@ mod tests {
         );
         // A cut scheduled for a *later* window is equally definitive here.
         let later = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(
                 &[ShardId::ROOT],
@@ -3853,7 +3900,7 @@ mod tests {
         );
         // No admitted reshape at all: definitively no termination.
         let quiet = TopologySchedule::new(
-            1000,
+            EpochWindows::new(0, 1000),
             Epoch::new(5),
             reshape_snap(&[left, right], &[], &[], &[]),
         );

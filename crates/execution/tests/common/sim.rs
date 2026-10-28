@@ -397,7 +397,7 @@ impl ExecutionSim {
             )]));
         self.snapshot = Arc::new(recorded);
         self.topology = TopologySchedule::new(
-            BLOCK_INTERVAL_MS,
+            EpochWindows::new(0, BLOCK_INTERVAL_MS),
             Epoch::GENESIS,
             Arc::clone(&self.snapshot),
         );
@@ -1024,7 +1024,7 @@ impl ExecutionSim {
                         records: block.abandonment_records(),
                         claims: block.state_claims(),
                     },
-                    EpochWindows::new(0),
+                    EpochWindows::new(0, 0),
                     terms,
                 )
             });

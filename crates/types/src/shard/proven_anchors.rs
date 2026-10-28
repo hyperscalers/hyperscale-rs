@@ -234,8 +234,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Epoch, Hash, NetworkDefinition, RecoveryBinding, RecoveryCause, ShardRecovery, StateRoot,
-        TopologySnapshot, ValidatorSet,
+        Epoch, EpochWindows, Hash, NetworkDefinition, RecoveryBinding, RecoveryCause,
+        ShardRecovery, StateRoot, TopologySnapshot, ValidatorSet,
     };
 
     fn root(seed: u8) -> StateRoot {
@@ -379,7 +379,7 @@ mod tests {
                 },
             )]));
         }
-        TopologySchedule::new(1_000, Epoch::new(4), Arc::new(head))
+        TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(4), Arc::new(head))
     }
 
     /// A fresh block's commit proof stands while its recovery is pending:
@@ -457,7 +457,7 @@ mod tests {
                 ValidatorSet::new(Vec::new()),
             )
             .with_recoveries(BTreeMap::from([(shards[0], history)]));
-            let schedule = TopologySchedule::new(1_000, Epoch::new(rotated + 1), Arc::new(head));
+            let schedule = TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(rotated + 1), Arc::new(head));
 
             let anchors = ProvenAnchors::new();
             for &(shard, height, ts) in &held {

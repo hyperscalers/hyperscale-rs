@@ -644,7 +644,8 @@ mod tests {
             // four, epoch 1 seats three.
             let epoch0 = Arc::new(committee.topology_snapshot(1));
             let epoch1 = Arc::new(TestCommittee::new(3, 22).topology_snapshot(1));
-            let mut sched = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&epoch1));
+            let mut sched =
+                TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(1), Arc::clone(&epoch1));
             sched.insert(Epoch::new(0), Arc::clone(&epoch0));
 
             // The certified block's parent anchors below the cut; the block
@@ -847,7 +848,11 @@ mod tests {
             // future-epoch lookup is NotYetCommitted, so resolution fails and
             // the caller defers rather than treating it as invalid.
             let snapshot = Arc::new(committee.topology_snapshot(1));
-            let mut schedule = TopologySchedule::new(1_000, Epoch::new(50), Arc::clone(&snapshot));
+            let mut schedule = TopologySchedule::new(
+                EpochWindows::new(0, 1_000),
+                Epoch::new(50),
+                Arc::clone(&snapshot),
+            );
             schedule.insert(Epoch::new(50), snapshot);
             assert_eq!(
                 proof.verify(&BlsVerifier, &schedule),

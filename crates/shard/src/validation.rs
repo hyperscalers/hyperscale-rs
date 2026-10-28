@@ -641,9 +641,9 @@ pub mod tests {
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         BodyRootContext, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline, Derivation,
-        DerivationError, Derived, DiscardCause, Engagement, EngagementRoot, Epoch, Evidence,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot,
-        LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
+        DerivationError, Derived, DiscardCause, Engagement, EngagementRoot, Epoch, EpochWindows,
+        Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
+        LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
         MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES,
         MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
@@ -2317,7 +2317,8 @@ pub mod tests {
     /// `plain`'s rows and shard anchored in its fifth window, governed by
     /// `window`.
     fn anchored_in_the_fifth_window(plain: Against, window: TopologySnapshot) -> Against {
-        let schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::new(window));
+        let schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(5), Arc::new(window));
         let mut against = Against::schedule(plain.snapshot.clone(), schedule);
         against.local_shard = plain.local_shard;
         against.members = plain.members;
@@ -2485,7 +2486,11 @@ pub mod tests {
             .snapshot
             .clone()
             .with_draining(BTreeMap::from([(local, Epoch::new(2))]));
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::new(window.clone()));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(5),
+            Arc::new(window.clone()),
+        );
         schedule.insert(Epoch::new(6), Arc::new(window.clone()));
         against.schedule = schedule;
         let own_anchor = WeightedTimestamp::from_millis(6_100);
@@ -2556,7 +2561,11 @@ pub mod tests {
             )
             .with_draining(BTreeMap::from([(x, Epoch::new(2)), (s, Epoch::new(2))])),
         );
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::clone(&window));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(5),
+            Arc::clone(&window),
+        );
         schedule.insert_lookahead(Epoch::new(5), window);
         let anchor = WeightedTimestamp::from_millis(5_500);
         let committed = WeightedTimestamp::from_millis(5_100);
@@ -2607,7 +2616,11 @@ pub mod tests {
         let (_, near, _) = among_four_shards();
         let toward_near = awaiting(0x10, 0x50);
         let after = lives(None, Some(near));
-        let schedule = TopologySchedule::new(1_000, Epoch::new(6), Arc::new(after.clone()));
+        let schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(6),
+            Arc::new(after.clone()),
+        );
         let (plain, ..) = among_four_shards();
         let mut against = Against::schedule(after, schedule);
         against.local_shard = plain.local_shard;
@@ -2705,7 +2718,11 @@ pub mod tests {
         };
         let classifying = against.snapshot.clone();
         let classifying = classifying.clone().with_formed(at_genesis(&classifying));
-        let schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(window));
+        let schedule = TopologySchedule::new(
+            EpochWindows::new(0, u64::MAX / 2),
+            Epoch::GENESIS,
+            Arc::new(window),
+        );
         let mut anchored = Against::schedule(classifying, schedule);
         anchored.local_shard = against.local_shard;
         anchored.members = against.members;
@@ -5244,8 +5261,11 @@ pub mod tests {
                     )]));
                 }
             }
-            let mut schedule =
-                TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()));
+            let mut schedule = TopologySchedule::new(
+                EpochWindows::new(0, 1_000),
+                Epoch::GENESIS,
+                Arc::new(snapshot.clone()),
+            );
             for epoch in 1..=60 {
                 schedule.insert(Epoch::new(epoch), Arc::new(snapshot.clone()));
             }

@@ -443,8 +443,8 @@ pub struct BoundaryMemo {
 /// block itself can carry a different weighted timestamp and flip the
 /// crossing verdict.
 struct BoundaryTrigger {
-    /// The chain's epoch window length — must match the beacon fold's.
-    epoch_duration_ms: u64,
+    /// The chain's epoch-window grid — must match the beacon fold's.
+    windows: EpochWindows,
     /// Backend pin (`BoundaryStore::pin_boundary`). Invoked on the I/O
     /// pool between the boundary block's write and its child's, when
     /// storage state is exactly the boundary block's.
@@ -557,12 +557,12 @@ impl BlockCommitCoordinator {
     /// most the one boundary that lands exactly at the restart gap.
     pub(crate) fn set_boundary_trigger(
         &mut self,
-        epoch_duration_ms: u64,
+        windows: EpochWindows,
         pin: Arc<dyn Fn(BlockHeight) + Send + Sync>,
         seed: Option<BoundaryMemo>,
     ) {
         self.boundary = Some(BoundaryTrigger {
-            epoch_duration_ms,
+            windows,
             pin,
             last: seed,
         });
@@ -948,7 +948,8 @@ impl BlockCommitCoordinator {
                 if let Some(last) = trigger.last
                     && parent_qc.block_hash() == last.hash
                     && (last.terminal
-                        || EpochWindows::new(trigger.epoch_duration_ms)
+                        || trigger
+                            .windows
                             .is_crossing(last.parent_qc_wt, parent_qc.weighted_timestamp()))
                 {
                     pin_before[i] = Some(last.height);
@@ -1158,7 +1159,7 @@ mod tests {
             frontier: FrontierInputs {
                 local: ShardId::ROOT,
                 anchor: WeightedTimestamp::ZERO,
-                windows: EpochWindows::new(1_000),
+                windows: EpochWindows::new(0, 1_000),
                 marks: BTreeMap::new(),
             },
             certified: commit.certified,
@@ -2148,7 +2149,11 @@ mod tests {
     fn boundary_pin_fires_between_crossing_and_child() {
         let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
-        coord.set_boundary_trigger(EPOCH_MS, pin_hook(Arc::clone(&sink)), None);
+        coord.set_boundary_trigger(
+            EpochWindows::new(0, EPOCH_MS),
+            pin_hook(Arc::clone(&sink)),
+            None,
+        );
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
 
@@ -2176,7 +2181,11 @@ mod tests {
     fn boundary_pin_fires_across_separate_flushes() {
         let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
-        coord.set_boundary_trigger(EPOCH_MS, pin_hook(Arc::clone(&sink)), None);
+        coord.set_boundary_trigger(
+            EpochWindows::new(0, EPOCH_MS),
+            pin_hook(Arc::clone(&sink)),
+            None,
+        );
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
 
@@ -2204,7 +2213,11 @@ mod tests {
     fn boundary_pin_skipped_on_broken_parent_linkage() {
         let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
-        coord.set_boundary_trigger(EPOCH_MS, pin_hook(Arc::clone(&sink)), None);
+        coord.set_boundary_trigger(
+            EpochWindows::new(0, EPOCH_MS),
+            pin_hook(Arc::clone(&sink)),
+            None,
+        );
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
 
@@ -2226,7 +2239,7 @@ mod tests {
         let sink = empty_sink();
         let tip_hash = BlockHash::from_raw(Hash::from_bytes(b"tip"));
         coord.set_boundary_trigger(
-            EPOCH_MS,
+            EpochWindows::new(0, EPOCH_MS),
             pin_hook(Arc::clone(&sink)),
             Some(BoundaryMemo {
                 hash: tip_hash,
@@ -2310,7 +2323,7 @@ mod tests {
     #[test]
     fn a_qc_only_commit_hears_the_verdict_claim_its_block_names() {
         let (shard, sibling) = (ShardId::ROOT, ShardId::leaf(1, 1));
-        let windows = EpochWindows::new(1_000_000);
+        let windows = EpochWindows::new(0, 1_000_000);
         let tx = TxHash::from(Hash::from_bytes(b"heard"));
         let deadline = Deadline::of(WeightedTimestamp::from_millis(90_000));
         let storage = SimShardStorage::default();
@@ -2415,7 +2428,7 @@ mod tests {
         removals: &[SubstateKey],
         certificates: &[Arc<Verifiable<Finalization>>],
     ) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>> {
-        let windows = EpochWindows::new(1_000_000);
+        let windows = EpochWindows::new(0, 1_000_000);
         let store = Arc::new(storage.clone());
         let height = storage.jmt_height().next();
         let child = |state_root| {

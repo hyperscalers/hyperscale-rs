@@ -83,7 +83,7 @@ impl TickEnvironment {
     pub const fn unfolded() -> Self {
         Self {
             seeds: SeedWindow::unfolded(),
-            windows: EpochWindows::new(0),
+            windows: EpochWindows::new(0, 0),
         }
     }
 }

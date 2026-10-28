@@ -226,7 +226,7 @@ mod tests {
         FrontierInputs {
             local,
             anchor: WeightedTimestamp::from_millis(anchor_ms),
-            windows: EpochWindows::new(WINDOW_MS),
+            windows: EpochWindows::new(0, WINDOW_MS),
             marks: marks.iter().copied().collect(),
         }
     }
@@ -273,7 +273,7 @@ mod tests {
             &store,
             &inputs(local, 100, &[(producer, mark(0, 7))]),
         ));
-        let close = EpochWindows::new(WINDOW_MS).window_of(Epoch::new(0)).end;
+        let close = EpochWindows::new(0, WINDOW_MS).window_of(Epoch::new(0)).end;
         let at_horizon = close.plus(RETENTION_HORIZON).as_millis();
         assert!(read_frontier_writes(&store, &inputs(local, at_horizon, &[])).is_empty());
         let past = read_frontier_writes(&store, &inputs(local, at_horizon + 1, &[]));

@@ -391,7 +391,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::TestCommittee;
-    use crate::{BlockHeight, TopologySchedule};
+    use crate::{BlockHeight, EpochWindows, TopologySchedule};
 
     fn heard(epoch: u64, said: Option<Said>) -> Heard {
         Heard {
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn an_evicted_window_decides_nothing() {
         let schedule = TopologySchedule::new(
-            1_000,
+            EpochWindows::new(0, 1_000),
             Epoch::new(4),
             Arc::new(TestCommittee::new(4, 7).topology_snapshot(1)),
         );
@@ -521,7 +521,7 @@ mod tests {
     fn a_yes_of_a_reshaping_sibling_counts() {
         let sibling = ShardId::leaf(1, 1);
         let schedule = TopologySchedule::new(
-            1_000,
+            EpochWindows::new(0, 1_000),
             Epoch::new(5),
             Arc::new(
                 TestCommittee::new(4, 7)

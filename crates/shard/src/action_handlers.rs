@@ -2226,7 +2226,7 @@ mod tests {
     /// never released.
     #[test]
     fn a_name_is_weighed_at_the_window_that_committed_it() {
-        let windows = EpochWindows::new(1_000);
+        let windows = EpochWindows::new(0, 1_000);
         let chain = Folded::to(&[(0, 1), (1, 2)]);
 
         let resolved = commit_windows_for(&chain, windows, &[named_at(500, 500)]);
@@ -2251,7 +2251,7 @@ mod tests {
     /// so only that one names the table the figures were frozen against.
     #[test]
     fn a_name_committed_across_a_cut_is_weighed_where_it_was_frozen() {
-        let windows = EpochWindows::new(1_000);
+        let windows = EpochWindows::new(0, 1_000);
         let chain = Folded::to(&[(0, 1), (1, 2)]);
 
         // The first block of the later window: its own anchor sits in
@@ -2275,7 +2275,7 @@ mod tests {
     /// the share at a placement the transaction never ran under.
     #[test]
     fn an_unfolded_epoch_resolves_no_window() {
-        let windows = EpochWindows::new(1_000);
+        let windows = EpochWindows::new(0, 1_000);
         let chain = Folded::to(&[(0, 1)]);
 
         let resolved = commit_windows_for(&chain, windows, &[named_at(5_000, 5_000)]);
