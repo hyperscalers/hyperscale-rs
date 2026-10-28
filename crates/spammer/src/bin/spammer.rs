@@ -11,7 +11,7 @@ use hyperscale_spammer::client::RpcClient;
 use hyperscale_spammer::config::SpammerConfig;
 use hyperscale_spammer::genesis::generate_genesis_toml;
 use hyperscale_spammer::runner::{Spammer, wait_for_ready};
-use hyperscale_spammer::validity::chain_clock;
+use hyperscale_spammer::validity::wall_clock;
 use hyperscale_spammer::workloads::TransferWorkload;
 use hyperscale_types::ShardId;
 use rand::SeedableRng;
@@ -280,9 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wait_for_ready(&clients, Duration::from_mins(1)).await?;
                 println!("All nodes ready.");
             }
-            let genesis_timestamp_ms = clients[0].get_status().await?.genesis_timestamp_ms;
-
-            let mut spammer = Spammer::new(config, chain_clock(genesis_timestamp_ms))?;
+            let mut spammer = Spammer::new(config, wall_clock())?;
 
             println!("Starting spammer for {:?}...", *duration);
             if measure_latency {
@@ -380,16 +378,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client_idx = routing.range_for_shard(target_shard).start % clients.len();
             let client = &clients[client_idx];
 
-            let genesis_timestamp_ms = client
-                .get_status()
-                .await
-                .expect("Failed to read the node's status")
-                .genesis_timestamp_ms;
-
             // Create a simple same-shard transfer targeting shard 0
             // Using a specific shard ensures we know exactly which validators to submit to
-            let workload = TransferWorkload::new(chain_clock(genesis_timestamp_ms))
-                .with_cross_shard_ratio(0.0); // Same-shard for simplicity
+            let workload = TransferWorkload::new(wall_clock()).with_cross_shard_ratio(0.0); // Same-shard for simplicity
 
             // Use current time as seed to generate unique transactions each run
             let seed = u64::try_from(

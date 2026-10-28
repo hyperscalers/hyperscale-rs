@@ -89,9 +89,6 @@ pub struct RpcState {
     /// When set and the node is this many blocks behind, new transaction
     /// submissions are rejected to allow the node to catch up.
     pub sync_backpressure_threshold: Option<u64>,
-    /// The network's genesis instant (ms since the Unix epoch), the origin
-    /// of the chain time a transaction's validity window is judged on.
-    pub genesis_timestamp_ms: u64,
 }
 
 impl RpcState {

@@ -6,9 +6,9 @@
 //! sub-second skew between submitter and chain.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hyperscale_types::{BeaconChainConfig, TimestampRange, WeightedTimestamp};
+use hyperscale_types::{TimestampRange, WeightedTimestamp};
 
 /// Default forward budget for spammer-submitted transactions.
 ///
@@ -19,7 +19,7 @@ pub(crate) const SPAMMER_VALIDITY_BUDGET: Duration = Duration::from_mins(1);
 
 /// Source of validity ranges for generated transactions.
 ///
-/// [`chain_clock`] against a live network; the simulator substitutes a
+/// [`wall_clock`] against a live network; the simulator substitutes a
 /// closure reading its simulated millisecond clock.
 pub type ValidityClock = Arc<dyn Fn() -> TimestampRange + Send + Sync>;
 
@@ -30,26 +30,26 @@ pub fn range_starting_at(start: WeightedTimestamp) -> TimestampRange {
     TimestampRange::new(start, start.plus(SPAMMER_VALIDITY_BUDGET))
 }
 
-/// A [`ValidityClock`] opening each window at the chain time of the local
-/// wall clock, on a network whose genesis instant is
-/// `genesis_timestamp_ms`.
+/// A [`ValidityClock`] opening each window at the local wall clock's
+/// reading of now, which is the chain's clock.
 #[must_use]
-pub fn chain_clock(genesis_timestamp_ms: u64) -> ValidityClock {
-    let chain = BeaconChainConfig {
-        genesis_timestamp_ms,
-        ..BeaconChainConfig::default()
-    };
-    Arc::new(move || range_starting_at(chain.chain_time(SystemTime::now())))
+pub fn wall_clock() -> ValidityClock {
+    Arc::new(|| {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        range_starting_at(WeightedTimestamp::from_millis(unix_ms))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::UNIX_EPOCH;
-
     use super::*;
 
     /// A window opens at the wall clock's Unix reading of now, which is
-    /// the time the node judges it by, whatever the network's genesis.
+    /// the time the node judges it by.
     #[test]
     fn a_window_opens_at_the_chains_reading_of_now() {
         let unix_ms = || {
@@ -62,7 +62,7 @@ mod tests {
             .unwrap()
         };
         let before = unix_ms();
-        let range = chain_clock(before - 42_000)();
+        let range = wall_clock()();
         let after = unix_ms();
 
         let opened = range.start_timestamp_inclusive.as_millis();

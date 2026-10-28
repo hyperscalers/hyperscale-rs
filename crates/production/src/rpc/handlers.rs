@@ -115,7 +115,6 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
         version: option_env!("HYPERSCALE_VERSION")
             .unwrap_or("localdev")
             .to_string(),
-        genesis_timestamp_ms: state.genesis_timestamp_ms,
         vnodes: node_status.vnodes.clone(),
     })
 }
@@ -509,7 +508,6 @@ mod tests {
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
-            genesis_timestamp_ms: 0,
         }
     }
 
@@ -750,7 +748,6 @@ mod tests {
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
-            genesis_timestamp_ms: 0,
         };
 
         let app = Router::new()
@@ -805,7 +802,6 @@ mod tests {
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
-            genesis_timestamp_ms: 0,
         };
 
         let app = Router::new()
@@ -863,7 +859,6 @@ mod tests {
             tx_status: Arc::new(TxStatusCache::new()),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
-            genesis_timestamp_ms: 0,
         };
         let app = Router::new()
             .route("/tx", post(submit_transaction_handler))
