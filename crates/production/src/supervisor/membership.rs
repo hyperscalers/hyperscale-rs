@@ -42,7 +42,8 @@ use tracing::{info, warn};
 
 use super::{LoopStart, Registering, ShardSupervisor, SupervisorEvent};
 use crate::bootstrap::bootstrap_shard_state;
-use crate::runner::{ShardChannels, ShardControl, VnodeConfig};
+use crate::runner::VnodeConfig;
+use crate::shard_thread::{ShardChannels, ShardControl};
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
 /// the imported storage verified against the attested anchor, plus the

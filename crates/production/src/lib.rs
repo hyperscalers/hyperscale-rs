@@ -44,6 +44,7 @@
 //! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
 //! [`PooledDispatch`]: hyperscale_dispatch_pooled::PooledDispatch
 
+mod beacon_thread;
 mod bootstrap;
 mod handle;
 pub mod network_file;
@@ -51,6 +52,7 @@ mod node;
 mod observe;
 pub mod rpc;
 mod runner;
+mod shard_thread;
 mod status;
 mod supervisor;
 mod telemetry;
