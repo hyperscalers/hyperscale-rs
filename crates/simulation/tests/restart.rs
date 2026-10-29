@@ -22,8 +22,8 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::query::{chain_fate, declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     HALT_STRADDLER_BATCH, build_leg_payment_tx, build_sponsored_swap_tx, build_swap_tx,
-    build_transfer_tx, cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
-    nullifier_race_genesis_accounts, recipient, sender, validity_around,
+    build_transfer_tx, cross_shard_genesis_accounts, genesis_accounts, halt_recovery_config,
+    halt_straddler_setup, nullifier_race_genesis_accounts, recipient, sender, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
@@ -43,20 +43,6 @@ use hyperscale_types::{
     verdict_leaf,
 };
 use support::{SimCluster, committee_member_host, seeded};
-
-/// The halt scenarios' topology: a split leaves a live sibling to carry
-/// the beacon through the folds that detect a stalled shard, and the pool
-/// holds the spares a re-draw seats.
-const fn halt_recovery_config() -> ScenarioConfig {
-    ScenarioConfig {
-        shard_size: 4,
-        vnodes_per_host: 1,
-        pool_surplus: 14,
-        num_shards: 1,
-        split_bytes: 36_000,
-        latency: Duration::from_millis(150),
-    }
-}
 
 /// A venue on one shard and its callers on the other, resharding
 /// disarmed so the committees a restart bounces are the ones that were

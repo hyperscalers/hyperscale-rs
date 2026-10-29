@@ -5,9 +5,9 @@ use std::time::Duration;
 /// Portable cluster configuration.
 ///
 /// Each adaptor translates this into its harness's native config — the sim's
-/// `SimConfig`, production's `ClusterSpec` over `TestFixtures` — deriving
-/// identical keys and topology from one seed. The fields are the knobs
-/// scenarios actually vary.
+/// `SimConfig`, production's `ClusterSpec` over `TestFixtures`. The two derive
+/// their own keys and host layouts, so one seed does not name the same
+/// validators on both. The fields are the knobs scenarios actually vary.
 ///
 /// `split_bytes` is the lever that makes reshape scenarios portable: a scenario
 /// arms an *organic* split by setting it to `0` and then awaits the children to

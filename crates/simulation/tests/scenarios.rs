@@ -17,15 +17,14 @@ use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
-    cross_shard_genesis_accounts, genesis_accounts, halt_recovery_split_bytes,
-    halt_straddler_setup, harvested_tick_setup, insolvent_genesis_accounts,
-    livelock_genesis_accounts, merge_convergence_setup, merge_split_bytes, merge_straddler_setup,
-    native_pq_genesis_accounts, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
-    participant_sweep_genesis_accounts, probe_train_genesis_accounts, remote_delegator,
-    reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
-    split_issuer_straddler_setup, split_straddler_setup, staking_genesis_accounts,
-    stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
-    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    cross_shard_genesis_accounts, genesis_accounts, halt_recovery_config, halt_straddler_setup,
+    harvested_tick_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
+    merge_convergence_setup, merge_split_bytes, merge_straddler_setup, native_pq_genesis_accounts,
+    nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
+    probe_train_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
+    securify_genesis_accounts, shared_recipient_genesis_accounts, split_issuer_straddler_setup,
+    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
@@ -2182,26 +2181,6 @@ const fn beacon_lag_config() -> ScenarioConfig {
 fn beacon_lag_drops_skipped_epochs_reveal_chains_sim() {
     let mut cluster = SimCluster::new(&beacon_lag_config(), 42);
     cluster.run_faultable(beacon_lag_drops_skipped_epochs_reveal_chains);
-}
-
-/// Single-shard genesis armed so the funded root (~43.9 KB) splits exactly
-/// once and the grown pair holds — each child (~29.0 KB and ~14.6 KB) sits
-/// between the derived merge floor and the split threshold — with two
-/// cohorts of pool surplus — one grows the root,
-/// the other is the halted shard's recovery committee — plus two spares of
-/// jail slack: the recovery draw needs a full free committee, and over the
-/// scenario's ~40 epochs an organic `Performance` jail on the healthy shard
-/// refills its seat from the pool, which with zero slack would starve the
-/// draw and park the recovery.
-fn halt_recovery_config() -> ScenarioConfig {
-    ScenarioConfig {
-        shard_size: 4,
-        vnodes_per_host: 1,
-        pool_surplus: 14,
-        num_shards: 1,
-        split_bytes: halt_recovery_split_bytes(),
-        latency: Duration::from_millis(150),
-    }
 }
 
 #[test]
