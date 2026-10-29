@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use super::ShardSupervisor;
-use crate::runner::{BeaconLoopConfig, ProdBeaconLoop, spawn_beacon_loop};
+use crate::beacon_thread::{BeaconLoopConfig, ProdBeaconLoop, spawn_beacon_loop};
 
 /// The host's pinned beacon thread plus the handle to stop it.
 pub(super) struct BeaconThread {

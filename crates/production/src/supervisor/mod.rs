@@ -45,17 +45,17 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::rpc::RpcPublishers;
-use crate::runner::{
-    LocalValidator, ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig,
-    spawn_shard_loop, wall_clock_local,
+use crate::runner::{LocalValidator, VnodeConfig, wall_clock_local};
+use crate::shard_thread::{
+    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, spawn_shard_loop,
 };
 
+mod beacon;
 mod membership;
-mod pool;
 mod reshape;
 
+use beacon::BeaconThread;
 use membership::{CompletedBootstrap, Rebuild, Replaced};
-use pool::BeaconThread;
 use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
