@@ -24,9 +24,7 @@ use hyperscale_types::{
 };
 use serial_test::serial;
 use support::harness::{ClusterSpec, Harness, HostSpec};
-use support::{
-    CONNECTION_TIMEOUT, start_host, start_host_at, temp_storage_dir, temp_storage_factory,
-};
+use support::{CONNECTION_TIMEOUT, open_shard_store, start_host, start_host_at};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
@@ -274,10 +272,8 @@ async fn leaving_a_shard_releases_its_store() {
 
     // The lock is what the reopen below measures: while the shard is
     // hosted, its thread holds it and a second opener is refused.
-    let open = temp_storage_factory();
-    let root_dir = temp_storage_dir(&dir)(ShardId::ROOT);
     assert!(
-        open(&root_dir, ShardId::ROOT).is_err(),
+        open_shard_store(dir.path(), ShardId::ROOT).is_err(),
         "a hosted shard holds its store's lock",
     );
 
@@ -298,7 +294,7 @@ async fn leaving_a_shard_releases_its_store() {
 
     let reopened = timeout(CONNECTION_TIMEOUT, async {
         loop {
-            match open(&root_dir, ShardId::ROOT) {
+            match open_shard_store(dir.path(), ShardId::ROOT) {
                 Ok(storage) => break storage,
                 Err(_) => sleep(Duration::from_millis(50)).await,
             }

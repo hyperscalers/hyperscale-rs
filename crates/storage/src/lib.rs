@@ -12,7 +12,8 @@
 //!
 //! Runners own storage and pass it to the executor:
 //! - `SimulationRunner` uses in-memory storage (`SimShardStorage`)
-//! - `ProductionRunner` uses `RocksDB` (`RocksDbShardStorage`)
+//! - a production host (`hyperscale_production::Node`) uses `RocksDB`
+//!   (`RocksDbShardStorage`)
 //!
 //! # Jellyfish Merkle Tree (JMT)
 //!
