@@ -196,6 +196,74 @@ pub enum ReshapeRequest {
     },
 }
 
+impl ReshapeRequest {
+    /// The store a store-prep request prepares: [`Self::OpenStore`]'s shard,
+    /// [`Self::SeedFromParent`]'s child. `None` for every other request.
+    #[must_use]
+    pub const fn prepared_shard(&self) -> Option<ShardId> {
+        match self {
+            Self::OpenStore { shard } => Some(*shard),
+            Self::SeedFromParent { child, .. } => Some(*child),
+            _ => None,
+        }
+    }
+
+    /// What a store-prep for a shard this host already runs answers; `None`
+    /// for every other request.
+    ///
+    /// A duty only ever prepares a store for a shard this host does not run
+    /// yet, so a running target is a duty rediscovered on a host that kept
+    /// the shard's loop: its store is that loop's live store and stays. An
+    /// open answers nothing and the duty stays unopened; a seed answers
+    /// [`ReshapeEvent::SeedUnavailable`], so the parent half relinquishes its
+    /// seat to the join, which seats its members on the running loop.
+    #[must_use]
+    pub const fn over_running(&self) -> Option<OverRunning> {
+        match self {
+            Self::OpenStore { .. } => Some(OverRunning::Nothing),
+            Self::SeedFromParent { child, .. } => {
+                Some(OverRunning::Answer(ReshapeEvent::SeedUnavailable {
+                    child: *child,
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What a store-prep for a shard this host already runs answers (see
+/// [`ReshapeRequest::over_running`]).
+#[derive(Debug, Clone)]
+pub enum OverRunning {
+    /// Nothing: the duty is left unopened.
+    Nothing,
+    /// This event, fed back to the orchestrator.
+    Answer(ReshapeEvent),
+}
+
+/// The seed gate a [`ReshapeRequest::SeedFromParent`] passes before its
+/// clone; `None` when the clone may run.
+///
+/// [`ReshapeEvent::SeedUnavailable`] when this host holds no parent store
+/// (`parent_height` is `None`), [`ReshapeEvent::SeedDeferred`] while the
+/// parent's committed height is below `through`.
+///
+/// `through` is the child's genesis height; the parent commits one block
+/// past its terminal (the coast certifying it), so the local chain is ready
+/// for the clone once its tip reaches it.
+#[must_use]
+pub fn seed_gate(
+    parent_height: Option<BlockHeight>,
+    child: ShardId,
+    through: BlockHeight,
+) -> Option<ReshapeEvent> {
+    match parent_height {
+        None => Some(ReshapeEvent::SeedUnavailable { child }),
+        Some(height) if height < through => Some(ReshapeEvent::SeedDeferred { child }),
+        Some(_) => None,
+    }
+}
+
 /// What a [`ReshapeEvent::Fetched`] carried back.
 #[derive(Debug, Clone)]
 pub enum FetchedKind {
@@ -279,8 +347,9 @@ pub enum ReshapeEvent {
         shard: ShardId,
     },
     /// A [`ReshapeRequest::SeedFromParent`] could not run yet — the host's local
-    /// parent has not committed through the terminal crossing — so the seed
-    /// should be re-armed and retried.
+    /// parent has not committed through the terminal crossing. The duty
+    /// re-requests the seed once `SEED_RETRY` has passed, so the adapter
+    /// feeds this back like any other event.
     SeedDeferred {
         /// The split child whose seed is deferred.
         child: ShardId,
@@ -349,6 +418,12 @@ const READY_REASSERT_MIN: Duration = Duration::from_secs(1);
 /// the terminal, a walk whose answer or unproven run was refused, or a walk
 /// at the chain's tip that found nothing above it yet.
 const REFETCH_WAIT: Duration = Duration::from_secs(1);
+
+/// Wait before re-requesting a seed the local parent was not ready for
+/// ([`ReshapeEvent::SeedDeferred`]). Half the adapters' one-second step
+/// cadence, so the retry goes out on the next step even when the step's
+/// local clock runs slightly slow.
+const SEED_RETRY: Duration = Duration::from_millis(500);
 
 /// Pace a walk after the answer that produced `outcome`. One that could
 /// not advance it — nothing held at the height yet, or a refusal — holds
@@ -641,6 +716,8 @@ enum ParentHalfPhase {
     Seeding {
         /// Whether the seed request is already in flight.
         requested: bool,
+        /// When a deferred seed may be requested again.
+        retry_at: Option<LocalTimestamp>,
     },
     /// Walking the parent's own committed chain to find its terminal
     /// crossing, so the child can be seeded and adopted at the cut rather
@@ -658,6 +735,8 @@ enum ParentHalfPhase {
         predecessors: Vec<Anchor>,
         /// Whether the seed request is already in flight.
         requested: bool,
+        /// When a deferred seed may be requested again.
+        retry_at: Option<LocalTimestamp>,
     },
     /// Store seeded; fetching the parent's certified terminal to derive the
     /// child genesis.
@@ -696,6 +775,12 @@ struct ParentHalfDuty {
     validators: Vec<ValidatorId>,
     phase: ParentHalfPhase,
     store_seeded: bool,
+}
+
+/// Whether a parent half's seed goes out at `now`: none is in flight, and a
+/// deferred one has waited out its [`SEED_RETRY`].
+fn seed_due(requested: bool, retry_at: Option<LocalTimestamp>, now: LocalTimestamp) -> bool {
+    !requested && retry_at.is_none_or(|at| now >= at)
 }
 
 /// The keeper half `from` addresses, when it is one of the duty's children.
@@ -952,8 +1037,18 @@ impl ReshapeOrchestrator {
             ReshapeEvent::SeedDeferred { child } => {
                 if let Some(duty) = self.parent_halves.get_mut(&child) {
                     match &mut duty.phase {
-                        ParentHalfPhase::Seeding { requested }
-                        | ParentHalfPhase::SeedingAt { requested, .. } => *requested = false,
+                        ParentHalfPhase::Seeding {
+                            requested,
+                            retry_at,
+                        }
+                        | ParentHalfPhase::SeedingAt {
+                            requested,
+                            retry_at,
+                            ..
+                        } => {
+                            *requested = false;
+                            *retry_at = Some(now.plus(SEED_RETRY));
+                        }
                         _ => {}
                     }
                 }
@@ -1804,7 +1899,10 @@ impl ReshapeOrchestrator {
                     .or_insert_with(|| ParentHalfDuty {
                         parent,
                         validators: Vec::new(),
-                        phase: ParentHalfPhase::Seeding { requested: false },
+                        phase: ParentHalfPhase::Seeding {
+                            requested: false,
+                            retry_at: None,
+                        },
                         store_seeded: false,
                     });
                 if !duty.validators.contains(&validator) {
@@ -1831,7 +1929,10 @@ impl ReshapeOrchestrator {
         let store_seeded = duty.store_seeded;
         let mut next: Option<ParentHalfPhase> = None;
         match &mut duty.phase {
-            ParentHalfPhase::Seeding { requested } => {
+            ParentHalfPhase::Seeding {
+                requested,
+                retry_at,
+            } => {
                 // With the cut scheduled a window ahead, the parent's own
                 // chain says which of its blocks is the terminal — no need
                 // to wait for the beacon to publish the child's anchor.
@@ -1869,7 +1970,7 @@ impl ReshapeOrchestrator {
                             anchor,
                             ask: TerminalAsk::NOW,
                         });
-                    } else if !*requested {
+                    } else if seed_due(*requested, *retry_at, now) {
                         out.push(ReshapeRequest::SeedFromParent {
                             parent,
                             child,
@@ -1902,6 +2003,7 @@ impl ReshapeOrchestrator {
                         genesis: Box::new(derived.block.clone()),
                         predecessors: derived.predecessor.into_iter().collect(),
                         requested: false,
+                        retry_at: None,
                     });
                 } else if view.boundary(child).is_some() {
                     // The walk ran out of time: the beacon published the
@@ -1914,7 +2016,10 @@ impl ReshapeOrchestrator {
                         "parent terminal walk did not resolve before the child anchored; \
                          falling back to the attested anchor"
                     );
-                    next = Some(ParentHalfPhase::Seeding { requested: false });
+                    next = Some(ParentHalfPhase::Seeding {
+                        requested: false,
+                        retry_at: None,
+                    });
                 } else if let Some(request) = tail.next_header_request(parent, now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
@@ -1928,6 +2033,7 @@ impl ReshapeOrchestrator {
                 genesis,
                 predecessors,
                 requested,
+                retry_at,
             } => {
                 if store_seeded {
                     next = Some(ParentHalfPhase::Adopting {
@@ -1935,7 +2041,7 @@ impl ReshapeOrchestrator {
                         genesis: genesis.clone(),
                         predecessors: predecessors.clone(),
                     });
-                } else if !*requested {
+                } else if seed_due(*requested, *retry_at, now) {
                     out.push(ReshapeRequest::SeedFromParent {
                         parent,
                         child,
@@ -2160,27 +2266,29 @@ mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_storage::ImportProgress;
     use hyperscale_storage::test_helpers::{
         make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     };
-    use hyperscale_types::network::request::GetBlockRequest;
+    use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
     use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
     use hyperscale_types::test_utils::{
         StubVmStatics, TestCommittee, install_stub_protocol_statics, signed_child_block,
         signed_split_terminal, stub_transaction, test_key,
     };
     use hyperscale_types::{
-        BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlockHeader,
-        ElidedCertifiedBlock, Epoch, EpochWindows, Hash, Inventory, LocalTimestamp,
+        BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlockHeader, ChainOrigin,
+        ElidedCertifiedBlock, Epoch, EpochWindows, FrontierInputs, Hash, Inventory, LocalTimestamp,
         NetworkDefinition, PrincipalAddr, ReshapeSeat, Round, ShardAnchor, ShardId, Signer,
         SplitChildRoots, StateRoot, TimestampRange, TopologySchedule, TopologySnapshot,
         Transaction, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp,
     };
 
     use super::{
-        FetchKind, FetchedKind, KeeperDuty, KeeperMember, KeeperPhase, KeeperRecognition,
-        ObserverDuty, ObserverPhase, ParentHalfDuty, ParentHalfPhase, REFETCH_WAIT, ReshapeEvent,
-        ReshapeOrchestrator, ReshapeRequest, TerminalAsk, split_terminal_request,
+        AdoptKind, FetchKind, FetchedKind, KeeperDuty, KeeperMember, KeeperPhase,
+        KeeperRecognition, ObserverDuty, ObserverPhase, OverRunning, ParentHalfDuty,
+        ParentHalfPhase, REFETCH_WAIT, ReshapeEvent, ReshapeOrchestrator, ReshapeRequest,
+        SEED_RETRY, TerminalAsk, seed_gate, split_terminal_request,
     };
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
     use crate::reshape::view::ReshapeView;
@@ -3693,7 +3801,14 @@ mod tests {
                 .is_empty()
         );
 
-        // A deferral (the local parent is still behind) re-arms the seed.
+        // A deferral (the local parent is still behind) re-arms the seed,
+        // but not at the deferral's own instant: an adapter feeds it straight
+        // back, and a re-request then would spin against a cause that stands.
+        let seeds = |requests: &[ReshapeRequest]| {
+            requests.iter().any(
+                |r| matches!(r, ReshapeRequest::SeedFromParent { child: c, .. } if *c == child),
+            )
+        };
         let requests = orch.step(
             &view,
             &BlsVerifier,
@@ -3702,11 +3817,115 @@ mod tests {
             at(0),
         );
         assert!(
-            requests.iter().any(
-                |r| matches!(r, ReshapeRequest::SeedFromParent { child: c, .. } if *c == child)
-            ),
-            "a deferred seed must re-arm and retry; got {requests:?}",
+            !seeds(&requests),
+            "a deferred seed must wait before retrying; got {requests:?}",
         );
+        let early = at(u64::try_from(SEED_RETRY.as_millis()).expect("fits u64") - 1);
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), early);
+        assert!(
+            !seeds(&requests),
+            "a deferred seed must wait out its retry; got {requests:?}",
+        );
+        let due = LocalTimestamp::ZERO.plus(SEED_RETRY);
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), due);
+        assert!(
+            seeds(&requests),
+            "a deferred seed must retry once its wait is out; got {requests:?}",
+        );
+        assert!(
+            orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), due)
+                .is_empty(),
+            "the retried seed is one-shot again",
+        );
+    }
+
+    /// Every store-prep request names the store it prepares and what it
+    /// answers over a shard already running here; no other request does.
+    #[test]
+    fn only_store_preps_prepare_a_shard_or_answer_over_a_running_one() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let open = ReshapeRequest::OpenStore { shard: parent };
+        let seed = ReshapeRequest::SeedFromParent {
+            parent,
+            child,
+            through: BlockHeight::new(8),
+        };
+        assert_eq!(open.prepared_shard(), Some(parent));
+        assert!(matches!(open.over_running(), Some(OverRunning::Nothing)));
+        assert_eq!(seed.prepared_shard(), Some(child));
+        assert!(matches!(
+            seed.over_running(),
+            Some(OverRunning::Answer(ReshapeEvent::SeedUnavailable { child: c })) if c == child
+        ));
+
+        let block = make_test_block(BlockHeight::new(1));
+        let others = [
+            ReshapeRequest::Fetch {
+                duty: child,
+                from: parent,
+                kind: FetchKind::Block {
+                    request: GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute),
+                },
+            },
+            ReshapeRequest::StageChunk {
+                shard: child,
+                progress: ImportProgress {
+                    anchor_height: BlockHeight::new(8),
+                    anchor_state_root: StateRoot::ZERO,
+                    split_bits: 0,
+                    chunk_limit: 1,
+                    staged_bytes: 0,
+                    cursors: Vec::new(),
+                },
+                leaves: Vec::new(),
+            },
+            ReshapeRequest::FinalizeImport {
+                shard: child,
+                height: BlockHeight::new(8),
+            },
+            ReshapeRequest::ApplyFollow {
+                shard: child,
+                block: Arc::new(block.clone()),
+                creations: Vec::new(),
+                frontier: FrontierInputs::still(child),
+            },
+            ReshapeRequest::BroadcastReady {
+                validator: vid(1),
+                child,
+                anchor: anchor(),
+                recipients: vec![vid(2)],
+            },
+            ReshapeRequest::Adopt {
+                shard: child,
+                kind: AdoptKind::ParentHalf,
+                origin: ChainOrigin::root(WeightedTimestamp::ZERO),
+                genesis: Box::new(block),
+                predecessors: Vec::new(),
+            },
+            ReshapeRequest::Seat { shard: child },
+        ];
+        for request in others {
+            assert_eq!(request.prepared_shard(), None, "{request:?}");
+            assert!(request.over_running().is_none(), "{request:?}");
+        }
+    }
+
+    /// A seed with no parent store is unavailable, one whose parent is below
+    /// `through` is deferred, and one whose parent reached it may clone.
+    #[test]
+    fn the_seed_gate_reads_the_parent_height_against_through() {
+        let (child, _) = ShardId::ROOT.children();
+        let through = BlockHeight::new(8);
+        assert!(matches!(
+            seed_gate(None, child, through),
+            Some(ReshapeEvent::SeedUnavailable { child: c }) if c == child
+        ));
+        assert!(matches!(
+            seed_gate(Some(BlockHeight::new(7)), child, through),
+            Some(ReshapeEvent::SeedDeferred { child: c }) if c == child
+        ));
+        assert!(seed_gate(Some(through), child, through).is_none());
     }
 
     /// A seed with no parent store to clone relinquishes the seat: the duty

@@ -557,6 +557,24 @@ pub fn placed_validators(
     placed
 }
 
+/// The local validators a reshape seat, or a relinquished seat's join,
+/// attaches.
+///
+/// Each member of `shard`'s seatable committee in `snapshot` that
+/// `is_local` holds. A split observer riding the committee is never
+/// attached as a signer beside co-hosted real members.
+#[must_use]
+pub fn seat_validators(
+    snapshot: &TopologySnapshot,
+    shard: ShardId,
+    is_local: impl Fn(ValidatorId) -> bool,
+) -> Vec<ValidatorId> {
+    snapshot
+        .seatable_committee_for_shard(shard)
+        .filter(|&validator| is_local(validator))
+        .collect()
+}
+
 /// Whether a hosted shard has aged out of this host's serving duty: no
 /// local validator holds any role in its active committee and none sits
 /// in its routing committee (no serve obligation).
@@ -1461,6 +1479,30 @@ mod tests {
         let co_hosting = HashSet::from([HOST, member]);
         assert_eq!(
             placed_validators(parent, &schedule, |v| co_hosting.contains(&v)),
+            vec![member]
+        );
+    }
+
+    /// A reshape seat attaches only the local seatable members: never a
+    /// riding observer, even a local one, and never a member another host
+    /// holds the key for.
+    #[test]
+    fn a_reshape_seat_skips_a_riding_observer_and_a_remote_member() {
+        let shard = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let (child, _) = shard.children();
+        let member = ValidatorId::new(2);
+        let remote = ValidatorId::new(3);
+        let topology_snapshot = explicit_head_with_observers(
+            HashMap::from([
+                (shard, vec![member, remote, HOST]),
+                (sibling, vec![ValidatorId::new(4)]),
+            ]),
+            BTreeMap::from([(shard, BTreeMap::from([(HOST, child)]))]),
+        );
+        let local = HashSet::from([HOST, member]);
+        assert_eq!(
+            seat_validators(&topology_snapshot, shard, |v| local.contains(&v)),
             vec![member]
         );
     }

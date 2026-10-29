@@ -16,9 +16,9 @@ use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::IrohNetwork;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
-use hyperscale_node::reshape::observer::observer_ready_signal;
+use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
-    AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
+    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
 };
 use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
@@ -27,7 +27,6 @@ use hyperscale_storage::{
     BoundaryStore, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
 };
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
-use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{
     GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
 };
@@ -113,19 +112,10 @@ pub enum ReshapeIo {
         /// The recovered state rebuilt over the adopted genesis.
         recovered: RecoveredState,
     },
-    /// A parent-half seed could not run yet — the local parent is still behind
-    /// the terminal crossing — so the seed should be re-armed on the next
-    /// reshape tick.
-    SeedDeferred {
-        /// The split child whose seed is deferred.
-        child: ShardId,
-    },
-    /// A parent-half seed found no hosted parent store to clone, so the duty
-    /// hands the child's seat to the ordinary join.
-    SeedUnavailable {
-        /// The split child whose seat is handed over.
-        child: ShardId,
-    },
+    /// A parent-half seed's gate answered instead of the clone: deferred
+    /// while the local parent is still behind the terminal crossing, or
+    /// unavailable with no hosted parent store to clone.
+    Event(ReshapeEvent),
 }
 
 impl ShardSupervisor {
@@ -153,12 +143,11 @@ impl ShardSupervisor {
         )
     }
 
-    /// The runner's reshape tick: pump the orchestrator with the deferrals
-    /// held for it, so a retry waits out the tick rather than re-running
-    /// against a cause that stands.
+    /// The runner's reshape tick: pump the orchestrator with no completion,
+    /// so a duty waiting on the clock — a deferred seed, a paced fetch —
+    /// re-arms once its wait is out.
     pub(crate) fn reshape_tick(&mut self) {
-        let deferred = std::mem::take(&mut self.deferred_reshape_events);
-        self.reshape_step(deferred);
+        self.reshape_step(Vec::new());
     }
 
     /// Pump the reshape orchestrator one step: feed back the io results in
@@ -224,11 +213,7 @@ impl ShardSupervisor {
         // until that join's open lands and is abandoned (`on_opened` ->
         // `reshape_owns`), so the two never touch the same `RocksDB` directory
         // at once. Resumed from `resume_pending_reshape_prep`.
-        let store_shard = match &request {
-            ReshapeRequest::OpenStore { shard } => Some(*shard),
-            ReshapeRequest::SeedFromParent { child, .. } => Some(*child),
-            _ => None,
-        };
+        let store_shard = request.prepared_shard();
         if let Some(shard) = store_shard
             && self.bootstrapping.contains_key(&shard)
         {
@@ -236,17 +221,14 @@ impl ShardSupervisor {
             self.pending_reshape_prep.insert(shard, request);
             return;
         }
-        // A duty only ever prepares a store for a shard this host does not
-        // run yet, so a running target is a duty rediscovered after a restart
-        // that resumed the shard's loop: its directory is that loop's live
-        // store and is never wiped. A parent half relinquishes its seat to the
-        // join, which seats its members on the running loop.
+        // A running target's directory is that loop's live store and is
+        // never wiped.
         if let Some(shard) = store_shard
             && self.shards.contains_key(&shard)
         {
             info!(shard = ?shard, "Reshape store-prep for a shard already running here; its store stays");
-            if let ReshapeRequest::SeedFromParent { child, .. } = request {
-                self.on_reshape_io(ReshapeIo::SeedUnavailable { child });
+            if let Some(OverRunning::Answer(event)) = request.over_running() {
+                self.on_reshape_event(event);
             }
             return;
         }
@@ -328,13 +310,13 @@ impl ShardSupervisor {
     }
 
     /// Seed a parent half's `child` store by checkpoint-cloning the host's own
-    /// retained `parent` store onto the child subtree, once that parent chain
-    /// has committed through the terminal crossing. Answers with
-    /// [`ReshapeIo::Opened`] when the clone lands, [`ReshapeIo::SeedDeferred`]
-    /// while the local parent is still behind, or [`ReshapeIo::SeedUnavailable`]
-    /// when this host holds no parent store. The checkpoint hard-links, so the
-    /// clone shares the engine bootstrap and the parent's substates without
-    /// copying.
+    /// retained `parent` store onto the child subtree, once [`seed_gate`]
+    /// passes: that parent chain has committed through the terminal crossing.
+    /// Answers with [`ReshapeIo::Opened`] when the clone lands, or with the
+    /// gate's event. The gate reads the parent's height inside the blocking
+    /// task, so no store read runs on the loop. The checkpoint hard-links, so
+    /// the clone shares the engine bootstrap and the parent's substates
+    /// without copying.
     fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId, through: BlockHeight) {
         let events = self.events_tx.clone();
         let parent_storage = self
@@ -344,19 +326,17 @@ impl ShardSupervisor {
             .get(&parent)
             .cloned();
         let Some(parent_storage) = parent_storage else {
-            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedUnavailable {
-                child,
-            }));
+            if let Some(event) = seed_gate(None, child, through) {
+                let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Event(event)));
+            }
             return;
         };
         let factory = Arc::clone(&self.storage_factory);
         let dir = (self.storage_dir)(child);
         self.tokio_handle.spawn_blocking(move || {
-            // `through` is the child's genesis height; the parent commits one
-            // block past its terminal (the coast certifying it), so the local
-            // chain is ready for the clone once its tip reaches it.
-            if parent_storage.committed_height() < through {
-                let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
+            if let Some(event) = seed_gate(Some(parent_storage.committed_height()), child, through)
+            {
+                let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Event(event)));
                 return;
             }
             let outcome = (|| -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
@@ -644,30 +624,16 @@ impl ShardSupervisor {
         anchor: ShardAnchor,
         recipients: &[ValidatorId],
     ) {
-        let Some(signer) = self.vnode_keys.get(&validator) else {
-            warn!(
-                validator = validator.inner(),
-                "Reshape ready signal for a validator without a local key; ignored"
-            );
-            return;
-        };
-        let Ok(signal) = observer_ready_signal(
+        if let Some(notification) = ready_notification(
             &self.beacon_network,
             validator,
             child,
-            signer.as_ref(),
+            self.vnode_keys.get(&validator).map(AsRef::as_ref),
             anchor,
             self.epoch_duration_ms,
-        ) else {
-            tracing::error!(
-                validator = validator.inner(),
-                "cannot sign reshape ready signal; skipping"
-            );
-            return;
-        };
-        self.process
-            .network()
-            .notify(recipients, &ReadySignalNotification::new(signal));
+        ) {
+            self.process.network().notify(recipients, &notification);
+        }
     }
 
     /// Adopt a reshape duty's derived genesis off the loop via the shared
@@ -790,18 +756,23 @@ impl ShardSupervisor {
                 }
                 ReshapeEvent::Adopted { shard }
             }
-            ReshapeIo::SeedDeferred { child } => {
-                self.deferred_reshape_events
-                    .push(ReshapeEvent::SeedDeferred { child });
-                return;
-            }
-            ReshapeIo::SeedUnavailable { child } => {
-                self.reshape_step(vec![ReshapeEvent::SeedUnavailable { child }]);
-                self.hand_over_to_join(child);
-                return;
-            }
+            ReshapeIo::Event(event) => event,
+        };
+        self.on_reshape_event(event);
+    }
+
+    /// Pump one reshape event back through [`Self::reshape_step`]. A seed
+    /// with no parent store to clone relinquishes the child's seat, which the
+    /// ordinary join then takes.
+    fn on_reshape_event(&mut self, event: ReshapeEvent) {
+        let unavailable = match event {
+            ReshapeEvent::SeedUnavailable { child } => Some(child),
+            _ => None,
         };
         self.reshape_step(vec![event]);
+        if let Some(child) = unavailable {
+            self.hand_over_to_join(child);
+        }
     }
 
     /// Join `child` through the ordinary membership path once its split duty

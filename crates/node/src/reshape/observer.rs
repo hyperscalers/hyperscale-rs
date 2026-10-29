@@ -33,6 +33,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
+use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{
     BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
 };
@@ -40,39 +41,58 @@ use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeRespons
 use hyperscale_types::{
     Anchor, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin,
     CommitProof, LocalTimestamp, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate,
-    ReadySignal, ShardAnchor, ShardId, SignError, Signer, StateRoot, ValidatorId, Verifier,
-    WeightedTimestamp, ready_signal_window, shard_prefix_path,
+    ReadySignal, ShardAnchor, ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp,
+    ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
 use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
 use crate::reshape::view::CommitteeLookup;
 
-/// The self-signed ready signal an observer broadcasts to the
-/// splitting shard's committee on completing its child-span bootstrap.
+/// The self-signed ready signal a reshape seat holder broadcasts to the
+/// target committee, wrapped for the wire: an observer on completing its
+/// child-span bootstrap, a merge keeper on running its child.
 ///
-/// Windowed from the splitting shard's attested anchor weighted
-/// timestamp — the freshest committed clock the observer holds an
-/// authenticated view of. The anchor refreshes every epoch boundary, so
-/// the [`ready_signal_window`] span (scaled to `epoch_duration_ms`)
-/// comfortably covers the chain's progress since; a signal that somehow
-/// passes uncollected is re-emitted against a newer anchor. At the
-/// committee, the signal classifies as a `ReshapeReady` witness leaf —
-/// the sender's observer seat rides the window's topology snapshot.
-/// # Errors
+/// Windowed from the attested `anchor`'s weighted timestamp — the freshest
+/// committed clock the seat holder holds an authenticated view of. The
+/// anchor refreshes every epoch boundary, so the [`ready_signal_window`]
+/// span (scaled to `epoch_duration_ms`) comfortably covers the chain's
+/// progress since; a signal that somehow passes uncollected is re-emitted
+/// against a newer anchor. At the committee, the signal classifies as a
+/// `ReshapeReady` witness leaf — the sender's seat rides the window's
+/// topology snapshot.
 ///
-/// Propagates [`SignError`] when the signer cannot sign.
-pub fn observer_ready_signal(
+/// `None`, logged, when `signer` is absent (this host holds no key for
+/// `validator`) or cannot sign.
+#[must_use]
+pub fn ready_notification(
     network: &NetworkDefinition,
     validator: ValidatorId,
     child: ShardId,
-    signer: &dyn Signer,
+    signer: Option<&dyn Signer>,
     anchor: ShardAnchor,
     epoch_duration_ms: u64,
-) -> Result<ReadySignal, SignError> {
+) -> Option<ReadySignalNotification> {
+    let Some(signer) = signer else {
+        tracing::warn!(
+            validator = validator.inner(),
+            "Reshape ready signal for a validator without a local key; ignored"
+        );
+        return None;
+    };
     let start = anchor.weighted_timestamp;
     let end = start.plus(ready_signal_window(epoch_duration_ms));
-    ReadySignal::sign(network, validator, child, start, end, signer)
+    match ReadySignal::sign(network, validator, child, start, end, signer) {
+        Ok(signal) => Some(ReadySignalNotification::new(signal)),
+        Err(error) => {
+            tracing::error!(
+                validator = validator.inner(),
+                %error,
+                "cannot sign reshape ready signal; skipping"
+            );
+            None
+        }
+    }
 }
 
 enum Phase {

@@ -26,7 +26,7 @@ use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::startup::{
     Replaced, join_wipes, placed_validators, rebuild_due, reseated_validators, retired_signers,
-    shard_retired,
+    seat_validators, shard_retired,
 };
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
@@ -1094,16 +1094,18 @@ impl ShardSupervisor {
         topology_snapshot: &TopologySnapshot,
         shard: ShardId,
     ) -> Vec<VnodeConfig> {
-        topology_snapshot
-            .seatable_committee_for_shard(shard)
-            .filter_map(|validator| {
-                self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
-                    validator_id: validator,
-                    local_shard: shard,
-                    signer: Arc::clone(signer),
-                })
+        seat_validators(topology_snapshot, shard, |validator| {
+            self.vnode_keys.contains_key(&validator)
+        })
+        .into_iter()
+        .filter_map(|validator| {
+            self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
+                validator_id: validator,
+                local_shard: shard,
+                signer: Arc::clone(signer),
             })
-            .collect()
+        })
+        .collect()
     }
 
     /// The vnode configs for every local validator [`placed_validators`]
