@@ -253,9 +253,9 @@ where
     }
 
     /// Run `validator`'s beacon participation on this host from now on,
-    /// resumed from its durable ratification record. Its startup timers
-    /// land in the timer scratch for the caller to drain. No-op if the
-    /// loop already runs it.
+    /// resumed from its durable ratification record. Its startup timers,
+    /// and the join its committed lookahead already owes it, land in the
+    /// scratch for the caller to drain. No-op if the loop already runs it.
     pub(crate) fn add_participant(&mut self, validator: ValidatorId, signer: Arc<dyn Signer>) {
         if self.participants.contains_key(&validator) {
             return;
@@ -274,7 +274,20 @@ where
             },
         );
         self.arm_startup(validator);
+        self.owe_standing_join(validator);
         self.refresh_committee_flag();
+    }
+
+    /// Surface the join `validator`'s committed lookahead already places it
+    /// on, as the adoption that drew it would have.
+    fn owe_standing_join(&mut self, validator: ValidatorId) {
+        if let Some(change) = self
+            .participants
+            .get(&validator)
+            .and_then(|p| p.duty.standing_lookahead_join(&self.fold))
+        {
+            self.pending_participation_changes.push(change);
+        }
     }
 
     /// Stop running `validator`'s participation. Its release gate closes
@@ -318,14 +331,17 @@ where
         self.participants.get(&validator).map(|p| &p.duty)
     }
 
-    /// Re-arm every participant's beacon startup timers and drain the
-    /// result — the production beacon thread's spawn-time bootstrap.
-    /// Re-arming is idempotent: it replaces the pending fire at the
-    /// runner's table with one at the same deadline.
+    /// Re-arm every participant's beacon startup timers, surface the joins
+    /// their committed lookaheads already owe them, and drain the result —
+    /// the production beacon thread's spawn-time bootstrap. Re-arming is
+    /// idempotent: it replaces the pending fire at the runner's table with
+    /// one at the same deadline, and a join to a shard already being
+    /// brought up is refused there.
     pub fn startup_output(&mut self) -> StepOutput {
         self.clear_scratch();
         for validator in self.validator_list() {
             self.arm_startup(validator);
+            self.owe_standing_join(validator);
         }
         self.take_output()
     }
@@ -480,6 +496,9 @@ where
                 (reply.0)(registration);
             }
             BeaconScopedInput::Deregister(token) => self.deregister(token),
+            BeaconScopedInput::AddParticipant { validator, signer } => {
+                self.add_participant(validator, signer);
+            }
         }
         self.update_fetch_tick_timer();
     }
@@ -1958,6 +1977,32 @@ mod tests {
         let (validator, signer) = fix.identity(idx);
         host.add_participant(validator, signer);
         let _ = host.drain_pending_output();
+    }
+
+    /// A validator added to a running host's beacon loop starts its
+    /// participation there: the loop runs it and its startup timers arm.
+    #[test]
+    fn a_validator_added_at_runtime_runs_a_participant() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let (validator, signer) = fix.identity(2);
+        assert!(host.beacon.participant(validator).is_none());
+        let out = host.step(HostEvent::Beacon(BeaconScopedInput::AddParticipant {
+            validator,
+            signer,
+        }));
+        assert!(host.beacon.participant(validator).is_some());
+        assert!(
+            out.timer_ops.iter().any(|op| matches!(
+                op,
+                TimerOp::Set {
+                    owner: TimerOwner::Participant(attachment),
+                    ..
+                } if attachment.validator == validator
+            )),
+            "its startup timers arm: {:?}",
+            out.timer_ops
+        );
     }
 
     /// A participant on the SPC committee asks for the proposals its

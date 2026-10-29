@@ -96,9 +96,10 @@ pub enum ShardCommand {
     Join {
         /// Shard to host.
         shard: ShardId,
-        /// Local validators participating in the shard's consensus. Every
-        /// entry's `local_shard` must equal `shard`.
-        vnodes: Vec<VnodeConfig>,
+        /// Hosted validators participating in the shard's consensus, by
+        /// id; the supervisor holds their signing keys. An id this host
+        /// does not hold is ignored.
+        validators: Vec<ValidatorId>,
     },
     /// Release one local validator's membership in `shard`. The shard's
     /// thread, subscriptions, and storage are torn down when the last
@@ -445,8 +446,75 @@ impl ShardSupervisor {
     /// Execute one membership command.
     pub(crate) fn handle(&mut self, command: ShardCommand) {
         match command {
-            ShardCommand::Join { shard, vnodes } => self.join(shard, &vnodes),
+            ShardCommand::Join { shard, validators } => {
+                let vnodes = self.hosted(shard, &validators);
+                if !vnodes.is_empty() {
+                    self.join(shard, &vnodes);
+                }
+            }
             ShardCommand::Leave { shard, validator } => self.leave(shard, validator),
+        }
+    }
+
+    /// The hosted validators among `validators`, seated on `shard` with
+    /// their signing keys.
+    fn hosted(&self, shard: ShardId, validators: &[ValidatorId]) -> Vec<VnodeConfig> {
+        validators
+            .iter()
+            .filter_map(|&validator_id| {
+                let Some(signer) = self.vnode_keys.get(&validator_id) else {
+                    warn!(
+                        validator = validator_id.inner(),
+                        "A join names a validator this host holds no key for; ignored"
+                    );
+                    return None;
+                };
+                Some(VnodeConfig {
+                    validator_id,
+                    local_shard: shard,
+                    signer: Arc::clone(signer),
+                })
+            })
+            .collect()
+    }
+
+    /// Act on a beacon-detected placement delta for one of this host's
+    /// validators. A join starts the shard's bootstrap immediately — the
+    /// delta arrives a full epoch before the window opens, and the
+    /// validator votes only once ready. A leave needs no command here: the
+    /// reshape tick's [`Self::reconcile_teardown`] tears a shard down once
+    /// it leaves both this host's active committee and its routing
+    /// committee, so serving outlasts a departing window for exactly as
+    /// long as the shard stays routable — covering a replacement's
+    /// snap-sync and a merge keeper's cross-child fetch from one committed
+    /// lifetime.
+    ///
+    /// The observer and keeper deltas (`observe`/`keep`) drive nothing
+    /// here — the reshape orchestrator self-determines those duties from
+    /// the committed topology projection — so this only wakes the
+    /// orchestrator to re-poll and dispatches the join the placement
+    /// surfaces. The orchestrator owns observer and keeper seating, so
+    /// [`Self::handle`] suppresses an observer split join and a
+    /// merge-execution join.
+    pub(crate) fn on_participation_change(&mut self, change: &ParticipationChange) {
+        tracing::info!(
+            validator = change.validator.inner(),
+            join = ?change.join,
+            leave = ?change.leave,
+            observe = ?change.observe,
+            keep = ?change.keep,
+            effective_epoch = change.effective_epoch.inner(),
+            "Beacon placement change detected"
+        );
+        // Wake the orchestrator to re-poll the committed view: a placement
+        // change often accompanies the cohort/keeper draws and boundary
+        // seedings its duties gate on.
+        self.reshape_step(Vec::new());
+        if let Some(shard) = change.join {
+            self.handle(ShardCommand::Join {
+                shard,
+                validators: vec![change.validator],
+            });
         }
     }
 
