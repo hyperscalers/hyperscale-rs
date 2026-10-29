@@ -24,7 +24,9 @@ use hyperscale_beacon::ChainRegistration;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
-use hyperscale_node::startup::{placed_validators, retired_signers, shard_retired};
+use hyperscale_node::startup::{
+    placed_validators, rebuild_due, reseated_validators, retired_signers, shard_retired,
+};
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
     network_genesis_block,
@@ -72,9 +74,10 @@ pub enum Replaced {
     /// The store fell beneath every peer's chain floor, on the chain the
     /// anchor continues: the rounds signed on it stay consumed.
     Behind,
-    /// The store committed past a fork recovery's attested frontier. The
-    /// fresh committee's chain leaves the frontier anew, and nothing
-    /// signed on the abandoned branch binds it.
+    /// The store committed a tail a recovery discarded: past a fork
+    /// recovery's attested frontier, or on a tail no recovered chain
+    /// extends. The recovered chain leaves the frontier anew, and nothing
+    /// signed on the abandoned tail binds it.
     Forked,
 }
 
@@ -505,9 +508,8 @@ impl ShardSupervisor {
     }
 
     /// Seat `vnodes` on `shard`'s running loop, or rebuild the loop first
-    /// when a fork recovery would seat one of them above its attested
-    /// frontier. A shard already rebuilding seats every placed validator
-    /// when its swap lands.
+    /// where [`rebuild_due`] says its store cannot carry them. A shard
+    /// already rebuilding seats every placed validator when its swap lands.
     fn seat_on_running(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
         if self.rebuilding.contains_key(&shard) {
             return;
@@ -519,39 +521,36 @@ impl ShardSupervisor {
         }
     }
 
-    /// Whether seating `vnodes` on `shard`'s running loop would restore a
-    /// fresh member above a fork recovery's attested frontier: the loop's
-    /// store committed past it on a branch the fresh committee must not
-    /// extend, and a store cannot un-commit.
+    /// Whether `shard`'s running loop is rebuilt before it carries
+    /// `vnodes` ([`rebuild_due`]).
     fn rebuild_due(&self, shard: ShardId, vnodes: &[VnodeConfig]) -> bool {
-        let Some(frontier) = self
-            .process
-            .topology_snapshot()
-            .load()
-            .fork_recovery_frontier(shard)
-        else {
-            return false;
-        };
         let Some(entry) = self.shards.get(&shard) else {
             return false;
         };
-        let unseated = vnodes
+        let placed: Vec<ValidatorId> = vnodes.iter().map(|vnode| vnode.validator_id).collect();
+        let seated: Vec<ValidatorId> = entry
+            .validator_ids
             .iter()
-            .any(|vnode| !entry.validator_ids.contains(&vnode.validator_id.inner()));
-        unseated
-            && self
-                .storages
-                .lock()
-                .expect("storages lock")
-                .get(&shard)
-                .is_some_and(|storage| storage.committed_height() > frontier)
+            .copied()
+            .map(ValidatorId::new)
+            .collect();
+        let head = self.process.topology_snapshot().load_full();
+        let windows = self.process.topology_schedule().windows();
+        self.storages
+            .lock()
+            .expect("storages lock")
+            .get(&shard)
+            .is_some_and(|storage| {
+                rebuild_due(storage.as_ref(), shard, &head, windows, &placed, &seated)
+            })
     }
 
     /// Re-seat `shard` at its attested anchor: its loop needs a height
     /// beneath every serving peer's chain floor, so block sync cannot
     /// carry the store forward and a snap-sync must. The rebuild seats
-    /// every validator the loop carries and every local validator the
-    /// shard places. A shard already rebuilding, bootstrapping, or not
+    /// [`reseated_validators`]: every local validator the shard places,
+    /// and every one the loop carries that a pending recovery did not
+    /// replace. A shard already rebuilding, bootstrapping, or not
     /// running here has nothing to re-seat, and one with no attested anchor
     /// has nothing to re-seat on.
     pub(super) fn reseat(&mut self, shard: ShardId) {
@@ -571,11 +570,21 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Store beneath every peer's chain floor, and no attested anchor to re-seat on");
             return;
         }
-        let carried: Vec<VnodeConfig> = self.shards[&shard]
+        let schedule = self.process.topology_schedule();
+        let carried: Vec<ValidatorId> = self.shards[&shard]
             .validator_ids
             .iter()
-            .filter_map(|&id| {
-                let validator = ValidatorId::new(id);
+            .copied()
+            .map(ValidatorId::new)
+            .collect();
+        let placed = self
+            .placed_vnodes(&schedule, shard)
+            .into_iter()
+            .map(|vnode| vnode.validator_id)
+            .collect();
+        let carried: Vec<VnodeConfig> = reseated_validators(shard, &schedule, &carried, placed)
+            .into_iter()
+            .filter_map(|validator| {
                 self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
                     validator_id: validator,
                     local_shard: shard,

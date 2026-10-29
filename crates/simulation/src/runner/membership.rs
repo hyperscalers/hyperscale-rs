@@ -32,7 +32,9 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
-use hyperscale_node::startup::{placed_validators, retired_signers, shard_retired};
+use hyperscale_node::startup::{
+    placed_validators, rebuild_due, reseated_validators, retired_signers, shard_retired,
+};
 use hyperscale_node::{HostedChain, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -106,9 +108,10 @@ enum Replaced {
     /// The store fell beneath every peer's chain floor, on the chain the
     /// anchor continues: the rounds signed on it stay consumed.
     Behind,
-    /// The store committed past a fork recovery's attested frontier. The
-    /// fresh committee's chain leaves the frontier anew, and nothing
-    /// signed on the abandoned branch binds it.
+    /// The store committed a tail a recovery discarded: past a fork
+    /// recovery's attested frontier, or on a tail no recovered chain
+    /// extends. The recovered chain leaves the frontier anew, and nothing
+    /// signed on the abandoned tail binds it.
     Forked,
 }
 
@@ -280,11 +283,12 @@ impl SimulationRunner {
     /// Re-seat every shard a loop asked to: its store needs a height
     /// beneath every serving peer's chain floor, so block sync cannot carry
     /// it forward. The counterpart of the production supervisor's
-    /// `reseat`: the loop is rebuilt at the shard's attested anchor, and the
-    /// validators it carried seat on it with any others the shard places on
-    /// the host. A shard no longer hosted, one a reshape duty is seating,
-    /// and one with no attested anchor have nothing to re-seat; a rebuild
-    /// that cannot complete yet asks again on the loop's next below-floor
+    /// `reseat`: the loop is rebuilt at the shard's attested anchor, and
+    /// [`reseated_validators`] seat on it: those the shard places on the
+    /// host, and those it carried that a pending recovery did not replace.
+    /// A shard no longer hosted, one a reshape duty is seating, and one
+    /// with no attested anchor have nothing to re-seat; a rebuild that
+    /// cannot complete yet asks again on the loop's next below-floor
     /// answer.
     fn reseat_step(&mut self) {
         for (host, shard) in std::mem::take(&mut self.pending_reseats) {
@@ -297,14 +301,11 @@ impl SimulationRunner {
             if schedule.head().boundary(shard).is_none() {
                 continue;
             }
-            let mut seats = self.hosts[host as usize].signers(shard);
-            for validator in placed_validators(shard, &schedule, |validator| {
+            let placed = placed_validators(shard, &schedule, |validator| {
                 self.homes_validator(host, validator)
-            }) {
-                if !seats.contains(&validator) {
-                    seats.push(validator);
-                }
-            }
+            });
+            let carried = self.hosts[host as usize].signers(shard);
+            let seats = reseated_validators(shard, &schedule, &carried, placed);
             self.rebuild_shard(host, shard, &seats, Replaced::Behind);
         }
     }
@@ -362,21 +363,19 @@ impl SimulationRunner {
                 });
                 if hosted.contains(&shard) {
                     let seated = self.hosts[host as usize].signers(shard);
-                    // Under a fork recovery a loop committed past the
-                    // attested frontier holds a suffix the fresh committee
-                    // must not extend, and a store cannot un-commit it: the
-                    // seat goes onto a store rebuilt at the anchor instead.
-                    let past_fork =
-                        snapshot
-                            .fork_recovery_frontier(shard)
-                            .is_some_and(|frontier| {
-                                self.hosts[host as usize]
-                                    .shard_io(shard)
-                                    .storage()
-                                    .committed_height()
-                                    > frontier
-                            });
-                    if past_fork && placed.iter().any(|validator| !seated.contains(validator)) {
+                    // A loop whose store cannot carry the placed seats —
+                    // on a tail a recovery discarded, or past a pending
+                    // fork's frontier — seats them on a store rebuilt at
+                    // the anchor instead.
+                    let due = rebuild_due(
+                        &**self.hosts[host as usize].shard_io(shard).storage(),
+                        shard,
+                        &snapshot,
+                        schedule.windows(),
+                        &placed,
+                        &seated,
+                    );
+                    if due {
                         self.rebuild_shard(host, shard, &placed, Replaced::Forked);
                         continue;
                     }
