@@ -73,6 +73,24 @@ use crate::protocol::{STREAM_ATTEST, STREAM_BIND, local_version};
 /// signature)` pair to every bind exchange.
 pub type LocalVnodeIdentity = (ValidatorId, Arc<dyn Signer>);
 
+/// The validators a host signs as, numbered by how many times the set has
+/// changed: what a bind attests, a pull answers for and an address record
+/// names.
+#[derive(Debug)]
+pub struct LocalIdentities {
+    /// How many times the set has changed since the host bound.
+    pub generation: u64,
+    /// Per-vnode signing identities. Non-empty.
+    pub vnodes: Vec<LocalVnodeIdentity>,
+}
+
+impl LocalIdentities {
+    /// The hosted validators' ids.
+    pub fn ids(&self) -> Vec<ValidatorId> {
+        self.vnodes.iter().map(|(vid, _)| *vid).collect()
+    }
+}
+
 /// `(validator_id, signature)` attestations carried in one bind frame.
 type Attestations = Vec<(ValidatorId, ConsensusSignature)>;
 
@@ -300,8 +318,8 @@ fn verify_bind_exchange(
 pub struct BindContext {
     /// The network identity, bound into every signed bind message.
     pub(crate) network: NetworkDefinition,
-    /// Per-vnode signing identities. Non-empty.
-    pub(crate) local_vnodes: Arc<[LocalVnodeIdentity]>,
+    /// The identities this host signs as, swapped whole when one is added.
+    pub(crate) local: Arc<ArcSwap<LocalIdentities>>,
     /// Local endpoint id, signed over to bind it to every hosted vnode.
     pub(crate) local_endpoint: EndpointId,
     /// Validator consensus keys remote signatures are verified against.
@@ -333,7 +351,9 @@ impl BindContext {
             },
             &self.network,
         );
-        self.local_vnodes
+        self.local
+            .load()
+            .vnodes
             .iter()
             .filter(|(vid, _)| wanted(*vid))
             .filter_map(|(vid, key)| match key.sign(&message) {

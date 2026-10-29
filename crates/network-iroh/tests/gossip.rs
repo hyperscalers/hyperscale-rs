@@ -10,12 +10,12 @@ use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
-use hyperscale_network::{HandlerRegistry, Network, Verdict, VerdictKey};
+use hyperscale_network::{HandlerRegistry, Network, ValidatorKeyMap, Verdict, VerdictKey};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::CountingVerifier;
 use hyperscale_network_iroh::{
-    IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager, RequestManagerConfig,
-    RequestPool, RequestStreams,
+    AddVnodeError, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager,
+    RequestManagerConfig, RequestPool, RequestStreams,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -1256,5 +1256,97 @@ async fn a_peer_whose_items_fail_a_later_check_is_cooled_down() {
     assert!(
         judged <= admitted,
         "the sender is cooled down: {judged} of {sent} certificates checked in {secs} s"
+    );
+}
+
+/// A validator added to a running host is bound by the hosts it is linked
+/// to over the links they already have: each takes the record the host hands
+/// it and pulls the proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validator_added_to_a_linked_host_is_pulled_through_its_record() {
+    let fixtures = TestFixtures::new(7, 3);
+    let first = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let second = host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        vec![first.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for("the hosts bind", || {
+        first.adapter.peer_for_validator(vid(1)) == Some(second.adapter.local_endpoint_id())
+    })
+    .await;
+
+    second
+        .network
+        .add_vnode((vid(2), fixtures.signer(2)))
+        .expect("a third validator fits");
+    wait_for("the added validator binds over the existing link", || {
+        first.adapter.peer_for_validator(vid(2)) == Some(second.adapter.local_endpoint_id())
+    })
+    .await;
+    assert_eq!(
+        first.adapter.connected_peers(),
+        vec![second.adapter.local_endpoint_id()]
+    );
+    assert_eq!(second.adapter.local_validator_ids(), vec![vid(1), vid(2)]);
+}
+
+/// A validator added before a linked host's topology holds its key is
+/// claimed from the record it is handed and pulled the moment the topology
+/// does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validator_added_before_its_peer_knows_it_is_pulled_when_it_does() {
+    let fixtures = TestFixtures::new(7, 3);
+    let first = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let all_keys = fixtures.validator_key_map();
+    let without_two: ValidatorKeyMap = all_keys
+        .iter()
+        .filter(|(validator, _)| **validator != vid(2))
+        .map(|(validator, key)| (*validator, *key))
+        .collect();
+    first.adapter.update_validator_keys(Arc::new(without_two));
+    let second = host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        vec![first.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for("the hosts bind", || {
+        first.adapter.peer_for_validator(vid(1)) == Some(second.adapter.local_endpoint_id())
+    })
+    .await;
+
+    second
+        .network
+        .add_vnode((vid(2), fixtures.signer(2)))
+        .expect("a third validator fits");
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        first.adapter.peer_for_validator(vid(2)),
+        None,
+        "a validator the topology holds no key for binds nowhere"
+    );
+
+    first.adapter.update_validator_keys(all_keys);
+    timeout(Duration::from_secs(2), async {
+        while first.adapter.peer_for_validator(vid(2)) != Some(second.adapter.local_endpoint_id()) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the claim is pulled as soon as the key arrives, ahead of any sweep");
+}
+
+/// A host refuses to add a validator it already runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_refuses_to_add_a_validator_it_runs() {
+    let fixtures = TestFixtures::new(7, 2);
+    let only = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    assert_eq!(
+        only.network.add_vnode((vid(0), fixtures.signer(0))),
+        Err(AddVnodeError::Hosted(vid(0)))
     );
 }

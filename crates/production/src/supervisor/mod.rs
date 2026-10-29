@@ -26,12 +26,12 @@ use crossbeam::channel::{Receiver, Sender};
 use hyperscale_core::ParticipationChange;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network_iroh::IrohNetwork;
+use hyperscale_network_iroh::{AddVnodeError, IrohNetwork};
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::process::ProcessIo;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator, ReshapeRequest};
-use hyperscale_node::shard::HostEvent;
+use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::{NodeConfig, Registration, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -46,8 +46,8 @@ use tracing::warn;
 
 use crate::rpc::RpcPublishers;
 use crate::runner::{
-    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, spawn_shard_loop,
-    wall_clock_local,
+    LocalValidator, ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig,
+    spawn_shard_loop, wall_clock_local,
 };
 
 mod membership;
@@ -84,6 +84,20 @@ pub type StorageDirResolver = Arc<dyn Fn(ShardId) -> PathBuf + Send + Sync>;
 #[must_use]
 pub fn shard_data_dir(root: &Path, shard: ShardId) -> PathBuf {
     root.join(format!("shard-d{}p{}", shard.depth(), shard.path()))
+}
+
+/// Why a running host would not take on a validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AddValidatorError {
+    /// The host already runs it.
+    #[error("validator {} is already hosted", .0.inner())]
+    Hosted(ValidatorId),
+    /// The host runs as many validators as one bind attests.
+    #[error("the host runs as many validators as it can attest")]
+    Full,
+    /// The topology holds another key for the validator.
+    #[error("validator {}'s key is not the one the network holds", .0.inner())]
+    KeyMismatch(ValidatorId),
 }
 
 /// A runtime shard-membership change, executed by [`ShardSupervisor`].
@@ -454,6 +468,58 @@ impl ShardSupervisor {
             }
             ShardCommand::Leave { shard, validator } => self.leave(shard, validator),
         }
+    }
+
+    /// Host `validator` from now on, on the running host: the transport
+    /// attests it and hands its record to every linked host, the supervisor
+    /// holds its key, and the beacon loop runs its participation, in that
+    /// order, so nothing it signs leaves before the transport carries it.
+    /// Seating follows from its placement, as for any hosted validator.
+    ///
+    /// # Errors
+    ///
+    /// [`AddValidatorError`] if the host already runs it, runs as many as
+    /// one bind attests, or the topology holds another key for it.
+    pub(crate) fn add_validator(
+        &mut self,
+        validator: LocalValidator,
+    ) -> Result<(), AddValidatorError> {
+        let LocalValidator {
+            validator_id,
+            signer,
+        } = validator;
+        if self.vnode_keys.contains_key(&validator_id) {
+            return Err(AddValidatorError::Hosted(validator_id));
+        }
+        if self
+            .process
+            .topology_snapshot()
+            .load()
+            .public_key(validator_id)
+            .is_some_and(|key| key != signer.public_key())
+        {
+            return Err(AddValidatorError::KeyMismatch(validator_id));
+        }
+        self.process
+            .network()
+            .add_vnode((validator_id, Arc::clone(&signer)))
+            .map_err(|error| match error {
+                AddVnodeError::Hosted(id) => AddValidatorError::Hosted(id),
+                AddVnodeError::Full => AddValidatorError::Full,
+            })?;
+        self.vnode_keys.insert(validator_id, Arc::clone(&signer));
+        self.reshape.add_me(validator_id);
+        let _ = self.process.beacon_event_sender().send(HostEvent::Beacon(
+            BeaconScopedInput::AddParticipant {
+                validator: validator_id,
+                signer,
+            },
+        ));
+        tracing::info!(
+            validator = validator_id.inner(),
+            "Validator added to the running host"
+        );
+        Ok(())
     }
 
     /// The hosted validators among `validators`, seated on `shard` with

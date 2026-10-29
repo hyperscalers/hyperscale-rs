@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hex::encode as hex_encode;
 use hyperscale_production::network_file::{Chain, Genesis, ValidatorEntry};
-use hyperscale_production::{LocalValidator, NetworkFile, Node, NodeSetup, Observation};
+use hyperscale_production::{
+    AddValidatorError, LocalValidator, NetworkFile, Node, NodeError, NodeSetup, Observation,
+};
 use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId, ValidatorId};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -374,6 +376,40 @@ async fn a_current_thread_caller_starts_and_stops_a_host() {
         network(None),
     ))
     .expect("the host starts");
+    node.stop().await.expect("the host stops cleanly");
+}
+
+/// A running node takes on another validator through its own handle, and
+/// says why when it will not.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_running_node_adds_a_validator() {
+    // Four seated, and a fifth registered in the draw.
+    let fixtures = TestFixtures::with_surplus(13, 4, 1);
+    let dir = TempDir::new().unwrap();
+    let node = Node::start(setup(
+        dir.path(),
+        &fixtures,
+        &[0, 1, 2, 3],
+        net::listen(free_port()),
+        vec![],
+        network(None),
+    ))
+    .expect("the host starts");
+    let fifth = LocalValidator {
+        validator_id: ValidatorId::new(4),
+        signer: fixtures.signer(4),
+    };
+    node.add_validator(fifth.clone())
+        .await
+        .expect("a fifth validator is taken");
+    assert!(
+        matches!(
+            node.add_validator(fifth).await,
+            Err(NodeError::AddValidator(AddValidatorError::Hosted(id))) if id == ValidatorId::new(4)
+        ),
+        "a validator the node runs is refused"
+    );
     node.stop().await.expect("the host stops cleanly");
 }
 

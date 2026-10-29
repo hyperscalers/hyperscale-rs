@@ -996,7 +996,17 @@ impl Fanout {
         if hand_book {
             records.extend(self.adapter.book_records());
         }
-        let peer = peer.endpoint;
+        self.hand_records(peer.endpoint, records);
+    }
+
+    /// Give `peer` this host's own address records, as it would a newly
+    /// bound peer, so a validator added to the host reaches every host it
+    /// is linked to at once rather than by the sampled announce.
+    pub(crate) fn hand_own_records(&self, peer: EndpointId) {
+        self.hand_records(peer, self.adapter.address_records());
+    }
+
+    fn hand_records(&self, peer: EndpointId, records: Vec<ValidatorAddressGossip>) {
         let type_id = ValidatorAddressGossip::message_type_id();
         for record in records {
             let Ok(payload) = hbor_to_vec(&record) else {

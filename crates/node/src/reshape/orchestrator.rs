@@ -754,6 +754,14 @@ impl ReshapeOrchestrator {
         }
     }
 
+    /// Count `validator` among this host's from now on: a validator added
+    /// to the running host, whose cohort and keeper seats it may hold.
+    pub fn add_me(&mut self, validator: ValidatorId) {
+        if !self.me.contains(&validator) {
+            self.me.push(validator);
+        }
+    }
+
     /// Whether an in-flight duty owns seating `shard` — a merging parent a
     /// keeper reforms, or a splitting child an observer syncs or a parent
     /// half seeds. The adapter suppresses the placement-delta join for such

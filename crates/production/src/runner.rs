@@ -71,7 +71,8 @@ use crate::rpc::{
 };
 use crate::status::SyncStatus;
 use crate::supervisor::{
-    LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
+    AddValidatorError, LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver,
+    StorageFactory, SupervisorEvent,
 };
 use crate::transport::{NetworkBuildArgs, NetworkStack, build_network_stack};
 
@@ -123,6 +124,19 @@ impl Drop for ShutdownHandle {
     }
 }
 
+/// A command to the running host, executed on the runner's loop.
+pub enum RunnerCommand {
+    /// A shard-membership change.
+    Shard(ShardCommand),
+    /// Take on another validator; the reply says whether it did.
+    AddValidator {
+        /// The validator and its signing key.
+        validator: LocalValidator,
+        /// Where the outcome goes.
+        reply: oneshot::Sender<Result<(), AddValidatorError>>,
+    },
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // VnodeConfig
 // ═══════════════════════════════════════════════════════════════════════════
@@ -166,9 +180,10 @@ impl LocalValidator {
 /// places `OnShard` is seated on that shard (its storage opened via the
 /// factory); one that is `Pooled` (or otherwise unseated) is seated nowhere
 /// until a placement delta seats it. Every one of them runs a beacon
-/// participant on the host's beacon loop. `VnodeConfig` (which
-/// does carry a shard) is the runtime-join shape the supervisor builds from a
-/// `ParticipationChange`, where the target shard is known.
+/// participant on the host's beacon loop. A host takes on another one while
+/// it runs through [`RunnerCommand::AddValidator`]. `VnodeConfig` (which
+/// does carry a shard) is the shape the supervisor seats a validator in once
+/// its target shard is known.
 #[derive(Clone)]
 pub struct LocalValidator {
     /// The validator identity this host runs.
@@ -697,11 +712,11 @@ pub struct ProductionRunner {
     /// runtime membership commands.
     supervisor: Option<ShardSupervisor>,
 
-    /// Command channel into the supervisor; cloned out via
+    /// Command channel into the running host; cloned out via
     /// [`Self::reconfigure_handle`].
-    reconfigure_tx: mpsc::Sender<ShardCommand>,
+    reconfigure_tx: mpsc::Sender<RunnerCommand>,
     /// Receiver drained by `run()`'s select loop.
-    reconfigure_rx: Option<mpsc::Receiver<ShardCommand>>,
+    reconfigure_rx: Option<mpsc::Receiver<RunnerCommand>>,
     /// Placement deltas the host's beacon loop emits for its validators.
     /// `run()`'s select loop hands each to the supervisor, which holds
     /// their signing keys.
@@ -963,11 +978,13 @@ impl ProductionRunner {
                     outcome = Err(RunnerError::BeaconLoopExited);
                     break;
                 }
-                command = reconfigure_rx.recv() => {
-                    if let Some(command) = command {
-                        supervisor.handle(command);
+                command = reconfigure_rx.recv() => match command {
+                    Some(RunnerCommand::Shard(command)) => supervisor.handle(command),
+                    Some(RunnerCommand::AddValidator { validator, reply }) => {
+                        let _ = reply.send(supervisor.add_validator(validator));
                     }
-                }
+                    None => {}
+                },
                 change = participation_rx.recv() => {
                     if let Some(change) = change {
                         supervisor.on_participation_change(&change);
@@ -1054,11 +1071,12 @@ impl ProductionRunner {
         (supervisor, beacon_exited)
     }
 
-    /// Command channel into the shard supervisor. Send
-    /// [`ShardCommand`]s to add or drop shard participation at runtime;
-    /// they execute on the runner's tokio loop, off the shard threads.
+    /// Command channel into the running host. Send [`RunnerCommand`]s to
+    /// add or drop shard participation, or to take on another validator, at
+    /// runtime; they execute on the runner's tokio loop, off the shard
+    /// threads.
     #[must_use]
-    pub fn reconfigure_handle(&self) -> mpsc::Sender<ShardCommand> {
+    pub fn reconfigure_handle(&self) -> mpsc::Sender<RunnerCommand> {
         self.reconfigure_tx.clone()
     }
 
