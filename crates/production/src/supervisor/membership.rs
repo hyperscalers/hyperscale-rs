@@ -25,7 +25,8 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::startup::{
-    Replaced, placed_validators, rebuild_due, reseated_validators, retired_signers, shard_retired,
+    Replaced, join_wipes, placed_validators, rebuild_due, reseated_validators, retired_signers,
+    shard_retired,
 };
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
@@ -158,18 +159,19 @@ impl ShardSupervisor {
                 // A clone of a split parent the reshape never adopted holds
                 // nothing of this shard's chain, and a child span an observer
                 // imported and never adopted holds state under no chain, which
-                // the snap-sync import refuses to write over. A store whose tip
-                // a recovery's band holds keeps a chain the recovered shard
-                // need not extend. Wipe any of them, and join from nothing.
+                // the snap-sync import refuses to write over. A store a
+                // recovery leaves behind ([`join_wipes`]) holds a chain the
+                // recovered shard need not extend. Wipe any of them, and join
+                // from nothing.
                 let unadopted = storage.holds_foreign_chain(shard)
                     || (storage.is_fresh()
                         && holds_state(storage.jmt_height(), storage.state_root()));
-                let banded = storage.committed_in_recovery_band(shard, &schedule);
-                if !unadopted && !banded {
+                let recovered_past = join_wipes(storage.as_ref(), shard, &schedule);
+                if !unadopted && !recovered_past {
                     return Ok(storage);
                 }
-                if banded {
-                    info!(shard = ?shard, "Join wiping a store committed in a recovery's band");
+                if recovered_past {
+                    info!(shard = ?shard, "Join wiping a store a recovery leaves behind");
                 } else {
                     info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
                 }
