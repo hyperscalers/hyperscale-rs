@@ -310,41 +310,59 @@ fn unanchored_past_fork_frontier<R: ShardChainReader + BoundaryStore + ?Sized>(
     })
 }
 
+/// Why a rebuild replaces a shard's store, which decides what the rebuilt
+/// store takes from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replaced {
+    /// The store holds only the chain the anchor continues: it fell
+    /// beneath every peer's chain floor, or was never seated at the anchor
+    /// of the fork now pending. The rounds signed on it stay consumed.
+    Behind,
+    /// The store committed a tail a recovery discarded: past a fork
+    /// recovery's attested frontier, or on a tail no recovered chain
+    /// extends. The recovered chain leaves the frontier anew, and nothing
+    /// signed on the abandoned tail binds it.
+    Forked,
+}
+
 /// Whether `shard`'s running loop is rebuilt at its attested anchor
-/// before it carries the validators `placed` there.
+/// before it carries the validators `placed` there, and why.
 ///
-/// `store` is the loop's, `seated` the validators it carries, and `head`
-/// the committed snapshot read on the epoch grid `windows`.
-///
-/// A store on a tail a recovery discarded for good
-/// ([`committed_on_discarded_tail`]) is rebuilt for a placed validator
-/// whether or not it is already seated: the loop cannot move. Under a
-/// pending fork, a store committed past the attested frontier is rebuilt
-/// before a placed validator it does not yet carry seats on it, since
-/// the fresh committee must not extend the replaced one's branch; the
-/// fresh committee's own chain also climbs past the frontier, so a store
-/// already carrying every placed validator is left be. With nothing
-/// placed, the loop is left to the teardown.
+/// `store` is the loop's and `head` the committed snapshot read on the
+/// epoch grid `windows`. With nothing placed, the loop is left to the
+/// teardown. A store on a tail a recovery discarded for good
+/// ([`committed_on_discarded_tail`]) is rebuilt as [`Replaced::Forked`]:
+/// the loop cannot move. Under a pending fork every placed validator
+/// sits on a store seated at the anchor under that fork
+/// ([`record_fork_anchor`]), the only kind a restart resumes: an unmarked
+/// store past the frontier may hold the replaced committee's branch and
+/// is rebuilt as [`Replaced::Forked`]; one at or below it holds only the
+/// chain the anchor continues and is rebuilt as [`Replaced::Behind`],
+/// keeping its signed rounds.
 #[must_use]
-pub fn rebuild_due<R: ShardChainReader + ?Sized>(
+pub fn rebuild_due<R: ShardChainReader + BoundaryStore + ?Sized>(
     store: &R,
     shard: ShardId,
     head: &TopologySnapshot,
     windows: EpochWindows,
     placed: &[ValidatorId],
-    seated: &[ValidatorId],
-) -> bool {
+) -> Option<Replaced> {
     if placed.is_empty() {
-        return false;
+        return None;
     }
-    committed_on_discarded_tail(
-        store,
-        head.recoveries(shard),
-        head.pending_recoveries().get(&shard),
-        windows,
-    ) || head.fork_recovery_frontier(shard).is_some_and(|frontier| {
-        store.committed_height() > frontier
-            && placed.iter().any(|validator| !seated.contains(validator))
+    let pending = head.pending_recoveries().get(&shard);
+    if committed_on_discarded_tail(store, head.recoveries(shard), pending, windows) {
+        return Some(Replaced::Forked);
+    }
+    let recovery = pending?;
+    let anchor = fork_anchor(shard, recovery)?;
+    if store.recovery_anchor() == Some(anchor) {
+        return None;
+    }
+    Some(if store.committed_height() > recovery.attested_frontier {
+        Replaced::Forked
+    } else {
+        Replaced::Behind
     })
 }
 
@@ -1027,49 +1045,50 @@ mod tests {
     }
 
     /// A running loop on a tail a completed recovery discarded is rebuilt
-    /// for a placed validator even one it already carries; a pending
-    /// fork's frontier rebuilds only for one it does not carry yet; a
-    /// pending halt's band and a loop with nobody placed are left be.
+    /// as forked. Under a pending fork a loop not seated at its anchor is
+    /// rebuilt, as forked past the frontier and as behind at or below it,
+    /// while one seated at the anchor is left be; a pending halt's band and
+    /// a loop with nobody placed are left be too.
     #[test]
     fn a_running_loop_is_rebuilt_where_its_store_cannot_carry_the_seat() {
         let placed = [HOST];
         let discarded = root_store_certified_at(DISCARDED_MS);
         let fresh = root_store_certified_at(FRESH_MS);
-        let due = |store: &SimShardStorage,
-                   schedule: &TopologySchedule,
-                   placed: &[ValidatorId],
-                   seated: &[ValidatorId]| {
-            rebuild_due(
-                store,
-                ShardId::ROOT,
-                schedule.head(),
-                WINDOWS,
-                placed,
-                seated,
-            )
+        let at_frontier = SimShardStorage::new(shard_prefix_path(ShardId::ROOT));
+        let due = |store: &SimShardStorage, schedule: &TopologySchedule, placed: &[ValidatorId]| {
+            rebuild_due(store, ShardId::ROOT, schedule.head(), WINDOWS, placed)
         };
 
         let completed = recovering(vec![HOST], vec![binding(true)], None);
-        assert!(due(&discarded, &completed, &placed, &placed));
-        assert!(!due(&discarded, &completed, &[], &placed));
-        assert!(!due(&fresh, &completed, &placed, &placed));
+        assert_eq!(due(&discarded, &completed, &placed), Some(Replaced::Forked));
+        assert_eq!(due(&discarded, &completed, &[]), None);
+        assert_eq!(due(&fresh, &completed, &placed), None);
+        assert_eq!(due(&at_frontier, &completed, &placed), None);
 
         let fork = recovering(
             vec![HOST],
             vec![binding(false)],
             Some(pending(RecoveryCause::Fork, vec![validator(9)])),
         );
-        assert!(due(&fresh, &fork, &placed, &[]));
-        assert!(!due(&fresh, &fork, &placed, &placed));
-        assert!(due(&discarded, &fork, &placed, &placed));
+        assert_eq!(due(&fresh, &fork, &placed), Some(Replaced::Forked));
+        assert_eq!(due(&discarded, &fork, &placed), Some(Replaced::Forked));
+        assert_eq!(due(&at_frontier, &fork, &placed), Some(Replaced::Behind));
+        let anchor = RecoveryAnchor {
+            shard: ShardId::ROOT,
+            rotated_at: ROTATED_AT,
+        };
+        fresh.record_recovery_anchor(anchor);
+        at_frontier.record_recovery_anchor(anchor);
+        assert_eq!(due(&fresh, &fork, &placed), None);
+        assert_eq!(due(&at_frontier, &fork, &placed), None);
 
         let halt = recovering(
             vec![HOST],
             vec![binding(false)],
             Some(pending(RecoveryCause::Halt, vec![validator(9)])),
         );
-        assert!(!due(&discarded, &halt, &placed, &placed));
-        assert!(!due(&discarded, &halt, &placed, &[]));
+        assert_eq!(due(&discarded, &halt, &placed), None);
+        assert_eq!(due(&at_frontier, &halt, &placed), None);
     }
 
     /// A re-seat drops a carried member a pending recovery replaced unless

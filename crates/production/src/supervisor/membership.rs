@@ -25,7 +25,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::startup::{
-    placed_validators, rebuild_due, reseated_validators, retired_signers, shard_retired,
+    Replaced, placed_validators, rebuild_due, reseated_validators, retired_signers, shard_retired,
 };
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
@@ -65,20 +65,6 @@ pub enum Rebuild {
     /// these vnodes seat on the staging store once it is renamed into
     /// the shard's directory.
     Swapping(Box<CompletedBootstrap>, Replaced),
-}
-
-/// Why a rebuild replaces a shard's store, which decides what the rebuilt
-/// store takes from it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Replaced {
-    /// The store fell beneath every peer's chain floor, on the chain the
-    /// anchor continues: the rounds signed on it stay consumed.
-    Behind,
-    /// The store committed a tail a recovery discarded: past a fork
-    /// recovery's attested frontier, or on a tail no recovered chain
-    /// extends. The recovered chain leaves the frontier anew, and nothing
-    /// signed on the abandoned tail binds it.
-    Forked,
 }
 
 impl ShardSupervisor {
@@ -514,35 +500,26 @@ impl ShardSupervisor {
         if self.rebuilding.contains_key(&shard) {
             return;
         }
-        if self.rebuild_due(shard, vnodes) {
-            self.rebuild(shard, vnodes, Replaced::Forked);
-        } else {
-            self.seat_into_running(shard, vnodes);
+        match self.rebuild_due(shard, vnodes) {
+            Some(replaced) => self.rebuild(shard, vnodes, replaced),
+            None => self.seat_into_running(shard, vnodes),
         }
     }
 
     /// Whether `shard`'s running loop is rebuilt before it carries
-    /// `vnodes` ([`rebuild_due`]).
-    fn rebuild_due(&self, shard: ShardId, vnodes: &[VnodeConfig]) -> bool {
-        let Some(entry) = self.shards.get(&shard) else {
-            return false;
-        };
+    /// `vnodes`, and why ([`rebuild_due`]).
+    fn rebuild_due(&self, shard: ShardId, vnodes: &[VnodeConfig]) -> Option<Replaced> {
+        if !self.shards.contains_key(&shard) {
+            return None;
+        }
         let placed: Vec<ValidatorId> = vnodes.iter().map(|vnode| vnode.validator_id).collect();
-        let seated: Vec<ValidatorId> = entry
-            .validator_ids
-            .iter()
-            .copied()
-            .map(ValidatorId::new)
-            .collect();
         let head = self.process.topology_snapshot().load_full();
         let windows = self.process.topology_schedule().windows();
         self.storages
             .lock()
             .expect("storages lock")
             .get(&shard)
-            .is_some_and(|storage| {
-                rebuild_due(storage.as_ref(), shard, &head, windows, &placed, &seated)
-            })
+            .and_then(|storage| rebuild_due(storage.as_ref(), shard, &head, windows, &placed))
     }
 
     /// Re-seat `shard` at its attested anchor: its loop needs a height

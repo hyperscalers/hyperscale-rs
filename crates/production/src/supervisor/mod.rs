@@ -55,7 +55,8 @@ mod membership;
 mod reshape;
 
 use beacon::BeaconThread;
-use membership::{CompletedBootstrap, Rebuild, Replaced};
+use hyperscale_node::startup::Replaced;
+use membership::{CompletedBootstrap, Rebuild};
 use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
