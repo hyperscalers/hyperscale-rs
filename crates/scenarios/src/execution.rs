@@ -34,7 +34,7 @@ use hyperscale_vm_types::{ARTIFACT_GRACE_MS, LegRole, SEAL_MATURITY_EPOCHS};
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::{
-    Crash, CrashableCluster, FaultHandle, FaultableCluster, report_claims_recarried,
+    FaultHandle, FaultableCluster, RestartableCluster, report_claims_recarried,
 };
 use crate::support::query::{
     answer_standing, await_leg_fated, beacon_epoch, clock, committed_past_validity, declared_price,
@@ -2761,7 +2761,7 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
 /// Panics if the votes were never cut, if the request is filled other
 /// than once, if the nullifier stands after the settle, or if the third
 /// composition reaches a verdict.
-pub fn a_late_settled_nullifier_still_refuses_its_intent<C: CrashableCluster>(c: &mut C) {
+pub fn a_late_settled_nullifier_still_refuses_its_intent<C: RestartableCluster>(c: &mut C) {
     let shard = ShardId::ROOT;
     let (first_key, second_key, requester_key) = nullifier_race_cast();
     let first = account_address(&first_key.public_key().0);
@@ -2861,12 +2861,12 @@ pub fn a_late_settled_nullifier_still_refuses_its_intent<C: CrashableCluster>(c:
     );
 }
 
-/// Crash and restart every host in `hosts`, one at a time so the cluster
+/// Stop and restart every host in `hosts`, one at a time so the cluster
 /// keeps a reader of its beacon while each replica rebuilds what
 /// execution held from its disk, then wait for `shard` to commit again.
-fn restart_each<C: CrashableCluster>(c: &mut C, shard: ShardId, hosts: &[usize]) {
+fn restart_each<C: RestartableCluster>(c: &mut C, shard: ShardId, hosts: &[usize]) {
     for &host in hosts {
-        c.crash(host, Crash::Process, epochs(1));
+        c.stop_host(host, epochs(1));
         assert!(
             c.run_until(epochs(4), |c| c.is_up(host)),
             "host {host} must come back",

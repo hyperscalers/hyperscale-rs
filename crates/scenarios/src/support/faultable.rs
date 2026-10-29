@@ -350,16 +350,30 @@ pub enum Crash {
     Machine,
 }
 
-/// A [`FaultableCluster`] that can crash its hosts and start them again
-/// on the disk they left.
+/// A [`FaultableCluster`] that can stop a host's process and start it
+/// again on the disk it left.
 ///
 /// A down host is absent: nothing reaches it and its copy of a shard
 /// reads as none until it restarts and catches up, which is how a fault
 /// drawn while it is down counts it.
-pub trait CrashableCluster: FaultableCluster {
+pub trait RestartableCluster: FaultableCluster {
     /// Whether host `host`'s process is running.
     fn is_up(&self, host: usize) -> bool;
 
+    /// Stop host `host`'s process now and start it again on the disk it
+    /// left `downtime` later; every write it completed survives. A fault
+    /// installed before the stop, or while the host is down, is not
+    /// promised to cover it once it is back.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` is down.
+    fn stop_host(&mut self, host: usize, downtime: Budget);
+}
+
+/// A [`RestartableCluster`] that can also crash its hosts, mid-write or
+/// with the machine's unsynced writes lost.
+pub trait CrashableCluster: RestartableCluster {
     /// Crash host `host` now, as `crash` says, and start its process
     /// again `downtime` later.
     fn crash(&mut self, host: usize, crash: Crash, downtime: Budget);
