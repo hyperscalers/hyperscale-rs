@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use hex::decode as hex_decode;
+use hex::{decode as hex_decode, encode as hex_encode};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_network_iroh::{
     BootstrapEntry, IrohConfig, RelayUrl, SecretKey, VersionInteroperabilityMode,
@@ -18,10 +18,10 @@ use hyperscale_types::{
     NetworkDefinition, NetworkParams, ParamBoundsError, PrincipalAddr, ReshapeThresholds,
     StakePoolSeat, ValidatorId, ValidatorInfo, ValidatorSet,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml::de::Error as TomlError;
-use toml::from_str as toml_from_str;
+use toml::{from_str as toml_from_str, to_string as toml_to_string};
 use tracing::{info, warn};
 
 /// Why a network's definition does not make a network.
@@ -99,7 +99,7 @@ pub enum NetworkFileError {
 
 /// The validator set, funded accounts and staking pools a network starts
 /// from.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Genesis {
     /// Validators in the network, every one seated on the genesis shard.
@@ -121,7 +121,7 @@ pub struct Genesis {
 
 /// A staking pool seated at genesis. Its founding members are not listed:
 /// genesis fills them from the validator set, for the pool they belong to.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoolEntry {
     /// The seat's number: the salt its instance's address derives under.
@@ -134,7 +134,7 @@ pub struct PoolEntry {
 }
 
 /// A funded account at genesis.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountBalanceEntry {
     /// Hex-encoded 32-byte account address.
@@ -145,7 +145,7 @@ pub struct AccountBalanceEntry {
 }
 
 /// A validator at genesis.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidatorEntry {
     /// Validator id.
@@ -156,6 +156,15 @@ pub struct ValidatorEntry {
 }
 
 impl ValidatorEntry {
+    /// The entry listing validator `id` under `key`.
+    #[must_use]
+    pub fn new(id: u64, key: &ConsensusPublicKey) -> Self {
+        Self {
+            id,
+            public_key: hex_encode(key.as_bytes()),
+        }
+    }
+
     /// The listed public key.
     ///
     /// # Errors
@@ -270,7 +279,7 @@ fn parse_principal(hex: &str) -> Result<PrincipalAddr, NetworkFileError> {
 /// The chain parameters a network file sets over
 /// [`BeaconChainConfig::production`]; the rest are the build's, and the
 /// governable ones move by vote.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chain {
     /// When the network's epoch clock starts, in Unix milliseconds. A
@@ -278,13 +287,17 @@ pub struct Chain {
     /// commits.
     pub genesis_timestamp_ms: u64,
     /// Epoch length.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epoch_duration_ms: Option<u64>,
     /// Seats on a shard, the genesis shard included.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_size: Option<u32>,
     /// Epochs a drawn seat has to report itself ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_timeout_epochs: Option<u64>,
     /// Committed state, in bytes, at or above which a shard splits. Unset,
     /// no shard reshapes on its size, and no header attests one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub split_bytes: Option<u64>,
 }
 
@@ -294,7 +307,7 @@ pub struct Chain {
 /// A file is the network's, not a host's: genesis accounts are outside the
 /// genesis hash, so two hosts whose files differ there handshake and later
 /// part ways on state.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkFile {
     /// Which network, by name: `mainnet`, `testnet` or `simulator`.
@@ -315,6 +328,17 @@ pub struct NetworkFile {
 }
 
 impl NetworkFile {
+    /// The file's text, as [`Self::from_toml`] reads it.
+    ///
+    /// # Panics
+    ///
+    /// If the TOML serializer refuses the file, which only a field of a
+    /// type TOML cannot carry would make it do.
+    #[must_use]
+    pub fn to_toml(&self) -> String {
+        toml_to_string(self).expect("a network file serializes")
+    }
+
     /// Reads a network file.
     ///
     /// # Errors
@@ -455,7 +479,7 @@ fn iroh_config(
     })
 }
 
-/// `serde` adapter reading a [`NetworkDefinition`] by its name.
+/// `serde` adapter carrying a [`NetworkDefinition`] by its name.
 ///
 /// A definition is fixed by which network it is, not assembled field by
 /// field: the name is the whole of it.
@@ -464,7 +488,19 @@ mod network_name {
 
     use hyperscale_types::NetworkDefinition;
     use serde::de::Error;
-    use serde::{Deserialize, Deserializer};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes a network by name.
+    ///
+    /// # Errors
+    ///
+    /// When the serializer refuses a string.
+    pub fn serialize<S>(network: &NetworkDefinition, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(network)
+    }
 
     /// Reads a network by name.
     ///
@@ -686,5 +722,30 @@ mod tests {
             VersionInteroperabilityMode::Strict
         );
         assert!(iroh_config(SecretKey::generate(), &["not a peer".to_owned()], &[]).is_err());
+    }
+
+    /// A file written by `to_toml` reads back to the same file, keys and
+    /// all, and unset chain parameters stay unset.
+    #[test]
+    fn a_written_file_reads_back() {
+        let read = NetworkFile::from_toml(&file(&[0, 1, 2], "")).expect("the file reads");
+        let written = read.to_toml();
+        let again = NetworkFile::from_toml(&written).expect("the written file reads");
+        assert_eq!(again.to_toml(), written);
+        assert_eq!(again.network, read.network);
+        assert_eq!(again.chain.ready_timeout_epochs, None);
+        assert!(!written.contains("ready_timeout_epochs"));
+        let keys = |f: &NetworkFile| -> Vec<ConsensusPublicKey> {
+            f.genesis
+                .validators
+                .iter()
+                .map(|v| v.key().expect("a listed key"))
+                .collect()
+        };
+        assert_eq!(keys(&again), keys(&read));
+        assert_eq!(
+            ValidatorEntry::new(7, &key(8)).key().expect("a listed key"),
+            key(8)
+        );
     }
 }

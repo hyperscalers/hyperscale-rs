@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hex::encode as hex_encode;
 use hyperscale_production::network_file::{Chain, Genesis, ValidatorEntry};
 use hyperscale_production::{
     AddValidatorError, LocalValidator, NetworkFile, Node, NodeError, NodeSetup, Observation,
@@ -87,10 +86,7 @@ fn network_file(fixtures: &TestFixtures, beacon_chain: BeaconChainConfig) -> Net
                 .iter()
                 .find(|v| v.validator_id == id)
                 .expect("a committee member is registered");
-            ValidatorEntry {
-                id: id.inner(),
-                public_key: hex_encode(info.public_key.as_bytes()),
-            }
+            ValidatorEntry::new(id.inner(), &info.public_key)
         })
         .collect();
     NetworkFile {
