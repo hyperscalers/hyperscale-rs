@@ -310,6 +310,31 @@ fn unanchored_past_fork_frontier<R: ShardChainReader + BoundaryStore + ?Sized>(
     })
 }
 
+/// Whether a join opening `store` for `shard` starts it over.
+///
+/// A store seated at the anchor of the fork now pending
+/// ([`record_fork_anchor`]) is kept: it holds nothing of the replaced
+/// committee's past the frontier, though the fresh committee's own blocks
+/// there sit in the recovery's band. Any other store is started over when
+/// its tip sits in a recovery's band, where the recovered chain need not
+/// extend it, or past a pending fork's frontier
+/// ([`unanchored_past_fork_frontier`]), where it may hold the replaced
+/// committee's branch.
+#[must_use]
+pub fn join_wipes<R: ShardChainReader + BoundaryStore + ?Sized>(
+    store: &R,
+    shard: ShardId,
+    schedule: &TopologySchedule,
+) -> bool {
+    let pending = schedule.head().pending_recoveries().get(&shard);
+    let seated_under_fork = pending
+        .and_then(|recovery| fork_anchor(shard, recovery))
+        .is_some_and(|anchor| store.recovery_anchor() == Some(anchor));
+    !seated_under_fork
+        && (store.committed_in_recovery_band(shard, schedule)
+            || unanchored_past_fork_frontier(store, shard, pending))
+}
+
 /// Why a rebuild replaces a shard's store, which decides what the rebuilt
 /// store takes from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1089,6 +1114,31 @@ mod tests {
         );
         assert_eq!(due(&discarded, &halt, &placed), None);
         assert_eq!(due(&at_frontier, &halt, &placed), None);
+    }
+
+    /// A join starts over a store past a pending fork's frontier unless it
+    /// was seated under that fork, and keeps a store no recovery touched.
+    #[test]
+    fn a_join_starts_over_a_store_a_pending_fork_did_not_seat() {
+        let fresh = root_store_certified_at(FRESH_MS);
+        let fork = recovering(
+            vec![HOST],
+            vec![binding(false)],
+            Some(pending(RecoveryCause::Fork, vec![validator(9)])),
+        );
+        assert!(join_wipes(&*fresh, ShardId::ROOT, &fork));
+        fresh.record_recovery_anchor(RecoveryAnchor {
+            shard: ShardId::ROOT,
+            rotated_at: ROTATED_AT,
+        });
+        assert!(!join_wipes(&*fresh, ShardId::ROOT, &fork));
+
+        let untouched = recovering(vec![HOST], Vec::new(), None);
+        assert!(!join_wipes(
+            &*root_store_certified_at(FRESH_MS),
+            ShardId::ROOT,
+            &untouched
+        ));
     }
 
     /// A re-seat drops a carried member a pending recovery replaced unless

@@ -33,7 +33,7 @@ use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
 use hyperscale_node::startup::{
-    Replaced, placed_validators, rebuild_due, record_fork_anchor, reseated_validators,
+    Replaced, join_wipes, placed_validators, rebuild_due, record_fork_anchor, reseated_validators,
     retired_signers, shard_retired,
 };
 use hyperscale_node::{HostedChain, ReplicaConfig};
@@ -394,7 +394,7 @@ impl SimulationRunner {
                             storage.load_recovered_state(shard).committed_height
                                 > BlockHeight::GENESIS
                                 && !storage.holds_foreign_chain(shard)
-                                && !storage.committed_in_recovery_band(shard, &schedule)
+                                && !join_wipes(storage, shard, &schedule)
                         })
                         .unwrap_or_else(|| open_store(shard, self.power_loss));
                     self.seat_joined_group(host, shard, &placed, storage);
