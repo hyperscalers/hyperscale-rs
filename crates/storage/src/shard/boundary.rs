@@ -9,14 +9,34 @@
 //! layer's boundary trigger and range-serving code stay generic and run
 //! identically in simulation and production.
 
+use hyperscale_hbor::Hbor;
 use hyperscale_jmt::{Key, NibblePath, TreeReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    FrontierInputs, ReadFrontier, ShardId, ShardWitnessPayload, StateRoot, SubstateKey,
+    Epoch, FrontierInputs, ReadFrontier, ShardId, ShardWitnessPayload, StateRoot, SubstateKey,
     SubstateLeaf,
 };
 
 use crate::{CrossingCursor, MemberIndex, Substates};
+
+/// The pending fork recovery a store was seated at its shard's attested
+/// anchor under: `shard`'s recovery whose fresh committee was seated at
+/// `rotated_at`, the pair the beacon keys a recovery's completion on.
+///
+/// Node-local: what this host's store holds, never what the chain says.
+/// A store snap-synced at the anchor while the fork is pending holds
+/// nothing above the fork's frontier, and every block it commits above it
+/// afterwards arrives through a fence that knows the fork; a store that
+/// committed above the frontier without one may hold the replaced
+/// committee's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct RecoveryAnchor {
+    /// The shard the recovery re-drew. A split child's store starts as a
+    /// clone of its parent's, record included, and names the parent here.
+    pub shard: ShardId,
+    /// The epoch the recovery seated its fresh committee.
+    pub rotated_at: Epoch,
+}
 
 /// Which pinned boundaries a store keeps when the node trims its pins.
 ///
@@ -491,6 +511,15 @@ pub trait BoundaryStore {
     /// [`MemberIndex::load`](crate::MemberIndex::load) over the store,
     /// read the same way however the store was reached.
     fn member_index(&self, shard: ShardId) -> MemberIndex;
+
+    /// The fork recovery this store was last seated at its attested
+    /// anchor under, or `None` if it never was.
+    fn recovery_anchor(&self) -> Option<RecoveryAnchor>;
+
+    /// Record `anchor` as the fork recovery this store is seated at its
+    /// attested anchor under, replacing any earlier record, and return
+    /// once it survives a crash.
+    fn record_recovery_anchor(&self, anchor: RecoveryAnchor);
 }
 
 #[cfg(test)]

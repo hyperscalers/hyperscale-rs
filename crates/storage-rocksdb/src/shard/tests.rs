@@ -14,8 +14,9 @@ use hyperscale_storage::test_helpers::{
     test_a_legs_own_finalization_keeps_the_floor,
     test_a_member_row_naming_an_unheld_height_keeps_nothing,
     test_a_package_cell_lands_in_the_artifact_index, test_a_rebuilt_store_carries_signed_rounds,
-    test_a_replayed_sweep_reads_what_its_block_removed, test_a_settled_tick_pulls_the_replay_down,
-    test_a_settling_claim_folds_its_removals, test_a_standing_member_row_keeps_its_rows,
+    test_a_recovery_anchor_reads_back, test_a_replayed_sweep_reads_what_its_block_removed,
+    test_a_settled_tick_pulls_the_replay_down, test_a_settling_claim_folds_its_removals,
+    test_a_standing_member_row_keeps_its_rows,
     test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives,
     test_a_stating_blocks_yes_receipts_prune_with_it, test_a_stored_block_keeps_its_terms,
     test_a_successor_keeps_its_predecessors_terminal,
@@ -86,6 +87,17 @@ fn open_fresh() -> (TempDir, RocksDbShardStorage) {
 fn a_fresh_store_holds_nothing() {
     let (_dir, storage) = open_fresh();
     test_a_fresh_store_holds_nothing(&storage);
+}
+
+/// The shared round trip, then a reopen: the record survives it.
+#[test]
+fn a_recovery_anchor_reads_back_and_survives_a_reopen() {
+    let (dir, storage) = open_fresh();
+    test_a_recovery_anchor_reads_back(&storage);
+    let recorded = storage.recovery_anchor();
+    drop(storage);
+    let reopened = RocksDbShardStorage::open(dir.path(), NibblePath::empty()).unwrap();
+    assert_eq!(reopened.recovery_anchor(), recorded);
 }
 
 #[test]

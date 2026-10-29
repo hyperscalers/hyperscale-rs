@@ -14,8 +14,8 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BoundaryRetention, BoundaryStore, CrossingCursor, ImportProgress, LeafRows,
-    MemberIndex, SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes,
-    holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
+    MemberIndex, RecoveryAnchor, SubstateStore, Substates, SweepRows, WitnessSeed,
+    followed_block_writes, holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, EntryKey, FrontierInputs, ReadFrontier,
@@ -124,6 +124,16 @@ impl BoundaryStore for SimShardStorage {
 
     fn member_index(&self, shard: ShardId) -> MemberIndex {
         MemberIndex::load(self, shard)
+    }
+
+    fn recovery_anchor(&self) -> Option<RecoveryAnchor> {
+        read_or_recover(&self.consensus).recovery_anchor
+    }
+
+    fn record_recovery_anchor(&self, anchor: RecoveryAnchor) {
+        crash_point::write();
+        write_or_recover(&self.consensus).recovery_anchor = Some(anchor);
+        self.sync();
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {

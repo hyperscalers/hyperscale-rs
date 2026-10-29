@@ -15,7 +15,7 @@ use hyperscale_jmt::{
     Child, ChildKind, Hash as JmtHash, InternalNode, KEY_BYTES as JMT_KEY_BYTES, LeafNode, Node,
     NodeKey,
 };
-use hyperscale_storage::{ImportCursor, ImportProgress};
+use hyperscale_storage::{ImportCursor, ImportProgress, RecoveryAnchor};
 use hyperscale_types::{
     BlockHeight, CertifiedBlockHeader, ChainOrigin, Hash, LEAF_KEY_BYTES, QuorumCertificate,
     StateRoot, WeightedTimestamp,
@@ -679,6 +679,15 @@ impl MetadataEntry for GenesisInstalledEntry {
     const KEY: &'static [u8] = b"chain:genesis_installed";
     type Value = BlockHeight;
     type Codec = BlockHeightCodec;
+}
+
+/// The fork recovery the store was seated at its attested anchor under,
+/// synced on its own write.
+pub struct RecoveryAnchorEntry;
+impl MetadataEntry for RecoveryAnchorEntry {
+    const KEY: &'static [u8] = b"recovery:anchor";
+    type Value = RecoveryAnchor;
+    type Codec = HborCodec<RecoveryAnchor>;
 }
 
 pub struct ChainOriginEntry;

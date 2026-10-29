@@ -16,7 +16,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{resumed_schedule, retention_floor};
-use hyperscale_storage::{BeaconStorage, ShardChainReader};
+use hyperscale_storage::{BeaconStorage, BoundaryStore, RecoveryAnchor, ShardChainReader};
 use hyperscale_types::{
     BeaconState, BlockHeight, EpochWindows, LocalTimestamp, NetworkDefinition, RecoveryBinding,
     RecoveryCause, RoutingCommittees, ShardBoundary, ShardId, ShardRecovery, Signer,
@@ -94,7 +94,10 @@ pub fn boot_routing(
 ///
 /// A store whose tip a recovery discarded for good
 /// ([`committed_on_discarded_tail`]) resumes no placed validator: they
-/// join, and the join wipes it.
+/// join, and the join wipes it. Nor does one committed past a pending
+/// fork's frontier that was not seated at the anchor under that fork
+/// ([`unanchored_past_fork_frontier`]): its placed validators join, which
+/// wipes it where the fork's band holds its tip.
 ///
 /// A store that is not resumed is dropped before this returns, so its
 /// join can open it again.
@@ -110,7 +113,7 @@ pub fn plan_seats<S, E>(
     mut open: impl FnMut(ShardId) -> Result<S, E>,
 ) -> Result<SeatPlan<S>, E>
 where
-    S: Deref<Target: ShardChainReader>,
+    S: Deref<Target: ShardChainReader + BoundaryStore>,
 {
     let mut placed: BTreeMap<ShardId, ShardSigners> = BTreeMap::new();
     let mut unplaced = ShardSigners::new();
@@ -159,14 +162,18 @@ where
         let store = open(shard)?;
         let foreign = store.holds_foreign_chain(shard);
         let mut vnodes = placed.remove(&shard).unwrap_or_default();
+        let pending = head.pending_recoveries.get(&shard);
         let discarded = !vnodes.is_empty()
             && committed_on_discarded_tail(
                 &*store,
                 head.recoveries.get(&shard).map_or(&[], Vec::as_slice),
-                head.pending_recoveries.get(&shard),
+                pending,
                 windows,
             );
-        if store.committed_height() > BlockHeight::GENESIS && !foreign && !discarded {
+        let unanchored =
+            !vnodes.is_empty() && unanchored_past_fork_frontier(&*store, shard, pending);
+        if store.committed_height() > BlockHeight::GENESIS && !foreign && !discarded && !unanchored
+        {
             vnodes.extend(routed.remove(&shard).unwrap_or_default());
             resumed.insert(shard, (store, vnodes));
             continue;
@@ -178,6 +185,12 @@ where
             info!(
                 ?shard,
                 "Seated shard's store committed a tail a recovery discarded; joining it"
+            );
+        } else if unanchored {
+            info!(
+                ?shard,
+                "Seated shard's store committed past a pending fork's frontier it was not \
+                 seated under; joining it"
             );
         } else if foreign {
             info!(
@@ -235,6 +248,65 @@ fn committed_on_discarded_tail<R: ShardChainReader + ?Sized>(
             .filter(|binding| binding.completed)
             .chain(pending_fork)
             .any(|binding| binding.discards(windows, height, at))
+    })
+}
+
+/// Record on `store`, snap-synced at `shard`'s attested anchor under
+/// `head`, the shard's pending recovery when a fork caused it
+/// ([`BoundaryStore::record_recovery_anchor`]).
+///
+/// A store seated at the anchor holds nothing above the fork's frontier,
+/// and every block it commits above it afterwards passes a fence that
+/// knows the fork, so the record is what lets a restart tell such a store
+/// from one holding the replaced committee's branch
+/// ([`unanchored_past_fork_frontier`]). Call it before the store is
+/// seated: until then it holds nothing above the frontier, where the
+/// restart does not read the record.
+pub fn record_fork_anchor<S: BoundaryStore + ?Sized>(
+    store: &S,
+    head: &TopologySnapshot,
+    shard: ShardId,
+) {
+    if let Some(anchor) = head
+        .pending_recoveries()
+        .get(&shard)
+        .and_then(|recovery| fork_anchor(shard, recovery))
+    {
+        store.record_recovery_anchor(anchor);
+    }
+}
+
+/// The record naming `shard`'s `recovery`, when a fork caused it.
+fn fork_anchor(shard: ShardId, recovery: &ShardRecovery) -> Option<RecoveryAnchor> {
+    (recovery.cause == RecoveryCause::Fork).then_some(RecoveryAnchor {
+        shard,
+        rotated_at: recovery.rotated_at,
+    })
+}
+
+/// Whether `store` committed past the frontier of `shard`'s `pending`
+/// fork without having been seated at the anchor under that fork.
+///
+/// Above the frontier a store may hold the fresh committee's chain or
+/// the replaced committee's other branch. The replaced committee's
+/// certificates may be dated in the window the recovery rotated in,
+/// where the fresh committee certifies too, or later still on a host
+/// whose beacon had not folded the fork, so neither a block's height nor
+/// its certificate's date tells the two apart. Only a store seated at the anchor under this fork
+/// ([`record_fork_anchor`]) is known to hold nothing of the replaced
+/// committee's past the frontier; any other is read as on the discarded
+/// branch. A record naming another recovery, completed or superseded,
+/// says nothing about this one.
+fn unanchored_past_fork_frontier<R: ShardChainReader + BoundaryStore + ?Sized>(
+    store: &R,
+    shard: ShardId,
+    pending: Option<&ShardRecovery>,
+) -> bool {
+    pending.is_some_and(|recovery| {
+        fork_anchor(shard, recovery).is_some_and(|anchor| {
+            store.committed_height() > recovery.attested_frontier
+                && store.recovery_anchor() != Some(anchor)
+        })
     })
 }
 
@@ -794,6 +866,21 @@ mod tests {
         pending: Option<ShardRecovery>,
         placed: bool,
     ) -> SeatPlan<Arc<SimShardStorage>> {
+        restart_on(
+            &root_store_certified_at(certified_ms),
+            history,
+            pending,
+            placed,
+        )
+    }
+
+    /// [`restart_over`] the root's `store`.
+    fn restart_on(
+        store: &Arc<SimShardStorage>,
+        history: Vec<RecoveryBinding>,
+        pending: Option<ShardRecovery>,
+        placed: bool,
+    ) -> SeatPlan<Arc<SimShardStorage>> {
         let committee = TestCommittee::new(2, 7);
         let first = if placed {
             on(ShardId::ROOT)
@@ -819,7 +906,7 @@ mod tests {
             &routing,
             &local(&committee),
             |_| true,
-            |_| Ok::<_, Infallible>(root_store_certified_at(certified_ms)),
+            |_| Ok::<_, Infallible>(Arc::clone(store)),
         )
         .expect("opening cannot fail")
     }
@@ -846,6 +933,43 @@ mod tests {
         );
         assert!(plan.resumed.is_empty());
         assert_eq!(ids(&plan.joins[&ShardId::ROOT]), vec![validator(0)]);
+    }
+
+    /// Past a pending fork's frontier, a block the fresh committee
+    /// certified in the window the recovery rotated in and one of the
+    /// replaced committee's other branch read alike, so a store there
+    /// resumes only if it was seated at the anchor under that same fork;
+    /// one seated under another recovery, or another shard's, is a join.
+    #[test]
+    fn a_store_past_a_pending_forks_frontier_resumes_only_if_seated_under_it() {
+        let restart = |anchor: Option<RecoveryAnchor>| {
+            let store = root_store_certified_at(FRESH_MS);
+            if let Some(anchor) = anchor {
+                store.record_recovery_anchor(anchor);
+            }
+            restart_on(
+                &store,
+                vec![binding(false)],
+                Some(pending(RecoveryCause::Fork, vec![validator(1)])),
+                true,
+            )
+        };
+        let joins = |plan: SeatPlan<Arc<SimShardStorage>>| {
+            assert!(plan.resumed.is_empty());
+            assert_eq!(ids(&plan.joins[&ShardId::ROOT]), vec![validator(0)]);
+        };
+        let under = |shard, rotated_at| Some(RecoveryAnchor { shard, rotated_at });
+
+        joins(restart(None));
+        joins(restart(under(ShardId::ROOT, Epoch::new(1))));
+        joins(restart(under(ShardId::leaf(1, 0), ROTATED_AT)));
+
+        let plan = restart(under(ShardId::ROOT, ROTATED_AT));
+        assert!(plan.joins.is_empty());
+        assert_eq!(
+            ids(&plan.resumed[&ShardId::ROOT].1),
+            vec![validator(0), validator(1)]
+        );
     }
 
     /// The stores a pending halt's harvest reads, a superseded recovery's

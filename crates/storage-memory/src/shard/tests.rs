@@ -9,7 +9,8 @@ use hyperscale_storage::test_helpers::{
     state_key, test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
-    test_a_replayed_sweep_reads_what_its_block_removed, test_a_stored_block_keeps_its_terms,
+    test_a_recovery_anchor_reads_back, test_a_replayed_sweep_reads_what_its_block_removed,
+    test_a_stored_block_keeps_its_terms,
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
@@ -91,6 +92,17 @@ fn entries_commit_serve_ranges_and_keep_history() {
 #[test]
 fn a_fresh_store_holds_nothing() {
     test_a_fresh_store_holds_nothing(&SimShardStorage::default());
+}
+
+/// The shared round trip, then a power loss: the record syncs on its own
+/// write.
+#[test]
+fn a_recovery_anchor_reads_back_and_survives_a_power_loss() {
+    let storage = SimShardStorage::default();
+    test_a_recovery_anchor_reads_back(&storage);
+    let recorded = storage.recovery_anchor();
+    storage.lose_unsynced();
+    assert_eq!(storage.recovery_anchor(), recorded);
 }
 
 #[test]

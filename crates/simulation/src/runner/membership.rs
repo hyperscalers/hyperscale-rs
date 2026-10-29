@@ -33,7 +33,8 @@ use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
 use hyperscale_node::startup::{
-    placed_validators, rebuild_due, reseated_validators, retired_signers, shard_retired,
+    placed_validators, rebuild_due, record_fork_anchor, reseated_validators, retired_signers,
+    shard_retired,
 };
 use hyperscale_node::{HostedChain, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
@@ -556,7 +557,9 @@ impl SimulationRunner {
     /// recovered state the joining replica boots from. Requests rotate
     /// across the serving hosts; a rejected chunk simply re-arms and
     /// the rotation retries it elsewhere. With `own_first`, the host's own
-    /// running store answers each request before any peer is asked.
+    /// running store answers each request before any peer is asked. Under
+    /// a pending fork the completed store records that fork
+    /// ([`record_fork_anchor`]) before it is handed back to be seated.
     ///
     /// Returns `None` when the shard cannot be read from a peer yet, in
     /// one of three transient shapes. No serving host holds it at all: a
@@ -619,21 +622,16 @@ impl SimulationRunner {
         // How far below the anchor this store has to reach before the
         // attested window folds can answer — off the same schedule
         // projection the folds read their own floor from.
+        let topology = self.hosts[host as usize].process().topology_snapshot();
         let floor = history_floor(
             anchor.weighted_timestamp,
-            self.hosts[host as usize]
-                .process()
-                .topology_snapshot()
-                .load()
-                .settled_window_floor(shard),
+            topology.load().settled_window_floor(shard),
         );
         let peers: Vec<StoreResponder<SimShardStorage>> = serving
             .iter()
             .map(|&i| StoreResponder::new(Arc::clone(self.hosts[i].shard_io(shard).storage())))
             .collect();
-        let anchor_qc = self.hosts[host as usize]
-            .process()
-            .topology_snapshot()
+        let anchor_qc = topology
             .load()
             .boundary_qc(shard)
             .filter(|qc| qc.block_hash() == anchor.block_hash)
@@ -698,6 +696,7 @@ impl SimulationRunner {
             bootstrap.is_complete(),
             "snap-sync bootstrap for shard {shard:?} did not complete against a pinned anchor",
         );
+        record_fork_anchor(storage, &topology.load(), shard);
         Some(bootstrap.into_recovered_state(storage))
     }
 

@@ -43,8 +43,8 @@ use hyperscale_jmt::TreeReader;
 pub use hyperscale_vm_kernel::Substates;
 pub use shard::block_rows::{BlockRowKeys, BlockRows, RebuiltBlock, Unbuilt, reconstruct_block};
 pub use shard::boundary::{
-    AdoptSource, Adoption, BoundaryRetention, BoundaryStore, ImportCursor, ImportProgress, Subtree,
-    Vintage, WitnessSeed, adopt_plan, holds_state,
+    AdoptSource, Adoption, BoundaryRetention, BoundaryStore, ImportCursor, ImportProgress,
+    RecoveryAnchor, Subtree, Vintage, WitnessSeed, adopt_plan, holds_state,
 };
 pub use shard::chain_floor::{ChainHold, FloorInputs, chain_floor, history_floor};
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
