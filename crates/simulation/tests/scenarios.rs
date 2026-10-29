@@ -168,10 +168,10 @@ use hyperscale_scenarios::{
     standing_answers_level_off_under_sustained_load,
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
-use hyperscale_storage::{RowState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, RecoveryAnchor, RowState, ShardChainReader};
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHash, BlockHeight, IDLE_PROPOSAL_INTERVAL, NetworkDefinition,
+    BeaconChainConfig, BlockHash, BlockHeight, Epoch, IDLE_PROPOSAL_INTERVAL, NetworkDefinition,
     PrincipalAddr, RecoveryCause, Round, ShardForkProof, ShardId, Timeout, TransactionDecision,
     TxHash, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId, WeightedTimestamp,
 };
@@ -2454,6 +2454,8 @@ struct ForkRun {
     members: Vec<ValidatorId>,
     /// The fresh committee the recovery drew.
     fresh: Vec<ValidatorId>,
+    /// The epoch the recovery seated the fresh committee.
+    rotated_at: Epoch,
     /// The beacon-attested frontier the recovery pinned.
     frontier: BlockHeight,
     /// The anchor block at that frontier.
@@ -2462,11 +2464,24 @@ struct ForkRun {
     retained_suffix: BTreeMap<BlockHeight, BlockHash>,
 }
 
+/// [`shard_fork_resumed`], run on until the fresh committee clears the
+/// recovery.
+fn shard_fork_recovery() -> (SimCluster, ForkRun) {
+    let (mut cluster, run) = shard_fork_resumed();
+    assert!(
+        cluster.run_until(epochs(30), |c| c
+            .beacon_state()
+            .is_some_and(|s| !s.pending_recoveries.contains_key(&run.shard))),
+        "the fresh committee's crossing must clear the fork recovery"
+    );
+    (cluster, run)
+}
+
 /// Fork a grown shard's committee, have the beacon fold the fork-caused
 /// recovery with a fresh member on a host that kept the forked shard, and
-/// run until the fresh committee clears the recovery.
+/// run until the fresh committee commits past the forked chain's tip.
 #[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
-fn shard_fork_recovery() -> (SimCluster, ForkRun) {
+fn shard_fork_resumed() -> (SimCluster, ForkRun) {
     let setup = halt_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 1, &setup.accounts);
     // A fork recovery supersedes whatever the old committee committed past
@@ -2653,7 +2668,7 @@ fn shard_fork_recovery() -> (SimCluster, ForkRun) {
     // The fold pinned the recovery to the beacon-attested frontier. Capture
     // the anchor the fresh chain must extend and the retained membership the
     // incomers' refusal is keyed on.
-    let (frontier, anchor, retained) = {
+    let (rotated_at, frontier, anchor, retained) = {
         let state = cluster.beacon_state().expect("beacon state committed");
         let recovery = state
             .pending_recoveries
@@ -2665,6 +2680,7 @@ fn shard_fork_recovery() -> (SimCluster, ForkRun) {
             "the fork fence must hold the boundary at the attested frontier",
         );
         (
+            recovery.rotated_at,
             recovery.attested_frontier,
             boundary.block_hash,
             recovery.retained.clone(),
@@ -2717,12 +2733,6 @@ fn shard_fork_recovery() -> (SimCluster, ForkRun) {
         resumed,
         "the recovered shard must resume committing under its fresh committee"
     );
-    assert!(
-        cluster.run_until(epochs(30), |c| c
-            .beacon_state()
-            .is_some_and(|s| !s.pending_recoveries.contains_key(&shard))),
-        "the fresh committee's crossing must clear the fork recovery"
-    );
 
     (
         cluster,
@@ -2731,11 +2741,65 @@ fn shard_fork_recovery() -> (SimCluster, ForkRun) {
             committee,
             members,
             fresh,
+            rotated_at,
             frontier,
             anchor,
             retained_suffix,
         },
     )
+}
+
+/// A host that rebuilt the forked shard for a fresh member and restarts
+/// while the fork is still pending resumes the rebuilt store: past the
+/// frontier only the record of the fork it was seated under tells it from
+/// the replaced committee's branch. The fresh committee still clears the
+/// recovery.
+#[test]
+fn a_rebuilt_store_resumes_across_a_restart_under_its_pending_fork() {
+    let (mut cluster, run) = shard_fork_resumed();
+    assert!(
+        cluster
+            .beacon_state()
+            .is_some_and(|s| s.pending_recoveries.contains_key(&run.shard)),
+        "fixture precondition: the fork is still pending",
+    );
+    let host = cluster
+        .committee_hosts(run.shard)
+        .into_iter()
+        .find(|host| run.committee.contains(host))
+        .expect("a host that kept the forked shard rebuilt it for a fresh member");
+    let node = u32::try_from(host).expect("host index fits a node index");
+    let anchor = RecoveryAnchor {
+        shard: run.shard,
+        rotated_at: run.rotated_at,
+    };
+    let committed = {
+        let store = cluster
+            .runner()
+            .hosts_shard(node, run.shard)
+            .expect("the rebuilt host serves the shard");
+        assert_eq!(store.recovery_anchor(), Some(anchor));
+        store.committed_height()
+    };
+    assert!(
+        committed > run.frontier,
+        "fixture precondition: the rebuilt store committed past the frontier",
+    );
+
+    cluster.restart_host(host);
+    let store = cluster
+        .runner()
+        .hosts_shard(node, run.shard)
+        .expect("the restart resumes the rebuilt store rather than joining");
+    assert!(store.committed_height() >= committed);
+    assert_eq!(store.recovery_anchor(), Some(anchor));
+
+    assert!(
+        cluster.run_until(epochs(30), |c| c
+            .beacon_state()
+            .is_some_and(|s| !s.pending_recoveries.contains_key(&run.shard))),
+        "the fresh committee's crossing must clear the fork recovery"
+    );
 }
 
 /// A forked rebuild attaches the local validators the fresh committee

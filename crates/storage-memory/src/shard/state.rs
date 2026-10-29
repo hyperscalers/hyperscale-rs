@@ -12,7 +12,7 @@ use hyperscale_jmt::NodeKey;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     BlockRowKeys, BlockRows, ChainHold, CreditBurns, CrossingJournal, Indexed, JmtSnapshot,
-    RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
+    RecoveryAnchor, RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
@@ -359,6 +359,9 @@ pub struct ConsensusState {
     pub(crate) installed_genesis: Option<BlockHeight>,
     /// The lowest height this store serves a block at.
     pub(crate) chain_floor: BlockHeight,
+    /// The fork recovery this store was seated at its attested anchor
+    /// under. Mirrors the production `recovery:anchor` metadata key.
+    pub(crate) recovery_anchor: Option<RecoveryAnchor>,
     /// Durable safe-vote register records keyed by validator, each
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
@@ -395,6 +398,7 @@ impl ConsensusState {
             chain_origin: None,
             installed_genesis: None,
             chain_floor: BlockHeight::GENESIS,
+            recovery_anchor: None,
             safe_vote_registers: OrdMap::new(),
             voted_blocks: OrdMap::new(),
             credit_burns: CreditBurns::default(),

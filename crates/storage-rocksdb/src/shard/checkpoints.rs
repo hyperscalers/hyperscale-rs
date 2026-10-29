@@ -20,8 +20,8 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryRetention, BoundaryStore, CrossingCursor, ImportProgress, JmtSnapshot,
-    LeafRows, MemberIndex, SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes,
-    holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
+    LeafRows, MemberIndex, RecoveryAnchor, SubstateStore, Substates, SweepRows, WitnessSeed,
+    followed_block_writes, holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs, ReadFrontier, ShardId,
@@ -29,7 +29,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::checkpoint::Checkpoint;
-use rocksdb::{ColumnFamily, DB, Options, WriteBatch};
+use rocksdb::{ColumnFamily, DB, Options, WriteBatch, WriteOptions};
 use tracing::warn;
 
 use super::column_families::{
@@ -43,8 +43,8 @@ use super::metadata::{read_jmt_metadata, write_boundary_header, write_jmt_metada
 use crate::StorageError;
 use crate::fs::{create_dir_durably, rename_durably};
 use crate::typed_cf::{
-    ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, iter_from, meta_delete,
-    meta_read, meta_write,
+    ImportProgressEntry, RecoveryAnchorEntry, TypedCf, batch_delete, batch_put, get, iter_all,
+    iter_from, meta_delete, meta_read, meta_write,
 };
 
 /// Write one import batch's leaves and re-derive every index that hangs
@@ -746,6 +746,20 @@ impl BoundaryStore for RocksDbShardStorage {
 
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
         Self::substate_bytes_at_version(self, version)
+    }
+
+    fn recovery_anchor(&self) -> Option<RecoveryAnchor> {
+        meta_read::<RecoveryAnchorEntry>(&*self.db)
+    }
+
+    fn record_recovery_anchor(&self, anchor: RecoveryAnchor) {
+        let mut batch = WriteBatch::default();
+        meta_write::<RecoveryAnchorEntry>(&mut batch, &anchor);
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .write_opt(batch, &write_opts)
+            .expect("recovery anchor write failed");
     }
 }
 

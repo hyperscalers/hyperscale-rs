@@ -57,12 +57,12 @@ use crate::{
     Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
     ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
     ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow, PackageArtifactStore,
-    ParentAnchor, PendingChain, RecoveredState, RowState, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateStore, SubstateView, Substates, SweepIndex, TickChain, TickOutput,
-    TickResolution, VerdictChange, VersionedStore, WitnessSeed, colliding_committed_cell,
-    committed_here, committed_tx_cell_key, committed_tx_cells, entry_leaf_value,
-    filter_state_writes_to_prefix, held_total, holds_state, key_under_prefix, member_row_leaf,
-    reserved_total, verdict_changes,
+    ParentAnchor, PendingChain, RecoveredState, RecoveryAnchor, RowState, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateStore, SubstateView, Substates, SweepIndex,
+    TickChain, TickOutput, TickResolution, VerdictChange, VersionedStore, WitnessSeed,
+    colliding_committed_cell, committed_here, committed_tx_cell_key, committed_tx_cells,
+    entry_leaf_value, filter_state_writes_to_prefix, held_total, holds_state, key_under_prefix,
+    member_row_leaf, reserved_total, verdict_changes,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -5312,6 +5312,28 @@ pub fn test_a_fresh_store_holds_nothing<S: TestStore + ShardChainReader>(storage
             .get_transactions_batch(&[TxHash::from(Hash::from_bytes(&[1; 32]))])
             .is_empty()
     );
+}
+
+/// A store records the fork recovery it was seated at its anchor under,
+/// and a later record replaces the earlier one.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_recovery_anchor_reads_back<S: BoundaryStore + ?Sized>(storage: &S) {
+    assert_eq!(storage.recovery_anchor(), None);
+    let first = RecoveryAnchor {
+        shard: ShardId::leaf(1, 0),
+        rotated_at: Epoch::new(3),
+    };
+    storage.record_recovery_anchor(first);
+    assert_eq!(storage.recovery_anchor(), Some(first));
+    let later = RecoveryAnchor {
+        rotated_at: Epoch::new(7),
+        ..first
+    };
+    storage.record_recovery_anchor(later);
+    assert_eq!(storage.recovery_anchor(), Some(later));
 }
 
 /// A committed cell reads back, and a snapshot keeps reading the version

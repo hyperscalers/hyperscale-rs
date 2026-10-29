@@ -23,6 +23,7 @@ use hyperscale_node::bootstrap::history::HistoryOutcome;
 use hyperscale_node::bootstrap::{
     BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome, StoreResponder,
 };
+use hyperscale_node::startup::record_fork_anchor;
 use hyperscale_storage::{RecoveredState, ShardStorage, history_floor};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::{BlockHeight, Request, ShardId};
@@ -48,6 +49,9 @@ const ROUNDS_BEFORE_ANCHOR_REFRESH: u32 = 30;
 /// boundary anchor, returning the [`RecoveredState`] its replica boots
 /// from. The caller has already established that `storage` is
 /// fresh and an anchor exists.
+///
+/// Under a pending fork the completed store records that fork
+/// ([`record_fork_anchor`]) before it is handed back to be seated.
 ///
 /// A `local` store this host already holds for the shard answers each
 /// request before the network is asked: a host rebuilding a shard it
@@ -190,6 +194,7 @@ where
             height = bootstrap.anchor().height.inner(),
             "Snap-sync bootstrap complete; state verified against the anchor"
         );
+        record_fork_anchor(&**storage, &topology_snapshot.load(), shard);
         return Ok(bootstrap.into_recovered_state(&**storage));
     }
 }
