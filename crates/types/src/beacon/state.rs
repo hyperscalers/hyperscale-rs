@@ -1506,10 +1506,22 @@ impl BeaconState {
         )
     }
 
+    /// The first epoch an `Unjail` lifts a validator jailed at `since` for
+    /// `reason`, as of this state: a withholding jail lasts a recency period,
+    /// which moves with the eligible set, and a performance jail the fixed
+    /// cooldown.
+    #[must_use]
+    pub fn jail_lifts_at(&self, since: Epoch, reason: JailReason) -> Epoch {
+        let cooldown = match reason {
+            JailReason::Withholding => self.beacon_recency_period(),
+            JailReason::Performance => JAIL_COOLDOWN_EPOCHS,
+        };
+        since.saturating_add(cooldown)
+    }
+
     /// Why an `Unjail` of `id` lifted by `pool` would lift nothing in the
     /// fold of this state's epoch; `None` when it would return `id` to the
-    /// pool. A withholding jail lasts a recency period, which moves with the
-    /// eligible set; a performance jail the fixed cooldown.
+    /// pool. The cooldown is [`Self::jail_lifts_at`]'s.
     #[must_use]
     pub fn unjail_refusal(&self, id: ValidatorId, pool: StakePoolId) -> Option<UnjailRefusal> {
         let Some(record) = self.validators.get(&id) else {
@@ -1525,11 +1537,7 @@ impl BeaconState {
         else {
             return Some(UnjailRefusal::NotJailed);
         };
-        let cooldown = match reason {
-            JailReason::Withholding => self.beacon_recency_period(),
-            JailReason::Performance => JAIL_COOLDOWN_EPOCHS,
-        };
-        let lifts_at = since_epoch.saturating_add(cooldown);
+        let lifts_at = self.jail_lifts_at(since_epoch, reason);
         if self.current_epoch < lifts_at {
             return Some(UnjailRefusal::CoolingDown { lifts_at });
         }
