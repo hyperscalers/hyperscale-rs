@@ -14,7 +14,7 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, armed_split_bytes, cross_fraction_genesis_accounts,
     cross_shard_fault_genesis_accounts, cross_shard_genesis_accounts, genesis_accounts,
-    halt_recovery_split_bytes, halt_straddler_setup, livelock_genesis_accounts, merge_split_bytes,
+    halt_recovery_config, halt_straddler_setup, livelock_genesis_accounts, merge_split_bytes,
     merge_straddler_setup, participant_sweep_genesis_accounts, remote_delegator,
     reshape_lifecycle_accounts, split_straddler_setup,
 };
@@ -541,25 +541,6 @@ fn merge_straddler_atomic_prod() {
     merge_straddler_atomic(&mut cluster);
 }
 
-/// Single-shard genesis whose funded root (~43.9 KB) splits once into a
-/// holding pair (~29.0 KB and ~14.6 KB, both inside the band), with two pool
-/// cohorts — one grows the root, the other is the halted shard's recovery
-/// committee — plus jail slack so an organic performance jail over the long
-/// run can refill from the pool without starving the recovery draw. Mirrors
-/// the simulation's `halt_recovery_config`. The halt takes `HALT_THRESHOLD`
-/// epochs to detect, so these run tens of epochs — hours at the ci epoch
-/// length, the slowest scenarios in this suite.
-fn halt_recovery_config() -> ScenarioConfig {
-    ScenarioConfig {
-        shard_size: 4,
-        vnodes_per_host: 1,
-        pool_surplus: 10,
-        num_shards: 1,
-        split_bytes: halt_recovery_split_bytes(),
-        latency: Duration::from_millis(150),
-    }
-}
-
 #[test]
 #[serial]
 #[ignore = "real-QUIC production scenario; run with -- --ignored"]
@@ -702,9 +683,9 @@ fn pool_capacity_caps_registrations_prod() {
 /// the pool, which with zero slack would leave a leaf short of full strength
 /// with nothing to refill from. The leftover stays below a committee's
 /// worth, so split admission's pool gate can't staff another cohort and the
-/// partition still stabilizes at `target` leaves. One validator per host
-/// (each reshape seat needs its own store) and a paced inter-host latency so
-/// the loadless committees track wall-clock through the multi-epoch grow.
+/// partition still stabilizes at `target` leaves. A paced inter-host latency
+/// keeps the loadless committees tracking wall-clock through the multi-epoch
+/// grow.
 const fn grow_config(target_shards: u32) -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,

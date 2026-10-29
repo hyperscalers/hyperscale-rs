@@ -38,6 +38,8 @@ use hyperscale_vm_sdk::client::VaultField;
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::Address;
 
+use super::ScenarioConfig;
+
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
 /// fee comes from the faucet, so any key notarizes it.
 #[must_use]
@@ -268,9 +270,29 @@ const HALT_RECOVERY_BAND: u64 = 20_000;
 /// The `split_bytes` the halt-recovery harnesses arm from genesis, so
 /// the root splits exactly once and the grown pair holds through the
 /// halt.
-#[must_use]
-pub fn halt_recovery_split_bytes() -> u64 {
+fn halt_recovery_split_bytes() -> u64 {
     stdlib_flash_bytes() + HALT_RECOVERY_BAND
+}
+
+/// The halt-recovery topology both harnesses run.
+///
+/// A single-shard genesis whose funded root splits exactly once, leaving a
+/// live sibling to carry the beacon through the folds that detect a stalled
+/// shard. The pool holds
+/// two cohorts, one to grow the root and one to recover the halted shard,
+/// plus jail slack: the recovery draw needs a full free committee, and an
+/// organic `Performance` jail over the long run refills its seat from the
+/// pool, which with no slack would starve the draw and park the recovery.
+#[must_use]
+pub fn halt_recovery_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 14,
+        num_shards: 1,
+        split_bytes: halt_recovery_split_bytes(),
+        latency: Duration::from_millis(150),
+    }
 }
 
 /// Build the halted-shard straddler genesis funding and probe transfers.
