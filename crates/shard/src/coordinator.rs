@@ -9768,7 +9768,7 @@ impl ShardCoordinator {
         // entry that always has the schedule in hand — so the fresh
         // committee holds the parent QC for its first block even when no
         // peer signal ever supplies a higher one.
-        let mut actions = self.release_stalled_harvest();
+        let mut actions = self.release_stalled_harvest(topology_schedule);
         actions.extend(self.try_adopt_anchor_qc(topology_schedule));
         // Seat the keeper on the tip committee the anchor or the seating
         // window may have just moved, so a fall-back's leader-activity
@@ -9798,24 +9798,38 @@ impl ShardCoordinator {
         actions
     }
 
-    /// Lift the proposal hold when the harvest it waits on has stalled:
-    /// `HALT_HARVEST_WAIT` with no synced block applied since the tip was
-    /// offered. A cohort that offers a tip and then serves none of it
-    /// past this point holds a tail nobody can serve — a block the halted
-    /// chain certified without any member keeping its body. The tip goes
-    /// unreachable, the sync settles at what it reached, the anchor is
-    /// adopted on this same tick if nothing applied, and the committee
-    /// builds on what it holds. Re-offers of the same tip change nothing;
-    /// a higher offer reopens the harvest, and once the committee has
-    /// certified a block of its own the harvest refuses offers instead.
-    fn release_stalled_harvest(&mut self) -> Vec<Action> {
+    /// Lift the proposal hold when the harvest it waits on can no longer
+    /// deliver the offered tip.
+    ///
+    /// It has stalled: `HALT_HARVEST_WAIT` with no synced block applied
+    /// since the tip was offered. A cohort that offers a tip and then
+    /// serves none of it past this point holds a tail nobody can serve —
+    /// a block the halted chain certified without any member keeping its
+    /// body.
+    ///
+    /// Or the fresh chain has left the bridge: `high_qc` is one the fresh
+    /// committee formed, so the halted tail above it is abandoned, as
+    /// [`Self::harvest_retained_tip`] abandons it for later offers. The
+    /// fresh chain's blocks reach this member by the same sync, and each
+    /// one applied counts as progress, so a member whose stall had not
+    /// yet fired when a peer released and built would otherwise go on
+    /// syncing toward a tip that chain does not hold, outside the vote,
+    /// for as long as the fresh chain keeps growing.
+    ///
+    /// Either way the tip goes unreachable, the sync settles at what it
+    /// reached, the anchor is adopted on this same tick if nothing
+    /// applied, and the committee builds on what it holds. Re-offers of
+    /// the same tip change nothing; a higher offer reopens the harvest
+    /// while the fresh chain still rides the bridge, and is refused once
+    /// it has left it.
+    fn release_stalled_harvest(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         if !self.recovery_behind_retained_tip() {
             return Vec::new();
         }
         let stalled = self
             .halt_harvest_progress
             .is_some_and(|since| self.now.saturating_sub(since) >= HALT_HARVEST_WAIT);
-        if !stalled {
+        if !stalled && self.qc_past_bridge(topology_schedule).is_none() {
             return Vec::new();
         }
         let Some(RetainedTip::Offered(offered)) = self.retained_tip else {
@@ -20696,6 +20710,29 @@ mod tests {
         let below_view = member_timeout(&keys, Round::new(1), &halted_qc);
         let _ = state.on_unverified_timeout(&schedule, &below_view);
         assert_eq!(state.high_qc_round(), Round::new(7));
+    }
+
+    /// A harvest still under way when the fresh chain leaves the bridge
+    /// is released on the next tick, however recently it applied: the
+    /// fresh chain's own blocks reach this member through the harvest
+    /// sync and would otherwise keep its stall clock from ever firing.
+    #[test]
+    fn a_harvest_is_released_once_the_fresh_chain_left_the_bridge() {
+        let (mut state, schedule, _, _, _) = fresh_chain_past_the_bridge();
+        state.retained_tip = Some(RetainedTip::Offered(BlockHeight::new(20)));
+        state.halt_harvest_progress = Some(state.now);
+        assert!(state.recovery_behind_retained_tip());
+
+        let actions = state.check_sync_health(&schedule);
+        assert!(!state.recovery_behind_retained_tip());
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::SettleBlockSync)),
+            "the sync settles at what it reached; got {actions:?}"
+        );
+        assert_eq!(
+            state.retained_tip,
+            Some(RetainedTip::Unreachable(BlockHeight::new(20)))
+        );
     }
 
     /// Once the fresh chain has certified past the bridge, a signer
