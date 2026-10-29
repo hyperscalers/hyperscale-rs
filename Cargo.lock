@@ -2406,6 +2406,7 @@ dependencies = [
  "hyperscale-network",
  "hyperscale-network-iroh",
  "hyperscale-node",
+ "hyperscale-production",
  "hyperscale-provisions",
  "hyperscale-scenarios",
  "hyperscale-shard",

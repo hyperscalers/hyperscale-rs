@@ -11,19 +11,24 @@ pub mod harness;
 pub mod prod_cluster;
 
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_dispatch_pooled::ThreadPoolConfig;
+use hyperscale_engine::GenesisConfig;
+use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::{EndpointAddr, IrohConfig, SecretKey};
 use hyperscale_production::{
-    LocalValidator, ProductionRunner, StorageDirResolver, StorageFactory, shard_data_dir,
+    LocalValidator, Node, NodeSetup, StorageDirResolver, StorageFactory, shard_data_dir,
 };
+use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::BeaconStorage;
-use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
-use hyperscale_types::{BeaconChainConfig, ShardId, ValidatorId, shard_prefix_path};
+use hyperscale_storage_rocksdb::{RocksDbConfig, RocksDbShardStorage};
+use hyperscale_types::{
+    BeaconChainConfig, GenesisValidators, ShardId, ValidatorId, shard_prefix_path,
+};
 #[allow(unused_imports)] // the lifecycle binaries compile support but never drive the adaptor
 pub use prod_cluster::ProdCluster;
 use tempfile::TempDir;
@@ -47,45 +52,83 @@ pub fn test_config(
     }
 }
 
-/// Build a one-host production runner hosting `validators` (indices into
-/// `fixtures`' deterministic keys), bootstrapped to `bootstrap_peers`. The
-/// adapter binds localhost QUIC and starts peering at build; the caller spawns
-/// the runner. Returns the runner, the temp dir its stores live in (keep it
-/// alive for the runner's lifetime), and its beacon store for tests that read
-/// committed beacon state.
-pub fn build_runner(
-    fixtures: &TestFixtures,
-    validators: &[u32],
-    bootstrap_peers: Vec<EndpointAddr>,
-    beacon_chain_config: Option<BeaconChainConfig>,
-) -> (ProductionRunner, TempDir, Arc<RocksDbBeaconStorage>) {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let network_config = test_config(&SecretKey::generate(), bootstrap_peers, Duration::ZERO);
-    let beacon_storage = Arc::new(
-        RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).expect("open beacon db"),
-    );
-    let local_validators = validators
+/// A test host's setup: the given identity and network, on minimal thread
+/// pools, a two-worker runtime and default stores, with every protocol
+/// setting at its default.
+pub fn test_setup(
+    data_dir: PathBuf,
+    validators: Vec<LocalValidator>,
+    genesis: GenesisValidators,
+    beacon_chain: BeaconChainConfig,
+    engine_genesis: GenesisConfig,
+    transport: IrohConfig,
+) -> NodeSetup {
+    NodeSetup {
+        data_dir,
+        validators,
+        genesis,
+        engine_genesis,
+        beacon_chain,
+        shard_consensus: ShardConsensusConfig::default(),
+        mempool: MempoolConfig::default(),
+        provisions: ProvisionConfig::default(),
+        transport,
+        threads: ThreadPoolConfig::minimal(),
+        io_threads: 2,
+        storage: RocksDbConfig::default(),
+    }
+}
+
+/// `validators` (indices into `fixtures`' deterministic keys) with their
+/// signers.
+pub fn local_validators(fixtures: &TestFixtures, validators: &[u32]) -> Vec<LocalValidator> {
+    validators
         .iter()
         .map(|&i| LocalValidator {
             validator_id: ValidatorId::new(u64::from(i)),
             signer: fixtures.signer(i),
         })
-        .collect();
-    let beacon_reader: Arc<dyn BeaconStorage> = beacon_storage.clone();
-    let mut builder = ProductionRunner::builder(
-        local_validators,
+        .collect()
+}
+
+/// Start a one-host node at `data_dir` hosting `validators` of `fixtures`'
+/// network on `beacon_chain`, bootstrapped to `bootstrap_peers` from a fresh
+/// network key.
+pub fn start_host_at(
+    data_dir: &Path,
+    fixtures: &TestFixtures,
+    validators: &[u32],
+    bootstrap_peers: Vec<EndpointAddr>,
+    beacon_chain: BeaconChainConfig,
+) -> Node {
+    Node::start(test_setup(
+        data_dir.to_path_buf(),
+        local_validators(fixtures, validators),
         fixtures.genesis_validators(),
-        ShardConsensusConfig::default(),
-        beacon_reader,
-        network_config,
-        temp_storage_factory(),
-        temp_storage_dir(&temp_dir),
+        beacon_chain,
+        GenesisConfig::default(),
+        test_config(&SecretKey::generate(), bootstrap_peers, Duration::ZERO),
+    ))
+    .expect("start the host")
+}
+
+/// [`start_host_at`] in a fresh temp dir, returned with the node: keep it
+/// alive for the node's life.
+pub fn start_host(
+    fixtures: &TestFixtures,
+    validators: &[u32],
+    bootstrap_peers: Vec<EndpointAddr>,
+    beacon_chain: BeaconChainConfig,
+) -> (Node, TempDir) {
+    let dir = TempDir::new().expect("temp dir");
+    let node = start_host_at(
+        dir.path(),
+        fixtures,
+        validators,
+        bootstrap_peers,
+        beacon_chain,
     );
-    if let Some(cfg) = beacon_chain_config {
-        builder = builder.beacon_chain_config(cfg);
-    }
-    let runner = builder.build().expect("build runner");
-    (runner, temp_dir, beacon_storage)
+    (node, dir)
 }
 
 /// Storage-directory resolver rooted in the test's temp dir. Runtime-joined

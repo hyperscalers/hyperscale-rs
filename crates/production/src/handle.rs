@@ -25,6 +25,8 @@ use crate::observe::{HeaderSummary, Observation};
 use crate::rpc::NodeStatusState;
 use crate::rpc::state::{MempoolSnapshot, PreviewSender, RpcPublishers, TxSubmissionSender};
 use crate::status::SyncStatus;
+#[cfg(feature = "test-utils")]
+use crate::testing::ProbeState;
 use crate::{LocalValidator, RunnerCommand};
 
 /// Everything a handle's calls reach. The host's `Node` holds the one
@@ -41,6 +43,9 @@ pub struct HostCalls {
     pub commands: mpsc::Sender<RunnerCommand>,
     /// The host's own runtime, which runs a preview's blocking work.
     pub runtime: RuntimeHandle,
+    /// What a probe reaches; `None` for a host built without one.
+    #[cfg(feature = "test-utils")]
+    pub probe: Option<ProbeState>,
 }
 
 /// A running host, as its embedder calls it. Cloning is cheap, and a clone
@@ -63,7 +68,7 @@ impl NodeHandle {
     /// Runs `call` on the host while the gate admits it. The strong
     /// reference taken here drops before the entry does, so the host's
     /// last one is never a caller's.
-    fn with<T>(&self, call: impl FnOnce(&HostCalls) -> T) -> Option<T> {
+    pub(crate) fn with<T>(&self, call: impl FnOnce(&HostCalls) -> T) -> Option<T> {
         let _entry = self.gate.enter()?;
         let calls = self.calls.upgrade()?;
         Some(call(&calls))
@@ -289,6 +294,8 @@ pub mod test_support {
             peers: Box::new(|| 0),
             commands: mpsc::channel(1).0,
             runtime: RuntimeHandle::current(),
+            #[cfg(feature = "test-utils")]
+            probe: None,
         });
         let handle = NodeHandle::new(&calls, Arc::new(Gate::new()));
         (calls, handle)

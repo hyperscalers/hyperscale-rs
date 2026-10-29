@@ -13,19 +13,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsSigner;
-use hyperscale_network_iroh::IrohAdapter;
 use hyperscale_network_iroh::test_utils::TestFixtures;
-use hyperscale_production::{AddValidatorError, LocalValidator, RunnerCommand, ShardCommand};
+use hyperscale_production::testing::{RunnerCommand, ShardCommand};
+use hyperscale_production::{AddValidatorError, LocalValidator, Node, NodeHandle};
 use hyperscale_storage::BeaconChainReader;
+use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     BeaconChainConfig, BlockHash, Epoch, RecoveryCause, ReshapeThresholds, ShardId, ShardRecovery,
     ValidatorId,
 };
 use serial_test::serial;
 use support::harness::{ClusterSpec, Harness, HostSpec};
-use support::{CONNECTION_TIMEOUT, build_runner, temp_storage_dir, temp_storage_factory};
+use support::{
+    CONNECTION_TIMEOUT, start_host, start_host_at, temp_storage_dir, temp_storage_factory,
+};
+use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -34,39 +37,67 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry, fmt};
 
-/// Waits for the runner to seat the root shard: the supervisor brings a
-/// startup shard up on its own thread after `run` is spawned.
-async fn seated_on_root(adapter: &IrohAdapter) {
+/// Whether the running host's transport carries `shard`.
+fn hosts(handle: &NodeHandle, shard: ShardId) -> bool {
+    handle
+        .probe(|p| p.network().local_shards().contains(&shard))
+        .expect("the host runs")
+}
+
+/// Whether the running host's transport carries no shard at all.
+fn hosts_nothing(handle: &NodeHandle) -> bool {
+    handle
+        .probe(|p| p.network().local_shards().is_empty())
+        .expect("the host runs")
+}
+
+/// Waits until the running host carries `shard` exactly when `seated`.
+async fn await_hosts(handle: &NodeHandle, shard: ShardId, seated: bool, what: &str) {
     timeout(CONNECTION_TIMEOUT, async {
-        while !adapter.local_shards().contains(&ShardId::ROOT) {
+        while hosts(handle, shard) != seated {
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the runner seats the root shard at startup");
+    .expect(what);
 }
 
-/// A single-validator runner builds against real networking, listens on
-/// localhost QUIC, and exits cleanly (returning `Ok`) when its shutdown
-/// handle drops.
+/// Waits for the host to seat the root shard: the supervisor brings a
+/// startup shard up on its own thread once the runner runs.
+async fn seated_on_root(handle: &NodeHandle) {
+    await_hosts(
+        handle,
+        ShardId::ROOT,
+        true,
+        "the runner seats the root shard at startup",
+    )
+    .await;
+}
+
+/// Stops `node` within the graceful-shutdown budget and expects it to
+/// stop cleanly.
+async fn stop_cleanly(node: Node, after: &str) {
+    let stopped = timeout(Duration::from_secs(5), node.stop())
+        .await
+        .unwrap_or_else(|_| panic!("the host stops within the budget {after}"));
+    assert!(
+        stopped.is_ok(),
+        "the host stops cleanly {after}: {stopped:?}"
+    );
+}
+
+/// A single-validator host starts against real networking, listens on
+/// localhost QUIC, and stops cleanly (returning `Ok`).
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn runner_boots_listens_and_shuts_down_cleanly() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(42, 1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[0], vec![], None);
+    let (node, _dir) = start_host(&fixtures, &[0], vec![], BeaconChainConfig::default());
 
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
     sleep(Duration::from_millis(200)).await;
-    drop(shutdown);
-
-    let joined = timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("runner exits within the graceful-shutdown budget")
-        .expect("runner task joins");
-    assert!(joined.is_ok(), "runner returns Ok on shutdown");
+    stop_cleanly(node, "on shutdown").await;
 }
 
 /// Runtime shard teardown through the supervisor: a runner seated on the root
@@ -80,38 +111,31 @@ async fn runtime_shard_leave_tears_down() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(43, 1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[0], vec![], None);
-
-    let adapter = Arc::clone(runner.network());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
-    seated_on_root(&adapter).await;
+    let (node, _dir) = start_host(&fixtures, &[0], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
+    seated_on_root(&handle).await;
 
     // Leave the root shard: the single vnode departing tears the shard down.
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Leave {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: ValidatorId::new(0),
         }))
         .await
         .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("left shard is removed from the adapter");
+    await_hosts(
+        &handle,
+        ShardId::ROOT,
+        false,
+        "left shard is removed from the adapter",
+    )
+    .await;
     assert!(
-        adapter.local_shards().is_empty(),
+        hosts_nothing(&handle),
         "the host hosts no shard after leaving the root"
     );
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the leave");
-    assert!(result.unwrap().is_ok(), "runner returns Ok");
+    stop_cleanly(node, "after the leave").await;
 }
 
 /// A leave names the signer it detaches. With two signers attached on the
@@ -124,17 +148,13 @@ async fn a_leave_detaches_the_signer_it_names() {
     let _ = fmt().with_test_writer().try_init();
 
     let fixtures = TestFixtures::new(44, 2);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
-
-    let adapter = Arc::clone(runner.network());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
-    seated_on_root(&adapter).await;
+    let (node, _dir) = start_host(&fixtures, &[0, 1], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
+    seated_on_root(&handle).await;
 
     for _ in 0..2 {
-        reconfigure
-            .send(RunnerCommand::Shard(ShardCommand::Leave {
+        handle
+            .command(RunnerCommand::Shard(ShardCommand::Leave {
                 shard: ShardId::ROOT,
                 validator: ValidatorId::new(1),
             }))
@@ -143,28 +163,27 @@ async fn a_leave_detaches_the_signer_it_names() {
     }
     sleep(Duration::from_millis(500)).await;
     assert!(
-        adapter.local_shards().contains(&ShardId::ROOT),
+        hosts(&handle, ShardId::ROOT),
         "the shard stays up for the signer that did not leave"
     );
 
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Leave {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: ValidatorId::new(0),
         }))
         .await
         .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the last signer leaving tears the shard down");
+    await_hosts(
+        &handle,
+        ShardId::ROOT,
+        false,
+        "the last signer leaving tears the shard down",
+    )
+    .await;
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the leaves");
+    let stopped = timeout(Duration::from_secs(5), node.stop()).await;
+    assert!(stopped.is_ok(), "the host stops after the leaves");
 }
 
 /// A validator the beacon genesis leaves `Pooled` — registered in the global
@@ -182,47 +201,37 @@ async fn pooled_validator_boots_as_follower_only_host() {
     // the genesis committee never seats.
     let fixtures = TestFixtures::with_surplus(44, 1, 1);
     let surplus = ValidatorId::new(1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
+    let (node, _dir) = start_host(&fixtures, &[1], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
 
-    // Derivation seated nothing: the host carries no shard before it runs.
+    // Derivation seated nothing: the host carries no shard as it starts.
     assert!(
-        runner.network().local_shards().is_empty(),
+        hosts_nothing(&handle),
         "a pooled validator seats no shard at startup"
     );
-
-    let adapter = Arc::clone(runner.network());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
     sleep(Duration::from_millis(200)).await;
 
     // Still hosts no shard while the beacon thread runs its follower.
-    assert!(
-        adapter.local_shards().is_empty(),
-        "follower-only host hosts no shard"
-    );
+    assert!(hosts_nothing(&handle), "follower-only host hosts no shard");
 
     // Seat the pooled validator onto ROOT: the supervisor opens the store,
     // brings the shard up, and retires the validator's beacon-loop follower.
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Join {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
         }))
         .await
         .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while !adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("seated shard becomes hosted on the adapter");
+    await_hosts(
+        &handle,
+        ShardId::ROOT,
+        true,
+        "seated shard becomes hosted on the adapter",
+    )
+    .await;
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after seating");
-    assert!(result.unwrap().is_ok(), "runner returns Ok");
+    stop_cleanly(node, "after seating").await;
 }
 
 /// Leaving a shard releases its store: a host that leaves a shard and is
@@ -250,28 +259,18 @@ async fn leaving_a_shard_releases_its_store() {
 
     let fixtures = TestFixtures::with_surplus(45, 1, 1);
     let surplus = ValidatorId::new(1);
-    let (mut runner, dir, _) = build_runner(&fixtures, &[1], vec![], None);
-
-    let adapter = Arc::clone(runner.network());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
+    let (node, dir) = start_host(&fixtures, &[1], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
     sleep(Duration::from_millis(200)).await;
 
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Join {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
         }))
         .await
         .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while !adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the join seats the shard");
+    await_hosts(&handle, ShardId::ROOT, true, "the join seats the shard").await;
 
     // The lock is what the reopen below measures: while the shard is
     // hosted, its thread holds it and a second opener is refused.
@@ -282,20 +281,20 @@ async fn leaving_a_shard_releases_its_store() {
         "a hosted shard holds its store's lock",
     );
 
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Leave {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: surplus,
         }))
         .await
         .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the left shard is removed from the adapter");
+    await_hosts(
+        &handle,
+        ShardId::ROOT,
+        false,
+        "the left shard is removed from the adapter",
+    )
+    .await;
 
     let reopened = timeout(CONNECTION_TIMEOUT, async {
         loop {
@@ -309,16 +308,12 @@ async fn leaving_a_shard_releases_its_store() {
     .expect("leaving the shard releases its store for a reopen");
     drop(reopened);
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the leave");
-    assert!(result.unwrap().is_ok(), "runner returns Ok");
+    stop_cleanly(node, "after the leave").await;
 }
 
-/// The `beacon_chain_config` builder setter threads a custom config through into
-/// the committed beacon genesis state. Every other production test leaves the
-/// setter unused and is unaffected: a custom `epoch_duration_ms` and reshape
-/// `split_bytes` reach the genesis state only when set explicitly.
+/// A host's beacon chain config reaches the committed beacon genesis state:
+/// a custom `epoch_duration_ms` and reshape `split_bytes` are what the
+/// genesis state carries.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn beacon_chain_config_reaches_genesis() {
@@ -333,12 +328,14 @@ async fn beacon_chain_config_reaches_genesis() {
         },
         ..BeaconChainConfig::default()
     };
-    let (_runner, _dir, beacon_storage) = build_runner(&fixtures, &[0], vec![], Some(chain_config));
+    let (node, _dir) = start_host(&fixtures, &[0], vec![], chain_config);
 
-    // Build commits the genesis (block, state) pair into the beacon store.
-    let (_block, state) = beacon_storage
+    // The start commits the genesis (block, state) pair into the beacon store.
+    let (_block, state) = node
+        .handle()
+        .history()
         .latest_committed()
-        .expect("genesis pair committed at build time");
+        .expect("genesis pair committed at start");
     assert_eq!(
         state.chain_config.epoch_duration_ms, 45_000,
         "custom epoch duration reaches the beacon genesis state"
@@ -347,6 +344,76 @@ async fn beacon_chain_config_reaches_genesis() {
         state.params.reshape_thresholds.split_bytes, 50_000,
         "custom split threshold seeds the live network params at genesis"
     );
+    stop_cleanly(node, "after reading its genesis").await;
+}
+
+/// A probe reaches a running host and nothing once it has stopped, its
+/// derivation included; the stop closes every store, so a host started
+/// again on the same directory opens them.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_probe_answers_nothing_once_its_host_stops() {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::new(48, 1);
+    let dir = TempDir::new().expect("temp dir");
+    let node = start_host_at(
+        dir.path(),
+        &fixtures,
+        &[0],
+        vec![],
+        BeaconChainConfig::default(),
+    );
+    let handle = node.handle();
+    seated_on_root(&handle).await;
+    let holds_root = |handle: &NodeHandle| {
+        handle
+            .probe(|p| p.shard_store(ShardId::ROOT, |_| ()).is_some())
+            .unwrap_or(false)
+    };
+    timeout(CONNECTION_TIMEOUT, async {
+        while !holds_root(&handle) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the running host holds its root store");
+    let transaction = test_transaction(1);
+    assert!(
+        handle
+            .probe(|p| p.derivation().declared(transaction.body()).is_ok())
+            .is_some(),
+        "a running host lends its derivation"
+    );
+
+    stop_cleanly(node, "before the restart").await;
+    assert!(
+        handle.probe(|_| ()).is_none(),
+        "a stopped host answers no probe"
+    );
+    assert!(
+        handle
+            .probe(|p| p.derivation().declared(transaction.body()).is_ok())
+            .is_none(),
+        "a stopped host lends no derivation"
+    );
+
+    let node = start_host_at(
+        dir.path(),
+        &fixtures,
+        &[0],
+        vec![],
+        BeaconChainConfig::default(),
+    );
+    let handle = node.handle();
+    timeout(CONNECTION_TIMEOUT, async {
+        while !holds_root(&handle) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the restarted host opens the stores its first run left");
+    stop_cleanly(node, "after the restart").await;
 }
 
 /// The epoch the restart and recovery tests run, the shortest a chain may,
@@ -544,16 +611,12 @@ async fn a_join_for_a_running_shard_attaches_to_its_replica() {
     // host, is left pooled.
     let fixtures = TestFixtures::with_surplus(46, 1, 1);
     let surplus = ValidatorId::new(1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
+    let (node, _dir) = start_host(&fixtures, &[0, 1], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
+    seated_on_root(&handle).await;
 
-    let adapter = Arc::clone(runner.network());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
-    seated_on_root(&adapter).await;
-
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Join {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
         }))
@@ -577,15 +640,12 @@ async fn a_join_for_a_running_shard_attaches_to_its_replica() {
         .await
         .expect(what);
         assert!(
-            adapter.local_shards().contains(&ShardId::ROOT),
+            hosts(&handle, ShardId::ROOT),
             "the shard stays up across its signer changes"
         );
     }
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the signer changes");
-    assert!(result.unwrap().is_ok(), "runner returns Ok");
+    stop_cleanly(node, "after the signer changes").await;
 }
 
 /// A leave for a validator whose attach is still on its way to the
@@ -600,24 +660,20 @@ async fn a_leave_for_a_queued_validator_detaches_it() {
 
     let fixtures = TestFixtures::with_surplus(47, 1, 1);
     let surplus = ValidatorId::new(1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
-
-    let adapter = Arc::clone(runner.network());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
-    seated_on_root(&adapter).await;
+    let (node, _dir) = start_host(&fixtures, &[0, 1], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
+    seated_on_root(&handle).await;
 
     // Both before the loop can report the attach back: the supervisor
     // takes commands ahead of the events its loops send.
-    reconfigure
-        .try_send(RunnerCommand::Shard(ShardCommand::Join {
+    handle
+        .try_command(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
         }))
         .expect("supervisor accepts commands");
-    reconfigure
-        .try_send(RunnerCommand::Shard(ShardCommand::Leave {
+    handle
+        .try_command(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: surplus,
         }))
@@ -633,26 +689,25 @@ async fn a_leave_for_a_queued_validator_detaches_it() {
         !messages.contains("Leave rejected"),
         "a leave for a queued validator is not refused"
     );
-    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+    assert!(hosts(&handle, ShardId::ROOT));
 
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Leave {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: ValidatorId::new(0),
         }))
         .await
         .expect("supervisor accepts commands");
-    timeout(CONNECTION_TIMEOUT, async {
-        while adapter.local_shards().contains(&ShardId::ROOT) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the last signer leaving tears the shard down");
+    await_hosts(
+        &handle,
+        ShardId::ROOT,
+        false,
+        "the last signer leaving tears the shard down",
+    )
+    .await;
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after the leaves");
+    let stopped = timeout(Duration::from_secs(5), node.stop()).await;
+    assert!(stopped.is_ok(), "the host stops after the leaves");
 }
 
 /// A join for a running shard under a fork recovery, whose store has
@@ -764,15 +819,17 @@ async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
 
     let fixtures = TestFixtures::with_surplus(47, 1, 1);
     let surplus = ValidatorId::new(1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
-
-    let topology = Arc::clone(runner.topology_snapshot());
-    let reconfigure = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
+    let (node, _dir) = start_host(&fixtures, &[1], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
     sleep(Duration::from_millis(200)).await;
 
-    let projected = topology.load_full();
+    let (topology, projected) = handle
+        .probe(|p| {
+            let topology = p.topology();
+            let projected = topology.load_full();
+            (topology, projected)
+        })
+        .expect("the host runs");
     assert!(
         projected.boundary(ShardId::ROOT).is_none() && projected.genesis_unanchored(ShardId::ROOT),
         "the beacon projects a genesis shard with no crossing as a genesis replay"
@@ -783,8 +840,8 @@ async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
             .with_genesis_unanchored(BTreeSet::new()),
     ));
 
-    reconfigure
-        .send(RunnerCommand::Shard(ShardCommand::Join {
+    handle
+        .command(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
         }))
@@ -826,14 +883,21 @@ async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
         .expect(what);
     }
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits after seating");
-    assert!(result.unwrap().is_ok(), "runner returns Ok");
+    stop_cleanly(node, "after seating").await;
 }
 
 /// What a running host answers an add of `validator` with.
-async fn add(
+async fn add(handle: &NodeHandle, validator: LocalValidator) -> Result<(), AddValidatorError> {
+    let (reply, answer) = oneshot::channel();
+    handle
+        .command(RunnerCommand::AddValidator { validator, reply })
+        .await
+        .expect("the runner takes commands");
+    answer.await.expect("the runner answers an add")
+}
+
+/// [`add`] through a host's command sender.
+async fn add_through(
     commands: &mpsc::Sender<RunnerCommand>,
     validator: LocalValidator,
 ) -> Result<(), AddValidatorError> {
@@ -855,17 +919,14 @@ async fn a_running_host_takes_on_a_validator_and_refuses_what_it_cannot() {
 
     // Validator 0 seated on ROOT, validator 1 registered and pooled.
     let fixtures = TestFixtures::with_surplus(45, 1, 1);
-    let (mut runner, _dir, _) = build_runner(&fixtures, &[0], vec![], None);
-    let adapter = Arc::clone(runner.network());
-    let commands = runner.reconfigure_handle();
-    let shutdown = runner.shutdown_handle().expect("shutdown handle");
-    let handle = spawn(runner.run());
+    let (node, _dir) = start_host(&fixtures, &[0], vec![], BeaconChainConfig::default());
+    let handle = node.handle();
     sleep(Duration::from_millis(200)).await;
 
     let registered = ValidatorId::new(1);
     assert_eq!(
         add(
-            &commands,
+            &handle,
             LocalValidator {
                 validator_id: registered,
                 signer: Arc::new(BlsSigner::generate()),
@@ -877,7 +938,7 @@ async fn a_running_host_takes_on_a_validator_and_refuses_what_it_cannot() {
     );
     assert_eq!(
         add(
-            &commands,
+            &handle,
             LocalValidator {
                 validator_id: registered,
                 signer: fixtures.signer(1),
@@ -887,13 +948,15 @@ async fn a_running_host_takes_on_a_validator_and_refuses_what_it_cannot() {
         Ok(()),
     );
     assert_eq!(
-        adapter.local_validator_ids(),
+        handle
+            .probe(|p| p.network().local_validator_ids())
+            .expect("the host runs"),
         vec![ValidatorId::new(0), registered],
         "the transport attests it from now on"
     );
     assert_eq!(
         add(
-            &commands,
+            &handle,
             LocalValidator {
                 validator_id: registered,
                 signer: fixtures.signer(1),
@@ -906,7 +969,7 @@ async fn a_running_host_takes_on_a_validator_and_refuses_what_it_cannot() {
     let unregistered = ValidatorId::new(9);
     assert_eq!(
         add(
-            &commands,
+            &handle,
             LocalValidator {
                 validator_id: unregistered,
                 signer: Arc::new(BlsSigner::generate()),
@@ -917,9 +980,8 @@ async fn a_running_host_takes_on_a_validator_and_refuses_what_it_cannot() {
         "a validator not yet registered is taken; peers bind it once they fold it"
     );
 
-    drop(shutdown);
-    let result = timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "runner exits");
+    let stopped = timeout(Duration::from_secs(5), node.stop()).await;
+    assert!(stopped.is_ok(), "the host stops");
 }
 
 /// A validator added to one running host of a cluster is bound by the
@@ -959,7 +1021,7 @@ async fn a_validator_added_to_a_running_host_is_bound_by_its_peers() {
     .await
     .expect("ROOT commits");
 
-    assert_eq!(add(&cluster.reconfigure(1), local(4)).await, Ok(()));
+    assert_eq!(add_through(&cluster.reconfigure(1), local(4)).await, Ok(()));
     let before = height(&cluster);
     let host1 = cluster.adapter(1).local_endpoint_id();
     timeout(CONNECTION_TIMEOUT, async {
