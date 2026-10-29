@@ -24,10 +24,10 @@ use crate::node::NodeError;
 use crate::observe::{HeaderSummary, Observation};
 use crate::rpc::NodeStatusState;
 use crate::rpc::state::{MempoolSnapshot, PreviewSender, RpcPublishers, TxSubmissionSender};
+use crate::runner::{LocalValidator, RunnerCommand};
 use crate::status::SyncStatus;
 #[cfg(feature = "test-utils")]
 use crate::testing::ProbeState;
-use crate::{LocalValidator, RunnerCommand};
 
 /// Everything a handle's calls reach. The host's `Node` holds the one
 /// strong reference and drops it only once the gate has closed and every

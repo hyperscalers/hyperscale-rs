@@ -66,8 +66,6 @@ pub use hyperscale_storage::BeaconChainReader;
 pub use network_file::{NetworkFile, NetworkFileError};
 pub use node::{DEFAULT_BLOCK_CACHE_MB, Node, NodeError, NodeSetup, beacon_data_dir};
 pub use observe::{Answers, HeaderSummary, Observation};
-pub use runner::{LocalValidator, ProductionRunner, RunnerCommand, RunnerError, ShutdownHandle};
-pub use supervisor::{
-    AddValidatorError, ShardCommand, StorageDirResolver, StorageFactory, shard_data_dir,
-};
+pub use runner::{LocalValidator, RunnerError, ShutdownHandle};
+pub use supervisor::{AddValidatorError, shard_data_dir};
 pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

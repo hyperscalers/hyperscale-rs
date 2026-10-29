@@ -47,9 +47,11 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
+#[cfg(feature = "test-utils")]
+use hyperscale_types::Derivation;
 use hyperscale_types::{
-    BeaconChainConfig, Derivation, GenesisValidators, LocalTimestamp, NetworkDefinition, ShardId,
-    Signer, StakePoolSeat, Transaction, ValidatorId,
+    BeaconChainConfig, GenesisValidators, LocalTimestamp, NetworkDefinition, ShardId, Signer,
+    StakePoolSeat, Transaction, ValidatorId,
 };
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
@@ -58,8 +60,8 @@ use tokio::task::block_in_place;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, error, info};
 
+use crate::rpc::TxSubmissionSender;
 use crate::rpc::state::{PreviewSender, RpcPublishers};
-use crate::rpc::{NodeStatusState, TxSubmissionSender};
 use crate::shard_thread::ShardChannels;
 use crate::supervisor::{
     AddValidatorError, LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory,
@@ -117,6 +119,7 @@ impl Drop for ShutdownHandle {
 /// A command to the running host, executed on the runner's loop.
 pub enum RunnerCommand {
     /// A shard-membership change.
+    #[cfg(feature = "test-utils")]
     Shard(ShardCommand),
     /// Take on another validator; the reply says whether it did.
     AddValidator {
@@ -190,9 +193,8 @@ pub struct LocalValidator {
 
 /// Builder for constructing a [`ProductionRunner`].
 ///
-/// Required fields are passed directly to
-/// [`ProductionRunner::builder`](crate::ProductionRunner::builder); optional
-/// fields are set via `&mut self` chained setters and then [`Self::build`]
+/// Required fields are passed directly to [`ProductionRunner::builder`];
+/// optional fields are set via `&mut self` chained setters and then [`Self::build`]
 /// is called.
 ///
 /// Required fields (taken at construction):
@@ -210,7 +212,6 @@ pub struct LocalValidator {
 ///
 /// Optional fields:
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
-/// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 pub struct ProductionRunnerBuilder {
     validators: Vec<LocalValidator>,
     genesis_validators: GenesisValidators,
@@ -218,7 +219,6 @@ pub struct ProductionRunnerBuilder {
     beacon_storage: Arc<dyn BeaconStorage>,
     network_config: IrohConfig,
     dispatch: Option<Arc<PooledDispatch>>,
-    channel_capacity: usize,
     /// Opens a runtime-joined shard's `RocksDB` storage.
     storage_factory: StorageFactory,
     /// Resolves a shard's storage directory for split-flip seeding.
@@ -226,9 +226,6 @@ pub struct ProductionRunnerBuilder {
     publishers: RpcPublishers,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
-    /// Network definition for transaction validation.
-    /// Defaults to simulator network if not set.
-    network_definition: Option<NetworkDefinition>,
     /// Mempool configuration.
     mempool_config: MempoolConfig,
     /// Provision coordinator configuration.
@@ -268,10 +265,8 @@ impl ProductionRunnerBuilder {
             beacon_storage,
             network_config,
             dispatch: None,
-            channel_capacity: 10_000,
             publishers: RpcPublishers::default(),
             genesis_config: None,
-            network_definition: None,
             // Harness default: the routing overlay runs in production
             // tests; the validator binary always overrides this from its
             // config file, where the overlay defaults off.
@@ -283,24 +278,10 @@ impl ProductionRunnerBuilder {
         }
     }
 
-    /// Set the network definition for transaction validation.
-    #[must_use]
-    pub fn network_definition(mut self, network: NetworkDefinition) -> Self {
-        self.network_definition = Some(network);
-        self
-    }
-
     /// Set the dispatch implementation (optional, defaults to auto-configured pools).
     #[must_use]
     pub fn dispatch(mut self, dispatch: Arc<PooledDispatch>) -> Self {
         self.dispatch = Some(dispatch);
-        self
-    }
-
-    /// Set the event channel capacity (default: 10,000).
-    #[must_use]
-    pub const fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.channel_capacity = capacity;
         self
     }
 
@@ -565,13 +546,10 @@ impl ProductionRunnerBuilder {
             })
             .collect();
         let identities: Vec<(ValidatorId, Arc<dyn Signer>)> = bind_vnodes.clone();
-        let network_definition = self
-            .network_definition
-            .unwrap_or_else(NetworkDefinition::simulator);
 
         let NetworkStack { adapter, network } = build_network_stack(NetworkBuildArgs {
             network_config,
-            network: network_definition,
+            network: NetworkDefinition::simulator(),
             local_shards: local_shards.clone(),
             bind_vnodes,
             initial_validator_keys,
@@ -753,12 +731,6 @@ impl ProductionRunner {
         )
     }
 
-    /// Get a reference to the dispatch implementation.
-    #[must_use]
-    pub const fn dispatch(&self) -> &Arc<PooledDispatch> {
-        &self.dispatch
-    }
-
     /// Get a reference to the network adapter.
     #[must_use]
     pub const fn network(&self) -> &Arc<IrohAdapter> {
@@ -766,6 +738,7 @@ impl ProductionRunner {
     }
 
     /// The topology snapshot the host's shards and supervisor read.
+    #[cfg(feature = "test-utils")]
     #[must_use]
     pub const fn topology_snapshot(&self) -> &SharedTopologySnapshot {
         &self.topology_snapshot
@@ -775,13 +748,6 @@ impl ProductionRunner {
     /// beacon thread's observations and header ring, and its imports.
     pub(crate) fn publishers(&self) -> RpcPublishers {
         self.publishers.clone()
-    }
-
-    /// The host's status: connected peers and, per hosted validator, its
-    /// shard, height and view, refreshed by the runner's status tick.
-    #[must_use]
-    pub fn node_status(&self) -> Arc<ArcSwap<NodeStatusState>> {
-        Arc::clone(&self.publishers.node_status)
     }
 
     /// Get the process-wide transaction status cache shared from
@@ -799,6 +765,7 @@ impl ProductionRunner {
     /// # Panics
     ///
     /// Panics if `run()` has already consumed the host.
+    #[cfg(feature = "test-utils")]
     #[must_use]
     pub fn derivation(&self) -> Arc<dyn Derivation> {
         self.host
@@ -941,6 +908,7 @@ impl ProductionRunner {
                     break;
                 }
                 command = reconfigure_rx.recv() => match command {
+                    #[cfg(feature = "test-utils")]
                     Some(RunnerCommand::Shard(command)) => supervisor.handle(command),
                     Some(RunnerCommand::AddValidator { validator, reply }) => {
                         let _ = reply.send(supervisor.add_validator(validator));

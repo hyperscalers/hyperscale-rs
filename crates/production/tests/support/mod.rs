@@ -12,7 +12,6 @@ pub mod prod_cluster;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch_pooled::ThreadPoolConfig;
@@ -20,9 +19,7 @@ use hyperscale_engine::GenesisConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::{EndpointAddr, IrohConfig, SecretKey};
-use hyperscale_production::{
-    LocalValidator, Node, NodeSetup, StorageDirResolver, StorageFactory, shard_data_dir,
-};
+use hyperscale_production::{LocalValidator, Node, NodeSetup, shard_data_dir};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{RocksDbConfig, RocksDbShardStorage};
@@ -131,20 +128,9 @@ pub fn start_host(
     (node, dir)
 }
 
-/// Storage-directory resolver rooted in the test's temp dir. Runtime-joined
-/// shards get `shard-d{depth}p{path}` directories, mirroring the validator
-/// binary's data-dir convention.
-pub fn temp_storage_dir(dir: &TempDir) -> StorageDirResolver {
-    let root = dir.path().to_path_buf();
-    Arc::new(move |shard: ShardId| shard_data_dir(&root, shard))
-}
-
-/// Storage factory opening a `RocksDbShardStorage` at whatever directory
-/// the supervisor names.
-pub fn temp_storage_factory() -> StorageFactory {
-    Arc::new(|dir: &Path, shard: ShardId| {
-        RocksDbShardStorage::open(dir, shard_prefix_path(shard))
-            .map(Arc::new)
-            .map_err(|e| format!("{e:?}"))
-    })
+/// Opens the store a host at `data_dir` keeps for `shard`, as the host's
+/// own storage factory opens it.
+pub fn open_shard_store(data_dir: &Path, shard: ShardId) -> Result<RocksDbShardStorage, String> {
+    RocksDbShardStorage::open(shard_data_dir(data_dir, shard), shard_prefix_path(shard))
+        .map_err(|e| format!("{e:?}"))
 }

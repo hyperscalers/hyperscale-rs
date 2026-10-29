@@ -792,6 +792,7 @@ impl ShardSupervisor {
     /// when it was the last. A leave that lands while the shard's join is
     /// still bootstrapping, or parked on its anchor, releases that pending
     /// membership instead, abandoning the join when the last one goes.
+    #[cfg(feature = "test-utils")]
     pub(super) fn leave(&mut self, shard: ShardId, validator: ValidatorId) {
         if let Some(pending) = self.bootstrapping.get_mut(&shard) {
             pending.remove(&validator);

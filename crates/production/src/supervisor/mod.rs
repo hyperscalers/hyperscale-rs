@@ -6,7 +6,7 @@
 //! shard's storage, builds its replica from the host's beacon chain with
 //! the joining validators attached as signers, wires the process-scoped
 //! maps via [`attach_shard`], and spawns the pinned thread; a
-//! [`ShardCommand::Leave`] detaches one validator's signer and tears
+//! `ShardCommand::Leave` detaches one validator's signer and tears
 //! the shard down — shutdown signal, thread join, map unwire, storage
 //! drop — only when the last local validator leaves.
 //!
@@ -119,6 +119,7 @@ pub enum ShardCommand {
     /// Release one local validator's membership in `shard`. The shard's
     /// thread, subscriptions, and storage are torn down when the last
     /// local validator leaves.
+    #[cfg(feature = "test-utils")]
     Leave {
         /// Shard to release the membership of.
         shard: ShardId,
@@ -467,6 +468,7 @@ impl ShardSupervisor {
                     self.join(shard, &vnodes);
                 }
             }
+            #[cfg(feature = "test-utils")]
             ShardCommand::Leave { shard, validator } => self.leave(shard, validator),
         }
     }
