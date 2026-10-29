@@ -274,20 +274,7 @@ where
             },
         );
         self.arm_startup(validator);
-        self.owe_standing_join(validator);
         self.refresh_committee_flag();
-    }
-
-    /// Surface the join `validator`'s committed lookahead already places it
-    /// on, as the adoption that drew it would have.
-    fn owe_standing_join(&mut self, validator: ValidatorId) {
-        if let Some(change) = self
-            .participants
-            .get(&validator)
-            .and_then(|p| p.duty.standing_lookahead_join(&self.fold))
-        {
-            self.pending_participation_changes.push(change);
-        }
     }
 
     /// Stop running `validator`'s participation. Its release gate closes
@@ -331,17 +318,14 @@ where
         self.participants.get(&validator).map(|p| &p.duty)
     }
 
-    /// Re-arm every participant's beacon startup timers, surface the joins
-    /// their committed lookaheads already owe them, and drain the result —
-    /// the production beacon thread's spawn-time bootstrap. Re-arming is
-    /// idempotent: it replaces the pending fire at the runner's table with
-    /// one at the same deadline, and a join to a shard already being
-    /// brought up is refused there.
+    /// Re-arm every participant's beacon startup timers and drain the
+    /// result — the production beacon thread's spawn-time bootstrap.
+    /// Re-arming is idempotent: it replaces the pending fire at the runner's
+    /// table with one at the same deadline.
     pub fn startup_output(&mut self) -> StepOutput {
         self.clear_scratch();
         for validator in self.validator_list() {
             self.arm_startup(validator);
-            self.owe_standing_join(validator);
         }
         self.take_output()
     }

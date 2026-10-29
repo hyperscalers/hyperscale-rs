@@ -321,9 +321,9 @@ impl SimulationRunner {
     ///
     /// Placement is [`placed_validators`], the rule the production
     /// supervisor's join half reads: the head and newest windows' seatable
-    /// committees, minus the committee a pending recovery replaced. The placement deltas
-    /// the hosts emit are drained, since the committed projection drives the
-    /// actual join/leave: the snap-sync usually completes within the slice,
+    /// committees, minus the committee a pending recovery replaced. The
+    /// placement deltas the hosts emit are drained, since the committed
+    /// projection drives the actual join/leave: the snap-sync usually completes within the slice,
     /// and a join whose attested anchor has gone stale (a transient fold
     /// freeze evicted its state) simply defers to a later slice, the same way
     /// production's async bootstrap retries against the advanced anchor.

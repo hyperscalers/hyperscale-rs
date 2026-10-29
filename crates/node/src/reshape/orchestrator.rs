@@ -771,9 +771,9 @@ impl ReshapeOrchestrator {
 
     /// Whether an in-flight duty owns seating `shard` — a merging parent a
     /// keeper reforms, or a splitting child an observer syncs or a parent
-    /// half seeds. The adapter suppresses the placement-delta join for such
-    /// a shard so the orchestrator seats it from the duty's prepared store,
-    /// rather than the join racing a redundant fresh snap-sync against it.
+    /// half seeds. The adapter's placement join skips such a shard so the
+    /// orchestrator seats it from the duty's prepared store, rather than the
+    /// join racing a redundant fresh snap-sync against it.
     #[must_use]
     pub fn is_seating(&self, shard: ShardId) -> bool {
         self.keepers.contains_key(&shard)
