@@ -433,12 +433,13 @@ impl Charges {
     /// derive, skipping a transaction that does not derive here.
     #[must_use]
     pub fn records<C: Cluster + ?Sized>(&self, c: &C) -> Vec<SubstateKey> {
-        let derivation = c.derivation();
-        self.owed
-            .values()
-            .filter_map(|tx| tx.try_derived(derivation.as_ref()).ok())
-            .flat_map(|derived| crossing_records(&derived.legs))
-            .collect()
+        c.with_derivation(|derivation| {
+            self.owed
+                .values()
+                .filter_map(|tx| tx.try_derived(derivation).ok())
+                .flat_map(|derived| crossing_records(&derived.legs))
+                .collect()
+        })
     }
 
     /// The cells of every crossing the recorded transactions derive.
@@ -460,11 +461,13 @@ impl Charges {
     /// charged issued between them.
     #[must_use]
     pub fn issued<C: Cluster + ?Sized>(&self, c: &C) -> usize {
-        let derivation = c.derivation();
         self.owed
             .iter()
             .filter(|(hash, _)| self.is_charged(c, **hash))
-            .filter_map(|(_, tx)| tx.try_derived(derivation.as_ref()).ok())
+            .filter_map(|(_, tx)| {
+                c.with_derivation(|derivation| tx.try_derived(derivation))
+                    .ok()
+            })
             .map(|derived| crossing_records(&derived.legs).len())
             .sum()
     }
@@ -510,13 +513,12 @@ impl Charges {
     /// until its fate.
     #[must_use]
     pub fn standing_holds<C: Cluster + ?Sized>(&self, c: &C) -> Vec<TxHash> {
-        let derivation = c.derivation();
         self.owed
             .iter()
             .filter(|(hash, _)| self.is_charged(c, **hash))
             .filter(|(_, tx)| {
-                tx.try_declared(derivation.as_ref())
-                    .is_ok_and(|_| stands_at(c, FeeTerms::of(tx).hold_key()))
+                c.with_derivation(|derivation| tx.try_declared(derivation).is_ok())
+                    && stands_at(c, FeeTerms::of(tx).hold_key())
             })
             .map(|(hash, _)| *hash)
             .collect()
@@ -605,7 +607,7 @@ mod tests {
             unreachable!()
         }
 
-        fn derivation(&self) -> Arc<dyn Derivation> {
+        fn with_derivation<T>(&self, _: impl FnOnce(&dyn Derivation) -> T) -> T {
             unreachable!()
         }
 

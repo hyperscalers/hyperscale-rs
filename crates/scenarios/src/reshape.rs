@@ -260,8 +260,7 @@ fn run_probe_train<C: Cluster>(
         // standing in the record until whoever holds the recipient's
         // prefix claims it. That is value the world still holds.
         world.owing(crossing_records(
-            &probe
-                .try_derived(c.derivation().as_ref())
+            &c.with_derivation(|derivation| probe.try_derived(derivation))
                 .expect("a scenario transfer derives")
                 .legs,
         ));

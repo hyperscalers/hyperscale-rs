@@ -597,8 +597,7 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
     );
     let price = declared_price(c, &swap);
     let records = crossing_records(
-        &swap
-            .try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| swap.try_derived(derivation))
             .expect("a scenario fixture derives")
             .legs,
     );
@@ -817,8 +816,7 @@ pub fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue<C: Cluster>(
     );
     let price = declared_price(c, &overdrawn);
     let record = crossing_records(
-        &overdrawn
-            .try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| overdrawn.try_derived(derivation))
             .expect("a scenario fixture derives")
             .legs,
     )
@@ -1053,7 +1051,7 @@ pub fn a_held_core_keeps_its_sponsors_hold_until_it_aborts<C: FaultableCluster>(
         0,
         validity,
     );
-    swap.try_declared(c.derivation().as_ref())
+    c.with_derivation(|derivation| swap.try_declared(derivation))
         .expect("a swap declares its terms");
     let fee = FeeTerms::of(&swap);
     let (hold, total) = (

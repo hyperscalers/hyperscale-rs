@@ -53,7 +53,7 @@ pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
     // One price for every shape, a publish included: its artifact is
     // bytes written and retained, which the declared vector already
     // carries, so nothing about it needs a rule of its own.
-    tx.price_under(c.derivation().as_ref(), &c.prices())
+    c.with_derivation(|derivation| tx.price_under(derivation, &c.prices()))
         .expect("a scenario fixture derives")
 }
 
@@ -77,7 +77,7 @@ pub fn declared_price<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> u128 {
 /// Panics if the transaction does not derive, or if a full block of it
 /// would be refused.
 pub(crate) fn assert_a_full_block_fits<C: Cluster + ?Sized>(c: &C, tx: &Transaction) {
-    tx.try_derived(c.derivation().as_ref())
+    c.with_derivation(|derivation| tx.try_derived(derivation))
         .expect("a scenario fixture derives");
     let live = live_shards(c);
     let (trie, shards) = if live.is_empty() {
@@ -266,8 +266,8 @@ pub(crate) fn standing_report<C: Cluster + ?Sized>(c: &C, crossings: &[CrossingC
 /// Panics if `tx` does not derive, which would be a defect in the
 /// scenario world rather than in the transaction.
 pub(crate) fn crossing_cells<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> Vec<CrossingCells> {
-    let derived = tx
-        .try_derived(c.derivation().as_ref())
+    let derived = c
+        .with_derivation(|derivation| tx.try_derived(derivation))
         .expect("a scenario fixture derives");
     crossing_ids(&derived.legs)
         .into_iter()

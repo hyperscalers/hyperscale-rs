@@ -125,7 +125,7 @@ fn transfer(c: &mut impl FaultableCluster) -> Transfer {
     let validity = validity_around(c.now());
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
     let records = crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario transfer derives")
             .legs,
     );

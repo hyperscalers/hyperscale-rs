@@ -28,7 +28,7 @@ use support::{
     CONNECTION_TIMEOUT, start_host, start_host_at, temp_storage_dir, temp_storage_factory,
 };
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -777,8 +777,8 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
     .expect("the beacon attests a ROOT boundary");
 
     cluster
-        .reconfigure(0)
-        .send(RunnerCommand::Shard(ShardCommand::Join {
+        .handle(0)
+        .command(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
         }))
@@ -896,19 +896,6 @@ async fn add(handle: &NodeHandle, validator: LocalValidator) -> Result<(), AddVa
     answer.await.expect("the runner answers an add")
 }
 
-/// [`add`] through a host's command sender.
-async fn add_through(
-    commands: &mpsc::Sender<RunnerCommand>,
-    validator: LocalValidator,
-) -> Result<(), AddValidatorError> {
-    let (reply, answer) = oneshot::channel();
-    commands
-        .send(RunnerCommand::AddValidator { validator, reply })
-        .await
-        .expect("the runner takes commands");
-    answer.await.expect("the runner answers an add")
-}
-
 /// A running host takes on a validator without a restart: its transport
 /// attests it from then on. It refuses one it already runs, and one whose
 /// key is not the one the network registered for it.
@@ -1021,14 +1008,20 @@ async fn a_validator_added_to_a_running_host_is_bound_by_its_peers() {
     .await
     .expect("ROOT commits");
 
-    assert_eq!(add_through(&cluster.reconfigure(1), local(4)).await, Ok(()));
+    assert_eq!(add(cluster.handle(1), local(4)).await, Ok(()));
     let before = height(&cluster);
-    let host1 = cluster.adapter(1).local_endpoint_id();
+    let host1 = cluster
+        .handle(1)
+        .probe(|p| p.network().local_endpoint_id())
+        .expect("host 1 runs");
     timeout(CONNECTION_TIMEOUT, async {
-        while (0..4)
-            .filter(|&peer| peer != 1)
-            .any(|peer| cluster.adapter(peer).peer_for_validator(added) != Some(host1))
-        {
+        while (0..4).filter(|&peer| peer != 1).any(|peer| {
+            cluster
+                .handle(peer)
+                .probe(|p| p.network().peer_for_validator(added))
+                .flatten()
+                != Some(host1)
+        }) {
             sleep(Duration::from_millis(50)).await;
         }
     })

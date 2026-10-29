@@ -925,10 +925,12 @@ fn host_index(host: usize) -> NodeIndex {
 }
 
 impl Cluster for SimCluster {
-    fn derivation(&self) -> Arc<dyn Derivation> {
-        self.live_host()
+    fn with_derivation<T>(&self, f: impl FnOnce(&dyn Derivation) -> T) -> T {
+        let derivation = self
+            .live_host()
             .and_then(|host| self.runner.host_derivation(host))
-            .expect("a cluster keeps at least one host up")
+            .expect("a cluster keeps at least one host up");
+        f(derivation.as_ref())
     }
 
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {

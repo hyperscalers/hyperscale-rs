@@ -1,42 +1,38 @@
 //! Multi-host production cluster harness.
 //!
-//! Spins up an N-host localhost-QUIC cluster on real `RocksDbShardStorage`
-//! and a real beacon chain, bootstrap-peers the hosts to host 0, drives
-//! real consensus, and exposes synchronous observation hooks (committed
-//! heights and state roots, beacon state, transaction status) plus per-host
-//! fault gates. The portable scenarios drive it through the `ProdCluster`
-//! adaptor rather than injecting `ShardCommand`s, so the production
-//! beacon-fold → duty → flip chain runs end to end.
+//! Spins up an N-host localhost-QUIC cluster of [`Node`]s, each on its own
+//! data directory in the production layout, bootstrap-peers the hosts to
+//! host 0, drives real consensus, and exposes synchronous observation hooks
+//! (committed heights and state roots, beacon state, transaction status)
+//! plus per-host fault gates, all read through each host's [`NodeHandle`].
+//! The portable scenarios drive it through the `ProdCluster` adaptor rather
+//! than injecting `ShardCommand`s, so the production beacon-fold → duty →
+//! flip chain runs end to end.
 //!
 //! These are real-time tests: there is no logical clock. Callers set a
 //! small `epoch_duration_ms` and mark `#[serial]`.
 
-use std::collections::HashMap;
+use std::fs::remove_dir_all;
+use std::io::ErrorKind;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::panic::resume_unwind;
+use std::sync::Arc;
 use std::time::Duration;
+use std::{iter, thread};
 
-use arc_swap::ArcSwap;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
 use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
 use hyperscale_network_iroh::fault::{DropSpec, HostId, Rewrite, RuleHandle};
 use hyperscale_network_iroh::{EndpointAddr, EndpointId, IrohAdapter, SecretKey};
-use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
-use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
-use hyperscale_production::{
-    LocalValidator, ProductionRunner, RunnerCommand, RunnerError, ShutdownHandle, StorageFactory,
-    shard_data_dir,
-};
+use hyperscale_node::{SharedTopologySnapshot, network_genesis_block};
+use hyperscale_production::testing::Probe;
+use hyperscale_production::{LocalValidator, Node, NodeHandle, shard_data_dir};
 use hyperscale_scenarios::query::{
     RanAs, chain_burn, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
 };
-use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{
-    BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore, VersionedStore,
-};
-use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
+use hyperscale_storage::{BeaconChainReader, ShardChainReader, SubstateStore, VersionedStore};
+use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation,
     GenesisValidators, ShardId, StateRoot, SubstateKey, TopologySnapshot, Transaction,
@@ -44,61 +40,17 @@ use hyperscale_types::{
     shard_prefix_path,
 };
 use tempfile::TempDir;
-use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, spawn};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 
-use super::{temp_storage_dir, test_config};
-
-/// Per-host registry of every `RocksDbShardStorage` the host has opened —
-/// the startup shards plus any the supervisor opens at a reshape flip or a
-/// runtime join. Entries are `Weak`: the harness observes the runner's
-/// stores, it never extends their lives. A strong clone here would hold the
-/// `RocksDB` directory lock through the runner's teardown, and any later
-/// re-seat of the host onto that shard — a halt-recovery redraw of a
-/// jailed-out member — would spin forever on "lock hold by current
-/// process" at the storage open. Reads upgrade per call: a torn-down
-/// shard's entry resolves `None`, and the cluster-level scan finds a host
-/// that still serves the shard.
-pub type StoreRegistry = Arc<Mutex<HashMap<ShardId, Weak<RocksDbShardStorage>>>>;
-
-/// Graceful-shutdown budget per host on teardown.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long a stopped host's handed-off store work may hold a store open.
-const STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+use super::{test_config, test_setup};
 
 /// How long the cluster's seated hosts have to install the network genesis
-/// once their runners start.
+/// once they start.
 const GENESIS_INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How often a restart rechecks for stores still open.
-const STORE_CLOSE_POLL: Duration = Duration::from_millis(50);
-
-/// Like [`temp_storage_factory`], but records every opened store into a
-/// shared registry so the harness can scan a runtime-joined shard's chain
-/// (a split child, a merged parent) the same way it scans a startup shard.
-///
-/// Only a store at the shard's own directory is recorded; a rebuild's
-/// staging store beside it holds no chain the harness should read.
-fn capturing_storage_factory(dir: &TempDir, registry: StoreRegistry) -> StorageFactory {
-    let resolve = temp_storage_dir(dir);
-    Arc::new(move |path: &Path, shard: ShardId| {
-        let store = RocksDbShardStorage::open(path, shard_prefix_path(shard))
-            .map(Arc::new)
-            .map_err(|e| format!("{e:?}"))?;
-        if path == resolve(shard) {
-            registry
-                .lock()
-                .expect("store registry")
-                .insert(shard, Arc::downgrade(&store));
-        }
-        Ok(store)
-    })
-}
-
 /// One host's seating: the validators it runs. Shard participation is not
-/// named — the runner derives each validator's seat (or pool membership)
+/// named — the host derives each validator's seat (or pool membership)
 /// from the committed beacon state, which mirrors the cluster topology.
 pub struct HostSpec {
     pub validators: Vec<LocalValidator>,
@@ -136,56 +88,75 @@ pub struct ClusterSpec {
     pub simulated_outbound_latency: Duration,
 }
 
-/// A running host: its network adapter, RPC status slot, beacon store,
-/// the live shard-store registry and transaction hooks, and the handles
-/// to shut it down and join its runner task.
+/// One host: what it is started from, and the running node.
 struct Host {
-    /// The validators this host runs, for routing a submission to a
-    /// host the beacon seats on the shard rather than one still carrying
-    /// a retired loop.
-    validator_ids: Vec<ValidatorId>,
-    /// The same validators with their signers, for rebuilding the host
-    /// on a restart.
+    /// The validators this host runs, with their signers.
     validators: Vec<LocalValidator>,
-    /// What a restart rebuilds the host's network identity from.
+    /// The host's network identity, kept across restarts.
     key: SecretKey,
-    adapter: Arc<IrohAdapter>,
-    rpc_status: Arc<ArcSwap<NodeStatusState>>,
-    beacon_storage: Arc<RocksDbBeaconStorage>,
-    /// Submit a transaction into this host's process (the production
-    /// analog of the sim's `ProcessScopedInput::SubmitTransaction`): routes
-    /// to the touched shards' mempools, gossiping any it doesn't host.
-    tx_submission: TxSubmissionSender,
-    /// Process-wide status cache — every shard thread on this host records
-    /// its terminal verdict here, the only place a counterpart abort (which
-    /// never lands on-chain) is observable.
-    tx_status: Arc<TxStatusCache>,
-    /// The host engine's derivation, which knows what its chains created.
-    derivation: Arc<dyn Derivation>,
-    /// Every `RocksDbShardStorage` this host has opened, shared live with
-    /// the runner for chain scans and byte-total reads.
-    stores: StoreRegistry,
-    /// Membership commands into this host's supervisor.
-    reconfigure: mpsc::Sender<RunnerCommand>,
-    /// The topology snapshot this host's shards and supervisor read.
-    topology: SharedTopologySnapshot,
-    shutdown: Option<ShutdownHandle>,
-    join: JoinHandle<Result<(), RunnerError>>,
+    /// The host's data directory. Kept for the cluster's life, so a
+    /// restarted host reopens what its previous run left.
+    dir: TempDir,
+    running: Running,
+}
+
+/// A started host: its owner, which stops it, and the handle every read
+/// goes through.
+struct Running {
+    node: Node,
+    handle: NodeHandle,
+}
+
+impl Host {
+    /// Whether this host runs `validator`.
+    fn runs(&self, validator: ValidatorId) -> bool {
+        self.validators
+            .iter()
+            .any(|local| local.validator_id == validator)
+    }
+
+    /// Runs `look` inside the running host.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host has stopped.
+    fn probe<T>(&self, look: impl FnOnce(Probe<'_>) -> T) -> T {
+        self.running
+            .handle
+            .probe(look)
+            .expect("a harness host is running")
+    }
+
+    /// Runs `read` on the host's store for `shard`; `None` when the host
+    /// holds none there.
+    fn read_store<T>(
+        &self,
+        shard: ShardId,
+        read: impl FnOnce(&RocksDbShardStorage) -> T,
+    ) -> Option<T> {
+        self.probe(|p| p.shard_store(shard, read))
+    }
+
+    /// Whether the host's transport carries `shard`.
+    fn serves(&self, shard: ShardId) -> bool {
+        self.probe(|p| p.network().local_shards().contains(&shard))
+    }
+
+    /// Runs `act` on the host's transport, which carries its fault gate.
+    fn network<T>(&self, act: impl FnOnce(&IrohAdapter) -> T) -> T {
+        self.probe(|p| act(p.network()))
+    }
 }
 
 /// A running multi-host production cluster.
 pub struct Harness {
     hosts: Vec<Host>,
-    /// Each host's data directory, by host index. Kept alive for the
-    /// cluster's lifetime; the on-disk stores are deleted only when the
-    /// cluster (and these) drop, so a restarted host reopens what its
-    /// previous run left.
-    temp_dirs: Vec<TempDir>,
-    /// What every host is built from, for rebuilding one on a restart.
+    /// What every host is started from, for starting one again on a
+    /// restart.
     build: ClusterBuild,
 }
 
-/// The cluster-wide build inputs every host shares.
+/// The cluster-wide inputs every host shares.
 struct ClusterBuild {
     genesis: GenesisValidators,
     /// Carries the shared genesis instant, so a restarted host keeps the
@@ -211,13 +182,35 @@ impl ClusterBuild {
         seed_founding_members(&boot.state, &mut config.pools, seat_pool);
         config
     }
+
+    /// Starts a host running `validators` at `dir` under `key`,
+    /// bootstrapped to `bootstrap_peers`. Blocks while its stores open and
+    /// its network binds.
+    fn start(
+        &self,
+        dir: &TempDir,
+        validators: Vec<LocalValidator>,
+        key: &SecretKey,
+        bootstrap_peers: Vec<EndpointAddr>,
+    ) -> Running {
+        let node = Node::start(test_setup(
+            dir.path().to_path_buf(),
+            validators,
+            self.genesis.clone(),
+            self.beacon_chain_config,
+            self.genesis_config.clone().unwrap_or_default(),
+            test_config(key, bootstrap_peers, self.simulated_outbound_latency),
+        ))
+        .expect("start a harness host");
+        let handle = node.handle();
+        Running { node, handle }
+    }
 }
 
 impl Harness {
-    /// Build and start the cluster: open per-host stores, build runners,
-    /// bootstrap-peer the hosts to host 0, and spawn every runner. The
-    /// adapters peer during the build; consensus starts when the runners
-    /// are spawned.
+    /// Start the cluster: host 0 first, then every other host at once,
+    /// each bootstrapped to host 0. Returns once every host seated on the
+    /// genesis committee has installed the network genesis.
     pub async fn start(spec: ClusterSpec) -> Self {
         let ClusterSpec {
             genesis,
@@ -232,73 +225,60 @@ impl Harness {
         // opens as the cluster starts rather than paced from a fixed date.
         let mut chain_config = beacon_chain_config;
         chain_config.genesis_timestamp_ms = now_millis();
+        let build = ClusterBuild {
+            genesis,
+            beacon_chain_config: chain_config,
+            genesis_config,
+            simulated_outbound_latency,
+        };
 
-        let mut temp_dirs = Vec::with_capacity(hosts.len());
-        let mut built = Vec::with_capacity(hosts.len());
-
-        // Build host 0 first so the rest can bootstrap to its address.
-        let mut bootstrap: Option<EndpointAddr> = None;
-        for (idx, host) in hosts.into_iter().enumerate() {
-            let temp_dir = TempDir::new().expect("temp dir");
-            let bootstrap_peers: Vec<EndpointAddr> = bootstrap.iter().cloned().collect();
-            let built_host = build_host(BuildHostArgs {
-                temp_dir: &temp_dir,
-                genesis: &genesis,
-                validators: host.validators,
-                beacon_chain_config: chain_config,
-                genesis_config: genesis_config.clone(),
-                key: SecretKey::generate(),
-                bootstrap_peers,
-                simulated_outbound_latency,
-            });
-            if idx == 0 {
-                bootstrap = Some(built_host.adapter.endpoint_addr());
+        let mut specs = hosts.into_iter();
+        let first = specs.next().expect("cluster needs at least one host");
+        let first = start_host(&build, first, Vec::new());
+        let bootstrap = first.probe(|p| p.network().endpoint_addr());
+        let rest: Vec<Host> = thread::scope(|scope| {
+            // Every start is spawned before any is joined, so the hosts
+            // open their stores and bind at once.
+            let mut starting = Vec::new();
+            for spec in specs {
+                let (build, bootstrap) = (&build, bootstrap.clone());
+                starting.push(scope.spawn(move || start_host(build, spec, vec![bootstrap])));
             }
-            temp_dirs.push(temp_dir);
-            built.push(built_host);
-        }
-
-        // Spawn every runner now that all adapters are peering.
-        let running = built.into_iter().map(spawn_host).collect();
+            starting
+                .into_iter()
+                .map(|host| host.join().unwrap_or_else(|panic| resume_unwind(panic)))
+                .collect()
+        });
 
         let harness = Self {
-            hosts: running,
-            temp_dirs,
-            build: ClusterBuild {
-                genesis,
-                beacon_chain_config: chain_config,
-                genesis_config,
-                simulated_outbound_latency,
-            },
+            hosts: iter::once(first).chain(rest).collect(),
+            build,
         };
         harness.await_genesis_installed().await;
         harness
     }
 
-    /// A derivation over everything the cluster's chains have created: the
-    /// first host's engine's, as a scenario asks of any host.
-    pub fn derivation(&self) -> Arc<dyn Derivation> {
-        Arc::clone(&self.hosts[0].derivation)
+    /// Runs `f` on a derivation over everything the cluster's chains have
+    /// created: the first host's engine's, as a scenario asks of any host.
+    pub fn with_derivation<T>(&self, f: impl FnOnce(&dyn Derivation) -> T) -> T {
+        self.hosts[0].probe(|p| f(p.derivation()))
     }
 
     /// Wait until every host seated on the genesis ROOT committee holds a
-    /// ROOT store that installed the network genesis. A runner opens and
-    /// installs its stores only once it runs, so until then a scenario
-    /// reading the cluster's state would find nothing there at all.
+    /// ROOT store that installed the network genesis. A host opens and
+    /// installs its stores only once its runner runs, so until then a
+    /// scenario reading the cluster's state would find nothing there at all.
     async fn await_genesis_installed(&self) {
         let committee = &self.build.genesis.committee;
-        let seated: Vec<usize> = (0..self.hosts.len())
-            .filter(|&host| {
-                self.hosts[host]
-                    .validator_ids
-                    .iter()
-                    .any(|validator| committee.contains(validator))
-            })
+        let seated: Vec<&Host> = self
+            .hosts
+            .iter()
+            .filter(|host| committee.iter().any(|&validator| host.runs(validator)))
             .collect();
         let installed = || {
-            seated.iter().all(|&host| {
-                self.host_store(host, ShardId::ROOT)
-                    .is_some_and(|store| store.installed_genesis().is_some())
+            seated.iter().all(|host| {
+                host.read_store(ShardId::ROOT, |store| store.installed_genesis().is_some())
+                    .unwrap_or(false)
             })
         };
         timeout(GENESIS_INSTALL_TIMEOUT, async {
@@ -310,25 +290,17 @@ impl Harness {
         .expect("every seated host installs the network genesis");
     }
 
-    /// Restart host `host` with its stores for `shards` wiped: shut the
-    /// host down, and rebuild it over a copy of its data directory with
-    /// those stores left out, so its beacon chain and every other shard's
-    /// store survive. The rebuilt host bootstraps to another
-    /// running host. Returns the topology the rebuilt host starts on, read
-    /// before its runner runs and so before it folds any beacon block.
-    ///
-    /// The rebuild runs on a copy because a stopped runner's process
-    /// resources are not all released in-process, and `RocksDB` refuses a
-    /// second open of a directory the process still holds. The copy is
-    /// what a restarted process would find on disk: the runner has
-    /// stopped writing, its transport is closed, and every store it opened
-    /// has closed, so no store work the supervisor handed off is still
-    /// changing the directory under the copy.
+    /// Restart host `host` with its stores for `shards` wiped: stop the
+    /// host, delete those stores from its data directory, and start it
+    /// again on what is left, so its beacon chain and every other shard's
+    /// store survive. The restarted host bootstraps to another running
+    /// host. Returns the topology it starts on, read before its runner
+    /// runs and so before it folds any beacon block.
     ///
     /// # Panics
     ///
-    /// Panics if the cluster has a single host (nothing to bootstrap to)
-    /// or the copy fails.
+    /// Panics if the cluster has a single host (nothing to bootstrap to),
+    /// or the host does not stop cleanly.
     pub async fn restart_with_wiped_shards(
         &mut self,
         host: usize,
@@ -375,39 +347,38 @@ impl Harness {
         let peer = (0..self.hosts.len())
             .find(|&i| i != host)
             .expect("a restart bootstraps to another host");
-        let bootstrap = self.hosts[peer].adapter.endpoint_addr();
+        let bootstrap = self.hosts[peer].probe(|p| p.network().endpoint_addr());
+        let peer_topology = self.hosts[peer].probe(|p| p.topology().load_full());
 
-        let mut old = self.hosts.remove(host);
-        if let Some(s) = old.shutdown.take() {
-            s.shutdown();
+        let Host {
+            validators,
+            key,
+            dir,
+            running,
+        } = self.hosts.remove(host);
+        running.node.stop().await.expect("the host stops cleanly");
+
+        for &shard in shards {
+            match remove_dir_all(shard_data_dir(dir.path(), shard)) {
+                Err(e) if e.kind() != ErrorKind::NotFound => {
+                    panic!("wipe the host's store for {shard:?}: {e}")
+                }
+                _ => {}
+            }
         }
-        let _ = timeout(SHUTDOWN_TIMEOUT, old.join).await;
-        await_stores_closed(&old.stores).await;
-
-        let data = TempDir::new().expect("temp dir");
-        let wiped: Vec<PathBuf> = shards
-            .iter()
-            .map(|&shard| shard_data_dir(self.temp_dirs[host].path(), shard))
-            .collect();
-        copy_dir_except(self.temp_dirs[host].path(), data.path(), &wiped)
-            .expect("copy the host's data directory");
         match replacement {
             Replacement::Wiped => {}
             Replacement::InstalledGenesis => {
-                let topology = self.hosts[peer - usize::from(peer > host)]
-                    .topology
-                    .load_full();
                 let config = self.build.network_genesis_config();
                 for &shard in shards {
-                    let store = RocksDbShardStorage::open(
-                        shard_data_dir(data.path(), shard),
-                        shard_prefix_path(shard),
-                    )
-                    .expect("open the store the genesis installs into");
+                    let at = shard_data_dir(dir.path(), shard);
+                    assert!(!at.exists(), "the genesis installs into an absent store");
+                    let store = RocksDbShardStorage::open(at, shard_prefix_path(shard))
+                        .expect("open the store the genesis installs into");
                     let _ = network_genesis_block(
                         &store,
                         shard,
-                        &topology,
+                        &peer_topology,
                         &config,
                         WeightedTimestamp::from_millis(
                             self.build.beacon_chain_config.genesis_timestamp_ms,
@@ -417,30 +388,29 @@ impl Harness {
             }
             Replacement::ParentClone(parent) => {
                 let store = RocksDbShardStorage::open(
-                    shard_data_dir(data.path(), parent),
+                    shard_data_dir(dir.path(), parent),
                     shard_prefix_path(parent),
                 )
                 .expect("open the parent store the clones are cut from");
                 for &shard in shards {
-                    store
-                        .checkpoint_into(&shard_data_dir(data.path(), shard))
-                        .expect("clone the parent store");
+                    let at = shard_data_dir(dir.path(), shard);
+                    assert!(!at.exists(), "the clone lands in an absent store");
+                    store.checkpoint_into(&at).expect("clone the parent store");
                 }
             }
         }
-        self.temp_dirs[host] = data;
-        let built = build_host(BuildHostArgs {
-            temp_dir: &self.temp_dirs[host],
-            genesis: &self.build.genesis,
-            validators: old.validators,
-            beacon_chain_config: self.build.beacon_chain_config,
-            genesis_config: self.build.genesis_config.clone(),
-            key: old.key,
-            bootstrap_peers: vec![bootstrap],
-            simulated_outbound_latency: self.build.simulated_outbound_latency,
-        });
-        let startup = built.runner.topology_snapshot().load_full();
-        self.hosts.insert(host, spawn_host(built));
+
+        let running = self
+            .build
+            .start(&dir, validators.clone(), &key, vec![bootstrap]);
+        let restarted = Host {
+            validators,
+            key,
+            dir,
+            running,
+        };
+        let startup = restarted.probe(|p| p.startup_topology());
+        self.hosts.insert(host, restarted);
         startup
     }
 
@@ -449,37 +419,22 @@ impl Harness {
         self.hosts.len()
     }
 
-    /// Membership commands into `host`'s supervisor.
-    pub fn reconfigure(&self, host: usize) -> mpsc::Sender<RunnerCommand> {
-        self.hosts[host].reconfigure.clone()
-    }
-
-    /// `host`'s network adapter.
-    pub fn adapter(&self, host: usize) -> &Arc<IrohAdapter> {
-        &self.hosts[host].adapter
+    /// The handle every call on `host` goes through.
+    pub fn handle(&self, host: usize) -> &NodeHandle {
+        &self.hosts[host].running.handle
     }
 
     /// The topology snapshot `host` reads.
     pub fn topology(&self, host: usize) -> SharedTopologySnapshot {
-        Arc::clone(&self.hosts[host].topology)
+        self.hosts[host].probe(|p| p.topology())
     }
 
     /// Highest committed height observed for `shard` across all hosts'
-    /// RPC status (`block_height`). `None` until some host reports a
-    /// vnode in `shard`.
+    /// status (`block_height`). `None` until some host reports a vnode in
+    /// `shard`.
     pub fn committed_height(&self, shard: ShardId) -> Option<u64> {
-        let key = shard.inner();
-        self.hosts
-            .iter()
-            .flat_map(|h| {
-                h.rpc_status
-                    .load()
-                    .vnodes
-                    .iter()
-                    .filter(|v| v.shard == key)
-                    .map(|v| v.block_height)
-                    .collect::<Vec<_>>()
-            })
+        (0..self.hosts.len())
+            .filter_map(|host| self.host_committed_height(host, shard))
             .max()
     }
 
@@ -487,38 +442,37 @@ impl Harness {
     /// live store — for typed comparison against a beacon-composed anchor.
     /// `None` if no host serves `shard`.
     pub fn committed_state_root(&self, shard: ShardId) -> Option<StateRoot> {
-        self.store_for(shard).map(|store| store.state_root())
+        self.read_any(shard, SubstateStore::state_root)
     }
 
     /// The committed height on `shard` at host `host` specifically — read off
-    /// that host's own RPC status, not the cluster-wide max — so a scenario can
+    /// that host's own status, not the cluster-wide max — so a scenario can
     /// watch a lagging fragment catch up after a heal.
     pub fn host_committed_height(&self, host: usize, shard: ShardId) -> Option<u64> {
         let key = shard.inner();
-        self.hosts
-            .get(host)?
-            .rpc_status
-            .load()
-            .vnodes
-            .iter()
-            .find(|v| v.shard == key)
-            .map(|v| v.block_height)
+        self.hosts.get(host)?.probe(|p| {
+            p.node_status()
+                .vnodes
+                .iter()
+                .find(|v| v.shard == key)
+                .map(|v| v.block_height)
+        })
     }
 
     /// The raw committed JMT root for `shard` on host `host` specifically, read
     /// off that host's own live store. `None` if host `host` serves no vnode
     /// there.
     pub fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot> {
-        self.host_store(host, shard).map(|store| store.state_root())
+        self.hosts
+            .get(host)?
+            .read_store(shard, SubstateStore::state_root)
     }
 
     /// Whether any host in the cluster currently serves `shard` — the
     /// "the reshape seated this shard" signal (a split's children, the
     /// merged parent).
     pub fn any_host_serves(&self, shard: ShardId) -> bool {
-        self.hosts
-            .iter()
-            .any(|h| h.adapter.local_shards().contains(&shard))
+        self.hosts.iter().any(|h| h.serves(shard))
     }
 
     /// The latest committed beacon state across all hosts (highest epoch) —
@@ -528,7 +482,7 @@ impl Harness {
     pub fn beacon_state(&self) -> Option<Arc<BeaconState>> {
         self.hosts
             .iter()
-            .filter_map(|h| h.beacon_storage.latest_committed())
+            .filter_map(|h| h.running.handle.history().latest_committed())
             .max_by_key(|(_, state)| state.current_epoch)
             .map(|(_, state)| state)
     }
@@ -546,38 +500,36 @@ impl Harness {
     /// routing it never reached itself, and with it skip the record
     /// fetch its replay of the commit reads back after a restart.
     pub fn submit_transaction(&self, idx: usize, tx: &Transaction) -> bool {
-        (self.hosts[idx].tx_submission)(Arc::new(Transaction::new(tx.body().clone())))
+        self.hosts[idx]
+            .running
+            .handle
+            .submit(Arc::new(Transaction::new(tx.body().clone())))
     }
 
     /// The status host `idx`'s process recorded for `hash`, with the
     /// hosted shard that reported it, if any.
     pub fn tx_status(&self, idx: usize, hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
-        self.hosts[idx].tx_status.get(hash)
+        self.hosts[idx].probe(|p| p.tx_status(hash))
     }
 
     /// The first host index serving `shard`, if any — used to address a
     /// transaction's source committee.
     pub fn host_serving(&self, shard: ShardId) -> Option<usize> {
-        self.hosts
-            .iter()
-            .position(|h| h.adapter.local_shards().contains(&shard))
+        self.hosts.iter().position(|h| h.serves(shard))
     }
 
     /// The first host serving `shard` that runs one of `committee`, if
     /// any — a host the beacon seats there, not one whose supervisor has
     /// yet to retire a replaced loop.
     pub fn host_serving_in(&self, shard: ShardId, committee: &[ValidatorId]) -> Option<usize> {
-        self.hosts.iter().position(|h| {
-            h.adapter.local_shards().contains(&shard)
-                && h.validator_ids.iter().any(|v| committee.contains(v))
-        })
+        self.hosts
+            .iter()
+            .position(|h| h.serves(shard) && committee.iter().any(|&v| h.runs(v)))
     }
 
     /// The host running `validator`, if any.
     pub fn host_of(&self, validator: ValidatorId) -> Option<usize> {
-        self.hosts
-            .iter()
-            .position(|h| h.validator_ids.contains(&validator))
+        self.hosts.iter().position(|h| h.runs(validator))
     }
 
     /// Every host index serving `shard` — its committee members, before a
@@ -586,44 +538,48 @@ impl Harness {
         self.hosts
             .iter()
             .enumerate()
-            .filter(|(_, h)| h.adapter.local_shards().contains(&shard))
+            .filter(|(_, h)| h.serves(shard))
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// A live handle to any host's `RocksDbShardStorage` for `shard`. Every
-    /// committee member commits the same chain, so the first match suffices.
-    /// A host whose runner has torn the shard down upgrades to `None` and is
-    /// skipped — only stores the consensus threads actually hold are read.
-    fn store_for(&self, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {
-        self.hosts.iter().find_map(|h| {
-            h.stores
-                .lock()
-                .expect("store registry")
-                .get(&shard)
-                .and_then(Weak::upgrade)
-        })
+    /// Runs `read` on the first host's store for `shard`. Every committee
+    /// member commits the same chain, so the first match suffices. A host
+    /// whose runner has torn the shard down holds no store there and is
+    /// skipped.
+    fn read_any<T>(&self, shard: ShardId, read: impl Fn(&RocksDbShardStorage) -> T) -> Option<T> {
+        self.hosts.iter().find_map(|h| h.read_store(shard, &read))
+    }
+
+    /// Runs `read` on the furthest-along live store any host holds for
+    /// `shard`, at that store's own JMT height. The greatest height rather
+    /// than the first host: a reseated or merged host holds a frozen
+    /// predecessor under the same id, and only the live copy has committed
+    /// past the cut.
+    fn read_furthest<T>(
+        &self,
+        shard: ShardId,
+        read: impl Fn(&RocksDbShardStorage, BlockHeight) -> T,
+    ) -> Option<T> {
+        self.hosts
+            .iter()
+            .filter_map(|h| {
+                h.read_store(shard, |store| {
+                    let height = store.jmt_height();
+                    (height, read(store, height))
+                })
+            })
+            .max_by_key(|(height, _)| *height)
+            .map(|(_, read)| read)
     }
 
     /// The committed value of `key` on `shard`, read off the furthest-along
-    /// live store any host holds for it, at that store's own JMT height.
-    /// The greatest height rather than the first host: a reseated or
-    /// merged host holds a frozen predecessor under the same id, and only
-    /// the live copy has committed past the cut. `None` when no host
-    /// serves `shard`, the height is unavailable, or the cell is absent.
+    /// live store any host holds for it. `None` when no host serves
+    /// `shard`, the height is unavailable, or the cell is absent.
     pub fn substate(&self, shard: ShardId, key: SubstateKey) -> Option<Vec<u8>> {
-        let store = self
-            .hosts
-            .iter()
-            .filter_map(|h| {
-                h.stores
-                    .lock()
-                    .expect("store registry")
-                    .get(&shard)
-                    .and_then(Weak::upgrade)
-            })
-            .max_by_key(|store| store.jmt_height())?;
-        store.get_substate_at_height(key, store.jmt_height())?
+        self.read_furthest(shard, |store, height| {
+            store.get_substate_at_height(key, height)
+        })??
     }
 
     /// The committed entries of `range` on `shard`, read off the
@@ -631,105 +587,83 @@ impl Harness {
     /// [`substate`](Self::substate) reads a cell. `None` when no host
     /// serves `shard` or the height is unavailable.
     pub fn entries(&self, shard: ShardId, range: DeclaredRange) -> Option<Vec<(u128, Vec<u8>)>> {
-        let store = self
-            .hosts
-            .iter()
-            .filter_map(|h| {
-                h.stores
-                    .lock()
-                    .expect("store registry")
-                    .get(&shard)
-                    .and_then(Weak::upgrade)
-            })
-            .max_by_key(|store| store.jmt_height())?;
-        store.get_entries_at_height(range, store.jmt_height())
-    }
-
-    /// A live handle to host `host`'s `RocksDbShardStorage` for `shard`, or
-    /// `None` if that host does not currently hold one there.
-    fn host_store(&self, host: usize, shard: ShardId) -> Option<Arc<RocksDbShardStorage>> {
-        self.hosts
-            .get(host)?
-            .stores
-            .lock()
-            .expect("store registry")
-            .get(&shard)
-            .and_then(Weak::upgrade)
+        self.read_furthest(shard, |store, height| {
+            store.get_entries_at_height(range, height)
+        })?
     }
 
     /// The committed substate byte total `shard`'s live store recorded at
     /// its genesis. `None` if no host serves `shard`.
     pub fn genesis_substate_bytes(&self, shard: ShardId) -> Option<u64> {
-        self.store_for(shard)?
-            .substate_bytes_at(BlockHeight::GENESIS)
+        self.read_any(shard, |store| store.substate_bytes_at(BlockHeight::GENESIS))?
     }
 
     /// The substate byte total each committed block's header claims, from
     /// height 1 through `through`, read off the live store. Empty if no
     /// host serves `shard`.
     pub fn substate_claims(&self, shard: ShardId, through: BlockHeight) -> Vec<Option<u64>> {
-        let Some(store) = self.store_for(shard) else {
-            return Vec::new();
-        };
-        (1..=through.inner())
-            .filter_map(|h| store.get_block(BlockHeight::new(h)))
-            .map(|block| block.block().header().load().substate_bytes)
-            .collect()
+        self.read_any(shard, |store| {
+            (1..=through.inner())
+                .filter_map(|h| store.get_block(BlockHeight::new(h)))
+                .map(|block| block.block().header().load().substate_bytes)
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     /// Where `shard`'s chain starts, read off the live store's recovered
     /// consensus state. `None` if no host serves `shard`.
     pub fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
-        let store = self.store_for(shard)?;
         let genesis =
             WeightedTimestamp::from_millis(self.build.beacon_chain_config.genesis_timestamp_ms);
-        Some(
+        self.read_any(shard, |store| {
             store
                 .load_recovered_state(shard)
                 .chain_origin
-                .unwrap_or_else(|| ChainOrigin::root(genesis)),
-        )
+                .unwrap_or_else(|| ChainOrigin::root(genesis))
+        })
     }
 
     /// The work `shard`'s committed tip leaves owing against the drain,
     /// read off the tip header the live store holds. `None` if no host
     /// serves `shard` or the tip carries no header.
     pub fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
-        let store = self.store_for(shard)?;
-        store
-            .get_certified_header(store.committed_height())
-            .map(|header| header.header().txs_in_flight())
+        self.read_any(shard, |store| {
+            store
+                .get_certified_header(store.committed_height())
+                .map(|header| header.header().txs_in_flight())
+        })?
     }
 
     /// [`chain_membership`] over the live store — what `shard`'s own
     /// certificates said it ran of `hash`. Empty if no host serves
     /// `shard` or no committed finalization names it.
     pub fn ran(&self, shard: ShardId, hash: TxHash) -> Vec<RanAs> {
-        self.store_for(shard)
-            .map_or_else(Vec::new, |store| chain_membership(store.as_ref(), hash))
+        self.read_any(shard, |store| chain_membership(store, hash))
+            .unwrap_or_default()
     }
 
     /// [`records_naming`] over the live store — every record on `shard`'s
     /// chain naming `hash`. Empty if no host serves `shard`.
     pub fn named_unsettled(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, ShardId)> {
-        self.store_for(shard)
-            .map_or_else(Vec::new, |store| records_naming(store.as_ref(), hash))
+        self.read_any(shard, |store| records_naming(store, hash))
+            .unwrap_or_default()
     }
 
     /// [`reads_record`] over the live store — whether `shard`'s chain has
     /// carried a held reading of `key`. False if no host serves `shard`.
     #[must_use]
     pub fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
-        self.store_for(shard)
-            .is_some_and(|store| reads_record(store.as_ref(), key))
+        self.read_any(shard, |store| reads_record(store, key))
+            .unwrap_or(false)
     }
 
     /// [`declines_naming`] over the live store — every crossing on
     /// `shard`'s chain that it refused for `hash`.
     #[must_use]
     pub fn declined(&self, shard: ShardId, hash: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
-        self.store_for(shard)
-            .map_or_else(Vec::new, |store| declines_naming(store.as_ref(), hash))
+        self.read_any(shard, |store| declines_naming(store, hash))
+            .unwrap_or_default()
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared
@@ -743,40 +677,43 @@ impl Harness {
         Option<BlockHeight>,
         Option<(BlockHeight, TransactionDecision)>,
     ) {
-        let Some(store) = self.store_for(shard) else {
-            return (None, None);
-        };
-        chain_fate(store.as_ref(), hash)
+        self.read_any(shard, |store| chain_fate(store, hash))
+            .unwrap_or((None, None))
     }
 
     /// [`chain_burn`] over the live store the runner writes to. `None` if
     /// no host serves `shard`.
     pub fn chain_burn(&self, shard: ShardId, hash: TxHash) -> Option<BlockHeight> {
-        self.store_for(shard)
-            .and_then(|store| chain_burn(store.as_ref(), hash))
+        self.read_any(shard, |store| chain_burn(store, hash))?
     }
 
     /// What credits committed on `shard`'s chain burned past
     /// `u128::MAX` on `key`: the most any host's store counted.
     pub fn credit_burned(&self, shard: ShardId, key: SubstateKey) -> u128 {
-        (0..self.hosts.len())
-            .filter_map(|host| self.host_store(host, shard))
-            .map(|store| store.credit_burned(key))
+        self.hosts
+            .iter()
+            .filter_map(|h| h.read_store(shard, |store| store.credit_burned(key)))
             .max()
             .unwrap_or(0)
     }
 
-    /// Signal every host to shut down and join its runner task. Drops the
-    /// real shard threads so they don't leak across `#[serial]` tests.
-    /// Idempotent: the hosts are drained, so a second call is a no-op.
+    /// Stop every host at once and wait until each has: its stores closed,
+    /// its sockets released and its threads joined, so nothing leaks across
+    /// `#[serial]` tests. Idempotent: the hosts are drained, so a second
+    /// call is a no-op.
     pub async fn shutdown(&mut self) {
-        for host in &mut self.hosts {
-            if let Some(s) = host.shutdown.take() {
-                s.shutdown();
-            }
-        }
+        let mut stopping = JoinSet::new();
         for host in self.hosts.drain(..) {
-            let _ = timeout(SHUTDOWN_TIMEOUT, host.join).await;
+            stopping.spawn(async move {
+                let stopped = host.running.node.stop().await;
+                drop(host.dir);
+                stopped
+            });
+        }
+        while let Some(stopped) = stopping.join_next().await {
+            if let Ok(Err(e)) = stopped {
+                tracing::warn!(error = %e, "A harness host stopped with an error");
+            }
         }
     }
 }
@@ -797,10 +734,10 @@ impl Harness {
             .hosts
             .iter()
             .enumerate()
-            .map(|(i, h)| (h.adapter.local_endpoint_id(), host_id(i)))
+            .map(|(i, h)| (h.network(IrohAdapter::local_endpoint_id), host_id(i)))
             .collect();
         for (i, host) in self.hosts.iter().enumerate() {
-            host.adapter.fault_configure(host_id(i), map.clone());
+            host.network(|network| network.fault_configure(host_id(i), map.clone()));
         }
     }
 
@@ -808,7 +745,7 @@ impl Harness {
     pub fn fault_install_drop(&self, spec: &DropSpec) -> Vec<RuleHandle> {
         self.hosts
             .iter()
-            .map(|h| h.adapter.fault_gate().install_drop(spec.clone()))
+            .map(|h| h.network(|network| network.fault_gate().install_drop(spec.clone())))
             .collect()
     }
 
@@ -816,7 +753,7 @@ impl Harness {
     /// handles it answered, one per host in host order.
     pub fn fault_remove_drop(&self, handles: &[RuleHandle]) {
         for (host, handle) in self.hosts.iter().zip(handles) {
-            host.adapter.fault_gate().remove_fault(handle);
+            host.network(|network| network.fault_gate().remove_fault(handle));
         }
     }
 
@@ -828,10 +765,11 @@ impl Harness {
         type_id: &'static str,
         rewrite: Rewrite,
     ) -> RuleHandle {
-        self.hosts[host]
-            .adapter
-            .fault_gate()
-            .install_response_rewrite(type_id, rewrite)
+        self.hosts[host].network(|network| {
+            network
+                .fault_gate()
+                .install_response_rewrite(type_id, rewrite)
+        })
     }
 
     /// Partition host groups `a` and `b` — each side blocks the other, so both
@@ -839,8 +777,8 @@ impl Harness {
     pub fn fault_partition(&self, a: &[usize], b: &[usize]) {
         for &i in a {
             for &j in b {
-                self.hosts[i].adapter.fault_gate().block_host(host_id(j));
-                self.hosts[j].adapter.fault_gate().block_host(host_id(i));
+                self.hosts[i].network(|network| network.fault_gate().block_host(host_id(j)));
+                self.hosts[j].network(|network| network.fault_gate().block_host(host_id(i)));
             }
         }
     }
@@ -850,24 +788,22 @@ impl Harness {
     pub fn fault_partition_during(&self, a: &[usize], b: &[usize], windows: &[Range<Duration>]) {
         for &i in a {
             for &j in b {
-                self.hosts[i]
-                    .adapter
-                    .fault_gate()
-                    .block_host_during(host_id(j), windows);
-                self.hosts[j]
-                    .adapter
-                    .fault_gate()
-                    .block_host_during(host_id(i), windows);
+                self.hosts[i].network(|network| {
+                    network.fault_gate().block_host_during(host_id(j), windows);
+                });
+                self.hosts[j].network(|network| {
+                    network.fault_gate().block_host_during(host_id(i), windows);
+                });
             }
         }
     }
 
     /// Isolate one host: it blocks every other, and every other blocks it.
     pub fn fault_isolate(&self, host: usize) {
-        self.hosts[host].adapter.fault_gate().block_all_hosts();
+        self.hosts[host].network(|network| network.fault_gate().block_all_hosts());
         for (i, h) in self.hosts.iter().enumerate() {
             if i != host {
-                h.adapter.fault_gate().block_host(host_id(host));
+                h.network(|network| network.fault_gate().block_host(host_id(host)));
             }
         }
     }
@@ -875,14 +811,14 @@ impl Harness {
     /// Heal the partition between hosts `a` and `b` only — each side lifts
     /// its block against the other, leaving every other cut intact.
     pub fn fault_heal_between(&self, a: usize, b: usize) {
-        self.hosts[a].adapter.fault_gate().unblock_host(host_id(b));
-        self.hosts[b].adapter.fault_gate().unblock_host(host_id(a));
+        self.hosts[a].network(|network| network.fault_gate().unblock_host(host_id(b)));
+        self.hosts[b].network(|network| network.fault_gate().unblock_host(host_id(a)));
     }
 
     /// Heal every partition on every host.
     pub fn fault_heal_all(&self) {
         for h in &self.hosts {
-            h.adapter.fault_gate().heal();
+            h.network(|network| network.fault_gate().heal());
         }
     }
 
@@ -890,117 +826,22 @@ impl Harness {
     /// partitions intact.
     pub fn fault_clear_all(&self) {
         for h in &self.hosts {
-            h.adapter.fault_gate().clear_faults();
+            h.network(|network| network.fault_gate().clear_faults());
         }
     }
 }
 
-/// Spawn a built host's runner and keep the handles the harness drives it
-/// through.
-fn spawn_host(mut bh: BuiltHost) -> Host {
-    let shutdown = bh.runner.shutdown_handle().expect("shutdown handle");
-    let reconfigure = bh.runner.reconfigure_handle();
-    let topology = Arc::clone(bh.runner.topology_snapshot());
-    let join = spawn(bh.runner.run());
+/// Starts a host from `spec` in a fresh data directory under a fresh
+/// network key, bootstrapped to `bootstrap_peers`.
+fn start_host(build: &ClusterBuild, spec: HostSpec, bootstrap_peers: Vec<EndpointAddr>) -> Host {
+    let dir = TempDir::new().expect("temp dir");
+    let key = SecretKey::generate();
+    let running = build.start(&dir, spec.validators.clone(), &key, bootstrap_peers);
     Host {
-        validator_ids: bh.validator_ids,
-        validators: bh.validators,
-        key: bh.key,
-        adapter: bh.adapter,
-        rpc_status: bh.rpc_status,
-        beacon_storage: bh.beacon_storage,
-        tx_submission: bh.tx_submission,
-        tx_status: bh.tx_status,
-        derivation: bh.derivation,
-        stores: bh.stores,
-        reconfigure,
-        topology,
-        shutdown: Some(shutdown),
-        join,
-    }
-}
-
-/// A built-but-not-yet-spawned host.
-struct BuiltHost {
-    validator_ids: Vec<ValidatorId>,
-    validators: Vec<LocalValidator>,
-    runner: ProductionRunner,
-    key: SecretKey,
-    adapter: Arc<IrohAdapter>,
-    rpc_status: Arc<ArcSwap<NodeStatusState>>,
-    beacon_storage: Arc<RocksDbBeaconStorage>,
-    tx_submission: TxSubmissionSender,
-    tx_status: Arc<TxStatusCache>,
-    /// The host engine's derivation, which knows what its chains created.
-    derivation: Arc<dyn Derivation>,
-    stores: StoreRegistry,
-}
-
-struct BuildHostArgs<'a> {
-    temp_dir: &'a TempDir,
-    genesis: &'a GenesisValidators,
-    validators: Vec<LocalValidator>,
-    beacon_chain_config: BeaconChainConfig,
-    genesis_config: Option<GenesisConfig>,
-    key: SecretKey,
-    bootstrap_peers: Vec<EndpointAddr>,
-    simulated_outbound_latency: Duration,
-}
-
-/// Build a host's runner (the adapter binds and starts peering immediately;
-/// the runner is spawned separately). The runner derives the host's seats
-/// from the beacon genesis and opens their stores through the factory, so
-/// nothing is pre-opened here.
-fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
-    let beacon_storage = Arc::new(
-        RocksDbBeaconStorage::open(args.temp_dir.path().join("beacon_db")).expect("open beacon db"),
-    );
-    let network_config = test_config(
-        &args.key,
-        args.bootstrap_peers,
-        args.simulated_outbound_latency,
-    );
-
-    // The factory records every store it opens — startup seats and
-    // reshape-opened children alike — into this registry, which starts empty.
-    let stores: StoreRegistry = Arc::new(Mutex::new(HashMap::new()));
-
-    let beacon_reader: Arc<dyn BeaconStorage> = beacon_storage.clone();
-    let validator_ids: Vec<ValidatorId> = args.validators.iter().map(|v| v.validator_id).collect();
-    let validators = args.validators.clone();
-    let mut builder = ProductionRunner::builder(
-        args.validators,
-        args.genesis.clone(),
-        ShardConsensusConfig::default(),
-        beacon_reader,
-        network_config,
-        capturing_storage_factory(args.temp_dir, Arc::clone(&stores)),
-        temp_storage_dir(args.temp_dir),
-    )
-    .beacon_chain_config(args.beacon_chain_config);
-    if let Some(cfg) = args.genesis_config {
-        builder = builder.genesis_config(cfg);
-    }
-    let runner = builder.build().expect("build runner");
-    let adapter = Arc::clone(runner.network());
-    let rpc_status = runner.node_status();
-    // Capture the submission + status hooks before `run()` consumes the host.
-    let tx_submission = runner.tx_submission_sender();
-    let tx_status = runner.tx_status_cache();
-    let derivation = runner.derivation();
-
-    BuiltHost {
-        validator_ids,
-        validators,
-        runner,
-        key: args.key,
-        adapter,
-        rpc_status,
-        beacon_storage,
-        tx_submission,
-        tx_status,
-        derivation,
-        stores,
+        validators: spec.validators,
+        key,
+        dir,
+        running,
     }
 }
 
@@ -1012,57 +853,6 @@ enum Replacement {
     InstalledGenesis,
     /// A clone of the host's store for this split parent, never adopted.
     ParentClone(ShardId),
-}
-
-/// Wait for every store in `stores` to close. Store work a supervisor
-/// hands off — an open, a parent clone, an adoption — holds its store
-/// past the runner's own stop and writes to its directory until it
-/// finishes.
-///
-/// # Panics
-///
-/// Panics if a store is still open after [`STORE_CLOSE_TIMEOUT`].
-async fn await_stores_closed(stores: &StoreRegistry) {
-    let open = || {
-        stores
-            .lock()
-            .expect("store registry")
-            .iter()
-            .filter(|(_, store)| store.strong_count() > 0)
-            .map(|(&shard, _)| shard)
-            .collect::<Vec<_>>()
-    };
-    let deadline = Instant::now() + STORE_CLOSE_TIMEOUT;
-    loop {
-        let still_open = open();
-        if still_open.is_empty() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stores still open after the host stopped: {still_open:?}",
-        );
-        sleep(STORE_CLOSE_POLL).await;
-    }
-}
-
-/// Copy the tree at `from` into `to`, leaving out the subtrees at `skip`.
-fn copy_dir_except(from: &Path, to: &Path, skip: &[PathBuf]) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let path = entry.path();
-        if skip.contains(&path) {
-            continue;
-        }
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_except(&path, &target, skip)?;
-        } else {
-            std::fs::copy(&path, &target)?;
-        }
-    }
-    Ok(())
 }
 
 /// Wall-clock milliseconds since the Unix epoch — the shared genesis
