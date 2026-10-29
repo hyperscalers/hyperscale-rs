@@ -762,6 +762,13 @@ impl ReshapeOrchestrator {
         }
     }
 
+    /// Stop counting `validator` among this host's: a validator that moved
+    /// to another host, which discovers its cohort and keeper seats there.
+    /// Duties already in flight here run on.
+    pub fn remove_me(&mut self, validator: ValidatorId) {
+        self.me.retain(|&kept| kept != validator);
+    }
+
     /// Whether an in-flight duty owns seating `shard` — a merging parent a
     /// keeper reforms, or a splitting child an observer syncs or a parent
     /// half seeds. The adapter suppresses the placement-delta join for such

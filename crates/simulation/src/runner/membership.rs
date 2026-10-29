@@ -23,6 +23,7 @@
 //! through [`SimulationRunner::topology_step`] rather than calling them
 //! separately.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_core::ParticipationChange;
@@ -31,6 +32,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
+use hyperscale_node::startup::{placed_validators, retired_signers, shard_retired};
 use hyperscale_node::{HostedChain, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -312,22 +314,21 @@ impl SimulationRunner {
     /// beacon placement — the deterministic counterpart of the production
     /// supervisor's reconcile pair (`reconcile_joins` /
     /// `reconcile_teardown`). Seats every live leaf the host holds a committed
-    /// `OnShard` placement on but isn't running, and tears down every leaf it
-    /// runs but no longer holds a placement on (a committee rotation moved its
-    /// members off). A shard a reshape duty owns (`is_seating`) is left to the
-    /// orchestrator. Idempotent; safe to call every slice.
+    /// `OnShard` placement on but isn't running, and tears down every shard it
+    /// runs that [`shard_retired`] retires. A leaf a reshape duty owns
+    /// (`is_seating`) is left to the orchestrator to seat. Idempotent; safe to
+    /// call every slice.
     ///
-    /// Placement is read from the seatable committee view — full membership
-    /// minus split-observer riders — the same view the production supervisor's
-    /// join half reads. An observer rides the networking committee for
-    /// serving, gossip, and ready-signal admission but must not be seated as
-    /// a consensus member. A terminated parent is an internal
-    /// trie host, not a leaf, so it is never torn down here — it stays retained
-    /// for serving. The placement deltas the hosts emit are drained for
-    /// parity with production's delta-driven path, but the committed projection
-    /// drives the actual join/leave: the snap-sync usually completes within the
-    /// slice, and a join whose attested anchor has gone stale (a transient fold
-    /// freeze evicted its state) simply defers to a later slice, the same way
+    /// Placement is [`placed_validators`]: the seatable committee view — full
+    /// membership minus split-observer riders — the rule the production
+    /// supervisor's join half reads. An
+    /// observer rides the networking committee for serving, gossip, and
+    /// ready-signal admission but must not be seated as a consensus member.
+    /// The placement deltas the hosts emit are drained for parity with
+    /// production's delta-driven path, but the committed projection drives the
+    /// actual join/leave: the snap-sync usually completes within the slice, and
+    /// a join whose attested anchor has gone stale (a transient fold freeze
+    /// evicted its state) simply defers to a later slice, the same way
     /// production's async bootstrap retries against the advanced anchor.
     pub(crate) fn reconcile_placement(&mut self) {
         let _ = self.take_participation_changes();
@@ -359,10 +360,9 @@ impl SimulationRunner {
                 if self.reshape[host as usize].is_seating(shard) {
                     continue;
                 }
-                let placed: Vec<ValidatorId> = snapshot
-                    .seatable_committee_for_shard(shard)
-                    .filter(|&validator| self.homes_validator(host, validator))
-                    .collect();
+                let placed = placed_validators(shard, &snapshot, |validator| {
+                    self.homes_validator(host, validator)
+                });
                 if hosted.contains(&shard) {
                     let seated = self.hosts[host as usize].signers(shard);
                     // Under a fork recovery a loop committed past the
@@ -426,51 +426,19 @@ impl SimulationRunner {
                 }
             }
 
+            // Teardown reads the same rule the production supervisor's
+            // reconcile reads, so a change to routing retention or the reshape
+            // handoff lands on both harnesses.
+            let host_ids: HashSet<ValidatorId> = self.homed_validators(host).into_iter().collect();
             for &shard in &hosted {
-                if self.reshape[host as usize].is_seating(shard) {
-                    continue;
-                }
-                let committee = snapshot.committee_for_shard(shard);
-                // A stalled ex-member: the host runs a live shard but the rotated
-                // committee no longer carries any of its validators. An empty
-                // committee is a terminated chain the host retains for serving,
-                // not an ex-member, so it stays. Teardown reads full membership
-                // rather than the seatable view: any window role — an observer
-                // ride included — keeps the shard up, mirroring the production
-                // supervisor's `host_in_committee` rule.
-                let ex_member = !committee.is_empty()
-                    && !committee
-                        .iter()
-                        .any(|&validator| self.homes_validator(host, validator));
-                // A host the routing view still resolves keeps serving: a
-                // halt recovery retains the replaced committee in the
-                // shard's routing entry until the shard commits under its
-                // fresh one — the members it replaced hold the halted tip
-                // the incomers sync from. This is the same projection the
-                // production supervisor's retired check reads, so a change
-                // to routing retention lands on both harnesses.
-                let in_routing = routing.get(&shard).is_some_and(|entry| {
-                    entry
-                        .iter()
-                        .any(|&validator| self.homes_validator(host, validator))
-                });
-                if ex_member && !in_routing {
+                if shard_retired(shard, &snapshot, &routing, &host_ids) {
                     let storage = self.leave_shard(host, shard);
                     self.retained_storages.insert((host, shard), storage);
                     continue;
                 }
-                // The loop stays; a validator attached to it that no
-                // longer holds a role in the committee or the routing
-                // entry detaches, by the same rule applied per validator.
-                // A replica left with no signer keeps following the chain.
-                for validator in self.hosts[host as usize].signers(shard) {
-                    let retained = committee.contains(&validator)
-                        || routing
-                            .get(&shard)
-                            .is_some_and(|entry| entry.contains(&validator));
-                    if !retained {
-                        self.hosts[host as usize].detach_signer(shard, validator);
-                    }
+                let attached = self.hosts[host as usize].signers(shard);
+                for validator in retired_signers(shard, &snapshot, &routing, &attached) {
+                    self.hosts[host as usize].detach_signer(shard, validator);
                 }
             }
         }
@@ -551,6 +519,7 @@ impl SimulationRunner {
         let index = usize::try_from(validator.inner()).expect("id fits usize");
         let from = self.validator_home[index];
         self.hosts[from as usize].remove_participant(validator);
+        self.reshape[from as usize].remove_me(validator);
         let source = Arc::clone(self.hosts[from as usize].beacon_storage());
         let destination = Arc::clone(self.hosts[host as usize].beacon_storage());
         if let Some(record) = source.beacon_vote_record(validator) {
@@ -563,6 +532,7 @@ impl SimulationRunner {
         self.network.bind_validator(validator, host);
         let signer = self.signer_of(validator);
         self.hosts[host as usize].add_participant(validator, signer);
+        self.reshape[host as usize].add_me(validator);
         let output = self.hosts[host as usize].drain_pending_output();
         self.process_step_output(host, output);
         self.placement_epoch[from as usize] = None;

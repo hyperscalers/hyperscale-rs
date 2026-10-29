@@ -321,7 +321,7 @@ impl SimulationRunner {
     }
 
     /// The validators whose keys live on `host`.
-    fn homed_validators(&self, host: NodeIndex) -> Vec<ValidatorId> {
+    pub(super) fn homed_validators(&self, host: NodeIndex) -> Vec<ValidatorId> {
         self.validator_home
             .iter()
             .enumerate()

@@ -24,7 +24,7 @@ use hyperscale_beacon::ChainRegistration;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
-use hyperscale_node::startup::holds_window_role;
+use hyperscale_node::startup::{placed_validators, retired_signers, shard_retired};
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
     network_genesis_block,
@@ -33,9 +33,7 @@ use hyperscale_storage::{
     RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds, holds_state,
 };
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};
-use hyperscale_types::{
-    Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
-};
+use hyperscale_types::{Block, BlockHeight, ShardId, TopologySnapshot, ValidatorId};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -938,18 +936,26 @@ impl ShardSupervisor {
         // validator, each signer that no longer holds a role in it, while
         // another keeps the loop running.
         for (&shard, entry) in &mut self.shards {
-            for id in entry.validator_ids.clone() {
-                let validator = ValidatorId::new(id);
-                let alone = HashSet::from([validator]);
-                if entry.validator_ids.len() > 1
-                    && shard_retired(shard, &topology_snapshot, &routing, &alone)
-                    && entry
-                        .control_tx
-                        .send(ShardControl::Detach(validator))
-                        .is_ok()
+            let attached: Vec<ValidatorId> = entry
+                .validator_ids
+                .iter()
+                .copied()
+                .map(ValidatorId::new)
+                .collect();
+            for validator in retired_signers(shard, &topology_snapshot, &routing, &attached) {
+                if entry
+                    .control_tx
+                    .send(ShardControl::Detach(validator))
+                    .is_ok()
                 {
-                    entry.validator_ids.retain(|&kept| kept != id);
-                    info!(shard = ?shard, validator = id, "Signer detached from a running shard");
+                    entry
+                        .validator_ids
+                        .retain(|&kept| kept != validator.inner());
+                    info!(
+                        shard = ?shard,
+                        validator = validator.inner(),
+                        "Signer detached from a running shard"
+                    );
                 }
             }
         }
@@ -989,7 +995,6 @@ impl ShardSupervisor {
                 self.join(shard, &vnodes);
             }
         }
-        let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
         // A running shard seats a local member it does not yet carry.
         let running: Vec<ShardId> = self
             .shards
@@ -998,14 +1003,14 @@ impl ShardSupervisor {
             .filter(|&shard| !self.reshape.is_seating(shard))
             .collect();
         for shard in running {
-            let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
+            let vnodes = self.placed_vnodes(&topology_snapshot, shard);
             self.seat_on_running(shard, &vnodes);
         }
         let needed: Vec<ShardId> = topology_snapshot
             .shard_trie()
             .leaves()
             .filter(|&shard| {
-                host_holds_seat(shard, &topology_snapshot, &host_ids)
+                !self.placed_vnodes(&topology_snapshot, shard).is_empty()
                     && !self.shards.contains_key(&shard)
                     && !self.bootstrapping.contains_key(&shard)
                     && !self.draining.contains_key(&shard)
@@ -1016,7 +1021,7 @@ impl ShardSupervisor {
             })
             .collect();
         for shard in needed {
-            let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
+            let vnodes = self.placed_vnodes(&topology_snapshot, shard);
             info!(shard = ?shard, "Reconciling a missed committee join from the committed view");
             self.join(shard, &vnodes);
         }
@@ -1116,6 +1121,25 @@ impl ShardSupervisor {
             .collect()
     }
 
+    /// The vnode configs for every local validator [`placed_validators`]
+    /// places on `shard`.
+    fn placed_vnodes(
+        &self,
+        topology_snapshot: &TopologySnapshot,
+        shard: ShardId,
+    ) -> Vec<VnodeConfig> {
+        placed_validators(shard, topology_snapshot, |validator| {
+            self.vnode_keys.contains_key(&validator)
+        })
+        .into_iter()
+        .map(|validator| VnodeConfig {
+            validator_id: validator,
+            local_shard: shard,
+            signer: Arc::clone(&self.vnode_keys[&validator]),
+        })
+        .collect()
+    }
+
     /// How this host builds every replica it runs at runtime.
     fn replica_config(&self) -> ReplicaConfig {
         ReplicaConfig {
@@ -1158,285 +1182,5 @@ fn await_release(store: Option<Weak<RocksDbShardStorage>>) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Whether a hosted shard has aged out of this host's serving duty: no
-/// local validator holds any role in its active committee and none sits
-/// in its routing committee (no serve obligation).
-///
-/// The active-committee guard keeps a shard up through its current window
-/// even after a lookahead delta has moved the validator on in the routing
-/// view; the routing guard keeps a dissolved shard served for as long as
-/// a fetch can still resolve this host among its peers. Both false means
-/// the shard is still wanted — it retires only when neither holds, so
-/// serving and routing share the one committed lifetime.
-fn shard_retired(
-    shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
-    routing: &RoutingCommittees,
-    host_ids: &HashSet<ValidatorId>,
-) -> bool {
-    // A reshape predecessor mid-handoff stays up even once it ages out of the
-    // routable window: under make-before-break its committee stays seated,
-    // serving its terminal, until the successors are live, so they can seed and
-    // finalize against it.
-    !holds_window_role(shard, topology_snapshot, routing, host_ids)
-        && !topology_snapshot.reshape_handoff_pending(shard)
-}
-
-/// Whether a local validator holds a consensus seat in `shard`'s committed
-/// committee — the join half's membership question, read from the seatable
-/// view. A split observer riding the committee never reads as a seat: seating
-/// it would emit a shard-joiner ready signal that classifies as the cohort's
-/// `ReshapeReady` and could fire the split gate before its child store has
-/// synced.
-fn host_holds_seat(
-    shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
-    host_ids: &HashSet<ValidatorId>,
-) -> bool {
-    topology_snapshot
-        .seatable_committee_for_shard(shard)
-        .any(|v| host_ids.contains(&v))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
-    use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_node::startup::host_in_committee;
-    use hyperscale_types::{
-        NetworkDefinition, ReshapeSeat, RoutingCommittees, ShardId, Signer, TopologySnapshot,
-        ValidatorId, ValidatorInfo, ValidatorSet,
-    };
-
-    use super::{host_holds_seat, shard_retired};
-
-    const HOST: ValidatorId = ValidatorId::new(1);
-
-    /// A head snapshot carrying `committees` as each shard's active
-    /// membership — a complete sibling set so the trie is well-formed.
-    fn head(committees: HashMap<ShardId, Vec<ValidatorId>>) -> TopologySnapshot {
-        head_with_observers(committees, BTreeMap::new())
-    }
-
-    /// [`head`] with pending-split observer cohorts riding the committees.
-    fn head_with_observers(
-        committees: HashMap<ShardId, Vec<ValidatorId>>,
-        observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
-    ) -> TopologySnapshot {
-        let ids: BTreeSet<ValidatorId> = committees.values().flatten().copied().collect();
-        let validators: Vec<ValidatorInfo> = ids
-            .iter()
-            .map(|&validator_id| ValidatorInfo {
-                validator_id,
-                public_key: BlsSigner::generate().public_key(),
-            })
-            .collect();
-        TopologySnapshot::from_explicit_committees(
-            NetworkDefinition::simulator(),
-            &ValidatorSet::new(validators),
-            committees,
-            HashMap::new(),
-            BTreeMap::new(),
-            HashMap::new(),
-            observers
-                .into_iter()
-                .map(|(parent, cohort)| {
-                    let seats = cohort
-                        .into_iter()
-                        .map(|(id, shard)| {
-                            (
-                                id,
-                                ReshapeSeat {
-                                    shard,
-                                    ready: false,
-                                },
-                            )
-                        })
-                        .collect();
-                    (parent, seats)
-                })
-                .collect(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        )
-    }
-
-    fn routing(entries: &[(ShardId, Vec<ValidatorId>)]) -> RoutingCommittees {
-        entries.iter().cloned().collect()
-    }
-
-    /// A live shard the host rotated off — gone from both its active and
-    /// its routing committee — retires.
-    #[test]
-    fn retires_a_shard_absent_from_active_and_routing() {
-        let shard = ShardId::leaf(1, 0);
-        let sibling = ShardId::leaf(1, 1);
-        let others = vec![ValidatorId::new(2), ValidatorId::new(3)];
-        let topology_snapshot = head(HashMap::from([
-            (shard, others.clone()),
-            (sibling, vec![ValidatorId::new(4)]),
-        ]));
-        let routing = routing(&[(shard, others)]);
-        assert!(shard_retired(
-            shard,
-            &topology_snapshot,
-            &routing,
-            &HashSet::from([HOST])
-        ));
-    }
-
-    /// A merge child gone from the head but retained in routing with the
-    /// host among its terminal committee stays served — the keeper-fetch
-    /// case the fix exists for.
-    #[test]
-    fn keeps_a_dissolved_shard_the_host_still_routes() {
-        let child = ShardId::leaf(2, 2);
-        let topology_snapshot = head(HashMap::from([
-            (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
-            (ShardId::leaf(1, 1), vec![HOST]),
-        ]));
-        let routing = routing(&[(child, vec![HOST, ValidatorId::new(2)])]);
-        assert!(!shard_retired(
-            child,
-            &topology_snapshot,
-            &routing,
-            &HashSet::from([HOST])
-        ));
-    }
-
-    /// The host still sits in the active committee — kept even after the
-    /// routing lookahead has moved it on, so the current window is served
-    /// to its end.
-    #[test]
-    fn keeps_a_shard_with_an_active_consensus_role() {
-        let shard = ShardId::leaf(1, 0);
-        let topology_snapshot = head(HashMap::from([
-            (shard, vec![HOST, ValidatorId::new(2)]),
-            (ShardId::leaf(1, 1), vec![ValidatorId::new(4)]),
-        ]));
-        // The lookahead already moved the host off in routing.
-        let routing = routing(&[(shard, vec![ValidatorId::new(2), ValidatorId::new(3)])]);
-        assert!(!shard_retired(
-            shard,
-            &topology_snapshot,
-            &routing,
-            &HashSet::from([HOST])
-        ));
-    }
-
-    /// A dissolved shard aged out of routing entirely retires — once its
-    /// reshape handoff has completed. Here `leaf(2, 2)` merged into `leaf(1, 1)`,
-    /// which is now live (advanced past genesis), so the predecessor is free.
-    #[test]
-    fn retires_a_shard_evicted_from_routing() {
-        let child = ShardId::leaf(2, 2);
-        let topology_snapshot = head(HashMap::from([
-            (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
-            (ShardId::leaf(1, 1), vec![HOST]),
-        ]))
-        .with_advanced([ShardId::leaf(1, 1)].into());
-        let routing = RoutingCommittees::new();
-        assert!(shard_retired(
-            child,
-            &topology_snapshot,
-            &routing,
-            &HashSet::from([HOST])
-        ));
-    }
-
-    /// A reshape predecessor mid-handoff is held up even once it has aged out of
-    /// routing: its successors aren't live yet, so it keeps serving its terminal.
-    #[test]
-    fn holds_a_reshape_predecessor_until_its_successor_is_live() {
-        let child = ShardId::leaf(2, 2);
-        // `leaf(2, 2)` merged into `leaf(1, 1)`, which is seated but not yet live.
-        let topology_snapshot = head(HashMap::from([
-            (ShardId::leaf(1, 0), vec![ValidatorId::new(2)]),
-            (ShardId::leaf(1, 1), vec![HOST]),
-        ]));
-        let routing = RoutingCommittees::new();
-        assert!(!shard_retired(
-            child,
-            &topology_snapshot,
-            &routing,
-            &HashSet::from([HOST])
-        ));
-    }
-
-    /// The join reconcile targets exactly the committed committees a local
-    /// validator belongs to; without a pending split the two membership
-    /// views agree.
-    #[test]
-    fn host_holds_seat_tracks_committed_committee_membership() {
-        let mine = ShardId::leaf(1, 0);
-        let theirs = ShardId::leaf(1, 1);
-        let topology_snapshot = head(HashMap::from([
-            (mine, vec![HOST, ValidatorId::new(2)]),
-            (theirs, vec![ValidatorId::new(3)]),
-        ]));
-        let host_ids = HashSet::from([HOST]);
-        assert!(host_holds_seat(mine, &topology_snapshot, &host_ids));
-        assert!(!host_holds_seat(theirs, &topology_snapshot, &host_ids));
-        assert!(host_in_committee(mine, &topology_snapshot, &host_ids));
-        assert!(!host_in_committee(theirs, &topology_snapshot, &host_ids));
-    }
-
-    /// A split-observer ride is a committee role but not a consensus seat:
-    /// the join reconcile must not bring the splitting parent up on a host
-    /// whose only stake in it is the observer, while a co-hosted real
-    /// member still reads as a seat.
-    #[test]
-    fn an_observer_ride_is_not_a_consensus_seat() {
-        let parent = ShardId::leaf(1, 0);
-        let sibling = ShardId::leaf(1, 1);
-        let (child, _) = parent.children();
-        let member = ValidatorId::new(2);
-        let topology_snapshot = head_with_observers(
-            HashMap::from([
-                (parent, vec![member, ValidatorId::new(3), HOST]),
-                (sibling, vec![ValidatorId::new(4)]),
-            ]),
-            BTreeMap::from([(parent, BTreeMap::from([(HOST, child)]))]),
-        );
-
-        let observer_only = HashSet::from([HOST]);
-        assert!(!host_holds_seat(parent, &topology_snapshot, &observer_only));
-        assert!(host_in_committee(
-            parent,
-            &topology_snapshot,
-            &observer_only
-        ));
-
-        let co_hosting = HashSet::from([HOST, member]);
-        assert!(host_holds_seat(parent, &topology_snapshot, &co_hosting));
-    }
-
-    /// The teardown half deliberately reads full membership: a hosted shard
-    /// whose only local committee link is an observer ride stays up for the
-    /// window even with no routing entry.
-    #[test]
-    fn keeps_a_shard_the_host_only_observes() {
-        let parent = ShardId::leaf(1, 0);
-        let sibling = ShardId::leaf(1, 1);
-        let (child, _) = parent.children();
-        let topology_snapshot = head_with_observers(
-            HashMap::from([
-                (parent, vec![ValidatorId::new(2), HOST]),
-                (sibling, vec![ValidatorId::new(3)]),
-            ]),
-            BTreeMap::from([(parent, BTreeMap::from([(HOST, child)]))]),
-        );
-        let routing = RoutingCommittees::new();
-        assert!(!shard_retired(
-            parent,
-            &topology_snapshot,
-            &routing,
-            &HashSet::from([HOST])
-        ));
     }
 }
