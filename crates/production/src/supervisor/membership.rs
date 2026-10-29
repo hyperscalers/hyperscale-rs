@@ -112,7 +112,7 @@ impl ShardSupervisor {
         // `pending_reshape_prep` covers a prep parked behind an earlier open.
         if self.reshape.is_seating(shard)
             || self.reshape_owns(shard)
-            || self.reshape_stores.contains_key(&shard)
+            || self.reshape_stores.contains(shard)
             || self.pending_reshape_prep.contains_key(&shard)
         {
             info!(shard = ?shard, "Join superseded by an active reshape duty; the orchestrator seats it");
@@ -1008,7 +1008,7 @@ impl ShardSupervisor {
                     && !self.pending_joins.contains_key(&shard)
                     && !self.awaiting_anchor.contains_key(&shard)
                     && !self.reshape.is_seating(shard)
-                    && !self.reshape_stores.contains_key(&shard)
+                    && !self.reshape_stores.contains(shard)
             })
             .collect();
         for shard in needed {

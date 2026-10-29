@@ -29,8 +29,8 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::{AddVnodeError, IrohNetwork};
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::process::ProcessIo;
-use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeOrchestrator, ReshapeRequest};
+use hyperscale_node::reshape::prepared::{PreparedStores, ReshapeCompletion};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::{NodeConfig, Registration, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
@@ -57,7 +57,6 @@ mod reshape;
 use beacon::BeaconThread;
 use hyperscale_node::startup::Replaced;
 use membership::{CompletedBootstrap, Rebuild};
-use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
 type ProdProcessIo = ProcessIo<RocksDbShardStorage, IrohNetwork, PooledDispatch>;
@@ -150,7 +149,7 @@ pub enum SupervisorEvent {
     /// it replaces is replaced.
     Rebuilt(Result<CompletedBootstrap, ShardId>, Replaced),
     /// A reshape orchestrator io result settled.
-    Reshape(ReshapeIo),
+    Reshape(ReshapeCompletion<Arc<RocksDbShardStorage>>),
     /// A shard loop attached a validator to its replica.
     Attached {
         /// Shard whose replica it attached to.
@@ -273,7 +272,7 @@ pub struct ShardSupervisor {
     /// splitting child or a merging parent), held between the
     /// orchestrator's open and seat requests. Seated stores move into
     /// [`Self::storages`].
-    reshape_stores: HashMap<ShardId, PreparedStore<Arc<RocksDbShardStorage>>>,
+    reshape_stores: PreparedStores<Arc<RocksDbShardStorage>>,
     /// Reshape store-prep requests (`OpenStore` / `SeedFromParent`) held while
     /// an ordinary join is still opening the same shard's store
     /// directory, keyed by that store shard. A reshape duty owns its successor's
@@ -366,7 +365,7 @@ impl ShardSupervisor {
             bootstrapping: HashMap::new(),
             rebuilding: HashMap::new(),
             reshape: ReshapeOrchestrator::new(vnode_keys.keys().copied().collect()),
-            reshape_stores: HashMap::new(),
+            reshape_stores: PreparedStores::new(),
             pending_reshape_prep: HashMap::new(),
             epoch_duration_ms,
             draining: HashMap::new(),
