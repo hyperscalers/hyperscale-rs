@@ -491,6 +491,18 @@ impl TopologySchedule {
         &self.head
     }
 
+    /// The newest window this schedule holds: the projection of the epoch
+    /// after the head that the last fold published, or the head itself
+    /// where nothing past it is held. The committees the beacon has drawn a
+    /// full window ahead, for placement questions; never for
+    /// committee-quorum verification.
+    #[must_use]
+    pub fn newest_window(&self) -> &Arc<TopologySnapshot> {
+        self.by_epoch
+            .last_key_value()
+            .map_or(&self.head, |(_, snapshot)| snapshot)
+    }
+
     /// Whether `shard`'s reshape successor(s) are live in the committed head —
     /// the make-before-break cutover a terminating committee reads off its own
     /// beacon fold. Keys on the live head, not a weighted-time window, because

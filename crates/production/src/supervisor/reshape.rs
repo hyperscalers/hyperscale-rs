@@ -714,7 +714,7 @@ impl ShardSupervisor {
     /// Seat a prepared reshape duty: install its derived genesis and start
     /// consensus for every local committee member of `shard`, from the
     /// store the duty adopted into. The orchestrator owns this seating, so
-    /// the placement-delta join for the same shard is suppressed.
+    /// an ordinary join for the same shard is suppressed.
     fn reshape_seat(&mut self, shard: ShardId) {
         let Some(PreparedStore {
             storage,
@@ -809,8 +809,7 @@ impl ShardSupervisor {
     /// until this host's topology carries one. A store the duty prepared is
     /// dropped first, releasing its directory to the join, which wipes what
     /// the duty left there. With no local member placed on the child yet, the
-    /// placement delta or the reshape tick's [`Self::reconcile_joins`] joins
-    /// it once one is.
+    /// reshape tick's [`Self::reconcile_joins`] joins it once one is.
     fn hand_over_to_join(&mut self, child: ShardId) {
         if !self.reshape.relinquished(child) {
             return;

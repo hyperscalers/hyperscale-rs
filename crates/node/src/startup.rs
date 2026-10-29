@@ -19,7 +19,7 @@ use hyperscale_beacon::coordinator::{resumed_schedule, retention_floor};
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_types::{
     BeaconState, BlockHeight, LocalTimestamp, NetworkDefinition, RoutingCommittees, ShardBoundary,
-    ShardId, Signer, TopologySnapshot, ValidatorId, ValidatorStatus,
+    ShardId, Signer, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus,
 };
 use tracing::info;
 
@@ -271,22 +271,35 @@ pub fn host_in_committee<H: BuildHasher>(
 }
 
 /// The local validators placed on `shard`: each `is_local` validator
-/// holding a consensus seat in its committed committee.
+/// holding a consensus seat in the head window's committee.
 ///
 /// The join half's membership question, read from the seatable view. A
 /// split observer riding the committee never reads as a seat: seating it
 /// would emit a shard-joiner ready signal that classifies as the cohort's
 /// `ReshapeReady` and could fire the split gate before its child store has
 /// synced.
+///
+/// Under a pending recovery only the members the recovery seats are
+/// placed: the head's committee as the newest window also seats it. In the
+/// window the recovery is drawn in, the head's committee is the one it
+/// replaced, and live work on the shard already binds to the fresh one, so
+/// a replaced member signs nothing more on the recovered chain; seated
+/// beside a fresh member on a store rebuilt at the attested frontier, it
+/// would hold a seat that chain does not have. Its replicas keep serving:
+/// routing retains the replaced committee until the recovery completes,
+/// and the teardown half reads routing.
 #[must_use]
 pub fn placed_validators(
     shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
+    schedule: &TopologySchedule,
     is_local: impl Fn(ValidatorId) -> bool,
 ) -> Vec<ValidatorId> {
-    topology_snapshot
-        .seatable_committee_for_shard(shard)
+    let head = schedule.head();
+    let recovering = head.pending_recoveries().contains_key(&shard);
+    let newest = schedule.newest_window();
+    head.seatable_committee_for_shard(shard)
         .filter(|&validator| is_local(validator))
+        .filter(|validator| !recovering || newest.committee_for_shard(shard).contains(validator))
         .collect()
 }
 
@@ -355,9 +368,9 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
-        BeaconChainConfig, BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, JailReason,
-        ReshapeSeat, ShardCommittee, StateRoot, ValidatorInfo, ValidatorRecord, ValidatorSet,
-        WeightedTimestamp, shard_prefix_path,
+        BeaconChainConfig, BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, EpochWindows,
+        JailReason, RecoveryCause, ReshapeSeat, ShardCommittee, ShardRecovery, StateRoot,
+        ValidatorInfo, ValidatorRecord, ValidatorSet, WeightedTimestamp, shard_prefix_path,
     };
 
     use super::*;
@@ -849,11 +862,9 @@ mod tests {
         ]));
         let host_ids = HashSet::from([HOST]);
         let is_local = |v| host_ids.contains(&v);
-        assert_eq!(
-            placed_validators(mine, &topology_snapshot, is_local),
-            vec![HOST]
-        );
-        assert!(placed_validators(theirs, &topology_snapshot, is_local).is_empty());
+        let schedule = TopologySchedule::single(Arc::new(topology_snapshot.clone()));
+        assert_eq!(placed_validators(mine, &schedule, is_local), vec![HOST]);
+        assert!(placed_validators(theirs, &schedule, is_local).is_empty());
         assert!(host_in_committee(mine, &topology_snapshot, &host_ids));
         assert!(!host_in_committee(theirs, &topology_snapshot, &host_ids));
     }
@@ -876,7 +887,8 @@ mod tests {
             BTreeMap::from([(parent, BTreeMap::from([(HOST, child)]))]),
         );
 
-        assert!(placed_validators(parent, &topology_snapshot, |v| v == HOST).is_empty());
+        let schedule = TopologySchedule::single(Arc::new(topology_snapshot.clone()));
+        assert!(placed_validators(parent, &schedule, |v| v == HOST).is_empty());
         assert!(host_in_committee(
             parent,
             &topology_snapshot,
@@ -885,9 +897,83 @@ mod tests {
 
         let co_hosting = HashSet::from([HOST, member]);
         assert_eq!(
-            placed_validators(parent, &topology_snapshot, |v| co_hosting.contains(&v)),
+            placed_validators(parent, &schedule, |v| co_hosting.contains(&v)),
             vec![member]
         );
+    }
+
+    /// A schedule whose head seats `current` and whose next window, as
+    /// the head's fold published it, seats `next`.
+    fn drawn_ahead(
+        current: HashMap<ShardId, Vec<ValidatorId>>,
+        next: HashMap<ShardId, Vec<ValidatorId>>,
+        recovery: Option<(ShardId, ShardRecovery)>,
+    ) -> TopologySchedule {
+        let head = explicit_head(current)
+            .with_pending_recoveries(recovery.into_iter().collect::<BTreeMap<_, _>>());
+        let mut schedule =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(3), Arc::new(head));
+        schedule.insert_lookahead(Epoch::new(4), Arc::new(explicit_head(next)));
+        schedule
+    }
+
+    /// A validator the beacon drew a window ahead is not placed until its
+    /// window opens.
+    #[test]
+    fn placement_waits_for_the_window_to_open() {
+        let shard = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let leaving = ValidatorId::new(2);
+        let drawn = ValidatorId::new(3);
+        let schedule = drawn_ahead(
+            HashMap::from([(shard, vec![leaving]), (sibling, vec![HOST])]),
+            HashMap::from([(shard, vec![drawn]), (sibling, vec![HOST])]),
+            None,
+        );
+        let local = HashSet::from([leaving, drawn]);
+        assert_eq!(
+            placed_validators(shard, &schedule, |v| local.contains(&v)),
+            vec![leaving]
+        );
+    }
+
+    /// Under a pending recovery the committee it replaced is not placed,
+    /// fork or halt alike, and the fresh committee is placed once its
+    /// window opens.
+    #[test]
+    fn a_pending_recovery_places_only_the_committee_it_seats() {
+        let shard = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let replaced = ValidatorId::new(2);
+        let fresh = ValidatorId::new(3);
+        let local = HashSet::from([replaced, fresh]);
+        for cause in [RecoveryCause::Fork, RecoveryCause::Halt] {
+            let recovery = ShardRecovery {
+                cause,
+                rotated_at: Epoch::new(3),
+                retained: vec![replaced],
+                attested_frontier: BlockHeight::new(10),
+            };
+            let drawn = drawn_ahead(
+                HashMap::from([(shard, vec![replaced]), (sibling, vec![HOST])]),
+                HashMap::from([(shard, vec![fresh]), (sibling, vec![HOST])]),
+                Some((shard, recovery.clone())),
+            );
+            assert!(
+                placed_validators(shard, &drawn, |v| local.contains(&v)).is_empty(),
+                "{cause:?}: the replaced committee is not placed in the window the recovery is drawn in",
+            );
+            let opened = drawn_ahead(
+                HashMap::from([(shard, vec![fresh]), (sibling, vec![HOST])]),
+                HashMap::from([(shard, vec![fresh]), (sibling, vec![HOST])]),
+                Some((shard, recovery)),
+            );
+            assert_eq!(
+                placed_validators(shard, &opened, |v| local.contains(&v)),
+                vec![fresh],
+                "{cause:?}: the fresh committee is placed once its window opens",
+            );
+        }
     }
 
     /// The teardown half deliberately reads full membership: a hosted shard

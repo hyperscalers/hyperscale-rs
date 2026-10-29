@@ -293,16 +293,15 @@ impl SimulationRunner {
             {
                 continue;
             }
-            let snapshot = self.hosts[host as usize]
-                .process()
-                .topology_snapshot()
-                .load_full();
-            if snapshot.boundary(shard).is_none() {
+            let schedule = self.hosts[host as usize].process().topology_schedule();
+            if schedule.head().boundary(shard).is_none() {
                 continue;
             }
             let mut seats = self.hosts[host as usize].signers(shard);
-            for validator in snapshot.seatable_committee_for_shard(shard) {
-                if self.homes_validator(host, validator) && !seats.contains(&validator) {
+            for validator in placed_validators(shard, &schedule, |validator| {
+                self.homes_validator(host, validator)
+            }) {
+                if !seats.contains(&validator) {
                     seats.push(validator);
                 }
             }
@@ -319,16 +318,13 @@ impl SimulationRunner {
     /// (`is_seating`) is left to the orchestrator to seat. Idempotent; safe to
     /// call every slice.
     ///
-    /// Placement is [`placed_validators`]: the seatable committee view — full
-    /// membership minus split-observer riders — the rule the production
-    /// supervisor's join half reads. An
-    /// observer rides the networking committee for serving, gossip, and
-    /// ready-signal admission but must not be seated as a consensus member.
-    /// The placement deltas the hosts emit are drained for parity with
-    /// production's delta-driven path, but the committed projection drives the
-    /// actual join/leave: the snap-sync usually completes within the slice, and
-    /// a join whose attested anchor has gone stale (a transient fold freeze
-    /// evicted its state) simply defers to a later slice, the same way
+    /// Placement is [`placed_validators`], the rule the production
+    /// supervisor's join half reads: the head window's seatable committee,
+    /// minus the committee a pending recovery replaced. The placement deltas
+    /// the hosts emit are drained, since the committed projection drives the
+    /// actual join/leave: the snap-sync usually completes within the slice,
+    /// and a join whose attested anchor has gone stale (a transient fold
+    /// freeze evicted its state) simply defers to a later slice, the same way
     /// production's async bootstrap retries against the advanced anchor.
     pub(crate) fn reconcile_placement(&mut self) {
         let _ = self.take_participation_changes();
@@ -349,6 +345,7 @@ impl SimulationRunner {
             let Some(snapshot) = self.host_topology(host) else {
                 continue;
             };
+            let schedule = self.hosts[host as usize].process().topology_schedule();
             let routing = self.hosts[host as usize]
                 .process()
                 .network()
@@ -360,7 +357,7 @@ impl SimulationRunner {
                 if self.reshape[host as usize].is_seating(shard) {
                     continue;
                 }
-                let placed = placed_validators(shard, &snapshot, |validator| {
+                let placed = placed_validators(shard, &schedule, |validator| {
                     self.homes_validator(host, validator)
                 });
                 if hosted.contains(&shard) {
