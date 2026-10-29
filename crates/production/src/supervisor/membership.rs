@@ -1075,29 +1075,23 @@ impl ShardSupervisor {
     /// overlap) republishes its mempool slot on that shard's next tick.
     fn scrub_rpc_state(&self, shard: ShardId, validator_ids: &[u64]) {
         let shard_key = shard.inner();
-        if let Some(ref rpc_status) = self.publishers.node_status {
-            rpc_status.rcu(|current| {
-                let mut updated = (**current).clone();
-                updated.vnodes.retain(|v| v.shard != shard_key);
-                Arc::new(updated)
-            });
-        }
-        if let Some(ref sync_status) = self.publishers.sync_status {
-            sync_status.rcu(|current| {
-                let mut updated = (**current).clone();
-                updated.shards.remove(&shard_key);
-                Arc::new(updated)
-            });
-        }
-        if let Some(ref mempool_snapshot) = self.publishers.mempool {
-            mempool_snapshot.rcu(|current| {
-                let mut updated = (**current).clone();
-                for id in validator_ids {
-                    updated.vnodes.remove(id);
-                }
-                Arc::new(updated)
-            });
-        }
+        self.publishers.node_status.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.vnodes.retain(|v| v.shard != shard_key);
+            Arc::new(updated)
+        });
+        self.publishers.sync_status.rcu(|current| {
+            let mut updated = (**current).clone();
+            updated.shards.remove(&shard_key);
+            Arc::new(updated)
+        });
+        self.publishers.mempool.rcu(|current| {
+            let mut updated = (**current).clone();
+            for id in validator_ids {
+                updated.vnodes.remove(id);
+            }
+            Arc::new(updated)
+        });
     }
 
     /// One [`VnodeConfig`] per seat-holding member of `shard`'s committee

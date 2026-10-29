@@ -19,7 +19,7 @@ use hyperscale_types::{
     Signer, TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
 };
 
-use crate::{GateEntry, ProtocolEvent, SignerGate};
+use crate::{Gate, GateEntry, ProtocolEvent};
 
 /// Context for executing delegated actions.
 ///
@@ -95,7 +95,7 @@ pub struct Signing<'a> {
     /// handler on a dispatch pool signs without re-entering that loop.
     pub key: &'a Arc<dyn Signer>,
     /// The release gate of the attachment that emitted the action.
-    pub gate: &'a SignerGate,
+    pub gate: &'a Gate,
 }
 
 impl Signing<'_> {
@@ -148,7 +148,7 @@ pub struct BeaconActionContext<'a, N: Network> {
     pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),
     /// The release gate of the identity that emitted the action. Every
     /// signing handler enters it around its persist, sign and notify.
-    pub gate: &'a SignerGate,
+    pub gate: &'a Gate,
 }
 
 impl<N: Network> BeaconActionContext<'_, N> {

@@ -59,17 +59,14 @@ use hyperscale_types::{
 };
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, block_in_place};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, error, info, warn};
 
-use crate::observe::{HeaderRing, Importing, Observation, Observations, Observer};
+use crate::observe::{HeaderRing, Observations, Observer};
 use crate::rpc::state::{PreviewSender, RpcPublishers, VnodeMempoolSnapshot};
-use crate::rpc::{
-    MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
-};
-use crate::status::SyncStatus;
+use crate::rpc::{NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry};
 use crate::supervisor::{
     AddValidatorError, LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver,
     StorageFactory, SupervisorEvent,
@@ -335,27 +332,6 @@ impl ProductionRunnerBuilder {
     #[must_use]
     pub const fn beacon_chain_config(mut self, config: BeaconChainConfig) -> Self {
         self.beacon_chain_config = Some(config);
-        self
-    }
-
-    /// Wire in the shared `NodeStatusState` so the runner publishes RPC status snapshots.
-    #[must_use]
-    pub fn rpc_status(mut self, status: Arc<ArcSwap<NodeStatusState>>) -> Self {
-        self.publishers.node_status = Some(status);
-        self
-    }
-
-    /// Wire in the shared mempool snapshot so the runner publishes mempool stats.
-    #[must_use]
-    pub fn mempool_snapshot(mut self, snapshot: Arc<ArcSwap<MempoolSnapshot>>) -> Self {
-        self.publishers.mempool = Some(snapshot);
-        self
-    }
-
-    /// Wire in the shared sync status so the runner publishes sync progress.
-    #[must_use]
-    pub fn sync_status(mut self, status: Arc<ArcSwap<SyncStatus>>) -> Self {
-        self.publishers.sync_status = Some(status);
         self
     }
 
@@ -802,24 +778,17 @@ impl ProductionRunner {
         &self.topology_snapshot
     }
 
-    /// The certified headers the beacon thread keeps, the last hour per
-    /// shard, summarised against the committees that signed them.
-    #[must_use]
-    pub fn header_ring(&self) -> Arc<HeaderRing> {
-        Arc::clone(&self.publishers.headers)
+    /// What the host publishes: its status, sync and mempool readouts, the
+    /// beacon thread's observations and header ring, and its imports.
+    pub(crate) fn publishers(&self) -> RpcPublishers {
+        self.publishers.clone()
     }
 
-    /// Bytes staged by each snap-sync import in progress.
+    /// The host's status: connected peers and, per hosted validator, its
+    /// shard, height and view, refreshed by the runner's status tick.
     #[must_use]
-    pub fn importing(&self) -> Arc<Importing> {
-        Arc::clone(&self.publishers.importing)
-    }
-
-    /// What the beacon thread has seen, as of its latest step; `None` until
-    /// its first.
-    #[must_use]
-    pub fn observe(&self) -> watch::Receiver<Option<Arc<Observation>>> {
-        self.publishers.observations.subscribe()
+    pub fn node_status(&self) -> Arc<ArcSwap<NodeStatusState>> {
+        Arc::clone(&self.publishers.node_status)
     }
 
     /// Get the process-wide transaction status cache shared from
@@ -1100,25 +1069,23 @@ impl ProductionRunner {
         set_network_peers(peer_count);
 
         // ── Update RPC status with peer count + live shard count ─────────
-        if let Some(ref rpc_status) = self.publishers.node_status {
-            let current = rpc_status.load();
-            let num_shards = self.topology_snapshot.load().num_shards();
-            if current.connected_peers != peer_count || current.num_shards != num_shards {
-                let mut updated = (**current).clone();
-                updated.connected_peers = peer_count;
-                updated.num_shards = num_shards;
-                rpc_status.store(Arc::new(updated));
-            }
+        let rpc_status = &self.publishers.node_status;
+        let current = rpc_status.load();
+        let num_shards = self.topology_snapshot.load().num_shards();
+        if current.connected_peers != peer_count || current.num_shards != num_shards {
+            let mut updated = (**current).clone();
+            updated.connected_peers = peer_count;
+            updated.num_shards = num_shards;
+            rpc_status.store(Arc::new(updated));
         }
 
         // ── Update sync_peers on the sync status (only runner has the adapter) ──
-        if let Some(ref sync_status) = self.publishers.sync_status {
-            let current = sync_status.load();
-            if current.sync_peers != peer_count {
-                let mut updated = (**current).clone();
-                updated.sync_peers = peer_count;
-                sync_status.store(Arc::new(updated));
-            }
+        let sync_status = &self.publishers.sync_status;
+        let current = sync_status.load();
+        if current.sync_peers != peer_count {
+            let mut updated = (**current).clone();
+            updated.sync_peers = peer_count;
+            sync_status.store(Arc::new(updated));
         }
     }
 
@@ -1478,13 +1445,11 @@ fn apply_step_output(
 /// otherwise hold a stale snapshot, and one still attached on another
 /// shard republishes it on that shard's next tick.
 fn scrub_mempool_slot(config: &ShardLoopConfig, validator: ValidatorId) {
-    if let Some(ref mempool_snapshot) = config.publishers.mempool {
-        mempool_snapshot.rcu(|current| {
-            let mut updated = (**current).clone();
-            updated.vnodes.remove(&validator.inner());
-            Arc::new(updated)
-        });
-    }
+    config.publishers.mempool.rcu(|current| {
+        let mut updated = (**current).clone();
+        updated.vnodes.remove(&validator.inner());
+        Arc::new(updated)
+    });
 }
 
 /// Write this shard's contribution into the shared RPC state. Each slot is
@@ -1500,65 +1465,57 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     let mempool = state.mempool_coordinator();
     let pending = mempool.pending_count();
     let in_flight = state.shard_coordinator().committed_in_flight();
-    if let Some(ref rpc_status) = config.publishers.node_status {
-        rpc_status.rcu(|current| {
-            let mut updated = (**current).clone();
-            updated.vnodes.retain(|v| v.shard != shard_key);
-            for validator in shard_loop.signers() {
-                updated.vnodes.push(VnodeStatusEntry {
-                    validator_id: validator.inner(),
-                    shard: shard_key,
-                    block_height: state.shard_coordinator().committed_height().inner(),
-                    view: state.shard_coordinator().view().inner(),
-                    state_root_hash: hex_encode(state.last_committed_jmt_root().as_bytes()),
-                    mempool: VnodeMempoolStats {
-                        pending_count: pending,
-                        in_flight_count: in_flight,
-                        total_count: mempool.len(),
-                    },
-                });
-            }
-            updated.vnodes.sort_by_key(|v| (v.shard, v.validator_id));
-            Arc::new(updated)
-        });
-    }
+    config.publishers.node_status.rcu(|current| {
+        let mut updated = (**current).clone();
+        updated.vnodes.retain(|v| v.shard != shard_key);
+        for validator in shard_loop.signers() {
+            updated.vnodes.push(VnodeStatusEntry {
+                validator_id: validator.inner(),
+                shard: shard_key,
+                block_height: state.shard_coordinator().committed_height().inner(),
+                view: state.shard_coordinator().view().inner(),
+                state_root_hash: hex_encode(state.last_committed_jmt_root().as_bytes()),
+                mempool: VnodeMempoolStats {
+                    pending_count: pending,
+                    in_flight_count: in_flight,
+                    total_count: mempool.len(),
+                },
+            });
+        }
+        updated.vnodes.sort_by_key(|v| (v.shard, v.validator_id));
+        Arc::new(updated)
+    });
 
     // ── /sync: per-shard block-sync state ──────────────────────────
-    if let Some(ref sync_status) = config.publishers.sync_status {
-        let block_sync = shard_loop.io.block_sync_status();
-        sync_status.rcu(|current| {
-            let mut updated = (**current).clone();
-            updated.shards.insert(shard_key, block_sync.clone());
-            Arc::new(updated)
-        });
-    }
+    let sync_status = &config.publishers.sync_status;
+    let block_sync = shard_loop.io.block_sync_status();
+    sync_status.rcu(|current| {
+        let mut updated = (**current).clone();
+        updated.shards.insert(shard_key, block_sync.clone());
+        Arc::new(updated)
+    });
 
     // ── Mempool: the replica's snapshot under each attached signer,
     // feeding RPC submission backpressure.
-    if let Some(ref mempool_snapshot) = config.publishers.mempool {
-        let remote_congestion_threshold = TxsInFlight::new(MAX_UNSETTLED_TXS * 4 / 5);
-        mempool_snapshot.rcu(|current| {
-            let mut updated = (**current).clone();
-            for validator in shard_loop.signers() {
-                updated.vnodes.insert(
-                    validator.inner(),
-                    VnodeMempoolSnapshot {
-                        pending_count: pending,
-                        in_flight_count: in_flight,
-                        total_count: mempool.len(),
-                        updated_at: Some(Instant::now()),
-                        accepting_rpc_transactions: in_flight < MAX_UNSETTLED_TXS,
-                        at_pending_limit: mempool.at_pending_limit(),
-                        remote_shard_in_flight: state
-                            .remote_headers_coordinator()
-                            .remote_shard_in_flight(),
-                        remote_congestion_threshold,
-                    },
-                );
-            }
-            Arc::new(updated)
-        });
-    }
+    let mempool_snapshot = &config.publishers.mempool;
+    let remote_congestion_threshold = TxsInFlight::new(MAX_UNSETTLED_TXS * 4 / 5);
+    mempool_snapshot.rcu(|current| {
+        let mut updated = (**current).clone();
+        for validator in shard_loop.signers() {
+            updated.vnodes.insert(
+                validator.inner(),
+                VnodeMempoolSnapshot {
+                    accepting_rpc_transactions: in_flight < MAX_UNSETTLED_TXS,
+                    at_pending_limit: mempool.at_pending_limit(),
+                    remote_shard_in_flight: state
+                        .remote_headers_coordinator()
+                        .remote_shard_in_flight(),
+                    remote_congestion_threshold,
+                },
+            );
+        }
+        Arc::new(updated)
+    });
 }
 
 /// Spawn one shard's pinned thread. No core affinity — modern Linux

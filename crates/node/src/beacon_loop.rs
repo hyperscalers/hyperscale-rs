@@ -33,8 +33,8 @@ use hyperscale_beacon::{
     Adopted, BeaconFold, BeaconParticipant, ChainRegistration, ParticipantStep,
 };
 use hyperscale_core::{
-    Action, ActionOwner, BeaconActionContext, BeaconFetchIds, FetchIds, FetchRequest,
-    ParticipationChange, ProtocolEvent, SignerGate,
+    Action, ActionOwner, BeaconActionContext, BeaconFetchIds, FetchIds, FetchRequest, Gate,
+    ParticipationChange, ProtocolEvent,
 };
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::{Answerers, Network, RequestError, ResponseVerdict};
@@ -153,7 +153,7 @@ struct Participant {
     signer: Arc<dyn Signer>,
     /// The release gate every signature the participant dispatches
     /// enters, closed when the participant is removed.
-    gate: Arc<SignerGate>,
+    gate: Arc<Gate>,
 }
 
 impl<S, N, D> BeaconLoop<S, N, D>
@@ -270,7 +270,7 @@ where
                 attachment: self.process.attach(validator),
                 duty: participant,
                 signer,
-                gate: Arc::new(SignerGate::new()),
+                gate: Arc::new(Gate::new()),
             },
         );
         self.arm_startup(validator);

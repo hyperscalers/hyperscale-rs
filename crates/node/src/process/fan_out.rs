@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::bounded;
+use crossbeam::channel::{Sender, bounded};
 use hyperscale_engine::{DeclaredReads, FetchedCells};
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::entry_leaf_value;
@@ -246,8 +246,10 @@ pub fn gather<N: Network>(
         return fetched;
     }
     let (tx, rx) = bounded(remote.len());
-    let ask_shard = |shard: ShardId, ask: &DeclaredReads| {
-        let tx = tx.clone();
+    // Each request carries its own sender and a held one hands it back for
+    // the retry, so the gathering keeps none: once every callback has run
+    // or been dropped unrun, the channel disconnects and the wait ends.
+    let ask_shard = |shard: ShardId, ask: &DeclaredReads, tx: Sender<Answer>| {
         let ask = ask.clone();
         let topology = Arc::clone(topology);
         let verifier = Arc::clone(verifier);
@@ -258,7 +260,11 @@ pub fn gather<N: Network>(
             None,
             Box::new(move |result| {
                 if let Err(RequestError::BackingOff { retry_in }) = result {
-                    let _ = tx.send(Answer::Held { shard, retry_in });
+                    let _ = tx.send(Answer::Held {
+                        shard,
+                        retry_in,
+                        tx: tx.clone(),
+                    });
                     return ResponseVerdict::Accept;
                 }
                 // Verified here rather than on the gathering thread,
@@ -281,8 +287,9 @@ pub fn gather<N: Network>(
         );
     };
     for (shard, ask) in &remote {
-        ask_shard(*shard, ask);
+        ask_shard(*shard, ask, tx.clone());
     }
+    drop(tx);
 
     // One deadline for the gathering, not one per answer: the shards are
     // asked together and waited on together, so a peer that never calls
@@ -302,10 +309,14 @@ pub fn gather<N: Network>(
                     fetched.absorb_from(one);
                 }
             }
-            Answer::Held { shard, retry_in } => {
+            Answer::Held {
+                shard,
+                retry_in,
+                tx,
+            } => {
                 if Instant::now() + retry_in < deadline {
                     sleep(retry_in);
-                    ask_shard(shard, remote[&shard]);
+                    ask_shard(shard, remote[&shard], tx);
                 } else {
                     outstanding -= 1;
                 }
@@ -319,8 +330,13 @@ pub fn gather<N: Network>(
 enum Answer {
     /// What verified, or `None` when nothing did.
     Gathered(Option<FetchedCells>),
-    /// Every stream to the shard is backing off for `retry_in`.
-    Held { shard: ShardId, retry_in: Duration },
+    /// Every stream to the shard is backing off for `retry_in`; `tx` is
+    /// the sender the retry carries.
+    Held {
+        shard: ShardId,
+        retry_in: Duration,
+        tx: Sender<Self>,
+    },
 }
 
 /// Fold this node's own answer for a shard it serves.
@@ -472,6 +488,9 @@ mod tests {
         /// fixture answers for real.
         held: AtomicU32,
         asked: AtomicU32,
+        /// Drops each callback unrun once the holds are spent, as a
+        /// transport torn down under a request does.
+        drops: bool,
     }
 
     impl Answering {
@@ -481,6 +500,7 @@ mod tests {
                 verdict: std::sync::Mutex::new(None),
                 held: held.into(),
                 asked: 0.into(),
+                drops: false,
             }
         }
     }
@@ -531,6 +551,10 @@ mod tests {
             {
                 let retry_in = Duration::from_millis(10);
                 let _ = on_response(Err(RequestError::BackingOff { retry_in }));
+                return;
+            }
+            if self.drops {
+                drop(on_response);
                 return;
             }
             let bytes = hbor_to_vec(&self.response).expect("the fixture answer encodes");
@@ -596,6 +620,32 @@ mod tests {
                 .is_some(),
             "the third ask is answered"
         );
+    }
+
+    /// A request whose callback is dropped unrun, after a hold or at once,
+    /// ends the gathering when it drops rather than at the deadline.
+    #[test]
+    fn a_dropped_callback_ends_the_gathering_at_once() {
+        let ask = one_range();
+        let (response, _) = served(&ask);
+        let asks = BTreeMap::from([(SHARD, ask)]);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        for held in [0, 1] {
+            let dropping = Answering {
+                drops: true,
+                ..Answering::new(response.clone(), held)
+            };
+            let started = Instant::now();
+            let fetched = gather(&asks, &topology, &dropping, &verifier, &|_, _| None);
+            assert!(
+                started.elapsed() < GATHER_TIMEOUT / 2,
+                "the gathering waited out its deadline after {held} holds"
+            );
+            assert!(!fetched.anchors.contains_key(&SHARD));
+        }
     }
 
     /// A served answer folds in, and the same answer with one byte moved
