@@ -29,7 +29,7 @@ use hyperscale_scenarios::query::{
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
-    MemberEdge, ScenarioConfig, grow_and_hold, submission_shards,
+    MemberEdge, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -1304,11 +1304,18 @@ impl SimCluster {
     }
 }
 
-impl CrashableCluster for SimCluster {
+impl RestartableCluster for SimCluster {
     fn is_up(&self, host: usize) -> bool {
         self.runner.is_up(host_index(host))
     }
 
+    fn stop_host(&mut self, host: usize, downtime: Budget) {
+        self.runner
+            .crash_host(host_index(host), CrashKind::Process, self.span(downtime));
+    }
+}
+
+impl CrashableCluster for SimCluster {
     fn crash(&mut self, host: usize, crash: Crash, downtime: Budget) {
         self.runner
             .crash_host(host_index(host), crash_kind(crash), self.span(downtime));

@@ -39,7 +39,7 @@ use crate::support::tx::{
     pool_at, pool_id, pool_operator, pool_vault_cell, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
-use crate::support::{Cluster, Crash, CrashableCluster, epochs, found_staged};
+use crate::support::{Cluster, RestartableCluster, epochs, found_staged};
 
 /// The single genesis stake pool every genesis validator belongs to.
 /// Warm the cluster until the beacon folds its first epoch — the precondition a
@@ -937,10 +937,10 @@ fn await_pooled<C: Cluster>(c: &mut C, validator: ValidatorId, what: &str) {
 /// Panics if the newcomer is never seated ready, if an epoch it sits
 /// through silent commits a view timeout late, if it is not jailed once its
 /// host is gone or is seated again, or if the shard stops committing.
-pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster) {
+pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl RestartableCluster) {
     let newcomer = seat_the_staged_newcomer(c);
     let host = c.host_of(newcomer).expect("the newcomer has a host");
-    c.crash(host, Crash::Process, epochs(100_000));
+    c.stop_host(host, epochs(100_000));
     let crashed_at = c.beacon_state().map(|s| s.current_epoch);
 
     // Every epoch the silent newcomer sits through commits within one SPC
@@ -1003,7 +1003,7 @@ pub fn an_offline_newcomer_leaves_the_network_live(c: &mut impl CrashableCluster
 ///
 /// As [`time_out_a_founding_newcomer`], or if the unjail never returns the
 /// newcomer to the pool.
-pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: CrashableCluster>(c: &mut C) {
+pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: RestartableCluster>(c: &mut C) {
     let (founder_key, founder) = newcomer_founder();
     let (newcomer, host) = time_out_a_founding_newcomer(c, true);
     let attempt = |c: &mut C| {
@@ -1025,7 +1025,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: CrashableCluster
 ///
 /// As [`time_out_a_founding_newcomer`], or if the sponsored unjail never
 /// returns the newcomer to the pool.
-pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableCluster>(c: &mut C) {
+pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: RestartableCluster>(c: &mut C) {
     let (founder_key, founder) = newcomer_founder();
     let (newcomer, _) = time_out_a_founding_newcomer(c, false);
     let (sponsor_key, _) = delegator();
@@ -1043,7 +1043,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableClu
 }
 
 /// Seat the staged newcomer in the pool it founds, its founder funded for
-/// its own fees when `funded`; crash its host until it is jailed; bring the
+/// its own fees when `funded`; stop its host until it is jailed; bring the
 /// host back; and wait until its time-out is over and the host, its loop
 /// retired, is seated nowhere. Returns the newcomer and its host.
 ///
@@ -1053,7 +1053,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: CrashableClu
 /// host is down, its host never comes back or keeps a shard loop, or its
 /// time-out never ends.
 fn time_out_a_founding_newcomer(
-    c: &mut impl CrashableCluster,
+    c: &mut impl RestartableCluster,
     funded: bool,
 ) -> (ValidatorId, usize) {
     let (_, founder) = newcomer_founder();
@@ -1070,7 +1070,7 @@ fn time_out_a_founding_newcomer(
         )));
     }
     let host = c.host_of(newcomer).expect("the newcomer has a host");
-    c.crash(host, Crash::Process, epochs(12));
+    c.stop_host(host, epochs(12));
     assert!(
         c.run_until(epochs(12), |c| matches!(
             validator_status(c, newcomer),
@@ -1107,7 +1107,7 @@ fn time_out_a_founding_newcomer(
 /// # Panics
 ///
 /// Panics if it never is.
-fn let_back_in<C: CrashableCluster>(c: &mut C, newcomer: ValidatorId, attempt: impl Fn(&mut C)) {
+fn let_back_in<C: RestartableCluster>(c: &mut C, newcomer: ValidatorId, attempt: impl Fn(&mut C)) {
     let back = |c: &C| {
         matches!(
             validator_status(c, newcomer),
@@ -1145,16 +1145,16 @@ const UNJAIL_ATTEMPTS: usize = 4;
 /// Panics if the newcomer is never seated ready, the restarted host
 /// never comes back, or the beacon or the shard stays stopped after it.
 pub fn a_restarted_genesis_host_resumes_beside_a_newcomer(
-    c: &mut impl CrashableCluster,
+    c: &mut impl RestartableCluster,
     newcomer_gone: bool,
 ) {
     let newcomer = seat_the_staged_newcomer(c);
     if newcomer_gone {
         let host = c.host_of(newcomer).expect("the newcomer has a host");
-        c.crash(host, Crash::Process, epochs(100_000));
+        c.stop_host(host, epochs(100_000));
     }
     let genesis = c.host_of(ValidatorId::new(0)).expect("genesis has a host");
-    c.crash(genesis, Crash::Process, epochs(1));
+    c.stop_host(genesis, epochs(1));
     assert!(
         c.run_until(epochs(4), |c| c.is_up(genesis)),
         "the genesis host never came back",
