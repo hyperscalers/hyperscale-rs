@@ -18,8 +18,9 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::{resumed_schedule, retention_floor};
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_types::{
-    BeaconState, BlockHeight, LocalTimestamp, NetworkDefinition, RoutingCommittees, ShardBoundary,
-    ShardId, Signer, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus,
+    BeaconState, BlockHeight, EpochWindows, LocalTimestamp, NetworkDefinition, RecoveryBinding,
+    RecoveryCause, RoutingCommittees, ShardBoundary, ShardId, ShardRecovery, Signer,
+    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus,
 };
 use tracing::info;
 
@@ -91,6 +92,10 @@ pub fn boot_routing(
 /// resumed. An observer is never seated, and a shard no local validator
 /// is placed on resumes only from a store already on disk (`on_disk`).
 ///
+/// A store whose tip a recovery discarded for good
+/// ([`committed_on_discarded_tail`]) resumes no placed validator: they
+/// join, and the join wipes it.
+///
 /// A store that is not resumed is dropped before this returns, so its
 /// join can open it again.
 ///
@@ -147,13 +152,21 @@ where
         .copied()
         .chain(routed.keys().copied().filter(|&shard| on_disk(shard)))
         .collect();
+    let windows = head.chain_config.epoch_windows();
     let mut resumed = BTreeMap::new();
     let mut joins = BTreeMap::new();
     for shard in shards {
         let store = open(shard)?;
         let foreign = store.holds_foreign_chain(shard);
         let mut vnodes = placed.remove(&shard).unwrap_or_default();
-        if store.committed_height() > BlockHeight::GENESIS && !foreign {
+        let discarded = !vnodes.is_empty()
+            && committed_on_discarded_tail(
+                &*store,
+                head.recoveries.get(&shard).map_or(&[], Vec::as_slice),
+                head.pending_recoveries.get(&shard),
+                windows,
+            );
+        if store.committed_height() > BlockHeight::GENESIS && !foreign && !discarded {
             vnodes.extend(routed.remove(&shard).unwrap_or_default());
             resumed.insert(shard, (store, vnodes));
             continue;
@@ -161,7 +174,12 @@ where
         if vnodes.is_empty() {
             continue;
         }
-        if foreign {
+        if discarded {
+            info!(
+                ?shard,
+                "Seated shard's store committed a tail a recovery discarded; joining it"
+            );
+        } else if foreign {
             info!(
                 ?shard,
                 "Seated shard's store holds a clone its reshape never adopted; joining it"
@@ -179,6 +197,116 @@ where
         joins,
         unplaced,
     })
+}
+
+/// Whether `store`'s committed tip is a block a recovery of its shard
+/// discarded for good ([`RecoveryBinding::discards`]): one in `history`
+/// that has completed, or a `pending` fork.
+///
+/// A completed recovery's chain has crossed its bridge, and a fork's
+/// chain extends no block above the frontier, so neither ever builds on
+/// such a tip. Block sync carries a store only along its own chain and a
+/// store cannot un-commit, so a seat on it would never move. A pending
+/// halt's harvest may yet extend the tail it discards, and its replaced
+/// committee's stores hold what the harvest reads, so its band is read as
+/// nobody's verdict yet; a superseded recovery shares its successor's
+/// frontier and lies inside its band. A tip the fresh committee
+/// certified, a coast block included, is certified no earlier than the
+/// window before the bridge and never reads as discarded.
+fn committed_on_discarded_tail<R: ShardChainReader + ?Sized>(
+    store: &R,
+    history: &[RecoveryBinding],
+    pending: Option<&ShardRecovery>,
+    windows: EpochWindows,
+) -> bool {
+    let pending_fork = pending
+        .filter(|recovery| recovery.cause == RecoveryCause::Fork)
+        .map(|recovery| RecoveryBinding {
+            rotated_at: recovery.rotated_at,
+            attested_frontier: recovery.attested_frontier,
+            completed: false,
+        });
+    let height = store.committed_height();
+    store.get_certified_header(height).is_some_and(|certified| {
+        let at = certified.qc().weighted_timestamp();
+        history
+            .iter()
+            .copied()
+            .filter(|binding| binding.completed)
+            .chain(pending_fork)
+            .any(|binding| binding.discards(windows, height, at))
+    })
+}
+
+/// Whether `shard`'s running loop is rebuilt at its attested anchor
+/// before it carries the validators `placed` there.
+///
+/// `store` is the loop's, `seated` the validators it carries, and `head`
+/// the committed snapshot read on the epoch grid `windows`.
+///
+/// A store on a tail a recovery discarded for good
+/// ([`committed_on_discarded_tail`]) is rebuilt for a placed validator
+/// whether or not it is already seated: the loop cannot move. Under a
+/// pending fork, a store committed past the attested frontier is rebuilt
+/// before a placed validator it does not yet carry seats on it, since
+/// the fresh committee must not extend the replaced one's branch; the
+/// fresh committee's own chain also climbs past the frontier, so a store
+/// already carrying every placed validator is left be. With nothing
+/// placed, the loop is left to the teardown.
+#[must_use]
+pub fn rebuild_due<R: ShardChainReader + ?Sized>(
+    store: &R,
+    shard: ShardId,
+    head: &TopologySnapshot,
+    windows: EpochWindows,
+    placed: &[ValidatorId],
+    seated: &[ValidatorId],
+) -> bool {
+    if placed.is_empty() {
+        return false;
+    }
+    committed_on_discarded_tail(
+        store,
+        head.recoveries(shard),
+        head.pending_recoveries().get(&shard),
+        windows,
+    ) || head.fork_recovery_frontier(shard).is_some_and(|frontier| {
+        store.committed_height() > frontier
+            && placed.iter().any(|validator| !seated.contains(validator))
+    })
+}
+
+/// The validators a loop re-seated at `shard`'s attested anchor carries:
+/// those `placed` on it, and those it `carried` that a pending recovery
+/// of the shard did not replace.
+///
+/// A replaced member signs nothing on the recovered chain, so a store
+/// rebuilt at the anchor holds no seat for it, as [`placed_validators`]
+/// reads. When nothing else remains, the loop carries what it did: it
+/// keeps a signer for as long as it stays up, and the replaced committee
+/// keeps serving while routing retains it.
+#[must_use]
+pub fn reseated_validators(
+    shard: ShardId,
+    schedule: &TopologySchedule,
+    carried: &[ValidatorId],
+    placed: Vec<ValidatorId>,
+) -> Vec<ValidatorId> {
+    let replaced = schedule
+        .head()
+        .pending_recoveries()
+        .get(&shard)
+        .map_or(&[][..], |recovery| recovery.retained.as_slice());
+    let mut seats = placed;
+    for &validator in carried {
+        if !replaced.contains(&validator) && !seats.contains(&validator) {
+            seats.push(validator);
+        }
+    }
+    if seats.is_empty() {
+        return carried.to_vec();
+    }
+    seats
 }
 
 /// Departed shards whose store is on disk, each with the local
@@ -375,7 +503,7 @@ mod tests {
     use std::convert::Infallible;
 
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_storage::test_helpers::commit_one;
+    use hyperscale_storage::test_helpers::{commit_one, commit_writes_at, make_settled_writes};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
@@ -612,6 +740,237 @@ mod tests {
         assert!(
             plan.resumed.is_empty(),
             "the dissolved shard is not resumed"
+        );
+    }
+
+    /// The root's store holding one block of its own chain, certified at
+    /// `certified_ms`.
+    fn root_store_certified_at(certified_ms: u64) -> Arc<SimShardStorage> {
+        let store = SimShardStorage::new(shard_prefix_path(ShardId::ROOT));
+        commit_writes_at(
+            &store,
+            &make_settled_writes(1, 1, vec![1]),
+            WeightedTimestamp::from_millis(certified_ms),
+        );
+        Arc::new(store)
+    }
+
+    /// Epochs a thousand milliseconds wide from a zero origin.
+    const EPOCH_MS: u64 = 1000;
+    const WINDOWS: EpochWindows = EpochWindows::new(0, EPOCH_MS);
+
+    /// A recovery of the root seated at epoch 3 above the genesis
+    /// frontier: its bridge is epoch 4, so a block certified in epoch 0
+    /// has the shape it discards and one certified in epoch 3, the window
+    /// before the bridge, is the fresh committee's.
+    const ROTATED_AT: Epoch = Epoch::new(3);
+    const DISCARDED_MS: u64 = 500;
+    const FRESH_MS: u64 = 3 * EPOCH_MS + 500;
+
+    fn binding(completed: bool) -> RecoveryBinding {
+        RecoveryBinding {
+            rotated_at: ROTATED_AT,
+            attested_frontier: BlockHeight::GENESIS,
+            completed,
+        }
+    }
+
+    fn pending(cause: RecoveryCause, retained: Vec<ValidatorId>) -> ShardRecovery {
+        ShardRecovery {
+            cause,
+            rotated_at: ROTATED_AT,
+            retained,
+            attested_frontier: BlockHeight::GENESIS,
+        }
+    }
+
+    /// A restart over the root's store certified at `certified_ms`, with
+    /// validator 0 placed on the root, validator 1 pooled and named by
+    /// routing, and the root's recovery history `history` beside any
+    /// `pending` recovery.
+    fn restart_over(
+        certified_ms: u64,
+        history: Vec<RecoveryBinding>,
+        pending: Option<ShardRecovery>,
+        placed: bool,
+    ) -> SeatPlan<Arc<SimShardStorage>> {
+        let committee = TestCommittee::new(2, 7);
+        let first = if placed {
+            on(ShardId::ROOT)
+        } else {
+            ValidatorStatus::Pooled
+        };
+        let mut head = head(
+            &committee,
+            &[first, ValidatorStatus::Pooled],
+            &[ShardId::ROOT],
+            BTreeMap::new(),
+        );
+        head.chain_config.genesis_timestamp_ms = 0;
+        head.chain_config.epoch_duration_ms = EPOCH_MS;
+        head.recoveries = BTreeMap::from([(ShardId::ROOT, history)]);
+        head.pending_recoveries = pending
+            .map(|recovery| (ShardId::ROOT, recovery))
+            .into_iter()
+            .collect();
+        let routing: RoutingCommittees = BTreeMap::from([(ShardId::ROOT, vec![validator(1)])]);
+        plan_seats(
+            &head,
+            &routing,
+            &local(&committee),
+            |_| true,
+            |_| Ok::<_, Infallible>(root_store_certified_at(certified_ms)),
+        )
+        .expect("opening cannot fail")
+    }
+
+    /// A store whose tip a completed recovery discarded resumes nobody
+    /// placed on it: the placed validator joins, which wipes the store,
+    /// and the routed one goes with the store.
+    #[test]
+    fn a_store_on_a_tail_a_completed_recovery_discarded_is_a_join() {
+        let plan = restart_over(DISCARDED_MS, vec![binding(true)], None, true);
+        assert!(plan.resumed.is_empty());
+        assert_eq!(ids(&plan.joins[&ShardId::ROOT]), vec![validator(0)]);
+    }
+
+    /// A pending fork extends no block above its frontier the replaced
+    /// committee certified, so such a tip is a join too.
+    #[test]
+    fn a_store_on_a_pending_forks_discarded_branch_is_a_join() {
+        let plan = restart_over(
+            DISCARDED_MS,
+            vec![binding(false)],
+            Some(pending(RecoveryCause::Fork, vec![validator(1)])),
+            true,
+        );
+        assert!(plan.resumed.is_empty());
+        assert_eq!(ids(&plan.joins[&ShardId::ROOT]), vec![validator(0)]);
+    }
+
+    /// The stores a pending halt's harvest reads, a superseded recovery's
+    /// band, the fresh committee's coast blocks, and a store only routing
+    /// names a validator on all resume.
+    #[test]
+    fn a_store_no_recovery_has_discarded_for_good_resumes() {
+        let resumes = |plan: &SeatPlan<Arc<SimShardStorage>>, seated: Vec<ValidatorId>| {
+            assert!(plan.joins.is_empty());
+            assert_eq!(ids(&plan.resumed[&ShardId::ROOT].1), seated);
+        };
+        resumes(
+            &restart_over(
+                DISCARDED_MS,
+                vec![binding(false)],
+                Some(pending(RecoveryCause::Halt, vec![validator(1)])),
+                true,
+            ),
+            vec![validator(0), validator(1)],
+        );
+        resumes(
+            &restart_over(DISCARDED_MS, vec![binding(false)], None, true),
+            vec![validator(0), validator(1)],
+        );
+        resumes(
+            &restart_over(FRESH_MS, vec![binding(true)], None, true),
+            vec![validator(0), validator(1)],
+        );
+        resumes(
+            &restart_over(DISCARDED_MS, vec![binding(true)], None, false),
+            vec![validator(1)],
+        );
+    }
+
+    /// A schedule of the root alone seating `committee`, over the
+    /// recovery history `history` and any `pending` recovery.
+    fn recovering(
+        committee: Vec<ValidatorId>,
+        history: Vec<RecoveryBinding>,
+        pending: Option<ShardRecovery>,
+    ) -> TopologySchedule {
+        let head = explicit_head(HashMap::from([(ShardId::ROOT, committee)]))
+            .with_recoveries(BTreeMap::from([(ShardId::ROOT, history)]))
+            .with_pending_recoveries(
+                pending
+                    .map(|recovery| (ShardId::ROOT, recovery))
+                    .into_iter()
+                    .collect(),
+            );
+        TopologySchedule::new(
+            EpochWindows::new(0, EPOCH_MS),
+            Epoch::new(5),
+            Arc::new(head),
+        )
+    }
+
+    /// A running loop on a tail a completed recovery discarded is rebuilt
+    /// for a placed validator even one it already carries; a pending
+    /// fork's frontier rebuilds only for one it does not carry yet; a
+    /// pending halt's band and a loop with nobody placed are left be.
+    #[test]
+    fn a_running_loop_is_rebuilt_where_its_store_cannot_carry_the_seat() {
+        let placed = [HOST];
+        let discarded = root_store_certified_at(DISCARDED_MS);
+        let fresh = root_store_certified_at(FRESH_MS);
+        let due = |store: &SimShardStorage,
+                   schedule: &TopologySchedule,
+                   placed: &[ValidatorId],
+                   seated: &[ValidatorId]| {
+            rebuild_due(
+                store,
+                ShardId::ROOT,
+                schedule.head(),
+                WINDOWS,
+                placed,
+                seated,
+            )
+        };
+
+        let completed = recovering(vec![HOST], vec![binding(true)], None);
+        assert!(due(&discarded, &completed, &placed, &placed));
+        assert!(!due(&discarded, &completed, &[], &placed));
+        assert!(!due(&fresh, &completed, &placed, &placed));
+
+        let fork = recovering(
+            vec![HOST],
+            vec![binding(false)],
+            Some(pending(RecoveryCause::Fork, vec![validator(9)])),
+        );
+        assert!(due(&fresh, &fork, &placed, &[]));
+        assert!(!due(&fresh, &fork, &placed, &placed));
+        assert!(due(&discarded, &fork, &placed, &placed));
+
+        let halt = recovering(
+            vec![HOST],
+            vec![binding(false)],
+            Some(pending(RecoveryCause::Halt, vec![validator(9)])),
+        );
+        assert!(!due(&discarded, &halt, &placed, &placed));
+        assert!(!due(&discarded, &halt, &placed, &[]));
+    }
+
+    /// A re-seat drops a carried member a pending recovery replaced unless
+    /// it is all the loop has, and keeps every other carried validator.
+    #[test]
+    fn a_reseat_carries_no_member_a_pending_recovery_replaced() {
+        let replaced = validator(2);
+        let lagging = validator(3);
+        let schedule = recovering(
+            vec![HOST],
+            vec![binding(false)],
+            Some(pending(RecoveryCause::Fork, vec![replaced])),
+        );
+        assert_eq!(
+            reseated_validators(ShardId::ROOT, &schedule, &[replaced, lagging], vec![HOST]),
+            vec![HOST, lagging]
+        );
+        assert_eq!(
+            reseated_validators(ShardId::ROOT, &schedule, &[replaced], Vec::new()),
+            vec![replaced]
+        );
+        let settled = recovering(vec![HOST], vec![binding(true)], None);
+        assert_eq!(
+            reseated_validators(ShardId::ROOT, &settled, &[replaced], vec![HOST]),
+            vec![HOST, replaced]
         );
     }
 
