@@ -88,7 +88,8 @@ pub struct ClusterSpec {
     pub simulated_outbound_latency: Duration,
 }
 
-/// One host: what it is started from, and the running node.
+/// One host: what it is started from, and the running node while it is
+/// up.
 struct Host {
     /// The validators this host runs, with their signers.
     validators: Vec<LocalValidator>,
@@ -97,7 +98,10 @@ struct Host {
     /// The host's data directory. Kept for the cluster's life, so a
     /// restarted host reopens what its previous run left.
     dir: TempDir,
-    running: Running,
+    /// How many times the host has started; a fault rule belongs to the
+    /// run that installed it.
+    incarnation: u64,
+    running: Option<Running>,
 }
 
 /// A started host: its owner, which stops it, and the handle every read
@@ -115,36 +119,57 @@ impl Host {
             .any(|local| local.validator_id == validator)
     }
 
-    /// Runs `look` inside the running host.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the host has stopped.
-    fn probe<T>(&self, look: impl FnOnce(Probe<'_>) -> T) -> T {
-        self.running
-            .handle
-            .probe(look)
-            .expect("a harness host is running")
+    /// The running host's handle; `None` while it is down.
+    fn handle(&self) -> Option<&NodeHandle> {
+        self.running.as_ref().map(|running| &running.handle)
+    }
+
+    /// Runs `look` inside the running host; `None` while it is down.
+    fn probe<T>(&self, look: impl FnOnce(Probe<'_>) -> T) -> Option<T> {
+        self.handle()?.probe(look)
     }
 
     /// Runs `read` on the host's store for `shard`; `None` when the host
-    /// holds none there.
+    /// is down or holds none there.
     fn read_store<T>(
         &self,
         shard: ShardId,
         read: impl FnOnce(&RocksDbShardStorage) -> T,
     ) -> Option<T> {
-        self.probe(|p| p.shard_store(shard, read))
+        self.probe(|p| p.shard_store(shard, read))?
     }
 
-    /// Whether the host's transport carries `shard`.
+    /// Whether the host is up and its transport carries `shard`.
     fn serves(&self, shard: ShardId) -> bool {
         self.probe(|p| p.network().local_shards().contains(&shard))
+            .unwrap_or(false)
     }
 
-    /// Runs `act` on the host's transport, which carries its fault gate.
-    fn network<T>(&self, act: impl FnOnce(&IrohAdapter) -> T) -> T {
+    /// Runs `act` on the host's transport, which carries its fault gate;
+    /// `None` while the host is down.
+    fn network<T>(&self, act: impl FnOnce(&IrohAdapter) -> T) -> Option<T> {
         self.probe(|p| act(p.network()))
+    }
+
+    /// The host's network identity, which it keeps across restarts.
+    fn endpoint_id(&self) -> EndpointId {
+        self.key.public()
+    }
+}
+
+/// A fault rule installed on one host's gate, in the run that installed
+/// it.
+#[derive(Clone)]
+pub struct HostRule {
+    host: usize,
+    incarnation: u64,
+    handle: RuleHandle,
+}
+
+impl HostRule {
+    /// How many times the rule fired.
+    pub fn fired(&self) -> u64 {
+        self.handle.fired()
     }
 }
 
@@ -235,7 +260,9 @@ impl Harness {
         let mut specs = hosts.into_iter();
         let first = specs.next().expect("cluster needs at least one host");
         let first = start_host(&build, first, Vec::new());
-        let bootstrap = first.probe(|p| p.network().endpoint_addr());
+        let bootstrap = first
+            .probe(|p| p.network().endpoint_addr())
+            .expect("the first host is running");
         let rest: Vec<Host> = thread::scope(|scope| {
             // Every start is spawned before any is joined, so the hosts
             // open their stores and bind at once.
@@ -259,9 +286,27 @@ impl Harness {
     }
 
     /// Runs `f` on a derivation over everything the cluster's chains have
-    /// created: the first host's engine's, as a scenario asks of any host.
+    /// created: the lowest up host's engine's, as a scenario asks of any
+    /// host.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no host is up.
     pub fn with_derivation<T>(&self, f: impl FnOnce(&dyn Derivation) -> T) -> T {
-        self.hosts[0].probe(|p| f(p.derivation()))
+        let host = self.live_host().expect("a derivation needs an up host");
+        self.hosts[host]
+            .probe(|p| f(p.derivation()))
+            .expect("the lowest up host is running")
+    }
+
+    /// The lowest host that is up, if any.
+    pub fn live_host(&self) -> Option<usize> {
+        self.hosts.iter().position(|host| host.running.is_some())
+    }
+
+    /// Whether host `host` is up.
+    pub fn is_up(&self, host: usize) -> bool {
+        self.hosts[host].running.is_some()
     }
 
     /// Wait until every host seated on the genesis ROOT committee holds a
@@ -293,14 +338,14 @@ impl Harness {
     /// Restart host `host` with its stores for `shards` wiped: stop the
     /// host, delete those stores from its data directory, and start it
     /// again on what is left, so its beacon chain and every other shard's
-    /// store survive. The restarted host bootstraps to another running
+    /// store survive. The restarted host bootstraps to the lowest other up
     /// host. Returns the topology it starts on, read before its runner
     /// runs and so before it folds any beacon block.
     ///
     /// # Panics
     ///
-    /// Panics if the cluster has a single host (nothing to bootstrap to),
-    /// or the host does not stop cleanly.
+    /// Panics if `host` is down or no other host is up (nothing to
+    /// bootstrap to), or the host does not stop cleanly.
     pub async fn restart_with_wiped_shards(
         &mut self,
         host: usize,
@@ -319,23 +364,20 @@ impl Harness {
         host: usize,
         shards: &[ShardId],
     ) -> Arc<TopologySnapshot> {
-        self.restart_with(host, shards, Replacement::InstalledGenesis)
+        let topology = self.topology(self.peer_of(host)).load_full();
+        self.restart_with(host, shards, Replacement::InstalledGenesis(topology))
             .await
     }
 
-    /// Restart host `host` with its stores for split `children` replaced
-    /// by clones of its store for their `parent` that no adoption ran
-    /// over: the disk a parent half leaves when it crashes between
-    /// seeding a child's store and adopting the child's genesis into it.
-    /// Otherwise as [`Self::restart_with_wiped_shards`].
-    pub async fn restart_with_unadopted_clones(
-        &mut self,
-        host: usize,
-        parent: ShardId,
-        children: &[ShardId],
-    ) -> Arc<TopologySnapshot> {
-        self.restart_with(host, children, Replacement::ParentClone(parent))
-            .await
+    /// The lowest up host other than `host`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no other host is up.
+    fn peer_of(&self, host: usize) -> usize {
+        (0..self.hosts.len())
+            .find(|&i| i != host && self.is_up(i))
+            .expect("a restart bootstraps to another up host")
     }
 
     async fn restart_with(
@@ -344,22 +386,66 @@ impl Harness {
         shards: &[ShardId],
         replacement: Replacement,
     ) -> Arc<TopologySnapshot> {
-        let peer = (0..self.hosts.len())
-            .find(|&i| i != host)
-            .expect("a restart bootstraps to another host");
-        let bootstrap = self.hosts[peer].probe(|p| p.network().endpoint_addr());
-        let peer_topology = self.hosts[peer].probe(|p| p.topology().load_full());
+        let bootstrap = self.endpoint_addr(self.peer_of(host));
+        self.stop_host(host).await;
+        self.replace_stores(host, shards, replacement);
+        self.start_host(host, Some(bootstrap));
+        self.hosts[host]
+            .probe(|p| p.startup_topology())
+            .expect("the restarted host is running")
+    }
 
-        let Host {
-            validators,
-            key,
-            dir,
-            running,
-        } = self.hosts.remove(host);
+    /// Stop host `host`'s node and wait until it has closed every store.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is down or does not stop cleanly.
+    pub async fn stop_host(&mut self, host: usize) {
+        let running = self.hosts[host]
+            .running
+            .take()
+            .expect("only an up host stops");
         running.node.stop().await.expect("the host stops cleanly");
+    }
 
+    /// Start host `host` again on the data directory it left, under its
+    /// own key, bootstrapped to `bootstrap` when given, and configure its
+    /// gate with every host's identity, its rules empty. Blocks while its
+    /// stores open and its network binds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is up.
+    pub fn start_host(&mut self, host: usize, bootstrap: Option<EndpointAddr>) {
+        let peers = self.peer_map();
+        let restarted = &mut self.hosts[host];
+        assert!(restarted.running.is_none(), "only a down host starts");
+        restarted.running = Some(self.build.start(
+            &restarted.dir,
+            restarted.validators.clone(),
+            &restarted.key,
+            bootstrap.into_iter().collect(),
+        ));
+        restarted.incarnation += 1;
+        restarted.network(|network| network.fault_configure(host_id(host), peers));
+    }
+
+    /// Replace host `host`'s stores for `shards` as `replacement` says,
+    /// writing each replacement into a directory the removal left absent:
+    /// a clone does not land on an existing store, and a genesis install
+    /// over a store with blocks resets nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is up, or a store cannot be removed or written.
+    fn replace_stores(&self, host: usize, shards: &[ShardId], replacement: Replacement) {
+        assert!(
+            !self.is_up(host),
+            "a store is replaced only while its host is down"
+        );
+        let dir = self.hosts[host].dir.path();
         for &shard in shards {
-            match remove_dir_all(shard_data_dir(dir.path(), shard)) {
+            match remove_dir_all(shard_data_dir(dir, shard)) {
                 Err(e) if e.kind() != ErrorKind::NotFound => {
                     panic!("wipe the host's store for {shard:?}: {e}")
                 }
@@ -368,17 +454,17 @@ impl Harness {
         }
         match replacement {
             Replacement::Wiped => {}
-            Replacement::InstalledGenesis => {
+            Replacement::InstalledGenesis(topology) => {
                 let config = self.build.network_genesis_config();
                 for &shard in shards {
-                    let at = shard_data_dir(dir.path(), shard);
+                    let at = shard_data_dir(dir, shard);
                     assert!(!at.exists(), "the genesis installs into an absent store");
                     let store = RocksDbShardStorage::open(at, shard_prefix_path(shard))
                         .expect("open the store the genesis installs into");
                     let _ = network_genesis_block(
                         &store,
                         shard,
-                        &peer_topology,
+                        &topology,
                         &config,
                         WeightedTimestamp::from_millis(
                             self.build.beacon_chain_config.genesis_timestamp_ms,
@@ -388,45 +474,90 @@ impl Harness {
             }
             Replacement::ParentClone(parent) => {
                 let store = RocksDbShardStorage::open(
-                    shard_data_dir(dir.path(), parent),
+                    shard_data_dir(dir, parent),
                     shard_prefix_path(parent),
                 )
                 .expect("open the parent store the clones are cut from");
                 for &shard in shards {
-                    let at = shard_data_dir(dir.path(), shard);
+                    let at = shard_data_dir(dir, shard);
                     assert!(!at.exists(), "the clone lands in an absent store");
                     store.checkpoint_into(&at).expect("clone the parent store");
                 }
             }
         }
-
-        let running = self
-            .build
-            .start(&dir, validators.clone(), &key, vec![bootstrap]);
-        let restarted = Host {
-            validators,
-            key,
-            dir,
-            running,
-        };
-        let startup = restarted.probe(|p| p.startup_topology());
-        self.hosts.insert(host, restarted);
-        startup
     }
 
-    /// Number of hosts in the cluster.
+    /// Replace down host `host`'s stores for split `children` by clones of
+    /// its store for their `parent` that no adoption ran over: the disk a
+    /// parent half leaves when it crashes between seeding a child's store
+    /// and adopting the child's genesis into it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is up or holds no store for `parent`.
+    pub fn clone_unadopted(&self, host: usize, parent: ShardId, children: &[ShardId]) {
+        self.replace_stores(host, children, Replacement::ParentClone(parent));
+    }
+
+    /// Runs `read` on down host `host`'s store for `shard` as it lies on
+    /// disk, opened as the host opens it; `None` when it holds none there.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is up or the store does not open.
+    pub fn read_stored<T>(
+        &self,
+        host: usize,
+        shard: ShardId,
+        read: impl FnOnce(&RocksDbShardStorage) -> T,
+    ) -> Option<T> {
+        assert!(
+            !self.is_up(host),
+            "a store is read off disk only while its host is down"
+        );
+        let at = shard_data_dir(self.hosts[host].dir.path(), shard);
+        if !at.exists() {
+            return None;
+        }
+        let store =
+            RocksDbShardStorage::open(at, shard_prefix_path(shard)).expect("open the stored shard");
+        Some(read(&store))
+    }
+
+    /// The address host `host` binds, to bootstrap another host to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is down.
+    pub fn endpoint_addr(&self, host: usize) -> EndpointAddr {
+        self.hosts[host]
+            .network(IrohAdapter::endpoint_addr)
+            .expect("an up host has an address")
+    }
+
+    /// Number of hosts in the cluster, up or down.
     pub const fn host_count(&self) -> usize {
         self.hosts.len()
     }
 
     /// The handle every call on `host` goes through.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is down.
     pub fn handle(&self, host: usize) -> &NodeHandle {
-        &self.hosts[host].running.handle
+        self.hosts[host].handle().expect("the host is up")
     }
 
     /// The topology snapshot `host` reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the host is down.
     pub fn topology(&self, host: usize) -> SharedTopologySnapshot {
-        self.hosts[host].probe(|p| p.topology())
+        self.hosts[host]
+            .probe(|p| p.topology())
+            .expect("the host is up")
     }
 
     /// Highest committed height observed for `shard` across all hosts'
@@ -456,7 +587,7 @@ impl Harness {
                 .iter()
                 .find(|v| v.shard == key)
                 .map(|v| v.block_height)
-        })
+        })?
     }
 
     /// The raw committed JMT root for `shard` on host `host` specifically, read
@@ -482,7 +613,7 @@ impl Harness {
     pub fn beacon_state(&self) -> Option<Arc<BeaconState>> {
         self.hosts
             .iter()
-            .filter_map(|h| h.running.handle.history().latest_committed())
+            .filter_map(|h| h.handle()?.history().latest_committed())
             .max_by_key(|(_, state)| state.current_epoch)
             .map(|(_, state)| state)
     }
@@ -491,7 +622,7 @@ impl Harness {
     /// analog of the sim's `ProcessScopedInput::SubmitTransaction`. The
     /// process computes the touched-shard fanout and admits onto every
     /// hosted shard's mempool, gossiping any it doesn't host. Returns
-    /// `false` only when the host is shutting down. Submit through a host
+    /// `false` when the host is down or shutting down. Submit through a host
     /// that runs the transaction's source shard so it admits directly
     /// rather than relying on a gossip hop.
     ///
@@ -501,15 +632,14 @@ impl Harness {
     /// fetch its replay of the commit reads back after a restart.
     pub fn submit_transaction(&self, idx: usize, tx: &Transaction) -> bool {
         self.hosts[idx]
-            .running
-            .handle
-            .submit(Arc::new(Transaction::new(tx.body().clone())))
+            .handle()
+            .is_some_and(|handle| handle.submit(Arc::new(Transaction::new(tx.body().clone()))))
     }
 
     /// The status host `idx`'s process recorded for `hash`, with the
     /// hosted shard that reported it, if any.
     pub fn tx_status(&self, idx: usize, hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
-        self.hosts[idx].probe(|p| p.tx_status(hash))
+        self.hosts[idx].probe(|p| p.tx_status(hash))?
     }
 
     /// The first host index serving `shard`, if any — used to address a
@@ -527,7 +657,7 @@ impl Harness {
             .position(|h| h.serves(shard) && committee.iter().any(|&v| h.runs(v)))
     }
 
-    /// The host running `validator`, if any.
+    /// The host running `validator`, up or down, if any.
     pub fn host_of(&self, validator: ValidatorId) -> Option<usize> {
         self.hosts.iter().position(|h| h.runs(validator))
     }
@@ -697,15 +827,18 @@ impl Harness {
             .unwrap_or(0)
     }
 
-    /// Stop every host at once and wait until each has: its stores closed,
-    /// its sockets released and its threads joined, so nothing leaks across
-    /// `#[serial]` tests. Idempotent: the hosts are drained, so a second
-    /// call is a no-op.
+    /// Stop every up host at once and wait until each has: its stores
+    /// closed, its sockets released and its threads joined, so nothing
+    /// leaks across `#[serial]` tests. Idempotent: the hosts are drained,
+    /// so a second call is a no-op.
     pub async fn shutdown(&mut self) {
         let mut stopping = JoinSet::new();
         for host in self.hosts.drain(..) {
+            let Some(running) = host.running else {
+                continue;
+            };
             stopping.spawn(async move {
-                let stopped = host.running.node.stop().await;
+                let stopped = running.node.stop().await;
                 drop(host.dir);
                 stopped
             });
@@ -723,48 +856,66 @@ fn host_id(index: usize) -> HostId {
     HostId(u32::try_from(index).expect("host index fits a HostId"))
 }
 
-/// Fault injection: drive every host's gate. The cluster addresses hosts by
-/// index; each host's gate keys on [`HostId`].
+/// Fault injection: drive every up host's gate; a down host has none, and
+/// starts again with an empty one. The cluster addresses hosts by index;
+/// each host's gate keys on [`HostId`].
 impl Harness {
-    /// Configure every host's gate with its own id and the full peer to
+    /// Every host's identity, up or down, mapped to its [`HostId`].
+    fn peer_map(&self) -> Vec<(EndpointId, HostId)> {
+        self.hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.endpoint_id(), host_id(i)))
+            .collect()
+    }
+
+    /// Configure every up host's gate with its own id and the full peer to
     /// `HostId` map, so partition and gossip filtering resolve peers. Call once
     /// before installing faults.
     pub fn fault_configure_all(&self) {
-        let map: Vec<(EndpointId, HostId)> = self
-            .hosts
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h.network(IrohAdapter::local_endpoint_id), host_id(i)))
-            .collect();
+        let map = self.peer_map();
         for (i, host) in self.hosts.iter().enumerate() {
             host.network(|network| network.fault_configure(host_id(i), map.clone()));
         }
     }
 
-    /// Install `spec` as a drop rule on every host's gate; one handle per host.
-    pub fn fault_install_drop(&self, spec: &DropSpec) -> Vec<RuleHandle> {
+    /// Install `spec` as a drop rule on every up host's gate; one rule per
+    /// host.
+    pub fn fault_install_drop(&self, spec: &DropSpec) -> Vec<HostRule> {
         self.hosts
             .iter()
-            .map(|h| h.network(|network| network.fault_gate().install_drop(spec.clone())))
+            .enumerate()
+            .filter_map(|(i, h)| {
+                let handle =
+                    h.network(|network| network.fault_gate().install_drop(spec.clone()))?;
+                Some(HostRule {
+                    host: i,
+                    incarnation: h.incarnation,
+                    handle,
+                })
+            })
             .collect()
     }
 
-    /// Remove a rule [`Self::fault_install_drop`] installed, given the
-    /// handles it answered, one per host in host order.
-    pub fn fault_remove_drop(&self, handles: &[RuleHandle]) {
-        for (host, handle) in self.hosts.iter().zip(handles) {
-            host.network(|network| network.fault_gate().remove_fault(handle));
+    /// Remove rules [`Self::fault_install_drop`] installed. A rule whose
+    /// host has stopped since went with that run's gate and is skipped.
+    pub fn fault_remove_drop(&self, rules: &[HostRule]) {
+        for rule in rules {
+            let host = &self.hosts[rule.host];
+            if host.incarnation == rule.incarnation {
+                host.network(|network| network.fault_gate().remove_fault(&rule.handle));
+            }
         }
     }
 
     /// Install `rewrite` over the answers host `host` serves for requests of
-    /// `type_id`.
+    /// `type_id`; `None` when the host is down.
     pub fn fault_install_response_rewrite(
         &self,
         host: usize,
         type_id: &'static str,
         rewrite: Rewrite,
-    ) -> RuleHandle {
+    ) -> Option<RuleHandle> {
         self.hosts[host].network(|network| {
             network
                 .fault_gate()
@@ -841,7 +992,8 @@ fn start_host(build: &ClusterBuild, spec: HostSpec, bootstrap_peers: Vec<Endpoin
         validators: spec.validators,
         key,
         dir,
-        running,
+        incarnation: 1,
+        running: Some(running),
     }
 }
 
@@ -849,8 +1001,9 @@ fn start_host(build: &ClusterBuild, spec: HostSpec, bootstrap_peers: Vec<Endpoin
 enum Replacement {
     /// Nothing: the store is gone.
     Wiped,
-    /// A store that installed the network genesis and committed nothing.
-    InstalledGenesis,
+    /// A store that installed the network genesis, projected from this
+    /// topology, and committed nothing.
+    InstalledGenesis(Arc<TopologySnapshot>),
     /// A clone of the host's store for this split parent, never adopted.
     ParentClone(ShardId),
 }
