@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, ActionContext, CommitSource, FetchIds, Parallelism, ParentJudgement, PreparedBlock,
-    ProtocolEvent, QcSubject, SignerGate, Signing, TimerId,
+    Action, ActionContext, CommitSource, FetchIds, Gate, Parallelism, ParentJudgement,
+    PreparedBlock, ProtocolEvent, QcSubject, Signing, TimerId,
 };
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::{ExecutionMode, Executor};
@@ -1423,7 +1423,7 @@ impl ShardCoordinatorSim {
         let commit_prepared = |block: PreparedBlock| {
             prepared.lock().expect("prepared lock").push(block);
         };
-        let gate = SignerGate::new();
+        let gate = Gate::new();
         let ctx = ActionContext {
             executor: &production.executor,
             topology_snapshot: self.topology_schedule.head(),

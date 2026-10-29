@@ -1,10 +1,12 @@
-//! The release gate a signing identity's delegated handlers pass through.
+//! A single-use release gate: calls enter it while it is open, and its
+//! owner closes it and waits until every call that entered has left.
 //!
 //! A node loop builds one gate per attachment of a signer and hands it to
 //! every action it dispatches for that signer. A handler enters the gate
 //! around its persist, sign and notify, and the loop closes the gate when
-//! the attachment ends. Once [`SignerGate::close_and_wait`] returns, no
+//! the attachment ends. Once [`Gate::close_and_wait`] returns, no
 //! handler of that attachment is mid-signature and none will start one.
+//! A host's handle passes every caller's call through one the same way.
 
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
@@ -12,7 +14,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 /// builds a fresh gate, so a task queued under an earlier attachment
 /// never signs under a later one.
 #[derive(Debug)]
-pub struct SignerGate {
+pub struct Gate {
     state: Mutex<GateState>,
     idle: Condvar,
 }
@@ -23,15 +25,15 @@ struct GateState {
     in_flight: usize,
 }
 
-/// A handler's pass through an open gate, held across its persist, sign
-/// and notify. Dropping it exits the gate.
-#[must_use = "the signature must be made while the entry is held"]
+/// A call's pass through an open gate, held for as long as the call runs.
+/// Dropping it exits the gate.
+#[must_use = "the call must run while the entry is held"]
 #[derive(Debug)]
 pub struct GateEntry<'a> {
-    gate: &'a SignerGate,
+    gate: &'a Gate,
 }
 
-impl SignerGate {
+impl Gate {
     /// An open gate with nothing in flight.
     #[must_use]
     pub const fn new() -> Self {
@@ -45,7 +47,7 @@ impl SignerGate {
     }
 
     /// Enter the gate, or `None` once it has closed, in which case the
-    /// handler drops its action unsigned.
+    /// call does not run.
     pub fn enter(&self) -> Option<GateEntry<'_>> {
         let mut state = self.lock();
         if !state.open {
@@ -56,10 +58,10 @@ impl SignerGate {
         Some(GateEntry { gate: self })
     }
 
-    /// Close the gate and wait until every handler that entered it has
+    /// Close the gate and wait until every call that entered it has
     /// exited.
     pub fn close_and_wait(&self) {
-        let closed = self.close();
+        let closed = self.close_locked();
         drop(
             self.idle
                 .wait_while(closed, |state| state.in_flight > 0)
@@ -67,8 +69,14 @@ impl SignerGate {
         );
     }
 
-    /// Close the gate, keeping the lock for the wait.
-    fn close(&self) -> MutexGuard<'_, GateState> {
+    /// Close the gate without waiting: from now on no call enters, and
+    /// those already in run on.
+    pub fn close(&self) {
+        drop(self.close_locked());
+    }
+
+    /// Close the gate, keeping the lock for a wait.
+    fn close_locked(&self) -> MutexGuard<'_, GateState> {
         let mut state = self.lock();
         state.open = false;
         state
@@ -84,14 +92,14 @@ impl SignerGate {
         }
     }
 
-    /// Entries exit on unwind, so a lock a panicking handler poisoned
+    /// Entries exit on unwind, so a lock a panicking call poisoned
     /// still holds exact counts.
     fn lock(&self) -> MutexGuard<'_, GateState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-impl Default for SignerGate {
+impl Default for Gate {
     fn default() -> Self {
         Self::new()
     }
@@ -116,7 +124,7 @@ mod tests {
     /// it begins no handler enters.
     #[test]
     fn close_and_wait_waits_for_a_started_signature_and_refuses_later_ones() {
-        let gate = Arc::new(SignerGate::new());
+        let gate = Arc::new(Gate::new());
         let signed = Arc::new(AtomicBool::new(false));
         let started = gate.enter().expect("an open gate admits");
 
@@ -159,9 +167,39 @@ mod tests {
     /// returns at once.
     #[test]
     fn a_closed_gate_stays_closed() {
-        let gate = SignerGate::new();
+        let gate = Gate::new();
         gate.close_and_wait();
         gate.close_and_wait();
         assert!(gate.enter().is_none());
+    }
+
+    /// A close without the wait refuses every later call at once, and the
+    /// wait that follows holds until a call entered before it leaves.
+    #[test]
+    fn close_refuses_later_calls_and_the_wait_holds_for_an_earlier_one() {
+        let gate = Arc::new(Gate::new());
+        let earlier = gate.enter().expect("an open gate admits");
+        gate.close();
+        assert!(gate.enter().is_none(), "a closed gate admits nothing");
+
+        let (done_tx, done_rx) = channel();
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                gate.close_and_wait();
+                done_tx.send(()).expect("the test holds the receiver");
+            })
+        };
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            done_rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "the wait returned while an earlier call was still in",
+        );
+        drop(earlier);
+        done_rx
+            .recv()
+            .expect("the wait returns once the call leaves");
+        waiter.join().expect("the waiter thread does not panic");
     }
 }

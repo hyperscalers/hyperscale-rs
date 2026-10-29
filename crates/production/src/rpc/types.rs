@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use super::state::VnodeStatusEntry;
+use super::state::VnodeStatusEntry;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Health & Readiness
@@ -149,22 +149,4 @@ pub struct ErrorResponse {
     /// Optional human-readable explanation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) details: Option<String>,
-}
-
-impl ErrorResponse {
-    /// Build an error response with no extra details.
-    pub fn new(error: impl Into<String>) -> Self {
-        Self {
-            error: error.into(),
-            details: None,
-        }
-    }
-
-    /// Build an error response with both a category and a detailed message.
-    pub fn with_details(error: impl Into<String>, details: impl Into<String>) -> Self {
-        Self {
-            error: error.into(),
-            details: Some(details.into()),
-        }
-    }
 }

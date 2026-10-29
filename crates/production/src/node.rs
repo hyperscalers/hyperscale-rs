@@ -1,42 +1,39 @@
 //! A validator host started from a library.
 //!
 //! [`Node::start`] opens the storage, the beacon store and the runner a host
-//! needs at the data directory's one layout, and hands back the publishers and
-//! senders an embedder reads. The host runs on a tokio runtime and thread pools
+//! needs at the data directory's one layout, and hands back the owner that
+//! stops it; every call an embedder makes goes through its [`NodeHandle`]. The host runs on a tokio runtime and thread pools
 //! of its own, so stopping it ends everything it started. It installs nothing
 //! process-global beyond the first-wins statics the runner already sets;
 //! tracing, signals and the allocator stay with the embedder.
 
-use std::collections::BTreeMap;
 use std::io::Error as IoError;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-use arc_swap::ArcSwap;
+use hyperscale_core::Gate;
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig, ThreadPoolError};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::IrohConfig;
-use hyperscale_node::TxStatusCache;
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage};
+use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbConfig, RocksDbShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, ConsensusPublicKey, GenesisValidators, ShardId, ValidatorId,
+    BeaconChainConfig, ConsensusPublicKey, GenesisValidators, ShardId, ValidatorId,
     shard_prefix_path,
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::handle::{HostCalls, NodeHandle};
 use crate::network_file::{NetworkFile, NetworkFileError};
-use crate::observe::{HeaderRing, HeaderSummary, Importing, Observation};
-use crate::rpc::{MempoolSnapshot, NodeStatusState, PreviewSender, TxSubmissionSender};
 use crate::{
-    AddValidatorError, LocalValidator, ProductionRunner, RunnerCommand, RunnerError,
-    ShutdownHandle, StorageDirResolver, StorageFactory, SyncStatus, shard_data_dir,
+    AddValidatorError, LocalValidator, ProductionRunner, RunnerError, ShutdownHandle,
+    StorageDirResolver, StorageFactory, shard_data_dir,
 };
 
 /// Everything a host needs to start, as plain values.
@@ -171,51 +168,51 @@ pub enum NodeError {
     Stopped,
 }
 
-/// A running host. Dropping it stops the host, as [`Node::stop`] does, and
-/// finishes tearing it down on a thread of its own without waiting.
+/// A running host's owner, which stops it and waits for it.
+///
+/// Dropping it stops the host, as [`Node::stop`] does, and finishes tearing
+/// it down on a thread of its own without waiting. Every other call goes
+/// through its [`NodeHandle`].
 pub struct Node {
-    status: Arc<ArcSwap<NodeStatusState>>,
-    sync_status: Arc<ArcSwap<SyncStatus>>,
-    mempool: Arc<ArcSwap<MempoolSnapshot>>,
-    tx_status: Arc<TxStatusCache>,
-    headers: Arc<HeaderRing>,
-    observe: watch::Receiver<Option<Arc<Observation>>>,
-    importing: Arc<Importing>,
+    handle: NodeHandle,
     shutdown: Option<ShutdownHandle>,
-    /// Commands to the running host.
-    commands: mpsc::Sender<RunnerCommand>,
     /// Everything that reaches the host's stores; `None` only once a
     /// teardown has taken it.
-    host: Option<Host>,
+    teardown: Option<Teardown>,
 }
 
 /// What a teardown ends, in the order it ends it.
-struct Host {
+struct Teardown {
     running: JoinHandle<Result<(), RunnerError>>,
     runtime: Runtime,
-    submit: TxSubmissionSender,
-    preview: PreviewSender,
-    history: Arc<dyn BeaconChainReader>,
+    /// Every handle call passes it.
+    gate: Arc<Gate>,
+    /// The one strong reference to what handle calls reach.
+    calls: Arc<HostCalls>,
     dispatch: Arc<PooledDispatch>,
 }
 
-impl Host {
-    /// Waits for the runner, then ends everything it left: the runtime's
-    /// tasks and blocking jobs, the handles into the stores, and the pools'
+impl Teardown {
+    /// Waits for the runner, then refuses further handle calls and ends
+    /// everything the runner left: the runtime's tasks and blocking jobs,
+    /// the calls already in, the handles into the stores, and the pools'
     /// jobs. Runs on a thread with no runtime of its own, so a socket whose
     /// drop hands its close to the current runtime closes here.
     fn tear_down(self) -> Result<(), NodeError> {
         let Self {
             running,
             runtime,
-            submit,
-            preview,
-            history,
+            gate,
+            calls,
             dispatch,
         } = self;
         let outcome = runtime.block_on(running);
+        gate.close();
+        // A call still in that waits on the host's runtime, a preview's
+        // blocking job, ends with it.
         drop(runtime);
-        drop((submit, preview, history));
+        gate.close_and_wait();
+        drop(calls);
         dispatch.wait_idle();
         outcome??;
         Ok(())
@@ -292,11 +289,6 @@ impl Node {
             })?,
         );
         let beacon_storage: Arc<dyn BeaconStorage> = Arc::clone(&beacon_db) as _;
-        let history: Arc<dyn BeaconChainReader> = beacon_db;
-
-        let status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default())));
-        let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
-        let mempool = Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default())));
 
         let mut runner = ProductionRunner::builder(
             setup.validators,
@@ -308,146 +300,48 @@ impl Node {
             storage_dir,
         )
         .dispatch(Arc::clone(&dispatch))
-        .rpc_status(Arc::clone(&status))
-        .mempool_snapshot(Arc::clone(&mempool))
-        .sync_status(Arc::clone(&sync_status))
         .mempool_config(setup.mempool)
         .provision_config(setup.provisions)
         .beacon_chain_config(setup.beacon_chain)
         .genesis_config(setup.engine_genesis)
         .build()?;
 
-        // These panic once `run` has taken the runner, so they are taken now.
-        let submit = runner.tx_submission_sender();
-        let preview = runner.preview_sender();
-        let tx_status = runner.tx_status_cache();
-        let headers = runner.header_ring();
-        let observe = runner.observe();
-        let importing = runner.importing();
+        // The senders panic once `run` has taken the runner, so they are
+        // taken now.
+        let network = Arc::clone(runner.network());
+        let calls = Arc::new(HostCalls {
+            submit: runner.tx_submission_sender(),
+            preview: runner.preview_sender(),
+            history: beacon_db,
+            publishers: runner.publishers(),
+            tx_status: runner.tx_status_cache(),
+            peers: Box::new(move || network.cached_peer_count()),
+            commands: runner.reconfigure_handle(),
+            runtime: runtime.handle().clone(),
+        });
+        let gate = Arc::new(Gate::new());
         let shutdown = runner.shutdown_handle();
-        let commands = runner.reconfigure_handle();
         let running = runtime.spawn(runner.run());
         drop(entered);
 
         Ok(Self {
-            status,
-            sync_status,
-            mempool,
-            tx_status,
-            headers,
-            observe,
-            importing,
+            handle: NodeHandle::new(&calls, Arc::clone(&gate)),
             shutdown,
-            commands,
-            host: Some(Host {
+            teardown: Some(Teardown {
                 running,
                 runtime,
-                submit,
-                preview,
-                history,
+                gate,
+                calls,
                 dispatch,
             }),
         })
     }
 
-    /// The host's handles; present until a teardown takes them.
-    const fn host(&self) -> &Host {
-        self.host
-            .as_ref()
-            .expect("only a teardown, which consumes the node, takes the host")
-    }
-
-    /// The host's status: connected peers and, per hosted validator, its
-    /// shard, height and view. Refreshed by the runner's status tick.
+    /// The handle every call on the running host goes through. Clones are
+    /// cheap; one kept past the host's stop answers empty.
     #[must_use]
-    pub fn status(&self) -> Arc<ArcSwap<NodeStatusState>> {
-        Arc::clone(&self.status)
-    }
-
-    /// Block sync progress per hosted shard.
-    #[must_use]
-    pub fn sync_status(&self) -> Arc<ArcSwap<SyncStatus>> {
-        Arc::clone(&self.sync_status)
-    }
-
-    /// The mempool's counts per hosted validator.
-    #[must_use]
-    pub fn mempool(&self) -> Arc<ArcSwap<MempoolSnapshot>> {
-        Arc::clone(&self.mempool)
-    }
-
-    /// Sends a transaction into the network; `false` if the host did not take
-    /// it.
-    #[must_use]
-    pub fn submit(&self) -> TxSubmissionSender {
-        Arc::clone(&self.host().submit)
-    }
-
-    /// Runs a transaction against committed state without sending it. Blocks,
-    /// so call it off the async runtime.
-    #[must_use]
-    pub fn preview(&self) -> PreviewSender {
-        Arc::clone(&self.host().preview)
-    }
-
-    /// Take on `validator` while the host runs, without a restart and
-    /// without interrupting the validators it already runs. The host attests
-    /// it to every peer it is linked to and starts its beacon participation;
-    /// it is seated wherever its placement puts it, as at start. Peers route
-    /// to it once their topology holds its registration. The host does not
-    /// remember it: the caller passes it again at the next start.
-    ///
-    /// # Errors
-    ///
-    /// [`NodeError::AddValidator`] if the host would not take it, and
-    /// [`NodeError::Stopped`] if the host is no longer running.
-    pub async fn add_validator(&self, validator: LocalValidator) -> Result<(), NodeError> {
-        let (reply, answer) = oneshot::channel();
-        self.commands
-            .send(RunnerCommand::AddValidator { validator, reply })
-            .await
-            .map_err(|_| NodeError::Stopped)?;
-        answer
-            .await
-            .map_err(|_| NodeError::Stopped)?
-            .map_err(NodeError::AddValidator)
-    }
-
-    /// What became of each transaction this host has seen.
-    #[must_use]
-    pub fn tx_status(&self) -> Arc<TxStatusCache> {
-        Arc::clone(&self.tx_status)
-    }
-
-    /// The certified headers this host has seen for `shard` from `since` on,
-    /// oldest first: the last hour of them, each with its signers and the
-    /// proposers whose rounds failed before it.
-    #[must_use]
-    pub fn headers(&self, shard: ShardId, since: BlockHeight) -> Vec<HeaderSummary> {
-        self.headers.since(shard, since)
-    }
-
-    /// What the host's beacon thread has seen, republished after each step
-    /// that changed it: the latest committed beacon state, each shard's
-    /// newest certified header, and the last day of adopted epochs with
-    /// what each settled. `None` until the thread's first step.
-    #[must_use]
-    pub fn observe(&self) -> watch::Receiver<Option<Arc<Observation>>> {
-        self.observe.clone()
-    }
-
-    /// The bytes each shard's snap-sync import has staged, for every import
-    /// in progress: a shard this host is copying before it can sign.
-    #[must_use]
-    pub fn importing(&self) -> BTreeMap<ShardId, u64> {
-        self.importing.snapshot()
-    }
-
-    /// The committed beacon chain, for history the observation does not
-    /// carry: any epoch's block and state.
-    #[must_use]
-    pub fn history(&self) -> Arc<dyn BeaconChainReader> {
-        Arc::clone(&self.host().history)
+    pub fn handle(&self) -> NodeHandle {
+        self.handle.clone()
     }
 
     /// The handle that stops the host, for a caller that stops it from
@@ -459,18 +353,19 @@ impl Node {
 
     /// Waits for the host to stop on its own or through a taken shutdown
     /// handle, then for everything it started to end: once this returns,
-    /// its stores are closed and its sockets released.
+    /// its stores are closed and its sockets released. Handle calls run
+    /// until the host has stopped, and are refused from then on.
     ///
     /// # Errors
     ///
     /// If the host stopped with an error or its task or teardown panicked.
     pub async fn finished(mut self) -> Result<(), NodeError> {
-        let Some(host) = self.host.take() else {
+        let Some(teardown) = self.teardown.take() else {
             return Ok(());
         };
         // The shutdown handle stays alive until the runner has returned:
         // dropping it would stop the host.
-        let outcome = host.tear_down_apart().await;
+        let outcome = teardown.tear_down_apart().await;
         drop(self.shutdown.take());
         outcome
     }
@@ -493,7 +388,7 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let Some(host) = self.host.take() else {
+        let Some(teardown) = self.teardown.take() else {
             return;
         };
         if let Some(shutdown) = self.shutdown.take() {
@@ -503,7 +398,7 @@ impl Drop for Node {
         let spawned = thread::Builder::new()
             .name("host-teardown".into())
             .spawn(move || {
-                if let Err(e) = host.tear_down() {
+                if let Err(e) = teardown.tear_down() {
                     tracing::warn!(error = %e, "The host stopped with an error");
                 }
             });

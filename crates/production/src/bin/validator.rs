@@ -717,16 +717,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             sync_backpressure_threshold: Some(10),
         };
 
-        let rpc_server = RpcServer::with_state(
-            rpc_config,
-            rpc_ready.clone(),
-            node.sync_status(),
-            node.status(),
-            node.submit(),
-            node.preview(),
-            node.tx_status(),
-            node.mempool(),
-        );
+        let rpc_server = RpcServer::for_node(rpc_config, &node.handle(), Arc::clone(&rpc_ready));
         let handle = rpc_server
             .start()
             .await

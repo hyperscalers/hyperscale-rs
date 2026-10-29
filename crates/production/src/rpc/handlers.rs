@@ -41,7 +41,6 @@ use hyperscale_types::{
     Hash, MAX_VALIDITY_RANGE, Transaction, TransactionDecision, TransactionStatus, TxHash,
     TxsInFlight, WeightedTimestamp,
 };
-use tokio::task::spawn_blocking;
 
 use super::state::RpcState;
 use super::types::{
@@ -105,7 +104,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
 
 /// Handler for `GET /api/v1/status` - node status.
 pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse {
-    let node_status = state.node_status.load();
+    let node_status = state.node.node_status();
     let uptime = state.start_time.elapsed().as_secs();
 
     Json(NodeStatusResponse {
@@ -123,7 +122,7 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
 pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
     // `BlockSyncStateKind` renames to snake case on the way out, so the
     // published `state` tag comes from the enum itself.
-    Json((*state.sync_status.load_full()).clone())
+    Json((*state.node.sync_status()).clone())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -133,11 +132,10 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 /// Answer what `tx` would do against committed state, committing
 /// nothing.
 ///
-/// The run is a blocking round trip to a shard driver, so it goes to a
-/// blocking worker rather than holding a tokio thread. A node that
-/// hosts no shard able to answer, or a driver that does not reply in
-/// time, is a `503`: the question is unanswerable here rather than
-/// malformed.
+/// The run goes to one of the host's blocking workers rather than holding
+/// a tokio thread. A node that hosts no shard able to answer, a driver
+/// that does not reply in time, or a host that has stopped, is a `503`:
+/// the question is unanswerable here rather than malformed.
 ///
 /// A declaration reaching a shard this node does not serve comes back
 /// `refused` with the shards named, not as an error — the node ran what
@@ -150,8 +148,7 @@ pub async fn preview_transaction_handler(
         Ok(tx) => tx,
         Err(rejection) => return rejection.into_response(),
     };
-    let preview = state.preview_tx;
-    let Ok(Some(report)) = spawn_blocking(move || preview(&transaction)).await else {
+    let Some(report) = state.node.preview(&transaction).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -215,9 +212,7 @@ pub async fn submit_transaction_handler(
 
     // Compute the touched-shard fanout on this tokio worker and push
     // admit envelopes directly onto each touched shard's event channel.
-    // The closure captures `Arc<ProcessIo>` (for the lock-free topology
-    // read) plus the per-shard senders.
-    if !(state.tx_submission_tx)(tx_arc) {
+    if !state.node.submit(tx_arc) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitTransactionResponse {
@@ -264,7 +259,7 @@ pub async fn get_transaction_handler(
 
     // One process-wide cache answers for every hosted shard, reporting a
     // hosted shard's own leg of the transaction.
-    match state.lookup_tx_status(&tx_hash) {
+    match state.node.tx_status(&tx_hash) {
         Some(status) => {
             let (status_str, committed_height, decision, error) =
                 format_transaction_status(&status);
@@ -299,7 +294,7 @@ pub async fn get_transaction_handler(
 /// shard would refuse, refuse the whole request."
 fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransactionResponse>)> {
     if let Some(threshold) = state.sync_backpressure_threshold {
-        let sync_status = state.sync_status.load();
+        let sync_status = state.node.sync_status();
         if let Some(behind) = sync_status.shards.values().map(|s| s.blocks_behind).max()
             && behind > threshold
         {
@@ -317,7 +312,7 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
         }
     }
 
-    let snapshot = state.mempool_snapshot.load();
+    let snapshot = state.node.mempool();
 
     if snapshot
         .vnodes
@@ -479,13 +474,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
-    use arc_swap::ArcSwap;
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use axum::routing::{get, post};
     use hyperscale_hbor::to_vec as hbor_to_vec;
-    use hyperscale_node::{BlockSyncStateKind, BlockSyncStatus, TxStatusCache};
+    use hyperscale_node::{BlockSyncStateKind, BlockSyncStatus};
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{BlockHeight, ShardId, TransactionDecision};
     use serde_json::{from_slice, to_string};
@@ -493,22 +487,26 @@ mod tests {
 
     use super::super::state::TxSubmissionSender;
     use super::*;
-    use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
+    use crate::handle::HostCalls;
+    use crate::handle::test_support::host;
     use crate::status::SyncStatus;
 
-    fn create_test_state() -> RpcState {
-        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
-        RpcState {
+    /// A not-yet-ready server over a host that takes every submission
+    /// with `submit` and previews nothing. The host's calls stay
+    /// reachable while the returned `Arc` lives.
+    fn state_with(submit: TxSubmissionSender) -> (Arc<HostCalls>, RpcState) {
+        let (calls, node) = host(submit, Arc::new(|_tx| None));
+        let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
-            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
-            tx_submission_tx,
-            preview_tx: Arc::new(|_tx| None),
+            node,
             start_time: Instant::now(),
-            tx_status: Arc::new(TxStatusCache::new()),
-            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
-        }
+        };
+        (calls, state)
+    }
+
+    fn create_test_state() -> (Arc<HostCalls>, RpcState) {
+        state_with(Arc::new(|_tx| true))
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -519,7 +517,7 @@ mod tests {
     async fn test_health_handler() {
         let app = Router::new()
             .route("/health", get(health_handler))
-            .with_state(create_test_state());
+            .with_state(create_test_state().1);
 
         let response = app
             .oneshot(
@@ -536,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_handler_not_ready() {
-        let state = create_test_state();
+        let (_calls, state) = create_test_state();
         let app = Router::new()
             .route("/ready", get(ready_handler))
             .with_state(state);
@@ -556,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_handler_ready() {
-        let state = create_test_state();
+        let (_calls, state) = create_test_state();
         state.ready.store(true, Ordering::SeqCst);
         let app = Router::new()
             .route("/ready", get(ready_handler))
@@ -635,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_transaction_not_found() {
-        let state = create_test_state();
+        let (_calls, state) = create_test_state();
         let app = Router::new()
             .route("/tx/{hash}", get(get_transaction_handler))
             .with_state(state);
@@ -656,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_transaction_invalid_hex() {
-        let state = create_test_state();
+        let (_calls, state) = create_test_state();
         let app = Router::new()
             .route("/tx/{hash}", get(get_transaction_handler))
             .with_state(state);
@@ -676,12 +674,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_transaction_found() {
-        let state = create_test_state();
+        let (calls, state) = create_test_state();
         // Create a hash from some input bytes
         let tx_hash = TxHash::from(Hash::from_bytes(&[0x12; 32]));
         let tx_hash_hex = hex_encode(tx_hash.as_bytes());
 
-        state
+        calls
             .tx_status
             .record(tx_hash, TransactionStatus::Pending, ShardId::ROOT);
 
@@ -733,22 +731,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_rejected_when_syncing() {
-        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
-
-        // Create state with node that is 20 blocks behind (threshold is 10)
-        let sync_status = sync_status_with(20);
-
-        let state = RpcState {
-            ready: Arc::new(AtomicBool::new(true)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
-            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
-            tx_submission_tx,
-            preview_tx: Arc::new(|_tx| None),
-            start_time: Instant::now(),
-            tx_status: Arc::new(TxStatusCache::new()),
-            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
-            sync_backpressure_threshold: Some(10),
-        };
+        // A node that is 20 blocks behind (threshold is 10)
+        let (calls, state) = create_test_state();
+        state.ready.store(true, Ordering::SeqCst);
+        calls
+            .publishers
+            .sync_status
+            .store(Arc::new(sync_status_with(20)));
 
         let app = Router::new()
             .route("/tx", post(submit_transaction_handler))
@@ -787,22 +776,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_accepted_when_caught_up() {
-        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
-
-        // Create state with node that is only 5 blocks behind (under threshold of 10)
-        let sync_status = sync_status_with(5);
-
-        let state = RpcState {
-            ready: Arc::new(AtomicBool::new(true)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
-            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
-            tx_submission_tx,
-            preview_tx: Arc::new(|_tx| None),
-            start_time: Instant::now(),
-            tx_status: Arc::new(TxStatusCache::new()),
-            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
-            sync_backpressure_threshold: Some(10),
-        };
+        // A node that is only 5 blocks behind (under threshold of 10)
+        let (calls, state) = create_test_state();
+        state.ready.store(true, Ordering::SeqCst);
+        calls
+            .publishers
+            .sync_status
+            .store(Arc::new(sync_status_with(5)));
 
         let app = Router::new()
             .route("/tx", post(submit_transaction_handler))
@@ -849,17 +829,8 @@ mod tests {
             seen.store(true, Ordering::SeqCst);
             true
         });
-        let state = RpcState {
-            ready: Arc::new(AtomicBool::new(true)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status_with(0)))),
-            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
-            tx_submission_tx,
-            preview_tx: Arc::new(|_tx| None),
-            start_time: Instant::now(),
-            tx_status: Arc::new(TxStatusCache::new()),
-            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
-            sync_backpressure_threshold: Some(10),
-        };
+        let (_calls, state) = state_with(tx_submission_tx);
+        state.ready.store(true, Ordering::SeqCst);
         let app = Router::new()
             .route("/tx", post(submit_transaction_handler))
             .with_state(state);

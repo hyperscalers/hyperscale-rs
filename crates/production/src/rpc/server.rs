@@ -5,17 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use arc_swap::ArcSwap;
 use axum::serve;
-use hyperscale_node::TxStatusCache;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{JoinError, JoinHandle, spawn};
 use tracing::{error, info};
 
 use super::routes::create_router;
-use super::state::{MempoolSnapshot, NodeStatusState, PreviewSender, RpcState, TxSubmissionSender};
-use crate::status::SyncStatus;
+use super::state::RpcState;
+use crate::handle::NodeHandle;
 
 /// Errors from the RPC server.
 #[derive(Debug, Error)]
@@ -59,36 +57,12 @@ pub struct RpcServerHandle {
     task: JoinHandle<()>,
     /// Ready flag to set when node is ready.
     ready_flag: Arc<AtomicBool>,
-    /// Sync status provider for updates.
-    sync_status: Arc<ArcSwap<SyncStatus>>,
-    /// Node status provider for updates.
-    node_status: Arc<ArcSwap<NodeStatusState>>,
-    /// Mempool snapshot for updates.
-    mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
 }
 
 impl RpcServerHandle {
     /// Mark the node as ready (for readiness probe).
     pub fn set_ready(&self, ready: bool) {
         self.ready_flag.store(ready, Ordering::SeqCst);
-    }
-
-    /// Get a reference to the sync status for updates.
-    #[must_use]
-    pub const fn sync_status(&self) -> &Arc<ArcSwap<SyncStatus>> {
-        &self.sync_status
-    }
-
-    /// Get a reference to the node status for updates.
-    #[must_use]
-    pub const fn node_status(&self) -> &Arc<ArcSwap<NodeStatusState>> {
-        &self.node_status
-    }
-
-    /// Get a reference to the mempool snapshot for updates.
-    #[must_use]
-    pub const fn mempool_snapshot(&self) -> &Arc<ArcSwap<MempoolSnapshot>> {
-        &self.mempool_snapshot
     }
 
     /// Abort the server.
@@ -113,65 +87,17 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    /// Create a new RPC server.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Server configuration
-    /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to `IoLoop`
-    /// * `preview_tx` - Ask a hosted shard what a transaction would do, committing nothing
-    /// * `tx_status` - Process-wide transaction status cache shared from the runner
+    /// A server answering for the host behind `node`, readiness read from
+    /// `ready`. Once the host stops, its reads answer empty and its
+    /// submissions and previews are refused.
     #[must_use]
-    pub fn new(
-        config: RpcServerConfig,
-        tx_submission_tx: TxSubmissionSender,
-        preview_tx: PreviewSender,
-        tx_status: Arc<TxStatusCache>,
-    ) -> Self {
-        let sync_backpressure_threshold = config.sync_backpressure_threshold;
-        let state = RpcState {
-            ready: Arc::new(AtomicBool::new(false)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
-            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
-            tx_submission_tx,
-            preview_tx,
-            start_time: Instant::now(),
-            tx_status,
-            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
-            sync_backpressure_threshold,
-        };
-
-        Self { config, state }
-    }
-
-    /// Create a new RPC server with pre-configured state.
-    ///
-    /// This allows sharing state between the server and other components.
-    #[allow(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn with_state(
-        config: RpcServerConfig,
-        ready: Arc<AtomicBool>,
-        sync_status: Arc<ArcSwap<SyncStatus>>,
-        node_status: Arc<ArcSwap<NodeStatusState>>,
-        tx_submission_tx: TxSubmissionSender,
-        preview_tx: PreviewSender,
-        tx_status: Arc<TxStatusCache>,
-        mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
-    ) -> Self {
-        let sync_backpressure_threshold = config.sync_backpressure_threshold;
+    pub fn for_node(config: RpcServerConfig, node: &NodeHandle, ready: Arc<AtomicBool>) -> Self {
         let state = RpcState {
             ready,
-            sync_status,
-            node_status,
-            tx_submission_tx,
-            preview_tx,
+            node: node.clone(),
             start_time: Instant::now(),
-            tx_status,
-            mempool_snapshot,
-            sync_backpressure_threshold,
+            sync_backpressure_threshold: config.sync_backpressure_threshold,
         };
-
         Self { config, state }
     }
 
@@ -184,9 +110,6 @@ impl RpcServer {
     pub async fn start(self) -> Result<RpcServerHandle, RpcServerError> {
         let addr = self.config.listen_addr;
         let ready_flag = self.state.ready.clone();
-        let sync_status = self.state.sync_status.clone();
-        let node_status = self.state.node_status.clone();
-        let mempool_snapshot = self.state.mempool_snapshot.clone();
 
         let router = create_router(self.state);
 
@@ -199,13 +122,7 @@ impl RpcServer {
             }
         });
 
-        Ok(RpcServerHandle {
-            task,
-            ready_flag,
-            sync_status,
-            node_status,
-            mempool_snapshot,
-        })
+        Ok(RpcServerHandle { task, ready_flag })
     }
 
     /// Start and serve until shutdown (convenience method).
@@ -230,20 +147,5 @@ mod tests {
         let config = RpcServerConfig::default();
         assert_eq!(config.listen_addr.port(), 8080);
         assert!(config.metrics_enabled);
-    }
-
-    #[tokio::test]
-    async fn test_server_creation() {
-        let config = RpcServerConfig::default();
-        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
-        let server = RpcServer::new(
-            config,
-            tx_submission_tx,
-            Arc::new(|_tx| None),
-            Arc::new(TxStatusCache::new()),
-        );
-
-        // Server should be created successfully
-        assert!(!server.state.ready.load(Ordering::SeqCst));
     }
 }

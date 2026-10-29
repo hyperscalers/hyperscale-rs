@@ -11,9 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hyperscale_production::network_file::{Chain, Genesis, ValidatorEntry};
 use hyperscale_production::{
-    AddValidatorError, LocalValidator, NetworkFile, Node, NodeError, NodeSetup, Observation,
+    AddValidatorError, BeaconChainReader, LocalValidator, NetworkFile, Node, NodeError, NodeHandle,
+    NodeSetup, Observation,
 };
-use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId, ValidatorId};
+use hyperscale_types::test_utils::test_transaction;
+use hyperscale_types::{BeaconChainConfig, BlockHeight, Epoch, ShardId, ValidatorId};
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
@@ -22,7 +24,7 @@ use tracing_subscriber::fmt;
 
 /// How long a fresh four-validator network gets to commit its first blocks.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// The height every hosted validator must reach.
+/// The root chain height a host must have seen certified.
 const TARGET_HEIGHT: u64 = 3;
 
 /// How soon a peer sees a stopped host's connection close: inside the
@@ -186,10 +188,13 @@ fn start_pair(
     (node0, node1)
 }
 
-/// The lowest height any of the node's hosted validators has committed.
-fn lowest_height(node: &Node) -> Option<u64> {
-    let status = node.status().load_full();
-    status.vnodes.iter().map(|v| v.block_height).min()
+/// The highest root chain height the host has seen certified. Every host
+/// here holds fewer than a quorum of the root committee, so the chain
+/// passes a height only with every host signing.
+fn certified_height(node: &NodeHandle) -> Option<u64> {
+    node.headers(ShardId::ROOT, BlockHeight::GENESIS)
+        .last()
+        .map(|summary| summary.height.inner())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -205,9 +210,10 @@ async fn two_co_hosted_nodes_commit() {
         network(None),
     );
 
+    let (handle0, handle1) = (node0.handle(), node1.handle());
     timeout(COMMIT_TIMEOUT, async {
         loop {
-            let heights = (lowest_height(&node0), lowest_height(&node1));
+            let heights = (certified_height(&handle0), certified_height(&handle1));
             if let (Some(h0), Some(h1)) = heights
                 && h0 >= TARGET_HEIGHT
                 && h1 >= TARGET_HEIGHT
@@ -218,13 +224,13 @@ async fn two_co_hosted_nodes_commit() {
         }
     })
     .await
-    .expect("every co-hosted validator reaches the target height");
+    .expect("each host sees the root chain reach the target height");
 
     // Each host keeps the root chain's certified headers once per height,
     // every certificate past genesis signed by members of the four-validator
     // committee (genesis's own certificate carries no votes).
     let validators: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
-    for node in [&node0, &node1] {
+    for node in [&handle0, &handle1] {
         let kept = node.headers(ShardId::ROOT, BlockHeight::new(1));
         assert!(
             kept.len() >= usize::try_from(TARGET_HEIGHT).unwrap(),
@@ -247,7 +253,9 @@ async fn two_co_hosted_nodes_commit() {
 
 /// A stopped host whose runtime is gone has closed its stores: the same
 /// process starts it again on the same data, as an embedder restarting its
-/// node does.
+/// node does. A handle kept past the stop reaches nothing: its history
+/// reads empty, it takes no transaction and previews none, and it holds no
+/// store open against the restart.
 #[test]
 #[serial]
 fn a_stopped_host_starts_again_on_its_own_data() {
@@ -267,19 +275,37 @@ fn a_stopped_host_starts_again_on_its_own_data() {
                 beacon_chain,
             ))
             .expect("the host starts on its own data");
+            let handle = node.handle();
             if first {
                 timeout(COMMIT_TIMEOUT, async {
-                    while lowest_height(&node).is_none_or(|h| h < 1) {
+                    while certified_height(&handle).is_none_or(|h| h < 1) {
                         sleep(Duration::from_millis(200)).await;
                     }
                 })
                 .await
                 .expect("the host commits before it stops");
+                assert!(
+                    handle.history().latest_committed_epoch().is_some(),
+                    "a running host reads its committed beacon chain"
+                );
             }
             node.stop().await.expect("the host stops cleanly");
-        });
+            handle
+        })
     };
-    run(true);
+    let kept = run(true);
+    let history = kept.history();
+    assert_eq!(history.latest_committed_epoch(), None);
+    assert!(history.get_state_by_epoch(Epoch::GENESIS).is_none());
+    assert!(history.states_since(Epoch::GENESIS).is_empty());
+    let transaction = test_transaction(1);
+    assert!(!kept.submit(Arc::new(transaction.clone())));
+    let previewed = Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(kept.preview(&transaction));
+    assert!(previewed.is_none());
+    assert!(kept.headers(ShardId::ROOT, BlockHeight::GENESIS).is_empty());
     run(false);
 }
 
@@ -317,15 +343,10 @@ async fn a_host_stopped_beside_a_live_peer_starts_again_at_once() {
         ))
     };
     let reach = |node: &Node, target: u64| {
-        let node_status = node.status();
+        let node = node.handle();
         async move {
             timeout(COMMIT_TIMEOUT, async {
-                loop {
-                    let status = node_status.load_full();
-                    let lowest = status.vnodes.iter().map(|v| v.block_height).min();
-                    if lowest.is_some_and(|h| h >= target) {
-                        return;
-                    }
+                while certified_height(&node).is_none_or(|h| h < target) {
                     sleep(Duration::from_millis(200)).await;
                 }
             })
@@ -338,9 +359,9 @@ async fn a_host_stopped_beside_a_live_peer_starts_again_at_once() {
         .await
         .expect("host 1 commits beside its peer");
     node1.stop().await.expect("host 1 stops cleanly");
-    let node0_status = node0.status();
+    let handle0 = node0.handle();
     timeout(LEAVE_SEEN_WITHIN, async {
-        while node0_status.load().connected_peers > 0 {
+        while handle0.peers() > 0 {
             sleep(Duration::from_millis(100)).await;
         }
     })
@@ -396,17 +417,23 @@ async fn a_running_node_adds_a_validator() {
         validator_id: ValidatorId::new(4),
         signer: fixtures.signer(4),
     };
-    node.add_validator(fifth.clone())
+    let handle = node.handle();
+    handle
+        .add_validator(fifth.clone())
         .await
         .expect("a fifth validator is taken");
     assert!(
         matches!(
-            node.add_validator(fifth).await,
+            handle.add_validator(fifth.clone()).await,
             Err(NodeError::AddValidator(AddValidatorError::Hosted(id))) if id == ValidatorId::new(4)
         ),
         "a validator the node runs is refused"
     );
     node.stop().await.expect("the host stops cleanly");
+    assert!(
+        matches!(handle.add_validator(fifth).await, Err(NodeError::Stopped)),
+        "a stopped node takes no validator"
+    );
 }
 
 /// The shortest epochs a chain may run, so a test sees the beacon adopt
@@ -420,7 +447,7 @@ const TARGET_EPOCH: u64 = 2;
 /// The host's observations up to the target epoch: the last, and the
 /// committee each published root tip said its child is proposed under.
 async fn watch_to_target(
-    node: &Node,
+    node: &NodeHandle,
 ) -> (Arc<Observation>, BTreeMap<BlockHeight, Vec<ValidatorId>>) {
     let mut observe = node.observe();
     let mut proposing = BTreeMap::new();
@@ -470,9 +497,10 @@ async fn each_observation_carries_its_epochs_effects() {
 
     // Watched together: a watch channel keeps only its newest value, so a
     // host awaited after the other would skip its early tips.
-    let (watched0, watched1) = tokio::join!(watch_to_target(&node0), watch_to_target(&node1));
+    let (handle0, handle1) = (node0.handle(), node1.handle());
+    let (watched0, watched1) = tokio::join!(watch_to_target(&handle0), watch_to_target(&handle1));
     let mut seen = Vec::new();
-    for (node, (last, proposing)) in [(&node0, watched0), (&node1, watched1)] {
+    for (node, (last, proposing)) in [(&handle0, watched0), (&handle1, watched1)] {
         let epochs: Vec<u64> = last.effects.iter().map(|(e, _)| e.inner()).collect();
         assert!(
             epochs.windows(2).all(|pair| pair[0] < pair[1]),
@@ -522,7 +550,7 @@ async fn a_rotation_retires_the_head_of_the_published_order() {
         beacon_chain,
     );
 
-    let mut observe = node0.observe();
+    let mut observe = node0.handle().observe();
     let mut published = BTreeMap::new();
     let (boundary, before, after) = timeout(EPOCHS_TIMEOUT, async {
         loop {

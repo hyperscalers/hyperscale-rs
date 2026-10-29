@@ -1019,7 +1019,7 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::Receiver;
-    use hyperscale_core::{Action, CommitSource, ProtocolEvent, SignerGate, StateMachine};
+    use hyperscale_core::{Action, CommitSource, Gate, ProtocolEvent, StateMachine};
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
     use hyperscale_network::HandlerRegistry;
     use hyperscale_network_memory::{PendingRequest, SimNetworkAdapter};
@@ -1355,7 +1355,7 @@ mod tests {
         let (_process, mut shards, _beacon) = host.into_parts();
         let shard_loop = shards.remove(&SHARD).expect("the fixture hosts SHARD");
         let chain = shard_loop.chain;
-        let gates: Vec<Arc<SignerGate>> = shard_loop
+        let gates: Vec<Arc<Gate>> = shard_loop
             .signers
             .values()
             .map(|attached| Arc::clone(&attached.gate))

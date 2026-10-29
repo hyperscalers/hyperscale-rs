@@ -955,13 +955,6 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
     let beacon_storage = Arc::new(
         RocksDbBeaconStorage::open(args.temp_dir.path().join("beacon_db")).expect("open beacon db"),
     );
-    let rpc_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
-        // Genesis is always a single ROOT shard; the runner republishes the live
-        // count from the committed beacon state on its first status tick.
-        num_shards: 1,
-        ..Default::default()
-    })));
-
     let network_config = test_config(
         &args.key,
         args.bootstrap_peers,
@@ -984,13 +977,13 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         capturing_storage_factory(args.temp_dir, Arc::clone(&stores)),
         temp_storage_dir(args.temp_dir),
     )
-    .beacon_chain_config(args.beacon_chain_config)
-    .rpc_status(Arc::clone(&rpc_status));
+    .beacon_chain_config(args.beacon_chain_config);
     if let Some(cfg) = args.genesis_config {
         builder = builder.genesis_config(cfg);
     }
     let runner = builder.build().expect("build runner");
     let adapter = Arc::clone(runner.network());
+    let rpc_status = runner.node_status();
     // Capture the submission + status hooks before `run()` consumes the host.
     let tx_submission = runner.tx_submission_sender();
     let tx_status = runner.tx_status_cache();

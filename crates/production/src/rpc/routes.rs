@@ -40,26 +40,27 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
-    use arc_swap::ArcSwap;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use hyperscale_node::TxStatusCache;
     use serde_json::from_slice;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::rpc::state::TxSubmissionSender;
-    use crate::rpc::{
-        MempoolSnapshot, NodeStatusResponse, NodeStatusState, VnodeMempoolStats, VnodeStatusEntry,
-    };
-    use crate::status::SyncStatus;
+    use crate::handle::HostCalls;
+    use crate::handle::test_support::host;
+    use crate::rpc::state::NodeStatusState;
+    use crate::rpc::types::NodeStatusResponse;
+    use crate::rpc::{VnodeMempoolStats, VnodeStatusEntry};
 
-    fn create_test_state() -> RpcState {
-        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
-        RpcState {
-            ready: Arc::new(AtomicBool::new(true)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
-            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
+    /// A ready server over a host with one validator on shard 0 and five
+    /// peers, that takes every submission and previews nothing. The
+    /// host's calls stay reachable while the returned `Arc` lives.
+    fn create_test_state() -> (Arc<HostCalls>, RpcState) {
+        let (calls, node) = host(Arc::new(|_tx| true), Arc::new(|_tx| None));
+        calls
+            .publishers
+            .node_status
+            .store(Arc::new(NodeStatusState {
                 num_shards: 2,
                 connected_peers: 5,
                 vnodes: vec![VnodeStatusEntry {
@@ -74,19 +75,20 @@ mod tests {
                         total_count: 0,
                     },
                 }],
-            }))),
-            tx_submission_tx,
-            preview_tx: Arc::new(|_tx| None),
+            }));
+        let state = RpcState {
+            ready: Arc::new(AtomicBool::new(true)),
+            node,
             start_time: Instant::now(),
-            tx_status: Arc::new(TxStatusCache::new()),
-            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
-        }
+        };
+        (calls, state)
     }
 
     #[tokio::test]
     async fn test_router_health() {
-        let app = create_router(create_test_state());
+        let (_calls, state) = create_test_state();
+        let app = create_router(state);
 
         let response = app
             .oneshot(
@@ -103,7 +105,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_status() {
-        let app = create_router(create_test_state());
+        let (_calls, state) = create_test_state();
+        let app = create_router(state);
 
         let response = app
             .oneshot(
@@ -132,7 +135,8 @@ mod tests {
     /// refuses instead of rendering a default.
     #[tokio::test]
     async fn a_preview_no_shard_answers_is_unavailable() {
-        let app = create_router(create_test_state());
+        let (_calls, state) = create_test_state();
+        let app = create_router(state);
 
         let response = app
             .oneshot(
@@ -155,7 +159,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_metrics() {
-        let app = create_router(create_test_state());
+        let (_calls, state) = create_test_state();
+        let app = create_router(state);
 
         let response = app
             .oneshot(

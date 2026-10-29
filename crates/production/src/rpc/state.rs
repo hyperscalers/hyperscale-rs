@@ -7,24 +7,24 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use hyperscale_engine::PreviewReport;
-use hyperscale_node::TxStatusCache;
-use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, TxsInFlight};
+use hyperscale_types::{ShardId, Transaction, TxsInFlight};
 use serde::{Deserialize, Serialize};
 
+use crate::handle::NodeHandle;
 use crate::observe::{HeaderRing, Importing, Observations};
 use crate::status::SyncStatus;
 
-/// Shared RPC state publishers — whole-value `ArcSwap`s the runner and
-/// shard threads store into and the HTTP handlers load lock-free. A
-/// `None` slot means no RPC server is attached (tests, tooling).
+/// The host's published state: whole-value `ArcSwap`s the runner and shard
+/// threads store into and readers load lock-free, and the beacon thread's
+/// observations.
 #[derive(Clone, Default)]
 pub struct RpcPublishers {
     /// `/status` per-signer readouts.
-    pub node_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    pub node_status: Arc<ArcSwap<NodeStatusState>>,
     /// `/sync` per-shard block-sync state.
-    pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    pub sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Per-signer mempool snapshots feeding RPC submission backpressure.
-    pub mempool: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+    pub mempool: Arc<ArcSwap<MempoolSnapshot>>,
     /// The last hour of certified headers per shard, kept by the beacon
     /// thread.
     pub headers: Arc<HeaderRing>,
@@ -48,42 +48,21 @@ pub type TxSubmissionSender = Arc<dyn Fn(Arc<Transaction>) -> bool + Send + Sync
 /// Ask the runner what a transaction would do, without submitting it.
 ///
 /// `None` when no hosted shard could answer or the driver did not answer in
-/// time. Blocking on a crossbeam reply, so handlers call it inside
-/// `spawn_blocking` rather than on a tokio worker.
+/// time. Blocking on a crossbeam reply, so callers run it on a blocking
+/// worker rather than on a tokio worker.
 pub type PreviewSender =
     Arc<dyn Fn(&Transaction) -> Option<Box<PreviewReport>> + Send + Sync + 'static>;
 
-/// Shared state for RPC handlers.
+/// Shared state for RPC handlers: the host, read through its handle, and
+/// the server's own readiness and start time.
 #[derive(Clone)]
 pub struct RpcState {
     /// Ready flag for readiness probe.
     pub ready: Arc<AtomicBool>,
-    /// Sync status provider.
-    pub sync_status: Arc<ArcSwap<SyncStatus>>,
-    /// Node status provider.
-    pub node_status: Arc<ArcSwap<NodeStatusState>>,
-    /// Ask a hosted shard what a transaction would do. Reads committed
-    /// state and commits nothing, so it neither admits the transaction
-    /// nor gossips it.
-    pub preview_tx: PreviewSender,
-    /// Channel to submit transactions to the `IoLoop`.
-    ///
-    /// RPC-submitted transactions are sent as `Event::SubmitTransaction` directly
-    /// to the `IoLoop`'s crossbeam event channel, which:
-    /// 1. Gossips to all relevant shards
-    /// 2. Queues for batch validation (via Dispatch)
-    /// 3. Dispatches to the mempool after validation
-    pub tx_submission_tx: TxSubmissionSender,
+    /// The host the server answers for.
+    pub node: NodeHandle,
     /// Server start time for uptime calculation.
     pub start_time: Instant,
-    /// Process-wide transaction status cache for querying transaction
-    /// state. Every shard thread writes through its monotonic merge;
-    /// reads here on the RPC threads are lock-free. Shard membership
-    /// changes don't touch it — a departed shard's entries age out by
-    /// LRU.
-    pub tx_status: Arc<TxStatusCache>,
-    /// Mempool snapshot for querying mempool stats.
-    pub mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     /// Number of blocks behind before rejecting transaction submissions.
     ///
     /// When set and the node is this many blocks behind, new transaction
@@ -91,21 +70,12 @@ pub struct RpcState {
     pub sync_backpressure_threshold: Option<u64>,
 }
 
-impl RpcState {
-    /// Look up the latest merged status for `hash`: a hosted shard's own
-    /// leg of it (see [`TxStatusCache`]).
-    #[must_use]
-    pub fn lookup_tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
-        self.tx_status.get(hash).map(|(status, _)| status)
-    }
-}
-
 /// Snapshot of mempool state for RPC queries.
 ///
 /// One [`VnodeMempoolSnapshot`] per attached signer, keyed by validator
 /// id. Signers on one shard read that shard replica's
 /// [`hyperscale_mempool::MempoolCoordinator`], so their entries repeat
-/// its counts. Used only by RPC submission backpressure — the counts
+/// its limits. Used only by RPC submission backpressure — the counts
 /// shown to clients live in [`NodeStatusState::vnodes`].
 #[derive(Debug, Clone, Default)]
 pub struct MempoolSnapshot {
@@ -113,17 +83,10 @@ pub struct MempoolSnapshot {
     pub vnodes: BTreeMap<u64, VnodeMempoolSnapshot>,
 }
 
-/// One attached signer's mempool readout: its shard replica's counts.
+/// One attached signer's mempool readout: whether its shard replica takes
+/// more submissions.
 #[derive(Debug, Clone)]
 pub struct VnodeMempoolSnapshot {
-    /// Number of pending transactions (waiting to be included in a block).
-    pub pending_count: usize,
-    /// Number of transactions holding state locks (Committed status).
-    pub in_flight_count: u64,
-    /// Total number of transactions in the mempool.
-    pub total_count: usize,
-    /// When this snapshot was taken.
-    pub updated_at: Option<Instant>,
     /// Whether the mempool is accepting new RPC transactions.
     ///
     /// When `false`, the cross-shard hard limit has been reached and new RPC
@@ -146,10 +109,6 @@ pub struct VnodeMempoolSnapshot {
 impl Default for VnodeMempoolSnapshot {
     fn default() -> Self {
         Self {
-            pending_count: 0,
-            in_flight_count: 0,
-            total_count: 0,
-            updated_at: None,
             accepting_rpc_transactions: true,
             at_pending_limit: false,
             remote_shard_in_flight: BTreeMap::new(),

@@ -45,6 +45,7 @@
 //! [`PooledDispatch`]: hyperscale_dispatch_pooled::PooledDispatch
 
 mod bootstrap;
+mod handle;
 pub mod network_file;
 mod node;
 mod observe;
@@ -54,16 +55,14 @@ mod status;
 mod supervisor;
 mod telemetry;
 mod transport;
-pub use arc_swap::ArcSwap;
+pub use handle::{HandleHistory, NodeHandle};
 pub use hyperscale_engine::{PreviewOutcome, PreviewReport};
 pub use hyperscale_network_iroh::{SecretKey, load_or_generate_secret_key};
-pub use hyperscale_node::TxStatusCache;
 pub use hyperscale_storage::BeaconChainReader;
 pub use network_file::{NetworkFile, NetworkFileError};
 pub use node::{DEFAULT_BLOCK_CACHE_MB, Node, NodeError, NodeSetup, for_core_count};
-pub use observe::{Answers, HeaderRing, HeaderSummary, Importing, Observation, Observations};
+pub use observe::{Answers, HeaderSummary, Observation};
 pub use runner::{LocalValidator, ProductionRunner, RunnerCommand, RunnerError, ShutdownHandle};
-pub use status::SyncStatus;
 pub use supervisor::{
     AddValidatorError, ShardCommand, StorageDirResolver, StorageFactory, shard_data_dir,
 };

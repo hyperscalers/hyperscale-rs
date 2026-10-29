@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::SignerGate;
+use hyperscale_core::Gate;
 use hyperscale_engine::CodeAvailability;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_provisions::ProvisionConfig;
@@ -78,7 +78,7 @@ pub fn build_replica(
 /// single-use release gate every action it signs carries.
 pub struct AttachedSigner {
     pub signer: Arc<dyn Signer>,
-    pub gate: Arc<SignerGate>,
+    pub gate: Arc<Gate>,
 }
 
 impl AttachedSigner {
@@ -86,7 +86,7 @@ impl AttachedSigner {
     pub fn new(signer: Arc<dyn Signer>) -> Self {
         Self {
             signer,
-            gate: Arc::new(SignerGate::new()),
+            gate: Arc::new(Gate::new()),
         }
     }
 }
