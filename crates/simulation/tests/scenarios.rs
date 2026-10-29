@@ -2334,7 +2334,9 @@ fn a_harvested_tick_over_a_discarded_tick_settles_nothing_at_seed(seed: u64) {
 
 seeded!(
     a_harvested_tick_over_a_discarded_tick_settles_nothing_at_seed:
+    seed_3 = 3,
     seed_7 = 7,
+    seed_9 = 9,
     seed_11 = 11,
     seed_42 = 42,
     seed_1337 = 1337,
