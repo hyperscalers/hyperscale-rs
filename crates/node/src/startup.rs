@@ -271,7 +271,8 @@ pub fn host_in_committee<H: BuildHasher>(
 }
 
 /// The local validators placed on `shard`: each `is_local` validator
-/// holding a consensus seat in the head window's committee.
+/// holding a consensus seat in the head window's committee or in the
+/// newest window's.
 ///
 /// The join half's membership question, read from the seatable view. A
 /// split observer riding the committee never reads as a seat: seating it
@@ -279,15 +280,19 @@ pub fn host_in_committee<H: BuildHasher>(
 /// `ReshapeReady` and could fire the split gate before its child store has
 /// synced.
 ///
-/// Under a pending recovery only the members the recovery seats are
-/// placed: the head's committee as the newest window also seats it. In the
-/// window the recovery is drawn in, the head's committee is the one it
-/// replaced, and live work on the shard already binds to the fresh one, so
-/// a replaced member signs nothing more on the recovered chain; seated
-/// beside a fresh member on a store rebuilt at the attested frontier, it
-/// would hold a seat that chain does not have. Its replicas keep serving:
-/// routing retains the replaced committee until the recovery completes,
-/// and the teardown half reads routing.
+/// The newest window is the one the beacon has drawn a full window ahead,
+/// so a validator it seats joins an epoch before its seat opens and spends
+/// that epoch syncing; one the head still seats stays placed until its
+/// window closes.
+///
+/// Under a pending recovery only the members the newest window seats are
+/// placed. In the window the recovery is drawn in, the head's committee is
+/// the one it replaced, and live work on the shard already binds to the
+/// fresh one, so a replaced member signs nothing more on the recovered
+/// chain; seated beside a fresh member on a store rebuilt at the attested
+/// frontier, it would hold a seat that chain does not have. Its replicas
+/// keep serving: routing retains the replaced committee until the recovery
+/// completes, and the teardown half reads routing.
 #[must_use]
 pub fn placed_validators(
     shard: ShardId,
@@ -295,12 +300,18 @@ pub fn placed_validators(
     is_local: impl Fn(ValidatorId) -> bool,
 ) -> Vec<ValidatorId> {
     let head = schedule.head();
-    let recovering = head.pending_recoveries().contains_key(&shard);
     let newest = schedule.newest_window();
-    head.seatable_committee_for_shard(shard)
-        .filter(|&validator| is_local(validator))
-        .filter(|validator| !recovering || newest.committee_for_shard(shard).contains(validator))
-        .collect()
+    let recovering = head.pending_recoveries().contains_key(&shard);
+    let current = head
+        .seatable_committee_for_shard(shard)
+        .filter(|validator| !recovering || newest.committee_for_shard(shard).contains(validator));
+    let mut placed: Vec<ValidatorId> = Vec::new();
+    for validator in current.chain(newest.seatable_committee_for_shard(shard)) {
+        if is_local(validator) && !placed.contains(&validator) {
+            placed.push(validator);
+        }
+    }
+    placed
 }
 
 /// Whether a hosted shard has aged out of this host's serving duty: no
@@ -917,10 +928,11 @@ mod tests {
         schedule
     }
 
-    /// A validator the beacon drew a window ahead is not placed until its
+    /// A validator the beacon drew a window ahead is placed beside the
+    /// one whose seat it takes, so it syncs through the epoch before its
     /// window opens.
     #[test]
-    fn placement_waits_for_the_window_to_open() {
+    fn a_validator_drawn_a_window_ahead_is_placed_before_its_window_opens() {
         let shard = ShardId::leaf(1, 0);
         let sibling = ShardId::leaf(1, 1);
         let leaving = ValidatorId::new(2);
@@ -933,13 +945,13 @@ mod tests {
         let local = HashSet::from([leaving, drawn]);
         assert_eq!(
             placed_validators(shard, &schedule, |v| local.contains(&v)),
-            vec![leaving]
+            vec![leaving, drawn]
         );
     }
 
     /// Under a pending recovery the committee it replaced is not placed,
-    /// fork or halt alike, and the fresh committee is placed once its
-    /// window opens.
+    /// fork or halt alike, and the fresh committee is placed from the
+    /// window the recovery is drawn in.
     #[test]
     fn a_pending_recovery_places_only_the_committee_it_seats() {
         let shard = ShardId::leaf(1, 0);
@@ -959,9 +971,10 @@ mod tests {
                 HashMap::from([(shard, vec![fresh]), (sibling, vec![HOST])]),
                 Some((shard, recovery.clone())),
             );
-            assert!(
-                placed_validators(shard, &drawn, |v| local.contains(&v)).is_empty(),
-                "{cause:?}: the replaced committee is not placed in the window the recovery is drawn in",
+            assert_eq!(
+                placed_validators(shard, &drawn, |v| local.contains(&v)),
+                vec![fresh],
+                "{cause:?}: only the fresh committee is placed in the window the recovery is drawn in",
             );
             let opened = drawn_ahead(
                 HashMap::from([(shard, vec![fresh]), (sibling, vec![HOST])]),
@@ -971,7 +984,7 @@ mod tests {
             assert_eq!(
                 placed_validators(shard, &opened, |v| local.contains(&v)),
                 vec![fresh],
-                "{cause:?}: the fresh committee is placed once its window opens",
+                "{cause:?}: the fresh committee stays placed once its window opens",
             );
         }
     }
