@@ -27,7 +27,8 @@ use iroh::EndpointId;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
-use crate::endpoint::IrohAdapter;
+use crate::bind::LocalVnodeIdentity;
+use crate::endpoint::{AddVnodeError, IrohAdapter};
 use crate::fanout::{Fanout, Scope};
 use crate::framing::encode_typed_frame;
 use crate::notify::ClassStreams;
@@ -119,6 +120,21 @@ impl IrohNetwork {
             notify_pool,
             fanout,
         }
+    }
+
+    /// Host `vnode` from now on, and hand its address record to every host
+    /// this one is linked to, each of which pulls its proof once its
+    /// topology holds the key.
+    ///
+    /// # Errors
+    ///
+    /// As [`IrohAdapter::add_vnode`].
+    pub fn add_vnode(&self, vnode: LocalVnodeIdentity) -> Result<(), AddVnodeError> {
+        self.adapter.add_vnode(vnode)?;
+        for peer in self.adapter.connected_peers() {
+            self.fanout.hand_own_records(peer);
+        }
+        Ok(())
     }
 
     /// How this host reaches the other members of the committees it sits

@@ -12,9 +12,10 @@ use std::fmt::{Debug, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_network_iroh::IrohAdapter;
 use hyperscale_network_iroh::test_utils::TestFixtures;
-use hyperscale_production::{LocalValidator, ShardCommand};
+use hyperscale_production::{AddValidatorError, LocalValidator, RunnerCommand, ShardCommand};
 use hyperscale_storage::BeaconChainReader;
 use hyperscale_types::{
     BeaconChainConfig, BlockHash, Epoch, RecoveryCause, ReshapeThresholds, ShardId, ShardRecovery,
@@ -23,6 +24,7 @@ use hyperscale_types::{
 use serial_test::serial;
 use support::harness::{ClusterSpec, Harness, HostSpec};
 use support::{CONNECTION_TIMEOUT, build_runner, temp_storage_dir, temp_storage_factory};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
 use tracing::field::{Field, Visit};
@@ -88,10 +90,10 @@ async fn runtime_shard_leave_tears_down() {
 
     // Leave the root shard: the single vnode departing tears the shard down.
     reconfigure
-        .send(ShardCommand::Leave {
+        .send(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: ValidatorId::new(0),
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -132,10 +134,10 @@ async fn a_leave_detaches_the_signer_it_names() {
 
     for _ in 0..2 {
         reconfigure
-            .send(ShardCommand::Leave {
+            .send(RunnerCommand::Shard(ShardCommand::Leave {
                 shard: ShardId::ROOT,
                 validator: ValidatorId::new(1),
-            })
+            }))
             .await
             .expect("supervisor accepts commands");
     }
@@ -146,10 +148,10 @@ async fn a_leave_detaches_the_signer_it_names() {
     );
 
     reconfigure
-        .send(ShardCommand::Leave {
+        .send(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: ValidatorId::new(0),
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -203,10 +205,10 @@ async fn pooled_validator_boots_as_follower_only_host() {
     // Seat the pooled validator onto ROOT: the supervisor opens the store,
     // brings the shard up, and retires the validator's beacon-loop follower.
     reconfigure
-        .send(ShardCommand::Join {
+        .send(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -257,10 +259,10 @@ async fn leaving_a_shard_releases_its_store() {
     sleep(Duration::from_millis(200)).await;
 
     reconfigure
-        .send(ShardCommand::Join {
+        .send(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -281,10 +283,10 @@ async fn leaving_a_shard_releases_its_store() {
     );
 
     reconfigure
-        .send(ShardCommand::Leave {
+        .send(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: surplus,
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -551,10 +553,10 @@ async fn a_join_for_a_running_shard_attaches_to_its_replica() {
     seated_on_root(&adapter).await;
 
     reconfigure
-        .send(ShardCommand::Join {
+        .send(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     for (needle, what) in [
@@ -609,16 +611,16 @@ async fn a_leave_for_a_queued_validator_detaches_it() {
     // Both before the loop can report the attach back: the supervisor
     // takes commands ahead of the events its loops send.
     reconfigure
-        .try_send(ShardCommand::Join {
+        .try_send(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
-        })
+        }))
         .expect("supervisor accepts commands");
     reconfigure
-        .try_send(ShardCommand::Leave {
+        .try_send(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: surplus,
-        })
+        }))
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
         while !messages.contains("Signer detached; shard stays up") {
@@ -634,10 +636,10 @@ async fn a_leave_for_a_queued_validator_detaches_it() {
     assert!(adapter.local_shards().contains(&ShardId::ROOT));
 
     reconfigure
-        .send(ShardCommand::Leave {
+        .send(RunnerCommand::Shard(ShardCommand::Leave {
             shard: ShardId::ROOT,
             validator: ValidatorId::new(0),
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -721,10 +723,10 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
 
     cluster
         .reconfigure(0)
-        .send(ShardCommand::Join {
+        .send(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     let rebuilt = format!(
@@ -782,10 +784,10 @@ async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
     ));
 
     reconfigure
-        .send(ShardCommand::Join {
+        .send(RunnerCommand::Shard(ShardCommand::Join {
             shard: ShardId::ROOT,
             validators: vec![surplus],
-        })
+        }))
         .await
         .expect("supervisor accepts commands");
     timeout(CONNECTION_TIMEOUT, async {
@@ -828,4 +830,155 @@ async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
     let result = timeout(Duration::from_secs(5), handle).await;
     assert!(result.is_ok(), "runner exits after seating");
     assert!(result.unwrap().is_ok(), "runner returns Ok");
+}
+
+/// What a running host answers an add of `validator` with.
+async fn add(
+    commands: &mpsc::Sender<RunnerCommand>,
+    validator: LocalValidator,
+) -> Result<(), AddValidatorError> {
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(RunnerCommand::AddValidator { validator, reply })
+        .await
+        .expect("the runner takes commands");
+    answer.await.expect("the runner answers an add")
+}
+
+/// A running host takes on a validator without a restart: its transport
+/// attests it from then on. It refuses one it already runs, and one whose
+/// key is not the one the network registered for it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_running_host_takes_on_a_validator_and_refuses_what_it_cannot() {
+    let _ = fmt().with_test_writer().try_init();
+
+    // Validator 0 seated on ROOT, validator 1 registered and pooled.
+    let fixtures = TestFixtures::with_surplus(45, 1, 1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0], vec![], None);
+    let adapter = Arc::clone(runner.network());
+    let commands = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+
+    let registered = ValidatorId::new(1);
+    assert_eq!(
+        add(
+            &commands,
+            LocalValidator {
+                validator_id: registered,
+                signer: Arc::new(BlsSigner::generate()),
+            },
+        )
+        .await,
+        Err(AddValidatorError::KeyMismatch(registered)),
+        "a key the network does not hold for the validator is refused"
+    );
+    assert_eq!(
+        add(
+            &commands,
+            LocalValidator {
+                validator_id: registered,
+                signer: fixtures.signer(1),
+            },
+        )
+        .await,
+        Ok(()),
+    );
+    assert_eq!(
+        adapter.local_validator_ids(),
+        vec![ValidatorId::new(0), registered],
+        "the transport attests it from now on"
+    );
+    assert_eq!(
+        add(
+            &commands,
+            LocalValidator {
+                validator_id: registered,
+                signer: fixtures.signer(1),
+            },
+        )
+        .await,
+        Err(AddValidatorError::Hosted(registered)),
+        "a validator the host runs is refused"
+    );
+    let unregistered = ValidatorId::new(9);
+    assert_eq!(
+        add(
+            &commands,
+            LocalValidator {
+                validator_id: unregistered,
+                signer: Arc::new(BlsSigner::generate()),
+            },
+        )
+        .await,
+        Ok(()),
+        "a validator not yet registered is taken; peers bind it once they fold it"
+    );
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits");
+}
+
+/// A validator added to one running host of a cluster is bound by the
+/// others over the links they already have, and the host's own validator
+/// keeps committing across the add: nothing restarts.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_validator_added_to_a_running_host_is_bound_by_its_peers() {
+    let _ = fmt().with_test_writer().try_init();
+
+    // ROOT's four seats on four hosts; validator 4 registered, pooled and
+    // hosted nowhere.
+    let fixtures = TestFixtures::with_surplus(47, 4, 1);
+    let local = |i: u32| LocalValidator {
+        validator_id: ValidatorId::new(u64::from(i)),
+        signer: fixtures.signer(i),
+    };
+    let added = ValidatorId::new(4);
+    let mut cluster = Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts: (0..4).map(|i| HostSpec::new(vec![local(i)])).collect(),
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: RESTART_EPOCH_MS,
+            shard_size: 4,
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await;
+    let height = |cluster: &Harness| cluster.host_committed_height(1, ShardId::ROOT).unwrap_or(0);
+    timeout(RESTART_EPOCH_WAIT, async {
+        while height(&cluster) < 3 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("ROOT commits");
+
+    assert_eq!(add(&cluster.reconfigure(1), local(4)).await, Ok(()));
+    let before = height(&cluster);
+    let host1 = cluster.adapter(1).local_endpoint_id();
+    timeout(CONNECTION_TIMEOUT, async {
+        while (0..4)
+            .filter(|&peer| peer != 1)
+            .any(|peer| cluster.adapter(peer).peer_for_validator(added) != Some(host1))
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every peer binds the added validator to its host");
+    timeout(CONNECTION_TIMEOUT, async {
+        while height(&cluster) < before + 3 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the host's own validator keeps committing across the add");
+
+    cluster.shutdown().await;
 }

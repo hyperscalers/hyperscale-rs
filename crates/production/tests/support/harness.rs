@@ -26,7 +26,7 @@ use hyperscale_network_iroh::{EndpointAddr, EndpointId, IrohAdapter, SecretKey};
 use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
-    LocalValidator, ProductionRunner, RunnerError, ShardCommand, ShutdownHandle, StorageFactory,
+    LocalValidator, ProductionRunner, RunnerCommand, RunnerError, ShutdownHandle, StorageFactory,
     shard_data_dir,
 };
 use hyperscale_scenarios::query::{
@@ -166,7 +166,7 @@ struct Host {
     /// the runner for chain scans and byte-total reads.
     stores: StoreRegistry,
     /// Membership commands into this host's supervisor.
-    reconfigure: mpsc::Sender<ShardCommand>,
+    reconfigure: mpsc::Sender<RunnerCommand>,
     /// The topology snapshot this host's shards and supervisor read.
     topology: SharedTopologySnapshot,
     shutdown: Option<ShutdownHandle>,
@@ -450,8 +450,13 @@ impl Harness {
     }
 
     /// Membership commands into `host`'s supervisor.
-    pub fn reconfigure(&self, host: usize) -> mpsc::Sender<ShardCommand> {
+    pub fn reconfigure(&self, host: usize) -> mpsc::Sender<RunnerCommand> {
         self.hosts[host].reconfigure.clone()
+    }
+
+    /// `host`'s network adapter.
+    pub fn adapter(&self, host: usize) -> &Arc<IrohAdapter> {
+        &self.hosts[host].adapter
     }
 
     /// The topology snapshot `host` reads.

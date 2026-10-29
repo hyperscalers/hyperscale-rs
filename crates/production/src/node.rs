@@ -28,15 +28,15 @@ use hyperscale_types::{
     shard_prefix_path,
 };
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::network_file::{NetworkFile, NetworkFileError};
 use crate::observe::{HeaderRing, HeaderSummary, Importing, Observation};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, PreviewSender, TxSubmissionSender};
 use crate::{
-    LocalValidator, ProductionRunner, RunnerError, ShutdownHandle, StorageDirResolver,
-    StorageFactory, SyncStatus, shard_data_dir,
+    AddValidatorError, LocalValidator, ProductionRunner, RunnerCommand, RunnerError,
+    ShutdownHandle, StorageDirResolver, StorageFactory, SyncStatus, shard_data_dir,
 };
 
 /// Everything a host needs to start, as plain values.
@@ -163,6 +163,12 @@ pub enum NodeError {
     /// The thread tearing the host down panicked.
     #[error("the host's teardown panicked")]
     Teardown,
+    /// The running host would not take on a validator.
+    #[error("adding a validator: {0}")]
+    AddValidator(#[from] AddValidatorError),
+    /// The host is no longer running.
+    #[error("the host has stopped")]
+    Stopped,
 }
 
 /// A running host. Dropping it stops the host, as [`Node::stop`] does, and
@@ -176,6 +182,8 @@ pub struct Node {
     observe: watch::Receiver<Option<Arc<Observation>>>,
     importing: Arc<Importing>,
     shutdown: Option<ShutdownHandle>,
+    /// Commands to the running host.
+    commands: mpsc::Sender<RunnerCommand>,
     /// Everything that reaches the host's stores; `None` only once a
     /// teardown has taken it.
     host: Option<Host>,
@@ -317,6 +325,7 @@ impl Node {
         let observe = runner.observe();
         let importing = runner.importing();
         let shutdown = runner.shutdown_handle();
+        let commands = runner.reconfigure_handle();
         let running = runtime.spawn(runner.run());
         drop(entered);
 
@@ -329,6 +338,7 @@ impl Node {
             observe,
             importing,
             shutdown,
+            commands,
             host: Some(Host {
                 running,
                 runtime,
@@ -378,6 +388,29 @@ impl Node {
     #[must_use]
     pub fn preview(&self) -> PreviewSender {
         Arc::clone(&self.host().preview)
+    }
+
+    /// Take on `validator` while the host runs, without a restart and
+    /// without interrupting the validators it already runs. The host attests
+    /// it to every peer it is linked to and starts its beacon participation;
+    /// it is seated wherever its placement puts it, as at start. Peers route
+    /// to it once their topology holds its registration. The host does not
+    /// remember it: the caller passes it again at the next start.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::AddValidator`] if the host would not take it, and
+    /// [`NodeError::Stopped`] if the host is no longer running.
+    pub async fn add_validator(&self, validator: LocalValidator) -> Result<(), NodeError> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(RunnerCommand::AddValidator { validator, reply })
+            .await
+            .map_err(|_| NodeError::Stopped)?;
+        answer
+            .await
+            .map_err(|_| NodeError::Stopped)?
+            .map_err(NodeError::AddValidator)
     }
 
     /// What became of each transaction this host has seen.

@@ -2,9 +2,10 @@
 //! beacon loop.
 //!
 //! Every host runs one beacon thread from startup to shutdown. It owns the
-//! host's fold and one participant per signing key the process holds,
-//! which is fixed for the life of the process, so the loop is never
-//! rebuilt. Chains register and deregister with it over its channel.
+//! host's fold and one participant per signing key the process holds; a key
+//! added to the running host gains its participant over the thread's
+//! channel, so the loop is never rebuilt. Chains register and deregister
+//! with it over the same channel.
 
 use std::sync::Arc;
 

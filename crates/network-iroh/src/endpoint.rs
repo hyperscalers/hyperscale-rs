@@ -40,7 +40,9 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 
 use crate::address_book::{AddressBook, IngestOutcome, record_sequence, sign_records};
-use crate::bind::{self, BindContext, Bound, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
+use crate::bind::{
+    self, BindContext, Bound, LocalIdentities, LocalVnodeIdentity, MAX_VNODES_PER_BIND,
+};
 use crate::bind_gate::{BindGate, Origin, Ticket};
 use crate::bootstrap::{self, RESOLVE_INTERVAL};
 use crate::config::{IrohConfig, MAX_RELAYS};
@@ -71,6 +73,17 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// attempt. Past this the endpoint is no longer being dialed, and its next
 /// dial starts the series afresh.
 const DIAL_BACKOFF_MEMORY: Duration = Duration::from_mins(1);
+
+/// Why a validator could not be added to a running host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AddVnodeError {
+    /// The host already runs it.
+    #[error("validator {} is already hosted", .0.inner())]
+    Hosted(ValidatorId),
+    /// The host runs as many validators as one bind attests.
+    #[error("the host already runs {MAX_VNODES_PER_BIND} validators")]
+    Full,
+}
 
 /// A bound connection to a peer host.
 struct Link {
@@ -139,7 +152,6 @@ struct Inner {
     /// the adapter can be driven from threads that are not the runtime's.
     runtime: Handle,
     endpoint: Endpoint,
-    local_validator_ids: Vec<ValidatorId>,
     local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
     bind: BindContext,
     /// Serves the streams bound peers open.
@@ -189,6 +201,8 @@ struct Inner {
 /// the sequence they carry, which the next signing moves past.
 struct SignedRecords {
     addressed: EndpointAddr,
+    /// The identities' generation they were signed for.
+    generation: u64,
     sequence: u64,
     records: Vec<ValidatorAddressGossip>,
 }
@@ -281,14 +295,16 @@ impl IrohAdapter {
             fault_gate,
             bind: BindContext {
                 network,
-                local_vnodes: Arc::from(vnodes),
+                local: Arc::new(ArcSwap::from_pointee(LocalIdentities {
+                    generation: 0,
+                    vnodes,
+                })),
                 local_endpoint: endpoint.id(),
                 validator_keys: Arc::new(ArcSwap::from(validator_keys)),
                 verifier,
                 version_interop_mode: config.version_interop_mode,
             },
             endpoint,
-            local_validator_ids,
             local_shards,
             links: DashMap::new(),
             validator_peers: DashMap::new(),
@@ -324,8 +340,36 @@ impl IrohAdapter {
 
     /// Validator ids hosted by this endpoint.
     #[must_use]
-    pub fn local_validator_ids(&self) -> &[ValidatorId] {
-        &self.inner.local_validator_ids
+    pub fn local_validator_ids(&self) -> Vec<ValidatorId> {
+        self.inner.bind.local.load().ids()
+    }
+
+    /// Host `vnode` from now on: new binds attest it, pulls answer for it,
+    /// and the address records name it. Peers already linked learn it from
+    /// the records [`Fanout`] hands them, and pull it once their topology
+    /// holds its key.
+    ///
+    /// # Errors
+    ///
+    /// [`AddVnodeError::Hosted`] if the validator is already hosted, and
+    /// [`AddVnodeError::Full`] past [`MAX_VNODES_PER_BIND`].
+    pub fn add_vnode(&self, vnode: LocalVnodeIdentity) -> Result<(), AddVnodeError> {
+        let local = &self.inner.bind.local;
+        let current = local.load();
+        if current.vnodes.iter().any(|(vid, _)| *vid == vnode.0) {
+            return Err(AddVnodeError::Hosted(vnode.0));
+        }
+        if current.vnodes.len() >= MAX_VNODES_PER_BIND {
+            return Err(AddVnodeError::Full);
+        }
+        let mut vnodes = current.vnodes.clone();
+        vnodes.push(vnode);
+        // The one writer: the host adds its validators one at a time.
+        local.store(Arc::new(LocalIdentities {
+            generation: current.generation + 1,
+            vnodes,
+        }));
+        Ok(())
     }
 
     /// Shards hosted by this endpoint (a loaded snapshot).
@@ -437,8 +481,10 @@ impl IrohAdapter {
             .signed_records
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let local = self.inner.bind.local.load();
         if let Some(last) = signed.as_ref()
             && last.addressed == endpoint
+            && last.generation == local.generation
         {
             return last.records.clone();
         }
@@ -450,14 +496,10 @@ impl IrohAdapter {
         )
         .unwrap_or(u64::MAX);
         let sequence = record_sequence(now_ms, signed.as_ref().map(|last| last.sequence));
-        let records = sign_records(
-            &endpoint,
-            sequence,
-            &self.inner.bind.network,
-            &self.inner.bind.local_vnodes,
-        );
+        let records = sign_records(&endpoint, sequence, &self.inner.bind.network, &local.vnodes);
         *signed = Some(SignedRecords {
             addressed: endpoint,
+            generation: local.generation,
             sequence,
             records: records.clone(),
         });
