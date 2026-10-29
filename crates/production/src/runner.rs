@@ -179,7 +179,7 @@ impl LocalValidator {
 /// state, so the runner derives it: a validator the committed beacon state
 /// places `OnShard` is seated on that shard (its storage opened via the
 /// factory); one that is `Pooled` (or otherwise unseated) is seated nowhere
-/// until a placement delta seats it. Every one of them runs a beacon
+/// until committed placement seats it. Every one of them runs a beacon
 /// participant on the host's beacon loop. A host takes on another one while
 /// it runs through [`RunnerCommand::AddValidator`]. `VnodeConfig` (which
 /// does carry a shard) is the shape the supervisor seats a validator in once
@@ -385,8 +385,8 @@ impl ProductionRunnerBuilder {
         install();
 
         let validators = self.validators;
-        // Per-validator signing keys, retained so a placement delta can be
-        // translated into a `ShardCommand::Join` for the moved validator.
+        // Per-validator signing keys, retained so a committed placement can
+        // seat the moved validator.
         let vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>> = validators
             .iter()
             .map(|v| (v.validator_id, Arc::clone(&v.signer)))

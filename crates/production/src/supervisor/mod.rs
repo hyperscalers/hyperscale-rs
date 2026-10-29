@@ -273,7 +273,7 @@ pub struct ShardSupervisor {
     /// [`Self::storages`].
     reshape_stores: HashMap<ShardId, PreparedStore<Arc<RocksDbShardStorage>>>,
     /// Reshape store-prep requests (`OpenStore` / `SeedFromParent`) held while
-    /// an ordinary placement-delta join is still opening the same shard's store
+    /// an ordinary join is still opening the same shard's store
     /// directory, keyed by that store shard. A reshape duty owns its successor's
     /// store, but a join that slipped past the `reshape_owns` suppression (a
     /// lagging topology snapshot) may already be mid-open; holding the prep until
@@ -296,7 +296,7 @@ pub struct ShardSupervisor {
     deferred_reshape_events: Vec<ReshapeEvent>,
     /// Joins that arrived while their shard was draining, replayed by
     /// the [`SupervisorEvent::TornDown`] handler. Dropping them instead
-    /// would lose the placement delta until restart.
+    /// would lose the join until the next reconcile.
     pending_joins: HashMap<ShardId, Vec<VnodeConfig>>,
     /// Joins whose fresh store found no attested anchor for a shard that
     /// did not begin at network genesis. Nothing is seated; the reshape
@@ -545,23 +545,18 @@ impl ShardSupervisor {
     }
 
     /// Act on a beacon-detected placement delta for one of this host's
-    /// validators. A join starts the shard's bootstrap immediately — the
-    /// delta arrives a full epoch before the window opens, and the
-    /// validator votes only once ready. A leave needs no command here: the
-    /// reshape tick's [`Self::reconcile_teardown`] tears a shard down once
-    /// it leaves both this host's active committee and its routing
-    /// committee, so serving outlasts a departing window for exactly as
-    /// long as the shard stays routable — covering a replacement's
-    /// snap-sync and a merge keeper's cross-child fetch from one committed
-    /// lifetime.
+    /// validators: log it and wake the reshape orchestrator to re-poll the
+    /// committed view, since a placement change often accompanies the
+    /// cohort/keeper draws and boundary seedings its duties gate on.
     ///
-    /// The observer and keeper deltas (`observe`/`keep`) drive nothing
-    /// here — the reshape orchestrator self-determines those duties from
-    /// the committed topology projection — so this only wakes the
-    /// orchestrator to re-poll and dispatches the join the placement
-    /// surfaces. The orchestrator owns observer and keeper seating, so
-    /// [`Self::handle`] suppresses an observer split join and a
-    /// merge-execution join.
+    /// No join or leave is issued here. [`Self::reconcile_joins`] seats
+    /// every validator
+    /// [`placed_validators`](hyperscale_node::startup::placed_validators)
+    /// places, under the rule the simulation reads, and
+    /// [`Self::reconcile_teardown`] tears a shard down once it leaves both
+    /// this host's active committee and its routing committee. The observer
+    /// and keeper deltas drive nothing either: the orchestrator
+    /// self-determines those duties from the committed projection.
     pub(crate) fn on_participation_change(&mut self, change: &ParticipationChange) {
         tracing::info!(
             validator = change.validator.inner(),
@@ -572,16 +567,7 @@ impl ShardSupervisor {
             effective_epoch = change.effective_epoch.inner(),
             "Beacon placement change detected"
         );
-        // Wake the orchestrator to re-poll the committed view: a placement
-        // change often accompanies the cohort/keeper draws and boundary
-        // seedings its duties gate on.
         self.reshape_step(Vec::new());
-        if let Some(shard) = change.join {
-            self.handle(ShardCommand::Join {
-                shard,
-                validators: vec![change.validator],
-            });
-        }
     }
 
     /// Stop every shard thread: fan the shutdown signals first so the

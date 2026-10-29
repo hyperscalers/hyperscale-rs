@@ -6,9 +6,9 @@
 //! unless the shard's chain runs from network genesis), and runs the shard's
 //! replica, with its local validators attached as signers, on a new pinned
 //! thread; a leave refcounts memberships down and tears the thread, maps, and
-//! storage down at zero. The reconcile pair is the committed-state backstop:
-//! [`ShardSupervisor::reconcile_joins`] brings up any shard a local validator
-//! holds a consensus seat in that a lost delta never joined, and
+//! storage down at zero. The reconcile pair drives membership from committed
+//! state: [`ShardSupervisor::reconcile_joins`] brings up any shard
+//! [`placed_validators`] places a local validator on, and
 //! [`ShardSupervisor::reconcile_teardown`] retires a shard once no local
 //! validator holds a committee or routing role in it. The two read different
 //! committee views on purpose: joining asks "must this host run consensus"
@@ -33,7 +33,9 @@ use hyperscale_storage::{
     RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds, holds_state,
 };
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};
-use hyperscale_types::{Block, BlockHeight, ShardId, TopologySnapshot, ValidatorId};
+use hyperscale_types::{
+    Block, BlockHeight, ShardId, TopologySchedule, TopologySnapshot, ValidatorId,
+};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -106,8 +108,8 @@ impl ShardSupervisor {
         // reforming the parent, or a split's children, surfaced as an ordinary
         // join when the reshape executes. The orchestrator seats them from the
         // prepared store (which carries the reshape's terminal/merged state),
-        // so the placement-delta join is a no-op here. The four conditions span
-        // the duty's whole lifetime so the join never opens a `RocksDB`
+        // so a join for it is a no-op here. The four conditions span the
+        // duty's whole lifetime so the join never opens a `RocksDB`
         // directory the duty is using — `RocksDB`'s exclusive lock fails the
         // second opener outright, so an overlap strands a co-hosted committee
         // member's seat. `is_seating` reads the orchestrator's post-discovery
@@ -335,8 +337,8 @@ impl ShardSupervisor {
     }
 
     /// Settle a finished bootstrap: seat the shard on success, clear
-    /// the bootstrapping entry on failure (so a later placement delta
-    /// can retry the join), drop the outcome when every pending vnode
+    /// the bootstrapping entry on failure (so a later reconcile can
+    /// retry the join), drop the outcome when every pending vnode
     /// left during the bootstrap. Runs on the runner's loop via the
     /// completion channel — never on the bootstrap task.
     pub(super) fn finish_join(&mut self, done: Result<CompletedBootstrap, ShardId>) {
@@ -682,8 +684,8 @@ impl ShardSupervisor {
             });
             return;
         }
-        let snapshot = self.process.topology_snapshot().load_full();
-        let mut vnodes = self.local_committee_vnodes(&snapshot, shard);
+        let schedule = self.process.topology_schedule();
+        let mut vnodes = self.placed_vnodes(&schedule, shard);
         for joiner in std::mem::take(&mut done.vnodes) {
             if !vnodes.iter().any(|v| v.validator_id == joiner.validator_id) {
                 vnodes.push(joiner);
@@ -962,18 +964,15 @@ impl ShardSupervisor {
     }
 
     /// Reconcile hosted shards against the committed committee assignment: bring
-    /// up any shard a local validator holds a consensus seat in that this host is
-    /// not already hosting, bootstrapping, draining, seating from a reshape
-    /// duty, or holding queued behind a drain. A split-observer ride is not a
-    /// seat — the observer's physical work is its child store, driven by the
-    /// reshape orchestrator, never a consensus vnode on the splitting parent.
+    /// up any shard [`placed_validators`] places a local validator on that this
+    /// host is not already hosting, bootstrapping, draining, seating from a
+    /// reshape duty, or holding queued behind a drain, and seat a placed
+    /// validator a running shard does not yet carry. A split-observer ride is
+    /// not a seat — the observer's physical work is its child store, driven by
+    /// the reshape orchestrator, never a consensus vnode on the splitting
+    /// parent.
     ///
-    /// The membership-up mirror of [`Self::reconcile_teardown`]. The placement
-    /// delta still drives a join immediately (it arrives an epoch ahead, so the
-    /// bootstrap completes before the window opens); this is the committed-state
-    /// backstop for a delta that was never seen — a join that raced a teardown
-    /// and lost its queued replay, or work missed across a restart — so a
-    /// dropped delta cannot strand the host off a shard it must run. Idempotent:
+    /// The membership-up mirror of [`Self::reconcile_teardown`]. Idempotent:
     /// the guards skip every shard already accounted for, and [`Self::join`]
     /// rejects a double bring-up regardless. A join parked on its shard's
     /// anchor is retried here once this host's topology carries it. Run on
@@ -1002,15 +1001,17 @@ impl ShardSupervisor {
             .copied()
             .filter(|&shard| !self.reshape.is_seating(shard))
             .collect();
+        let schedule = self.process.topology_schedule();
         for shard in running {
-            let vnodes = self.placed_vnodes(&topology_snapshot, shard);
+            let vnodes = self.placed_vnodes(&schedule, shard);
             self.seat_on_running(shard, &vnodes);
         }
-        let needed: Vec<ShardId> = topology_snapshot
+        let needed: Vec<ShardId> = schedule
+            .head()
             .shard_trie()
             .leaves()
             .filter(|&shard| {
-                !self.placed_vnodes(&topology_snapshot, shard).is_empty()
+                !self.placed_vnodes(&schedule, shard).is_empty()
                     && !self.shards.contains_key(&shard)
                     && !self.bootstrapping.contains_key(&shard)
                     && !self.draining.contains_key(&shard)
@@ -1021,8 +1022,8 @@ impl ShardSupervisor {
             })
             .collect();
         for shard in needed {
-            let vnodes = self.placed_vnodes(&topology_snapshot, shard);
-            info!(shard = ?shard, "Reconciling a missed committee join from the committed view");
+            let vnodes = self.placed_vnodes(&schedule, shard);
+            info!(shard = ?shard, "Joining a shard the committed view places a local validator on");
             self.join(shard, &vnodes);
         }
     }
@@ -1123,12 +1124,8 @@ impl ShardSupervisor {
 
     /// The vnode configs for every local validator [`placed_validators`]
     /// places on `shard`.
-    fn placed_vnodes(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-        shard: ShardId,
-    ) -> Vec<VnodeConfig> {
-        placed_validators(shard, topology_snapshot, |validator| {
+    fn placed_vnodes(&self, schedule: &TopologySchedule, shard: ShardId) -> Vec<VnodeConfig> {
+        placed_validators(shard, schedule, |validator| {
             self.vnode_keys.contains_key(&validator)
         })
         .into_iter()
