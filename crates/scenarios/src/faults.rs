@@ -2692,7 +2692,8 @@ fn assert_delivered_after_heal<C: FaultableCluster>(
 ///
 /// # Panics
 ///
-/// Panics if the partitioned pool advances the epoch, a shard fails to coast then
+/// Panics if the partitioned pool advances the epoch past one already in flight
+/// when the partition landed, or at all during the hold, a shard fails to coast then
 /// freeze, either shard keeps committing past its runway (a fork or a wedge
 /// rather than a clean defer), or the heal fails to resume epochs, shard
 /// progress, or cross-host root agreement.
@@ -2722,13 +2723,18 @@ pub fn beacon_pool_partition_stalls_epoch_production(c: &mut impl FaultableClust
     c.partition(&left_hosts, &right_hosts);
 
     // Coast past the L = 1 runway, then the shards defer at the schedule head.
+    // An epoch whose votes were already in flight when the partition landed
+    // may still commit; none past it can.
     c.run_until(epochs(3), |_| false);
     let left_frozen = c.committed_height(left).expect("left serves").inner();
     let right_frozen = c.committed_height(right).expect("right serves").inner();
-    assert_eq!(
-        beacon_epoch(c).map(Epoch::inner),
-        Some(start_epoch),
-        "the pool partitioned below quorum must halt epoch production",
+    let halted_epoch = beacon_epoch(c)
+        .expect("a committed beacon epoch under the partition")
+        .inner();
+    assert!(
+        halted_epoch <= start_epoch + 1,
+        "the pool partitioned below quorum must halt epoch production \
+         (epoch {start_epoch} before the partition, {halted_epoch} after the runway)",
     );
     assert!(
         left_frozen > left_before && right_frozen > right_before,
@@ -2751,7 +2757,7 @@ pub fn beacon_pool_partition_stalls_epoch_production(c: &mut impl FaultableClust
     );
     assert_eq!(
         beacon_epoch(c).map(Epoch::inner),
-        Some(start_epoch),
+        Some(halted_epoch),
         "epoch production must stay halted while the pool is partitioned",
     );
 
@@ -2759,8 +2765,8 @@ pub fn beacon_pool_partition_stalls_epoch_production(c: &mut impl FaultableClust
     // past their frozen heights on the one chain every serving host agrees on.
     c.heal_all();
     assert!(
-        await_beacon_epoch(c, start_epoch + 1, epochs(8)),
-        "epoch production must resume once the pool heals (stalled at epoch {start_epoch})",
+        await_beacon_epoch(c, halted_epoch + 1, epochs(8)),
+        "epoch production must resume once the pool heals (stalled at epoch {halted_epoch})",
     );
     assert!(
         await_height(c, left, left_frozen + 1, epochs(8))
