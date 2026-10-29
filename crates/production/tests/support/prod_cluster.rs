@@ -6,6 +6,7 @@
 //! cadence the harness's own `await_*` helpers use, sleeping between polls on
 //! an owned multi-thread runtime. The runtime never leaks into a scenario body.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,15 +15,16 @@ use hyperscale_engine::GenesisConfig;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network_iroh::fault::{DropSpec, HostId, RuleHandle};
+use hyperscale_network_iroh::fault::{DropSpec, HostId};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::RanAs;
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    BlockServingCap, Budget, Cluster, FaultHandle, FaultableCluster, MemberEdge, ScenarioConfig,
-    grow_and_hold, submission_shards,
+    BlockServingCap, Budget, Cluster, FaultHandle, FaultableCluster, MemberEdge,
+    RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
 };
+use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation,
@@ -34,7 +36,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::time::sleep;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use super::harness::{ClusterSpec, Harness, HostSpec};
+use super::harness::{ClusterSpec, Harness, HostRule, HostSpec};
 
 /// Poll cadence between predicate samples in `run_until`, matching the
 /// harness's own `await_*` interval.
@@ -53,12 +55,12 @@ struct StartArgs<'a> {
 }
 
 /// A [`FaultableCluster::drop_type_between_members`] rule: its edge, the
-/// per-host handles of each host pair it drops between now, and every
-/// handle it has installed, whose fires its handle sums.
+/// per-host rules of each host pair it drops between now, and every rule
+/// it has installed, whose fires its handle sums.
 struct MemberRule {
     edge: MemberEdge,
-    live: Vec<Vec<RuleHandle>>,
-    installed: Arc<Mutex<Vec<RuleHandle>>>,
+    live: Vec<Vec<HostRule>>,
+    installed: Arc<Mutex<Vec<HostRule>>>,
 }
 
 /// The production adaptor: a [`Cluster`] over the real QUIC + `RocksDB` harness.
@@ -73,6 +75,8 @@ pub struct ProdCluster {
     staged: Range<u32>,
     /// The drop rules that follow shard membership, re-read at each poll.
     member_rules: Vec<MemberRule>,
+    /// The stopped hosts, each with when it starts again.
+    due: BTreeMap<usize, Instant>,
 }
 
 impl ProdCluster {
@@ -140,6 +144,7 @@ impl ProdCluster {
             withholding,
             staged,
             member_rules: Vec::new(),
+            due: BTreeMap::new(),
         }
     }
 
@@ -150,7 +155,7 @@ impl ProdCluster {
         from: &[usize],
         to: &[usize],
         type_id: &'static str,
-    ) -> Vec<Vec<RuleHandle>> {
+    ) -> Vec<Vec<HostRule>> {
         let mut handles = Vec::new();
         for &src in from {
             for &dst in to {
@@ -303,20 +308,41 @@ impl ProdCluster {
             .block_on(self.inner.restart_with_wiped_shards(host, shards))
     }
 
-    /// Restart host `host` with its stores for split `children` replaced by
-    /// unadopted clones of its `parent` store (see
-    /// [`Harness::restart_with_unadopted_clones`]). Returns the topology the
-    /// rebuilt host starts on.
-    pub fn restart_with_unadopted_clones(
-        &mut self,
+    /// Replace down host `host`'s stores for split `children` by unadopted
+    /// clones of its `parent` store (see [`Harness::clone_unadopted`]).
+    pub fn clone_unadopted(&self, host: usize, parent: ShardId, children: &[ShardId]) {
+        self.inner.clone_unadopted(host, parent, children);
+    }
+
+    /// Runs `read` on down host `host`'s store for `shard` as it lies on
+    /// disk (see [`Harness::read_stored`]).
+    pub fn read_stored<T>(
+        &self,
         host: usize,
-        parent: ShardId,
-        children: &[ShardId],
-    ) -> Arc<TopologySnapshot> {
-        self.runtime.block_on(
-            self.inner
-                .restart_with_unadopted_clones(host, parent, children),
-        )
+        shard: ShardId,
+        read: impl FnOnce(&RocksDbShardStorage) -> T,
+    ) -> Option<T> {
+        self.inner.read_stored(host, shard, read)
+    }
+
+    /// Start every stopped host whose downtime is over, each bootstrapped
+    /// to the lowest up host.
+    fn start_due(&mut self) {
+        let now = Instant::now();
+        let ready: Vec<usize> = self
+            .due
+            .iter()
+            .filter(|&(_, &at)| at <= now)
+            .map(|(&host, _)| host)
+            .collect();
+        for host in ready {
+            self.due.remove(&host);
+            let bootstrap = self
+                .inner
+                .live_host()
+                .map(|peer| self.inner.endpoint_addr(peer));
+            self.inner.start_host(host, bootstrap);
+        }
     }
 
     /// A host serving any shard `tx` touches, for submission routing.
@@ -331,6 +357,7 @@ impl ProdCluster {
     fn host_for_tx(&self, tx: &Transaction) -> Option<usize> {
         // The harness builds transactions outside every host, so nothing
         // has derived this one and routing is a derived fact.
+        self.inner.live_host()?;
         if !self
             .inner
             .with_derivation(|derivation| tx.try_derived(derivation).is_ok())
@@ -367,13 +394,16 @@ impl Cluster for ProdCluster {
     }
 
     fn submit(&mut self, tx: Arc<Transaction>) {
-        let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.inner.submit_transaction(host, &tx);
+        if let Some(host) = self.host_for_tx(&tx).or_else(|| self.inner.live_host()) {
+            self.inner.submit_transaction(host, &tx);
+        }
     }
 
     fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
-        let host = self.committee_hosts(shard).first().copied().unwrap_or(0);
-        self.inner.submit_transaction(host, &tx);
+        let first = self.committee_hosts(shard).first().copied();
+        if let Some(host) = first.or_else(|| self.inner.live_host()) {
+            self.inner.submit_transaction(host, &tx);
+        }
     }
 
     fn vote_fold_budget_ms(&self) -> u64 {
@@ -386,6 +416,7 @@ impl Cluster for ProdCluster {
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_millis(self.epoch_ms) * budget.0;
         loop {
+            self.start_due();
             self.follow_membership();
             if cond(self) {
                 return true;
@@ -531,6 +562,18 @@ impl ProdCluster {
     }
 }
 
+impl RestartableCluster for ProdCluster {
+    fn is_up(&self, host: usize) -> bool {
+        self.inner.is_up(host)
+    }
+
+    fn stop_host(&mut self, host: usize, downtime: Budget) {
+        self.runtime.block_on(self.inner.stop_host(host));
+        let downtime = Duration::from_millis(self.epoch_ms) * downtime.0;
+        self.due.insert(host, Instant::now() + downtime);
+    }
+}
+
 impl FaultableCluster for ProdCluster {
     fn host_count(&self) -> usize {
         self.inner.host_count()
@@ -541,7 +584,7 @@ impl FaultableCluster for ProdCluster {
             type_id: Some(type_id),
             ..DropSpec::default()
         });
-        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+        FaultHandle::new(move || handles.iter().map(HostRule::fired).sum())
     }
 
     fn drop_type_with_probability(
@@ -554,7 +597,7 @@ impl FaultableCluster for ProdCluster {
             probability: Some(probability),
             ..DropSpec::default()
         });
-        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+        FaultHandle::new(move || handles.iter().map(HostRule::fired).sum())
     }
 
     fn partition(&mut self, group_a: &[usize], group_b: &[usize]) {
@@ -605,7 +648,7 @@ impl FaultableCluster for ProdCluster {
                 .lock()
                 .expect("no holder of the rule's handles panics")
                 .iter()
-                .map(RuleHandle::fired)
+                .map(HostRule::fired)
                 .sum()
         })
     }
@@ -630,12 +673,12 @@ impl FaultableCluster for ProdCluster {
         to: &[usize],
         type_id: &'static str,
     ) -> FaultHandle {
-        let handles: Vec<RuleHandle> = self
+        let handles: Vec<HostRule> = self
             .install_between(from, to, type_id)
             .into_iter()
             .flatten()
             .collect();
-        FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+        FaultHandle::new(move || handles.iter().map(HostRule::fired).sum())
     }
 
     fn cap_block_serving(&mut self, shard: ShardId, height: BlockHeight) -> FaultHandle {

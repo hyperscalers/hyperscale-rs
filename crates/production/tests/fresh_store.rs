@@ -10,7 +10,12 @@ use std::time::Duration;
 
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
-use hyperscale_scenarios::{Budget, Cluster, FaultableCluster, ScenarioConfig, grow_to};
+use hyperscale_scenarios::{
+    Budget, Cluster, FaultableCluster, RestartableCluster, ScenarioConfig,
+    a_restart_beside_a_departed_parent_store_resumes,
+    a_restart_mid_handoff_keeping_its_stores_catches_the_child_up, grow_to,
+};
+use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, NetworkDefinition, ReshapeThresholds, ShardId, ValidatorId,
 };
@@ -243,62 +248,12 @@ fn a_wiped_store_on_a_split_child_rejoins_its_chain() {
 }
 
 /// A former member of a split parent restarted with the parent's store
-/// still on disk comes back up: the departed store serves its history
-/// for as long as routing names this host among the parent's members,
-/// and the host's child store resumes and catches up with the chain.
+/// still on disk comes back up and catches its child store up.
 #[test]
 #[serial]
-fn a_restart_beside_a_departed_parent_store_resumes() {
+fn a_restart_beside_a_departed_parent_store_resumes_prod() {
     let mut cluster = ProdCluster::start(&split_config(), 11, SPLIT_EPOCH_MS);
-    let parent_committee = cluster
-        .beacon_state()
-        .expect("a beacon state is committed")
-        .derive_topology_snapshot(NetworkDefinition::simulator())
-        .committee_for_shard(ShardId::ROOT)
-        .to_vec();
-    grow_to(&mut cluster, 2);
-
-    let child = ShardId::leaf(1, 0);
-    let settled = |c: &ProdCluster| {
-        c.beacon_state().is_some_and(|state| {
-            let topology = state.derive_topology_snapshot(NetworkDefinition::simulator());
-            !topology.reshape_handoff_pending(ShardId::ROOT)
-                && topology.reshape_parent_half_cohorts().is_empty()
-                && topology.boundary(child).is_some()
-        })
-    };
-    assert!(
-        cluster.run_until(Budget(20), settled),
-        "the split hands off to its children"
-    );
-    let member = cluster
-        .beacon_state()
-        .expect("a beacon state is committed")
-        .derive_topology_snapshot(NetworkDefinition::simulator())
-        .committee_for_shard(child)
-        .iter()
-        .copied()
-        .find(|member| parent_committee.contains(member))
-        .expect("a parent member carries on into the child");
-    let host = cluster.host_of(member).expect("a host runs the member");
-    let before = cluster
-        .committed_height(child)
-        .expect("the child commits after the grow");
-    let served = cluster.committee_hosts(ShardId::ROOT).contains(&host);
-
-    cluster.restart_with_wiped_shards(host, &[]);
-    assert!(
-        !served || cluster.committee_hosts(ShardId::ROOT).contains(&host),
-        "a departed store the host served before the restart is served after it"
-    );
-
-    let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
-    assert!(
-        cluster.run_until(Budget(20), |c| c
-            .host_committed_height(host, child)
-            .is_some_and(|height| height >= target)),
-        "the restarted host's child store catches up with the chain",
-    );
+    a_restart_beside_a_departed_parent_store_resumes(&mut cluster);
 }
 
 /// A split child's parent-half member restarted before the handoff
@@ -344,43 +299,18 @@ fn a_restart_mid_handoff_without_the_parent_store_rejoins_the_child() {
 }
 
 /// A split child's parent-half member restarted before the handoff
-/// completes, with every store it held kept, resumes both: the departed
-/// parent's loop serves its terminal, the child's loop resumes from its
-/// own store, and the child catches up with the chain.
+/// completes, with every store it held kept, catches the child up.
 #[test]
 #[serial]
-fn a_restart_mid_handoff_keeping_its_stores_catches_the_child_up() {
+fn a_restart_mid_handoff_keeping_its_stores_catches_the_child_up_prod() {
     let mut cluster = ProdCluster::start(&split_config(), 11, SPLIT_EPOCH_MS);
-    grow_to(&mut cluster, 2);
-
-    let (child, member) = cluster
-        .beacon_state()
-        .expect("a beacon state is committed")
-        .derive_topology_snapshot(NetworkDefinition::simulator())
-        .reshape_parent_half_cohorts()
-        .iter()
-        .find_map(|(&child, cohort)| cohort.keys().next().map(|&member| (child, member)))
-        .expect("the handoff is still in flight once both children commit");
-    let host = cluster.host_of(member).expect("a host runs the member");
-    let before = cluster
-        .committed_height(child)
-        .expect("the child commits after the grow");
-
-    cluster.restart_with_wiped_shards(host, &[]);
-
-    let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
-    assert!(
-        cluster.run_until(Budget(20), |c| c
-            .host_committed_height(host, child)
-            .is_some_and(|height| height >= target)),
-        "the restarted host's child store catches up with the chain",
-    );
+    a_restart_mid_handoff_keeping_its_stores_catches_the_child_up(&mut cluster);
 }
 
 /// A split child's parent-half member restarted between cloning its parent
 /// store for the child and adopting the child's genesis into the clone
-/// catches the child up. The clone holds the parent's chain, not the
-/// child's, so the restart resumes nothing from it.
+/// catches the child up. The clone holds the parent's chain through its
+/// terminal, not the child's, so the restart resumes nothing from it.
 #[test]
 #[serial]
 fn a_restart_before_a_clones_adoption_catches_the_child_up() {
@@ -395,12 +325,41 @@ fn a_restart_before_a_clones_adoption_catches_the_child_up() {
         .iter()
         .find_map(|(&child, cohort)| cohort.keys().next().map(|&member| (child, member)))
         .expect("the handoff is still in flight once both children commit");
+    // The children seat off the parent's cut ahead of the fold that
+    // records its terminal.
+    let terminal = |c: &ProdCluster| {
+        c.beacon_state()?
+            .derive_topology_snapshot(NetworkDefinition::simulator())
+            .boundary(ShardId::ROOT)
+            .filter(|anchor| anchor.terminal_epoch.is_some())
+    };
+    assert!(
+        cluster.run_until(Budget(4), |c| terminal(c).is_some()),
+        "the beacon records the parent's terminal"
+    );
+    let terminal = terminal(&cluster).expect("just recorded");
     let host = cluster.host_of(member).expect("a host runs the member");
     let before = cluster
         .committed_height(child)
         .expect("the child commits after the grow");
 
-    cluster.restart_with_unadopted_clones(host, ShardId::ROOT, &[child]);
+    cluster.stop_host(host, Budget(0));
+    cluster.clone_unadopted(host, ShardId::ROOT, &[child]);
+    let cloned = cluster.read_stored(host, child, |store| {
+        store
+            .get_certified_header(terminal.height)
+            .map(|certified| (certified.header().hash(), certified.header().state_root()))
+    });
+    assert_eq!(
+        cloned,
+        Some(Some((terminal.block_hash, terminal.state_root))),
+        "before the host starts, its child store holds the parent's chain and state at the \
+         terminal {terminal:?}",
+    );
+    assert!(
+        cluster.run_until(Budget(1), |c| c.is_up(host)),
+        "host {host} comes back"
+    );
 
     let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
     assert!(
@@ -408,5 +367,55 @@ fn a_restart_before_a_clones_adoption_catches_the_child_up() {
             .host_committed_height(host, child)
             .is_some_and(|height| height >= target)),
         "the restarted host's child store catches up with the chain",
+    );
+}
+
+/// One shard of four hosts, the split trigger disarmed.
+const fn one_shard_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(60),
+    }
+}
+
+/// A host stopped for an epoch reads as down, with no shard to its name,
+/// comes back on the disk it left and commits ROOT past where the chain
+/// stood when it returned.
+#[test]
+#[serial]
+fn a_stopped_host_reads_as_down_then_commits_again() {
+    let mut cluster = ProdCluster::start(&one_shard_config(), 11, SPLIT_EPOCH_MS);
+    let host = 3;
+    assert!(
+        cluster.run_until(Budget(2), |c| c
+            .host_committed_height(host, ShardId::ROOT)
+            .is_some_and(|height| height.inner() >= CATCH_UP_BLOCKS)),
+        "host {host} commits ROOT before it stops",
+    );
+
+    cluster.stop_host(host, Budget(1));
+    assert!(
+        !cluster.is_up(host)
+            && cluster.host_committed_height(host, ShardId::ROOT).is_none()
+            && !cluster.committee_hosts(ShardId::ROOT).contains(&host),
+        "a stopped host reads as down and serves nothing",
+    );
+
+    assert!(
+        cluster.run_until(Budget(2), |c| c.is_up(host)),
+        "host {host} comes back once its downtime is over"
+    );
+    let returned = cluster
+        .committed_height(ShardId::ROOT)
+        .expect("ROOT commits");
+    assert!(
+        cluster.run_until(Budget(2), |c| c
+            .host_committed_height(host, ShardId::ROOT)
+            .is_some_and(|height| height > returned)),
+        "host {host} commits ROOT past {returned:?} again",
     );
 }

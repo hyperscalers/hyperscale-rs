@@ -29,8 +29,10 @@ use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
     Cluster, Crash, CrashableCluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, SWAPPERS,
     ScenarioConfig, VENUE_SHARD, a_late_settled_nullifier_still_refuses_its_intent,
-    a_rejoined_producer_reads_a_lost_answer_at_a_boundary, epochs, grind_onto, split_lifecycle,
-    stand_up_venue, venue_genesis_accounts,
+    a_rejoined_producer_reads_a_lost_answer_at_a_boundary,
+    a_restart_beside_a_departed_parent_store_resumes,
+    a_restart_mid_handoff_keeping_its_stores_catches_the_child_up, epochs, grind_onto,
+    split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
@@ -644,6 +646,32 @@ fn a_restart_resumes_nothing_on_a_dissolved_parent(seed: u64) {
 
 seeded!(
     a_restart_resumes_nothing_on_a_dissolved_parent:
+    seed_11 = 11,
+    seed_42 = 42,
+);
+
+/// A former member of a split parent restarted with the parent's store
+/// still on disk comes back up and catches its child store up.
+fn a_restart_beside_a_departed_parent_store_resumes_at_seed(seed: u64) {
+    let mut cluster = SimCluster::new(&split_config(), seed);
+    a_restart_beside_a_departed_parent_store_resumes(&mut cluster);
+}
+
+seeded!(
+    a_restart_beside_a_departed_parent_store_resumes_at_seed:
+    seed_11 = 11,
+    seed_42 = 42,
+);
+
+/// A split child's parent-half member restarted before the handoff
+/// completes, with every store it held kept, catches the child up.
+fn a_restart_mid_handoff_keeping_its_stores_catches_the_child_up_at_seed(seed: u64) {
+    let mut cluster = SimCluster::new(&split_config(), seed);
+    a_restart_mid_handoff_keeping_its_stores_catches_the_child_up(&mut cluster);
+}
+
+seeded!(
+    a_restart_mid_handoff_keeping_its_stores_catches_the_child_up_at_seed:
     seed_11 = 11,
     seed_42 = 42,
 );

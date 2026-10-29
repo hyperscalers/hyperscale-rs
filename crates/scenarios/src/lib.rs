@@ -26,6 +26,7 @@ mod multi_vnode;
 mod payer_floor;
 mod pushes;
 mod reshape;
+mod restart;
 mod route;
 mod route_reshape;
 mod straddler;
@@ -106,6 +107,10 @@ pub use reshape::{
     merge_seats_full_keeper_committee, split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle,
+};
+pub use restart::{
+    a_restart_beside_a_departed_parent_store_resumes,
+    a_restart_mid_handoff_keeping_its_stores_catches_the_child_up,
 };
 pub use route::{
     Certificates, CoreLoad, FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport,
