@@ -15,8 +15,8 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, armed_split_bytes, cross_fraction_genesis_accounts,
     cross_shard_fault_genesis_accounts, cross_shard_genesis_accounts, genesis_accounts,
     halt_recovery_config, halt_straddler_setup, livelock_genesis_accounts, merge_split_bytes,
-    merge_straddler_setup, participant_sweep_genesis_accounts, remote_delegator,
-    reshape_lifecycle_accounts, split_straddler_setup,
+    merge_straddler_setup, nullifier_race_genesis_accounts, participant_sweep_genesis_accounts,
+    remote_delegator, reshape_lifecycle_accounts, split_straddler_setup, staking_genesis_accounts,
 };
 use hyperscale_scenarios::{
     ScenarioConfig, a_delivery_cut_off_past_its_window_is_owed,
@@ -24,10 +24,15 @@ use hyperscale_scenarios::{
     a_delivery_lands_past_every_window_once_its_record_arrives,
     a_founded_pool_seats_another_validator_once_its_stake_covers_it,
     a_healed_network_delivers_past_the_old_window,
+    a_late_settled_nullifier_still_refuses_its_intent,
     a_leg_whose_core_never_answers_refuses_at_the_deadline, a_newcomer_founds_its_own_pool,
-    a_skip_deferred_split_keeps_every_settlement_in_its_window, abort_converges,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    a_restarted_genesis_host_resumes_beside_a_newcomer,
+    a_skip_deferred_split_keeps_every_settlement_in_its_window,
+    a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
+    a_timed_out_newcomer_is_let_back_in_from_its_own_host, abort_converges,
+    an_offline_newcomer_leaves_the_network_live, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, delegation_folds_into_beacon_state,
@@ -45,7 +50,7 @@ use hyperscale_scenarios::{
     stake_withdraw_drops_effective_stake, surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, zipf_payments,
 };
-use hyperscale_types::PrincipalAddr;
+use hyperscale_types::{BeaconChainConfig, PrincipalAddr};
 use serial_test::serial;
 use support::ProdCluster;
 
@@ -744,4 +749,100 @@ fn surviving_sibling_split_seats_full_committees_prod() {
     let mut cluster =
         ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
     surviving_sibling_split_seats_full_committees(&mut cluster);
+}
+
+/// Single shard, four-validator committee, resharding disarmed: the
+/// simulation's restart ground.
+const fn one_shard() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_late_settled_nullifier_still_refuses_its_intent_prod() {
+    let mut cluster = ProdCluster::start_with_accounts(
+        &one_shard(),
+        1,
+        EPOCH_MS,
+        nullifier_race_genesis_accounts(),
+    );
+    a_late_settled_nullifier_still_refuses_its_intent(&mut cluster);
+}
+
+/// The devnet's shape: one shard of five validators on one host, and one
+/// pool extra the scenarios stage as a newcomer on a host of its own.
+const fn devnet_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 5,
+        vnodes_per_host: 5,
+        pool_surplus: 1,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
+}
+
+/// The devnet's beacon: production sizing on thirty-second epochs with a
+/// four-epoch ready timeout.
+fn devnet_chain(chain: BeaconChainConfig) -> BeaconChainConfig {
+    BeaconChainConfig {
+        epoch_duration_ms: 30_000,
+        beacon_committee_size: BeaconChainConfig::production().beacon_committee_size,
+        ready_timeout_epochs: 4,
+        ..chain
+    }
+}
+
+/// A devnet with its one newcomer staged, at `seed`.
+fn devnet(seed: u64) -> ProdCluster {
+    ProdCluster::start_with_staged_newcomers(
+        &devnet_config(),
+        seed,
+        staking_genesis_accounts(),
+        1,
+        devnet_chain,
+    )
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_timed_out_newcomer_is_let_back_in_from_its_own_host_prod() {
+    devnet(1).run_faultable(a_timed_out_newcomer_is_let_back_in_from_its_own_host);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent_prod() {
+    devnet(1).run_faultable(a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn an_offline_newcomer_leaves_the_network_live_prod() {
+    devnet(1).run_faultable(an_offline_newcomer_leaves_the_network_live);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_restarted_genesis_host_resumes_beside_a_live_newcomer_prod() {
+    devnet(1).run_faultable(|c| a_restarted_genesis_host_resumes_beside_a_newcomer(c, false));
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn a_restarted_genesis_host_resumes_beside_a_gone_newcomer_prod() {
+    devnet(1).run_faultable(|c| a_restarted_genesis_host_resumes_beside_a_newcomer(c, true));
 }
