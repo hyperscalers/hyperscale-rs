@@ -33,8 +33,8 @@ use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
 use hyperscale_node::startup::{
-    placed_validators, rebuild_due, record_fork_anchor, reseated_validators, retired_signers,
-    shard_retired,
+    Replaced, placed_validators, rebuild_due, record_fork_anchor, reseated_validators,
+    retired_signers, shard_retired,
 };
 use hyperscale_node::{HostedChain, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
@@ -100,20 +100,6 @@ fn ask_peers(
         }
     }
     last
-}
-
-/// Why a rebuild replaces a shard's store, which decides what the rebuilt
-/// store takes from it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Replaced {
-    /// The store fell beneath every peer's chain floor, on the chain the
-    /// anchor continues: the rounds signed on it stay consumed.
-    Behind,
-    /// The store committed a tail a recovery discarded: past a fork
-    /// recovery's attested frontier, or on a tail no recovered chain
-    /// extends. The recovered chain leaves the frontier anew, and nothing
-    /// signed on the abandoned tail binds it.
-    Forked,
 }
 
 impl SimulationRunner {
@@ -365,19 +351,17 @@ impl SimulationRunner {
                 if hosted.contains(&shard) {
                     let seated = self.hosts[host as usize].signers(shard);
                     // A loop whose store cannot carry the placed seats —
-                    // on a tail a recovery discarded, or past a pending
-                    // fork's frontier — seats them on a store rebuilt at
-                    // the anchor instead.
-                    let due = rebuild_due(
+                    // on a tail a recovery discarded, or not seated at the
+                    // anchor of the fork now pending — seats them on a
+                    // store rebuilt at the anchor instead.
+                    if let Some(replaced) = rebuild_due(
                         &**self.hosts[host as usize].shard_io(shard).storage(),
                         shard,
                         &snapshot,
                         schedule.windows(),
                         &placed,
-                        &seated,
-                    );
-                    if due {
-                        self.rebuild_shard(host, shard, &placed, Replaced::Forked);
+                    ) {
+                        self.rebuild_shard(host, shard, &placed, replaced);
                         continue;
                     }
                     // A validator drawn onto a shard this host already
