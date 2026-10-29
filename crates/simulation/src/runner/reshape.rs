@@ -24,26 +24,26 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
-use hyperscale_node::reshape::observer::observer_ready_signal;
+use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
-    AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
+    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
 };
 use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
+use hyperscale_node::startup::seat_validators;
 use hyperscale_node::{
     serve_block_request, serve_local_certified_headers, serve_state_range_request,
 };
 use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, WitnessSeed};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
     Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
     shard_prefix_path,
 };
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::{SimulationRunner, open_store};
 
@@ -87,11 +87,10 @@ impl SimulationRunner {
         let mut orch = std::mem::take(&mut self.reshape[host as usize]);
         let derivation = self.hosts[host as usize].derivation();
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
-        // Last slice's deferred io — a state range no host could serve yet, a
-        // seed the local parent was not ready for — re-arms its sequencer here
-        // (a `FetchFailed` clears the in-flight flag set when it was issued),
-        // so this slice re-requests it: production's callback firing on a
-        // later tick.
+        // Last slice's deferred io — a state range no host could serve yet —
+        // re-arms its sequencer here (a `FetchFailed` clears the in-flight
+        // flag set when it was issued), so this slice re-requests it:
+        // production's callback firing on a later tick.
         let mut events = std::mem::take(&mut self.reshape_pending[host as usize]);
         let mut retries: Vec<ReshapeEvent> = Vec::new();
         // The whole fixpoint runs at one instant: the slice's io is
@@ -153,15 +152,16 @@ impl SimulationRunner {
         broadcasted: &mut HashSet<ValidatorId>,
         retries: &mut Vec<ReshapeEvent>,
     ) -> Option<ReshapeEvent> {
+        if let Some(shard) = request.prepared_shard()
+            && self.hosts_shard(host, shard).is_some()
+        {
+            return match request.over_running() {
+                Some(OverRunning::Answer(event)) => Some(event),
+                Some(OverRunning::Nothing) | None => None,
+            };
+        }
         match request {
             ReshapeRequest::OpenStore { shard } => {
-                // A duty only ever prepares a store for a shard this host does
-                // not run yet, so a running target is a duty rediscovered on a
-                // host that kept the shard's loop: its store is that loop's
-                // live store, and the duty is left unopened.
-                if self.hosts_shard(host, shard).is_some() {
-                    return None;
-                }
                 self.reshape_open_store(host, shard);
                 Some(ReshapeEvent::Opened { shard })
             }
@@ -169,7 +169,7 @@ impl SimulationRunner {
                 parent,
                 child,
                 through,
-            } => self.reshape_seed_from_parent(host, parent, child, through, retries),
+            } => Some(self.reshape_seed_from_parent(host, parent, child, through)),
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
             }
@@ -225,24 +225,19 @@ impl SimulationRunner {
                     );
                     return None;
                 }
-                if broadcasted.insert(validator) {
-                    let Ok(signal) = observer_ready_signal(
+                if broadcasted.insert(validator)
+                    && let Some(notification) = ready_notification(
                         &self.beacon_network,
                         validator,
                         child,
-                        self.signers[idx].as_ref(),
+                        Some(self.signers[idx].as_ref()),
                         anchor,
                         self.epoch_duration_ms,
-                    ) else {
-                        error!(
-                            validator = validator.inner(),
-                            "cannot sign reshape ready signal; skipping"
-                        );
-                        return None;
-                    };
+                    )
+                {
                     self.hosts[host as usize]
                         .network()
-                        .notify(&recipients, &ReadySignalNotification::new(signal));
+                        .notify(&recipients, &notification);
                 }
                 None
             }
@@ -277,28 +272,22 @@ impl SimulationRunner {
     }
 
     /// Seed a parent half's child store by deep-cloning the host's own retained
-    /// parent store onto the child subtree, once that parent chain has committed
-    /// through the terminal crossing. While it still lags, carry a deferral to
-    /// the next slice so the seed re-arms. A host with no parent store to seed
-    /// from, or already running the child on a store it keeps, answers
-    /// [`ReshapeEvent::SeedUnavailable`] and the parent half relinquishes.
+    /// parent store onto the child subtree, once [`seed_gate`] passes: the
+    /// parent chain has committed through the terminal crossing. Otherwise
+    /// answer the gate's event — a deferral the orchestrator paces, or
+    /// [`ReshapeEvent::SeedUnavailable`] when the host holds no parent store.
     fn reshape_seed_from_parent(
         &mut self,
         host: NodeIndex,
         parent: ShardId,
         child: ShardId,
         through: BlockHeight,
-        retries: &mut Vec<ReshapeEvent>,
-    ) -> Option<ReshapeEvent> {
-        if self.hosts_shard(host, child).is_some() {
-            return Some(ReshapeEvent::SeedUnavailable { child });
-        }
-        let Some(parent_storage) = self.hosts_shard(host, parent) else {
-            return Some(ReshapeEvent::SeedUnavailable { child });
-        };
-        if parent_storage.committed_height() < through {
-            retries.push(ReshapeEvent::SeedDeferred { child });
-            return None;
+    ) -> ReshapeEvent {
+        let parent_height = self
+            .hosts_shard(host, parent)
+            .map(ShardChainReader::committed_height);
+        if let Some(event) = seed_gate(parent_height, child, through) {
+            return event;
         }
         let storage = self.hosts[host as usize]
             .shard_io(parent)
@@ -313,7 +302,7 @@ impl SimulationRunner {
                 recovered,
             },
         );
-        Some(ReshapeEvent::Opened { shard: child })
+        ReshapeEvent::Opened { shard: child }
     }
 
     /// Serve one reshape fetch from a committee host's store. A state range
@@ -467,10 +456,9 @@ impl SimulationRunner {
         let Some(snapshot) = self.host_topology(host) else {
             return;
         };
-        let validators: Vec<ValidatorId> = snapshot
-            .seatable_committee_for_shard(shard)
-            .filter(|&validator| self.homes_validator(host, validator))
-            .collect();
+        let validators = seat_validators(&snapshot, shard, |validator| {
+            self.homes_validator(host, validator)
+        });
         if validators.is_empty() {
             return;
         }
