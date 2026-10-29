@@ -43,7 +43,7 @@ use hyperscale_types::{
     Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
     shard_prefix_path,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use super::{SimulationRunner, open_store};
 
@@ -110,7 +110,7 @@ impl SimulationRunner {
             let mut progressed = false;
             for request in requests {
                 if let Some(event) =
-                    self.dispatch_reshape(host, &view, request, &mut broadcasted, &mut retries)
+                    self.dispatch_reshape(host, request, &mut broadcasted, &mut retries)
                 {
                     events.push(event);
                     progressed = true;
@@ -137,6 +137,10 @@ impl SimulationRunner {
             self.placement_epoch[host as usize] = None;
         }
         self.reshape[host as usize] = orch;
+        // The duty's notifies leave now, as production's do, rather than
+        // waiting on the host's next event: a pool observer's dedicated home
+        // runs no shard, so its next event may be a long way off.
+        self.drain_host_io(host);
     }
 
     /// Perform one reshape request, answering with the [`ReshapeEvent`] the
@@ -145,13 +149,19 @@ impl SimulationRunner {
     fn dispatch_reshape(
         &mut self,
         host: NodeIndex,
-        view: &ReshapeView,
         request: ReshapeRequest,
         broadcasted: &mut HashSet<ValidatorId>,
         retries: &mut Vec<ReshapeEvent>,
     ) -> Option<ReshapeEvent> {
         match request {
             ReshapeRequest::OpenStore { shard } => {
+                // A duty only ever prepares a store for a shard this host does
+                // not run yet, so a running target is a duty rediscovered on a
+                // host that kept the shard's loop: its store is that loop's
+                // live store, and the duty is left unopened.
+                if self.hosts_shard(host, shard).is_some() {
+                    return None;
+                }
                 self.reshape_open_store(host, shard);
                 Some(ReshapeEvent::Opened { shard })
             }
@@ -204,20 +214,23 @@ impl SimulationRunner {
                 anchor,
                 recipients,
             } => {
-                // Originate the notify from a recipient's home host — a follower
-                // host (a pool observer's dedicated home) shares no shard with
-                // the target committee, so the signal must come from within its
-                // mesh to reach the receivers that fold the readiness gate. Every
-                // recipient is a member of that committee, so its home serves it.
-                if broadcasted.insert(validator)
-                    && let Some(sender) = self.reshape_notify_origin(&recipients)
-                {
+                // The duty host signs with the keys it holds and notifies from
+                // its own links, so a partition or fault on those links reaches
+                // the readiness gate as it does in production.
+                let idx = usize::try_from(validator.inner()).expect("id fits usize");
+                if self.validator_home.get(idx) != Some(&host) {
+                    warn!(
+                        validator = validator.inner(),
+                        "Reshape ready signal for a validator without a local key; ignored"
+                    );
+                    return None;
+                }
+                if broadcasted.insert(validator) {
                     let Ok(signal) = observer_ready_signal(
                         &self.beacon_network,
                         validator,
                         child,
-                        self.signers[usize::try_from(validator.inner()).expect("id fits usize")]
-                            .as_ref(),
+                        self.signers[idx].as_ref(),
                         anchor,
                         self.epoch_duration_ms,
                     ) else {
@@ -227,7 +240,7 @@ impl SimulationRunner {
                         );
                         return None;
                     };
-                    self.hosts[sender as usize]
+                    self.hosts[host as usize]
                         .network()
                         .notify(&recipients, &ReadySignalNotification::new(signal));
                 }
@@ -241,7 +254,7 @@ impl SimulationRunner {
                 predecessors,
             } => self.reshape_adopt(host, shard, kind, origin, *genesis, predecessors),
             ReshapeRequest::Seat { shard } => {
-                self.reshape_seat(host, view, shard);
+                self.reshape_seat(host, shard);
                 None
             }
         }
@@ -266,7 +279,9 @@ impl SimulationRunner {
     /// Seed a parent half's child store by deep-cloning the host's own retained
     /// parent store onto the child subtree, once that parent chain has committed
     /// through the terminal crossing. While it still lags, carry a deferral to
-    /// the next slice so the seed re-arms.
+    /// the next slice so the seed re-arms. A host with no parent store to seed
+    /// from, or already running the child on a store it keeps, answers
+    /// [`ReshapeEvent::SeedUnavailable`] and the parent half relinquishes.
     fn reshape_seed_from_parent(
         &mut self,
         host: NodeIndex,
@@ -275,10 +290,13 @@ impl SimulationRunner {
         through: BlockHeight,
         retries: &mut Vec<ReshapeEvent>,
     ) -> Option<ReshapeEvent> {
-        let ready = self
-            .hosts_shard(host, parent)
-            .is_some_and(|storage| storage.committed_height() >= through);
-        if !ready {
+        if self.hosts_shard(host, child).is_some() {
+            return Some(ReshapeEvent::SeedUnavailable { child });
+        }
+        let Some(parent_storage) = self.hosts_shard(host, parent) else {
+            return Some(ReshapeEvent::SeedUnavailable { child });
+        };
+        if parent_storage.committed_height() < through {
             retries.push(ReshapeEvent::SeedDeferred { child });
             return None;
         }
@@ -373,18 +391,6 @@ impl SimulationRunner {
         }
     }
 
-    /// The host to originate a ready-signal notify from: the home host of the
-    /// first recipient. Each recipient is a member of the target committee, so
-    /// its home serves the target shard and sits in the mesh the receivers
-    /// fold the gate on. `None` only if no recipient has a home.
-    fn reshape_notify_origin(&self, recipients: &[ValidatorId]) -> Option<NodeIndex> {
-        recipients.iter().find_map(|recipient| {
-            self.validator_home
-                .get(usize::try_from(recipient.inner()).expect("id fits usize"))
-                .copied()
-        })
-    }
-
     /// Serve a certified-header batch for a recognition walk, from any host
     /// that holds `from`'s chain. Mirrors production's local-first read: the
     /// walked shard is terminating, so its committee may already be gone
@@ -444,7 +450,7 @@ impl SimulationRunner {
     /// Seat a prepared duty: install its genesis and start consensus for every
     /// committee member of `shard` this host homes, from the duty's adopted
     /// store.
-    fn reshape_seat(&mut self, host: NodeIndex, view: &ReshapeView, shard: ShardId) {
+    fn reshape_seat(&mut self, host: NodeIndex, shard: ShardId) {
         let Some(PreparedStore {
             storage,
             genesis,
@@ -453,12 +459,17 @@ impl SimulationRunner {
         else {
             return;
         };
+        if self.hosts_shard(host, shard).is_some() {
+            warn!(shard = ?shard, "Reshape seat for an already-hosted shard; dropped");
+            return;
+        }
         let genesis = genesis.expect("reshape seat follows the adopt");
-        let validators: Vec<ValidatorId> = view
-            .committee(shard)
-            .iter()
-            .copied()
-            .filter(|validator| self.homes_validator(host, *validator))
+        let Some(snapshot) = self.host_topology(host) else {
+            return;
+        };
+        let validators: Vec<ValidatorId> = snapshot
+            .seatable_committee_for_shard(shard)
+            .filter(|&validator| self.homes_validator(host, validator))
             .collect();
         if validators.is_empty() {
             return;
@@ -467,9 +478,7 @@ impl SimulationRunner {
     }
 
     /// Install a prepared store on `host`: attach one signer per `validator`
-    /// and commit the genesis through the normal pipeline. Tears down a
-    /// stale chain under the same id first — a merge reforms the grow's
-    /// terminated parent.
+    /// and commit the genesis through the normal pipeline.
     fn seat_shard_with_genesis(
         &mut self,
         host: NodeIndex,
@@ -479,20 +488,6 @@ impl SimulationRunner {
         genesis: &Block,
         recovered: &RecoveredState,
     ) {
-        // Don't clobber a live chain. A duplicate seat — two reshape duties for
-        // one child on a co-hosted host — would otherwise tear down the running
-        // chain and reinstall it at genesis. Skip when this host already runs
-        // `shard` past the genesis we'd install; the deliberate teardown below
-        // still fires for a stale terminated chain (a merge reforms the grow's
-        // terminated parent at a height above its pre-split terminal). Mirrors
-        // the production supervisor dropping a seat for an already-hosted shard.
-        if self
-            .hosts_shard(host, shard)
-            .is_some_and(|s| s.committed_height() > genesis.height())
-        {
-            return;
-        }
-        let _ = self.hosts[host as usize].remove_shard(shard);
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
