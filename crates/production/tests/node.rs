@@ -396,6 +396,37 @@ async fn a_current_thread_caller_starts_and_stops_a_host() {
     node.stop().await.expect("the host stops cleanly");
 }
 
+/// A second host on data another holds is refused before it opens a store,
+/// and gets in once the first has stopped.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_second_host_on_held_data_is_refused() {
+    let fixtures = TestFixtures::new(11, 4);
+    let dir = TempDir::new().unwrap();
+    let chain = network(None);
+    let start = || {
+        Node::start(setup(
+            dir.path(),
+            &fixtures,
+            &[0, 1, 2, 3],
+            net::listen(free_port()),
+            vec![],
+            chain,
+        ))
+    };
+    let first = start().expect("the first host starts");
+    assert!(
+        matches!(start(), Err(NodeError::InUse { path }) if path == dir.path()),
+        "a second host on held data is refused as in use"
+    );
+    first.stop().await.expect("the first host stops cleanly");
+    start()
+        .expect("the data is free once its host stopped")
+        .stop()
+        .await
+        .expect("the second host stops cleanly");
+}
+
 /// A running node takes on another validator through its own handle, and
 /// says why when it will not.
 #[tokio::test(flavor = "multi_thread")]

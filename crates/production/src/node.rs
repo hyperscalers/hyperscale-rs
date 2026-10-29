@@ -7,8 +7,9 @@
 //! process-global beyond the first-wins statics the runner already sets;
 //! tracing, signals and the allocator stay with the embedder.
 
+use std::fs::{File, OpenOptions, TryLockError, create_dir_all};
 use std::io::Error as IoError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -143,6 +144,20 @@ pub enum NodeError {
     /// The consensus or throughput thread pool could not be built.
     #[error("thread pools: {0}")]
     Threads(#[from] ThreadPoolError),
+    /// Another host holds the data directory.
+    #[error("another host holds the data at {path}")]
+    InUse {
+        /// The data directory.
+        path: PathBuf,
+    },
+    /// The data directory could not be made or locked.
+    #[error("data directory {path}: {reason}")]
+    DataDir {
+        /// The data directory.
+        path: PathBuf,
+        /// What the file system reported.
+        reason: String,
+    },
     /// The beacon store under the data directory could not be opened.
     #[error("beacon store at {path}: {reason}")]
     BeaconStore {
@@ -190,6 +205,8 @@ struct Teardown {
     /// The one strong reference to what handle calls reach.
     calls: Arc<HostCalls>,
     dispatch: Arc<PooledDispatch>,
+    /// The data directory's lock, released once every store has closed.
+    lock: File,
 }
 
 impl Teardown {
@@ -205,6 +222,7 @@ impl Teardown {
             gate,
             calls,
             dispatch,
+            lock,
         } = self;
         let outcome = runtime.block_on(running);
         gate.close();
@@ -214,6 +232,7 @@ impl Teardown {
         gate.close_and_wait();
         drop(calls);
         dispatch.wait_idle();
+        drop(lock);
         outcome??;
         Ok(())
     }
@@ -279,7 +298,8 @@ impl Node {
                 .map_err(|e| format!("failed to open database at {}: {e:?}", dir.display()))
         });
 
-        let beacon_path = setup.data_dir.join("beacon").join("db");
+        let lock = lock_data_dir(&setup.data_dir)?;
+        let beacon_path = beacon_data_dir(&setup.data_dir).join("db");
         let beacon_db = Arc::new(
             RocksDbBeaconStorage::open_with_config(&beacon_path, &setup.storage).map_err(|e| {
                 NodeError::BeaconStore {
@@ -333,6 +353,7 @@ impl Node {
                 gate,
                 calls,
                 dispatch,
+                lock,
             }),
         })
     }
@@ -383,6 +404,36 @@ impl Node {
             shutdown.shutdown();
         }
         self.finished().await
+    }
+}
+
+/// Where the host keeps its beacon store under the data directory `root`.
+#[must_use]
+pub fn beacon_data_dir(root: &Path) -> PathBuf {
+    root.join("beacon")
+}
+
+/// Makes the data directory and takes its lock, held for the host's life.
+/// The lock is advisory, between hosts: a second host on the same data is
+/// refused before it opens a store.
+fn lock_data_dir(root: &Path) -> Result<File, NodeError> {
+    let failed = |e: IoError| NodeError::DataDir {
+        path: root.to_path_buf(),
+        reason: e.to_string(),
+    };
+    create_dir_all(root).map_err(failed)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("host.lock"))
+        .map_err(failed)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(NodeError::InUse {
+            path: root.to_path_buf(),
+        }),
+        Err(TryLockError::Error(e)) => Err(failed(e)),
     }
 }
 
