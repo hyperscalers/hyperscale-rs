@@ -30,17 +30,20 @@ use std::{fmt, io};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use hyperscale_metrics::{record_network_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
+use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
 use tokio::spawn;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::spawn_blocking;
-use tokio::time::{sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{debug, warn};
 
+use crate::bind::{self, BindContext, BindError};
 use crate::cooldown::{Cooldown, Refusal, refused_work};
 use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
@@ -49,13 +52,18 @@ use crate::path::PathPolicy;
 use crate::peer::Peer;
 use crate::protocol::{
     RESPONSE_BUSY, RESPONSE_OK, RESPONSE_RELAYED, RESPONSE_SHARD_UNSUPPORTED,
-    RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STOP_REFUSED, STREAM_GOSSIP, STREAM_NOTIFY,
-    STREAM_REQUEST, STREAM_SUBSCRIBE, class_from_byte, class_priority, decode_shard,
+    RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STOP_REFUSED, STREAM_ATTEST, STREAM_GOSSIP,
+    STREAM_NOTIFY, STREAM_REQUEST, STREAM_SUBSCRIBE, class_from_byte, class_priority, decode_shard,
 };
 use crate::serve_budget::{ServeBudget, processor_time};
 
 /// Timeout for reading a stream's header and its request frame.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The least time between two pulls a peer has this host answer: each
+/// costs a signature per validator asked for, and an honest peer pulls
+/// only when its topology learns a validator it was told of.
+const MIN_PULL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Timeout for writing a response. A response may be the largest frame the
 /// protocol allows, and the requester's own timeout stops the stream sooner
@@ -100,6 +108,19 @@ pub struct InboundRouter {
     /// Where gossip and subscription streams go. Unset until the host's
     /// gossip is running; such streams are dropped unread before then.
     fanout: OnceLock<Weak<Fanout>>,
+    /// What answers a pull: the identities this host signs as. Unset
+    /// until the endpoint installs it; a pull is refused before then.
+    attest: OnceLock<BindContext>,
+    /// When each peer last had a pull answered, and whether one is being
+    /// answered now.
+    pulls: DashMap<EndpointId, PullTurn>,
+}
+
+/// A peer's turn at having this host answer a pull.
+#[derive(Clone, Copy)]
+struct PullTurn {
+    at: Instant,
+    open: bool,
 }
 
 impl InboundRouter {
@@ -121,7 +142,14 @@ impl InboundRouter {
             serve_budget: ServeBudget::default(),
             judging: DashMap::new(),
             fanout: OnceLock::new(),
+            attest: OnceLock::new(),
+            pulls: DashMap::new(),
         }
+    }
+
+    /// Answer pulls with `ctx`'s identities from now on.
+    pub(crate) fn install_attest(&self, ctx: BindContext) {
+        let _ = self.attest.set(ctx);
     }
 
     /// Route gossip and subscription streams to `fanout` from now on.
@@ -394,6 +422,9 @@ impl InboundRouter {
         .await
         .map_err(|_| StreamError::Timeout)?
         .map_err(StreamError::Io)?;
+        if kind[0] == STREAM_ATTEST {
+            return self.serve_pull(peer, send, recv).await;
+        }
         if kind[0] != STREAM_REQUEST {
             return Err(StreamError::UnknownStreamKind);
         }
@@ -409,6 +440,59 @@ impl InboundRouter {
         drop(permit);
         self.release(peer.principal);
         result
+    }
+
+    /// Answer one pull: one at a time per peer, and none sooner than
+    /// [`MIN_PULL_INTERVAL`] after its last. A pull outside its turn, or one
+    /// naming nothing this host runs, costs the peer what refusing it cost.
+    async fn serve_pull(
+        &self,
+        peer: Peer,
+        send: SendStream,
+        recv: RecvStream,
+    ) -> Result<(), StreamError> {
+        let Some(ctx) = self.attest.get() else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        let taken = match self.pulls.entry(peer.endpoint) {
+            Entry::Occupied(mut turn) => {
+                let held = *turn.get();
+                if held.open || now < held.at + MIN_PULL_INTERVAL {
+                    false
+                } else {
+                    turn.insert(PullTurn {
+                        at: now,
+                        open: true,
+                    });
+                    true
+                }
+            }
+            Entry::Vacant(turn) => {
+                turn.insert(PullTurn {
+                    at: now,
+                    open: true,
+                });
+                true
+            }
+        };
+        if !taken {
+            self.charge(peer, refused_work(0, Refusal::Fault));
+            return Ok(());
+        }
+        let answered = timeout(REQUEST_READ_TIMEOUT, bind::answer_pull(send, recv, ctx)).await;
+        if let Some(mut turn) = self.pulls.get_mut(&peer.endpoint) {
+            turn.open = false;
+        }
+        match answered {
+            Err(_) => Err(StreamError::Timeout),
+            Ok(Err(error)) => Err(StreamError::from(error)),
+            Ok(Ok(0)) => {
+                self.charge(peer, refused_work(0, Refusal::Fault));
+                Ok(())
+            }
+            Ok(Ok(_)) => Ok(()),
+        }
     }
 
     /// Read one request, run its handler, and write the response.
@@ -518,6 +602,16 @@ enum StreamError {
     UnknownStreamKind,
     MalformedHeader,
     UnknownMessageType,
+}
+
+impl From<BindError> for StreamError {
+    fn from(error: BindError) -> Self {
+        match error {
+            BindError::Io(e) => Self::Io(e),
+            BindError::Frame(e) => Self::Frame(e),
+            _ => Self::MalformedHeader,
+        }
+    }
 }
 
 impl StreamError {

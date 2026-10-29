@@ -40,7 +40,7 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{debug, info, warn};
 
 use crate::address_book::{AddressBook, IngestOutcome, record_sequence, sign_records};
-use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
+use crate::bind::{self, BindContext, Bound, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
 use crate::bind_gate::{BindGate, Origin, Ticket};
 use crate::bootstrap::{self, RESOLVE_INTERVAL};
 use crate::config::{IrohConfig, MAX_RELAYS};
@@ -80,6 +80,11 @@ struct Link {
     dialed_by: EndpointId,
     /// The validator the peer answers as.
     principal: ValidatorId,
+    /// Validators the peer claims to host that this host's topology gave no
+    /// key when it claimed them; each is pulled once the topology does.
+    claimed: BTreeSet<ValidatorId>,
+    /// Whether a pull is under way on this link.
+    pulling: bool,
 }
 
 /// Bytes a host has exchanged in UDP datagrams over its bound connections,
@@ -300,6 +305,7 @@ impl IrohAdapter {
             signed_records: Mutex::new(None),
         });
 
+        inner.router.install_attest(inner.bind.clone());
         let tasks = vec![
             inner.runtime.spawn(Arc::clone(&inner).accept_loop()),
             inner.runtime.spawn(Arc::clone(&inner).maintenance_loop()),
@@ -389,12 +395,16 @@ impl IrohAdapter {
         );
         if let Some(endpoint) = recorded {
             inner.lookup.set_endpoint_info(endpoint.clone());
-            // A wanted validator whose record has just arrived is dialed
-            // now rather than at the next sweep.
-            if inner.wanted_validators.load().contains(&gossip.validator)
-                && !inner.validator_peers.contains_key(&gossip.validator)
-            {
-                inner.dial(endpoint);
+            if !inner.validator_peers.contains_key(&gossip.validator) {
+                if inner.is_linked(endpoint.id) {
+                    // A host already linked that names a validator it has
+                    // not proved is asked to prove it.
+                    inner.claim(endpoint.id, gossip.validator);
+                } else if inner.wanted_validators.load().contains(&gossip.validator) {
+                    // A wanted validator whose record has just arrived is
+                    // dialed now rather than at the next sweep.
+                    inner.dial(endpoint);
+                }
             }
         }
         outcome
@@ -489,9 +499,26 @@ impl IrohAdapter {
         }
     }
 
-    /// Update the validator key map for bind and address verification.
+    /// Update the validator key map for bind and address verification, and
+    /// pull every claim it now lets this host check.
     pub fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
-        self.inner.bind.validator_keys.store(keys);
+        let inner = &self.inner;
+        let checkable: Vec<EndpointId> = inner
+            .links
+            .iter()
+            .filter(|link| link.claimed.iter().any(|v| keys.contains_key(v)))
+            .map(|link| *link.key())
+            .collect();
+        inner.bind.validator_keys.store(keys);
+        for peer in checkable {
+            inner.pull_claims(peer);
+        }
+    }
+
+    /// Note that the linked `peer` signed a record naming `validator`,
+    /// which the topology cannot check yet, so it is pulled once it can.
+    pub(crate) fn claim(&self, peer: EndpointId, validator: ValidatorId) {
+        self.inner.claim(peer, validator);
     }
 
     /// Replace the set of validators this host must hold unicast
@@ -854,7 +881,7 @@ impl Inner {
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, bind::respond(&connection, &self.bind)).await {
-            Ok(Ok(validators)) => self.register(connection, peer, &validators),
+            Ok(Ok(bound)) => self.register(connection, peer, bound),
             Ok(Err(error)) => {
                 warn!(peer = %peer.fmt_short(), %error, "Inbound validator-bind failed");
                 connection.close(CLOSE_BIND_FAILED, b"bind failed");
@@ -937,7 +964,7 @@ impl Inner {
                     .await
                     .map_err(|e| e.to_string())?;
                 match bind::initiate(&connection, &inner.bind).await {
-                    Ok(validators) => Ok((connection, validators)),
+                    Ok(bound) => Ok((connection, bound)),
                     Err(e) => {
                         connection.close(CLOSE_BIND_FAILED, b"bind failed");
                         Err(e.to_string())
@@ -946,9 +973,9 @@ impl Inner {
             })
             .await;
             match outcome {
-                Ok(Ok((connection, validators))) => {
+                Ok(Ok((connection, bound))) => {
                     let dialed_by = inner.endpoint.id();
-                    inner.register(connection, dialed_by, &validators);
+                    inner.register(connection, dialed_by, bound);
                 }
                 Ok(Err(error)) => debug!(peer = %peer.fmt_short(), %error, "Dial failed"),
                 Err(_) => debug!(peer = %peer.fmt_short(), "Dial timed out"),
@@ -963,12 +990,11 @@ impl Inner {
     /// Both sides keep the one dialed by the smaller endpoint id, so they
     /// agree without talking; a second connection from the same dialer
     /// replaces the first, which that dialer has given up on.
-    fn register(
-        self: &Arc<Self>,
-        connection: Connection,
-        dialed_by: EndpointId,
-        validators: &[ValidatorId],
-    ) {
+    fn register(self: &Arc<Self>, connection: Connection, dialed_by: EndpointId, bound: Bound) {
+        let Bound {
+            validators,
+            claimed,
+        } = bound;
         let peer = connection.remote_id();
         // A bind proves at least one validator; the lowest is the one the
         // peer answers as.
@@ -992,12 +1018,14 @@ impl Inner {
                 connection: connection.clone(),
                 dialed_by,
                 principal,
+                claimed: claimed.into_iter().collect(),
+                pulling: false,
             },
         );
         if let Some(superseded) = superseded {
             superseded.connection.close(CLOSE_SUPERSEDED, b"superseded");
         }
-        for validator in validators {
+        for validator in &validators {
             self.validator_peers.insert(*validator, peer);
         }
         self.dial_backoff
@@ -1027,14 +1055,90 @@ impl Inner {
         });
     }
 
-    /// Dial every wanted validator that is unbound and has a record.
+    /// Dial every wanted validator that is unbound and has a record, and
+    /// pull it from a host it names that is already linked.
     fn dial_wanted(self: &Arc<Self>) {
         let candidates = self
             .address_book
             .dial_candidates(&self.wanted_validators.load(), &self.validator_peers);
-        for target in candidates {
-            self.dial(target);
+        for (target, validators) in candidates {
+            if self.is_linked(target.id) {
+                for validator in validators {
+                    self.claim(target.id, validator);
+                }
+            } else {
+                self.dial(target);
+            }
         }
+    }
+
+    /// Note that `peer` claims to host `validator`, and pull it if the
+    /// topology can check it. A link holds at most
+    /// [`MAX_VNODES_PER_BIND`] claims.
+    fn claim(self: &Arc<Self>, peer: EndpointId, validator: ValidatorId) {
+        if self.validator_peers.contains_key(&validator) {
+            return;
+        }
+        if let Some(mut link) = self.links.get_mut(&peer)
+            && link.claimed.len() < MAX_VNODES_PER_BIND
+        {
+            link.claimed.insert(validator);
+        }
+        self.pull_claims(peer);
+    }
+
+    /// Pull, over the link to `peer`, every validator it claims that the
+    /// topology now gives a key, unless a pull is already under way there.
+    fn pull_claims(self: &Arc<Self>, peer: EndpointId) {
+        let keys = self.bind.validator_keys.load();
+        let (connection, wanted) = {
+            let Some(mut link) = self.links.get_mut(&peer) else {
+                return;
+            };
+            if link.pulling {
+                return;
+            }
+            let wanted: Vec<ValidatorId> = link
+                .claimed
+                .iter()
+                .copied()
+                .filter(|validator| keys.contains_key(validator))
+                .collect();
+            if wanted.is_empty() {
+                return;
+            }
+            link.pulling = true;
+            (link.connection.clone(), wanted)
+        };
+        let id = connection.stable_id();
+        let inner = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let outcome = timeout(BIND_TIMEOUT, bind::pull(&connection, &inner.bind, &wanted)).await;
+            // Inserted while the link is held, so a close that evicts it
+            // either comes after and takes these with it, or came before
+            // and leaves nothing to insert into.
+            let Some(mut link) = inner
+                .links
+                .get_mut(&peer)
+                .filter(|link| link.connection.stable_id() == id)
+            else {
+                return;
+            };
+            link.pulling = false;
+            match outcome {
+                Ok(Ok(bound)) => {
+                    for validator in &bound.validators {
+                        link.claimed.remove(validator);
+                        inner.validator_peers.insert(*validator, peer);
+                    }
+                    if !bound.validators.is_empty() {
+                        info!(peer = %peer.fmt_short(), validators = ?bound.validators, "Peer bound more validators");
+                    }
+                }
+                Ok(Err(error)) => debug!(peer = %peer.fmt_short(), %error, "Pull failed"),
+                Err(_) => debug!(peer = %peer.fmt_short(), "Pull timed out"),
+            }
+        });
     }
 
     /// Keep bootstrap peers and wanted validators connected.

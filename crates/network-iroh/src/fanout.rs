@@ -875,6 +875,11 @@ impl Fanout {
         };
         let validator = record.validator;
         if !self.adapter.knows_validator(validator) {
+            // A linked peer naming itself as a validator this host cannot
+            // check yet is asked to prove it once the topology can.
+            if record.endpoint_id == *arrival.sender.endpoint.as_bytes() {
+                self.adapter.claim(arrival.sender.endpoint, validator);
+            }
             self.forget(&item);
             return Some(Verdict::Ignore);
         }

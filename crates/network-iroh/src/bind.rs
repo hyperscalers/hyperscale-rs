@@ -23,9 +23,26 @@
 //! Each side attests as **every** validator it hosts: a multi-vnode process
 //! emits one `(validator_id, signature)` pair per hosted vnode, where
 //! `sig_x_i = sign(x_i_key, "hyperscale-validator-bind-v1" || x_endpoint_id
-//! || their_nonce)`. The verifier checks every signature against that
-//! validator's consensus key from the topology; any failure rejects the
-//! whole exchange.
+//! || their_nonce)`. The verifier checks each signature against that
+//! validator's consensus key from the topology. A validator the topology
+//! gives no key yet, because its registration has not folded here, is set
+//! aside as claimed rather than refusing the exchange; any signature that
+//! does not verify, or an exchange proving no validator, refuses it.
+//!
+//! # Pulling an attestation
+//!
+//! A claim the verifier could not check is proved later over the same
+//! connection, once the verifier's topology holds its key. The verifier
+//! opens a bidirectional stream marked
+//! [`STREAM_ATTEST`](crate::protocol::STREAM_ATTEST), names a fresh nonce
+//! and the validators it wants, and the attester answers with a signature
+//! for each one it hosts, made exactly as a bind's.
+//!
+//! ```text
+//! Verifier                                                   Attester
+//!     ── nonce (32B), [count][count × vid] ───────────────────────▶
+//!     ◀── [count][count × (vid, sig)], finish ──────────────────────
+//! ```
 //!
 //! The listener signs before the dialer has proved anything, so the
 //! endpoint runs the exchange only for a dialer that has a turn at it
@@ -49,7 +66,7 @@ use tracing::{error, info};
 
 use crate::config::VersionInteroperabilityMode;
 use crate::framing::{self, FrameError};
-use crate::protocol::{STREAM_BIND, local_version};
+use crate::protocol::{STREAM_ATTEST, STREAM_BIND, local_version};
 
 /// Per-vnode signing identity the host attests as. A multi-vnode host
 /// supplies one entry per vnode; each contributes one `(validator_id,
@@ -74,6 +91,17 @@ const PAIR_LEN: usize = 8 + 96;
 const VERSION_PREFIX: &str = "hyperscale/";
 
 // ─── Wire format ────────────────────────────────────────────────────────
+
+/// What a bind or a pull established: the validators the peer proved it
+/// hosts, and those it claimed that the verifier's topology gives no key
+/// yet.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Bound {
+    /// Validators proved by a signature over this connection.
+    pub validators: Vec<ValidatorId>,
+    /// Validators claimed and not yet checkable.
+    pub claimed: Vec<ValidatorId>,
+}
 
 /// Append one attestation list to `buf`: `[2-byte LE count][count × pair]`.
 fn write_attestations(buf: &mut Vec<u8>, attestations: &[(ValidatorId, ConsensusSignature)]) {
@@ -224,8 +252,10 @@ fn verify_bind(
     }
 }
 
-/// Verify every `(vid, sig)` claim against the locally chosen nonce. All
-/// must verify: any failure rejects the whole bind.
+/// Verify every `(vid, sig)` claim against the locally chosen nonce: a
+/// claim whose validator `keys` holds must verify, and one it does not hold
+/// is set aside as claimed. Only the verified ones are bound; nothing
+/// downstream sees the rest as proven.
 fn verify_all(
     verifier: &dyn Verifier,
     network: &NetworkDefinition,
@@ -233,11 +263,34 @@ fn verify_all(
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
     attestations: &[(ValidatorId, ConsensusSignature)],
     keys: &ValidatorKeyMap,
-) -> Result<(), BindError> {
+) -> Result<Bound, BindError> {
+    let mut bound = Bound::default();
     for (vid, sig) in attestations {
-        verify_bind(verifier, network, endpoint, *vid, nonce, sig, keys)?;
+        if keys.contains_key(vid) {
+            verify_bind(verifier, network, endpoint, *vid, nonce, sig, keys)?;
+            bound.validators.push(*vid);
+        } else {
+            bound.claimed.push(*vid);
+        }
     }
-    Ok(())
+    Ok(bound)
+}
+
+/// [`verify_all`] for a bind, which has to prove at least one validator:
+/// a connection standing for no validator the verifier knows binds nothing.
+fn verify_bind_exchange(
+    verifier: &dyn Verifier,
+    network: &NetworkDefinition,
+    endpoint: EndpointId,
+    nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
+    attestations: &[(ValidatorId, ConsensusSignature)],
+    keys: &ValidatorKeyMap,
+) -> Result<Bound, BindError> {
+    let bound = verify_all(verifier, network, endpoint, nonce, attestations, keys)?;
+    match bound.claimed.first() {
+        Some(&unknown) if bound.validators.is_empty() => Err(BindError::UnknownValidator(unknown)),
+        _ => Ok(bound),
+    }
 }
 
 // ─── Context ────────────────────────────────────────────────────────────
@@ -264,6 +317,15 @@ impl BindContext {
     /// vnode whose signer cannot sign contributes no attestation; the
     /// exchange proceeds with the rest.
     fn sign_all(&self, remote_nonce: &[u8; VALIDATOR_BIND_NONCE_LEN]) -> Attestations {
+        self.sign_where(remote_nonce, |_| true)
+    }
+
+    /// [`Self::sign_all`] for the hosted vnodes `wanted` selects.
+    fn sign_where(
+        &self,
+        remote_nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
+        wanted: impl Fn(ValidatorId) -> bool,
+    ) -> Attestations {
         let message = signed_bytes(
             &ValidatorBindMessage {
                 endpoint_id: *self.local_endpoint.as_bytes(),
@@ -273,6 +335,7 @@ impl BindContext {
         );
         self.local_vnodes
             .iter()
+            .filter(|(vid, _)| wanted(*vid))
             .filter_map(|(vid, key)| match key.sign(&message) {
                 Ok(sig) => Some((*vid, sig)),
                 Err(err) => {
@@ -307,8 +370,8 @@ impl BindContext {
         remote: EndpointId,
         nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
         attestations: &Attestations,
-    ) -> Result<(), BindError> {
-        verify_all(
+    ) -> Result<Bound, BindError> {
+        verify_bind_exchange(
             self.verifier.as_ref(),
             &self.network,
             remote,
@@ -332,33 +395,28 @@ async fn read(recv: &mut RecvStream) -> Result<Vec<u8>, BindError> {
         .map_err(BindError::Frame)
 }
 
-/// The validators `attestations` proved, logged against their peer.
-fn proven(remote: EndpointId, attestations: &Attestations, side: &str) -> Vec<ValidatorId> {
-    attestations
-        .iter()
-        .map(|(vid, _)| {
-            info!(
-                peer = %remote.fmt_short(),
-                validator_id = vid.inner(),
-                side,
-                "Validator-bind verified"
-            );
-            *vid
-        })
-        .collect()
+/// `bound`, its proven validators logged against their peer.
+fn proven(remote: EndpointId, bound: Bound, side: &str) -> Bound {
+    for vid in &bound.validators {
+        info!(
+            peer = %remote.fmt_short(),
+            validator_id = vid.inner(),
+            side,
+            "Validator-bind verified"
+        );
+    }
+    bound
 }
 
 /// Run the exchange as the side that dialed `connection`. Returns the
-/// validators the peer proved it hosts.
+/// validators the peer proved it hosts and those it claimed unchecked.
 ///
 /// # Errors
 ///
 /// Returns [`BindError`] when the stream fails, the peer's version is
-/// incompatible, or any of its attestations does not verify.
-pub async fn initiate(
-    connection: &Connection,
-    ctx: &BindContext,
-) -> Result<Vec<ValidatorId>, BindError> {
+/// incompatible, any of its attestations does not verify, or it proves no
+/// validator the topology holds.
+pub async fn initiate(connection: &Connection, ctx: &BindContext) -> Result<Bound, BindError> {
     let remote = connection.remote_id();
     let (mut send, mut recv) = connection
         .open_bi()
@@ -375,27 +433,25 @@ pub async fn initiate(
     ctx.check_version(&read(&mut recv).await?)?;
     let (remote_attestations, remote_nonce) =
         decode_response(&read(&mut recv).await?).ok_or(BindError::InvalidMessage)?;
-    ctx.verify(remote, &our_nonce, &remote_attestations)?;
+    let bound = ctx.verify(remote, &our_nonce, &remote_attestations)?;
 
     write(&mut send, &encode_final(&ctx.sign_all(&remote_nonce))).await?;
     send.finish()
         .map_err(|e| BindError::Io(io::Error::other(e)))?;
 
-    Ok(proven(remote, &remote_attestations, "dialer"))
+    Ok(proven(remote, bound, "dialer"))
 }
 
 /// Run the exchange as the side that accepted `connection`. Returns the
-/// validators the peer proved it hosts.
+/// validators the peer proved it hosts and those it claimed unchecked.
 ///
 /// # Errors
 ///
 /// Returns [`BindError`] when the peer's first stream is not a bind stream,
-/// the stream fails, the peer's version is incompatible, or any of its
-/// attestations does not verify.
-pub async fn respond(
-    connection: &Connection,
-    ctx: &BindContext,
-) -> Result<Vec<ValidatorId>, BindError> {
+/// the stream fails, the peer's version is incompatible, any of its
+/// attestations does not verify, or it proves no validator the topology
+/// holds.
+pub async fn respond(connection: &Connection, ctx: &BindContext) -> Result<Bound, BindError> {
     let remote = connection.remote_id();
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -425,9 +481,122 @@ pub async fn respond(
 
     let remote_attestations =
         decode_final(&read(&mut recv).await?).ok_or(BindError::InvalidMessage)?;
-    ctx.verify(remote, &our_nonce, &remote_attestations)?;
+    let bound = ctx.verify(remote, &our_nonce, &remote_attestations)?;
 
-    Ok(proven(remote, &remote_attestations, "listener"))
+    Ok(proven(remote, bound, "listener"))
+}
+
+/// Encode a pull's request: `[32-byte nonce][2-byte LE count][count × 8-byte
+/// LE vid]`.
+fn encode_pull(nonce: &[u8; VALIDATOR_BIND_NONCE_LEN], wanted: &[ValidatorId]) -> Vec<u8> {
+    let count = u16::try_from(wanted.len()).expect("caller bounds a pull by MAX_VNODES_PER_BIND");
+    let mut buf = Vec::with_capacity(VALIDATOR_BIND_NONCE_LEN + 2 + wanted.len() * 8);
+    buf.extend_from_slice(nonce);
+    buf.extend_from_slice(&count.to_le_bytes());
+    for vid in wanted {
+        buf.extend_from_slice(&vid.to_le_bytes());
+    }
+    buf
+}
+
+/// Decode a pull's request. Rejects an empty or oversized list, a truncated
+/// or overlong body, and a repeated id.
+fn decode_pull(data: &[u8]) -> Option<([u8; VALIDATOR_BIND_NONCE_LEN], Vec<ValidatorId>)> {
+    let nonce: [u8; VALIDATOR_BIND_NONCE_LEN] =
+        data.get(..VALIDATOR_BIND_NONCE_LEN)?.try_into().ok()?;
+    let rest = &data[VALIDATOR_BIND_NONCE_LEN..];
+    let count = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+    if count == 0 || count > MAX_VNODES_PER_BIND || rest.len() != 2 + count * 8 {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(count);
+    let mut wanted = Vec::with_capacity(count);
+    for chunk in rest[2..].as_chunks::<8>().0 {
+        let vid = ValidatorId::new(u64::from_le_bytes(*chunk));
+        if !seen.insert(vid) {
+            return None;
+        }
+        wanted.push(vid);
+    }
+    Some((nonce, wanted))
+}
+
+/// Encode a pull's answer: `[2-byte LE count][count × pair]`, empty when the
+/// attester hosts none of what was asked.
+fn encode_pull_answer(attestations: &[(ValidatorId, ConsensusSignature)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + attestations.len() * PAIR_LEN);
+    write_attestations(&mut buf, attestations);
+    buf
+}
+
+/// Decode a pull's answer.
+fn decode_pull_answer(data: &[u8]) -> Option<Attestations> {
+    if data == [0, 0] {
+        return Some(Vec::new());
+    }
+    let (pairs, rest) = read_attestations(data)?;
+    rest.is_empty().then_some(pairs)
+}
+
+/// Ask the peer at the far end of `connection` to prove it hosts `wanted`,
+/// as the verifier. Returns the ones it proved, and any it answered for that
+/// the verifier's topology still gives no key.
+///
+/// # Errors
+///
+/// Returns [`BindError`] when the stream fails or an answered signature
+/// does not verify.
+pub async fn pull(
+    connection: &Connection,
+    ctx: &BindContext,
+    wanted: &[ValidatorId],
+) -> Result<Bound, BindError> {
+    let remote = connection.remote_id();
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| BindError::StreamOpen(e.to_string()))?;
+    send.write_all(&[STREAM_ATTEST])
+        .await
+        .map_err(|e| BindError::Io(io::Error::other(e)))?;
+    let nonce: [u8; VALIDATOR_BIND_NONCE_LEN] = random();
+    write(&mut send, &encode_pull(&nonce, wanted)).await?;
+    send.finish()
+        .map_err(|e| BindError::Io(io::Error::other(e)))?;
+    let answered = decode_pull_answer(&read(&mut recv).await?).ok_or(BindError::InvalidMessage)?;
+    // Only what was asked counts: an answer naming anything else is not one.
+    if answered.iter().any(|(vid, _)| !wanted.contains(vid)) {
+        return Err(BindError::InvalidMessage);
+    }
+    let bound = verify_all(
+        ctx.verifier.as_ref(),
+        &ctx.network,
+        remote,
+        &nonce,
+        &answered,
+        &ctx.validator_keys.load(),
+    )?;
+    Ok(proven(remote, bound, "pull"))
+}
+
+/// Answer a pull read from `recv`, its stream kind already taken: sign for
+/// each validator asked for that this host runs. Returns how many it signed
+/// for.
+///
+/// # Errors
+///
+/// Returns [`BindError`] when the stream fails or the request is malformed.
+pub async fn answer_pull(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    ctx: &BindContext,
+) -> Result<usize, BindError> {
+    let (nonce, wanted) = decode_pull(&read(&mut recv).await?).ok_or(BindError::InvalidMessage)?;
+    let attestations = ctx.sign_where(&nonce, |vid| wanted.contains(&vid));
+    write(&mut send, &encode_pull_answer(&attestations)).await?;
+    send.finish()
+        .map_err(|e| BindError::Io(io::Error::other(e)))?;
+    Ok(attestations.len())
 }
 
 /// Open a bind exchange on `connection` as a dialer that proves nothing:
@@ -549,6 +718,74 @@ mod tests {
         let mut short = encode_final(&[pair_for(1), pair_for(2)]);
         short.pop();
         assert!(decode_final(&short).is_none());
+    }
+
+    /// A bind binds the validators the verifier knows and sets the rest
+    /// aside: a known one with a bad signature refuses the whole exchange,
+    /// and so does an exchange proving nothing the verifier knows.
+    #[test]
+    fn a_bind_binds_only_the_validators_its_verifier_knows() {
+        let known_key = BlsSigner::generate();
+        let unknown_key = BlsSigner::generate();
+        let (known, unknown) = (ValidatorId::new(1), ValidatorId::new(2));
+        let nonce = [7u8; VALIDATOR_BIND_NONCE_LEN];
+        let keys = keys_for(known, known_key.public_key());
+        let check = |attestations: &[(ValidatorId, ConsensusSignature)]| {
+            verify_bind_exchange(
+                &BlsVerifier,
+                &NetworkDefinition::simulator(),
+                endpoint(1),
+                &nonce,
+                attestations,
+                &keys,
+            )
+        };
+        let both = [
+            (known, signature(&known_key, endpoint(1), nonce)),
+            (unknown, signature(&unknown_key, endpoint(1), nonce)),
+        ];
+        assert_eq!(
+            check(&both).unwrap(),
+            Bound {
+                validators: vec![known],
+                claimed: vec![unknown],
+            },
+        );
+        let forged = [
+            (known, signature(&unknown_key, endpoint(1), nonce)),
+            (unknown, signature(&unknown_key, endpoint(1), nonce)),
+        ];
+        assert!(matches!(check(&forged), Err(BindError::InvalidSignature(v)) if v == known));
+        let strangers = [(unknown, signature(&unknown_key, endpoint(1), nonce))];
+        assert!(matches!(check(&strangers), Err(BindError::UnknownValidator(v)) if v == unknown));
+    }
+
+    #[test]
+    fn a_pull_and_its_answer_roundtrip() {
+        let nonce = [3u8; VALIDATOR_BIND_NONCE_LEN];
+        let wanted = vec![ValidatorId::new(4), ValidatorId::new(9)];
+        assert_eq!(
+            decode_pull(&encode_pull(&nonce, &wanted)),
+            Some((nonce, wanted))
+        );
+        let pairs = vec![pair_for(4)];
+        assert_eq!(decode_pull_answer(&encode_pull_answer(&pairs)), Some(pairs));
+        assert_eq!(
+            decode_pull_answer(&encode_pull_answer(&[])),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_malformed_pull_is_refused() {
+        let nonce = [3u8; VALIDATOR_BIND_NONCE_LEN];
+        assert!(decode_pull(&encode_pull(&nonce, &[])).is_none());
+        let repeated = [ValidatorId::new(4), ValidatorId::new(4)];
+        assert!(decode_pull(&encode_pull(&nonce, &repeated)).is_none());
+        let mut trailing = encode_pull(&nonce, &[ValidatorId::new(4)]);
+        trailing.push(0);
+        assert!(decode_pull(&trailing).is_none());
+        assert!(decode_pull(&nonce).is_none());
     }
 
     #[test]

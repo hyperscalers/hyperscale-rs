@@ -302,20 +302,20 @@ impl AddressBook {
         self.named.contains_key(&Named::Address(addr))
     }
 
-    /// Endpoints to dial so every validator in `wanted` becomes reachable:
-    /// the wanted validators with no live bind entry in `bound` whose
-    /// address is known, deduplicated by endpoint (a multi-vnode host
-    /// announces the same endpoint for each of its validators). A validator
-    /// that is wanted, unbound, and absent from the book resolves nothing;
-    /// the caller retries once its announcement arrives.
+    /// Endpoints to reach so every validator in `wanted` becomes reachable,
+    /// each beside the wanted validators it names: the wanted validators
+    /// with no live bind entry in `bound` whose address is known, grouped
+    /// by endpoint (a multi-vnode host announces the same endpoint for each
+    /// of its validators). A validator that is wanted, unbound, and absent
+    /// from the book resolves nothing; the caller retries once its
+    /// announcement arrives.
     #[must_use]
     pub(crate) fn dial_candidates(
         &self,
         wanted: &BTreeSet<ValidatorId>,
         bound: &DashMap<ValidatorId, EndpointId>,
-    ) -> Vec<EndpointAddr> {
-        let mut seen: HashSet<EndpointId> = HashSet::new();
-        let mut candidates = Vec::new();
+    ) -> Vec<(EndpointAddr, Vec<ValidatorId>)> {
+        let mut candidates: Vec<(EndpointAddr, Vec<ValidatorId>)> = Vec::new();
         for &validator in wanted {
             if bound.contains_key(&validator) {
                 continue;
@@ -323,8 +323,12 @@ impl AddressBook {
             let Some(record) = self.get(validator) else {
                 continue;
             };
-            if seen.insert(record.endpoint.id) {
-                candidates.push(record.endpoint);
+            match candidates
+                .iter_mut()
+                .find(|(endpoint, _)| endpoint.id == record.endpoint.id)
+            {
+                Some((_, validators)) => validators.push(validator),
+                None => candidates.push((record.endpoint, vec![validator])),
             }
         }
         candidates
@@ -600,11 +604,12 @@ mod tests {
             .collect();
 
         // The bound validator needs no dial, the co-hosted pair collapses
-        // to one endpoint, and the validator with no record resolves
-        // nothing.
+        // to one endpoint naming both, and the validator with no record
+        // resolves nothing.
         let candidates = book.dial_candidates(&wanted, &bound);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].id, endpoint(2).id);
+        assert_eq!(candidates[0].0.id, endpoint(2).id);
+        assert_eq!(candidates[0].1, vec![cohost_a, cohost_b]);
 
         // Unwanted records are still there for a host looking for anyone.
         let anyone = book.endpoints_except(8, |id| id == endpoint(1).id);

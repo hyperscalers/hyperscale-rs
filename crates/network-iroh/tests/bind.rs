@@ -298,6 +298,65 @@ async fn a_validator_unknown_to_the_topology_binds_once_its_key_arrives() {
     );
 }
 
+/// A host carrying a validator its peer's topology does not hold yet still
+/// binds the ones it does, and the peer proves the rest over the same link
+/// once its topology learns them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validator_registered_after_its_host_bound_is_pulled_over_the_link() {
+    let fixtures = TestFixtures::new(7, 3);
+    let all_keys = fixtures.validator_key_map();
+    let without_two: ValidatorKeyMap = all_keys
+        .iter()
+        .filter(|(validator, _)| **validator != vid(2))
+        .map(|(validator, key)| (*validator, *key))
+        .collect();
+
+    let mut spec = HostSpec::new(&fixtures, &[0]);
+    spec.keys = Some(Arc::new(without_two));
+    let host0 = spec.bind().await;
+    let mut spec = HostSpec::new(&fixtures, &[1, 2]);
+    spec.bootstrap = vec![host0.endpoint_addr()];
+    let host1 = spec.bind().await;
+
+    assert!(
+        wait_for(BIND_BUDGET, || resolves(&host0, &[1], &host1)).await,
+        "the validator host0 knows binds"
+    );
+    assert_eq!(
+        host0.peer_for_validator(vid(2)),
+        None,
+        "the one it does not know is never routable"
+    );
+
+    host0.update_validator_keys(all_keys);
+    assert!(
+        wait_for(Duration::from_secs(2), || resolves(&host0, &[1, 2], &host1)).await,
+        "the claimed validator is pulled as soon as host0's topology holds it"
+    );
+    assert_eq!(
+        host0.connected_peers(),
+        vec![host1.local_endpoint_id()],
+        "over the link it already had"
+    );
+}
+
+/// A host whose signature for a validator its peer knows does not verify is
+/// refused whole, whatever else it attests.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_signature_beside_a_true_one_is_refused() {
+    let fixtures = TestFixtures::new(7, 3);
+    let host0 = HostSpec::new(&fixtures, &[0]).bind().await;
+    let mut spec = HostSpec::new(&fixtures, &[1, 2]);
+    spec.bootstrap = vec![host0.endpoint_addr()];
+    spec.signers = Some(vec![fixtures.signer(1), Arc::new(BlsSigner::generate())]);
+    let impostor = spec.bind().await;
+
+    sleep(REFUSAL_WATCH).await;
+    assert_eq!(host0.peer_for_validator(vid(1)), None);
+    assert_eq!(host0.peer_for_validator(vid(2)), None);
+    assert_eq!(impostor.cached_peer_count(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_that_never_binds_is_closed() {
     let fixtures = TestFixtures::new(7, 1);

@@ -17,6 +17,11 @@ pub const REDIAL_ALPN: &[u8] = b"hyperscale/redial/1";
 /// First byte of the stream that carries the validator bind handshake.
 pub const STREAM_BIND: u8 = 1;
 
+/// First byte of a bidirectional stream on which a bound peer is asked to
+/// prove validators it claimed and could not yet be checked for
+/// ([`crate::bind::pull`]).
+pub const STREAM_ATTEST: u8 = 6;
+
 /// First byte of a unidirectional stream of notifications, all of one
 /// class.
 pub const STREAM_NOTIFY: u8 = 2;
