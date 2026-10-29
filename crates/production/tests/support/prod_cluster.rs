@@ -49,9 +49,17 @@ struct StartArgs<'a> {
     seed: u64,
     epoch_ms: u64,
     accounts: Vec<(PrincipalAddr, u128)>,
-    /// Pool extras to host but leave out of beacon genesis; nonzero only
-    /// for a cluster [`grow_and_hold`] registers them on.
+    /// Pool extras to host but leave out of beacon genesis: those
+    /// [`grow_and_hold`] registers, or newcomers a scenario seats.
     staged_pool_extras: u32,
+    /// Retunes the beacon chain the cluster starts on; its epoch length
+    /// is the one the cluster's budgets count in.
+    chain: fn(BeaconChainConfig) -> BeaconChainConfig,
+}
+
+/// The beacon chain as the config sizes it.
+const fn stock_chain(chain: BeaconChainConfig) -> BeaconChainConfig {
+    chain
 }
 
 /// A [`FaultableCluster::drop_type_between_members`] rule: its edge, the
@@ -104,6 +112,30 @@ impl ProdCluster {
             epoch_ms,
             accounts,
             staged_pool_extras: 0,
+            chain: stock_chain,
+        })
+    }
+
+    /// A genesis cluster from `config` with its last `staged` pool extras
+    /// hosted but left out of beacon genesis, for a scenario to seat as
+    /// newcomers, on the beacon chain `chain` retunes. The mirror of
+    /// `SimCluster::with_staged_newcomers`.
+    #[must_use]
+    pub fn start_with_staged_newcomers(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: Vec<(PrincipalAddr, u128)>,
+        staged: u32,
+        chain: fn(BeaconChainConfig) -> BeaconChainConfig,
+    ) -> Self {
+        let epoch_ms = BeaconChainConfig::default().epoch_duration_ms;
+        Self::start_full(&StartArgs {
+            config,
+            seed,
+            epoch_ms,
+            accounts,
+            staged_pool_extras: staged,
+            chain,
         })
     }
 
@@ -126,7 +158,7 @@ impl ProdCluster {
         let (spec, withholding) = Self::spec(args);
         let hosted = u32::try_from(withholding.len()).expect("validator count fits u32");
         let staged = hosted - args.staged_pool_extras..hosted;
-        let epoch_ms = args.epoch_ms;
+        let epoch_ms = spec.beacon_chain_config.epoch_duration_ms;
         // Claim the global recorder before the runner installs its Prometheus one
         // (`set_global_recorder` is first-wins), so `metric()` reads node counters.
         // Every `ProdCluster` claims it, so all prod scenario tests — fault or
@@ -221,6 +253,7 @@ impl ProdCluster {
             epoch_ms,
             accounts,
             staged_pool_extras: config.staged_pool_extras(),
+            chain: stock_chain,
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
@@ -267,7 +300,7 @@ impl ProdCluster {
         let spec = ClusterSpec {
             genesis,
             hosts,
-            beacon_chain_config: BeaconChainConfig {
+            beacon_chain_config: (args.chain)(BeaconChainConfig {
                 epoch_duration_ms: args.epoch_ms,
                 shard_size: config.shard_size,
                 reshape_thresholds: ReshapeThresholds {
@@ -275,7 +308,7 @@ impl ProdCluster {
                     split_fullness: u32::MAX,
                 },
                 ..BeaconChainConfig::default()
-            },
+            }),
             // Match the simulation's genesis, so a scenario's accounts
             // behave identically on both harnesses. Every cluster funds
             // the pool operator and seats the pools: the founding pool's
