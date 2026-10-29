@@ -922,10 +922,6 @@ mod tests {
             self.participant.participation_delta(&self.fold, effects)
         }
 
-        fn standing_lookahead_join(&self) -> Option<ParticipationChange> {
-            self.participant.standing_lookahead_join(&self.fold)
-        }
-
         fn spc_recipients(&self) -> Vec<ValidatorId> {
             self.participant.spc_recipients(&self.fold)
         }
@@ -5568,39 +5564,6 @@ mod tests {
         // the action fires at exactly one commit.
         coord.fold.state.shard_committees = coord.fold.state.next_shard_committees.clone();
         assert_eq!(coord.participation_delta(&SlotEffects::default()), None);
-    }
-
-    /// A participant started after the adoption that drew it into a
-    /// lookahead seat is owed that join, and only the join; one whose next
-    /// seat is its seat now is owed nothing.
-    #[test]
-    fn a_participant_started_late_is_owed_its_lookahead_join() {
-        let mut coord = fresh_coord();
-        assert_eq!(coord.standing_lookahead_join(), None);
-
-        let from = ShardId::ROOT;
-        let to = ShardId::leaf(1, 1);
-        let me = coord.me();
-        let mut moved = coord.fold.state.next_shard_committees[&from].clone();
-        moved.members.retain(|&v| v != me);
-        coord.fold.state.next_shard_committees.insert(from, moved);
-        coord
-            .fold
-            .state
-            .next_shard_committees
-            .insert(to, ShardCommittee { members: vec![me] });
-
-        let owed = coord
-            .standing_lookahead_join()
-            .expect("a lookahead seat is owed its join");
-        assert_eq!(owed.join, Some(to));
-        assert_eq!(owed.leave, None, "a leave is read off committed state");
-        assert_eq!(owed.observe, None);
-        assert_eq!(owed.keep, None);
-
-        // Unseated next: nothing to join.
-        remove_me(&mut coord.fold.state.next_shard_committees, me);
-        assert_eq!(coord.standing_lookahead_join(), None);
     }
 
     /// Another validator's move is invisible to this coordinator — the

@@ -1672,26 +1672,6 @@ impl BeaconParticipant {
         })
     }
 
-    /// The join a participant starting now owes the seat its committed
-    /// lookahead already places it on, where that differs from its seat
-    /// now: the delta [`Self::participation_delta`] emitted at the adoption
-    /// that drew it, which a participant started after that adoption never
-    /// saw. Only the join: a leave, an observer and a keeper duty are read
-    /// off committed state by whoever acts on them.
-    #[must_use]
-    pub fn standing_lookahead_join(&self, fold: &BeaconFold) -> Option<ParticipationChange> {
-        let current = self.placement(fold, &fold.state.shard_committees);
-        let next = self.placement(fold, &fold.state.next_shard_committees);
-        (next != current && next.is_some()).then(|| ParticipationChange {
-            validator: self.me,
-            join: next,
-            leave: None,
-            observe: None,
-            keep: None,
-            effective_epoch: fold.state.current_epoch.next(),
-        })
-    }
-
     /// The shard `committees` seat this participant on as a member, unless
     /// that seat is the one it observes.
     fn placement(
