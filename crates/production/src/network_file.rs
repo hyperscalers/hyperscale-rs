@@ -417,7 +417,7 @@ impl NetworkFile {
 /// # Errors
 ///
 /// When a peer or relay is malformed.
-pub fn iroh_config(
+fn iroh_config(
     secret_key: SecretKey,
     peers: &[String],
     relays: &[String],
@@ -459,7 +459,7 @@ pub fn iroh_config(
 ///
 /// A definition is fixed by which network it is, not assembled field by
 /// field: the name is the whole of it.
-pub mod network_name {
+mod network_name {
     use std::str::FromStr;
 
     use hyperscale_types::NetworkDefinition;
