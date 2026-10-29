@@ -1654,7 +1654,7 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
     // The record the leg's crossing writes is value the world still holds
     // while it stands, and value nothing can reach once the span closes.
     world.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario stake derives")
             .legs,
     ));
@@ -1762,7 +1762,7 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
     // The record the leg's crossing writes is value the world still holds
     // while it stands, owed to the recipient.
     world.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario transfer derives")
             .legs,
     ));
@@ -1909,8 +1909,8 @@ pub fn a_consumer_never_committing_declines_a_pushed_record<C: FaultableCluster>
     let validity = short_validity(c);
     let tx = build_bounded_transfer_tx(&payer_key, from, to, BOUNDED_PAYMENT, validity);
     let price = declared_price(c, &tx);
-    let derived = tx
-        .try_derived(c.derivation().as_ref())
+    let derived = c
+        .with_derivation(|derivation| tx.try_derived(derivation))
         .expect("a scenario payment derives");
     assert_eq!(
         derived
@@ -2141,7 +2141,7 @@ pub fn more_records_than_the_cap_are_declined_in_turn<C: FaultableCluster>(c: &m
         let tx = build_bounded_transfer_tx(key, *payer, to, BOUNDED_PAYMENT, validity);
         price += declared_price(c, &tx);
         world.owing(crossing_records(
-            &tx.try_derived(c.derivation().as_ref())
+            &c.with_derivation(|derivation| tx.try_derived(derivation))
                 .expect("a scenario payment derives")
                 .legs,
         ));
@@ -2436,7 +2436,7 @@ pub fn a_delivery_lands_past_every_window_once_its_record_arrives<C: FaultableCl
     let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
     let price = declared_price(c, &tx);
     world.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario transfer derives")
             .legs,
     ));

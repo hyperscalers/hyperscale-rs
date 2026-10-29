@@ -710,7 +710,7 @@ fn issue_a_leg_under_a_cut_push<C: FaultableCluster>(
     let price = declared_price(c, &tx);
     let past_window = Deadline::of_transaction(&tx).at().plus(MAX_VALIDITY_RANGE);
     let records = crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario transfer derives")
             .legs,
     );
@@ -1269,7 +1269,7 @@ pub fn an_owed_crossing_a_merge_converges_is_credited_on_the_successor<C: Faulta
     let mut charges = Charges::default();
     let tx = build_transfer_tx(&payer_key, payer, recipient, 100, validity_around(c.now()));
     let records = crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario transfer derives")
             .legs,
     );

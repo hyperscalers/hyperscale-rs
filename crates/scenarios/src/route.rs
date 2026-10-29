@@ -237,7 +237,7 @@ pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: Cluster
         validity_around(c.now()),
     );
     let records: Vec<SubstateKey> = records_by_road(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario route derives")
             .legs,
     )
@@ -1535,8 +1535,7 @@ pub fn a_stall_past_the_finalization_delay_states_every_member_of_its_tick<C: Fa
 
     let routes = near_among_long_routes(c.now(), &traders, (&venues[0], &venues[1]));
     let near = routes[0].hash();
-    routes[0]
-        .try_declared(c.derivation().as_ref())
+    c.with_derivation(|derivation| routes[0].try_declared(derivation))
         .expect("a scenario route declares its terms");
     let deadline = Deadline::of_transaction(&routes[0]);
     let hashes: Vec<TxHash> = routes.iter().map(Transaction::hash).collect();
@@ -1631,8 +1630,7 @@ struct FeeHeld {
 
 impl FeeHeld {
     fn of<C: Cluster>(c: &C, route: &Transaction, sponsor: PrincipalAddr) -> Self {
-        route
-            .try_declared(c.derivation().as_ref())
+        c.with_derivation(|derivation| route.try_declared(derivation))
             .expect("a route declares its terms");
         let fee = FeeTerms::of(route);
         Self {
@@ -1883,8 +1881,8 @@ fn crossing_between<C: Cluster>(
     producer: ShardId,
     consumer: ShardId,
 ) -> CrossingId {
-    let legs = &route
-        .try_derived(c.derivation().as_ref())
+    let legs = &c
+        .with_derivation(|derivation| route.try_derived(derivation))
         .expect("a scenario route derives")
         .legs;
     let trie = ShardTrie::uniform(2);
@@ -2089,7 +2087,7 @@ fn drive_routes<C: Cluster>(
             validity_around(c.now()),
         );
         records.extend(records_by_road(
-            &tx.try_derived(c.derivation().as_ref())
+            &c.with_derivation(|derivation| tx.try_derived(derivation))
                 .expect("a scenario route derives")
                 .legs,
         ));
@@ -2845,8 +2843,7 @@ fn hold_past_a_certificates_life<C: FaultableCluster>(
     };
     let held_from = c.now();
     let hash = route.hash();
-    route
-        .try_declared(c.derivation().as_ref())
+    c.with_derivation(|derivation| route.try_declared(derivation))
         .expect("a scenario route declares its terms");
     let closes = Window::Stating.of(Deadline::of_transaction(&route)).end;
     c.submit(Arc::new(route));

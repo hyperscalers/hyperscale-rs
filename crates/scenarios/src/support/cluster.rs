@@ -77,13 +77,18 @@ pub trait Cluster {
     /// it on the record it consumes still standing.
     fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>);
 
-    /// A derivation the cluster answers alike to — what a scenario reads
-    /// a routed fact off a transaction it built itself through.
+    /// Runs `f` on a derivation the cluster answers alike to — what a
+    /// scenario reads a routed fact off a transaction it built itself
+    /// through.
     ///
     /// A transaction assembled in the scenario has been derived by
     /// nobody: routing, work and the rest are a node's answer, and the
     /// harness has to borrow one to ask.
-    fn derivation(&self) -> Arc<dyn Derivation>;
+    ///
+    /// The derivation is lent for the length of `f`: a production host's
+    /// derivation holds its stores open, and nothing kept past `f` may
+    /// hold them across a stop.
+    fn with_derivation<T>(&self, f: impl FnOnce(&dyn Derivation) -> T) -> T;
 
     /// The price table the cluster's head window carries.
     ///

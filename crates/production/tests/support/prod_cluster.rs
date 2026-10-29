@@ -112,8 +112,10 @@ impl ProdCluster {
             )
             .with_test_writer()
             .try_init();
+        // Each host runs on a runtime of its own; this one only paces
+        // `run_until` and carries the harness's own awaits.
         let runtime = Builder::new_multi_thread()
-            .worker_threads(16)
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("tokio runtime");
@@ -329,7 +331,12 @@ impl ProdCluster {
     fn host_for_tx(&self, tx: &Transaction) -> Option<usize> {
         // The harness builds transactions outside every host, so nothing
         // has derived this one and routing is a derived fact.
-        tx.try_derived(self.inner.derivation().as_ref()).ok()?;
+        if !self
+            .inner
+            .with_derivation(|derivation| tx.try_derived(derivation).is_ok())
+        {
+            return None;
+        }
         let topology_snapshot = self
             .inner
             .beacon_state()?
@@ -355,8 +362,8 @@ impl Drop for ProdCluster {
 }
 
 impl Cluster for ProdCluster {
-    fn derivation(&self) -> Arc<dyn Derivation> {
-        self.inner.derivation()
+    fn with_derivation<T>(&self, f: impl FnOnce(&dyn Derivation) -> T) -> T {
+        self.inner.with_derivation(f)
     }
 
     fn submit(&mut self, tx: Arc<Transaction>) {

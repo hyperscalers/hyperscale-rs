@@ -722,8 +722,7 @@ pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
             window,
         );
         if nth == 0 {
-            route
-                .try_derived(c.derivation().as_ref())
+            c.with_derivation(|derivation| route.try_derived(derivation))
                 .expect("a scenario route derives");
             assert_eq!(
                 awaited_core(&member_of(&route, &trie, survivor))[..],

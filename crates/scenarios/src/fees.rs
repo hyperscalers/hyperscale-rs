@@ -238,8 +238,7 @@ pub fn a_fee_hold_stands_until_its_burn<C: Cluster>(c: &mut C) {
     let mut charges = Charges::default();
 
     let transfer = build_transfer_tx(&payer, from, to, 1, validity_around(c.now()));
-    transfer
-        .try_declared(c.derivation().as_ref())
+    c.with_derivation(|derivation| transfer.try_declared(derivation))
         .expect("a transfer declares its terms");
     let hold = FeeTerms::of(&transfer);
     let total = fee_hold_total_key(&ProtocolHasher, hold.vault);

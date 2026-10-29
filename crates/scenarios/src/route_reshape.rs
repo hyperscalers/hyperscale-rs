@@ -2123,11 +2123,10 @@ impl Accounts {
         bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
         venue: &StockedVenue,
     ) -> Self {
-        let derivation = c.derivation();
         let mut records: BTreeMap<Address, Vec<SubstateKey>> = BTreeMap::new();
         for swap in load.values() {
-            let derived = swap
-                .try_derived(derivation.as_ref())
+            let derived = c
+                .with_derivation(|derivation| swap.try_derived(derivation))
                 .expect("a swap of the load derives");
             records.entry(swap.fee_payer()).or_default().extend(
                 crossing_records(&derived.legs)
@@ -2671,7 +2670,7 @@ fn submit_departing_route<C: Cluster>(
     // holds while they stand; the output's is the one a departure can
     // leave owed to the trader.
     route.protocol_resource.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario route derives")
             .legs,
     ));
@@ -2978,7 +2977,7 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
         validity_around(c.now()),
     );
     protocol_resource.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario route derives")
             .legs,
     ));
@@ -3156,7 +3155,7 @@ pub fn a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing<C: Faultable
         validity_around(c.now()),
     );
     protocol_resource.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario route derives")
             .legs,
     ));
@@ -3353,7 +3352,7 @@ pub fn a_crossing_within_a_merging_pair_settles_before_the_merge_cuts<C: Faultab
         validity_around(c.now()),
     );
     protocol_resource.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario route derives")
             .legs,
     ));
@@ -3477,7 +3476,7 @@ pub fn a_route_accepted_before_its_venues_split_is_projected_is_not_torn<C: Faul
         validity_around(c.now()),
     );
     protocol_resource.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario route derives")
             .legs,
     ));
@@ -3670,7 +3669,7 @@ impl OneWayRoute {
             validity_around(c.now()),
         );
         let records = crossing_records(
-            &tx.try_derived(c.derivation().as_ref())
+            &c.with_derivation(|derivation| tx.try_derived(derivation))
                 .expect("a scenario route derives")
                 .legs,
         );
@@ -4097,7 +4096,7 @@ pub fn a_split_under_steady_core_load_lands_without_a_cancel<C: Cluster>(c: &mut
             validity_around(c.now()),
         );
         route.protocol_resource.owing(crossing_records(
-            &tx.try_derived(c.derivation().as_ref())
+            &c.with_derivation(|derivation| tx.try_derived(derivation))
                 .expect("a scenario route derives")
                 .legs,
         ));
@@ -5366,7 +5365,7 @@ fn send_leg<C: Cluster>(
     // recipient's prefix claims it. That is value the world still
     // holds.
     world.owing(crossing_records(
-        &tx.try_derived(c.derivation().as_ref())
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
             .expect("a scenario transfer derives")
             .legs,
     ));
