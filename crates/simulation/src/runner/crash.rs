@@ -123,20 +123,10 @@ impl SimulationRunner {
             self.retained_storages
                 .insert((host, shard), (**shard_loop.io.storage()).clone());
         }
-        let preparing: Vec<ShardId> = self
-            .reshape_stores
-            .keys()
-            .filter(|(h, _)| *h == host)
-            .map(|(_, shard)| *shard)
-            .collect();
-        for shard in preparing {
-            let prepared = self
-                .reshape_stores
-                .remove(&(host, shard))
-                .expect("listed above");
+        for (shard, storage) in self.reshape_stores[i].drain() {
             self.retained_storages
                 .entry((host, shard))
-                .or_insert(prepared.storage);
+                .or_insert(storage);
         }
         if kind == CrashKind::Machine {
             assert!(

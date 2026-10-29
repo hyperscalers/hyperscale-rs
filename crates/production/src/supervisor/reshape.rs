@@ -6,20 +6,20 @@
 //! projection, and dispatches the requests it returns — store opens and
 //! seeds off the loop, fetches on the network, imports, applies, and adopts
 //! via `spawn_blocking`, seats through the membership path. Every completion
-//! lands back on the runner's select loop as a
-//! [`SupervisorEvent::Reshape`].
+//! lands back on the runner's select loop as a [`SupervisorEvent::Reshape`]
+//! and settles through the host's prepared stores.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::IrohNetwork;
-use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
 use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
 };
+use hyperscale_node::reshape::prepared::{ReshapeCompletion, Seating};
 use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::{serve_local_certified_headers, serve_state_range_request};
@@ -33,90 +33,13 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
     Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
-    StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
+    SubstateKey, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::{ShardSupervisor, SupervisorEvent};
 use crate::runner::wall_clock_local;
-
-/// One reshape io result fed back into the orchestrator's pump. The io
-/// callbacks (network responses, off-loop store work) push these onto the
-/// supervisor's event channel; [`ShardSupervisor::on_reshape_io`] updates
-/// the in-flight [`PreparedStore`] cache and translates each into the
-/// orchestrator's [`ReshapeEvent`] — the layer the orchestrator's `step`
-/// consumes, which carries no store handles of its own.
-pub enum ReshapeIo {
-    /// A reshape store open settled: the open store and its recovered
-    /// state, cached for the duty, or the open failure.
-    Opened {
-        /// The duty's store shard.
-        shard: ShardId,
-        /// The opened store and recovered state, or the open failure.
-        outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
-    },
-    /// A reshape fetch returned a response.
-    Fetched {
-        /// The duty the fetch belonged to.
-        duty: ShardId,
-        /// The shard the fetch addressed.
-        from: ShardId,
-        /// The response.
-        kind: FetchedKind,
-    },
-    /// A reshape fetch failed at the transport level.
-    FetchFailed {
-        /// The duty the fetch belonged to.
-        duty: ShardId,
-        /// The shard the fetch addressed.
-        from: ShardId,
-        /// What failed, for re-arming.
-        kind: FetchKind,
-    },
-    /// A staged chunk was durably written.
-    Staged {
-        /// The store shard.
-        shard: ShardId,
-    },
-    /// A staged chunk's durable write failed; hands the chunk back for
-    /// re-staging.
-    StageFailed {
-        /// The store shard.
-        shard: ShardId,
-        /// The assembly's progress after the chunk.
-        progress: ImportProgress,
-        /// The chunk's verified leaves.
-        leaves: Vec<SubstateLeaf>,
-    },
-    /// A boundary import completed with the resulting store root.
-    Imported {
-        /// The store shard.
-        shard: ShardId,
-        /// The imported root.
-        root: StateRoot,
-    },
-    /// A followed-block application completed with the resulting store
-    /// root.
-    Applied {
-        /// The store shard.
-        shard: ShardId,
-        /// The applied root.
-        root: StateRoot,
-    },
-    /// A genesis adoption settled (root already verified against the
-    /// anchor); carries the recovered state the seat boots from.
-    Adopted {
-        /// The store shard.
-        shard: ShardId,
-        /// The recovered state rebuilt over the adopted genesis.
-        recovered: RecoveredState,
-    },
-    /// A parent-half seed's gate answered instead of the clone: deferred
-    /// while the local parent is still behind the terminal crossing, or
-    /// unavailable with no hosted parent store to clone.
-    Event(ReshapeEvent),
-}
 
 impl ShardSupervisor {
     /// Whether a reshape duty on this host owns seating `shard` — one of the
@@ -170,13 +93,13 @@ impl ShardSupervisor {
         for request in requests {
             self.dispatch_reshape(request);
         }
-        let relinquished: Vec<ShardId> = self
+        // A store no live duty owns any more is dropped, releasing its
+        // directory. A relinquished seat goes to the join now; a dropped
+        // duty's shard is joined by the next `reconcile_joins`.
+        let released = self
             .reshape_stores
-            .keys()
-            .copied()
-            .filter(|&shard| self.reshape.relinquished(shard))
-            .collect();
-        for shard in relinquished {
+            .release(|shard| self.reshape.is_seating(shard));
+        for shard in released {
             self.hand_over_to_join(shard);
         }
     }
@@ -206,7 +129,7 @@ impl ShardSupervisor {
     }
 
     /// Perform one reshape io request, answering with a
-    /// [`SupervisorEvent::Reshape`] the runner loop feeds back through
+    /// [`SupervisorEvent::Reshape`] the runner loop settles through
     /// [`Self::on_reshape_io`].
     fn dispatch_reshape(&mut self, request: ReshapeRequest) {
         // A store-prep for a shard an ordinary join is still opening is held
@@ -228,7 +151,7 @@ impl ShardSupervisor {
         {
             info!(shard = ?shard, "Reshape store-prep for a shard already running here; its store stays");
             if let Some(OverRunning::Answer(event)) = request.over_running() {
-                self.on_reshape_event(event);
+                self.on_reshape_io(ReshapeCompletion::Event(event));
             }
             return;
         }
@@ -242,7 +165,7 @@ impl ShardSupervisor {
                 // The clone replaces the child's directory wholesale, so a
                 // store an observer prepared there before it relinquished
                 // the seat to this parent half is closed first.
-                self.reshape_stores.remove(&child);
+                self.reshape_stores.remove(child);
                 self.reshape_seed_from_parent(parent, child, through);
             }
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
@@ -272,14 +195,15 @@ impl ShardSupervisor {
                 origin,
                 genesis,
                 predecessors,
-            } => self.reshape_adopt(shard, kind, origin, *genesis, predecessors),
+            } => self.reshape_adopt(shard, kind, origin, genesis, predecessors),
             ReshapeRequest::Seat { shard } => self.reshape_seat(shard),
         }
     }
 
     /// Open (wiping any stale directory) a reshape duty's store off the
     /// loop, replicating the engine bootstrap into the fresh store, and
-    /// answer with [`ReshapeIo::Opened`].
+    /// answer with [`ReshapeCompletion::Opened`]. A failed open logs and
+    /// strands the duty.
     fn reshape_open_store(&self, shard: ShardId) {
         let factory = Arc::clone(&self.storage_factory);
         let engine_bootstrap = self.engine_bootstrap.clone();
@@ -301,19 +225,15 @@ impl ShardSupervisor {
                 let recovered = storage.load_recovered_state(shard);
                 Ok((storage, recovered))
             })();
-            // Send failure means the runner is shutting down.
-            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Opened {
-                shard,
-                outcome,
-            }));
+            send_opened(&events, shard, outcome);
         });
     }
 
     /// Seed a parent half's `child` store by checkpoint-cloning the host's own
     /// retained `parent` store onto the child subtree, once [`seed_gate`]
     /// passes: that parent chain has committed through the terminal crossing.
-    /// Answers with [`ReshapeIo::Opened`] when the clone lands, or with the
-    /// gate's event. The gate reads the parent's height inside the blocking
+    /// Answers with [`ReshapeCompletion::Opened`] when the clone lands, or
+    /// with the gate's event. The gate reads the parent's height inside the blocking
     /// task, so no store read runs on the loop. The checkpoint hard-links, so
     /// the clone shares the engine bootstrap and the parent's substates
     /// without copying.
@@ -327,7 +247,7 @@ impl ShardSupervisor {
             .cloned();
         let Some(parent_storage) = parent_storage else {
             if let Some(event) = seed_gate(None, child, through) {
-                let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Event(event)));
+                let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
             }
             return;
         };
@@ -336,7 +256,7 @@ impl ShardSupervisor {
         self.tokio_handle.spawn_blocking(move || {
             if let Some(event) = seed_gate(Some(parent_storage.committed_height()), child, through)
             {
-                let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Event(event)));
+                let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
                 return;
             }
             let outcome = (|| -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
@@ -351,17 +271,13 @@ impl ShardSupervisor {
                 let recovered = storage.load_recovered_state(child);
                 Ok((storage, recovered))
             })();
-            // Send failure means the runner is shutting down.
-            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Opened {
-                shard: child,
-                outcome,
-            }));
+            send_opened(&events, child, outcome);
         });
     }
 
     /// Issue one reshape fetch against `from`'s committee, answering with
-    /// [`ReshapeIo::Fetched`] on success or [`ReshapeIo::FetchFailed`] on a
-    /// transport error. `from` resolves to its committee through the live
+    /// [`ReshapeEvent::Fetched`] on success or [`ReshapeEvent::FetchFailed`]
+    /// on a transport error. `from` resolves to its committee through the live
     /// topology.
     fn reshape_fetch(&self, duty: ShardId, from: ShardId, kind: FetchKind) {
         let events = self.events_tx.clone();
@@ -392,14 +308,17 @@ impl ShardSupervisor {
                 self.tokio_handle.spawn_blocking(move || {
                     let response = serve_state_range_request(&storage, &request);
                     if response.chunk.is_some() {
-                        let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Fetched {
-                            duty,
-                            from,
-                            kind: FetchedKind::StateRange {
-                                sub_range,
-                                response: Box::new(response),
+                        send_event(
+                            &events,
+                            ReshapeEvent::Fetched {
+                                duty,
+                                from,
+                                kind: FetchedKind::StateRange {
+                                    sub_range,
+                                    response: Box::new(response),
+                                },
                             },
-                        }));
+                        );
                     } else {
                         // The local store no longer pins the boundary; fall back
                         // to the shard's committee.
@@ -428,13 +347,16 @@ impl ShardSupervisor {
                 };
                 self.tokio_handle.spawn_blocking(move || {
                     let response = serve_local_certified_headers(storage.as_ref(), &request);
-                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Fetched {
-                        duty,
-                        from,
-                        kind: FetchedKind::Headers {
-                            response: Box::new(response),
+                    send_event(
+                        &events,
+                        ReshapeEvent::Fetched {
+                            duty,
+                            from,
+                            kind: FetchedKind::Headers {
+                                response: Box::new(response),
+                            },
                         },
-                    }));
+                    );
                 });
             }
             FetchKind::Block { request } => {
@@ -445,8 +367,8 @@ impl ShardSupervisor {
                     request,
                     None,
                     Box::new(move |result| {
-                        let (io, verdict) = block_answer(duty, from, asked, result);
-                        let _ = events.send(SupervisorEvent::Reshape(io));
+                        let (event, verdict) = block_answer(duty, from, asked, result);
+                        send_event(&events, event);
                         verdict
                     }),
                 );
@@ -472,15 +394,15 @@ impl ShardSupervisor {
             request,
             None,
             Box::new(move |result| {
-                let (io, verdict) = headers_answer(duty, from, asked, result);
-                let _ = events.send(SupervisorEvent::Reshape(io));
+                let (event, verdict) = headers_answer(duty, from, asked, result);
+                send_event(&events, event);
                 verdict
             }),
         );
     }
 
     /// Request one reshape state range from `from`'s committee, answering with a
-    /// [`ReshapeIo`]. The fallback when a duty's source isn't co-hosted locally.
+    /// [`ReshapeEvent`]. The fallback when a duty's source isn't co-hosted locally.
     fn network_state_range(
         network: &Arc<IrohNetwork>,
         events: &mpsc::UnboundedSender<SupervisorEvent>,
@@ -497,8 +419,8 @@ impl ShardSupervisor {
             request,
             None,
             Box::new(move |result| {
-                let io = result.map_or_else(
-                    |_| ReshapeIo::FetchFailed {
+                let event = result.map_or_else(
+                    |_| ReshapeEvent::FetchFailed {
                         duty,
                         from,
                         kind: FetchKind::StateRange {
@@ -506,7 +428,7 @@ impl ShardSupervisor {
                             request: on_fail,
                         },
                     },
-                    |response| ReshapeIo::Fetched {
+                    |response| ReshapeEvent::Fetched {
                         duty,
                         from,
                         kind: FetchedKind::StateRange {
@@ -515,77 +437,66 @@ impl ShardSupervisor {
                         },
                     },
                 );
-                let _ = events.send(SupervisorEvent::Reshape(io));
+                send_event(&events, event);
                 ResponseVerdict::Accept
             }),
         );
     }
 
     /// Durably stage one verified chunk into a reshape duty's store off
-    /// the loop, answering with [`ReshapeIo::Staged`] — or handing the
-    /// chunk back via [`ReshapeIo::StageFailed`] so the duty re-stages it
+    /// the loop, answering with [`ReshapeEvent::Staged`] — or handing the
+    /// chunk back via [`ReshapeEvent::StageFailed`] so the duty re-stages it
     /// instead of waiting forever on an ack that will never come.
     fn reshape_stage(&self, shard: ShardId, progress: ImportProgress, leaves: Vec<SubstateLeaf>) {
-        let Some(storage) = self
-            .reshape_stores
-            .get(&shard)
-            .map(|s| Arc::clone(&s.storage))
-        else {
+        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape stage for an unopened store; re-queued");
-            let _ = self
-                .events_tx
-                .send(SupervisorEvent::Reshape(ReshapeIo::StageFailed {
+            send_event(
+                &self.events_tx,
+                ReshapeEvent::StageFailed {
                     shard,
                     progress,
                     leaves,
-                }));
+                },
+            );
             return;
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
             match storage.stage_import_chunk(&progress, &leaves) {
-                Ok(()) => {
-                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Staged { shard }));
-                }
+                Ok(()) => send_event(&events, ReshapeEvent::Staged { shard }),
                 Err(error) => {
                     warn!(shard = ?shard, %error, "Reshape chunk staging failed; re-queued");
-                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::StageFailed {
-                        shard,
-                        progress,
-                        leaves,
-                    }));
+                    send_event(
+                        &events,
+                        ReshapeEvent::StageFailed {
+                            shard,
+                            progress,
+                            leaves,
+                        },
+                    );
                 }
             }
         });
     }
 
     /// Build a reshape duty's boundary state from its staged chunks off
-    /// the loop, answering with [`ReshapeIo::Imported`].
+    /// the loop, answering with [`ReshapeEvent::Imported`].
     fn reshape_finalize(&self, shard: ShardId, height: BlockHeight) {
-        let Some(storage) = self
-            .reshape_stores
-            .get(&shard)
-            .map(|s| Arc::clone(&s.storage))
-        else {
+        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape finalize for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
             match storage.finalize_boundary_import(height, WitnessSeed::default()) {
-                Ok(root) => {
-                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Imported {
-                        shard,
-                        root,
-                    }));
-                }
+                Ok(root) => send_event(&events, ReshapeEvent::Imported { shard, root }),
                 Err(error) => warn!(shard = ?shard, %error, "Reshape boundary import failed"),
             }
         });
     }
 
     /// Apply a followed parent block's writes into a reshape duty's store
-    /// off the loop, answering with [`ReshapeIo::Applied`].
+    /// off the loop, answering with [`ReshapeEvent::Applied`].
     fn reshape_apply(
         &self,
         shard: ShardId,
@@ -593,21 +504,14 @@ impl ShardSupervisor {
         creations: Vec<(SubstateKey, Vec<u8>)>,
         frontier: FrontierInputs,
     ) {
-        let Some(storage) = self
-            .reshape_stores
-            .get(&shard)
-            .map(|s| Arc::clone(&s.storage))
-        else {
+        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape follow apply for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
             match storage.follow_block_writes(&block, &creations, &frontier) {
-                Ok(root) => {
-                    let _ =
-                        events.send(SupervisorEvent::Reshape(ReshapeIo::Applied { shard, root }));
-                }
+                Ok(root) => send_event(&events, ReshapeEvent::Applied { shard, root }),
                 Err(error) => warn!(shard = ?shard, %error, "Reshape follow apply failed"),
             }
         });
@@ -637,20 +541,18 @@ impl ShardSupervisor {
     }
 
     /// Adopt a reshape duty's derived genesis off the loop via the shared
-    /// [`adopt_prepared_store`] gate, answering with [`ReshapeIo::Adopted`];
-    /// a gate failure logs and strands the duty (the seat never fires).
+    /// [`adopt_prepared_store`] gate, answering with
+    /// [`ReshapeCompletion::Adopted`], which carries the genesis back for the
+    /// seat; a gate failure logs and strands the duty (the seat never fires).
     fn reshape_adopt(
-        &mut self,
+        &self,
         shard: ShardId,
         kind: AdoptKind,
         origin: ChainOrigin,
-        genesis: Block,
+        genesis: Box<Block>,
         predecessors: Vec<Anchor>,
     ) {
-        let Some(storage) = self.reshape_stores.get_mut(&shard).map(|entry| {
-            entry.genesis = Some(genesis.clone());
-            Arc::clone(&entry.storage)
-        }) else {
+        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape adopt for an unopened store; dropped");
             return;
         };
@@ -665,8 +567,9 @@ impl ShardSupervisor {
                 predecessors,
             ) {
                 Ok(recovered) => {
-                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Adopted {
+                    let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Adopted {
                         shard,
+                        genesis,
                         recovered,
                     }));
                 }
@@ -682,19 +585,15 @@ impl ShardSupervisor {
     /// store the duty adopted into. The orchestrator owns this seating, so
     /// an ordinary join for the same shard is suppressed.
     fn reshape_seat(&mut self, shard: ShardId) {
-        let Some(PreparedStore {
+        let hosted = self.shards.contains_key(&shard);
+        let Some(Seating {
             storage,
-            recovered,
             genesis,
-        }) = self.reshape_stores.remove(&shard)
+            recovered,
+        }) = self.reshape_stores.take_for_seat(shard, hosted)
         else {
-            warn!(shard = ?shard, "Reshape seat for an unprepared store; dropped");
             return;
         };
-        if self.shards.contains_key(&shard) {
-            warn!(shard = ?shard, "Reshape seat for an already-hosted shard; dropped");
-            return;
-        }
         // The reshape duty owns this successor; an ordinary join racing it
         // yields. Abandon the in-flight join — its opened store drops at
         // `on_opened` (which finds no `bootstrapping` entry) — and seat from the
@@ -709,62 +608,20 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Reshape seat with no local committee members; dropped");
             return;
         }
-        self.seat_shard_with_genesis(shard, &vnodes, storage, &recovered, genesis.as_ref());
+        self.seat_shard_with_genesis(shard, &vnodes, storage, &recovered, Some(&genesis));
     }
 
-    /// Settle one reshape io result: update the duty's [`PreparedStore`]
-    /// cache, then translate the result into the orchestrator's
-    /// [`ReshapeEvent`] and pump it back through [`Self::reshape_step`].
-    pub(super) fn on_reshape_io(&mut self, io: ReshapeIo) {
-        let event = match io {
-            ReshapeIo::Opened { shard, outcome } => match outcome {
-                Ok((storage, recovered)) => {
-                    self.reshape_stores.insert(
-                        shard,
-                        PreparedStore {
-                            storage,
-                            recovered,
-                            genesis: None,
-                        },
-                    );
-                    ReshapeEvent::Opened { shard }
-                }
-                Err(error) => {
-                    warn!(shard = ?shard, error, "Reshape store open failed; duty stranded");
-                    return;
-                }
-            },
-            ReshapeIo::Fetched { duty, from, kind } => ReshapeEvent::Fetched { duty, from, kind },
-            ReshapeIo::FetchFailed { duty, from, kind } => {
-                ReshapeEvent::FetchFailed { duty, from, kind }
-            }
-            ReshapeIo::Staged { shard } => ReshapeEvent::Staged { shard },
-            ReshapeIo::StageFailed {
-                shard,
-                progress,
-                leaves,
-            } => ReshapeEvent::StageFailed {
-                shard,
-                progress,
-                leaves,
-            },
-            ReshapeIo::Imported { shard, root } => ReshapeEvent::Imported { shard, root },
-            ReshapeIo::Applied { shard, root } => ReshapeEvent::Applied { shard, root },
-            ReshapeIo::Adopted { shard, recovered } => {
-                if let Some(entry) = self.reshape_stores.get_mut(&shard) {
-                    entry.recovered = recovered;
-                }
-                ReshapeEvent::Adopted { shard }
-            }
-            ReshapeIo::Event(event) => event,
-        };
-        self.on_reshape_event(event);
-    }
-
-    /// Pump one reshape event back through [`Self::reshape_step`]. A seed
-    /// with no parent store to clone relinquishes the child's seat, which the
+    /// Settle one reshape completion through the prepared stores and pump
+    /// the event it answers back through [`Self::reshape_step`]. A seed with
+    /// no parent store to clone relinquishes the child's seat, which the
     /// ordinary join then takes.
-    fn on_reshape_event(&mut self, event: ReshapeEvent) {
+    pub(super) fn on_reshape_io(
+        &mut self,
+        completion: ReshapeCompletion<Arc<RocksDbShardStorage>>,
+    ) {
+        let Some(event) = self.reshape_stores.settle(completion) else {
+            return;
+        };
         let unavailable = match event {
             ReshapeEvent::SeedUnavailable { child } => Some(child),
             _ => None,
@@ -785,7 +642,7 @@ impl ShardSupervisor {
         if !self.reshape.relinquished(child) {
             return;
         }
-        self.reshape_stores.remove(&child);
+        self.reshape_stores.remove(child);
         info!(
             shard = ?child,
             "Split duty relinquished the child's seat; joining it instead"
@@ -795,6 +652,32 @@ impl ShardSupervisor {
         if !vnodes.is_empty() {
             self.join(child, &vnodes);
         }
+    }
+}
+
+/// Send a reshape event back to the supervisor loop. Send failure means
+/// the runner is shutting down.
+fn send_event(events: &mpsc::UnboundedSender<SupervisorEvent>, event: ReshapeEvent) {
+    let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
+}
+
+/// Send a landed store open or seed back to the supervisor loop; a failed one
+/// logs and sends nothing, stranding the duty.
+fn send_opened(
+    events: &mpsc::UnboundedSender<SupervisorEvent>,
+    shard: ShardId,
+    outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
+) {
+    match outcome {
+        Ok((storage, recovered)) => {
+            // Send failure means the runner is shutting down.
+            let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Opened {
+                shard,
+                storage,
+                recovered,
+            }));
+        }
+        Err(error) => warn!(shard = ?shard, error, "Reshape store open failed; duty stranded"),
     }
 }
 
@@ -831,7 +714,7 @@ fn host_reshape_owns(
         })
 }
 
-/// A reshape block fetch's result as the io its duty consumes, and the
+/// A reshape block fetch's result as the event its duty consumes, and the
 /// verdict the transport scores the serving peer by.
 ///
 /// Every answer reaches the duty, which judges it again against what it
@@ -842,11 +725,11 @@ fn block_answer(
     from: ShardId,
     asked: GetBlockRequest,
     result: Result<GetBlockResponse, RequestError>,
-) -> (ReshapeIo, ResponseVerdict) {
+) -> (ReshapeEvent, ResponseVerdict) {
     let Ok(response) = result else {
         let kind = FetchKind::Block { request: asked };
         return (
-            ReshapeIo::FetchFailed { duty, from, kind },
+            ReshapeEvent::FetchFailed { duty, from, kind },
             ResponseVerdict::Accept,
         );
     };
@@ -854,7 +737,7 @@ fn block_answer(
     let kind = FetchedKind::Block {
         response: Box::new(response),
     };
-    (ReshapeIo::Fetched { duty, from, kind }, verdict)
+    (ReshapeEvent::Fetched { duty, from, kind }, verdict)
 }
 
 /// [`block_answer`] for a recognition walk's certified-header fetch.
@@ -863,11 +746,11 @@ fn headers_answer(
     from: ShardId,
     asked: GetRemoteHeadersRequest,
     result: Result<GetRemoteHeadersResponse, RequestError>,
-) -> (ReshapeIo, ResponseVerdict) {
+) -> (ReshapeEvent, ResponseVerdict) {
     let Ok(response) = result else {
         let kind = FetchKind::Headers { request: asked };
         return (
-            ReshapeIo::FetchFailed { duty, from, kind },
+            ReshapeEvent::FetchFailed { duty, from, kind },
             ResponseVerdict::Accept,
         );
     };
@@ -875,7 +758,7 @@ fn headers_answer(
     let kind = FetchedKind::Headers {
         response: Box::new(response),
     };
-    (ReshapeIo::Fetched { duty, from, kind }, verdict)
+    (ReshapeEvent::Fetched { duty, from, kind }, verdict)
 }
 
 #[cfg(test)]
@@ -884,7 +767,7 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_network::{RequestError, ResponseVerdict};
-    use hyperscale_node::reshape::orchestrator::FetchedKind;
+    use hyperscale_node::reshape::orchestrator::{FetchedKind, ReshapeEvent};
     use hyperscale_storage::test_helpers::make_test_block;
     use hyperscale_types::network::request::{
         BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
@@ -896,7 +779,7 @@ mod tests {
         ValidatorId, WeightedTimestamp,
     };
 
-    use super::{ReshapeIo, ReshapeSeat, block_answer, headers_answer, host_reshape_owns};
+    use super::{ReshapeSeat, block_answer, headers_answer, host_reshape_owns};
 
     /// Two blocks of one parent chain above height 1, their QCs signed by
     /// `committee`.
@@ -946,11 +829,11 @@ mod tests {
         };
         let answer = |result| block_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
 
-        let (io, verdict) = answer(served(&b3));
+        let (event, verdict) = answer(served(&b3));
         assert_eq!(verdict, ResponseVerdict::Reject, "a block off the height");
         assert!(matches!(
-            io,
-            ReshapeIo::Fetched {
+            event,
+            ReshapeEvent::Fetched {
                 kind: FetchedKind::Block { .. },
                 ..
             }
@@ -961,9 +844,9 @@ mod tests {
             ResponseVerdict::Accept,
             "a height nothing holds yet is an honest answer",
         );
-        let (io, verdict) = answer(Err(RequestError::Timeout));
+        let (event, verdict) = answer(Err(RequestError::Timeout));
         assert_eq!(verdict, ResponseVerdict::Accept);
-        assert!(matches!(io, ReshapeIo::FetchFailed { .. }));
+        assert!(matches!(event, ReshapeEvent::FetchFailed { .. }));
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //! - [`merge_flip`] — derive a merged parent's genesis from both children's
 //!   terminals ([`merge_genesis_from_terminals`](merge_flip::merge_genesis_from_terminals));
 //! - [`screen`] — the peer verdict on a reshape fetch's answer, judged
-//!   against the request alone, which both drivers hand the transport.
+//!   against the request alone, which both drivers hand the transport;
+//! - [`prepared`] — the stores duties prepare, and the one place their
+//!   lifecycle from open to seat is written.
 //!
 //! Sans-io like the substrate they compose: drivers own transport, pacing, and
 //! the store writes. The production supervisor pumps them with async requests;
@@ -21,24 +23,7 @@ pub mod adopt;
 pub mod merge_flip;
 pub mod observer;
 pub mod orchestrator;
+pub mod prepared;
 pub mod screen;
 pub mod split_flip;
 pub mod view;
-
-use hyperscale_storage::RecoveredState;
-use hyperscale_types::Block;
-
-/// A reshape duty's in-flight store, held by the driver between the
-/// orchestrator's `OpenStore` and `Seat` requests.
-///
-/// Bundles the open store the duty imports and adopts into, the recovered
-/// state its seated replica boots from (rebuilt at the adopt), and the derived
-/// genesis the seat installs.
-pub struct PreparedStore<S> {
-    /// The opened store the duty imports and adopts into.
-    pub storage: S,
-    /// The recovered state the seat boots from, rebuilt at the adopt.
-    pub recovered: RecoveredState,
-    /// The derived genesis, set at the adopt, installed at the seat.
-    pub genesis: Option<Block>,
-}

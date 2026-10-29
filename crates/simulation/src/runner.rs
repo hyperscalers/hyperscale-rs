@@ -26,8 +26,8 @@ use hyperscale_network_memory::{
     BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
     NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
+use hyperscale_node::reshape::prepared::PreparedStores;
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
     HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig, ShardGenesis, TimerOp,
@@ -486,9 +486,9 @@ pub struct SimulationRunner {
     /// `reshape_step`.
     reshape: Vec<ReshapeOrchestrator>,
 
-    /// In-flight reshape stores the orchestrators opened, imported, and adopted
-    /// into, keyed by `(host, duty shard)`, held until the seat installs each.
-    reshape_stores: HashMap<(NodeIndex, ShardId), PreparedStore<SimShardStorage>>,
+    /// Per-host in-flight reshape stores the orchestrators opened, imported,
+    /// and adopted into, held until the seat installs each.
+    reshape_stores: Vec<PreparedStores<SimShardStorage>>,
 
     /// Per-host reshape fetches whose target block had not committed yet,
     /// carried to the next slice as `FetchFailed` events so the sequencer
@@ -924,7 +924,7 @@ impl SimulationRunner {
             genesis_ms,
             batch_wakes: vec![None; num_hosts],
             reshape,
-            reshape_stores: HashMap::new(),
+            reshape_stores: (0..num_hosts).map(|_| PreparedStores::new()).collect(),
             reshape_pending: vec![Vec::new(); num_hosts],
             retained_storages: HashMap::new(),
             placement_epoch: vec![None; num_hosts],

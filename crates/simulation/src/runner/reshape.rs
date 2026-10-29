@@ -22,12 +22,12 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
-use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
 use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
 };
+use hyperscale_node::reshape::prepared::{ReshapeCompletion, Seating};
 use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
@@ -120,19 +120,14 @@ impl SimulationRunner {
             }
         }
         self.reshape_pending[host as usize] = retries;
-        // A duty that relinquished its seat hands it to placement: the store
-        // it prepared is dropped, and the host's placement rescans now rather
-        // than when its committed epoch next turns over.
-        let relinquished: Vec<ShardId> = self
-            .reshape_stores
-            .keys()
-            .filter(|&&(at, shard)| at == host && orch.relinquished(shard))
-            .map(|&(_, shard)| shard)
-            .collect();
-        for shard in &relinquished {
-            self.reshape_stores.remove(&(host, *shard));
-        }
-        if !relinquished.is_empty() {
+        // A seat no live duty owns any more — relinquished, or its duty
+        // dropped — is placement's: the store it prepared is dropped, and the
+        // host's placement rescans now rather than when its committed epoch
+        // next turns over.
+        if !self.reshape_stores[host as usize]
+            .release(|shard| orch.is_seating(shard))
+            .is_empty()
+        {
             self.placement_epoch[host as usize] = None;
         }
         self.reshape[host as usize] = orch;
@@ -161,15 +156,12 @@ impl SimulationRunner {
             };
         }
         match request {
-            ReshapeRequest::OpenStore { shard } => {
-                self.reshape_open_store(host, shard);
-                Some(ReshapeEvent::Opened { shard })
-            }
+            ReshapeRequest::OpenStore { shard } => self.reshape_open_store(host, shard),
             ReshapeRequest::SeedFromParent {
                 parent,
                 child,
                 through,
-            } => Some(self.reshape_seed_from_parent(host, parent, child, through)),
+            } => self.reshape_seed_from_parent(host, parent, child, through),
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
             }
@@ -178,18 +170,15 @@ impl SimulationRunner {
                 progress,
                 leaves,
             } => {
-                self.reshape_stores
-                    .get(&(host, shard))?
-                    .storage
+                self.reshape_stores[host as usize]
+                    .storage(shard)?
                     .stage_import_chunk(&progress, &leaves)
                     .expect("chunk staging into the opened store");
                 Some(ReshapeEvent::Staged { shard })
             }
             ReshapeRequest::FinalizeImport { shard, height } => {
-                let root = self
-                    .reshape_stores
-                    .get(&(host, shard))?
-                    .storage
+                let root = self.reshape_stores[host as usize]
+                    .storage(shard)?
                     .finalize_boundary_import(height, WitnessSeed::default())
                     .expect("reshape boundary import into the opened store");
                 Some(ReshapeEvent::Imported { shard, root })
@@ -200,10 +189,8 @@ impl SimulationRunner {
                 creations,
                 frontier,
             } => {
-                let root = self
-                    .reshape_stores
-                    .get(&(host, shard))?
-                    .storage
+                let root = self.reshape_stores[host as usize]
+                    .storage(shard)?
                     .follow_block_writes(&block, &creations, &frontier)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeEvent::Applied { shard, root })
@@ -247,7 +234,7 @@ impl SimulationRunner {
                 origin,
                 genesis,
                 predecessors,
-            } => self.reshape_adopt(host, shard, kind, origin, *genesis, predecessors),
+            } => self.reshape_adopt(host, shard, kind, origin, genesis, predecessors),
             ReshapeRequest::Seat { shard } => {
                 self.reshape_seat(host, shard);
                 None
@@ -256,19 +243,16 @@ impl SimulationRunner {
     }
 
     /// Open a fresh duty store, replicate the engine bootstrap into it, and
-    /// cache it for the duty.
-    fn reshape_open_store(&mut self, host: NodeIndex, shard: ShardId) {
+    /// settle it for the duty.
+    fn reshape_open_store(&mut self, host: NodeIndex, shard: ShardId) -> Option<ReshapeEvent> {
         let storage = open_store(shard, self.power_loss);
         replicate_engine_bootstrap(&storage, &self.genesis_config());
         let recovered = storage.load_recovered_state(shard);
-        self.reshape_stores.insert(
-            (host, shard),
-            PreparedStore {
-                storage,
-                genesis: None,
-                recovered,
-            },
-        );
+        self.reshape_stores[host as usize].settle(ReshapeCompletion::Opened {
+            shard,
+            storage,
+            recovered,
+        })
     }
 
     /// Seed a parent half's child store by deep-cloning the host's own retained
@@ -282,27 +266,23 @@ impl SimulationRunner {
         parent: ShardId,
         child: ShardId,
         through: BlockHeight,
-    ) -> ReshapeEvent {
+    ) -> Option<ReshapeEvent> {
         let parent_height = self
             .hosts_shard(host, parent)
             .map(ShardChainReader::committed_height);
         if let Some(event) = seed_gate(parent_height, child, through) {
-            return event;
+            return Some(event);
         }
         let storage = self.hosts[host as usize]
             .shard_io(parent)
             .storage()
             .clone_for_split_child(shard_prefix_path(child));
         let recovered = storage.load_recovered_state(child);
-        self.reshape_stores.insert(
-            (host, child),
-            PreparedStore {
-                storage,
-                genesis: None,
-                recovered,
-            },
-        );
-        ReshapeEvent::Opened { shard: child }
+        self.reshape_stores[host as usize].settle(ReshapeCompletion::Opened {
+            shard: child,
+            storage,
+            recovered,
+        })
     }
 
     /// Serve one reshape fetch from a committee host's store. A state range
@@ -424,35 +404,32 @@ impl SimulationRunner {
         shard: ShardId,
         kind: AdoptKind,
         origin: ChainOrigin,
-        genesis: Block,
+        genesis: Box<Block>,
         predecessors: Vec<Anchor>,
     ) -> Option<ReshapeEvent> {
-        let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
+        let storage = self.reshape_stores[host as usize].storage(shard)?.clone();
         let recovered = adopt_prepared_store(&storage, shard, kind, origin, &genesis, predecessors)
             .expect("adopted reshape root must match the genesis it derived");
-        let entry = self.reshape_stores.get_mut(&(host, shard))?;
-        entry.genesis = Some(genesis);
-        entry.recovered = recovered;
-        Some(ReshapeEvent::Adopted { shard })
+        self.reshape_stores[host as usize].settle(ReshapeCompletion::Adopted {
+            shard,
+            genesis,
+            recovered,
+        })
     }
 
     /// Seat a prepared duty: install its genesis and start consensus for every
     /// committee member of `shard` this host homes, from the duty's adopted
     /// store.
     fn reshape_seat(&mut self, host: NodeIndex, shard: ShardId) {
-        let Some(PreparedStore {
+        let hosted = self.hosts_shard(host, shard).is_some();
+        let Some(Seating {
             storage,
             genesis,
             recovered,
-        }) = self.reshape_stores.remove(&(host, shard))
+        }) = self.reshape_stores[host as usize].take_for_seat(shard, hosted)
         else {
             return;
         };
-        if self.hosts_shard(host, shard).is_some() {
-            warn!(shard = ?shard, "Reshape seat for an already-hosted shard; dropped");
-            return;
-        }
-        let genesis = genesis.expect("reshape seat follows the adopt");
         let Some(snapshot) = self.host_topology(host) else {
             return;
         };
