@@ -32,6 +32,8 @@ use tokio::task::{JoinError, JoinHandle};
 
 use crate::handle::{HostCalls, NodeHandle};
 use crate::network_file::{NetworkFile, NetworkFileError};
+#[cfg(feature = "test-utils")]
+use crate::testing::{ProbeState, ShardStores, record_shard_store};
 use crate::{
     AddValidatorError, LocalValidator, ProductionRunner, RunnerError, ShutdownHandle,
     StorageDirResolver, StorageFactory, shard_data_dir,
@@ -292,10 +294,21 @@ impl Node {
         // Opens a shard's store when the runner seats this host on it, at the
         // one directory convention, so a restart reopens what a seat created.
         let shard_storage = setup.storage.clone();
+        #[cfg(feature = "test-utils")]
+        let shard_stores = ShardStores::default();
+        #[cfg(feature = "test-utils")]
+        let (recorded, recorded_root) = (Arc::clone(&shard_stores), setup.data_dir.clone());
         let storage_factory: StorageFactory = Arc::new(move |dir, shard| {
-            RocksDbShardStorage::open_with_config(dir, &shard_storage, shard_prefix_path(shard))
-                .map(Arc::new)
-                .map_err(|e| format!("failed to open database at {}: {e:?}", dir.display()))
+            let store = RocksDbShardStorage::open_with_config(
+                dir,
+                &shard_storage,
+                shard_prefix_path(shard),
+            )
+            .map(Arc::new)
+            .map_err(|e| format!("failed to open database at {}: {e:?}", dir.display()))?;
+            #[cfg(feature = "test-utils")]
+            record_shard_store(&recorded, &recorded_root, dir, shard, &store);
+            Ok(store)
         });
 
         let lock = lock_data_dir(&setup.data_dir)?;
@@ -328,6 +341,14 @@ impl Node {
 
         // The senders panic once `run` has taken the runner, so they are
         // taken now.
+        #[cfg(feature = "test-utils")]
+        let probe = Some(ProbeState {
+            network: Arc::clone(runner.network()),
+            derivation: runner.derivation(),
+            topology: Arc::clone(runner.topology_snapshot()),
+            startup_topology: runner.topology_snapshot().load_full(),
+            shard_stores,
+        });
         let network = Arc::clone(runner.network());
         let calls = Arc::new(HostCalls {
             submit: runner.tx_submission_sender(),
@@ -338,6 +359,8 @@ impl Node {
             peers: Box::new(move || network.cached_peer_count()),
             commands: runner.reconfigure_handle(),
             runtime: runtime.handle().clone(),
+            #[cfg(feature = "test-utils")]
+            probe,
         });
         let gate = Arc::new(Gate::new());
         let shutdown = runner.shutdown_handle();

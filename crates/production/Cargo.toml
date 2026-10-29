@@ -18,6 +18,9 @@ path = "src/bin/keygen.rs"
 # 5-minute production one, matching the simulation harness's local default.
 # For quick local checks; a parity run leaves it off.
 short-epochs = []
+# The `testing` module: a running host's internals for this crate's own
+# tests, absent from every embedder build.
+test-utils = ["hyperscale-network-iroh/test-utils"]
 
 [dependencies]
 hyperscale-crypto-bls.workspace = true
@@ -88,6 +91,7 @@ hyperscale-dispatch-sync.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
+hyperscale-production = { path = ".", features = ["test-utils"] }
 hyperscale-scenarios.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true

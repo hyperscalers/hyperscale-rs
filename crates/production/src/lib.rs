@@ -56,6 +56,8 @@ mod shard_thread;
 mod status;
 mod supervisor;
 mod telemetry;
+#[cfg(feature = "test-utils")]
+pub mod testing;
 mod transport;
 pub use handle::{HandleHistory, NodeHandle};
 pub use hyperscale_engine::{PreviewOutcome, PreviewReport};

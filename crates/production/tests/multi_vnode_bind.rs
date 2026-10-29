@@ -5,20 +5,17 @@
 //! shard-agnostic (the adapter exposes a flat `local_validator_ids` and resolves
 //! peers by validator id), so same-shard hosting exercises the whole bind path.
 //! Consensus progress is timing-sensitive over real networking and is exercised
-//! separately by the simulator; this scopes itself to the production-runner
-//! construction path and the multi-validator handshake. `#[serial]`; runs on a
-//! multi-threaded runtime to match the production host's runtime shape.
+//! separately by the simulator; this scopes itself to a host's start and the
+//! multi-validator handshake. `#[serial]`.
 
 mod support;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network_iroh::test_utils::TestFixtures;
-use hyperscale_types::ValidatorId;
+use hyperscale_types::{BeaconChainConfig, ValidatorId};
 use serial_test::serial;
-use support::build_runner;
-use tokio::task::spawn;
+use support::start_host;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
 
@@ -30,42 +27,66 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
     // Four validators, all in shard 0; two per host.
     let fixtures = TestFixtures::new(7, 4);
 
-    let (mut runner0, _dir0, _) = build_runner(&fixtures, &[0, 1], vec![], None);
-    let adapter0 = Arc::clone(runner0.network());
+    let (node0, _dir0) = start_host(&fixtures, &[0, 1], vec![], BeaconChainConfig::default());
+    let host0 = node0.handle();
+    let (ids0, host0_addr, host0_id) = host0
+        .probe(|p| {
+            let network = p.network();
+            (
+                network.local_validator_ids(),
+                network.endpoint_addr(),
+                network.local_endpoint_id(),
+            )
+        })
+        .expect("host 0 runs");
     assert_eq!(
-        adapter0.local_validator_ids(),
+        ids0,
         &[ValidatorId::new(0), ValidatorId::new(1)],
         "host 0 should expose both hosted validator ids"
     );
 
     // Bind host 1 to host 0's address.
-    let host0_addr = adapter0.endpoint_addr();
-
-    let (mut runner1, _dir1, _) = build_runner(&fixtures, &[2, 3], vec![host0_addr], None);
-    let adapter1 = Arc::clone(runner1.network());
+    let (node1, _dir1) = start_host(
+        &fixtures,
+        &[2, 3],
+        vec![host0_addr],
+        BeaconChainConfig::default(),
+    );
+    let host1 = node1.handle();
+    let (ids1, host1_id) = host1
+        .probe(|p| {
+            (
+                p.network().local_validator_ids(),
+                p.network().local_endpoint_id(),
+            )
+        })
+        .expect("host 1 runs");
     assert_eq!(
-        adapter1.local_validator_ids(),
+        ids1,
         &[ValidatorId::new(2), ValidatorId::new(3)],
         "host 1 should expose both hosted validator ids"
     );
-
-    let shutdown0 = runner0.shutdown_handle().expect("shutdown0");
-    let shutdown1 = runner1.shutdown_handle().expect("shutdown1");
-    let h0 = spawn(runner0.run());
-    let h1 = spawn(runner1.run());
 
     // Each handshake takes a few hundred ms at most; wait until both sides resolve every remote vid or the
     // bind timeout elapses.
     let (host0_sees, host1_sees) = timeout(Duration::from_secs(10), async {
         loop {
-            let host0_sees = [
-                adapter0.peer_for_validator(ValidatorId::new(2)),
-                adapter0.peer_for_validator(ValidatorId::new(3)),
-            ];
-            let host1_sees = [
-                adapter1.peer_for_validator(ValidatorId::new(0)),
-                adapter1.peer_for_validator(ValidatorId::new(1)),
-            ];
+            let host0_sees = host0
+                .probe(|p| {
+                    [
+                        p.network().peer_for_validator(ValidatorId::new(2)),
+                        p.network().peer_for_validator(ValidatorId::new(3)),
+                    ]
+                })
+                .expect("host 0 runs");
+            let host1_sees = host1
+                .probe(|p| {
+                    [
+                        p.network().peer_for_validator(ValidatorId::new(0)),
+                        p.network().peer_for_validator(ValidatorId::new(1)),
+                    ]
+                })
+                .expect("host 1 runs");
             if host0_sees.iter().all(Option::is_some) && host1_sees.iter().all(Option::is_some) {
                 return (host0_sees, host1_sees);
             }
@@ -78,14 +99,12 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
     // Every remote validator id on host 0 resolves to host 1's single peer,
     // and vice versa — this is the load-bearing multi-vnode bind property.
     for resolved in host0_sees {
-        assert_eq!(resolved, Some(adapter1.local_endpoint_id()));
+        assert_eq!(resolved, Some(host1_id));
     }
     for resolved in host1_sees {
-        assert_eq!(resolved, Some(adapter0.local_endpoint_id()));
+        assert_eq!(resolved, Some(host0_id));
     }
 
-    drop(shutdown0);
-    drop(shutdown1);
-    let _ = timeout(Duration::from_secs(5), h0).await;
-    let _ = timeout(Duration::from_secs(5), h1).await;
+    let _ = timeout(Duration::from_secs(5), node0.stop()).await;
+    let _ = timeout(Duration::from_secs(5), node1.stop()).await;
 }
