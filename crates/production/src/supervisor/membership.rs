@@ -162,22 +162,29 @@ impl ShardSupervisor {
         let engine_bootstrap = self.engine_bootstrap.clone();
         let events = self.events_tx.clone();
         let vnodes = vnodes.to_vec();
+        let schedule = self.process.topology_schedule();
         self.tokio_handle.spawn_blocking(move || {
             let outcome = factory(&dir, shard).and_then(|storage| {
                 // A clone of a split parent the reshape never adopted holds
                 // nothing of this shard's chain, and a child span an observer
                 // imported and never adopted holds state under no chain, which
-                // the snap-sync import refuses to write over: wipe either, and
-                // join from nothing.
+                // the snap-sync import refuses to write over. A store whose tip
+                // a recovery's band holds keeps a chain the recovered shard
+                // need not extend. Wipe any of them, and join from nothing.
                 let unadopted = storage.holds_foreign_chain(shard)
                     || (storage.is_fresh()
                         && holds_state(storage.jmt_height(), storage.state_root()));
-                if !unadopted {
+                let banded = storage.committed_in_recovery_band(shard, &schedule);
+                if !unadopted && !banded {
                     return Ok(storage);
                 }
-                info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
+                if banded {
+                    info!(shard = ?shard, "Join wiping a store committed in a recovery's band");
+                } else {
+                    info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
+                }
                 drop(storage);
-                std::fs::remove_dir_all(&dir).map_err(|e| format!("unadopted clone wipe: {e}"))?;
+                std::fs::remove_dir_all(&dir).map_err(|e| format!("unadopted store wipe: {e}"))?;
                 factory(&dir, shard)
             });
             let outcome = outcome.map(|storage| {

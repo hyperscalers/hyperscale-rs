@@ -8,8 +8,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash,
-    ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
-    TxHash, Verifiable, Verified,
+    ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, TopologySchedule,
+    Transaction, TxHash, Verifiable, Verified,
 };
 
 use crate::RecoveredState;
@@ -105,6 +105,24 @@ pub trait ShardChainReader: Send + Sync + 'static {
     fn holds_foreign_chain(&self, shard: ShardId) -> bool {
         self.get_certified_header(self.committed_height())
             .is_some_and(|certified| certified.header().shard_id() != shard)
+    }
+
+    /// Whether the committed tip this store holds sits in the band of a
+    /// recovery `schedule` records for `shard`: anchored below the
+    /// recovery's bridge, at a height above its frontier.
+    ///
+    /// The recovered chain builds past the frontier on blocks of its own,
+    /// and those may sit at heights this store committed under another
+    /// hash: a harvest that fell short of the tail this store holds
+    /// leaves the tail on no chain. Block sync carries a store only along
+    /// its own chain, and a store cannot un-commit, so a seat resumed on
+    /// it would wait for good on a parent the shard never names.
+    fn committed_in_recovery_band(&self, shard: ShardId, schedule: &TopologySchedule) -> bool {
+        let height = self.committed_height();
+        self.get_certified_header(height).is_some_and(|certified| {
+            let anchor = certified.header().parent_qc().weighted_timestamp();
+            schedule.recovery_orphaned(shard, anchor, height)
+        })
     }
 
     /// The committed height and the hash of the block at it, read

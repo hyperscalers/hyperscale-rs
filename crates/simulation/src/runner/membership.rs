@@ -393,6 +393,7 @@ impl SimulationRunner {
                     continue;
                 }
                 if !placed.is_empty() {
+                    let schedule = self.hosts[host as usize].process().topology_schedule();
                     let storage = self
                         .retained_storages
                         .remove(&(host, shard))
@@ -405,11 +406,14 @@ impl SimulationRunner {
                         // path; it is an abandoned bootstrap, and the seat
                         // starts again from an empty store against the anchor
                         // that has since advanced. Nor is a split child's clone
-                        // no adoption ran over: its chain is its parent's.
+                        // no adoption ran over: its chain is its parent's. Nor
+                        // is a store whose tip a recovery's band holds: the
+                        // recovered chain need not extend it.
                         .filter(|storage| {
                             storage.load_recovered_state(shard).committed_height
                                 > BlockHeight::GENESIS
                                 && !storage.holds_foreign_chain(shard)
+                                && !storage.committed_in_recovery_band(shard, &schedule)
                         })
                         .unwrap_or_else(|| open_store(shard, self.power_loss));
                     self.seat_joined_group(host, shard, &placed, storage);
