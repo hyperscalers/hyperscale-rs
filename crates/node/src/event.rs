@@ -29,7 +29,7 @@ use hyperscale_types::{
     Address, BeaconChainConfig, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock,
     CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
     ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, ShardForkProof, ShardId,
-    ShardVoteEquivocation, TopologySchedule, Transaction, TxHash, ValidatorId, Verifiable,
+    ShardVoteEquivocation, Signer, TopologySchedule, Transaction, TxHash, ValidatorId, Verifiable,
     Verified, WeightedTimestamp,
 };
 
@@ -770,6 +770,15 @@ pub enum BeaconScopedInput {
 
     /// Stop tracking a chain whose loop has closed.
     Deregister(ChainRegistration),
+
+    /// Run another validator's beacon participation on this host from now
+    /// on.
+    AddParticipant {
+        /// The validator.
+        validator: ValidatorId,
+        /// Its signing key.
+        signer: Arc<dyn Signer>,
+    },
 }
 
 impl BeaconScopedInput {
@@ -798,7 +807,8 @@ impl BeaconScopedInput {
             | Self::SubmissionWantsRecords { .. }
             | Self::Shard { .. }
             | Self::Register { .. }
-            | Self::Deregister(_) => EventPriority::Internal,
+            | Self::Deregister(_)
+            | Self::AddParticipant { .. } => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,
         }
     }

@@ -472,20 +472,11 @@ impl ProductionRunnerBuilder {
             storages.insert(shard, store);
             seated_by_shard.insert(shard, vnodes);
         }
-        let mut fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>> = BTreeMap::new();
-        for (shard, vnodes) in plan.joins {
-            fresh_seats.insert(
-                shard,
-                vnodes
-                    .into_iter()
-                    .map(|(validator_id, signer)| VnodeConfig {
-                        validator_id,
-                        local_shard: shard,
-                        signer,
-                    })
-                    .collect(),
-            );
-        }
+        let fresh_seats: BTreeMap<ShardId, Vec<ValidatorId>> = plan
+            .joins
+            .into_iter()
+            .map(|(shard, vnodes)| (shard, vnodes.into_iter().map(|(id, _)| id).collect()))
+            .collect();
         // The network's genesis config: replicated into every fresh store
         // the supervisor opens for a post-genesis join or observer duty,
         // and installed whole by a fresh store on a never-crossed genesis
@@ -654,7 +645,7 @@ impl ProductionRunnerBuilder {
             participation_tx,
             chain_config.epoch_duration_ms,
             beacon_event_rx,
-            vnode_keys.clone(),
+            vnode_keys,
         );
 
         Ok(ProductionRunner {
@@ -664,7 +655,6 @@ impl ProductionRunnerBuilder {
             reconfigure_tx,
             reconfigure_rx: Some(reconfigure_rx),
             participation_rx: Some(participation_rx),
-            vnode_keys,
             network: adapter,
             topology_snapshot,
             storages,
@@ -712,13 +702,10 @@ pub struct ProductionRunner {
     reconfigure_tx: mpsc::Sender<ShardCommand>,
     /// Receiver drained by `run()`'s select loop.
     reconfigure_rx: Option<mpsc::Receiver<ShardCommand>>,
-    /// Placement deltas emitted by the hosted shard loops, forwarded off
-    /// their threads. `run()`'s select
-    /// loop translates each into [`ShardCommand`]s for the supervisor.
+    /// Placement deltas the host's beacon loop emits for its validators.
+    /// `run()`'s select loop hands each to the supervisor, which holds
+    /// their signing keys.
     participation_rx: Option<mpsc::UnboundedReceiver<ParticipationChange>>,
-    /// Per-validator signing keys for every validator this runner was built
-    /// with, keyed for the placement-delta translation.
-    vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
 
     /// Network adapter: the host's connections, shared with the
     /// [`Network`](hyperscale_network::Network) the node sends through.
@@ -738,7 +725,7 @@ pub struct ProductionRunner {
     resumed: BTreeMap<ShardId, RecoveredState>,
     /// Seats whose store opened fresh at startup, joined through the
     /// supervisor once it runs.
-    fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>>,
+    fresh_seats: BTreeMap<ShardId, Vec<ValidatorId>>,
 
     /// Shared RPC publishers; the metrics tick stamps peer counts into
     /// the status slots.
@@ -983,7 +970,7 @@ impl ProductionRunner {
                 }
                 change = participation_rx.recv() => {
                     if let Some(change) = change {
-                        self.apply_participation_change(&mut supervisor, &change);
+                        supervisor.on_participation_change(&change);
                     }
                 }
                 event = supervisor_events_rx.recv() => {
@@ -1061,8 +1048,8 @@ impl ProductionRunner {
         // Every host runs its beacon loop, with a participant for every key
         // it holds, seated or not.
         let beacon_exited = supervisor.install_beacon_loop(beacon);
-        for (shard, vnodes) in std::mem::take(&mut self.fresh_seats) {
-            supervisor.handle(ShardCommand::Join { shard, vnodes });
+        for (shard, validators) in std::mem::take(&mut self.fresh_seats) {
+            supervisor.handle(ShardCommand::Join { shard, validators });
         }
         (supervisor, beacon_exited)
     }
@@ -1073,64 +1060,6 @@ impl ProductionRunner {
     #[must_use]
     pub fn reconfigure_handle(&self) -> mpsc::Sender<ShardCommand> {
         self.reconfigure_tx.clone()
-    }
-
-    /// Translate a beacon-detected placement delta into supervisor
-    /// commands for the moved validator. A join starts the shard's
-    /// bootstrap immediately — the delta arrives a full epoch before
-    /// the window opens, and the validator votes only once ready. A leave
-    /// needs no command here: the reshape tick's
-    /// [`ShardSupervisor::reconcile_teardown`] tears a shard down once it
-    /// leaves both this host's active committee and its routing committee,
-    /// so serving outlasts a departing window for exactly as long as the
-    /// shard stays routable — covering a replacement's snap-sync and a
-    /// merge keeper's cross-child fetch from one committed lifetime.
-    ///
-    /// The observer and keeper deltas (`observe`/`keep`) drive nothing
-    /// here — the reshape orchestrator self-determines those duties from
-    /// the committed topology projection — so this only wakes the
-    /// orchestrator to re-poll and dispatches the join the placement
-    /// surfaces. The orchestrator owns observer and keeper seating, so the
-    /// supervisor suppresses an observer split join and a merge-execution
-    /// join (see [`ShardSupervisor::handle`]).
-    fn apply_participation_change(
-        &self,
-        supervisor: &mut ShardSupervisor,
-        change: &ParticipationChange,
-    ) {
-        info!(
-            validator = change.validator.inner(),
-            join = ?change.join,
-            leave = ?change.leave,
-            observe = ?change.observe,
-            keep = ?change.keep,
-            effective_epoch = change.effective_epoch.inner(),
-            "Beacon placement change detected"
-        );
-        // Wake the orchestrator to re-poll the committed view: a placement
-        // change often accompanies the cohort/keeper draws and boundary
-        // seedings its duties gate on. A `leave` needs no action here — the
-        // reshape tick's `reconcile_teardown` retires the shard once it
-        // ages out of this host's active and routing committees.
-        supervisor.reshape_step(Vec::new());
-        let Some(shard) = change.join else {
-            return;
-        };
-        let Some(signer) = self.vnode_keys.get(&change.validator) else {
-            warn!(
-                validator = change.validator.inner(),
-                "Placement change for a validator without a local signing key; ignored"
-            );
-            return;
-        };
-        supervisor.handle(ShardCommand::Join {
-            shard,
-            vnodes: vec![VnodeConfig {
-                validator_id: change.validator,
-                local_shard: shard,
-                signer: Arc::clone(signer),
-            }],
-        });
     }
 
     // ═══════════════════════════════════════════════════════════════════

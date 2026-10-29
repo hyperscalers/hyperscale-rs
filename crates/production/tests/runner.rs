@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use hyperscale_network_iroh::IrohAdapter;
 use hyperscale_network_iroh::test_utils::TestFixtures;
-use hyperscale_production::{LocalValidator, ShardCommand, VnodeConfig};
+use hyperscale_production::{LocalValidator, ShardCommand};
 use hyperscale_storage::BeaconChainReader;
 use hyperscale_types::{
     BeaconChainConfig, BlockHash, Epoch, RecoveryCause, ReshapeThresholds, ShardId, ShardRecovery,
@@ -205,11 +205,7 @@ async fn pooled_validator_boots_as_follower_only_host() {
     reconfigure
         .send(ShardCommand::Join {
             shard: ShardId::ROOT,
-            vnodes: vec![VnodeConfig {
-                validator_id: surplus,
-                local_shard: ShardId::ROOT,
-                signer: fixtures.signer(1),
-            }],
+            validators: vec![surplus],
         })
         .await
         .expect("supervisor accepts commands");
@@ -263,11 +259,7 @@ async fn leaving_a_shard_releases_its_store() {
     reconfigure
         .send(ShardCommand::Join {
             shard: ShardId::ROOT,
-            vnodes: vec![VnodeConfig {
-                validator_id: surplus,
-                local_shard: ShardId::ROOT,
-                signer: fixtures.signer(1),
-            }],
+            validators: vec![surplus],
         })
         .await
         .expect("supervisor accepts commands");
@@ -561,11 +553,7 @@ async fn a_join_for_a_running_shard_attaches_to_its_replica() {
     reconfigure
         .send(ShardCommand::Join {
             shard: ShardId::ROOT,
-            vnodes: vec![VnodeConfig {
-                validator_id: surplus,
-                local_shard: ShardId::ROOT,
-                signer: fixtures.signer(1),
-            }],
+            validators: vec![surplus],
         })
         .await
         .expect("supervisor accepts commands");
@@ -623,11 +611,7 @@ async fn a_leave_for_a_queued_validator_detaches_it() {
     reconfigure
         .try_send(ShardCommand::Join {
             shard: ShardId::ROOT,
-            vnodes: vec![VnodeConfig {
-                validator_id: surplus,
-                local_shard: ShardId::ROOT,
-                signer: fixtures.signer(1),
-            }],
+            validators: vec![surplus],
         })
         .expect("supervisor accepts commands");
     reconfigure
@@ -739,11 +723,7 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
         .reconfigure(0)
         .send(ShardCommand::Join {
             shard: ShardId::ROOT,
-            vnodes: vec![VnodeConfig {
-                validator_id: surplus,
-                local_shard: ShardId::ROOT,
-                signer: fixtures.signer(4),
-            }],
+            validators: vec![surplus],
         })
         .await
         .expect("supervisor accepts commands");
@@ -804,11 +784,7 @@ async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
     reconfigure
         .send(ShardCommand::Join {
             shard: ShardId::ROOT,
-            vnodes: vec![VnodeConfig {
-                validator_id: surplus,
-                local_shard: ShardId::ROOT,
-                signer: fixtures.signer(1),
-            }],
+            validators: vec![surplus],
         })
         .await
         .expect("supervisor accepts commands");
