@@ -60,9 +60,7 @@ pub use hyperscale_engine::{PreviewOutcome, PreviewReport};
 pub use hyperscale_network_iroh::{SecretKey, load_or_generate_secret_key};
 pub use hyperscale_storage::BeaconChainReader;
 pub use network_file::{NetworkFile, NetworkFileError};
-pub use node::{
-    DEFAULT_BLOCK_CACHE_MB, Node, NodeError, NodeSetup, beacon_data_dir, for_core_count,
-};
+pub use node::{DEFAULT_BLOCK_CACHE_MB, Node, NodeError, NodeSetup, beacon_data_dir};
 pub use observe::{Answers, HeaderSummary, Observation};
 pub use runner::{LocalValidator, ProductionRunner, RunnerCommand, RunnerError, ShutdownHandle};
 pub use supervisor::{

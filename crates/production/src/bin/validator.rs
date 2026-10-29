@@ -59,24 +59,23 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use hex::{decode as hex_decode, encode as hex_encode};
-use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_dispatch_pooled::ThreadPoolConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::VersionInteroperabilityMode;
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
     DEFAULT_BLOCK_CACHE_MB, LocalValidator, NetworkFile, Node, NodeSetup, TelemetryConfig,
-    for_core_count, init_telemetry,
+    init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_storage_rocksdb::{CompressionType as RocksCompressionType, RocksDbConfig};
-use hyperscale_types::{ConsensusPublicKey, Signer, ValidatorId};
+use hyperscale_types::{ConsensusPublicKey, ValidatorId};
 use serde::Deserialize;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tokio::task::spawn;
 use toml::from_str as toml_from_str;
-use tracing::{info, warn};
+use tracing::info;
 
 #[path = "validator/network.rs"]
 mod network;
@@ -441,19 +440,11 @@ fn format_public_key(pk: &ConsensusPublicKey) -> String {
     hex_encode(pk.as_bytes())
 }
 
-/// Load or generate a signing keypair.
-///
-/// The key file stores a 32-byte seed that deterministically generates the keypair.
-/// This seed can be stored as raw bytes or hex-encoded.
-fn load_or_generate_signer(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
+/// Load a vnode's signing seed from `path`, generating and saving one if
+/// the file does not exist yet. The seed is stored as 32 raw bytes or as
+/// 64 hex characters.
+fn load_or_generate_seed(path: &Path) -> Result<[u8; 32]> {
     use rand::{Rng, rng};
-
-    let Some(path) = key_path else {
-        warn!("No key path specified, generating ephemeral keypair");
-        let mut seed = [0u8; 32];
-        rng().fill_bytes(&mut seed);
-        return Ok(BlsSigner::from_seed(&seed));
-    };
 
     if path.exists() {
         let key_bytes = fs::read(path)
@@ -470,18 +461,14 @@ fn load_or_generate_signer(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
             );
         };
 
-        let seed: [u8; 32] = decoded
+        decoded
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
-
-        Ok(BlsSigner::from_seed(&seed))
+            .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))
     } else {
         info!("Key file not found, generating new keypair");
 
         let mut seed = [0u8; 32];
         rng().fill_bytes(&mut seed);
-
-        let keypair = BlsSigner::from_seed(&seed);
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -490,7 +477,7 @@ fn load_or_generate_signer(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
             .with_context(|| format!("Failed to write key file: {}", path.display()))?;
         info!("Saved new keypair seed to {}", path.display());
 
-        Ok(keypair)
+        Ok(seed)
     }
 }
 
@@ -509,36 +496,17 @@ fn write_private_seed(path: &Path, seed: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// Build thread pool configuration from TOML config.
-///
-/// When TOML values are 0 (auto), computes thread counts based on
-/// available cores. The I/O (tokio) thread count is returned separately
-/// since it is not part of the rayon pool configuration.
-fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
-    let all_auto = config.consensus_threads == 0 && config.throughput_threads == 0;
-
-    let mut builder = if all_auto {
-        let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-        let (consensus, throughput) = for_core_count(available);
-        ThreadPoolConfig::builder()
-            .consensus_threads(consensus)
-            .throughput_threads(throughput)
-    } else {
-        let mut b = ThreadPoolConfig::builder();
-        if config.consensus_threads > 0 {
-            b = b.consensus_threads(config.consensus_threads);
-        }
-        if config.throughput_threads > 0 {
-            b = b.throughput_threads(config.throughput_threads);
-        }
-        b
-    };
-
-    if config.pin_cores {
-        builder = builder.pin_cores(true);
+/// The host's thread pools: `sized`, the node's own sizing for this
+/// machine, with every `[threads]` setting the config gives in its place.
+const fn thread_pools(config: &ThreadsConfig, mut sized: ThreadPoolConfig) -> ThreadPoolConfig {
+    if config.consensus_threads > 0 {
+        sized.consensus_threads = config.consensus_threads;
     }
-
-    builder.build_unchecked()
+    if config.throughput_threads > 0 {
+        sized.throughput_threads = config.throughput_threads;
+    }
+    sized.pin_cores |= config.pin_cores;
+    sized
 }
 
 /// Build `RocksDB` configuration from TOML config.
@@ -660,29 +628,21 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         "Loaded network file"
     );
 
-    // Ordered as config.vnodes: the first entry is the host's primary vnode.
-    let mut hosted_signers: Vec<(ValidatorId, Arc<BlsSigner>)> =
-        Vec::with_capacity(config.vnodes.len());
+    // The validators this host runs, ordered as config.vnodes: the first is
+    // the host's primary vnode. Shard participation is not named here — the
+    // runner derives each validator's seat (or pool membership) from the
+    // committed beacon state and opens any seated shard's storage itself.
+    let mut validators: Vec<LocalValidator> = Vec::with_capacity(config.vnodes.len());
     for entry in &config.vnodes {
-        let keypair = load_or_generate_signer(Some(&entry.key_path))?;
+        let seed = load_or_generate_seed(&entry.key_path)?;
+        let validator = LocalValidator::from_seed(ValidatorId::new(entry.validator_id), &seed);
         info!(
             validator_id = entry.validator_id,
-            public_key = %format_public_key(&keypair.public_key()),
+            public_key = %format_public_key(&validator.signer.public_key()),
             "Loaded vnode signing keypair"
         );
-        hosted_signers.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));
+        validators.push(validator);
     }
-
-    // The validators this host runs. Shard participation is not named here —
-    // the runner derives each validator's seat (or pool membership) from the
-    // committed beacon state and opens any seated shard's storage itself.
-    let validators: Vec<LocalValidator> = hosted_signers
-        .iter()
-        .map(|(validator_id, signer)| LocalValidator {
-            validator_id: *validator_id,
-            signer: Arc::clone(signer) as Arc<dyn Signer>,
-        })
-        .collect();
 
     // The network file fixes the chain and its genesis; this host's own
     // settings replace the defaults for everything else.
@@ -697,7 +657,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let mut node = Node::start(NodeSetup {
         mempool: config.mempool.clone(),
         provisions: config.provisions,
-        threads: build_thread_pool_config(&config.threads),
+        threads: thread_pools(&config.threads, setup.threads),
         io_threads: config.threads.io_threads,
         storage: build_rocksdb_config(&config.storage),
         ..setup
@@ -808,24 +768,31 @@ mod tests {
     }
 
     #[test]
-    fn test_build_thread_pool_config_auto() {
-        let config = ThreadsConfig::default();
-        let pool_config = build_thread_pool_config(&config);
-        assert!(pool_config.consensus_threads >= 2);
-        assert!(pool_config.throughput_threads >= 1);
+    fn thread_pools_keep_the_node_sizing_when_unset() {
+        let sized = ThreadPoolConfig::builder()
+            .consensus_threads(2)
+            .throughput_threads(6)
+            .build_unchecked();
+        let pool_config = thread_pools(&ThreadsConfig::default(), sized);
+        assert_eq!(pool_config.consensus_threads, 2);
+        assert_eq!(pool_config.throughput_threads, 6);
     }
 
     #[test]
-    fn test_build_thread_pool_config_explicit() {
+    fn thread_pools_take_each_setting_given() {
         let config = ThreadsConfig {
             consensus_threads: 3,
-            throughput_threads: 14,
+            throughput_threads: 0,
             io_threads: 0,
             pin_cores: false,
         };
-        let pool_config = build_thread_pool_config(&config);
+        let sized = ThreadPoolConfig::builder()
+            .consensus_threads(2)
+            .throughput_threads(6)
+            .build_unchecked();
+        let pool_config = thread_pools(&config, sized);
         assert_eq!(pool_config.consensus_threads, 3);
-        assert_eq!(pool_config.throughput_threads, 14);
+        assert_eq!(pool_config.throughput_threads, 6);
     }
 
     /// The shipped example config must satisfy the `deny_unknown_fields`

@@ -83,7 +83,7 @@ pub const DEFAULT_BLOCK_CACHE_MB: usize = 512;
 /// reserved against: unpinned, the scheduler interleaves them with pool
 /// workers.
 #[must_use]
-pub const fn for_core_count(total_cores: usize) -> (usize, usize) {
+const fn for_core_count(total_cores: usize) -> (usize, usize) {
     let consensus = 2;
     let throughput = total_cores.saturating_sub(consensus);
     (consensus, if throughput == 0 { 1 } else { throughput })
