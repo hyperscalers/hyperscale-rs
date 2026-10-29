@@ -66,7 +66,7 @@ use hyperscale_network_iroh::VersionInteroperabilityMode;
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
     DEFAULT_BLOCK_CACHE_MB, LocalValidator, NetworkFile, Node, NodeSetup, TelemetryConfig,
-    TelemetryGuard, for_core_count, init_telemetry,
+    for_core_count, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_storage_rocksdb::{CompressionType as RocksCompressionType, RocksDbConfig};
@@ -77,10 +77,6 @@ use tokio::signal;
 use tokio::task::spawn;
 use toml::from_str as toml_from_str;
 use tracing::{info, warn};
-use tracing_appender::non_blocking as wrap_non_blocking;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::never;
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[path = "validator/network.rs"]
 mod network;
@@ -592,76 +588,23 @@ fn main() -> Result<()> {
 
 #[allow(clippy::too_many_lines)] // straight-line startup wiring; helpers would just shuffle locals
 async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
-    // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export;
-    // otherwise the basic fmt subscriber is used.
-    #[allow(dead_code)]
-    enum UnifiedGuard {
-        Telemetry(TelemetryGuard),
-        Basic(Option<WorkerGuard>),
-    }
-
     // Telemetry's `validator` resource attribute reports the primary
     // (first-listed) vnode's id. Shard participation is beacon-derived and
     // can change over the node's life, so it isn't a stable startup label.
     let primary_validator_label = config.vnodes.first().map_or(0, |v| v.validator_id);
 
-    let _log_guard = if config.telemetry.enabled {
-        let telemetry_config = TelemetryConfig {
-            service_name: config.telemetry.service_name.clone(),
-            otlp_endpoint: config.telemetry.otlp_endpoint.clone(),
-            sampling_ratio: 1.0,
-            prometheus_enabled: false, // We handle metrics separately
-            prometheus_port: 9090,
-            resource_attributes: vec![(
-                "validator".to_string(),
-                primary_validator_label.to_string(),
-            )],
-            log_file: config.telemetry.log_file.clone(),
-        };
-        UnifiedGuard::Telemetry(init_telemetry(&telemetry_config)?)
-    } else {
-        // Basic logging without OTLP export
-        let builder = fmt();
-
-        let inner_guard = if let Some(log_file) = &config.telemetry.log_file {
-            if let Some(parent) = log_file.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let file_name = log_file
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Invalid log file name"))?
-                .to_string_lossy()
-                .to_string();
-            let directory = log_file
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-
-            let file_appender = never(directory, file_name);
-            let (non_blocking_writer, guard) = wrap_non_blocking(file_appender);
-
-            builder
-                .with_writer(non_blocking_writer)
-                .with_ansi(false) // Disable ANSI colors in file logs
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
-                )
-                .init();
-            Some(guard)
-        } else {
-            builder
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
-                )
-                .init();
-            None
-        };
-        UnifiedGuard::Basic(inner_guard)
-    };
+    let _log_guard = init_telemetry(&TelemetryConfig {
+        service_name: config.telemetry.service_name.clone(),
+        otlp_endpoint: config
+            .telemetry
+            .otlp_endpoint
+            .clone()
+            .filter(|_| config.telemetry.enabled),
+        sampling_ratio: 1.0,
+        default_filter: cli.log_level.clone(),
+        resource_attributes: vec![("validator".to_string(), primary_validator_label.to_string())],
+        log_file: config.telemetry.log_file.clone(),
+    })?;
 
     info!("Hyperscale Validator starting...");
 

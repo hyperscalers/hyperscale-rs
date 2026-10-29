@@ -4,18 +4,8 @@
 //! The architecture instruments the production runner while preserving
 //! state machine determinism.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use arc_swap::ArcSwap;
-use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::{Json, Router, serve};
-use hyperscale_metrics_prometheus::encode_metrics;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{ExporterBuildError, SpanExporter, WithExportConfig};
@@ -23,10 +13,8 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkError;
 use opentelemetry_sdk::trace::{RandomIdGenerator, Sampler, SdkTracerProvider};
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
-use serde::Serialize;
 use thiserror::Error;
-use tokio::net::TcpListener;
-use tokio::task::{JoinHandle, spawn, spawn_blocking};
+use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_appender::non_blocking as wrap_non_blocking;
@@ -36,11 +24,6 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::fmt::layer as fmt_layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
-
-use crate::status::SyncStatus;
-
-/// Provider for sync status, used by the telemetry HTTP server.
-pub type SyncStatusProvider = Arc<ArcSwap<SyncStatus>>;
 
 /// Errors that can occur while initialising telemetry.
 #[derive(Debug, Error)]
@@ -57,9 +40,9 @@ pub enum TelemetryError {
     #[error("Failed to set global subscriber: {0}")]
     SetSubscriber(#[from] SetGlobalDefaultError),
 
-    /// I/O error while binding the metrics HTTP listener or preparing the log file.
-    #[error("Failed to bind metrics port: {0}")]
-    MetricsPort(#[from] std::io::Error),
+    /// I/O error while preparing the log file.
+    #[error("Failed to prepare the log file: {0}")]
+    LogFile(#[from] std::io::Error),
 }
 
 /// Configuration for telemetry.
@@ -71,10 +54,8 @@ pub struct TelemetryConfig {
     pub otlp_endpoint: Option<String>,
     /// Sampling ratio (0.0 to 1.0). Default: 1.0 (sample everything).
     pub sampling_ratio: f64,
-    /// Enable Prometheus metrics endpoint.
-    pub prometheus_enabled: bool,
-    /// Prometheus metrics port.
-    pub prometheus_port: u16,
+    /// The log filter directives used when `RUST_LOG` is unset.
+    pub default_filter: String,
     /// Additional resource attributes.
     pub resource_attributes: Vec<(String, String)>,
     /// Optional log file path. If provided, logs are written to this file instead of stdout.
@@ -87,8 +68,7 @@ impl Default for TelemetryConfig {
             service_name: "hyperscale-node".to_string(),
             otlp_endpoint: None,
             sampling_ratio: 1.0,
-            prometheus_enabled: false,
-            prometheus_port: 9090,
+            default_filter: "info,hyperscale=debug".to_string(),
             resource_attributes: vec![],
             log_file: None,
         }
@@ -113,8 +93,8 @@ impl Default for TelemetryConfig {
 /// # Errors
 ///
 /// Returns [`TelemetryError`] if the OTLP exporter or tracer provider cannot be
-/// constructed, the global tracing subscriber cannot be installed, or (when
-/// Prometheus is enabled) the log directory cannot be created.
+/// constructed, the global tracing subscriber cannot be installed, or the log
+/// directory cannot be created.
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     // Build resource attributes
     let mut resource_attrs = vec![
@@ -130,7 +110,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
 
     // Build the subscriber layers
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hyperscale=debug"));
+        .unwrap_or_else(|_| EnvFilter::new(&config.default_filter));
 
     // Optional OTLP tracing layer
     let (otel_layer, tracer_provider) = if let Some(endpoint) = &config.otlp_endpoint {
@@ -160,12 +140,12 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
     // Initialize formatting layer (file or stdout)
     let (fmt_layer, appender_guard) = if let Some(log_file) = &config.log_file {
         if let Some(parent) = log_file.parent() {
-            std::fs::create_dir_all(parent).map_err(TelemetryError::MetricsPort)?;
+            std::fs::create_dir_all(parent).map_err(TelemetryError::LogFile)?;
         }
         let file_name = log_file
             .file_name()
             .ok_or_else(|| {
-                TelemetryError::MetricsPort(std::io::Error::new(
+                TelemetryError::LogFile(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Invalid log file name",
                 ))
@@ -200,26 +180,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
 
     set_global_default(subscriber)?;
 
-    // Start Prometheus metrics endpoint if enabled
-    let (prometheus_handle, ready_flag, sync_status) = if config.prometheus_enabled {
-        let ready_flag = Arc::new(AtomicBool::new(false));
-        let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
-        let handle = start_metrics_server(
-            config.prometheus_port,
-            ready_flag.clone(),
-            sync_status.clone(),
-        );
-        (Some(handle), Some(ready_flag), Some(sync_status))
-    } else {
-        (None, None, None)
-    };
-
     Ok(TelemetryGuard {
         tracer_provider,
-        prometheus_handle,
-        ready_flag,
-        sync_status,
-        appender_guard,
+        _appender_guard: appender_guard,
     })
 }
 
@@ -229,11 +192,8 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
 /// before dropping. The `Drop` impl provides a fallback but cannot flush async.
 pub struct TelemetryGuard {
     tracer_provider: Option<SdkTracerProvider>,
-    prometheus_handle: Option<JoinHandle<()>>,
-    ready_flag: Option<Arc<AtomicBool>>,
-    sync_status: Option<SyncStatusProvider>,
-    #[allow(dead_code)] // kept alive to keep the non-blocking log appender worker running
-    appender_guard: Option<WorkerGuard>,
+    /// Keeps the non-blocking log appender's worker running.
+    _appender_guard: Option<WorkerGuard>,
 }
 
 impl TelemetryGuard {
@@ -262,156 +222,7 @@ impl TelemetryGuard {
             )
             .await;
         }
-
-        // Stop Prometheus server
-        if let Some(handle) = self.prometheus_handle.take() {
-            handle.abort();
-        }
     }
-
-    /// Set the Prometheus server handle (called internally).
-    #[allow(dead_code)]
-    pub(crate) fn set_prometheus_handle(&mut self, handle: JoinHandle<()>) {
-        self.prometheus_handle = Some(handle);
-    }
-
-    /// Mark the node as ready (for readiness probe).
-    ///
-    /// Call this after the node has completed initialization and is ready
-    /// to participate in consensus.
-    pub fn set_ready(&self, ready: bool) {
-        if let Some(flag) = &self.ready_flag {
-            flag.store(ready, Ordering::SeqCst);
-        }
-    }
-
-    /// Get the sync status provider for updating sync status.
-    ///
-    /// Returns `None` if Prometheus metrics are disabled.
-    /// The runner should call this to get a handle for updating sync status.
-    #[must_use]
-    pub fn sync_status_provider(&self) -> Option<SyncStatusProvider> {
-        self.sync_status.clone()
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Prometheus HTTP Server
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Start the metrics HTTP server.
-///
-/// Exposes:
-/// - `GET /metrics` - Prometheus metrics in text format
-/// - `GET /health` - Liveness probe (always returns 200 if server is running)
-/// - `GET /ready` - Readiness probe (returns 200 if node is ready, 503 otherwise)
-/// - `GET /system/sync-status` - Sync status for operational visibility
-fn start_metrics_server(
-    port: u16,
-    ready_flag: Arc<AtomicBool>,
-    sync_status: SyncStatusProvider,
-) -> JoinHandle<()> {
-    spawn(async move {
-        let ready_flag_clone = ready_flag.clone();
-        let sync_status_clone = sync_status.clone();
-
-        let app = Router::new()
-            .route("/metrics", get(metrics_handler))
-            .route("/health", get(health_handler))
-            .route(
-                "/ready",
-                get(move || ready_handler(ready_flag_clone.clone())),
-            )
-            .route(
-                "/system/sync-status",
-                get(move || sync_status_handler(sync_status_clone.clone())),
-            );
-
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        tracing::info!(port, "Starting metrics server on http://{}", addr);
-
-        let listener = match TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(error = ?e, port, "Failed to bind metrics server");
-                return;
-            }
-        };
-
-        if let Err(e) = serve(listener, app).await {
-            tracing::error!(error = ?e, "Metrics server error");
-        }
-    })
-}
-
-/// Handler for `/metrics` - returns Prometheus metrics.
-async fn metrics_handler() -> impl IntoResponse {
-    match encode_metrics() {
-        Ok((content_type, buffer)) => ([(CONTENT_TYPE, content_type)], buffer).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to encode metrics");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to encode metrics",
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Handler for `/health` - liveness probe.
-///
-/// Returns 200 OK if the server is running. This indicates the process is alive
-/// but not necessarily ready to serve traffic.
-async fn health_handler() -> impl IntoResponse {
-    Json(HealthResponse { status: "ok" })
-}
-
-/// Handler for `/ready` - readiness probe.
-///
-/// Returns 200 OK if the node is ready to participate in consensus.
-/// Returns 503 Service Unavailable if still initializing.
-#[allow(clippy::unused_async)] // axum::Handler requires fns returning a Future
-async fn ready_handler(ready_flag: Arc<AtomicBool>) -> impl IntoResponse {
-    if ready_flag.load(Ordering::SeqCst) {
-        (
-            StatusCode::OK,
-            Json(ReadyResponse {
-                status: "ready",
-                ready: true,
-            }),
-        )
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadyResponse {
-                status: "not_ready",
-                ready: false,
-            }),
-        )
-    }
-}
-
-/// Handler for `/system/sync-status` - sync status endpoint.
-///
-/// Returns the current sync status as JSON.
-#[allow(clippy::unused_async)] // axum::Handler requires fns returning a Future
-async fn sync_status_handler(sync_status: SyncStatusProvider) -> impl IntoResponse {
-    let status = sync_status.load();
-    Json((**status).clone())
-}
-
-/// Response for health endpoint.
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-}
-
-/// Response for readiness endpoint.
-#[derive(Serialize)]
-struct ReadyResponse {
-    status: &'static str,
-    ready: bool,
 }
 
 impl Drop for TelemetryGuard {
@@ -420,19 +231,11 @@ impl Drop for TelemetryGuard {
         if let Some(provider) = self.tracer_provider.take() {
             let _ = provider.shutdown();
         }
-        if let Some(handle) = self.prometheus_handle.take() {
-            handle.abort();
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::body::{Body, to_bytes};
-    use axum::http::Request;
-    use serde_json::{Value, from_slice};
-    use tower::ServiceExt;
-
     use super::*;
 
     #[test]
@@ -441,180 +244,6 @@ mod tests {
         assert_eq!(config.service_name, "hyperscale-node");
         assert!(config.otlp_endpoint.is_none());
         assert!((config.sampling_ratio - 1.0).abs() < f64::EPSILON);
-        assert!(!config.prometheus_enabled);
-        assert_eq!(config.prometheus_port, 9090);
-    }
-
-    #[test]
-    fn test_telemetry_disabled_by_default() {
-        // Verify config defaults to no OTLP endpoint
-        let config = TelemetryConfig::default();
-        assert!(config.otlp_endpoint.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_health_endpoint() {
-        let ready_flag = Arc::new(AtomicBool::new(false));
-        let app = Router::new().route("/health", get(health_handler));
-
-        let response = Request::builder()
-            .uri("/health")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(response).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let json: Value = from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
-
-        // Suppress unused variable warning
-        let _ = ready_flag;
-    }
-
-    #[tokio::test]
-    async fn test_ready_endpoint_not_ready() {
-        let ready_flag = Arc::new(AtomicBool::new(false));
-        let flag_clone = ready_flag.clone();
-
-        let app = Router::new().route("/ready", get(move || ready_handler(flag_clone.clone())));
-
-        let response = Request::builder()
-            .uri("/ready")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(response).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let json: Value = from_slice(&body).unwrap();
-        assert_eq!(json["status"], "not_ready");
-        assert_eq!(json["ready"], false);
-    }
-
-    #[tokio::test]
-    async fn test_ready_endpoint_ready() {
-        let ready_flag = Arc::new(AtomicBool::new(true));
-        let flag_clone = ready_flag.clone();
-
-        let app = Router::new().route("/ready", get(move || ready_handler(flag_clone.clone())));
-
-        let response = Request::builder()
-            .uri("/ready")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(response).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let json: Value = from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ready");
-        assert_eq!(json["ready"], true);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_endpoint() {
-        let app = Router::new().route("/metrics", get(metrics_handler));
-
-        let response = Request::builder()
-            .uri("/metrics")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(response).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Check content type is Prometheus text format
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(content_type.contains("text/plain"));
-
-        // Body should be valid (even if empty metrics)
-        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        // Prometheus format is text-based, should be valid UTF-8
-        let _text = std::str::from_utf8(&body).expect("Metrics should be valid UTF-8");
-    }
-
-    #[tokio::test]
-    async fn test_set_ready_flag() {
-        let ready_flag = Arc::new(AtomicBool::new(false));
-
-        // Create a mock guard with the ready flag
-        let guard = TelemetryGuard {
-            tracer_provider: None,
-            prometheus_handle: None,
-            ready_flag: Some(ready_flag.clone()),
-            sync_status: None,
-            appender_guard: None,
-        };
-
-        // Initially not ready
-        assert!(!ready_flag.load(Ordering::SeqCst));
-
-        // Set ready
-        guard.set_ready(true);
-        assert!(ready_flag.load(Ordering::SeqCst));
-
-        // Set not ready
-        guard.set_ready(false);
-        assert!(!ready_flag.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn test_sync_status_endpoint() {
-        use hyperscale_node::{BlockSyncStateKind, BlockSyncStatus};
-
-        let mut shards = std::collections::HashMap::new();
-        shards.insert(
-            0u64,
-            BlockSyncStatus {
-                state: BlockSyncStateKind::Syncing,
-                current_height: 100,
-                target_height: Some(200),
-                blocks_behind: 100,
-                pending_fetches: 2,
-                queued_heights: 98,
-            },
-        );
-        let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus {
-            shards,
-            sync_peers: 3,
-        })));
-
-        let status_clone = sync_status.clone();
-        let app = Router::new().route(
-            "/system/sync-status",
-            get(move || sync_status_handler(status_clone.clone())),
-        );
-
-        let response = Request::builder()
-            .uri("/system/sync-status")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(response).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let json: Value = from_slice(&body).unwrap();
-
-        assert_eq!(json["sync_peers"], 3);
-        let entry = &json["shards"]["0"];
-        assert_eq!(entry["state"], "syncing");
-        assert_eq!(entry["current_height"], 100);
-        assert_eq!(entry["target_height"], 200);
-        assert_eq!(entry["blocks_behind"], 100);
+        assert_eq!(config.default_filter, "info,hyperscale=debug");
     }
 }
