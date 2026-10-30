@@ -796,7 +796,7 @@ pub enum ProtocolEvent {
     BeaconBlockSyncReadyToApply {
         /// The fetched block, wrapped `Unverified` — the coordinator
         /// dispatches cert verification before adopting.
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
     },
 
     /// A cross-shard consumer is parked on a source block whose height sits
@@ -995,7 +995,7 @@ pub enum ProtocolEvent {
     /// the `Verified` marker.
     BeaconBlockReceived {
         /// Received certified block.
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
     },
 
     /// A `BeaconProposal` arrived, its sender authenticated and its VRF
@@ -1100,7 +1100,7 @@ pub enum ProtocolEvent {
     /// round-trip.
     BeaconBlockVerified {
         /// Verified block on success; the typed error otherwise.
-        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
+        result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
     },
 
     /// Result of an [`Action::VerifyRatifyVote`] dispatch.

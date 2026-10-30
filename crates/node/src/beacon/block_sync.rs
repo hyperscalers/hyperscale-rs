@@ -14,8 +14,6 @@
 //! buffer is needed. The binding sets `Key = Epoch`, so the generic
 //! schedules over epochs directly.
 
-use std::sync::Arc;
-
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::{Answerers, Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
@@ -122,7 +120,7 @@ where
     pub(super) fn on_sync_response(
         &mut self,
         epoch: Epoch,
-        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+        block: Option<Verifiable<CertifiedBeaconBlock>>,
     ) {
         let Some(block) = block else {
             // Back off rather than re-queue immediately: the sync target

@@ -150,7 +150,7 @@ impl Member {
         let me = self.committee.validator_id(0);
         let mut coordinator = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
-            Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash)),
+            Verified::<CertifiedBeaconBlock>::genesis(config_hash),
             vec![build_genesis_beacon_state(&config)],
             me,
             ShardId::ROOT,

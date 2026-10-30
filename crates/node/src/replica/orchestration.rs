@@ -291,8 +291,9 @@ mod tests {
             SignerBitfield::new(4),
             AggregateSignature::new([0; 96]),
         );
-        let block = Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert)),
+        let block = Verified::new_unchecked_for_test(CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Skip(cert),
         ));
         let now = LocalTimestamp::from_millis((epoch.inner() + 1) * epoch_ms(node));
         node.adopt(now, block);
@@ -349,14 +350,12 @@ mod tests {
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
         );
-        let block = Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBeaconBlock::new_unchecked(
-                block,
-                BeaconCert::Normal {
-                    spc: Box::new(spc),
-                    ratify,
-                },
-            ),
+        let block = Verified::new_unchecked_for_test(CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Normal {
+                spc: Box::new(spc),
+                ratify,
+            },
         ));
         let now = LocalTimestamp::from_millis((epoch.inner() + 1) * epoch_ms(node));
         node.adopt(now, block);

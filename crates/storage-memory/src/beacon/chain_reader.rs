@@ -9,10 +9,7 @@ use hyperscale_types::{BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch
 use super::core::SimBeaconStorage;
 
 impl BeaconChainReader for SimBeaconStorage {
-    fn get_beacon_block_by_epoch(
-        &self,
-        epoch: Epoch,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    fn get_beacon_block_by_epoch(&self, epoch: Epoch) -> Option<Verified<CertifiedBeaconBlock>> {
         read_or_recover(&self.inner)
             .blocks_by_epoch
             .get(&epoch)
@@ -22,7 +19,7 @@ impl BeaconChainReader for SimBeaconStorage {
     fn get_beacon_block_by_hash(
         &self,
         hash: BeaconBlockHash,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    ) -> Option<Verified<CertifiedBeaconBlock>> {
         let inner = read_or_recover(&self.inner);
         let epoch = *inner.hash_to_epoch.get(&hash)?;
         inner.blocks_by_epoch.get(&epoch).cloned()
@@ -43,11 +40,11 @@ impl BeaconChainReader for SimBeaconStorage {
             .copied()
     }
 
-    fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+    fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
         let inner = read_or_recover(&self.inner);
         let (&epoch, block) = inner.blocks_by_epoch.iter().next_back()?;
         let state = inner.state_by_epoch.get(&epoch).cloned()?;
-        let block = Arc::clone(block);
+        let block = block.clone();
         drop(inner);
         Some((block, state))
     }

@@ -40,7 +40,7 @@ pub type Loop = ShardLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 /// committee.
 pub struct Fixture {
     pub committee: TestCommittee,
-    genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
+    genesis_block: Verified<CertifiedBeaconBlock>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
     validator_set: ValidatorSet,
@@ -72,7 +72,7 @@ impl Fixture {
         };
         let genesis_state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &network, &[]);
-        let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let genesis_block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         let validator_set = ValidatorSet::new(
             (0..4)
                 .map(|i| ValidatorInfo {
@@ -148,8 +148,8 @@ impl Fixture {
     }
 
     /// The genesis beacon block every host here starts from.
-    pub fn genesis_block(&self) -> Arc<Verified<CertifiedBeaconBlock>> {
-        Arc::clone(&self.genesis_block)
+    pub fn genesis_block(&self) -> Verified<CertifiedBeaconBlock> {
+        self.genesis_block.clone()
     }
 
     /// How every host here builds its replicas and its fold.
@@ -247,7 +247,7 @@ impl Fixture {
     /// storage holding `history`'s blocks and states.
     pub fn host_over_history(
         &self,
-        history: Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)>,
+        history: Vec<(Verified<CertifiedBeaconBlock>, BeaconState)>,
         now: LocalTimestamp,
     ) -> (Host, Receiver<HostEvent>) {
         let (event_tx, events) = unbounded();
@@ -279,7 +279,7 @@ impl Fixture {
     /// from what the store recovers with `committee[0]` attached, at `now`.
     pub fn host_resumed(
         &self,
-        history: Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)>,
+        history: Vec<(Verified<CertifiedBeaconBlock>, BeaconState)>,
         storage: SimShardStorage,
         now: LocalTimestamp,
     ) -> (Host, Receiver<HostEvent>) {

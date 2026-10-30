@@ -285,7 +285,7 @@ impl BeaconCoordinator {
     #[allow(clippy::too_many_arguments)] // identity + storage state both threaded explicitly
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+        latest_block: Verified<CertifiedBeaconBlock>,
         history: Vec<BeaconState>,
         me: ValidatorId,
         local_shard: ShardId,
@@ -328,7 +328,7 @@ impl BeaconCoordinator {
         actions
     }
 
-    fn adopt(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Vec<Action> {
+    fn adopt(&mut self, block: Verified<CertifiedBeaconBlock>) -> Vec<Action> {
         self.fold
             .adopt(block)
             .map_or_else(Vec::new, |adopted| self.settle(adopted))
@@ -632,7 +632,7 @@ impl BeaconCoordinator {
     /// [`BeaconFold::on_beacon_block_received`].
     pub fn on_beacon_block_received(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
     ) -> Vec<Action> {
         self.fold.on_beacon_block_received(block)
     }
@@ -647,7 +647,7 @@ impl BeaconCoordinator {
     /// binding) is not bypassed.
     pub fn on_beacon_block_sync_ready_to_apply(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
     ) -> Vec<Action> {
         self.fold.on_beacon_block_received(block)
     }
@@ -678,7 +678,7 @@ impl BeaconCoordinator {
     /// Panics when the verified block competes with the adopted tip.
     pub fn on_beacon_block_verified(
         &mut self,
-        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
+        result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
     ) -> Vec<Action> {
         self.fold
             .on_beacon_block_verified(result)
@@ -800,7 +800,7 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn latest_block(&self) -> &Arc<Verified<CertifiedBeaconBlock>> {
+    pub const fn latest_block(&self) -> &Verified<CertifiedBeaconBlock> {
         &self.fold.latest_block
     }
 
@@ -1014,7 +1014,7 @@ mod tests {
     /// on an empty store: build genesis state, hash the config, wrap
     /// the genesis block.
     fn genesis_trio() -> (
-        Arc<Verified<CertifiedBeaconBlock>>,
+        Verified<CertifiedBeaconBlock>,
         BeaconState,
         GenesisConfigHash,
     ) {
@@ -1022,7 +1022,7 @@ mod tests {
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
         let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
-        (Arc::new(block), state, config_hash)
+        (block, state, config_hash)
     }
 
     fn new_coord(me: ValidatorId) -> BeaconCoordinator {
@@ -1632,7 +1632,7 @@ mod tests {
                     active_pool,
                     equivocation_signers,
                 } => {
-                    let result = Arc::unwrap_or_clone(block)
+                    let result = block
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             verifier: &BlsVerifier,
                             network: &net,
@@ -1640,7 +1640,6 @@ mod tests {
                             active_pool: &active_pool,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
                     let post = coord.on_beacon_block_verified(result);
                     out.extend(complete_verifications(coord, post));
@@ -1699,7 +1698,7 @@ mod tests {
         let block_hash = block.block_hash();
         let coord = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
-            Arc::clone(&block),
+            block,
             vec![state],
             ValidatorId::new(0),
             ShardId::ROOT,
@@ -1755,7 +1754,7 @@ mod tests {
         );
         let _coord = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
-            Arc::new(mismatched_block),
+            mismatched_block,
             vec![state],
             ValidatorId::new(0),
             ShardId::ROOT,
@@ -2290,7 +2289,7 @@ mod tests {
         };
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
-        let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         let mut coord = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
             block,
@@ -2323,7 +2322,7 @@ mod tests {
         // Re-keyed under a foreign shard: dropped.
         let mut coord2 = {
             let state = build_genesis_beacon_state(&config);
-            let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+            let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
             BeaconCoordinator::new(
                 Arc::new(BlsVerifier),
                 block,
@@ -2412,7 +2411,7 @@ mod tests {
         };
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
-        let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         BeaconCoordinator::new(
             Arc::new(BlsVerifier),
             block,
@@ -3130,7 +3129,7 @@ mod tests {
         coord: &BeaconCoordinator,
         epoch: Epoch,
         prev_hash: BeaconBlockHash,
-    ) -> Arc<Verifiable<CertifiedBeaconBlock>> {
+    ) -> Verifiable<CertifiedBeaconBlock> {
         let n = coord.fold.state.committee.len();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -3154,13 +3153,13 @@ mod tests {
         );
         let block = BeaconBlock::new(epoch, prev_hash, Capped::empty());
         let ratify = ratify_cert_for_block(coord, &block);
-        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
+        Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal {
                 spc: Box::new(cert),
                 ratify,
             },
-        )))
+        ))
     }
 
     /// Like `valid_block_at`, but carrying one committed proposal (a
@@ -3173,7 +3172,7 @@ mod tests {
         coord: &BeaconCoordinator,
         epoch: Epoch,
         prev_hash: BeaconBlockHash,
-    ) -> Arc<Verifiable<CertifiedBeaconBlock>> {
+    ) -> Verifiable<CertifiedBeaconBlock> {
         let n = coord.fold.state.committee.len();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -3210,13 +3209,13 @@ mod tests {
             Capped::from_array([(committee[0].0, proposal)]),
         );
         let ratify = ratify_cert_for_block(coord, &block);
-        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
+        Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal {
                 spc: Box::new(cert),
                 ratify,
             },
-        )))
+        ))
     }
 
     #[test]
@@ -3226,9 +3225,7 @@ mod tests {
         // tip's perspective. `on_beacon_block_received` should drop it
         // before even inspecting the cert.
         let _prev = coord.fold.latest_block.block_hash();
-        let block = Arc::new(Verifiable::from(CertifiedBeaconBlock::genesis(
-            GenesisConfigHash::ZERO,
-        )));
+        let block = Verifiable::from(CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO));
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert_eq!(coord.fold.state.current_epoch, Epoch::GENESIS);
@@ -3286,7 +3283,7 @@ mod tests {
     /// deadline passed, one verified precommit for the skip hash per
     /// pool member, cert assembly, adoption. Returns the broadcast
     /// skip block.
-    fn adopt_skip_block(coord: &mut BeaconCoordinator) -> Arc<Verified<CertifiedBeaconBlock>> {
+    fn adopt_skip_block(coord: &mut BeaconCoordinator) -> Verified<CertifiedBeaconBlock> {
         pass_skip_deadline(coord);
         let skip_hash = coord.participant.ratify.skip_block_hash();
         let mut adopted = None;
@@ -3322,7 +3319,7 @@ mod tests {
         coord_a.set_now(LocalTimestamp::from_millis(2 * ed));
         let genesis_tip = coord_a.fold.latest_block.block_hash();
         let normal = valid_nonempty_block_at(&coord_a, Epoch::new(1), genesis_tip);
-        let dispatched = coord_a.on_beacon_block_received(Arc::clone(&normal));
+        let dispatched = coord_a.on_beacon_block_received(normal);
         let _ = complete_verifications(&mut coord_a, dispatched);
         assert_eq!(coord_a.current_epoch(), Epoch::new(1));
 
@@ -3341,9 +3338,7 @@ mod tests {
         // Contact: the skip block reaches A. Its cert is dispatched for
         // verification against the pool that governed epoch 1, and the
         // verified competitor halts the replica.
-        let competitor = Arc::new(Verifiable::from(
-            Arc::unwrap_or_clone(skip_block).into_inner(),
-        ));
+        let competitor = Verifiable::from(skip_block.into_inner());
         let dispatched = coord_a.on_beacon_block_received(competitor);
         assert!(
             dispatched
@@ -3430,7 +3425,7 @@ mod tests {
         let prev = coord.fold.latest_block.block_hash();
         let block = valid_block_at(&coord, Epoch::new(1), prev);
         let block_hash = block.block_hash();
-        let dispatched = coord.on_beacon_block_received(Arc::clone(&block));
+        let dispatched = coord.on_beacon_block_received(block);
 
         // Cert verification is offloaded — the immediate handler emits
         // exactly one `VerifyBeaconBlock` action.
@@ -3475,7 +3470,7 @@ mod tests {
         // `fresh_coord` is at now = 0, before any epoch boundary.
         let prev = coord.fold.latest_block.block_hash();
         let block = valid_block_at(&coord, Epoch::new(1), prev);
-        let dispatched = coord.on_beacon_block_received(Arc::clone(&block));
+        let dispatched = coord.on_beacon_block_received(block);
         let actions = complete_verifications(&mut coord, dispatched);
 
         assert_eq!(coord.fold.state.current_epoch, Epoch::new(1));
@@ -3510,7 +3505,7 @@ mod tests {
         let block = valid_block_at(&observer, Epoch::new(1), prev);
         let block_hash = block.block_hash();
 
-        let dispatched = observer.on_beacon_block_received(Arc::clone(&block));
+        let dispatched = observer.on_beacon_block_received(block);
         let actions = complete_verifications(&mut observer, dispatched);
         // Off-committee observers still advance state via apply_epoch.
         assert!(
@@ -3538,7 +3533,7 @@ mod tests {
             let prev = observer.fold.latest_block.block_hash();
             let block = valid_block_at(&observer, Epoch::new(epoch), prev);
             let block_hash = block.block_hash();
-            let dispatched = observer.on_beacon_block_received(Arc::clone(&block));
+            let dispatched = observer.on_beacon_block_received(block);
             let actions = complete_verifications(&mut observer, dispatched);
             assert!(
                 actions
@@ -4923,9 +4918,7 @@ mod tests {
         assert_eq!(published(&genesis, 2), Err(Unpublished));
 
         let tip = valid_block_at(&genesis, Epoch::new(3), genesis.latest_block().block_hash());
-        let tip = Arc::new(Verified::new_unchecked_for_test(
-            tip.as_unverified().clone(),
-        ));
+        let tip = Verified::new_unchecked_for_test(tip.as_unverified().clone());
         let (_, _, config_hash) = genesis_trio();
         let resumed = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
@@ -5307,7 +5300,7 @@ mod tests {
         let block = emitted
             .iter()
             .find_map(|action| match action {
-                Action::BroadcastBeaconBlock { block } => Some(Arc::clone(block)),
+                Action::BroadcastBeaconBlock { block } => Some(block.clone()),
                 _ => None,
             })
             .expect("the certified block is broadcast");
@@ -5315,12 +5308,12 @@ mod tests {
         assert_eq!(epoch, block.epoch());
         assert!(
             certifier
-                .on_beacon_block_verified(Ok(Arc::clone(&block)))
+                .on_beacon_block_verified(Ok(block.clone()))
                 .is_empty(),
             "the gossiped copy adopts nothing",
         );
         assert!(
-            certifier.fold.adopt(Arc::clone(&block)).is_none(),
+            certifier.fold.adopt(block.clone()).is_none(),
             "nor does the fold itself on a second copy",
         );
         assert_eq!(certifier.current_epoch(), epoch);

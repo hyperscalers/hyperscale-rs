@@ -76,7 +76,7 @@ pub struct Crossing {
 #[derive(Clone)]
 pub struct CapturedCommit {
     pub epoch: Epoch,
-    pub block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub block: Verified<CertifiedBeaconBlock>,
     pub state: BeaconState,
 }
 
@@ -126,7 +126,7 @@ enum SimEvent {
         proposal: Verified<BeaconProposal>,
     },
     BeaconBlock {
-        block: Arc<Verified<CertifiedBeaconBlock>>,
+        block: Verified<CertifiedBeaconBlock>,
     },
     BeaconCandidate {
         candidate: Verified<CandidateBeaconBlock>,
@@ -303,13 +303,13 @@ impl CoordinatorSim {
 
         let initial_state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &network, &[]);
-        let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let genesis_block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
 
         let coordinators: Vec<BeaconCoordinator> = (0..pool_n)
             .map(|i| {
                 BeaconCoordinator::new(
                     Arc::new(BlsVerifier),
-                    Arc::clone(&genesis_block),
+                    genesis_block.clone(),
                     vec![initial_state.clone()],
                     members[i].0,
                     ShardId::ROOT,
@@ -907,9 +907,9 @@ impl CoordinatorSim {
     pub fn deliver_block_to(
         &mut self,
         replica_idx: usize,
-        block: &Arc<Verified<CertifiedBeaconBlock>>,
+        block: &Verified<CertifiedBeaconBlock>,
     ) -> Vec<Action> {
-        let wrapped = Arc::new(Verifiable::from((***block).clone()));
+        let wrapped = Verifiable::from((**block).clone());
         let dispatched = self.coordinators[replica_idx].on_beacon_block_received(wrapped);
         let resolved = self.resolve_verifications(replica_idx, dispatched);
         self.absorb(replica_idx, resolved.clone());
@@ -946,7 +946,7 @@ impl CoordinatorSim {
                     active_pool,
                     equivocation_signers,
                 } => {
-                    let result = Arc::unwrap_or_clone(block)
+                    let result = block
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             verifier: &BlsVerifier,
                             network: &self.network,
@@ -954,7 +954,6 @@ impl CoordinatorSim {
                             active_pool: &active_pool,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
                     let post = self.coordinators[replica_idx].on_beacon_block_verified(result);
                     out.extend(self.resolve_verifications(replica_idx, post));
@@ -1247,7 +1246,7 @@ impl CoordinatorSim {
                 proposal,
             } => self.coordinators[env.to_idx].on_beacon_proposal_received(from, epoch, proposal),
             SimEvent::BeaconBlock { block } => {
-                let wrapped = Arc::new(Verifiable::from((**block).clone()));
+                let wrapped = Verifiable::from(block.into_inner());
                 self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
             SimEvent::BeaconCandidate { candidate } => {
@@ -1549,7 +1548,7 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::BeaconBlock {
-                            block: Arc::clone(&block),
+                            block: block.clone(),
                         },
                     });
                 }
@@ -1644,7 +1643,7 @@ impl CoordinatorSim {
                 // sim collapses the round-trip to a synchronous inline
                 // verify + result-feedback so verification timing doesn't
                 // reshape envelope-delivery ordering.
-                let result = Arc::unwrap_or_clone(block)
+                let result = block
                     .upgrade(&CertifiedBeaconBlockVerifyContext {
                         verifier: &BlsVerifier,
                         network: &self.network,
@@ -1652,7 +1651,6 @@ impl CoordinatorSim {
                         active_pool: &active_pool,
                         equivocation_signers: &equivocation_signers,
                     })
-                    .map(Arc::new)
                     .map_err(|(_, e)| e);
                 let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
                 self.absorb(emitter_idx, post);

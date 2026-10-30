@@ -85,7 +85,7 @@ const MAX_EARLY_CANDIDATES: usize = 4;
 #[allow(missing_docs)] // the struct doc names both fields
 pub struct ParticipantStep {
     pub actions: Vec<Action>,
-    pub certified: Option<Arc<Verified<CertifiedBeaconBlock>>>,
+    pub certified: Option<Verified<CertifiedBeaconBlock>>,
 }
 
 impl From<Vec<Action>> for ParticipantStep {
@@ -1326,7 +1326,7 @@ impl BeaconParticipant {
     fn commit_ratified_block(
         &mut self,
         cert: Verified<RatifyCert>,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    ) -> Option<Verified<CertifiedBeaconBlock>> {
         let block_hash = cert.block_hash();
         let certified = if block_hash == self.ratify.skip_block_hash() {
             let block = BeaconBlock::skip(cert.epoch(), cert.anchor_hash());
@@ -1351,7 +1351,7 @@ impl BeaconParticipant {
             );
             return None;
         };
-        Some(Arc::new(certified))
+        Some(certified)
     }
 
     /// A previously-dispatched [`Action::VerifyRatifyVote`] has
@@ -1405,7 +1405,7 @@ impl BeaconParticipant {
             .and_then(|cert| self.commit_ratified_block(*cert));
         if let Some(block) = &certified {
             actions.push(Action::BroadcastBeaconBlock {
-                block: Arc::clone(block),
+                block: block.clone(),
             });
         }
         actions.extend(self.ask_for_prevoted_candidates(fold));

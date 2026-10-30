@@ -4,8 +4,6 @@
 //! chain. A `CertifiedBeaconBlock` is self-contained (block + cert, no
 //! provisions to re-attach), so the serve is a thin storage read.
 
-use std::sync::Arc;
-
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_types::Verifiable;
@@ -27,7 +25,7 @@ pub fn serve_beacon_block_request(
     let response = storage
         .get_beacon_block_by_epoch(req.epoch)
         .map_or_else(GetBeaconBlockResponse::not_found, |block| {
-            GetBeaconBlockResponse::found(Arc::new(Verifiable::from((**block).clone())))
+            GetBeaconBlockResponse::found(Verifiable::from(block.into_inner()))
         });
     record_fetch_response_sent("beacon_block", usize::from(response.block.is_some()));
     response

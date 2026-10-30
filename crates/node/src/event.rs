@@ -677,7 +677,7 @@ pub enum BeaconScopedInput {
         /// Epoch of the block being synced.
         epoch: Epoch,
         /// The fetched block, or `None` if the peer didn't have it.
-        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+        block: Option<Verifiable<CertifiedBeaconBlock>>,
     },
 
     /// A beacon-block sync fetch failed at the transport layer.

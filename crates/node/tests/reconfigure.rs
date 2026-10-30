@@ -43,7 +43,7 @@ const SHARD_B: ShardId = ShardId::leaf(1, 1);
 /// everyone in one pool.
 struct Fixture {
     committee: TestCommittee,
-    genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
+    genesis_block: Verified<CertifiedBeaconBlock>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
     topology_snapshot: Arc<TopologySnapshot>,
@@ -88,7 +88,7 @@ fn fixture() -> Fixture {
     };
     let genesis_state = build_genesis_beacon_state(&config);
     let config_hash = genesis_config_hash(&config, &network, &[]);
-    let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+    let genesis_block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
 
     let validator_set = ValidatorSet::new(
         (0..4)
@@ -310,7 +310,7 @@ fn a_shard_less_host_receives_beacon_gossip_with_no_route_gate() {
 
     // Global scope, no source shard: with no hosted shard only the
     // host-level handler runs.
-    let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
+    let gossip = BeaconBlockGossip::new(Verifiable::from((*fix.genesis_block).clone()));
     let _ = registry.local_dispatch_gossip(&gossip, None);
     let event = event_rx
         .try_recv()
@@ -343,7 +343,7 @@ fn a_beacon_item_the_loop_never_checks_stays_deferred_on_a_hosted_shard_host() {
     );
     while event_rx.try_recv().is_ok() {}
 
-    let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
+    let gossip = BeaconBlockGossip::new(Verifiable::from((*fix.genesis_block).clone()));
     let verdict = registry.local_dispatch_gossip(&gossip, None);
     assert!(
         matches!(verdict, Some(Verdict::Defer(_))),

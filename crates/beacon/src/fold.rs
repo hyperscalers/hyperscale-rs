@@ -88,7 +88,7 @@ pub struct BeaconFold {
     /// Latest committed beacon block paired with its authenticating
     /// cert. Carried so SPC instance bootstrap and ratify anchor
     /// checks read `prev_block_hash` without a storage roundtrip.
-    pub(crate) latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub(crate) latest_block: Verified<CertifiedBeaconBlock>,
 
     /// Beacon committee that governed the tip epoch, captured before
     /// its fold advanced the state. A competing block for the adopted
@@ -161,7 +161,7 @@ impl BeaconFold {
     /// match `expected_config_hash`.
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+        latest_block: Verified<CertifiedBeaconBlock>,
         history: Vec<impl Borrow<BeaconState>>,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
@@ -284,7 +284,7 @@ impl BeaconFold {
 
     /// The tip: the latest adopted block.
     #[must_use]
-    pub const fn latest_block(&self) -> &Arc<Verified<CertifiedBeaconBlock>> {
+    pub const fn latest_block(&self) -> &Verified<CertifiedBeaconBlock> {
         &self.latest_block
     }
 
@@ -375,7 +375,7 @@ impl BeaconFold {
     /// problem handled elsewhere.
     pub fn on_beacon_block_received(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
     ) -> Vec<Action> {
         let epoch = block.epoch();
         let tip_epoch = self.latest_block.epoch();
@@ -441,7 +441,7 @@ impl BeaconFold {
     /// adoption — the live state's sets are post-fold.
     fn tip_competitor_verification(
         &mut self,
-        block: &Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: &Verifiable<CertifiedBeaconBlock>,
     ) -> Option<Vec<Action>> {
         if block.epoch() != self.latest_block.epoch()
             || block.epoch() == Epoch::GENESIS
@@ -459,7 +459,7 @@ impl BeaconFold {
         );
         let equivocation_signers = self.equivocation_signers_for(block.block());
         Some(self.dispatch_block_verification(
-            Arc::clone(block),
+            block.clone(),
             self.tip_epoch_committee.clone(),
             self.tip_epoch_pool.clone(),
             equivocation_signers,
@@ -496,7 +496,7 @@ impl BeaconFold {
     /// the in-flight slot's result drives admission for any duplicate.
     fn dispatch_block_verification(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         active_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
         equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
@@ -530,7 +530,7 @@ impl BeaconFold {
     /// the evidence rather than continuing on a forked beacon chain.
     pub fn on_beacon_block_verified(
         &mut self,
-        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
+        result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
     ) -> Option<Adopted> {
         let block = match result {
             Ok(b) => b,
@@ -600,7 +600,7 @@ impl BeaconFold {
     /// the epoch after the tip adopts: every path that certifies an
     /// epoch reaches here, and the first to arrive is the one that
     /// folds it, so `apply_epoch` never sees a regression.
-    pub fn adopt(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Option<Adopted> {
+    pub fn adopt(&mut self, block: Verified<CertifiedBeaconBlock>) -> Option<Adopted> {
         let epoch = block.epoch();
         if epoch != self.state.current_epoch.next() {
             return None;
@@ -618,7 +618,7 @@ impl BeaconFold {
             block.epoch(),
             input,
         );
-        self.latest_block = Arc::clone(&block);
+        self.latest_block = block.clone();
 
         // Refresh the head and record the active snapshot for the just-applied
         // epoch plus the lookahead for the next, then drop entries every

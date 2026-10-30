@@ -11,21 +11,18 @@ use super::core::RocksDbBeaconStorage;
 use crate::typed_cf::TypedCf;
 
 impl BeaconChainReader for RocksDbBeaconStorage {
-    fn get_beacon_block_by_epoch(
-        &self,
-        epoch: Epoch,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    fn get_beacon_block_by_epoch(&self, epoch: Epoch) -> Option<Verified<CertifiedBeaconBlock>> {
         self.cf_get::<BeaconBlocksByEpochCf>(&epoch.inner())
-            .map(|block| Arc::new(Verified::<CertifiedBeaconBlock>::from_persisted(block)))
+            .map(Verified::<CertifiedBeaconBlock>::from_persisted)
     }
 
     fn get_beacon_block_by_hash(
         &self,
         hash: BeaconBlockHash,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    ) -> Option<Verified<CertifiedBeaconBlock>> {
         let epoch = self.cf_get::<BeaconHashToEpochCf>(&hash.into_raw())?;
         self.cf_get::<BeaconBlocksByEpochCf>(&epoch)
-            .map(|block| Arc::new(Verified::<CertifiedBeaconBlock>::from_persisted(block)))
+            .map(Verified::<CertifiedBeaconBlock>::from_persisted)
     }
 
     fn get_state_by_epoch(&self, epoch: Epoch) -> Option<Arc<BeaconState>> {
@@ -46,7 +43,7 @@ impl BeaconChainReader for RocksDbBeaconStorage {
         Some(Epoch::new(u64::from_be_bytes(bytes)))
     }
 
-    fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+    fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
         let epoch = self.latest_committed_epoch()?;
         let block = self.get_beacon_block_by_epoch(epoch)?;
         let state = self.get_state_by_epoch(epoch)?;

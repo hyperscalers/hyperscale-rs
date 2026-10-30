@@ -212,10 +212,7 @@ impl NodeHandle {
 pub struct HandleHistory(NodeHandle);
 
 impl BeaconChainReader for HandleHistory {
-    fn get_beacon_block_by_epoch(
-        &self,
-        epoch: Epoch,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    fn get_beacon_block_by_epoch(&self, epoch: Epoch) -> Option<Verified<CertifiedBeaconBlock>> {
         self.0
             .with(|calls| calls.history.get_beacon_block_by_epoch(epoch))
             .flatten()
@@ -224,7 +221,7 @@ impl BeaconChainReader for HandleHistory {
     fn get_beacon_block_by_hash(
         &self,
         hash: BeaconBlockHash,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+    ) -> Option<Verified<CertifiedBeaconBlock>> {
         self.0
             .with(|calls| calls.history.get_beacon_block_by_hash(hash))
             .flatten()
@@ -242,7 +239,7 @@ impl BeaconChainReader for HandleHistory {
             .flatten()
     }
 
-    fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+    fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
         self.0
             .with(|calls| calls.history.latest_committed())
             .flatten()
@@ -265,16 +262,13 @@ pub mod test_support {
     struct NoHistory;
 
     impl BeaconChainReader for NoHistory {
-        fn get_beacon_block_by_epoch(
-            &self,
-            _: Epoch,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        fn get_beacon_block_by_epoch(&self, _: Epoch) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
         fn get_beacon_block_by_hash(
             &self,
             _: BeaconBlockHash,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
         fn get_state_by_epoch(&self, _: Epoch) -> Option<Arc<BeaconState>> {
@@ -283,9 +277,7 @@ pub mod test_support {
         fn latest_committed_epoch(&self) -> Option<Epoch> {
             None
         }
-        fn latest_committed(
-            &self,
-        ) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+        fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
             None
         }
     }

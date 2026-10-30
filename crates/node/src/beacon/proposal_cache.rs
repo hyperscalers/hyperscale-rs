@@ -135,14 +135,14 @@ mod tests {
         fn get_beacon_block_by_epoch(
             &self,
             _epoch: Epoch,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
 
         fn get_beacon_block_by_hash(
             &self,
             _hash: BeaconBlockHash,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
 
@@ -154,9 +154,7 @@ mod tests {
             Some(Epoch::new(self.0.load(Ordering::Relaxed)))
         }
 
-        fn latest_committed(
-            &self,
-        ) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+        fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
             None
         }
     }

@@ -182,7 +182,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
 pub struct GenesisBoot {
     /// Genesis [`CertifiedBeaconBlock`], verified for each host's beacon
     /// fold to resume from.
-    pub(crate) block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub(crate) block: Verified<CertifiedBeaconBlock>,
     /// Folded genesis [`BeaconState`].
     pub state: Arc<BeaconState>,
     /// Genesis config hash, bound into beacon signatures alongside the
@@ -279,7 +279,7 @@ pub fn build_genesis(
     };
     let state = Arc::new(build_genesis_beacon_state(&config));
     let config_hash = genesis_config_hash(&config, &genesis.network, pools);
-    let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+    let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
     let topology_snapshot = Arc::new(state.derive_topology_snapshot(genesis.network.clone()));
     GenesisBoot {
         block,

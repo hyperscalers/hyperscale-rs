@@ -303,10 +303,7 @@ where
             });
         }
         Action::BroadcastBeaconBlock { block } => {
-            ctx.network
-                .broadcast_global(&BeaconBlockGossip::new(Arc::new(Verifiable::from(
-                    Arc::unwrap_or_clone(block),
-                ))));
+            ctx.network.broadcast_global(&BeaconBlockGossip::new(block));
         }
         Action::SignAndBroadcastRatifyVote {
             anchor,
@@ -607,7 +604,7 @@ pub fn verify_beacon_block<N: Network>(
     // the fold dispatches it only for a block it can place, so a failure
     // is the block's own.
     let key = VerdictKey::of(block.as_unverified());
-    let result = Arc::unwrap_or_clone(block)
+    let result = block
         .upgrade(&CertifiedBeaconBlockVerifyContext {
             verifier,
             network,
@@ -615,7 +612,6 @@ pub fn verify_beacon_block<N: Network>(
             active_pool: &active_pool,
             equivocation_signers: &equivocation_signers,
         })
-        .map(Arc::new)
         .map_err(|(_, e)| e);
     transport.settle(key, checked(result.is_ok()));
     notify(ProtocolEvent::BeaconBlockVerified { result });

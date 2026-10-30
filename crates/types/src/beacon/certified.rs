@@ -454,7 +454,7 @@ impl Verified<CertifiedBeaconBlock> {
     /// witnesses checked), so re-reading it post-restart returns a value
     /// whose predicate already held at write time. The beacon storage
     /// write entry point (`commit_beacon_block`) takes
-    /// `&Arc<Verified<CertifiedBeaconBlock>>`, so unverified blocks can't
+    /// `&Verified<CertifiedBeaconBlock>`, so unverified blocks can't
     /// reach the write path. Mirror of
     /// [`Verified::<CertifiedBlock>::from_persisted`] on the shard side;
     /// callers in storage adapters or recovery paths use this

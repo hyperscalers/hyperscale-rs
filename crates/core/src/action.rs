@@ -1611,7 +1611,7 @@ pub enum Action {
     /// beacon gossip topic.
     BroadcastBeaconBlock {
         /// Certified block to broadcast.
-        block: Arc<Verified<CertifiedBeaconBlock>>,
+        block: Verified<CertifiedBeaconBlock>,
     },
 
     /// Verify the certs authenticating a beacon block — the pool
@@ -1627,7 +1627,7 @@ pub enum Action {
         /// short-circuits dispatch. Carried back through the result
         /// event so the coordinator doesn't have to stash it
         /// separately.
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
         /// Beacon committee for the block's epoch — the SPC cert's
         /// signer base. Positional ordering matches the cert's
         /// bitfields.
@@ -1807,7 +1807,7 @@ pub enum Action {
     /// to `BeaconStorage`. Both writes go in one atomic batch.
     CommitBeaconBlock {
         /// Certified committed block.
-        block: Arc<Verified<CertifiedBeaconBlock>>,
+        block: Verified<CertifiedBeaconBlock>,
         /// State the block advances to. Boxed to bound enum size.
         state: Box<BeaconState>,
     },

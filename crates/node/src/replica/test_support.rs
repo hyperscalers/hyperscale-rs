@@ -92,11 +92,7 @@ impl TestNode {
 
     /// Adopt `block` into the fold at `now` and hand the node the schedule
     /// it folded, as the host's beacon loop does after its commit.
-    pub(crate) fn adopt(
-        &mut self,
-        now: LocalTimestamp,
-        block: Arc<Verified<CertifiedBeaconBlock>>,
-    ) {
+    pub(crate) fn adopt(&mut self, now: LocalTimestamp, block: Verified<CertifiedBeaconBlock>) {
         self.fold.set_now(now);
         let adopted = self.fold.adopt(block).expect("the block extends the tip");
         for action in adopted.actions {
@@ -255,7 +251,7 @@ fn test_fold(
     let mut state = build_genesis_beacon_state(&config);
     state.recoveries.extend(recoveries);
     let config_hash = genesis_config_hash(&config, &network, &[]);
-    let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+    let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
     let history = match history {
         Some(history) => history(state),
         None => vec![state],

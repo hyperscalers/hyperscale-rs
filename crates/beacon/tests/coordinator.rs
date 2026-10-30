@@ -314,7 +314,7 @@ fn adoption_path_advances_non_participating_replica() {
     let mut sim_a = CoordinatorSim::new(4, seed);
     sim_a.kick_off();
     sim_a.run_until_committed(1, MAX_STEPS);
-    let peer_block = Arc::clone(&sim_a.commits[0][0].block);
+    let peer_block = sim_a.commits[0][0].block.clone();
     let expected_state = sim_a.commits[0][0].state.clone();
 
     // Sim B: byte-identical setup so the genesis state and committee
@@ -1454,7 +1454,7 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
         sim.commits[late].is_empty(),
         "the late member adopted a block"
     );
-    let parent = Arc::clone(&sim.commits[0][0].block);
+    let parent = sim.commits[0][0].block.clone();
     let candidate = sim
         .broadcast_candidate(Epoch::new(2))
         .expect("the connected side broadcast its epoch 2 candidate");
@@ -1510,7 +1510,7 @@ fn candidates_further_ahead_give_way_to_a_nearer_one() {
         sim.commits[late].is_empty(),
         "the late member adopted a block"
     );
-    let parent = Arc::clone(&sim.commits[0][0].block);
+    let parent = sim.commits[0][0].block.clone();
     let candidate = sim
         .broadcast_candidate(Epoch::new(2))
         .expect("the connected side broadcast its epoch 2 candidate");
@@ -1572,8 +1572,8 @@ fn a_candidate_several_blocks_ahead_of_the_tip_is_prevoted_once_its_parent_is_ad
         sim.commits[late].is_empty(),
         "the late member adopted a block"
     );
-    let grandparent = Arc::clone(&sim.commits[0][0].block);
-    let parent = Arc::clone(&sim.commits[0][1].block);
+    let grandparent = sim.commits[0][0].block.clone();
+    let parent = sim.commits[0][1].block.clone();
     let candidate = sim
         .broadcast_candidate(Epoch::new(3))
         .expect("the connected side broadcast its epoch 3 candidate");

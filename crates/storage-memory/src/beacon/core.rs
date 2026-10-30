@@ -45,7 +45,7 @@ impl Default for SimBeaconStorage {
 pub(super) struct Inner {
     /// Primary block store keyed by epoch. `BTreeMap` so iteration is
     /// naturally epoch-ordered for latest-key lookup.
-    pub(super) blocks_by_epoch: OrdMap<Epoch, Arc<Verified<CertifiedBeaconBlock>>>,
+    pub(super) blocks_by_epoch: OrdMap<Epoch, Verified<CertifiedBeaconBlock>>,
     /// Secondary index `block_hash → epoch`.
     pub(super) hash_to_epoch: OrdMap<BeaconBlockHash, Epoch>,
     /// Parallel state store keyed by epoch. Written in the same

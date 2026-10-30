@@ -387,7 +387,7 @@ fn placeholder_cert() -> SpcCert {
 /// placeholder. Suitable for storage round-trip tests, not for
 /// consensus verification.
 #[must_use]
-pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedBeaconBlock>> {
+pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Verified<CertifiedBeaconBlock> {
     let block = BeaconBlock::new(
         Epoch::new(epoch),
         BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
@@ -401,14 +401,12 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedB
         SignerBitfield::new(4),
         AggregateSignature::new([0x22; 96]),
     );
-    Arc::new(Verified::new_unchecked_for_test(
-        CertifiedBeaconBlock::new_unchecked(
-            block,
-            BeaconCert::Normal {
-                spc: Box::new(placeholder_cert()),
-                ratify,
-            },
-        ),
+    Verified::new_unchecked_for_test(CertifiedBeaconBlock::new_unchecked(
+        block,
+        BeaconCert::Normal {
+            spc: Box::new(placeholder_cert()),
+            ratify,
+        },
     ))
 }
 
@@ -440,7 +438,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
 pub fn make_test_block_and_state(
     epoch: u64,
     tag: &[u8],
-) -> (Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>) {
+) -> (Verified<CertifiedBeaconBlock>, Arc<BeaconState>) {
     let state = make_test_beacon_state(epoch, tag);
     let block = make_test_beacon_block(epoch, tag);
     (block, state)

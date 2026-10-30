@@ -707,9 +707,9 @@ fn beacon_gossip_reaches_a_seated_hosts_loop_once() {
     let fix = Fixture::new();
     let (mut wire, _host, events) = wired(&fix, SyncDispatch::new());
     wire.peer
-        .broadcast_global(&BeaconBlockGossip::new(Arc::new(Verifiable::from(
-            (*fix.genesis_block()).clone(),
-        ))));
+        .broadcast_global(&BeaconBlockGossip::new(Verifiable::from(
+            fix.genesis_block().into_inner(),
+        )));
     for entry in wire.peer.drain_outbox() {
         wire.network
             .accept_gossip(1, wire.now, entry, &mut wire.streams);
@@ -778,11 +778,11 @@ fn co_hosted_participants_check_a_peer_vote_once() {
 fn the_beacon_loops_block_sync_asks_past_the_host() {
     let fix = Fixture::new();
     let (mut wire, mut host, events) = wired(&fix, SyncDispatch::new());
-    let counter = |count: &Arc<AtomicUsize>, block: Arc<Verified<CertifiedBeaconBlock>>| {
+    let counter = |count: &Arc<AtomicUsize>, block: Verified<CertifiedBeaconBlock>| {
         let count = Arc::clone(count);
         move |_: GetBeaconBlockRequest| {
             count.fetch_add(1, Ordering::SeqCst);
-            GetBeaconBlockResponse::found(Arc::new(Verifiable::from((*block).clone())))
+            GetBeaconBlockResponse::found(Verifiable::from((*block).clone()))
         }
     };
     let here = Arc::new(AtomicUsize::new(0));
@@ -817,7 +817,7 @@ fn a_beacon_sync_answer_for_another_epoch_is_refused() {
     let genesis = fix.genesis_block();
     wire.peer
         .register_request_handler(SHARD, move |_: GetBeaconBlockRequest| {
-            GetBeaconBlockResponse::found(Arc::new(Verifiable::from((*genesis).clone())))
+            GetBeaconBlockResponse::found(Verifiable::from((*genesis).clone()))
         });
     host.beacon.start_sync(Epoch::new(1));
     wire.pump(&mut host, &events);
@@ -1111,10 +1111,7 @@ fn two_identities_on_one_host_each_sign_their_own_spc_view() {
 /// Commit a skip block for every epoch in `1..=tip` over the genesis
 /// state, each state's live boundary at its own epoch, so the fold a
 /// host resumes over them retains only the windows at its tip.
-fn advanced_history(
-    fix: &Fixture,
-    tip: u64,
-) -> Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)> {
+fn advanced_history(fix: &Fixture, tip: u64) -> Vec<(Verified<CertifiedBeaconBlock>, BeaconState)> {
     let mut history = vec![(fix.genesis_block(), fix.genesis_state().clone())];
     for epoch in 1..=tip {
         let (parent, state) = history.last().expect("genesis is first").clone();
@@ -1132,7 +1129,7 @@ fn advanced_history(
 fn skip_block(
     parent: &Verified<CertifiedBeaconBlock>,
     epoch: Epoch,
-) -> Arc<Verified<CertifiedBeaconBlock>> {
+) -> Verified<CertifiedBeaconBlock> {
     let tip = parent.block_hash();
     let block = BeaconBlock::skip(epoch, tip);
     let cert = RatifyCert::new(
@@ -1143,8 +1140,9 @@ fn skip_block(
         SignerBitfield::new(4),
         AggregateSignature::new([0; 96]),
     );
-    Arc::new(Verified::new_unchecked_for_test(
-        CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert)),
+    Verified::new_unchecked_for_test(CertifiedBeaconBlock::new_unchecked(
+        block,
+        BeaconCert::Skip(cert),
     ))
 }
 
@@ -1216,7 +1214,7 @@ fn a_runtime_join_builds_its_replica_from_the_registration_reply() {
 fn a_restarted_host_installs_the_next_beacon_blocks_schedule() {
     let fix = Fixture::new();
     let history = advanced_history(&fix, 2);
-    let tip = Arc::clone(&history.last().expect("a tip").0);
+    let tip = history.last().expect("a tip").0.clone();
     let storage = SimShardStorage::new(shard_prefix_path(SHARD));
     commit_one(&storage, 1);
     let (mut host, events) = fix.host_resumed(history, storage, far_future());
@@ -1248,16 +1246,14 @@ fn the_fold_commits_each_beacon_block_once() {
     let block = skip_block(&fix.genesis_block(), Epoch::new(1));
     let verified = || {
         fold_outcome(ProtocolEvent::BeaconBlockVerified {
-            result: Ok(Arc::clone(&block)),
+            result: Ok(block.clone()),
         })
     };
     let (ran, left) = crash_point::armed(Some(u64::MAX), || {
         let _ = host.step(verified());
         let _ = host.step(verified());
-        host.beacon.on_sync_response(
-            Epoch::new(1),
-            Some(Arc::new(Verifiable::from((*block).clone()))),
-        );
+        host.beacon
+            .on_sync_response(Epoch::new(1), Some(Verifiable::from((*block).clone())));
         for event in events.try_iter() {
             let _ = host.step(event);
         }
@@ -1786,7 +1782,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
 /// The states a merge into the root leaves: window 1 runs the root's
 /// two children and window 2 the root alone, so each child's terminal
 /// window is 1.
-fn merged_history(fix: &Fixture) -> Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)> {
+fn merged_history(fix: &Fixture) -> Vec<(Verified<CertifiedBeaconBlock>, BeaconState)> {
     let genesis = fix.genesis_state();
     let mut split = genesis.clone();
     split.current_epoch = Epoch::new(1);
