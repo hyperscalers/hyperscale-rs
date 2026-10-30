@@ -693,6 +693,9 @@ pub enum BeaconScopedInput {
     /// A fetch request for these ids never reached a peer; retry on the
     /// tick.
     FetchUnroutable(FetchIds),
+    /// A fetch for these ids was answered whole at its response boundary;
+    /// they retire.
+    FetchFulfilled(FetchIds),
     /// A fetch for `ids` was answered with `event`. The ids retire once
     /// the loop takes what the answer carries, and are released as
     /// failed when its fold refuses a witness run.
@@ -795,6 +798,7 @@ impl BeaconScopedInput {
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::FetchFailed(_)
             | Self::FetchUnroutable(_)
+            | Self::FetchFulfilled(_)
             | Self::InstanceRecordsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
             | Self::PackagesInstalled { .. }

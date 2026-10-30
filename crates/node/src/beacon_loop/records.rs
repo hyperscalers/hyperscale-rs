@@ -24,16 +24,19 @@ use hyperscale_core::{BeaconFetchIds, FetchIds};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Executor, artifact_package, instance_of_record};
 use hyperscale_hbor::{Bytes, Capped};
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{GetInstanceRecordsRequest, GetPackageArtifactsRequest};
+use hyperscale_types::network::response::{
+    GetInstanceRecordsResponse, GetPackageArtifactsResponse,
+};
 use hyperscale_types::{Address, Hash, ShardId};
 
 use super::{Asked, Askers, BeaconLoop, Interest};
 use crate::beacon::{BeaconFetchState, BeaconReply};
 use crate::event::{BeaconOwner, BeaconScopedInput, HostEvent};
 use crate::fetch::{
-    Fetch, FetchBinding, FetchInput, FetchReply, FetchedBy, Route, partition_solicited,
+    Fetch, FetchBinding, FetchInput, FetchedBy, Route, Settles, SolicitedAnswer, dispatch_solicited,
 };
 use crate::shard::ShardScopedInput;
 
@@ -69,58 +72,50 @@ impl FetchedBy<BeaconFetchState> for InstanceRecordBinding {
         network: &N,
         reply: &BeaconReply,
     ) {
-        let reply = reply.clone();
-        let requested = ids.clone();
-        route.request(
-            network,
-            GetInstanceRecordsRequest::new(
-                Capped::new(ids).expect("the fetch config clamps a chunk to the record cap"),
-            ),
-            Box::new(move |result| {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        reply.failed(Self::ids(requested), &error);
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                // Re-deriving the address from the record is the whole
-                // verification: a component's address is the hash of its
-                // record, so bytes deriving nothing are a lie and bytes
-                // deriving anything else are dropped here, before the
-                // registry sees them. The address travels on beside the
-                // bytes, so nothing downstream derives it again.
-                let mut underived = 0usize;
-                let addressed: Vec<(Address, Vec<u8>)> = resp
-                    .records
-                    .into_iter()
-                    .map(Bytes::into_inner)
-                    .filter_map(|record| {
-                        let address = instance_of_record(&record);
-                        underived += usize::from(address.is_none());
-                        address.map(|address| (address, record))
-                    })
-                    .collect();
-                let split = partition_solicited(addressed, &requested, |(address, _)| [*address]);
-                if !split.kept.is_empty() {
-                    reply.push(BeaconScopedInput::InstanceRecordsFetched {
-                        records: split.kept,
-                    });
-                }
-                if !split.missing.is_empty() {
-                    reply.refused(Self::ids(split.missing));
-                }
-                // A peer that does not hold a record says so by leaving
-                // it out, and is asked again like any miss; one that
-                // hands over bytes no record derives, or a record nobody
-                // asked for, answered with something it made up.
-                if split.unsolicited > 0 || underived > 0 {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// Re-deriving the address from the record is the whole verification: a
+/// component's address is the hash of its record. Bytes deriving no
+/// record answer for nothing asked, so a peer handing them over is
+/// rejected like one answering with a record nobody asked for. The
+/// address travels on beside the bytes, so nothing downstream derives it
+/// again. The fetch stays in flight until the records are seated.
+impl SolicitedAnswer for InstanceRecordBinding {
+    type Request = GetInstanceRecordsRequest;
+    type Item = (Option<Address>, Vec<u8>);
+    type Input = BeaconScopedInput;
+    const SETTLES: Settles = Settles::OnVerdict;
+
+    fn request(ids: &[Address]) -> GetInstanceRecordsRequest {
+        GetInstanceRecordsRequest::new(
+            Capped::new(ids.to_vec()).expect("the fetch config clamps a chunk to the record cap"),
+        )
+    }
+
+    fn items(response: GetInstanceRecordsResponse) -> Vec<Self::Item> {
+        response
+            .records
+            .into_iter()
+            .map(Bytes::into_inner)
+            .map(|record| (instance_of_record(&record), record))
+            .collect()
+    }
+
+    fn answers_for(
+        (address, _): &(Option<Address>, Vec<u8>),
+    ) -> impl IntoIterator<Item = Address> + use<> {
+        *address
+    }
+
+    fn deliver(kept: Vec<Self::Item>) -> Vec<BeaconScopedInput> {
+        vec![BeaconScopedInput::InstanceRecordsFetched {
+            records: kept
+                .into_iter()
+                .filter_map(|(address, record)| Some((address?, record)))
+                .collect(),
+        }]
     }
 }
 
@@ -143,48 +138,41 @@ impl FetchedBy<BeaconFetchState> for PackageArtifactBinding {
     }
 
     fn dispatch_chunk<N: Network>(ids: Vec<Hash>, route: Route, network: &N, reply: &BeaconReply) {
-        let reply = reply.clone();
-        let requested = ids.clone();
-        route.request(
-            network,
-            GetPackageArtifactsRequest::new(
-                Capped::new(ids).expect("the fetch config clamps a chunk to the artifact cap"),
-            ),
-            Box::new(move |result| {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        reply.failed(Self::ids(requested), &error);
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                // Hashing the bytes is the whole verification: an
-                // artifact either is the one asked for or is dropped
-                // here, before anything installs it. The address
-                // travels on beside the bytes, so nothing downstream
-                // derives it a second time.
-                let addressed: Vec<(Hash, Vec<u8>)> = resp
-                    .artifacts
-                    .into_iter()
-                    .map(Bytes::into_inner)
-                    .map(|artifact| (artifact_package(&artifact), artifact))
-                    .collect();
-                let split = partition_solicited(addressed, &requested, |(package, _)| [*package]);
-                if !split.kept.is_empty() {
-                    reply.push(BeaconScopedInput::PackageArtifactsFetched {
-                        artifacts: split.kept,
-                    });
-                }
-                if !split.missing.is_empty() {
-                    reply.refused(Self::ids(split.missing));
-                }
-                if split.unsolicited > 0 {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// Hashing the bytes is the whole verification: an artifact either is the
+/// one asked for or answers for nothing asked. The address travels on
+/// beside the bytes, so nothing downstream derives it a second time. The
+/// fetch stays in flight until the install reports.
+impl SolicitedAnswer for PackageArtifactBinding {
+    type Request = GetPackageArtifactsRequest;
+    type Item = (Hash, Vec<u8>);
+    type Input = BeaconScopedInput;
+    const SETTLES: Settles = Settles::OnVerdict;
+
+    fn request(ids: &[Hash]) -> GetPackageArtifactsRequest {
+        GetPackageArtifactsRequest::new(
+            Capped::new(ids.to_vec()).expect("the fetch config clamps a chunk to the artifact cap"),
+        )
+    }
+
+    fn items(response: GetPackageArtifactsResponse) -> Vec<Self::Item> {
+        response
+            .artifacts
+            .into_iter()
+            .map(Bytes::into_inner)
+            .map(|artifact| (artifact_package(&artifact), artifact))
+            .collect()
+    }
+
+    fn answers_for((package, _): &(Hash, Vec<u8>)) -> impl IntoIterator<Item = Hash> + use<> {
+        [*package]
+    }
+
+    fn deliver(artifacts: Vec<Self::Item>) -> Vec<BeaconScopedInput> {
+        vec![BeaconScopedInput::PackageArtifactsFetched { artifacts }]
     }
 }
 

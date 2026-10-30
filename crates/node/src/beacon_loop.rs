@@ -472,6 +472,7 @@ where
             }
             BeaconScopedInput::FetchFailed(ids) => self.release(ids, Release::Failed),
             BeaconScopedInput::FetchUnroutable(ids) => self.release(ids, Release::Unroutable),
+            BeaconScopedInput::FetchFulfilled(ids) => self.release(ids, Release::Admitted),
             BeaconScopedInput::Answered { ids, event } => self.on_answer(ids, *event),
             BeaconScopedInput::FetchTick => {
                 self.fetch_tick.fired();
@@ -1868,6 +1869,7 @@ mod tests {
 
     use super::*;
     use crate::HostedChain;
+    use crate::fetch::settle_solicited;
     use crate::shard::mempool::DeferredTransaction;
     use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
     use crate::shard::{ShardScopedInput, ThreadShardLoop};
@@ -3942,6 +3944,36 @@ mod tests {
         want_record(&mut host, chain, instance);
         assert!(records_asked(&host).is_empty());
         assert_eq!(arrivals(&receiver), vec![instance]);
+    }
+
+    /// Bytes that derive no record answer for nothing asked: the peer
+    /// that gave them is rejected, and the record asked for is asked of
+    /// another.
+    #[test]
+    fn record_bytes_deriving_nothing_reject_their_peer() {
+        let fix = Fixture::new();
+        let host = fix.host(BlockHeight::GENESIS);
+        let (instance, _) = record_on_shard(&host);
+        let (tx, events) = unbounded();
+        let reply = BeaconReply::new(
+            tx,
+            ProposalKeys {
+                topology: host.process.topology_snapshot.clone(),
+                verifier: Arc::clone(&host.process.verifier),
+                network: NetworkDefinition::simulator(),
+            },
+        );
+        let garbage = GetInstanceRecordsResponse::new(
+            Capped::new(vec![Bytes::new(vec![0xff; 4]).expect("bytes fit a cell")])
+                .expect("one record"),
+        );
+        let verdict =
+            settle_solicited::<InstanceRecordBinding, _>(vec![instance], Ok(garbage), &reply);
+        assert!(matches!(verdict, ResponseVerdict::Reject));
+        assert!(matches!(
+            events.try_iter().collect::<Vec<_>>().as_slice(),
+            [HostEvent::Beacon(BeaconScopedInput::FetchFailed(_))]
+        ));
     }
 
     /// A peer's record lands in the registry and on disk, and the loop

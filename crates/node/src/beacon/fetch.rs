@@ -38,7 +38,7 @@ use tracing::warn;
 use crate::config::NodeConfig;
 use crate::event::BeaconScopedInput;
 use crate::fetch::{
-    Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, Refusal, Route,
+    Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, HandsOver, Refusal, Route,
     ScopedAnswer, defers_to_the_tick, dispatch_scoped, transport_failed,
 };
 use crate::shard::{HostEvent, SharedTopologySnapshot};
@@ -249,6 +249,17 @@ impl FetchReply for BeaconReply {
             ids,
             event: Box::new(event),
         });
+    }
+}
+
+impl HandsOver<BeaconScopedInput> for BeaconReply {
+    fn hand_over(&self, fulfilled: Option<FetchIds>, inputs: Vec<BeaconScopedInput>) {
+        if let Some(ids) = fulfilled {
+            self.push(BeaconScopedInput::FetchFulfilled(ids));
+        }
+        for input in inputs {
+            self.push(input);
+        }
     }
 }
 
