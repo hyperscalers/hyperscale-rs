@@ -1,5 +1,7 @@
 //! Block fetch request.
 
+use std::sync::Arc;
+
 use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetBlockResponse;
@@ -52,8 +54,9 @@ pub struct GetBlockRequest {
     /// The block the requester needs at `height`, when it knows which.
     pub hash: Option<BlockHash>,
     /// Per-category inventory of hashes already held locally. Bodies
-    /// matching these filters may be omitted from the response.
-    pub inventory: Inventory,
+    /// matching these filters may be omitted from the response. Shared,
+    /// because one snapshot rides every fetch of a sync batch.
+    pub inventory: Arc<Inventory>,
 }
 
 impl GetBlockRequest {
@@ -66,7 +69,7 @@ impl GetBlockRequest {
             height,
             intent,
             hash: None,
-            inventory: Inventory::empty(),
+            inventory: Arc::new(Inventory::empty()),
         }
     }
 
@@ -89,7 +92,7 @@ impl GetBlockRequest {
     /// the requester already has. Typically called once per sync tick so
     /// every in-flight fetch in the batch shares a single snapshot.
     #[must_use]
-    pub fn with_inventory(mut self, inventory: Inventory) -> Self {
+    pub fn with_inventory(mut self, inventory: Arc<Inventory>) -> Self {
         self.inventory = inventory;
         self
     }
@@ -154,8 +157,8 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let req =
-            GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute).with_inventory(inv);
+        let req = GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute)
+            .with_inventory(Arc::new(inv));
         assert!(!req.inventory.is_empty());
         assert!(req.inventory.tx_have.is_some());
     }
@@ -166,11 +169,11 @@ mod tests {
         let h = TxHash::from(Hash::from_bytes(b"tx"));
         bf.insert(&h);
         let req = GetBlockRequest::new(BlockHeight::new(1), BlockIntent::History).with_inventory(
-            Inventory {
+            Arc::new(Inventory {
                 tx_have: Some(bf),
                 cert_have: None,
                 provision_have: None,
-            },
+            }),
         );
         let bytes = hbor_to_vec(&req).unwrap();
         let decoded: GetBlockRequest = hbor_from_slice(&bytes).unwrap();

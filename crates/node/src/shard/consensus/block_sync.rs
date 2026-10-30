@@ -255,7 +255,7 @@ where
         // Snapshot the sync inventory once per batch so every Fetch in
         // this tick shares a consistent view of mempool / cert-cache /
         // provision-store membership. Built lazily.
-        let mut inventory_cache: Option<Inventory> = None;
+        let mut inventory_cache: Option<Arc<Inventory>> = None;
         for output in outputs {
             match output {
                 SyncOutput::Fetch { from: height, .. } => {
@@ -279,7 +279,7 @@ where
     fn dispatch_block_sync_fetch(
         &self,
         height: BlockHeight,
-        inventory_cache: &mut Option<Inventory>,
+        inventory_cache: &mut Option<Arc<Inventory>>,
     ) {
         use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 
@@ -288,14 +288,12 @@ where
         // Heights flagged `force_full` were rehydration misses last time —
         // request with empty inventory so the responder cannot elide bodies.
         let inventory = if force_full {
-            Inventory::empty()
+            Arc::new(Inventory::empty())
         } else {
-            inventory_cache
-                .get_or_insert_with(|| self.build_sync_inventory())
-                .clone()
+            Arc::clone(inventory_cache.get_or_insert_with(|| Arc::new(self.build_sync_inventory())))
         };
-        let mut request =
-            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory.clone());
+        let mut request = GetBlockRequest::new(height, BlockIntent::Execute)
+            .with_inventory(Arc::clone(&inventory));
         if let Some(hash) = self.io.consensus.block_sync.named_block(height) {
             request = request.naming(hash);
         }
