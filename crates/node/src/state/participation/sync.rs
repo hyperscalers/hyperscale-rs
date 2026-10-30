@@ -1,4 +1,4 @@
-//! Sync-flow dispatch arms.
+//! Sync-flow handlers.
 //!
 //! When `BlockSyncComplete` fires we fan out across all three
 //! coordinators in one pass: shard consensus exits sync mode and re-issues any
@@ -6,119 +6,115 @@
 //! provisions flush their expected sets so we can immediately
 //! participate in execution for blocks within the `MAX_FINALIZATION_DELAY` window.
 
-use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
+use std::sync::Arc;
+
+use hyperscale_core::{Action, FetchRequest};
 use hyperscale_shard::SettledTxSet;
-use hyperscale_types::{ShardId, SubstateKey, TopologySchedule, derive_block_transactions};
+use hyperscale_types::network::response::ServedValue;
+use hyperscale_types::{
+    Anchor, BlockHash, BlockHeight, CertifiedBlock, MerkleInclusionProof, QuorumCertificate,
+    ShardId, SubstateKey, TopologySchedule, VerdictCells, Verified, derive_block_transactions,
+};
 
 use super::ShardParticipation;
 
 impl ShardParticipation {
-    /// Dispatch a sync-category `ProtocolEvent`.
-    pub(in crate::state) fn handle_sync(
+    /// A synced block is ready to apply: derive its transactions, then
+    /// hand it to shard consensus.
+    pub(in crate::state) fn on_block_sync_ready_to_apply(
         &mut self,
-        topology_schedule: &TopologySchedule,
-        event: ProtocolEvent,
+        sched: &TopologySchedule,
+        certified: Arc<CertifiedBlock>,
     ) -> Vec<Action> {
-        match event {
-            ProtocolEvent::BlockSyncReadyToApply { certified } => {
-                derive_block_transactions(certified.block(), self.derivation.as_ref());
-                self.shard_coordinator.on_sync_block_ready_to_apply(
-                    topology_schedule,
-                    std::sync::Arc::unwrap_or_clone(certified),
-                )
-            }
-            // BlockSync finished fetching: exit shard consensus sync mode + flush
-            // expected provisions + flush expected headers, all in one
-            // pass.
-            ProtocolEvent::BlockSyncComplete { .. } => {
-                let mut actions = self
-                    .shard_coordinator
-                    .on_block_sync_complete(topology_schedule);
-                actions.extend(
-                    self.remote_headers_coordinator
-                        .flush_expected_headers(topology_schedule),
-                );
-                actions.extend(self.provisions_coordinator.flush_expected_provisions());
-                actions
-            }
-            // Both halves resume from the same recovered tip: consensus
-            // from the frontier it stored, execution from the
-            // transactions that frontier still owes an outcome for. The
-            // replay's folds are handed off as a live commit's are, and
-            // the tip is settled once over the last of them, so the
-            // restarted voter refuses by the fold's owed ticks before its
-            // first live commit.
-            ProtocolEvent::CommittedStateRestored { height, hash, qc } => {
-                let mut actions = self
-                    .shard_coordinator
-                    .on_committed_state_restored(height, hash, qc);
-                self.shard_coordinator.latch_dissolution(topology_schedule);
-                let effects = self
-                    .execution_coordinator
-                    .on_committed_state_restored(topology_schedule, self.derivation.as_ref());
-                actions.extend(self.apply_commit_effects(effects));
-                actions.extend(self.settle_tip(topology_schedule));
-                actions
-            }
-            // A past-terminal shard's settled set is reconstructed: record
-            // it for the split-boundary fence, then re-drive any votes
-            // that deferred for want of it.
-            ProtocolEvent::SettledTxsReconstructed {
-                shard,
-                txs,
-                terminal_wt,
-            } => self.on_settled_txs_reconstructed(
-                topology_schedule,
-                shard,
-                SettledTxSet { txs, terminal_wt },
-            ),
-            // A state proof against a commit-proven header verified. A
-            // proof against the parent terminal this chain asks answers
-            // which markers it holds: record them and re-drive the
-            // proposal that was filtering them out; the votes that
-            // deferred for want of them re-drive off the fence's
-            // evidence. The execution coordinator reads its own probes
-            // off every proof and ignores keys it never asked.
-            ProtocolEvent::FetchedStateProofVerified {
-                anchor,
-                keys,
-                proof,
-                values,
-            } => {
-                if self.shard_coordinator.precut_terminal() == Some(anchor)
-                    && let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, &keys)
-                {
-                    let presences: Vec<(SubstateKey, bool)> = inclusions
-                        .into_iter()
-                        .map(|(key, inclusion)| (key, inclusion.value_hash().is_some()))
-                        .collect();
-                    self.shard_coordinator
-                        .record_precut_proof(anchor, &presences);
-                }
-                self.execution_coordinator
-                    .on_proof_fetched(anchor, &keys, &proof, &values);
-                self.shard_coordinator.queue_ready_proposal();
-                Vec::new()
-            }
+        derive_block_transactions(certified.block(), self.derivation.as_ref());
+        self.shard_coordinator
+            .on_sync_block_ready_to_apply(sched, Arc::unwrap_or_clone(certified))
+    }
 
-            // A proof for verdict questions verified: the execution
-            // coordinator holds what a hearing row here would take.
-            ProtocolEvent::FetchedVerdictProofVerified {
-                anchor,
-                questions,
-                proof,
-            } => {
-                self.execution_coordinator.on_verdict_proof_fetched(
-                    anchor,
-                    &questions,
-                    &proof,
-                    topology_schedule.windows(),
-                );
-                self.shard_coordinator.queue_ready_proposal();
-                Vec::new()
-            }
-            _ => unreachable!("non-sync event routed to handle_sync"),
+    /// Block sync finished fetching: exit shard consensus sync mode, and
+    /// flush expected provisions and expected headers, all in one pass.
+    pub(in crate::state) fn on_block_sync_complete(
+        &mut self,
+        sched: &TopologySchedule,
+    ) -> Vec<Action> {
+        let mut actions = self.shard_coordinator.on_block_sync_complete(sched);
+        actions.extend(
+            self.remote_headers_coordinator
+                .flush_expected_headers(sched),
+        );
+        actions.extend(self.provisions_coordinator.flush_expected_provisions());
+        actions
+    }
+
+    /// Both halves resume from the same recovered tip: consensus from the
+    /// frontier it stored, execution from the transactions that frontier
+    /// still owes an outcome for. The replay's folds are handed off as a
+    /// live commit's are, and the tip is settled once over the last of
+    /// them, so the restarted voter refuses by the fold's owed ticks
+    /// before its first live commit.
+    pub(in crate::state) fn on_committed_state_restored(
+        &mut self,
+        sched: &TopologySchedule,
+        height: BlockHeight,
+        hash: Option<BlockHash>,
+        qc: Option<Verified<QuorumCertificate>>,
+    ) -> Vec<Action> {
+        let mut actions = self
+            .shard_coordinator
+            .on_committed_state_restored(height, hash, qc);
+        self.shard_coordinator.latch_dissolution(sched);
+        let effects = self
+            .execution_coordinator
+            .on_committed_state_restored(sched, self.derivation.as_ref());
+        actions.extend(self.apply_commit_effects(effects));
+        actions.extend(self.settle_tip(sched));
+        actions
+    }
+
+    /// A state proof against a commit-proven header verified. A proof
+    /// against the parent terminal this chain asks answers which markers
+    /// it holds: record them and re-drive the proposal that was filtering
+    /// them out; the votes that deferred for want of them re-drive off the
+    /// fence's evidence. The execution coordinator reads its own probes
+    /// off every proof and ignores keys it never asked.
+    pub(in crate::state) fn on_fetched_state_proof_verified(
+        &mut self,
+        anchor: Anchor,
+        keys: &[SubstateKey],
+        proof: &MerkleInclusionProof,
+        values: &[ServedValue],
+    ) {
+        if self.shard_coordinator.precut_terminal() == Some(anchor)
+            && let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, keys)
+        {
+            let presences: Vec<(SubstateKey, bool)> = inclusions
+                .into_iter()
+                .map(|(key, inclusion)| (key, inclusion.value_hash().is_some()))
+                .collect();
+            self.shard_coordinator
+                .record_precut_proof(anchor, &presences);
         }
+        self.execution_coordinator
+            .on_proof_fetched(anchor, keys, proof, values);
+        self.shard_coordinator.queue_ready_proposal();
+    }
+
+    /// A proof for verdict questions verified: the execution coordinator
+    /// holds what a hearing row here would take.
+    pub(in crate::state) fn on_fetched_verdict_proof_verified(
+        &mut self,
+        sched: &TopologySchedule,
+        anchor: Anchor,
+        questions: &[VerdictCells],
+        proof: &MerkleInclusionProof,
+    ) {
+        self.execution_coordinator.on_verdict_proof_fetched(
+            anchor,
+            questions,
+            proof,
+            sched.windows(),
+        );
+        self.shard_coordinator.queue_ready_proposal();
     }
 
     /// Beacon advanced an epoch — replay any cross-shard artifacts buffered
@@ -186,7 +182,7 @@ impl ShardParticipation {
     /// Record a past-terminal shard's settled set, which releases what
     /// the execution coordinator held for want of it; the votes that
     /// deferred re-drive off the fence's evidence.
-    fn on_settled_txs_reconstructed(
+    pub(in crate::state) fn on_settled_txs_reconstructed(
         &mut self,
         topology_schedule: &TopologySchedule,
         shard: ShardId,

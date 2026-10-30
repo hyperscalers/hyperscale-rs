@@ -1,4 +1,4 @@
-//! Transaction-flow dispatch arms.
+//! Transaction-flow handlers.
 //!
 //! Four `ProtocolEvent` variants drive the transaction pipeline:
 //! - `TransactionValidated` — gossip-delivered tx that passed async validation
@@ -14,42 +14,28 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::Action;
 use hyperscale_types::{TopologySchedule, Transaction, Verified};
 
 use super::ShardParticipation;
 
 impl ShardParticipation {
-    /// Dispatch a transaction-category `ProtocolEvent`.
-    pub(in crate::state) fn handle_transaction(
+    /// The mempool admitted `txs`: shard consensus's pending-block
+    /// subscriber takes them, and the next proposal may carry them.
+    ///
+    /// A newly-admitted transaction that opened before this chain did is
+    /// refused until a predecessor answers for it. Asking here rather
+    /// than waiting for the cleanup tick is what keeps the refusal from
+    /// costing a full tick of latency per arrival.
+    pub(in crate::state) fn on_transactions_admitted(
         &mut self,
         sched: &TopologySchedule,
-        event: ProtocolEvent,
+        txs: &[Arc<Verified<Transaction>>],
     ) -> Vec<Action> {
-        match event {
-            ProtocolEvent::TransactionValidated {
-                tx,
-                submitted_locally,
-            } => self.on_transaction_validated(sched, tx, submitted_locally),
-            ProtocolEvent::TransactionsReceived { transactions } => {
-                self.on_transactions_fetched(sched, transactions)
-            }
-            ProtocolEvent::TransactionsAdmitted { txs } => {
-                let mut actions = self.shard_coordinator.on_transactions_admitted(sched, &txs);
-                // A newly-admitted transaction that opened before this
-                // chain did is refused until a predecessor answers for
-                // it. Asking here rather than waiting for the cleanup
-                // tick is what keeps the refusal from costing a full
-                // tick of latency per arrival.
-                actions.extend(self.scan_precut_queries());
-                self.shard_coordinator.queue_ready_proposal();
-                actions
-            }
-            ProtocolEvent::TransactionsResolved { resolutions } => {
-                self.mempool_coordinator.on_resolutions(&resolutions)
-            }
-            _ => unreachable!("non-transaction event routed to handle_transaction"),
-        }
+        let mut actions = self.shard_coordinator.on_transactions_admitted(sched, txs);
+        actions.extend(self.scan_precut_queries());
+        self.shard_coordinator.queue_ready_proposal();
+        actions
     }
 
     /// Hand a validated transaction to the canonical mempool: one a client
@@ -58,7 +44,7 @@ impl ShardParticipation {
     /// the gossip path. Mempool emits `Continuation(TransactionsAdmitted)`
     /// for whatever it admits; that arm latches the proposal-retry — no
     /// need to do it optimistically here.
-    fn on_transaction_validated(
+    pub(in crate::state) fn on_transaction_validated(
         &mut self,
         sched: &TopologySchedule,
         tx: Arc<Verified<Transaction>>,
@@ -83,7 +69,7 @@ impl ShardParticipation {
     /// dropped before reaching this arm. Mempool emits
     /// `Continuation(TransactionsAdmitted)` for the admitted subset; the
     /// admission arm latches the proposal-retry.
-    fn on_transactions_fetched(
+    pub(in crate::state) fn on_transactions_fetched(
         &mut self,
         sched: &TopologySchedule,
         txs: Vec<Arc<Verified<Transaction>>>,

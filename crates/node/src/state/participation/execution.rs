@@ -1,4 +1,4 @@
-//! Execution-flow dispatch arms.
+//! Execution-flow handlers.
 //!
 //! Covers tick-based voting (votes received, aggregated, certificate
 //! verified) and the engine results path (`ExecutionBatchCompleted`).
@@ -7,108 +7,75 @@
 //! outbound batches this shard sent it: its outcomes go straight to the
 //! outbound provision tracker.
 
-use hyperscale_core::{Action, ProtocolEvent};
-use hyperscale_types::TopologySchedule;
+use std::sync::Arc;
+
+use hyperscale_core::{Action, TickBatchOutcome};
+use hyperscale_types::{
+    BlockHeight, ExecutionCertificate, Finalization, TopologySchedule, Verifiable,
+};
 
 use super::ShardParticipation;
 
 impl ShardParticipation {
-    /// Dispatch an execution-category `ProtocolEvent`.
-    pub(in crate::state) fn handle_execution(
+    /// One tick's results arrived. They can (a) finalize a tick whose
+    /// local certificate landed ahead of the engine, (b) unblock vote
+    /// emission, (c) release the next queued tick.
+    pub(in crate::state) fn on_execution_batch_completed(
         &mut self,
-        topology_schedule: &TopologySchedule,
-        event: ProtocolEvent,
+        sched: &TopologySchedule,
+        tick: BlockHeight,
+        outcome: TickBatchOutcome,
     ) -> Vec<Action> {
-        match event {
-            ProtocolEvent::ExecutionBatchCompleted { tick, outcome } => {
-                // Results arriving can (a) finalize a tick whose local
-                // certificate landed ahead of the engine, (b) unblock vote
-                // emission, (c) release the next queued tick.
-                let mut actions = self.execution_coordinator.on_execution_batch_completed(
-                    topology_schedule,
-                    tick,
-                    outcome,
-                );
-                actions.extend(
-                    self.execution_coordinator
-                        .emit_vote_actions(topology_schedule),
-                );
-                actions
-            }
-            ProtocolEvent::ExecutionVoteReceived { vote } => self
-                .execution_coordinator
-                .on_execution_vote(topology_schedule, vote),
-            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                tick_id,
-                block_hash,
-                verified_votes,
-            } => self.execution_coordinator.on_votes_verified(
-                topology_schedule,
-                tick_id,
-                block_hash,
-                verified_votes,
-            ),
-            ProtocolEvent::ExecutionCertificateAggregated {
-                tick_id,
-                certificate,
-            } => self.execution_coordinator.on_certificate_aggregated(
-                topology_schedule,
-                &tick_id,
-                &certificate,
-            ),
-            ProtocolEvent::ExecutionCertificatesReceived { certificates } => {
-                let mut actions = Vec::new();
-                for cert in certificates {
-                    actions.extend(
-                        self.execution_coordinator
-                            .on_execution_certificate(topology_schedule, cert),
-                    );
-                }
-                actions
-            }
-            ProtocolEvent::FinalizationsReceived { finalizations } => {
-                let mut actions = Vec::new();
-                for tick in finalizations {
-                    actions.extend(
-                        self.execution_coordinator
-                            .admit_finalization(topology_schedule, tick),
-                    );
-                }
-                actions
-            }
-            ProtocolEvent::FinalizationVerified { result } => {
-                self.execution_coordinator.on_finalization_verified(result)
-            }
-            ProtocolEvent::LegsHalfBuilt { tick, tip, half } => self
-                .execution_coordinator
-                .on_legs_half_built(tick, tip, half),
-            ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
-                .execution_coordinator
-                .on_certificate_verified(topology_schedule, result),
-            ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
-                // A remote certificate's outcomes acknowledge the outbound
-                // batches this shard sent it. The tracker keys on the
-                // transaction, so an outcome for nothing sent is a no-op.
-                if certificate.shard_id() != self.local_shard {
-                    self.outbound_provisions
-                        .on_ec_observed(certificate.shard_id(), certificate.tx_outcomes());
-                }
-                // Remote EC abort propagation may unlock local accumulators — re-scan.
-                self.execution_coordinator
-                    .emit_vote_actions(topology_schedule)
-            }
-            ProtocolEvent::ExecutionBatchUnavailable {
-                tick,
-                tick_ts,
-                env,
-                requests,
-                included,
-                package,
-            } => self
-                .execution_coordinator
-                .on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package),
-            _ => unreachable!("non-execution event routed to handle_execution"),
+        let mut actions = self
+            .execution_coordinator
+            .on_execution_batch_completed(sched, tick, outcome);
+        actions.extend(self.execution_coordinator.emit_vote_actions(sched));
+        actions
+    }
+
+    /// A certificate was admitted. One from another shard acknowledges
+    /// the outbound batches this shard sent it; the tracker keys on the
+    /// transaction, so an outcome for nothing sent is a no-op.
+    pub(in crate::state) fn on_execution_certificate_admitted(
+        &mut self,
+        sched: &TopologySchedule,
+        certificate: &ExecutionCertificate,
+    ) -> Vec<Action> {
+        if certificate.shard_id() != self.local_shard {
+            self.outbound_provisions
+                .on_ec_observed(certificate.shard_id(), certificate.tx_outcomes());
         }
+        // Remote EC abort propagation may unlock local accumulators — re-scan.
+        self.execution_coordinator.emit_vote_actions(sched)
+    }
+
+    /// Hand each received certificate to the execution coordinator.
+    pub(in crate::state) fn on_execution_certificates_received(
+        &mut self,
+        sched: &TopologySchedule,
+        certificates: Vec<Verifiable<ExecutionCertificate>>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for cert in certificates {
+            actions.extend(
+                self.execution_coordinator
+                    .on_execution_certificate(sched, cert),
+            );
+        }
+        actions
+    }
+
+    /// Admit each received finalization.
+    pub(in crate::state) fn on_finalizations_received(
+        &mut self,
+        sched: &TopologySchedule,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for tick in finalizations {
+            actions.extend(self.execution_coordinator.admit_finalization(sched, tick));
+        }
+        actions
     }
 }
 

@@ -1,13 +1,13 @@
 //! The shard half of a replica: the coordinators it runs on its shard,
-//! plus the per-domain dispatch over them.
+//! plus the per-domain handlers over them.
 //!
 //! [`ShardParticipation`] bundles [`ShardCoordinator`], [`ExecutionCoordinator`],
 //! [`MempoolCoordinator`], [`ProvisionCoordinator`], [`OutboundProvisionTracker`],
 //! and [`RemoteHeaderCoordinator`]. [`NodeStateMachine`](super::NodeStateMachine)
 //! holds one for its shard.
 //!
-//! The per-domain dispatch (the [`shard`], [`execution`], [`provisions`],
-//! [`transactions`], [`sync`], [`timers`], [`proposal`] submodules) lives here as
+//! The per-domain handlers (the [`shard`], [`execution`], [`provisions`],
+//! [`transactions`], [`sync`], [`timers`], [`proposal`] submodules) live here as
 //! methods on `ShardParticipation`. Each takes the per-epoch
 //! [`TopologySchedule`] as a parameter — the beacon projection these handlers
 //! verify against — rather than reaching back into the enclosing machine. The

@@ -13,10 +13,11 @@
 //! live on [`NodeHost`](crate::host::NodeHost), which feeds events in and
 //! dispatches emitted [`Action`]s.
 //!
-//! [`handle`](StateMachine::handle) is a thin router: each category is
-//! dispatched onto [`ShardParticipation`] with the held [`TopologySchedule`]
-//! passed as a parameter; the flows that also report to the beacon stay here
-//! as orchestrators (see [`orchestration`]).
+//! [`handle`](StateMachine::handle) is one exhaustive match over
+//! [`ProtocolEvent`]: each arm calls the coordinator or
+//! [`ShardParticipation`] handler for its variant with the held
+//! [`TopologySchedule`] passed as a parameter; the flows that also report
+//! to the beacon stay here as orchestrators (see [`orchestration`]).
 
 mod orchestration;
 mod participation;
@@ -32,7 +33,7 @@ use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
 use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
-use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
+use hyperscale_shard::{SettledTxSet, ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     Block, BlockHeight, Derivation, Epoch, LocalTimestamp, Round, SafeVoteRegisters, ShardId,
@@ -231,15 +232,6 @@ impl NodeStateMachine {
             .seed_standing_answers(height, count);
     }
 
-    /// Run `f` against the shard half with the held [`TopologySchedule`]
-    /// passed in.
-    fn on_shard<F>(&mut self, f: F) -> Vec<Action>
-    where
-        F: FnOnce(&mut ShardParticipation, &TopologySchedule) -> Vec<Action>,
-    {
-        f(&mut self.shard, &self.schedule)
-    }
-
     /// Hold `schedule`, folded at `epoch`, if it is newer than the one
     /// held. The replica latches its dissolution against the schedule it
     /// gives up and then against the new one, so a reading either showed
@@ -362,22 +354,19 @@ impl StateMachine for NodeStateMachine {
         event = %event.type_name(),
         height = self.shard.shard_coordinator.committed_height().inner(),
     ))]
-    #[allow(clippy::too_many_lines)] // single dispatch over ProtocolEvent variants
+    #[allow(clippy::too_many_lines)] // single dispatch, one arm per ProtocolEvent variant
     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
         self.shard.set_time(now);
 
+        let sched = &self.schedule;
         let mut inputs = Vec::new();
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
-            ProtocolEvent::CleanupTimer => self.on_shard(ShardParticipation::on_cleanup_timer),
-            ProtocolEvent::ViewChangeTimer => {
-                self.on_shard(ShardParticipation::on_view_change_timer)
-            }
-            ProtocolEvent::ProposalPaceTimer => {
-                self.on_shard(ShardParticipation::try_event_driven_proposal)
-            }
+            ProtocolEvent::CleanupTimer => self.shard.on_cleanup_timer(sched),
+            ProtocolEvent::ViewChangeTimer => self.shard.on_view_change_timer(sched),
+            ProtocolEvent::ProposalPaceTimer => self.shard.try_event_driven_proposal(sched),
             ProtocolEvent::ProposalFetchTimer => {
-                self.on_shard(|s, _| s.shard_coordinator.fetch_overdue_proposals())
+                self.shard.shard_coordinator.fetch_overdue_proposals()
             }
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
@@ -398,47 +387,161 @@ impl StateMachine for NodeStateMachine {
                 self.on_remote_header_committed(&certified_header, &mut inputs)
             }
 
-            // ── Shard Consensus ────────────────────────────────────────────
-            evt @ (ProtocolEvent::BlockHeaderReceived { .. }
-            | ProtocolEvent::QuorumCertificateFormed { .. }
-            | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
-            | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
-            | ProtocolEvent::RemoteHeadersBelowFloor { .. }
-            | ProtocolEvent::VerifiedBlockVoteReceived { .. }
-            | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
-            | ProtocolEvent::VerifiedTimeoutReceived { .. }
-            | ProtocolEvent::UnverifiedTimeoutReceived { .. }
-            | ProtocolEvent::QcAnnouncementReceived { .. }
-            | ProtocolEvent::BlockReadyToCommit { .. }
-            | ProtocolEvent::QuorumCertificateResult { .. }
-            | ProtocolEvent::QcSignatureVerified { .. }
-            | ProtocolEvent::RemoteHeaderQcVerified { .. }
-            | ProtocolEvent::BlockCheckCompleted { .. }
-            | ProtocolEvent::ProposalBuilt { .. }
-            | ProtocolEvent::BlockPersisted { .. }
-            | ProtocolEvent::FinalizationsAdmitted { .. }
-            | ProtocolEvent::ReadySignalReceived { .. }
-            | ProtocolEvent::UnverifiedShardForkProofReceived { .. }
-            | ProtocolEvent::CommitProofNeeded { .. }) => {
-                self.on_shard(move |s, sched| s.handle_shard(sched, evt))
+            // ── Shard consensus ──────────────────────────────────────────
+            ProtocolEvent::BlockHeaderReceived { header, manifest } => self
+                .shard
+                .on_block_header_received(sched, &header, manifest),
+            ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
+                self.shard.on_qc_formed(sched, block_hash, &qc)
+            }
+            // Structural pre-checks happen in the remote header
+            // coordinator; downstream consumers receive headers via
+            // `RemoteHeaderAdmitted`.
+            ProtocolEvent::UnverifiedRemoteHeaderReceived {
+                certified_header,
+                sender,
+            } => self
+                .shard
+                .remote_headers_coordinator
+                .on_remote_header_received(sched, certified_header, sender),
+            ProtocolEvent::VerifiedRemoteHeaderReceived {
+                certified_header,
+                sender,
+            } => self
+                .shard
+                .remote_headers_coordinator
+                .on_verified_remote_header_received(sched, certified_header, sender),
+            ProtocolEvent::RemoteHeadersBelowFloor {
+                source_shard,
+                floor,
+            } => {
+                self.shard.remote_headers_coordinator.on_source_below_floor(
+                    sched,
+                    source_shard,
+                    floor,
+                );
+                Vec::new()
+            }
+            ProtocolEvent::RemoteHeaderQcVerified {
+                certified_header,
+                sender,
+                result,
+            } => self
+                .shard
+                .remote_headers_coordinator
+                .on_remote_header_qc_verified(sched, &certified_header, sender, *result),
+            ProtocolEvent::CommitProofNeeded {
+                source_shard,
+                block_height,
+            } => self.shard.remote_headers_coordinator.request_commit_proof(
+                sched,
+                source_shard,
+                block_height,
+            ),
+            ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
+                .shard
+                .shard_coordinator
+                .on_verified_block_vote(sched, vote),
+            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
+                .shard
+                .shard_coordinator
+                .on_unverified_block_vote(sched, vote),
+            ProtocolEvent::VerifiedTimeoutReceived { timeout } => self
+                .shard
+                .shard_coordinator
+                .on_verified_timeout(sched, timeout),
+            ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
+                .shard
+                .shard_coordinator
+                .on_unverified_timeout(sched, &timeout),
+            ProtocolEvent::QcAnnouncementReceived { announcement } => self
+                .shard
+                .shard_coordinator
+                .on_qc_announcement(sched, &announcement),
+            ProtocolEvent::ReadySignalReceived { signal } => {
+                self.shard
+                    .shard_coordinator
+                    .on_ready_signal_received(sched, signal);
+                Vec::new()
+            }
+            ProtocolEvent::BlockReadyToCommit { certified, source } => self
+                .shard
+                .shard_coordinator
+                .on_block_ready_to_commit(sched, certified, source),
+            ProtocolEvent::QuorumCertificateResult {
+                block_hash,
+                qc,
+                verified_votes,
+                binding,
+            } => self
+                .shard
+                .shard_coordinator
+                .on_qc_result(block_hash, binding, qc, verified_votes),
+            ProtocolEvent::QcSignatureVerified { subject, result } => self
+                .shard
+                .shard_coordinator
+                .on_qc_signature_verified(sched, subject, result),
+            ProtocolEvent::BlockCheckCompleted {
+                block_hash,
+                kind,
+                outcome,
+            } => self
+                .shard
+                .shard_coordinator
+                .on_block_check_completed(sched, block_hash, kind, outcome),
+            ProtocolEvent::ProposalBuilt {
+                height,
+                round,
+                block,
+                block_hash,
+                finalizations,
+                provisions,
+                bytes_delta,
+                answers,
+                additions,
+            } => self.shard.shard_coordinator.on_proposal_built(
+                sched,
+                height,
+                round,
+                &block,
+                block_hash,
+                finalizations,
+                provisions,
+                bytes_delta,
+                answers,
+                additions,
+            ),
+            ProtocolEvent::BlockPersisted {
+                height,
+                substate_bytes,
+                standing_answers,
+            } => self
+                .shard
+                .on_block_persisted(sched, height, substate_bytes, standing_answers),
+            ProtocolEvent::FinalizationsAdmitted { finalizations } => {
+                self.shard.on_finalizations_admitted(sched, &finalizations)
             }
 
             // A fork is proven — locally assembled from verified headers, or
             // a peer's proof that just verified. The shard layer engages its
             // local provisional fence and re-gossips, and the proof goes into
-            // the beacon observation buffer once the arm has run, so the next
-            // beacon proposal funnels it into a fork-caused recovery.
+            // the beacon observation buffer, so the next beacon proposal
+            // funnels it into a fork-caused recovery.
             ProtocolEvent::ShardForkDetected { proof } => {
                 inputs.push(BeaconInput::ForkProof(proof.clone()));
-                let evt = ProtocolEvent::ShardForkDetected { proof };
-                self.on_shard(move |s, sched| s.handle_shard(sched, evt))
+                self.shard.on_fork_proven(sched, *proof)
             }
             ProtocolEvent::ShardForkProofVerified { proof, verified } => {
                 if verified {
                     inputs.push(BeaconInput::ForkProof(proof.clone()));
                 }
-                let evt = ProtocolEvent::ShardForkProofVerified { proof, verified };
-                self.on_shard(move |s, sched| s.handle_shard(sched, evt))
+                self.shard.on_fork_proof_verified(sched, *proof, verified)
+            }
+            // A gossiped proof: resolve committees from the local schedule
+            // and dispatch off-thread verification (self-authenticating, no
+            // sender trust).
+            ProtocolEvent::UnverifiedShardForkProofReceived { proof } => {
+                self.shard.on_unverified_fork_proof(sched, *proof)
             }
 
             // A double-vote pair the local vote keeper caught goes to the
@@ -449,49 +552,149 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Provisions ───────────────────────────────────────────────
-            evt @ (ProtocolEvent::VerifiedProvisionsReceived { .. }
-            | ProtocolEvent::UnverifiedProvisionsReceived { .. }
-            | ProtocolEvent::CrossingReadingsReceived { .. }
-            | ProtocolEvent::StateProvisionsVerified { .. }
-            | ProtocolEvent::ProvisionsAdmitted { .. }
-            | ProtocolEvent::OutboundProvisionBroadcast { .. }) => {
-                self.on_shard(move |s, sched| s.handle_provisions(sched, evt))
+            ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
+                .shard
+                .provisions_coordinator
+                .on_state_provisions_received(sched, Arc::unwrap_or_clone(provisions)),
+            ProtocolEvent::VerifiedProvisionsReceived { provisions } => {
+                let now = self.shard.now;
+                self.shard
+                    .provisions_coordinator
+                    .on_verified_state_provisions_received(sched, provisions, now)
+            }
+            ProtocolEvent::StateProvisionsVerified { result, anchor } => {
+                let now = self.shard.now;
+                self.shard
+                    .provisions_coordinator
+                    .on_state_provisions_verified(result, anchor, now)
+            }
+            ProtocolEvent::CrossingReadingsReceived { claims } => {
+                self.shard.on_crossing_readings(sched, claims)
+            }
+            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
+                self.shard.on_provisions_admitted(sched, provisions)
+            }
+            ProtocolEvent::OutboundProvisionBroadcast {
+                provisions,
+                target_shard,
+            } => {
+                self.shard
+                    .outbound_provisions
+                    .on_broadcast(&provisions, target_shard);
+                Vec::new()
             }
 
             // ── Execution ────────────────────────────────────────────────
-            evt @ (ProtocolEvent::ExecutionBatchCompleted { .. }
-            | ProtocolEvent::ExecutionBatchUnavailable { .. }
-            | ProtocolEvent::ExecutionVoteReceived { .. }
-            | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }
-            | ProtocolEvent::ExecutionCertificateAggregated { .. }
-            | ProtocolEvent::ExecutionCertificatesReceived { .. }
-            | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
-            | ProtocolEvent::ExecutionCertificateAdmitted { .. }
-            | ProtocolEvent::FinalizationsReceived { .. }
-            | ProtocolEvent::FinalizationVerified { .. }
-            | ProtocolEvent::LegsHalfBuilt { .. }) => {
-                self.on_shard(move |s, sched| s.handle_execution(sched, evt))
+            ProtocolEvent::ExecutionBatchCompleted { tick, outcome } => self
+                .shard
+                .on_execution_batch_completed(sched, tick, outcome),
+            ProtocolEvent::ExecutionBatchUnavailable {
+                tick,
+                tick_ts,
+                env,
+                requests,
+                included,
+                package,
+            } => self
+                .shard
+                .execution_coordinator
+                .on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package),
+            ProtocolEvent::ExecutionVoteReceived { vote } => self
+                .shard
+                .execution_coordinator
+                .on_execution_vote(sched, vote),
+            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
+                tick_id,
+                block_hash,
+                verified_votes,
+            } => self.shard.execution_coordinator.on_votes_verified(
+                sched,
+                tick_id,
+                block_hash,
+                verified_votes,
+            ),
+            ProtocolEvent::ExecutionCertificateAggregated {
+                tick_id,
+                certificate,
+            } => self.shard.execution_coordinator.on_certificate_aggregated(
+                sched,
+                &tick_id,
+                &certificate,
+            ),
+            ProtocolEvent::ExecutionCertificatesReceived { certificates } => self
+                .shard
+                .on_execution_certificates_received(sched, certificates),
+            ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
+                .shard
+                .execution_coordinator
+                .on_certificate_verified(sched, result),
+            ProtocolEvent::ExecutionCertificateAdmitted { certificate } => self
+                .shard
+                .on_execution_certificate_admitted(sched, &certificate),
+            ProtocolEvent::FinalizationsReceived { finalizations } => {
+                self.shard.on_finalizations_received(sched, finalizations)
             }
+            ProtocolEvent::FinalizationVerified { result } => self
+                .shard
+                .execution_coordinator
+                .on_finalization_verified(result),
+            ProtocolEvent::LegsHalfBuilt { tick, tip, half } => self
+                .shard
+                .execution_coordinator
+                .on_legs_half_built(tick, tip, half),
 
             // ── Transactions ─────────────────────────────────────────────
-            evt @ (ProtocolEvent::TransactionValidated { .. }
-            | ProtocolEvent::TransactionsReceived { .. }
-            | ProtocolEvent::TransactionsAdmitted { .. }
-            | ProtocolEvent::TransactionsResolved { .. }) => {
-                self.on_shard(move |s, sched| s.handle_transaction(sched, evt))
+            ProtocolEvent::TransactionValidated {
+                tx,
+                submitted_locally,
+            } => self
+                .shard
+                .on_transaction_validated(sched, tx, submitted_locally),
+            ProtocolEvent::TransactionsReceived { transactions } => {
+                self.shard.on_transactions_fetched(sched, transactions)
+            }
+            ProtocolEvent::TransactionsAdmitted { txs } => {
+                self.shard.on_transactions_admitted(sched, &txs)
+            }
+            ProtocolEvent::TransactionsResolved { resolutions } => {
+                self.shard.mempool_coordinator.on_resolutions(&resolutions)
             }
 
             // ── Sync ─────────────────────────────────────────────────────
-            evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
-            | ProtocolEvent::BlockSyncComplete { .. }
-            | ProtocolEvent::SettledTxsReconstructed { .. }
-            | ProtocolEvent::FetchedStateProofVerified { .. }
-            | ProtocolEvent::FetchedVerdictProofVerified { .. }) => {
-                self.on_shard(move |s, sched| s.handle_sync(sched, evt))
+            ProtocolEvent::BlockSyncReadyToApply { certified } => {
+                self.shard.on_block_sync_ready_to_apply(sched, certified)
             }
-
-            evt @ ProtocolEvent::CommittedStateRestored { .. } => {
-                self.on_shard(move |s, sched| s.handle_sync(sched, evt))
+            ProtocolEvent::BlockSyncComplete { .. } => self.shard.on_block_sync_complete(sched),
+            ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
+                .shard
+                .on_committed_state_restored(sched, height, hash, qc),
+            ProtocolEvent::SettledTxsReconstructed {
+                shard,
+                txs,
+                terminal_wt,
+            } => self.shard.on_settled_txs_reconstructed(
+                sched,
+                shard,
+                SettledTxSet { txs, terminal_wt },
+            ),
+            ProtocolEvent::FetchedStateProofVerified {
+                anchor,
+                keys,
+                proof,
+                values,
+            } => {
+                self.shard
+                    .on_fetched_state_proof_verified(anchor, &keys, &proof, &values);
+                Vec::new()
+            }
+            ProtocolEvent::FetchedVerdictProofVerified {
+                anchor,
+                questions,
+                proof,
+            } => {
+                self.shard
+                    .on_fetched_verdict_proof_verified(sched, anchor, &questions, &proof);
+                Vec::new()
             }
 
             // ── Beacon ───────────────────────────────────────────────────
@@ -499,7 +702,7 @@ impl StateMachine for NodeStateMachine {
             // coordinators replay what waited on the epoch.
             ProtocolEvent::BeaconBlockPersisted { epoch, schedule } => {
                 let mut actions = self.install_schedule(epoch, schedule);
-                actions.extend(self.on_shard(ShardParticipation::on_beacon_block_persisted));
+                actions.extend(self.shard.on_beacon_block_persisted(&self.schedule));
                 actions
             }
 

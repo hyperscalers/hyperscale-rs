@@ -1,78 +1,63 @@
-//! Provision-flow dispatch arms.
+//! Provision-flow handlers.
 //!
 //! Covers both inbound provision delivery (received → verified → admitted)
 //! and outbound provision tracking (broadcasts the local shard issued, and
 //! the remote ECs that ack them).
 
-use hyperscale_core::{Action, ProtocolEvent};
+use std::sync::Arc;
+
+use hyperscale_core::Action;
 use hyperscale_metrics::record_crossing_push_dropped;
-use hyperscale_types::TopologySchedule;
+use hyperscale_types::{Provisions, StateClaim, TopologySchedule, Verifiable};
 
 use super::ShardParticipation;
 
 impl ShardParticipation {
-    /// Dispatch a provision-category `ProtocolEvent`.
-    pub(in crate::state) fn handle_provisions(
+    /// Crossing readings a counterpart pushed. A claim at a height this
+    /// node fences against never reaches a block, so it is not worth
+    /// parking either.
+    pub(in crate::state) fn on_crossing_readings(
         &mut self,
         sched: &TopologySchedule,
-        event: ProtocolEvent,
+        claims: Vec<StateClaim>,
     ) -> Vec<Action> {
-        match event {
-            ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
-                .provisions_coordinator
-                .on_state_provisions_received(sched, std::sync::Arc::unwrap_or_clone(provisions)),
-            ProtocolEvent::VerifiedProvisionsReceived { provisions } => self
-                .provisions_coordinator
-                .on_verified_state_provisions_received(sched, provisions, self.now),
-            ProtocolEvent::StateProvisionsVerified { result, anchor } => self
-                .provisions_coordinator
-                .on_state_provisions_verified(result, anchor, self.now),
-            ProtocolEvent::CrossingReadingsReceived { claims } => {
-                // A claim at a height this node fences against never
-                // reaches a block, so it is not worth parking either.
-                let fence = &self.fork_fence;
-                let claims: Vec<_> = claims
-                    .into_iter()
-                    .filter(|claim| {
-                        let fenced = fence.is_fenced(claim.anchor.shard, claim.anchor.height);
-                        if fenced {
-                            record_crossing_push_dropped("fenced");
-                        }
-                        !fenced
-                    })
-                    .collect();
-                let actions = self
-                    .execution_coordinator
-                    .on_crossing_readings(sched, claims);
-                self.shard_coordinator.queue_ready_proposal();
-                actions
-            }
-            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
-                // A verified bundle is engagement evidence: promote any
-                // parked cross-shard transaction it names, before the
-                // proposal latch below gathers ready transactions — the
-                // bundle and its transactions then pair in one proposal.
-                self.mempool_coordinator.on_engagement_evidence(
-                    sched.head().shard_trie(),
-                    provisions.source_shard(),
-                    provisions.transactions().iter().map(|entry| entry.tx_hash),
-                );
-                let actions = self
-                    .shard_coordinator
-                    .on_provisions_admitted(sched, &[provisions]);
-                self.shard_coordinator.queue_ready_proposal();
-                actions
-            }
-            ProtocolEvent::OutboundProvisionBroadcast {
-                provisions,
-                target_shard,
-            } => {
-                self.outbound_provisions
-                    .on_broadcast(&provisions, target_shard);
-                vec![]
-            }
-            _ => unreachable!("non-provision event routed to handle_provisions"),
-        }
+        let fence = &self.fork_fence;
+        let claims: Vec<_> = claims
+            .into_iter()
+            .filter(|claim| {
+                let fenced = fence.is_fenced(claim.anchor.shard, claim.anchor.height);
+                if fenced {
+                    record_crossing_push_dropped("fenced");
+                }
+                !fenced
+            })
+            .collect();
+        let actions = self
+            .execution_coordinator
+            .on_crossing_readings(sched, claims);
+        self.shard_coordinator.queue_ready_proposal();
+        actions
+    }
+
+    /// A verified bundle is engagement evidence: promote any parked
+    /// cross-shard transaction it names, before the proposal latch
+    /// gathers ready transactions, so the bundle and its transactions
+    /// pair in one proposal.
+    pub(in crate::state) fn on_provisions_admitted(
+        &mut self,
+        sched: &TopologySchedule,
+        provisions: Arc<Verifiable<Provisions>>,
+    ) -> Vec<Action> {
+        self.mempool_coordinator.on_engagement_evidence(
+            sched.head().shard_trie(),
+            provisions.source_shard(),
+            provisions.transactions().iter().map(|entry| entry.tx_hash),
+        );
+        let actions = self
+            .shard_coordinator
+            .on_provisions_admitted(sched, &[provisions]);
+        self.shard_coordinator.queue_ready_proposal();
+        actions
     }
 }
 

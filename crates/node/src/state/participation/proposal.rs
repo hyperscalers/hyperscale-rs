@@ -1,4 +1,4 @@
-//! Block-proposal helpers used by the shard consensus-driven dispatch arms.
+//! Block-proposal helpers used by the shard consensus-driven handlers.
 //!
 //! Both the post-dispatch proposal-retry hook and the QC-formed path build
 //! proposals from the same triple — ready txs from mempool, finalizations

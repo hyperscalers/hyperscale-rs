@@ -1,4 +1,4 @@
-//! Timer-driven dispatch arms.
+//! Timer-driven handlers.
 //!
 //! Two `ProtocolEvent` variants drive the periodic timers: `CleanupTimer`
 //! (mempool / shard consensus housekeeping) and `ViewChangeTimer` (leader liveness).

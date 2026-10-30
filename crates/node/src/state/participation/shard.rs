@@ -1,220 +1,83 @@
-//! Shard consensus dispatch arms and the multi-coordinator orchestrators that
-//! sit alongside them.
-//!
-//! Routing arms forward to `ShardCoordinator`. The orchestrators that span
-//! multiple coordinators live here too because each is fundamentally a
-//! shard-consensus-flow response — the coordinators that get notified are the
-//! downstream subscribers:
+//! Shard consensus handlers, and the orchestrators spanning several
+//! coordinators that sit alongside them. Each is a response to a
+//! shard-consensus flow; the coordinators it notifies are downstream
+//! subscribers:
 //!
 //! - `on_block_header_received` validates in-flight before shard ingest;
 //! - `on_qc_formed` gathers proposal inputs to feed `shard.on_qc_formed`;
+//! - `on_block_persisted` hands the write to shard consensus and execution;
+//! - `on_fork_proven` engages the fork fence and re-gossips the proof;
 //! - `apply_commit_effects` and `settle_tip` take what an execution fold
 //!   returns, for a live commit, the restart's replay and a parked commit
-//!   folded on a beacon block alike;
-//! - `RemoteHeaderAdmitted` fans verified headers to execution + provisions.
+//!   folded on a beacon block alike.
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::Action;
 use hyperscale_execution::CommitEffects;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockManifest, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof, TopologySchedule, Verifiable, Verified,
-    drain_admits_block,
+    BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof,
+    StandingAnswers, TopologySchedule, Verifiable, Verified, drain_admits_block,
 };
 
 use super::ShardParticipation;
 
 impl ShardParticipation {
-    /// Dispatch a shard-category `ProtocolEvent`.
+    /// The local chain persisted `height`. It advances
+    /// `last_persisted_height`, a fallback gate for deferred state root
+    /// verifications. Steady-state unblocking happens on `BlockCommitted`;
+    /// this still matters for boot-time catch-up (freshly-booted node has
+    /// persisted state but an empty in-memory set, so child verifications
+    /// of just-persisted parents unblock here).
     ///
-    /// `BlockCommitted` and `RemoteHeaderAdmitted` are not routed here — they
-    /// also drive the beacon coordinator, so they stay on
-    /// [`NodeStateMachine`](crate::state::NodeStateMachine) as orchestrators.
-    #[allow(clippy::too_many_lines)] // single dispatch, one arm per shard variant
-    pub(in crate::state) fn handle_shard(
+    /// Execution reads it too: the tick above `height` reads the base as
+    /// that block left it, and waits here for the write.
+    pub(in crate::state) fn on_block_persisted(
         &mut self,
-        topology_schedule: &TopologySchedule,
-        event: ProtocolEvent,
+        sched: &TopologySchedule,
+        height: BlockHeight,
+        substate_bytes: u64,
+        standing_answers: Option<(BlockHeight, BlockHash, StandingAnswers)>,
     ) -> Vec<Action> {
-        match event {
-            ProtocolEvent::BlockHeaderReceived { header, manifest } => {
-                self.on_block_header_received(topology_schedule, &header, manifest)
-            }
-            ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
-                self.on_qc_formed(topology_schedule, block_hash, &qc)
-            }
-            ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                certified_header,
-                sender,
-            } => {
-                // Route through the centralized remote header coordinator.
-                // Structural pre-checks happen there; downstream consumers
-                // receive headers via `RemoteHeaderAdmitted`.
-                self.remote_headers_coordinator.on_remote_header_received(
-                    topology_schedule,
-                    certified_header,
-                    sender,
-                )
-            }
-            ProtocolEvent::RemoteHeadersBelowFloor {
-                source_shard,
-                floor,
-            } => {
-                self.remote_headers_coordinator.on_source_below_floor(
-                    topology_schedule,
-                    source_shard,
-                    floor,
-                );
-                Vec::new()
-            }
-            ProtocolEvent::VerifiedRemoteHeaderReceived {
-                certified_header,
-                sender,
-            } => self
-                .remote_headers_coordinator
-                .on_verified_remote_header_received(topology_schedule, certified_header, sender),
-            ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
-                .shard_coordinator
-                .on_verified_block_vote(topology_schedule, vote),
-            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
-                .shard_coordinator
-                .on_unverified_block_vote(topology_schedule, vote),
-            ProtocolEvent::VerifiedTimeoutReceived { timeout } => self
-                .shard_coordinator
-                .on_verified_timeout(topology_schedule, timeout),
-            ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
-                .shard_coordinator
-                .on_unverified_timeout(topology_schedule, &timeout),
-            ProtocolEvent::QcAnnouncementReceived { announcement } => self
-                .shard_coordinator
-                .on_qc_announcement(topology_schedule, &announcement),
-            ProtocolEvent::ReadySignalReceived { signal } => {
-                self.shard_coordinator
-                    .on_ready_signal_received(topology_schedule, signal);
-                Vec::new()
-            }
-            ProtocolEvent::BlockReadyToCommit { certified, source } => self
-                .shard_coordinator
-                .on_block_ready_to_commit(topology_schedule, certified, source),
-            ProtocolEvent::QuorumCertificateResult {
-                block_hash,
-                qc,
-                verified_votes,
-                binding,
-            } => self
-                .shard_coordinator
-                .on_qc_result(block_hash, binding, qc, verified_votes),
-            ProtocolEvent::QcSignatureVerified { subject, result } => self
-                .shard_coordinator
-                .on_qc_signature_verified(topology_schedule, subject, result),
-            ProtocolEvent::RemoteHeaderQcVerified {
-                certified_header,
-                sender,
-                result,
-            } => self
-                .remote_headers_coordinator
-                .on_remote_header_qc_verified(
-                    topology_schedule,
-                    &certified_header,
-                    sender,
-                    *result,
-                ),
-            ProtocolEvent::BlockCheckCompleted {
-                block_hash,
-                kind,
-                outcome,
-            } => self.shard_coordinator.on_block_check_completed(
-                topology_schedule,
-                block_hash,
-                kind,
-                outcome,
-            ),
-            ProtocolEvent::ProposalBuilt {
-                height,
-                round,
-                block,
-                block_hash,
-                finalizations,
-                provisions,
-                bytes_delta,
-                answers,
-                additions,
-            } => self.shard_coordinator.on_proposal_built(
-                topology_schedule,
-                height,
-                round,
-                &block,
-                block_hash,
-                finalizations,
-                provisions,
-                bytes_delta,
-                answers,
-                additions,
-            ),
-            // `BlockPersisted` advances `last_persisted_height`, a fallback
-            // gate for deferred state root verifications. Steady-state
-            // unblocking happens on `BlockCommitted`; this still matters for
-            // boot-time catch-up (freshly-booted node has persisted state
-            // but an empty in-memory set, so child verifications of just-
-            // persisted parents unblock here).
-            //
-            // Execution reads it too: the tick above `height` reads the
-            // base as that block left it, and waits here for the write.
-            ProtocolEvent::BlockPersisted {
-                height,
-                substate_bytes,
-                standing_answers,
-            } => {
-                let mut actions = self.shard_coordinator.on_block_persisted(
-                    topology_schedule,
-                    height,
-                    substate_bytes,
-                    standing_answers,
-                );
-                actions.extend(
-                    self.execution_coordinator
-                        .on_block_persisted(topology_schedule, height),
-                );
-                actions
-            }
-            ProtocolEvent::FinalizationsAdmitted { finalizations } => {
-                let actions = self
-                    .shard_coordinator
-                    .on_finalizations_admitted(topology_schedule, &finalizations);
-                self.shard_coordinator.queue_ready_proposal();
-                actions
-            }
-            // Locally assembled from already-verified headers — engage the
-            // fence and re-gossip directly (no re-verification needed).
-            ProtocolEvent::ShardForkDetected { proof } => {
-                self.on_fork_proven(topology_schedule, *proof)
-            }
-            // A peer's proof finished verification: fence + re-gossip on a
-            // real verdict, discard a forgery.
-            ProtocolEvent::ShardForkProofVerified { proof, verified } => {
-                if verified {
-                    self.on_fork_proven(topology_schedule, *proof)
-                } else {
-                    tracing::warn!("discarding a shard fork proof that failed verification");
-                    Vec::new()
-                }
-            }
-            // A gossiped proof: resolve committees from the local schedule
-            // and dispatch off-thread verification (self-authenticating, no
-            // sender trust).
-            ProtocolEvent::UnverifiedShardForkProofReceived { proof } => {
-                self.on_unverified_fork_proof(topology_schedule, *proof)
-            }
-            ProtocolEvent::CommitProofNeeded {
-                source_shard,
-                block_height,
-            } => self.remote_headers_coordinator.request_commit_proof(
-                topology_schedule,
-                source_shard,
-                block_height,
-            ),
-            _ => unreachable!("non-shard event routed to handle_shard"),
+        let mut actions = self.shard_coordinator.on_block_persisted(
+            sched,
+            height,
+            substate_bytes,
+            standing_answers,
+        );
+        actions.extend(self.execution_coordinator.on_block_persisted(sched, height));
+        actions
+    }
+
+    /// Finalizations reached the node's cache: the shard coordinator
+    /// fills pending blocks waiting on them, and the next proposal may
+    /// carry them.
+    pub(in crate::state) fn on_finalizations_admitted(
+        &mut self,
+        sched: &TopologySchedule,
+        finalizations: &[Arc<Verifiable<Finalization>>],
+    ) -> Vec<Action> {
+        let actions = self
+            .shard_coordinator
+            .on_finalizations_admitted(sched, finalizations);
+        self.shard_coordinator.queue_ready_proposal();
+        actions
+    }
+
+    /// A peer's proof finished verification: fence and re-gossip on a
+    /// real verdict, discard a forgery.
+    pub(in crate::state) fn on_fork_proof_verified(
+        &mut self,
+        sched: &TopologySchedule,
+        proof: ShardForkProof,
+        verified: bool,
+    ) -> Vec<Action> {
+        if verified {
+            self.on_fork_proven(sched, proof)
+        } else {
+            tracing::warn!("discarding a shard fork proof that failed verification");
+            Vec::new()
         }
     }
 
@@ -232,7 +95,7 @@ impl ShardParticipation {
     /// stops admitting transactions bound to it, and its headers stop
     /// promoting. Every fence holds until the beacon-attested recovery the
     /// proof arms completes.
-    fn on_fork_proven(
+    pub(in crate::state) fn on_fork_proven(
         &mut self,
         topology_schedule: &TopologySchedule,
         proof: ShardForkProof,
@@ -274,7 +137,7 @@ impl ShardParticipation {
     /// the local schedule and dispatch off-thread verification (the proof
     /// self-authenticates — no sender trust). An unresolvable epoch drops
     /// the proof; a re-gossip retries.
-    fn on_unverified_fork_proof(
+    pub(in crate::state) fn on_unverified_fork_proof(
         &self,
         topology_schedule: &TopologySchedule,
         proof: ShardForkProof,
@@ -303,7 +166,7 @@ impl ShardParticipation {
     }
 
     /// Validate in-flight before letting shard ingest a received header.
-    fn on_block_header_received(
+    pub(in crate::state) fn on_block_header_received(
         &mut self,
         sched: &TopologySchedule,
         header: &BlockHeader,
@@ -388,7 +251,7 @@ impl ShardParticipation {
     }
 
     /// QC formed — may trigger immediate next proposal.
-    fn on_qc_formed(
+    pub(in crate::state) fn on_qc_formed(
         &mut self,
         sched: &TopologySchedule,
         block_hash: BlockHash,
