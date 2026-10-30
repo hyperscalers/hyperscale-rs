@@ -1468,13 +1468,26 @@ impl BoundaryClaims {
     }
 
     /// Cut from the claims held at each anchor the cells `carried` names
-    /// there.
-    fn cut(&mut self, carried: &BTreeMap<Anchor, BTreeSet<SubstateKey>>) {
+    /// there, and stop awaiting them there: a proof still out for one
+    /// would hold it again while the rows still read it, and a proposer
+    /// would carry it twice. Hands back the cells no longer awaited, for
+    /// their fetches to be let go.
+    fn cut(
+        &mut self,
+        carried: &BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+    ) -> Vec<(Anchor, SubstateKey)> {
+        let mut released = Vec::new();
         for (anchor, keys) in carried {
             if let Some(at) = self.at.get_mut(anchor) {
                 at.drop_cells(keys);
+                for key in keys {
+                    if at.pending.remove(key) {
+                        released.push((*anchor, *key));
+                    }
+                }
             }
         }
+        released
     }
 }
 
@@ -2040,12 +2053,15 @@ impl Counterparts {
         // from every held claim at the anchor, so a claim another
         // proposer cut differently leaves only what the block carried,
         // and the remainder of a cut claim is offered whole.
-        self.cut_carried(&CarriedClaims::of(
+        let released = self.cut_carried(&CarriedClaims::of(
             self.ledger.local(),
             block.state_claims(),
         ));
         self.fold_state_claims(block);
         let mut actions = Vec::new();
+        if !released.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::StateProofs(released)));
+        }
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
@@ -2105,14 +2121,21 @@ impl Counterparts {
     /// leaf at that anchor is still owed to a block whole. What is held
     /// for a verdict question goes by its row's entry alone, where the
     /// questions are stood.
-    fn cut_carried(&mut self, carried: &CarriedClaims) {
+    ///
+    /// Hands back the boundary cells no longer awaited, for their
+    /// fetches to be let go.
+    fn cut_carried(&mut self, carried: &CarriedClaims) -> Vec<(Anchor, SubstateKey)> {
         if !carried.cells().is_empty() {
             self.fetched.cut(carried.cells());
         }
         // A deletion a block carried is not offered again. The row and
         // the marker read beside it stay held: another answer of the
         // same transaction reads them too.
-        self.boundaries.cut(carried.deleted());
+        let released = self.boundaries.cut(carried.deleted());
+        for (anchor, key) in &released {
+            self.resume(key, anchor, "released");
+        }
+        released
     }
 
     /// Whether this validator's re-push of `record` stands paused.
@@ -5962,6 +5985,56 @@ mod tests {
             .boundary_claims;
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].deletions, vec![asked]);
+    }
+
+    /// A deletion a block carried is not offered again by a replica whose
+    /// own fetch for it was still out: the cut lets that fetch go, and
+    /// the proof arriving after it holds nothing, though the answer's
+    /// row still reads the record until the block's writes are indexed.
+    #[test]
+    fn a_proof_arriving_after_its_deletion_is_carried_holds_nothing() {
+        let now = WeightedTimestamp::from_millis(900_000);
+        let (row, _) = exit_cells();
+        let Answering {
+            counterparts: mut offering,
+            record,
+            ..
+        } = answering();
+        let Answering {
+            counterparts: mut late,
+            ..
+        } = answering();
+        let mut asked = vec![record, row];
+        asked.sort_unstable();
+        let (boundary, proof) = boundary_of(80, 300_000, &[], &asked);
+        let schedule = recording(&[boundary]);
+        for counterparts in [&mut offering, &mut late] {
+            assert_eq!(
+                asked_at(&counterparts.ask_boundaries(&schedule, now)),
+                vec![(boundary, asked.clone())]
+            );
+        }
+        offering.on_proof_fetched(boundary, &asked, &proof, &[]);
+        let carried = offering
+            .offers(&CarriedClaims::default())
+            .boundary_claims
+            .remove(0)
+            .carrying(1);
+
+        let released = late.cut_carried(&CarriedClaims::of(CONSUMER, &carried));
+        assert_eq!(
+            released,
+            vec![(boundary, record)],
+            "the fetch out for it is let go"
+        );
+        late.on_proof_fetched(boundary, &asked, &proof, &[]);
+        assert!(
+            late.offers(&CarriedClaims::default())
+                .boundary_claims
+                .iter()
+                .all(|offer| offer.deletions.iter().all(|cells| !cells.contains(&record))),
+            "the late proof does not hold the carried deletion again",
+        );
     }
 
     /// The row leaf and marker read beside a record's absence stay held
