@@ -22,13 +22,13 @@
 //! simulation steps it deterministically — both run this exact
 //! sequencing.
 
-pub mod history;
-pub mod responder;
-pub mod snap_sync;
+mod history;
+mod responder;
+mod snap_sync;
 mod span_collect;
-pub mod state_range_serve;
-pub mod witness_history;
-pub mod witness_history_serve;
+pub(crate) mod state_range_serve;
+mod witness_history;
+pub(crate) mod witness_history_serve;
 
 use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_storage::{
@@ -47,9 +47,10 @@ use hyperscale_types::{
     shard_prefix_path,
 };
 
-use self::history::{HistoryBackfill, HistoryOutcome};
+use self::history::HistoryBackfill;
+pub use self::history::HistoryOutcome;
 pub use self::responder::{BootstrapResponse, StoreResponder};
-use self::snap_sync::SnapSync;
+pub(crate) use self::snap_sync::SnapSync;
 pub use self::snap_sync::StateRangeOutcome;
 pub(crate) use self::span_collect::SpanCollect;
 use self::witness_history::WitnessHistorySync;
@@ -591,9 +592,8 @@ mod tests {
     use hyperscale_types::{LEAF_KEY_BYTES, ShardWitnessPayload};
 
     use super::*;
-    use crate::bootstrap::state_range_serve::serve_state_range_request;
-    use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
+    use crate::{serve_state_range_request, serve_witness_history_request};
 
     const ENTRIES: u8 = 12;
 

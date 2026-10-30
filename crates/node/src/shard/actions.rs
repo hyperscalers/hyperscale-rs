@@ -19,9 +19,8 @@ use hyperscale_types::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::{
-    ShardLoop, ShardScopedInput, TimerOp, TimerOwner, push_protocol_event, push_shard_input,
-};
+use super::{ShardLoop, push_protocol_event, push_shard_input};
+use crate::event::{ShardScopedInput, TimerOp, TimerOwner};
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyPrep,

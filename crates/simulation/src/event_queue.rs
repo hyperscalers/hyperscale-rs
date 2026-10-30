@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hyperscale_dispatch_sync::Job;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::shard::{EventPriority, HostEvent};
+use hyperscale_node::event::{EventPriority, HostEvent};
 
 /// What the runner does for a host when its key comes up.
 pub enum SimEvent {

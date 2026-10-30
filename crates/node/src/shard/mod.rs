@@ -20,17 +20,17 @@
 // Per-shard state, grouped by subsystem over shared infra. Crate-internal —
 // `shard` is `pub` for its driver types (ShardLoop, HostEvent, …), but the
 // subsystem internals are not part of the crate's external API.
-pub(crate) mod boundary_pins;
-pub(crate) mod caches;
-pub(crate) mod commit;
-pub(crate) mod consensus;
-pub(crate) mod cross_shard;
-pub(crate) mod crossing_index;
-pub(crate) mod instances;
-pub(crate) mod io;
-pub(crate) mod mempool;
-pub(crate) mod phase_times;
-pub(crate) mod verify;
+pub mod boundary_pins;
+pub mod caches;
+pub mod commit;
+pub mod consensus;
+pub mod cross_shard;
+pub mod crossing_index;
+pub mod instances;
+pub mod io;
+pub mod mempool;
+pub mod phase_times;
+pub mod verify;
 
 // The driver shell: dispatch, lifecycle, metrics, the generic
 // fetch/timer plumbing, and the consensus driver glue.
@@ -41,14 +41,14 @@ pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
 #[cfg(test)]
-pub(crate) mod test_host;
+pub mod test_host;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Sender, TrySendError};
-pub(crate) use fetch_dispatch::FetchTicker;
+pub use fetch_dispatch::FetchTicker;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
@@ -66,9 +66,8 @@ pub use io::ShardIo;
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
-pub use crate::event::{
-    BeaconScopedInput, EventPriority, FetchFailureKind, HostEvent, NETWORK_LANE_CAPACITY,
-    ProcessScopedInput, ShardInbox, ShardScopedInput, StepOutput, TimerOp, TimerOwner, timer_event,
+use crate::event::{
+    BeaconScopedInput, HostEvent, ShardInbox, ShardScopedInput, StepOutput, TimerOp,
 };
 use crate::fetch::Release;
 use crate::process::ProcessIo;
@@ -93,7 +92,7 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// `per_shard`, keyed by the hosted shard id. Delegated handlers select
 /// the right entry from the emitting loop's shard, loading the map per
 /// dispatch so shards added or dropped at runtime are observed.
-pub(crate) struct DispatchHandles<S: ShardStorage, N> {
+pub struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: Arc<Executor>,
     pub(crate) network: Arc<N>,
     /// Process-level serve cache for beacon proposals — fed by the
@@ -122,7 +121,7 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
 /// belongs to a shard this node does not serve, the answer is the copy
 /// the record fetch persisted — which survives a restart and the cache
 /// letting the record go alike — or nothing, where it never fetched one.
-pub(crate) struct HostedRecords<S: ShardStorage> {
+pub struct HostedRecords<S: ShardStorage> {
     per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
     beacon_storage: Arc<dyn BeaconStorage>,
 }
@@ -180,7 +179,7 @@ impl<S: ShardStorage, N> DispatchHandles<S, N> {
 }
 
 /// Per-shard subset of [`DispatchHandles`]. One entry per hosted shard.
-pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
+pub struct ShardDispatchHandles<S: ShardStorage> {
     pub(crate) storage: Arc<S>,
     pub(crate) pending_chain: Arc<PendingChain<S>>,
     pub(crate) tick_chain: Arc<TickChain<S>>,
@@ -209,7 +208,7 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
 /// failure is silently ignored by design (the only failure mode is the
 /// receiver having been dropped at shutdown, in which case there's
 /// nothing to do).
-pub(crate) fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: ShardScopedInput) {
+pub fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: ShardScopedInput) {
     let _ = tx.send(HostEvent::shard(shard, input));
 }
 
@@ -217,7 +216,7 @@ pub(crate) fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: Sh
 /// [`ShardScopedInput::Protocol`]) into the event channel, for `shard`'s
 /// replica.
 /// See [`push_shard_input`] for the drop-on-shutdown convention.
-pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: ProtocolEvent) {
+pub fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: ProtocolEvent) {
     let _ = tx.send(HostEvent::protocol(shard, event));
 }
 
@@ -231,7 +230,7 @@ pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event:
 /// bound is on what peers may queue here, not on what the host itself
 /// produced.
 #[must_use]
-pub(crate) fn offer_network_input(
+pub fn offer_network_input(
     inbox: &ShardInbox,
     shard: ShardId,
     input: ShardScopedInput,
@@ -242,7 +241,7 @@ pub(crate) fn offer_network_input(
 
 /// [`offer_network_input`] for a [`ProtocolEvent`].
 #[must_use]
-pub(crate) fn offer_network_event(
+pub fn offer_network_event(
     inbox: &ShardInbox,
     shard: ShardId,
     event: ProtocolEvent,
@@ -912,7 +911,7 @@ where
 /// step), so what "resuming from recovered state" means is written once.
 ///
 /// [`NodeHost::resume_shard_committed`]: crate::host::NodeHost::resume_shard_committed
-pub(crate) fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEvent {
+pub fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEvent {
     ProtocolEvent::CommittedStateRestored {
         height: recovered.committed_height,
         hash: recovered.committed_hash,
@@ -944,9 +943,10 @@ mod tests {
         SweepFrontier, TopologySchedule, ValidatorId, Verified, VotePosition, WeightedTimestamp,
     };
 
+    use crate::event::{BeaconScopedInput, HostEvent};
+    use crate::shard::ThreadShardLoop;
     use crate::shard::cross_shard::RemoteHeaderSyncInput;
     use crate::shard::test_host::{Fixture, Host, Loop, SHARD, loop_of};
-    use crate::shard::{BeaconScopedInput, HostEvent, ThreadShardLoop};
 
     /// A chain of empty blocks a loop commits one at a time, each
     /// prepared over the one before it.
@@ -1521,7 +1521,7 @@ mod tests {
     fn an_execution_vote_for_a_co_hosted_leader_is_fed_back_not_sent() {
         use hyperscale_types::{GlobalReceiptRoot, TickId};
 
-        use crate::shard::ShardScopedInput;
+        use crate::event::ShardScopedInput;
 
         let fix = Fixture::new();
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
@@ -1567,8 +1567,8 @@ mod tests {
         use crossbeam::channel::{bounded, unbounded};
         use hyperscale_core::FetchIds;
 
+        use crate::event::{ShardInbox, ShardScopedInput};
         use crate::fetch::{FetchReply, ShardReply};
-        use crate::shard::{ShardInbox, ShardScopedInput};
 
         let fix = Fixture::new();
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));

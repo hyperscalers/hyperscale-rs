@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_node::shard::{HostEvent, ShardScopedInput};
+use hyperscale_node::event::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,

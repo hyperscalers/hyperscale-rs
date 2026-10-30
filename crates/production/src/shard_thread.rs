@@ -3,7 +3,7 @@
 //! then its two input lanes in turn), publishing the shard's RPC readouts
 //! as it goes.
 //!
-//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+//! [`ShardLoop`]: hyperscale_node::ShardLoop
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,10 +15,10 @@ use hyperscale_core::{ParticipationChange, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics::set_shard_channel_depths;
 use hyperscale_network_iroh::IrohNetwork;
-use hyperscale_node::shard::{
-    HostEvent, NETWORK_LANE_CAPACITY, ShardInbox, ShardLoop, StepOutput, ThreadShardLoop, TimerOp,
-    TimerOwner, timer_event,
+use hyperscale_node::event::{
+    HostEvent, NETWORK_LANE_CAPACITY, ShardInbox, StepOutput, TimerOp, TimerOwner, timer_event,
 };
+use hyperscale_node::{ShardLoop, ThreadShardLoop};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{MAX_UNSETTLED_TXS, ShardId, Signer, TxsInFlight, ValidatorId};
 use tokio::runtime::Handle as TokioHandle;
@@ -506,7 +506,7 @@ pub fn spawn_shard_loop(
 #[cfg(test)]
 mod tests {
     use crossbeam::channel::TrySendError;
-    use hyperscale_node::shard::{HostEvent, ShardScopedInput};
+    use hyperscale_node::event::{HostEvent, ShardScopedInput};
     use hyperscale_types::ShardId;
 
     use super::ShardInputs;

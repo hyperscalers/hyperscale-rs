@@ -39,7 +39,7 @@ use hyperscale_types::{
 use crate::NodeStateMachine;
 use crate::beacon::{BeaconCandidateCache, BeaconLoop, BeaconProposalCache, resume_fold};
 use crate::config::NodeConfig;
-use crate::event::Registration;
+use crate::event::{HostEvent, ProcessScopedInput, Registration, ShardInbox, StepOutput};
 use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::replica::ReplicaConfig;
 use crate::shard::boundary_pins::BoundaryPins;
@@ -51,15 +51,15 @@ use crate::shard::crossing_index::ChainCrossings;
 use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
-    DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
-    ShardDispatchHandles, ShardInbox, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
+    DispatchHandles, FetchTicker, HostedRecords, ShardDispatchHandles, ShardIo, ShardLoop,
+    SharedTopologySnapshot,
 };
 
 /// Output of [`NodeHost::into_parts`].
 ///
 /// The shared process-scoped resources, the per-shard drivers keyed by
 /// hosted shard id, and the host's beacon loop.
-pub(crate) type NodeHostParts<S, N, D> = (
+pub type NodeHostParts<S, N, D> = (
     Arc<ProcessIo<S, N, D>>,
     BTreeMap<ShardId, ShardLoop<S, N, D>>,
     BeaconLoop<S, N, D>,

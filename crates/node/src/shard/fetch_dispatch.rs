@@ -10,7 +10,8 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
 use tracing::warn;
 
-use super::{ShardIo, ShardLoop, TimerOp, TimerOwner};
+use super::{ShardIo, ShardLoop};
+use crate::event::{TimerOp, TimerOwner};
 use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Intent, Release, ShardReply};
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{

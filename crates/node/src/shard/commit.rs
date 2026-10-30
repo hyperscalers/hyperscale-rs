@@ -35,7 +35,8 @@ use hyperscale_types::{
 };
 use tracing::debug;
 
-use crate::shard::{HostEvent, push_protocol_event};
+use crate::event::HostEvent;
+use crate::shard::push_protocol_event;
 
 /// Handle to the assembled `Verified<CertifiedBlock>` that the
 /// `io_loop` forwards to `BlockCommitted`. Cloned `Arc` to the commit
@@ -1076,7 +1077,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::shard::ShardScopedInput;
+    use crate::event::ShardScopedInput;
 
     /// Shared sink the test closures record their (height, tag) commit
     /// against. Threaded through `make_commit` so the test can assert on

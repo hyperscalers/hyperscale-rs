@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_node::event::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_transactions::{Ceilings, Client, Terms};

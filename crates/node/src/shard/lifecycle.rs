@@ -21,8 +21,9 @@ use hyperscale_types::{
     Verified, WeightedTimestamp,
 };
 
+use crate::event::{HostEvent, StepOutput};
 use crate::host::{NodeHost, ShardGenesis};
-use crate::shard::{HostEvent, StepOutput, committed_state_restored};
+use crate::shard::committed_state_restored;
 
 impl<S, N, D> NodeHost<S, N, D>
 where

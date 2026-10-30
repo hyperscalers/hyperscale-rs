@@ -35,11 +35,10 @@ use hyperscale_types::{Address, Hash, ShardId};
 use super::interest::AskRoute;
 use super::{Asked, Askers, BeaconLoop, Interest};
 use crate::beacon::{BeaconFetchState, BeaconReply};
-use crate::event::{BeaconOwner, BeaconScopedInput, HostEvent};
+use crate::event::{BeaconOwner, BeaconScopedInput, HostEvent, ShardScopedInput};
 use crate::fetch::{
     Fetch, FetchBinding, FetchInput, FetchedBy, Route, Settles, SolicitedAnswer, dispatch_solicited,
 };
-use crate::shard::ShardScopedInput;
 
 /// The prefix a package's artifact is kept under: the cell's own owner,
 /// which its content address derives. The shard holding that prefix is

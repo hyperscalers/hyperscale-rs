@@ -32,7 +32,8 @@ use hyperscale_types::network::Request;
 use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
 use tracing::{debug, trace, warn};
 
-use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_shard_input};
+use crate::event::{HostEvent, ShardScopedInput};
+use crate::shard::{ShardIo, push_shard_input};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]

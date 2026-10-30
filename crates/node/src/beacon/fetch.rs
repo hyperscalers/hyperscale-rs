@@ -36,12 +36,12 @@ use hyperscale_types::{
 use tracing::warn;
 
 use crate::config::NodeConfig;
-use crate::event::BeaconScopedInput;
+use crate::event::{BeaconScopedInput, HostEvent};
 use crate::fetch::{
     Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, HandsOver, Refusal, Route,
     ScopedAnswer, defers_to_the_tick, dispatch_scoped, scored, transport_failed,
 };
-use crate::shard::{HostEvent, SharedTopologySnapshot};
+use crate::shard::SharedTopologySnapshot;
 
 /// Cross-shard beacon-witness fetch keyed by
 /// `(source_shard, block_height, committed_block_hash, lo, hi)`.

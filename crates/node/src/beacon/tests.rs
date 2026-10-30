@@ -40,11 +40,11 @@ use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 use super::records::InstanceRecordBinding;
 use super::*;
 use crate::HostedChain;
-use crate::event::{BeaconInput, FetchFailureKind};
+use crate::event::{BeaconInput, FetchFailureKind, ShardScopedInput, TimerOwner};
 use crate::fetch::settle_solicited;
+use crate::shard::ThreadShardLoop;
 use crate::shard::mempool::DeferredTransaction;
 use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
-use crate::shard::{ShardScopedInput, ThreadShardLoop, TimerOwner};
 
 type Loop = BeaconLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 

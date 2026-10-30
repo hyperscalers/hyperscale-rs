@@ -118,7 +118,7 @@ impl<S: ShardStorage> ShardIo<S> {
     /// [`CrossShardState`]. The I/O loop flattens this into the larger
     /// `MetricsSnapshot`.
     #[must_use]
-    pub fn fetch_metrics(&self) -> FetchMetrics {
+    pub(crate) fn fetch_metrics(&self) -> FetchMetrics {
         let x = &self.cross_shard;
         let m = &self.mempool;
         FetchMetrics {

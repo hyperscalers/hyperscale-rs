@@ -20,7 +20,7 @@ use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_node::event::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
     chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,

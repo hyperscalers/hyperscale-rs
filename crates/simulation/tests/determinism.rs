@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hex::encode;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_node::event::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, genesis_accounts, recipient,
     sender, validity_around,

@@ -22,11 +22,12 @@ use hyperscale_types::network::request::GetProposalRequest;
 use hyperscale_types::network::response::GetProposalResponse;
 use hyperscale_types::{BlockHash, BlockHeight};
 
+use crate::event::ShardScopedInput;
 use crate::fetch::{
     Fetch, FetchBinding, FetchedBy, Route, Settles, ShardReply, SolicitedAnswer, dispatch_solicited,
 };
 use crate::shard::verify::verify_signed_by_proposer;
-use crate::shard::{ShardIo, ShardLoop, ShardScopedInput};
+use crate::shard::{ShardIo, ShardLoop};
 
 /// Proposals held for serving at once. The coordinator admits proposals
 /// only within its own window above the committed tip, and commits prune
@@ -205,8 +206,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::event::HostEvent;
     use crate::fetch::{FetchConfig, FetchInput, FetchOutput, settle_solicited};
-    use crate::shard::HostEvent;
 
     fn proposal_at(height: u64, tag: &[u8]) -> BlockHeaderNotification {
         let header = BlockHeader::new(BlockHeaderParts {

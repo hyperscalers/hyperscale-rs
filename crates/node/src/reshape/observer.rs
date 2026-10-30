@@ -45,8 +45,9 @@ use hyperscale_types::{
     shard_prefix_path,
 };
 
-use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
-use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
+use crate::bootstrap::{
+    BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT, SnapSync, StateRangeOutcome,
+};
 use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::view::CommitteeLookup;
 
@@ -1012,7 +1013,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::bootstrap::state_range_serve::serve_state_range_request;
+    use crate::serve_state_range_request;
 
     const ENTRIES: u8 = 12;
 

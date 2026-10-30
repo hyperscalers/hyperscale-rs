@@ -18,9 +18,8 @@ use super::records::{InstanceRecordBinding, PackageArtifactBinding};
 use crate::beacon::{
     self, BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding, ShardWitnessBinding,
 };
-use crate::event::BeaconOwner;
+use crate::event::{BeaconOwner, TimerOwner};
 use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Release};
-use crate::shard::TimerOwner;
 
 impl<S, N, D> BeaconLoop<S, N, D>
 where

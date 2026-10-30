@@ -15,9 +15,9 @@
 //! submissions fan out via [`ProcessIo::compute_submit_fanout`] into the
 //! relevant shards' internal lanes.
 //!
-//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+//! [`ShardLoop`]: hyperscale_node::ShardLoop
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
-//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
+//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::ProcessIo::compute_submit_fanout
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -38,8 +38,8 @@ use hyperscale_metrics_prometheus::install;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_network_iroh::{IrohAdapter, IrohConfig, IrohNetwork, NetworkError};
 use hyperscale_node::bootstrap::EngineBootstrap;
+use hyperscale_node::event::{HostEvent, ShardInbox};
 use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
-use hyperscale_node::shard::{HostEvent, ShardInbox};
 use hyperscale_node::{
     HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot,
     TxStatusCache,
@@ -635,7 +635,7 @@ impl ProductionRunnerBuilder {
 /// handles async I/O routing, RPC transaction submission, sync/fetch
 /// management, and the per-host metrics + GC tick.
 ///
-/// [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+/// [`ShardLoop`]: hyperscale_node::ShardLoop
 pub struct ProductionRunner {
     /// The composed [`NodeHost`], wrapped in `Option` because it's
     /// decomposed via `into_parts()` and moved onto the per-shard
@@ -777,7 +777,7 @@ impl ProductionRunner {
     /// channels. Returns `true` on success, `false` only when every
     /// per-shard channel is closed (shutdown).
     ///
-    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
+    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::ProcessIo::compute_submit_fanout
     /// # Panics
     ///
     /// Panics if `run()` has already consumed the host. The closure

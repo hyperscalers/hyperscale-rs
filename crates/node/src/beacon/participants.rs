@@ -17,8 +17,9 @@ use tracing::warn;
 
 use super::BeaconLoop;
 use crate::beacon::{BeaconCandidateBinding, BeaconProposalBinding};
-use crate::event::{Attachment, BeaconOwner, BeaconScopedInput, HostEvent};
-use crate::shard::{StepOutput, TimerOp, TimerOwner};
+use crate::event::{
+    Attachment, BeaconOwner, BeaconScopedInput, HostEvent, StepOutput, TimerOp, TimerOwner,
+};
 
 impl<S, N, D> BeaconLoop<S, N, D>
 where

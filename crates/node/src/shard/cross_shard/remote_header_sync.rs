@@ -25,8 +25,8 @@ use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardId, ValidatorId};
 
-use crate::event::classify_fetch_error;
-use crate::shard::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::event::{FetchFailureKind, ShardScopedInput, classify_fetch_error};
+use crate::shard::{ShardLoop, push_shard_input};
 use crate::sync::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
 /// Default upper bound on heights packed into a single range fetch.

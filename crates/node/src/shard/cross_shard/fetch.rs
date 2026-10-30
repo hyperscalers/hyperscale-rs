@@ -29,11 +29,12 @@ use hyperscale_types::{
     settled_txs_root_from_hashes,
 };
 
+use crate::event::ShardScopedInput;
 use crate::fetch::{
     Fetch, FetchBinding, FetchedBy, Refusal, Route, ScopedAnswer, Settles, ShardReply,
     SolicitedAnswer, dispatch_scoped, dispatch_solicited,
 };
-use crate::shard::{ShardIo, ShardScopedInput};
+use crate::shard::ShardIo;
 
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].
@@ -775,8 +776,8 @@ mod solicited_tests {
     use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash, WeightedTimestamp};
 
     use super::*;
+    use crate::event::HostEvent;
     use crate::fetch::settle_solicited;
-    use crate::shard::HostEvent;
 
     const LOCAL: ShardId = ShardId::leaf(2, 0);
     const SOURCE: ShardId = ShardId::leaf(2, 1);

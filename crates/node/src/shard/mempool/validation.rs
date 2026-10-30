@@ -34,12 +34,10 @@ use hyperscale_types::{
 
 use super::{DeferredTransaction, Origin};
 use crate::batch_accumulator::BatchAccumulator;
+use crate::event::{BeaconScopedInput, HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::SubmitFanout;
-use crate::shard::{
-    BeaconScopedInput, HostEvent, ShardLoop, ShardScopedInput, push_protocol_event,
-    push_shard_input,
-};
+use crate::shard::{ShardLoop, push_protocol_event, push_shard_input};
 
 /// Byte budget one outbound gossip batch accumulates before it flushes:
 /// the fetch response's, since both answer with envelopes into one frame.

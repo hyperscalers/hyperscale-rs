@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crossbeam::channel::Sender;
+use hyperscale_node::event::ShardInbox;
 use hyperscale_node::reshape::ReshapeRequest;
 use hyperscale_node::seating::Replaced;
-use hyperscale_node::shard::ShardInbox;
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{Block, ShardId, ValidatorId};

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-pub(crate) use canonical_txs::CanonicalTxs;
+pub use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{
@@ -35,7 +35,7 @@ use hyperscale_types::{
     Derivation, Epoch, MAX_TXS_PER_BLOCK, ShardId, TopologySchedule, TopologySnapshot, Transaction,
     Unresolved, ValidatorId, Verifier,
 };
-pub(crate) use network_handlers::register_shard_request_handlers;
+pub use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
 use crate::event::{Attachment, BeaconScopedInput, HostEvent, ShardInbox, ShardScopedInput};
@@ -48,7 +48,7 @@ use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 /// Handler closures and RPC fan-out `.load()` for an atomic snapshot on
 /// every use; the map is swapped only when shard participation changes,
 /// and the reconfiguring thread is the sole writer.
-pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, ShardInbox>>>;
+pub type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, ShardInbox>>>;
 
 /// Process-scoped resources shared across every hosted shard.
 ///
@@ -205,12 +205,6 @@ where
             validator,
             self.next_attachment.fetch_add(1, Ordering::Relaxed),
         )
-    }
-
-    /// Process-level beacon chain storage handle.
-    #[must_use]
-    pub fn beacon_storage(&self) -> &Arc<dyn BeaconStorage> {
-        &self.beacon_storage
     }
 
     /// This node's derivation, held by its engine — what a replica built
@@ -642,7 +636,7 @@ type ShardSenders = Arc<BTreeMap<ShardId, ShardInbox>>;
 /// A hosted shard a submission routes to, with the sender it was hosted
 /// under when the route was read. A shard detached since then still takes
 /// the send, into a channel that dies with its receiver.
-pub(crate) struct ShardRoute {
+pub struct ShardRoute {
     pub(crate) shard: ShardId,
     pub(crate) sender: Sender<HostEvent>,
 }
@@ -650,7 +644,7 @@ pub(crate) struct ShardRoute {
 /// Routing decision for a locally-submitted transaction. Returned by
 /// [`ProcessIo::compute_submit_fanout`]; consumed by `NodeHost` (sim)
 /// or the production routing thread.
-pub(crate) enum SubmitFanout {
+pub enum SubmitFanout {
     /// At least one hosted shard is in the tx's touched set. `source`
     /// admits, takes `locally_submitted` ownership, and gossips out;
     /// `passive` admit only.

@@ -17,15 +17,14 @@ use std::time::{Duration, Instant};
 
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_crypto_bls::BlsVerifier;
-use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
+use hyperscale_node::event::{BeaconScopedInput, HostEvent, Registration, RegistrationReply};
 use hyperscale_node::seating::{
     HostedView, Replaced, SeatChange, Wipe, join_wipe, placed_validators, reconcile, reseat,
     seat_running, seat_validators,
 };
-use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::{
-    HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
-    network_genesis_block,
+    HostedChain, ReplicaConfig, attach_shard, chain_anchors, detach_shard,
+    installed_network_genesis_block, network_genesis_block,
 };
 use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};

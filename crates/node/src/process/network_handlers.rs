@@ -32,7 +32,7 @@ use hyperscale_types::{ExecutionCertificate, ShardId, Signed, Verifiable, signed
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
-use crate::event::{HostEvent, ShardScopedInput};
+use crate::event::{HostEvent, ShardInbox, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::ProcessIo;
 use crate::process::single_flight::{Flight, SingleFlight};
@@ -42,7 +42,7 @@ use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
 };
-use crate::shard::{ShardInbox, ShardIo, offer_network_event, offer_network_input};
+use crate::shard::{ShardIo, offer_network_event, offer_network_input};
 
 impl<S, N, D> NodeHost<S, N, D>
 where
@@ -1048,8 +1048,6 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     use crate::beacon::block_serve::serve_beacon_block_request;
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
-    use crate::bootstrap::state_range_serve::serve_state_range_request;
-    use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
         SettledTxsCache, serve_cells_request, serve_finalizations_request,
@@ -1057,6 +1055,7 @@ pub fn register_shard_request_handlers<S, N, D>(
         serve_settled_txs_request, serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
+    use crate::{serve_state_range_request, serve_witness_history_request};
 
     // Cap how long a waiter blocks on a producer. Request handlers run on
     // tokio blocking-pool threads; without a bound, a stalled producer can
@@ -1353,8 +1352,9 @@ mod tests {
         NetworkDefinition, NetworkMessage, ReadySignal, ShardId, WeightedTimestamp,
     };
 
+    use crate::event::{HostEvent, ShardInbox, ShardScopedInput};
+    use crate::shard::push_shard_input;
     use crate::shard::test_host::{Fixture, SHARD, loop_of};
-    use crate::shard::{HostEvent, ShardInbox, ShardScopedInput, push_shard_input};
 
     fn gossip(seed: u8) -> TransactionGossip {
         TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(seed))]))

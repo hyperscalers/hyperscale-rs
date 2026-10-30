@@ -1,7 +1,7 @@
 //! The host's beacon thread: its [`BeaconLoop`], its timers, and the
 //! observer that publishes what the loop has seen.
 //!
-//! [`BeaconLoop`]: hyperscale_node::beacon::BeaconLoop
+//! [`BeaconLoop`]: hyperscale_node::BeaconLoop
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -11,8 +11,8 @@ use crossbeam::channel::{Receiver, after, never};
 use hyperscale_core::{ParticipationChange, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_network_iroh::IrohNetwork;
-use hyperscale_node::beacon::BeaconLoop;
-use hyperscale_node::shard::{
+use hyperscale_node::BeaconLoop;
+use hyperscale_node::event::{
     BeaconScopedInput, HostEvent, StepOutput, TimerOp, TimerOwner, timer_event,
 };
 use hyperscale_storage_rocksdb::RocksDbShardStorage;

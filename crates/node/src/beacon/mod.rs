@@ -52,11 +52,11 @@ use hyperscale_types::{
 use tracing::warn;
 
 use crate::config::NodeConfig;
-use crate::event::{Attachment, BeaconOwner, BeaconScopedInput, HostEvent};
+use crate::event::{Attachment, BeaconOwner, BeaconScopedInput, HostEvent, StepOutput, TimerOp};
 use crate::fetch::Release;
 use crate::process::ProcessIo;
+use crate::shard::FetchTicker;
 use crate::shard::mempool::DeferredForRecords;
-use crate::shard::{FetchTicker, StepOutput, TimerOp};
 
 pub mod block_serve;
 mod block_sync;
@@ -71,9 +71,7 @@ mod records;
 mod submissions;
 pub mod witness_serve;
 
-pub use block_sync::{
-    BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, has_pending, resumed_at,
-};
+pub use block_sync::{BeaconBlockSync, has_pending, resumed_at};
 pub use candidate_cache::BeaconCandidateCache;
 pub use fetch::{
     BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding, BeaconReply, ProposalKeys,
@@ -82,7 +80,7 @@ pub use fetch::{
 use interest::{Asked, Askers, Interest};
 use participants::{Participant, SharedCheck};
 pub use proposal_cache::BeaconProposalCache;
-pub(crate) use records::custodian;
+pub use records::custodian;
 
 /// The host's beacon driver.
 pub struct BeaconLoop<S, N, D>
@@ -744,7 +742,7 @@ where
 ///
 /// Panics if `storage` holds no committed block — every host commits the
 /// genesis pair before it builds its fold.
-pub(crate) fn resume_fold(
+pub fn resume_fold(
     storage: &dyn BeaconStorage,
     verifier: Arc<dyn Verifier>,
     network: NetworkDefinition,

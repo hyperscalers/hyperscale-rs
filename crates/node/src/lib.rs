@@ -31,33 +31,33 @@
 //! [`ProcessIo`]: crate::process::ProcessIo
 
 mod batch_accumulator;
-pub mod beacon;
+mod beacon;
 pub mod bootstrap;
 mod config;
 pub mod event;
 mod fetch;
-pub mod host;
-pub mod process;
+mod host;
+mod process;
 mod replica;
 pub mod reshape;
 pub mod seating;
 mod serve;
-pub mod shard;
+mod shard;
 mod sync;
 
+pub use beacon::BeaconLoop;
 pub use bootstrap::state_range_serve::serve_state_range_request;
 pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
-pub use event::{Registration, RegistrationReply};
 pub use fetch::FetchConfig;
-pub use host::{HostResources, HostedChain, NodeHost, ShardGenesis};
-pub use process::TxStatusCache;
+pub use host::{
+    HostResources, HostedChain, NodeHost, ShardGenesis, attach_shard, chain_anchors, detach_shard,
+};
+pub use process::{ProcessIo, TxStatusCache};
 pub use replica::{NodeStateMachine, ReplicaConfig};
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
-pub use shard::cross_shard::{
-    serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
-};
+pub use shard::cross_shard::serve_local_certified_headers;
 pub use shard::{
-    SharedTopologySnapshot, TimerOp, TimerOwner, installed_network_genesis_block,
-    network_genesis_block, timer_event,
+    ShardLoop, SharedTopologySnapshot, ThreadShardLoop, installed_network_genesis_block,
+    network_genesis_block,
 };

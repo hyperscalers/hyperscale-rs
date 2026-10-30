@@ -84,7 +84,7 @@ enum SubRangeState {
 }
 
 /// Snap-sync assembly state for one shard bootstrap.
-pub(crate) struct SnapSync {
+pub struct SnapSync {
     anchor: ShardAnchor,
     root_path: NibblePath,
     split_bits: u8,
@@ -380,7 +380,7 @@ mod tests {
     use hyperscale_types::BlockHeight;
 
     use super::*;
-    use crate::bootstrap::state_range_serve::serve_state_range_request;
+    use crate::serve_state_range_request;
 
     const ENTRIES: u8 = 12;
 

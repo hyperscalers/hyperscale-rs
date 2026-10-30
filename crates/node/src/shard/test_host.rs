@@ -24,7 +24,8 @@ use hyperscale_types::{
     ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
 };
 
-use crate::shard::{HostEvent, ShardInbox, ShardLoop};
+use crate::event::{HostEvent, ShardInbox};
+use crate::shard::ShardLoop;
 use crate::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 
 pub const SHARD: ShardId = ShardId::leaf(1, 0);

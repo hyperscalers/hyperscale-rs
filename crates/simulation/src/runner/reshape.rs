@@ -22,13 +22,13 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
+use hyperscale_node::event::HostEvent;
 use hyperscale_node::reshape::{
     AdoptKind, DerivedGenesis, FetchKind, FetchedKind, OverRunning, ReshapeCompletion,
     ReshapeEvent, ReshapeRequest, ReshapeView, Seating, adopt_prepared_store, block_verdict,
     headers_verdict, ready_notification, seed_gate,
 };
 use hyperscale_node::seating::seat_validators;
-use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
     serve_block_request, serve_local_certified_headers, serve_state_range_request,
 };

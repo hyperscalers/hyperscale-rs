@@ -16,10 +16,11 @@ use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::network::response::GetTransactionsResponse;
 use hyperscale_types::{Transaction, TxHash};
 
+use crate::event::ShardScopedInput;
 use crate::fetch::{
     Fetch, FetchBinding, FetchedBy, Route, Settles, ShardReply, SolicitedAnswer, dispatch_solicited,
 };
-use crate::shard::{ShardIo, ShardScopedInput};
+use crate::shard::ShardIo;
 
 /// Per-tx fetch keyed by [`TxHash`].
 pub type TransactionFetch = Fetch<TxHash>;

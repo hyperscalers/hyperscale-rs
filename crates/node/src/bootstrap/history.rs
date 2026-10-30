@@ -52,7 +52,7 @@ pub enum HistoryOutcome {
 
 /// The walk down from a boundary anchor.
 #[derive(Debug)]
-pub(crate) struct HistoryBackfill {
+pub struct HistoryBackfill {
     /// The highest height not yet on the hash line.
     next: BlockHeight,
     /// The hash the block at [`Self::next`] must have.

@@ -18,7 +18,7 @@ use hyperscale_hbor::Capped;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_network_memory::SimNetworkAdapter;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput, ShardScopedInput};
+use hyperscale_node::event::{HostEvent, ProcessScopedInput, ShardScopedInput};
 use hyperscale_node::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;

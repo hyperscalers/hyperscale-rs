@@ -10,9 +10,9 @@ pub struct DerivedGenesis {
     /// The genesis block the successor adopts.
     pub block: Block,
     /// The chain origin it starts from.
-    pub origin: ChainOrigin,
+    pub(crate) origin: ChainOrigin,
     /// The terminals the successor succeeds, carried off the same headers
     /// the genesis derives from — one for a split child, two for a merged
     /// parent, none when a terminal carries no terminal settled root.
-    pub predecessors: Vec<Anchor>,
+    pub(crate) predecessors: Vec<Anchor>,
 }

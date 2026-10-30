@@ -41,8 +41,8 @@ use hyperscale_types::{
 };
 use serde::Serialize;
 
-use crate::event::classify_fetch_error;
-use crate::shard::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::event::{FetchFailureKind, ShardScopedInput, classify_fetch_error};
+use crate::shard::{ShardLoop, push_shard_input};
 use crate::sync::{ScopeStatus, Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
 /// Configuration alias for block-sync.
@@ -104,17 +104,6 @@ pub enum BlockSyncStateKind {
     Idle,
     /// Actively fetching and applying blocks.
     Syncing,
-}
-
-impl BlockSyncStateKind {
-    /// Stable string tag for metrics / logging.
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Syncing => "syncing",
-        }
-    }
 }
 
 /// Combined block-sync status snapshot.

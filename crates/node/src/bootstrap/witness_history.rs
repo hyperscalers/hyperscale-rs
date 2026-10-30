@@ -46,7 +46,7 @@ enum SyncState {
 }
 
 /// Witness-history assembly state for one shard bootstrap.
-pub(crate) struct WitnessHistorySync {
+pub struct WitnessHistorySync {
     anchor: ShardAnchor,
     /// The beacon's QC for the anchor, when a crossing attested one. It
     /// is the QC this assembly hands on, and a served one is ignored.
@@ -250,7 +250,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::bootstrap::witness_history_serve::serve_witness_history_request;
+    use crate::serve_witness_history_request;
 
     const HEIGHT: u64 = 1;
 

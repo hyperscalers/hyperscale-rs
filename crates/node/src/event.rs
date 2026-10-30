@@ -155,8 +155,8 @@ pub enum ShardScopedInput {
     /// on `TimerId::FetchTick`; the runner's timer driver fires the timer
     /// into this shard's input channel.
     ///
-    /// [`TimerOp::Set`]: crate::shard::TimerOp::Set
-    /// [`TimerOp::Cancel`]: crate::shard::TimerOp::Cancel
+    /// [`TimerOp::Set`]: crate::event::TimerOp::Set
+    /// [`TimerOp::Cancel`]: crate::event::TimerOp::Cancel
     FetchTick,
 
     /// Raw gossip-delivered transaction. `NodeHost` queues it for async
@@ -495,7 +495,7 @@ impl ShardScopedInput {
     /// derive; `Protocol` delegates to the inner `ProtocolEvent::type_name`
     /// so protocol telemetry is attributable per inner variant.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Protocol(event) => event.type_name(),
             other => other.into(),
@@ -527,7 +527,7 @@ impl ProcessScopedInput {
 
     /// Telemetry label.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         self.into()
     }
 }
@@ -620,11 +620,11 @@ pub struct Registration {
     /// The token every later input from the loop carries.
     pub token: ChainRegistration,
     /// The fold's schedule, widened for the chain.
-    pub schedule: Arc<TopologySchedule>,
+    pub(crate) schedule: Arc<TopologySchedule>,
     /// The epoch the fold folded the schedule at.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// The beacon chain's config.
-    pub chain_config: BeaconChainConfig,
+    pub(crate) chain_config: BeaconChainConfig,
 }
 
 /// Where a runtime registration's [`Registration`] goes.
@@ -818,7 +818,7 @@ impl BeaconScopedInput {
     /// Telemetry label. `Protocol` delegates to the inner
     /// [`ProtocolEvent::type_name`]; the rest use their variant names.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Protocol(event)
             | Self::Continuation { event, .. }
@@ -935,7 +935,7 @@ impl HostEvent {
 
     /// Construct the beacon loop's fetch tick.
     #[must_use]
-    pub const fn beacon_fetch_tick() -> Self {
+    pub(crate) const fn beacon_fetch_tick() -> Self {
         Self::Beacon(BeaconScopedInput::FetchTick)
     }
 
