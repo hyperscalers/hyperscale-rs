@@ -10,12 +10,15 @@
 //!
 //! Two rules keep the map in step with the orchestrator. A completion that
 //! carries store state lands only when the orchestrator awaits its ticket,
-//! so the map never holds a store its duty did not take. And a shard has at
-//! most one prep in flight: a later prep waits until the earlier one lands,
-//! and the earlier store, which no duty then awaits, is closed before the
-//! later prep wipes the directory.
+//! so the map never holds a store its duty did not take. And a prep wipes a
+//! shard's directory only once no other io holds it: every prep, and every
+//! job on a prepared store (taken through [`PreparedStores::lease`]), holds
+//! the shard until its completion settles, and a prep issued meanwhile
+//! waits. By then every earlier handle is closed — an unawaited store when
+//! its open lands, a replaced store when the prep is admitted, and a job's
+//! copy when the job ends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{Block, ShardId};
@@ -40,18 +43,19 @@ struct PreparedStore<S> {
 }
 
 /// Every store this host's reshape duties prepared, keyed by the shard each
-/// will seat, and the preps still preparing one.
+/// will seat, and the io still holding each shard's directory.
 pub struct PreparedStores<S> {
     stores: BTreeMap<ShardId, PreparedStore<S>>,
-    /// The ticket of the prep in flight on each shard's directory.
-    preparing: BTreeMap<ShardId, Ticket>,
-    /// The latest prep for a shard issued while an earlier one was in
-    /// flight, waiting for that one to land.
+    /// The tickets of the io in flight on each shard's directory: its prep,
+    /// or the jobs on its prepared store. A shard with none has no entry.
+    in_flight: BTreeMap<ShardId, BTreeSet<Ticket>>,
+    /// The latest prep for a shard issued while io held its directory,
+    /// waiting for that io to land.
     held: BTreeMap<ShardId, ReshapeRequest>,
 }
 
 /// A reshape io completion as an adapter reports it: the two that carry
-/// store state the map holds, a failed prep, and every other event as is.
+/// store state the map holds, failed io, and every other event as is.
 pub enum ReshapeCompletion<S> {
     /// A store open or parent seed landed.
     Opened {
@@ -64,12 +68,13 @@ pub enum ReshapeCompletion<S> {
         /// The open's or seed's ticket.
         ticket: Ticket,
     },
-    /// A store open or parent seed failed; its duty is stranded, and the
-    /// shard's directory is free for the next prep.
-    PrepFailed {
-        /// The shard the prep was preparing.
+    /// A store prep, or a job on a prepared store, failed with nothing to
+    /// answer; its duty is stranded, and the io no longer holds the shard's
+    /// directory.
+    Failed {
+        /// The shard the io held.
         shard: ShardId,
-        /// The open's or seed's ticket.
+        /// The failed request's ticket.
         ticket: Ticket,
     },
     /// A genesis adoption landed, its root verified against the genesis's.
@@ -118,40 +123,50 @@ impl<S> PreparedStores<S> {
     pub const fn new() -> Self {
         Self {
             stores: BTreeMap::new(),
-            preparing: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
             held: BTreeMap::new(),
         }
     }
 
     /// Admit `request` for the adapter to perform, or hold it.
     ///
-    /// A store prep for a shard with another prep in flight is held until
-    /// that one lands (see [`Self::ready_preps`]), so two preps never touch
-    /// one directory at once. An admitted prep closes any store an earlier
-    /// duty prepared for the shard, since the prep replaces the directory,
-    /// and is in flight until its completion settles. Every other request
-    /// passes through.
+    /// A store prep for a shard whose directory other io still holds — an
+    /// earlier prep, or a job on the store this one replaces — is held until
+    /// that io lands (see [`Self::ready_preps`]), so a prep never wipes a
+    /// directory under a live handle. An admitted prep closes any store an
+    /// earlier duty prepared for the shard, since the prep replaces the
+    /// directory, and holds the shard until its completion settles. Every
+    /// other request passes through.
     pub fn prep(&mut self, request: ReshapeRequest) -> Option<ReshapeRequest> {
         let Some((shard, ticket)) = prep_of(&request) else {
             return Some(request);
         };
-        if self.preparing.contains_key(&shard) {
-            debug!(shard = ?shard, "Reshape store-prep held behind the shard's prep in flight");
+        if self.in_flight.contains_key(&shard) {
+            debug!(shard = ?shard, "Reshape store-prep held behind io on the shard's directory");
             self.held.insert(shard, request);
             return None;
         }
         self.stores.remove(&shard);
-        self.preparing.insert(shard, ticket);
+        self.in_flight.entry(shard).or_default().insert(ticket);
         Some(request)
     }
 
-    /// Take every held prep whose shard has no prep in flight any more,
-    /// ascending by shard, dropping the ones no duty awaits — `awaits` is
-    /// the orchestrator's.
+    /// The store prepared for `shard`, for the job `ticket` names to run
+    /// on. The job holds the shard's directory until its completion
+    /// settles, so no prep wipes the directory under the job's handle.
+    pub fn lease(&mut self, shard: ShardId, ticket: Ticket) -> Option<&S> {
+        let store = self.stores.get(&shard)?;
+        self.in_flight.entry(shard).or_default().insert(ticket);
+        Some(&store.storage)
+    }
+
+    /// Take every held prep whose shard no io holds any more, ascending by
+    /// shard, dropping the ones no duty awaits — `awaits` is the
+    /// orchestrator's.
     pub fn ready_preps(&mut self, awaits: impl Fn(ShardId, Ticket) -> bool) -> Vec<ReshapeRequest> {
         let (ready, waiting): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|(shard, _)| !self.preparing.contains_key(shard));
+            .partition(|(shard, _)| !self.in_flight.contains_key(shard));
         self.held = waiting;
         ready
             .into_values()
@@ -162,11 +177,12 @@ impl<S> PreparedStores<S> {
     /// Settle one completion and answer the event the orchestrator consumes.
     ///
     /// `awaits` is the orchestrator's: a duty takes a completion only for a
-    /// ticket it awaits, and the map follows it. A prep's completion ends
-    /// the prep in flight on its shard. An awaited open inserts its store
-    /// and answers [`ReshapeEvent::Opened`]; an unawaited one closes its
-    /// store and answers nothing. An awaited adopt moves a held store from opened to
-    /// adopted and answers [`ReshapeEvent::Adopted`]; an unawaited one, or
+    /// ticket it awaits, and the map follows it. Every completion releases
+    /// its io's hold on the shard's directory. An awaited open inserts its
+    /// store and answers [`ReshapeEvent::Opened`]; an unawaited one closes
+    /// its store and answers nothing. An awaited adopt moves a held store
+    /// from opened to adopted and answers [`ReshapeEvent::Adopted`]; an
+    /// unawaited one, or
     /// one whose store is gone, answers nothing, since every path that drops
     /// a store mid-flight acts on a duty that no longer owns the shard. Any
     /// other event passes through.
@@ -197,7 +213,7 @@ impl<S> PreparedStores<S> {
                 );
                 Some(ReshapeEvent::Opened { shard, ticket })
             }
-            ReshapeCompletion::PrepFailed { shard, ticket } => {
+            ReshapeCompletion::Failed { shard, ticket } => {
                 self.landed(shard, ticket);
                 None
             }
@@ -207,6 +223,7 @@ impl<S> PreparedStores<S> {
                 recovered,
                 ticket,
             } => {
+                self.landed(shard, ticket);
                 if !awaits(shard, ticket) {
                     return None;
                 }
@@ -227,20 +244,21 @@ impl<S> PreparedStores<S> {
                     ),
                     "a store-carrying completion passed as a bare event: {event:?}",
                 );
-                if let ReshapeEvent::SeedDeferred { child, ticket }
-                | ReshapeEvent::SeedUnavailable { child, ticket } = event
-                {
-                    self.landed(child, ticket);
+                if let Some(ticket) = event.ticket() {
+                    self.landed(event.duty(), ticket);
                 }
                 Some(event)
             }
         }
     }
 
-    /// End the prep `ticket` names on `shard`, if it is the one in flight.
+    /// Release the hold the io `ticket` names has on `shard`'s directory.
     fn landed(&mut self, shard: ShardId, ticket: Ticket) {
-        if self.preparing.get(&shard) == Some(&ticket) {
-            self.preparing.remove(&shard);
+        if let Some(tickets) = self.in_flight.get_mut(&shard) {
+            tickets.remove(&ticket);
+            if tickets.is_empty() {
+                self.in_flight.remove(&shard);
+            }
         }
     }
 
@@ -304,10 +322,11 @@ impl<S> PreparedStores<S> {
         released
     }
 
-    /// Take every prepared store, ascending by shard, and forget every prep
-    /// in flight or held: the host and its orchestrator go down together.
+    /// Take every prepared store, ascending by shard, and forget every io in
+    /// flight and every held prep: the host and its orchestrator go down
+    /// together.
     pub fn drain(&mut self) -> impl Iterator<Item = (ShardId, S)> + use<S> {
-        self.preparing.clear();
+        self.in_flight.clear();
         self.held.clear();
         std::mem::take(&mut self.stores)
             .into_iter()
@@ -537,7 +556,7 @@ mod tests {
         assert!(
             stores
                 .settle(
-                    ReshapeCompletion::PrepFailed {
+                    ReshapeCompletion::Failed {
                         shard,
                         ticket: first
                     },
@@ -580,5 +599,48 @@ mod tests {
         opened(&mut stores, shard, 7);
         assert!(stores.prep(open_request(shard, Ticket::new(5))).is_some());
         assert!(!stores.contains(shard));
+    }
+
+    /// A prep issued while jobs still run on the store it replaces waits
+    /// for every one of them to settle, whether it answers or fails, even
+    /// once the store has left the map.
+    #[test]
+    fn a_prep_waits_for_every_job_on_the_store_it_replaces() {
+        let shard = ShardId::leaf(1, 0);
+        let (stage, apply, reopen) = (Ticket::new(5), Ticket::new(6), Ticket::new(7));
+        let awaits = awaiting(&[(shard, reopen)]);
+        let mut stores = PreparedStores::new();
+        opened(&mut stores, shard, 7);
+        assert_eq!(stores.lease(shard, stage), Some(&7));
+        assert_eq!(stores.lease(shard, apply), Some(&7));
+        assert_eq!(stores.release(|_| false), vec![shard]);
+        assert!(
+            stores.lease(shard, Ticket::new(9)).is_none(),
+            "no store to lease"
+        );
+
+        assert!(stores.prep(open_request(shard, reopen)).is_none());
+        let staged = ReshapeEvent::Staged {
+            shard,
+            ticket: stage,
+        };
+        assert!(
+            stores
+                .settle(ReshapeCompletion::Event(staged), &awaits)
+                .is_some()
+        );
+        assert!(
+            stores.ready_preps(&awaits).is_empty(),
+            "the apply still runs"
+        );
+        let failed = ReshapeCompletion::Failed {
+            shard,
+            ticket: apply,
+        };
+        assert!(stores.settle(failed, &awaits).is_none());
+        let ready = stores.ready_preps(&awaits);
+        assert!(
+            matches!(ready.as_slice(), [ReshapeRequest::OpenStore { ticket, .. }] if *ticket == reopen)
+        );
     }
 }

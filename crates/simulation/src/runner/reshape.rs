@@ -179,7 +179,7 @@ impl SimulationRunner {
                 ticket,
             } => {
                 self.reshape_stores[host as usize]
-                    .storage(shard)?
+                    .lease(shard, ticket)?
                     .stage_import_chunk(&progress, &leaves)
                     .expect("chunk staging into the opened store");
                 Some(ReshapeCompletion::Event(ReshapeEvent::Staged {
@@ -193,7 +193,7 @@ impl SimulationRunner {
                 ticket,
             } => {
                 let root = self.reshape_stores[host as usize]
-                    .storage(shard)?
+                    .lease(shard, ticket)?
                     .finalize_boundary_import(height, WitnessSeed::default())
                     .expect("reshape boundary import into the opened store");
                 Some(ReshapeCompletion::Event(ReshapeEvent::Imported {
@@ -210,7 +210,7 @@ impl SimulationRunner {
                 ticket,
             } => {
                 let root = self.reshape_stores[host as usize]
-                    .storage(shard)?
+                    .lease(shard, ticket)?
                     .follow_block_writes(&block, &creations, &frontier)
                     .expect("reshape follow apply into the opened store");
                 Some(ReshapeCompletion::Event(ReshapeEvent::Applied {
@@ -443,14 +443,14 @@ impl SimulationRunner {
     /// [`adopt_prepared_store`] gate, answering with the genesis plus the
     /// recovered state the seat boots from.
     fn reshape_adopt(
-        &self,
+        &mut self,
         host: NodeIndex,
         shard: ShardId,
         kind: AdoptKind,
         genesis: DerivedGenesis,
         ticket: Ticket,
     ) -> Option<ReshapeCompletion<SimShardStorage>> {
-        let storage = self.reshape_stores[host as usize].storage(shard)?;
+        let storage = self.reshape_stores[host as usize].lease(shard, ticket)?;
         let recovered = adopt_prepared_store(storage, shard, kind, &genesis)
             .expect("adopted reshape root must match the genesis it derived");
         Some(ReshapeCompletion::Adopted {

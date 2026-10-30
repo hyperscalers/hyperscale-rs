@@ -166,7 +166,7 @@ impl Duty {
 
 impl ReshapeEvent {
     /// The duty this event answers, by the store shard the duty is keyed by.
-    const fn duty(&self) -> ShardId {
+    pub(crate) const fn duty(&self) -> ShardId {
         match self {
             Self::Opened { shard, .. }
             | Self::Staged { shard, .. }
@@ -181,7 +181,7 @@ impl ReshapeEvent {
 
     /// The ticket of the request this event completes; `None` for a fetch
     /// answer, which its sequencer checks against what it asked for.
-    const fn ticket(&self) -> Option<Ticket> {
+    pub(crate) const fn ticket(&self) -> Option<Ticket> {
         match self {
             Self::Opened { ticket, .. }
             | Self::Staged { ticket, .. }
