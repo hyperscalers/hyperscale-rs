@@ -577,6 +577,42 @@ struct ObserverDuty {
     ready_asserts: BTreeMap<ValidatorId, Option<ReadyAssert>>,
 }
 
+impl ObserverDuty {
+    /// Whether the duty still has a seat to take, pruning the seats it
+    /// no longer holds.
+    ///
+    /// Until the split is irrevocable the beacon may cancel or lapse it, or
+    /// re-staff a seat onto the sibling child, and the cohort projection is
+    /// the only record of which seats stand: one it no longer names is gone,
+    /// and a duty with none left ends. Past that point the cohort clears as
+    /// the split executes, and the duty runs on while one of its seats sits
+    /// on the child's committee, or the child has none yet.
+    ///
+    /// A seated or relinquished observer lingers through the parent-half
+    /// phase so its child stays in `observers` rather than being
+    /// rediscovered; a seated one also defers any co-hosted parent half to
+    /// the seat already issued. Once the projection releases the child the
+    /// duty ends.
+    fn held(&mut self, view: &ReshapeView) -> bool {
+        if matches!(
+            self.phase,
+            ObserverPhase::Seated | ObserverPhase::Relinquished
+        ) {
+            return view.parent_half_cohorts().contains_key(&self.child);
+        }
+        if view.split_irrevocable(self.parent, self.child) {
+            return seats_on(view, self.child, self.validators.iter());
+        }
+        let (parent, child) = (self.parent, self.child);
+        self.validators
+            .retain(|&validator| view.observer_child(parent, validator) == Some(child));
+        let validators = &self.validators;
+        self.ready_asserts
+            .retain(|validator, _| validators.contains(validator));
+        !self.validators.is_empty()
+    }
+}
+
 /// One keeper seat this host runs in a pending merge.
 struct KeeperMember {
     validator: ValidatorId,
@@ -707,6 +743,28 @@ struct KeeperDuty {
     stages_unacked: usize,
 }
 
+impl KeeperDuty {
+    /// Whether the duty still has a seat to take, pruning the seats it no
+    /// longer holds — the merge counterpart of [`ObserverDuty::held`].
+    /// Until the merge is irrevocable a seat stands only while the keeper
+    /// cohort names it; past that point the duty runs on while one of its
+    /// members sits on the reformed parent's committee, or the parent has
+    /// none yet.
+    fn held(&mut self, parent: ShardId, view: &ReshapeView) -> bool {
+        if view.merge_irrevocable(parent) {
+            return seats_on(
+                view,
+                parent,
+                self.members.iter().map(|member| &member.validator),
+            );
+        }
+        self.members.retain(|member| {
+            view.keeper_parent(member.own_child, member.validator) == Some(parent)
+        });
+        !self.members.is_empty()
+    }
+}
+
 /// One parent half's progress through its split duty, keyed by the child it
 /// seats.
 enum ParentHalfPhase {
@@ -775,6 +833,40 @@ struct ParentHalfDuty {
     validators: Vec<ValidatorId>,
     phase: ParentHalfPhase,
     store_seeded: bool,
+}
+
+impl ParentHalfDuty {
+    /// Whether the duty still has a seat to take. A parent half is
+    /// discovered only once its split has executed, so it runs on while
+    /// one of its seats sits on the child's committee, or the child has
+    /// none yet.
+    ///
+    /// A seated or relinquished parent half lingers only to keep its child
+    /// from being re-discovered; once the projection releases it (the child
+    /// committed past genesis) the duty is done.
+    fn held(&self, child: ShardId, view: &ReshapeView) -> bool {
+        if matches!(
+            self.phase,
+            ParentHalfPhase::Seated | ParentHalfPhase::Relinquished
+        ) {
+            return view.parent_half_cohorts().contains_key(&child);
+        }
+        seats_on(view, child, self.validators.iter())
+    }
+}
+
+/// Whether one of `seats` can still seat on `shard`: it sits on the
+/// shard's committee, or the shard has no committee yet to sit on. A
+/// successor's committee forms with every seat its reshape placed, so one
+/// that names none of a duty's seats never will, and the duty's prepared
+/// store has nothing to seat.
+fn seats_on<'a>(
+    view: &ReshapeView,
+    shard: ShardId,
+    mut seats: impl Iterator<Item = &'a ValidatorId>,
+) -> bool {
+    let committee = view.committee(shard);
+    committee.is_empty() || seats.any(|seat| committee.contains(seat))
 }
 
 /// Whether a parent half's seed goes out at `now`: none is in flight, and a
@@ -909,6 +1001,12 @@ impl ReshapeOrchestrator {
         }
         self.discover_observer_duties(view);
         self.discover_keeper_duties(view);
+        // Before any duty advances, so one whose seats are gone emits
+        // nothing more.
+        self.parent_halves
+            .retain(|&child, duty| duty.held(child, view));
+        self.observers.retain(|_, duty| duty.held(view));
+        self.keepers.retain(|&parent, duty| duty.held(parent, view));
 
         let mut requests = Vec::new();
         let children: Vec<ShardId> = self.observers.keys().copied().collect();
@@ -928,26 +1026,6 @@ impl ReshapeOrchestrator {
         for child in halves {
             self.advance_parent_half(child, view, verifier, now, &mut requests);
         }
-        // A seated or relinquished parent half lingers only to keep its child
-        // from being re-discovered; once the projection releases it (the child
-        // committed past genesis) the duty is done.
-        self.parent_halves.retain(|child, duty| {
-            !matches!(
-                duty.phase,
-                ParentHalfPhase::Seated | ParentHalfPhase::Relinquished
-            ) || view.parent_half_cohorts().contains_key(child)
-        });
-        // A seated or relinquished observer lingers through the parent-half
-        // phase so its child stays in `observers` rather than being
-        // rediscovered; a seated one also defers any co-hosted parent half
-        // to the seat already issued. Once the projection releases the
-        // child the duty ends.
-        self.observers.retain(|child, duty| {
-            !matches!(
-                duty.phase,
-                ObserverPhase::Seated | ObserverPhase::Relinquished
-            ) || view.parent_half_cohorts().contains_key(child)
-        });
         requests
     }
 
@@ -2398,6 +2476,27 @@ mod tests {
         seeded: &[ShardId],
         boundary: ShardAnchor,
     ) -> TopologySnapshot {
+        build_split_pending(
+            committees,
+            observers,
+            keepers,
+            parent_halves,
+            seeded,
+            boundary,
+            &[],
+        )
+    }
+
+    /// [`build`] with the shards whose admitted split has not executed.
+    fn build_split_pending(
+        committees: &[(ShardId, &[u64])],
+        observers: &[(ShardId, u64, ShardId, bool)],
+        keepers: &[(ShardId, u64, ShardId, bool)],
+        parent_halves: &[(ShardId, u64, ShardId)],
+        seeded: &[ShardId],
+        boundary: ShardAnchor,
+        split_pending: &[ShardId],
+    ) -> TopologySnapshot {
         let mut ids: BTreeSet<u64> = BTreeSet::new();
         for (_, members) in committees {
             ids.extend(members.iter().copied());
@@ -2459,7 +2558,7 @@ mod tests {
             observer_cohorts,
             keeper_cohorts,
             parent_half_cohorts,
-            BTreeSet::new(),
+            split_pending.iter().copied().collect(),
         )
     }
 
@@ -2509,9 +2608,15 @@ mod tests {
             .collect()
     }
 
-    /// A one-window schedule seating `committee` on `shard`. Every stamp a
-    /// test signs below one second sits inside that window.
-    fn committee_schedule(shard: ShardId, committee: &TestCommittee) -> TopologySchedule {
+    /// A one-window schedule seating `committee` on `shard`, with the
+    /// observer cohort seats `(validator, child)` of `shard`'s pending
+    /// split. Every stamp a test signs below one second sits inside that
+    /// window.
+    fn committee_schedule(
+        shard: ShardId,
+        committee: &TestCommittee,
+        observers: &[(u64, ShardId)],
+    ) -> TopologySchedule {
         let validators: Vec<ValidatorInfo> = (0..committee.size())
             .map(|i| ValidatorInfo {
                 validator_id: committee.validator_id(i),
@@ -2526,7 +2631,21 @@ mod tests {
             HashMap::from([(shard, members)]),
             BTreeMap::new(),
             HashMap::new(),
-            BTreeMap::new(),
+            BTreeMap::from([(
+                shard,
+                observers
+                    .iter()
+                    .map(|&(validator, child)| {
+                        (
+                            vid(validator),
+                            ReshapeSeat {
+                                shard: child,
+                                ready: false,
+                            },
+                        )
+                    })
+                    .collect(),
+            )]),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -2560,7 +2679,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let committee = TestCommittee::new(4, 3);
-        let schedule = committee_schedule(parent, &committee);
+        let schedule = committee_schedule(parent, &committee, &[(50, child)]);
         let view = ReshapeView::new(&schedule);
 
         let wt = WeightedTimestamp::from_millis;
@@ -2702,7 +2821,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let committee = TestCommittee::new(4, 3);
-        let schedule = committee_schedule(parent, &committee);
+        let schedule = committee_schedule(parent, &committee, &[(50, child)]);
         let view = ReshapeView::new(&schedule);
 
         let wt = WeightedTimestamp::from_millis;
@@ -2768,7 +2887,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let committee = TestCommittee::new(4, 3);
-        let schedule = committee_schedule(parent, &committee);
+        let schedule = committee_schedule(parent, &committee, &[(50, child)]);
         let view = ReshapeView::new(&schedule);
         let (anchor_block, anchor) = anchored_block();
         let b2 = signed_child_block(
@@ -2933,7 +3052,7 @@ mod tests {
         let (child, _) = parent.children();
         let committee = TestCommittee::new(4, 3);
         let impostors = TestCommittee::new(4, 99);
-        let schedule = committee_schedule(parent, &committee);
+        let schedule = committee_schedule(parent, &committee, &[]);
         let view = ReshapeView::new(&schedule);
         let (anchor_block, anchor) = anchored_block();
         let pair = SplitChildRoots {
@@ -3013,7 +3132,7 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let committee = TestCommittee::new(4, 3);
-        let schedule = committee_schedule(parent, &committee);
+        let schedule = committee_schedule(parent, &committee, &[]);
         let view = ReshapeView::new(&schedule);
         let (anchor_block, anchor) = anchored_block();
         let b2 = signed_child_block(
@@ -3107,7 +3226,7 @@ mod tests {
     fn syncing_forwards_the_bootstrap_state_ranges() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[], &[parent]);
+        let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[(parent, 5, child)], &[parent]);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
@@ -3143,7 +3262,7 @@ mod tests {
 
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[], &[parent]);
+        let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[(parent, 5, child)], &[parent]);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         let mut duty = observer_duty(
             parent,
@@ -3203,7 +3322,7 @@ mod tests {
     fn following_reasserts_ready_to_the_parent_committee() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
+        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[(parent, 5, child)], &[parent]);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
@@ -3256,7 +3375,7 @@ mod tests {
     fn ready_assertions_back_off_within_one_anchor_window() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
+        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[(parent, 5, child)], &[parent]);
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
         let mut orch = following_observer(parent, child);
@@ -3289,7 +3408,7 @@ mod tests {
     fn pumping_without_the_clock_advancing_asserts_once() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
+        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[(parent, 5, child)], &[parent]);
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
         let mut orch = following_observer(parent, child);
@@ -3315,7 +3434,7 @@ mod tests {
     fn a_new_anchor_window_re_arms_the_assertion() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[], &[parent]);
+        let snap = snapshot(&[(parent, &[1, 2, 3, 5])], &[(parent, 5, child)], &[parent]);
         let mut orch = following_observer(parent, child);
 
         // Run the first window out to where it has backed off well past the
@@ -3335,7 +3454,7 @@ mod tests {
 
         let rolled = build(
             &[(parent, &[1, 2, 3, 5])],
-            &[],
+            &uncredited(&[(parent, 5, child)]),
             &[],
             &[],
             &[parent],
@@ -3426,7 +3545,7 @@ mod tests {
         // Both children seeded → the gate fires; the terminal fetch addresses
         // the parent, whose tip it is, and the child, whose flipped members
         // hold it once the parent's have left.
-        let snap = snapshot(&[(child, &[1, 2])], &[], &[parent, child, sibling]);
+        let snap = snapshot(&[(child, &[1, 5])], &[], &[parent, child, sibling]);
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
@@ -3618,8 +3737,8 @@ mod tests {
     fn a_prepared_duty_waits_until_placed() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        // Child committee does not yet include the observer.
-        let snap = snapshot(&[(child, &[1, 2])], &[], &[]);
+        // The cut is scheduled but the child has no committee yet.
+        let snap = scheduled_split(&[(parent, &[1, 2])], &[], &[], parent);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
@@ -3636,6 +3755,226 @@ mod tests {
             )
             .is_empty()
         );
+        assert!(
+            orch.is_seating(child),
+            "a placement still to come keeps the duty"
+        );
+    }
+
+    /// [`snapshot`] with `parent`'s split cut scheduled for the window
+    /// after genesis.
+    fn scheduled_split(
+        committees: &[(ShardId, &[u64])],
+        cohort: &[(ShardId, u64, ShardId)],
+        seeded: &[ShardId],
+        parent: ShardId,
+    ) -> TopologySnapshot {
+        let (observers, keepers) = (uncredited(cohort), Vec::new());
+        build_split_pending(
+            committees,
+            &observers,
+            &keepers,
+            &[],
+            seeded,
+            anchor(),
+            &[parent],
+        )
+        .with_scheduled_terminals(BTreeMap::from([(parent, Epoch::new(1))]))
+    }
+
+    /// A split the beacon cancels or lapses before its cut is scheduled
+    /// leaves only its cohort's absence: the observer duty ends with it, so
+    /// the host stops asserting ready and its prepared store is released.
+    #[test]
+    fn a_cancelled_split_ends_its_observer_duty() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let pending = snapshot(&[(parent, &[1, 2, 3, 4])], &[(parent, 5, child)], &[parent]);
+        let mut orch = following_observer(parent, child);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&pending)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(orch.is_seating(child));
+
+        let cancelled = snapshot(&[(parent, &[1, 2, 3, 4])], &[], &[parent]);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&cancelled)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(1_000),
+        );
+        assert!(!orch.is_seating(child), "a cancelled split's duty must end");
+        assert!(
+            orch.step(
+                &ReshapeView::new(&windowed(&cancelled)),
+                &BlsVerifier,
+                &StubVmStatics,
+                Vec::new(),
+                at(60_000),
+            )
+            .is_empty(),
+            "nothing is asserted for a cancelled split",
+        );
+    }
+
+    /// A seat the beacon re-staffs onto the sibling child leaves the duty
+    /// for the child it no longer syncs.
+    #[test]
+    fn a_seat_re_staffed_onto_the_sibling_moves_its_duty() {
+        let parent = ShardId::ROOT;
+        let (child, sibling) = parent.children();
+        let mut orch = following_observer(parent, child);
+        let restaffed = snapshot(
+            &[(parent, &[1, 2, 3, 4])],
+            &[(parent, 5, sibling)],
+            &[parent],
+        );
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&restaffed)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(!orch.is_seating(child));
+        assert!(orch.is_seating(sibling));
+    }
+
+    /// Once the cut is scheduled the cohort clears as the split executes,
+    /// and the duty runs on; once the child's committee forms without any
+    /// of the duty's seats, nothing is left for it to seat.
+    #[test]
+    fn a_scheduled_split_keeps_its_duty_until_the_child_forms_without_it() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let mut orch = following_observer(parent, child);
+        let scheduled = scheduled_split(&[(parent, &[1, 2, 3, 4])], &[], &[parent], parent);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&scheduled)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(orch.is_seating(child), "a scheduled cut is irrevocable");
+
+        let executed = snapshot(&[(child, &[1, 5])], &[], &[]);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&executed)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(
+            orch.is_seating(child),
+            "a seat on the formed child keeps the duty"
+        );
+
+        let without = snapshot(&[(child, &[1, 2])], &[], &[]);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&without)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(
+            !orch.is_seating(child),
+            "a child formed without the duty's seats ends it"
+        );
+    }
+
+    /// A merge the beacon cancels — a half went quiet — ends the keeper
+    /// duty re-asserting ready for it.
+    #[test]
+    fn a_cancelled_merge_ends_its_keeper_duty() {
+        let parent = ShardId::ROOT;
+        let (own_child, _) = parent.children();
+        let pending = snapshot_keepers(
+            &[(own_child, &[1, 2, 3, 5])],
+            &[(own_child, 5, parent)],
+            &[own_child],
+        );
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&pending)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(orch.is_seating(parent));
+
+        let cancelled = snapshot_keepers(&[(own_child, &[1, 2, 3, 5])], &[], &[own_child]);
+        let requests = orch.step(
+            &ReshapeView::new(&windowed(&cancelled)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(60_000),
+        );
+        assert!(
+            !orch.is_seating(parent),
+            "a cancelled merge's duty must end"
+        );
+        let requests = [
+            requests,
+            orch.step(
+                &ReshapeView::new(&windowed(&cancelled)),
+                &BlsVerifier,
+                &StubVmStatics,
+                Vec::new(),
+                at(120_000),
+            ),
+        ]
+        .concat();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::BroadcastReady { .. })),
+            "nothing is asserted once the merge is cancelled; got {requests:?}",
+        );
+    }
+
+    /// A prepared keeper none of whose members the reformed parent's
+    /// committee seated has nothing to seat, and ends.
+    #[test]
+    fn a_prepared_keeper_the_parent_did_not_seat_ends() {
+        let parent = ShardId::ROOT;
+        let (own_child, _) = parent.children();
+        let snap = snapshot_keepers(&[(parent, &[1, 2])], &[], &[]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        orch.keepers.insert(
+            parent,
+            KeeperDuty {
+                members: vec![KeeperMember {
+                    validator: vid(5),
+                    own_child,
+                    ready_assert: None,
+                }],
+                phase: KeeperPhase::Prepared,
+                open_requested: true,
+                store_opened: true,
+                pending_stage: Vec::new(),
+                stages_unacked: 0,
+            },
+        );
+
+        let requests = orch.step(
+            &ReshapeView::new(&windowed(&snap)),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(requests.is_empty());
+        assert!(!orch.is_seating(parent));
     }
 
     #[test]
@@ -4368,7 +4707,7 @@ mod tests {
             ..anchor()
         };
         let observing = |record: ShardAnchor| {
-            let snap = snapshot(&[(child, &[1, 2])], &[], &[])
+            let snap = snapshot(&[(child, &[1, 5])], &[], &[])
                 .with_boundaries(BTreeMap::from([(parent, record), (child, anchor())]));
             let schedule = windowed(&snap);
             let view = ReshapeView::new(&schedule);

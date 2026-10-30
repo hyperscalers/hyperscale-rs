@@ -76,6 +76,30 @@ impl<'a> ReshapeView<'a> {
         Some(windows.window_of(terminal).end)
     }
 
+    /// Whether `parent`'s split into `child` is past the point the beacon
+    /// can cancel it: its cut is scheduled, or it has executed and `child`
+    /// stands in the trie with a committee of its own.
+    ///
+    /// Before that, a split the beacon cancels or lapses leaves nothing of
+    /// itself but its cohort's absence.
+    #[must_use]
+    pub(crate) fn split_irrevocable(&self, parent: ShardId, child: ShardId) -> bool {
+        (self.topology_snapshot().split_pending(parent) && self.terminal_cut(parent).is_some())
+            || !self.committee(child).is_empty()
+    }
+
+    /// Whether the merge reforming `parent` is past the point the beacon
+    /// can cancel it: its children's cut is scheduled, or it has executed
+    /// and `parent` stands in the trie with a committee of its own.
+    #[must_use]
+    pub(crate) fn merge_irrevocable(&self, parent: ShardId) -> bool {
+        let head = self.topology_snapshot();
+        <[ShardId; 2]>::from(parent.children())
+            .into_iter()
+            .any(|child| !head.split_pending(child) && self.terminal_cut(child).is_some())
+            || !self.committee(parent).is_empty()
+    }
+
     /// The chain's network definition — the domain every signature and QC
     /// verification binds to.
     #[must_use]
