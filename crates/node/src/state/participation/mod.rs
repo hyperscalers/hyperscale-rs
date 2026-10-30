@@ -165,12 +165,10 @@ impl ShardParticipation {
             persisted_base,
         );
         let committed_provisions = Arc::clone(shard_coordinator.committed_provisions());
-        // The shard's committed-provision window, shared rather than
-        // mirrored — as the proven anchors and mirror above are. Both coordinators ask whether the chain already carries a
-        // batch; two copies are two answers, and the provisions-side copy
-        // was process-lifetime, so a restart re-verified every
-        // already-committed batch that re-arrived for a whole retention
-        // horizon.
+        // The shard's committed-provision window, shared as the proven
+        // anchors and mirror above are: both coordinators ask whether the
+        // chain already carries a batch, and two copies could answer
+        // differently.
         let provisions_coordinator = ProvisionCoordinator::with_config_and_store(
             local_shard,
             config.provision_config,

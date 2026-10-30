@@ -12,16 +12,15 @@ use tracing::instrument;
 use super::ShardParticipation;
 
 /// Consecutive cleanup ticks of unchanged committed height before the
-/// cross-shard fallback fetches are flushed. At the default one-second cleanup
-/// interval this is ~5s — aligned with the per-fallback gossip grace, so it
-/// fires only on a genuine stall, not a transient gap between commits.
+/// cross-shard fallback fetches are flushed. Sized to outlast the
+/// per-fallback gossip grace, so it fires only on a genuine stall, not a
+/// transient gap between commits.
 const STALL_RECOVERY_TICKS: u32 = 5;
 
 /// Cleanup ticks a coasting chain offers its unincluded pool back over
-/// before falling silent until dissolution. At the default one-second
-/// interval this covers the seating of successors that flip from the
-/// terminal cut, which is the common case; the dissolution offer is what
-/// covers a successor that takes longer.
+/// before falling silent until dissolution. Sized to cover the seating of
+/// successors that flip from the terminal cut, which is the common case;
+/// the dissolution offer is what covers a successor that takes longer.
 const HANDBACK_ATTEMPTS: u32 = 5;
 
 /// The pending-pool handback's latch: the offers made so far, and
