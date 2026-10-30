@@ -25,6 +25,7 @@
 pub mod history;
 pub mod responder;
 pub mod snap_sync;
+mod span_collect;
 pub mod state_range_serve;
 pub mod witness_history;
 pub mod witness_history_serve;
@@ -50,6 +51,7 @@ use self::history::{HistoryBackfill, HistoryOutcome};
 pub use self::responder::{BootstrapResponse, StoreResponder};
 use self::snap_sync::SnapSync;
 pub use self::snap_sync::StateRangeOutcome;
+pub(crate) use self::span_collect::SpanCollect;
 use self::witness_history::WitnessHistorySync;
 
 /// Replicate the network's genesis package state into a store created
@@ -181,9 +183,8 @@ pub struct ShardBootstrap {
     /// A resumed assembly's restored progress, consumed when the
     /// witness phase completes to seed the state fan-out's cursors.
     resume: Option<ImportProgress>,
-    /// How far below the anchor the committed chain has to be walked,
-    /// or `None` for an assembly that walks none.
-    history_floor: Option<WeightedTimestamp>,
+    /// How far below the anchor the committed chain has to be walked.
+    history_floor: WeightedTimestamp,
     /// Total value bytes across the chunks handed to the driver for
     /// staging — the imported substate byte total, identical to the
     /// total the store seeds at the anchor height. Seeds the recovered
@@ -213,7 +214,7 @@ impl ShardBootstrap {
             ))),
             witness: None,
             resume: None,
-            history_floor: Some(history_floor),
+            history_floor,
             imported_substate_bytes: 0,
         }
     }
@@ -255,32 +256,8 @@ impl ShardBootstrap {
             witness: None,
             imported_substate_bytes: progress.staged_bytes,
             resume: Some(progress),
-            history_floor: Some(history_floor),
+            history_floor,
         })
-    }
-
-    /// Start a state-only assembly against `anchor` — no witness
-    /// history. A merge keeper collects a terminating child's span this
-    /// way: the reformed parent's witness domain starts fresh, so the
-    /// import seeds no window and [`Self::take_finalize`]'s seed is empty.
-    #[must_use]
-    pub(crate) fn state_only(shard: ShardId, anchor: ShardAnchor) -> Self {
-        Self {
-            shard,
-            anchor,
-            phase: Phase::State(Box::new(SnapSync::new(
-                anchor,
-                shard_prefix_path(shard),
-                SPLIT_BITS,
-                STATE_CHUNK_LIMIT,
-            ))),
-            witness: None,
-            resume: None,
-            // A keeper's store becomes a chain that does not exist yet,
-            // so there is no history of its own below the anchor to walk.
-            history_floor: None,
-            imported_substate_bytes: 0,
-        }
     }
 
     /// The anchor this bootstrap verifies against.
@@ -386,20 +363,17 @@ impl ShardBootstrap {
         if !matches!(self.phase, Phase::FinalizeReady) {
             return None;
         }
+        // The state phase opens only once the witness window verified.
+        let window = self.witness.as_mut()?;
+        let seed = WitnessSeed {
+            base: window.header.beacon_witness_base(),
+            payloads: std::mem::take(&mut window.payloads),
+            boundary: Some(CertifiedBlockHeader::new(
+                (*window.header).clone(),
+                (*window.qc).clone(),
+            )),
+        };
         self.phase = Phase::Finalizing;
-        // A full bootstrap seeds the verified window; a state-only one
-        // ([`Self::state_only`]) has none and seeds nothing.
-        let seed = self
-            .witness
-            .as_mut()
-            .map_or_else(WitnessSeed::default, |window| WitnessSeed {
-                base: window.header.beacon_witness_base(),
-                payloads: std::mem::take(&mut window.payloads),
-                boundary: Some(CertifiedBlockHeader::new(
-                    (*window.header).clone(),
-                    (*window.qc).clone(),
-                )),
-            });
         Some((self.anchor.height, seed))
     }
 
@@ -426,10 +400,10 @@ impl ShardBootstrap {
                 self.anchor.state_root,
             ));
         }
-        self.phase = match self.history_floor {
-            Some(floor) => Phase::History(Box::new(HistoryBackfill::new(&self.anchor, floor))),
-            None => Phase::Complete,
-        };
+        self.phase = Phase::History(Box::new(HistoryBackfill::new(
+            &self.anchor,
+            self.history_floor,
+        )));
         Ok(())
     }
 
@@ -565,15 +539,6 @@ impl ShardBootstrap {
     #[must_use]
     pub const fn pre_finalize(&self) -> bool {
         matches!(self.phase, Phase::Witness(_) | Phase::State(_))
-    }
-
-    /// Whether every sub-range is staged and the finalize has not been
-    /// taken. A merge keeper's half collect parks here: the union
-    /// finalize is the duty's, at the reformed parent's genesis height,
-    /// not the half's.
-    #[must_use]
-    pub(crate) const fn is_staged(&self) -> bool {
-        matches!(self.phase, Phase::FinalizeReady)
     }
 
     /// Whether every phase has completed and verified.

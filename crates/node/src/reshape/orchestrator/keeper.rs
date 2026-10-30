@@ -14,7 +14,7 @@ use super::shared::{
     REFETCH_WAIT, ReadyAssert, SeatTail, StageQueue, TerminalAsk, paced, recipients_for, seats_on,
     terminal_commit,
 };
-use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
+use crate::bootstrap::{SpanCollect, StateRangeOutcome};
 use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::merge_flip::merge_genesis_from_terminals;
 use crate::reshape::observer::{ObserverTail, TerminalSighting, TwoChainCheck};
@@ -33,7 +33,7 @@ pub(super) struct KeeperMember {
 /// its certified terminal.
 pub(super) struct KeeperHalf {
     child: ShardId,
-    bootstrap: Box<ShardBootstrap>,
+    span: Box<SpanCollect>,
     terminal: Option<(BlockHeader, QuorumCertificate)>,
     /// The anchored terminal the fetch in flight names.
     terminal_requested: Option<BlockHash>,
@@ -44,7 +44,7 @@ impl KeeperHalf {
     pub(super) fn new(child: ShardId, anchor: ShardAnchor) -> Self {
         Self {
             child,
-            bootstrap: Box::new(ShardBootstrap::state_only(child, anchor)),
+            span: Box::new(SpanCollect::new(child, anchor)),
             terminal: None,
             terminal_requested: None,
             terminal_ask: TerminalAsk::NOW,
@@ -58,7 +58,7 @@ impl KeeperHalf {
         let header = &sighting.header;
         Self {
             child,
-            bootstrap: Box::new(ShardBootstrap::state_only(child, terminal_anchor(header))),
+            span: Box::new(SpanCollect::new(child, terminal_anchor(header))),
             terminal: Some((header.clone(), sighting.terminal_qc.clone())),
             terminal_requested: None,
             terminal_ask: TerminalAsk::NOW,
@@ -75,11 +75,7 @@ impl KeeperHalf {
         now: LocalTimestamp,
         out: &mut Vec<ReshapeRequest>,
     ) {
-        for request in self.bootstrap.next_requests() {
-            // The half collect only assembles state, so only state ranges appear.
-            let BootstrapRequest::StateRange(sub_range, request) = request else {
-                continue;
-            };
+        for (sub_range, request) in self.span.next_requests() {
             out.push(ReshapeRequest::Fetch {
                 duty,
                 from: self.child,
@@ -290,7 +286,7 @@ impl KeeperDuty {
                 if let Some(half) = half_for(left, right, from) {
                     match kind {
                         FetchKind::StateRange { sub_range, .. } => {
-                            half.bootstrap.on_state_range_failure(*sub_range);
+                            half.span.on_state_range_failure(*sub_range);
                         }
                         FetchKind::Block { .. } => {
                             half.terminal_requested = None;
@@ -329,7 +325,7 @@ impl KeeperDuty {
                 response,
             } => {
                 if let StateRangeOutcome::Staged { leaves, progress } =
-                    half.bootstrap.on_state_range(sub_range, &response)
+                    half.span.on_state_range(sub_range, &response)
                 {
                     self.stages.push(progress, leaves);
                 }
@@ -564,8 +560,8 @@ impl KeeperDuty {
                 }
                 if !*finalize_requested
                     && self.stages.is_durable()
-                    && left.bootstrap.is_staged()
-                    && right.bootstrap.is_staged()
+                    && left.span.is_staged()
+                    && right.span.is_staged()
                     && let Some(genesis) = derived.as_deref()
                 {
                     out.push(ReshapeRequest::FinalizeImport {
