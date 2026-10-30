@@ -32,7 +32,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
-use hyperscale_node::startup::{
+use hyperscale_node::seating::{
     HostedView, Replaced, SeatChange, join_wipe, reconcile, record_fork_anchor, reseat,
 };
 use hyperscale_node::{HostedChain, ReplicaConfig};

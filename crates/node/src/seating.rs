@@ -1,4 +1,6 @@
-//! What a host starting on the disk it left behind runs.
+//! Which shards a host runs and which validators each one seats: at a
+//! start on the disk it left behind ([`plan_seats`]), and while it runs
+//! ([`reconcile`]).
 //!
 //! Participation is a projection of the committed beacon state, and a
 //! store is only as good as the chain it holds: a validator placed

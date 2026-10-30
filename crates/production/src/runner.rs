@@ -38,8 +38,8 @@ use hyperscale_metrics_prometheus::install;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_network_iroh::{IrohAdapter, IrohConfig, IrohNetwork, NetworkError};
 use hyperscale_node::bootstrap::EngineBootstrap;
+use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::startup::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
     HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot, TxStatusCache,
 };

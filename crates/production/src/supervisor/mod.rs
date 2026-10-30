@@ -53,7 +53,7 @@ mod reshape;
 mod seats;
 
 use beacon::BeaconThread;
-use hyperscale_node::startup::Replaced;
+use hyperscale_node::seating::Replaced;
 use membership::CompletedBootstrap;
 use seats::{SeatTable, ShardThread};
 
@@ -476,7 +476,7 @@ impl ShardSupervisor {
     ///
     /// No join or leave is issued here. [`Self::reconcile_seats`] carries
     /// out the seat changes
-    /// [`reconcile`](hyperscale_node::startup::reconcile) plans, the plan
+    /// [`reconcile`](hyperscale_node::seating::reconcile) plans, the plan
     /// the simulation carries out too: it seats every placed validator and
     /// tears a shard down once it leaves both this host's active committee
     /// and its routing committee. The observer

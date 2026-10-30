@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
-use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
-use hyperscale_node::startup::{
+use hyperscale_node::seating::{
     HostedView, Replaced, SeatChange, Wipe, join_wipe, placed_validators, reconcile, reseat,
     seat_running, seat_validators,
 };
+use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
     network_genesis_block,
