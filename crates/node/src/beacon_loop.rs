@@ -43,12 +43,11 @@ use hyperscale_types::network::gossip::ShardVoteEquivocationGossip;
 use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
-    Address, BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
-    BlockHeight, CandidateBeaconBlock, CandidateVerifyContext, CertifiedBeaconBlock,
-    CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MessageClass,
-    NetworkDefinition, ShardId, ShardVoteEquivocation, Signer, SlotEffects, TopologySchedule,
-    TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verifier, Verify,
-    verify_shard_vote_equivocation,
+    Address, BeaconBlockHash, BeaconProposal, BeaconState, BlockHash, BlockHeight,
+    CandidateBeaconBlock, CandidateVerifyContext, CertifiedBeaconBlock, CertifiedBlockHeader,
+    Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MessageClass, NetworkDefinition,
+    ShardId, ShardVoteEquivocation, Signer, SlotEffects, TopologySchedule, TopologySnapshot,
+    ValidatorId, ValidatorStatus, Verifiable, Verified, Verifier, verify_shard_vote_equivocation,
 };
 use tracing::warn;
 
@@ -513,7 +512,7 @@ where
                 epoch,
                 proposal,
             } => {
-                if let Some(proposal) = self.verify_proposal(from, epoch, proposal) {
+                if let Some(proposal) = Self::sealed(from, proposal) {
                     for validator in self.validator_list() {
                         let proposal = Arc::clone(&proposal);
                         self.drive(validator, |p, fold| {
@@ -739,7 +738,7 @@ where
                 epoch,
                 proposal,
             } => {
-                if let Some(proposal) = self.verify_proposal(from, epoch, proposal) {
+                if let Some(proposal) = Self::sealed(from, proposal) {
                     self.drive(validator, |p, fold| {
                         p.on_beacon_proposal_received(fold, from, epoch, proposal)
                     });
@@ -1014,49 +1013,22 @@ where
         self.proof_routes.insert((source, height), token);
     }
 
-    /// Lift a gossiped proposal to verified, VRF-checking it against its
-    /// sender's key when the marker isn't already live.
-    ///
-    /// A sealed proposal goes straight through: this host's own sign and
-    /// send produced the reveal, and a colocated sender's notification
-    /// keeps the marker because `notify` hands local recipients the
-    /// in-memory message. An unsealed proposal from a sender the fold
-    /// does not know, or whose reveal fails, is dropped with a warning.
-    fn verify_proposal(
-        &self,
+    /// The verified proposal a received one carries. The wire handler
+    /// checks a peer's VRF reveal before forwarding it and the host's own
+    /// sign and send seal it, so every proposal reaching the loop keeps
+    /// its marker; one that does not is dropped with a warning.
+    fn sealed(
         from: ValidatorId,
-        epoch: Epoch,
         proposal: Arc<Verifiable<BeaconProposal>>,
     ) -> Option<Arc<Verified<BeaconProposal>>> {
-        let raw = match Arc::unwrap_or_clone(proposal).into_verified() {
-            Ok(verified) => return Some(Arc::new(verified)),
-            Err(raw) => raw,
-        };
-        let Some(record) = self.fold.state().validators.get(&from) else {
-            warn!(
-                ?from,
-                "BeaconProposalReceived from validator not in BeaconState — dropping",
-            );
-            return None;
-        };
-        let ctx = BeaconProposalVerifyContext {
-            verifier: self.fold.verifier().as_ref(),
-            network: self.fold.network(),
-            epoch,
-            sender_pk: record.pubkey,
-        };
-        match raw.verify(&ctx) {
-            Ok(verified) => Some(Arc::new(verified)),
-            Err(err) => {
-                warn!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    ?err,
-                    "BeaconProposalReceived VRF verification failed — dropping",
-                );
-                None
-            }
+        let sealed = Arc::unwrap_or_clone(proposal)
+            .into_verified()
+            .ok()
+            .map(Arc::new);
+        if sealed.is_none() {
+            warn!(?from, "BeaconProposalReceived without its check — dropping");
         }
+        sealed
     }
 
     /// Check a gossiped double-vote pair off-thread under the accused
@@ -1771,6 +1743,7 @@ mod tests {
     };
     use hyperscale_storage::RecoveredState;
     use hyperscale_storage::test_helpers::commit_one;
+    use hyperscale_types::network::notification::beacon::BeaconProposalNotification;
     use hyperscale_types::network::request::GetInstanceRecordsRequest;
     use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
     use hyperscale_types::network::response::GetInstanceRecordsResponse;
@@ -2287,6 +2260,71 @@ mod tests {
         assert!(
             pool(&host),
             "the dwell's fetch brings the lost proposal into the participant's pool",
+        );
+    }
+
+    /// A peer's proposal reaches the beacon loop only once the wire
+    /// handler has checked its VRF reveal, and carries that check: one
+    /// whose reveal fails is dropped there, never forwarded.
+    #[test]
+    fn a_wire_proposal_reaches_the_loop_only_once_checked() {
+        let fix = Fixture::new();
+        let (mut wire, host, events) = wired(&fix, SyncDispatch::new());
+        host.register_notification_handlers();
+        let author = fix.committee.validator_id(1);
+        let network = NetworkDefinition::simulator();
+        let signer = fix.committee.signer(1);
+        let honest = BeaconProposalDraft::new(
+            signer.as_ref(),
+            &network,
+            Epoch::new(1),
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .and_then(BeaconProposalDraft::sign)
+        .expect("the author's key signs its proposal")
+        .into_inner();
+        let forged = BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        for proposal in [forged, honest] {
+            wire.peer.notify(
+                &[fix.committee.validator_id(0)],
+                &BeaconProposalNotification::new(
+                    author,
+                    Epoch::new(1),
+                    Arc::new(Verifiable::from(proposal)),
+                ),
+            );
+        }
+        let pending = wire.peer.drain_pending_notifications();
+        wire.network
+            .accept_notifications(1, wire.now, pending, &mut wire.streams);
+        wire.network
+            .flush_notifications(wire.now + Duration::from_secs(10));
+
+        let received: Vec<bool> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                HostEvent::Beacon(BeaconScopedInput::Protocol(event)) => match *event {
+                    ProtocolEvent::BeaconProposalReceived { proposal, .. } => {
+                        Some(proposal.verified().is_some())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            received,
+            vec![true],
+            "only the honest proposal reaches the loop, already checked",
         );
     }
 

@@ -719,15 +719,18 @@ where
                 },
             );
 
-        // ── beacon.proposal → Unverified/VerifiedBeaconProposalReceived ──
+        // ── beacon.proposal → BeaconProposalReceived ──
         //
         // Beacon-committee unicast, to the host's beacon loop, whose
-        // participants each decide admission. Wire
-        // decode lands the wrapper as `Unverified`; local-dispatched
-        // sends preserve the `Verified` marker. The process-level
-        // serve cache takes a copy (VRF-verified here when the wire
-        // dropped the marker) so `GetBeaconProposalRequest` is
-        // answered without reading any coordinator's pool.
+        // participants each decide admission. The VRF reveal is checked
+        // here, once, under the sender's key from the topology the
+        // beacon loop publishes at each adoption (the network thread
+        // cannot read the fold, and both name a committee member's key
+        // alike); local-dispatched sends keep their `Verified` marker
+        // and skip it. Only a proposal that holds reaches the loop, and
+        // the process-level serve cache keeps a copy so
+        // `GetBeaconProposalRequest` is answered without reading any
+        // participant's pool.
         let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
@@ -738,25 +741,25 @@ where
                 move |gossip: BeaconProposalNotification| -> Verdict {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
-                    // The participants judge the proposal themselves, so it
-                    // reaches them whatever the cache made of it.
-                    let verdict = match topology_snapshot.load().public_key(from) {
-                        Some(sender_pk) => proposal_cache.admit_wire(
-                            verifier.as_ref(),
-                            from,
-                            epoch,
-                            &gossip.proposal,
-                            sender_pk,
-                        ),
-                        None => Verdict::Ignore,
+                    let Some(sender_pk) = topology_snapshot.load().public_key(from) else {
+                        return Verdict::Ignore;
+                    };
+                    let Some(proposal) = proposal_cache.admit_wire(
+                        verifier.as_ref(),
+                        from,
+                        epoch,
+                        gossip.proposal,
+                        sender_pk,
+                    ) else {
+                        return Verdict::Reject;
                     };
                     let event = ProtocolEvent::BeaconProposalReceived {
                         from,
                         epoch,
-                        proposal: gossip.proposal,
+                        proposal: Arc::new(Verifiable::from(Arc::unwrap_or_clone(proposal))),
                     };
                     let _ = beacon_tx.send(HostEvent::beacon(event));
-                    verdict
+                    Verdict::Accept
                 },
             );
 
