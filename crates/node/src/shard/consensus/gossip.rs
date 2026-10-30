@@ -1,18 +1,16 @@
 //! Committed-block-gossip step handlers.
 //!
-//! Gossip-delivered committed block headers go through a sender-signature
-//! signature verification pass before reaching the state machine. The flow is:
+//! A peer's committed block header goes through a sender-signature
+//! verification pass before reaching the state machine; the host's own
+//! broadcast reaches it from the inbound handler. The flow is:
 //!
 //! 1. `CommittedBlockGossipReceived` — the inbound handler closure has
 //!    already verified the sender's committee membership and resolved the
 //!    public key. The header is queued in a batch accumulator so one
 //!    dispatched task checks a batch of sender signatures, each on its own.
 //! 2. `flush_certified_header_verifications` — fires when the batch fills
-//!    or its window expires. Verified-marked items (local-dispatched from
-//!    a colocated proposer) emit directly as
-//!    `ProtocolEvent::VerifiedRemoteHeaderReceived` — the typestate
-//!    marker rides through. Unverified items are queued on the throughput
-//!    pool for envelope signature verification; on success they emit as
+//!    or its window expires. The items are queued on the throughput pool
+//!    for envelope signature verification; on success they emit as
 //!    `ProtocolEvent::UnverifiedRemoteHeaderReceived` (the marker tracks
 //!    the QC predicate, which the envelope check doesn't establish), and
 //!    the state machine still dispatches `Action::VerifyRemoteHeaderQc`
@@ -79,49 +77,17 @@ where
 
     /// Flush accumulated certified header sender-signature verifications.
     ///
-    /// Partitions the batch on `is_verified()`: verified items
-    /// (local-dispatched from a colocated proposer) emit directly as
-    /// `VerifiedRemoteHeaderReceived`, skipping the envelope signature check.
-    /// Unverified items go to one throughput-pool task that checks each
-    /// sender signature in turn; valid ones emit as `UnverifiedRemoteHeaderReceived`,
-    /// invalid ones are warn-dropped.
+    /// Every item is a peer's copy: the host's own broadcast reaches the
+    /// state machine from the inbound handler. One throughput-pool task
+    /// checks each sender signature in turn; valid ones emit as
+    /// `UnverifiedRemoteHeaderReceived`, invalid ones are warn-dropped.
     pub(crate) fn flush_certified_header_verifications(&mut self) {
         let items = self.io.consensus.certified_header_batch.take();
         if items.is_empty() {
             return;
         }
 
-        let mut verified_items = Vec::new();
-        let mut unverified_items = Vec::new();
-        for item in items {
-            if item.0.is_verified() {
-                verified_items.push(item);
-            } else {
-                unverified_items.push(item);
-            }
-        }
-
         let shard = self.shard;
-
-        // Fast path: emit verified items synchronously — no signature work.
-        for (certified_header, sender, _public_key, _sender_signature) in verified_items {
-            let verified_header = Arc::unwrap_or_clone(certified_header)
-                .into_verified()
-                .unwrap_or_else(|_| unreachable!("is_verified() guards the verified partition"));
-            push_protocol_event(
-                self.event_sender(),
-                shard,
-                ProtocolEvent::VerifiedRemoteHeaderReceived {
-                    certified_header: Arc::new(verified_header),
-                    sender,
-                },
-            );
-        }
-
-        if unverified_items.is_empty() {
-            return;
-        }
-
         let event_tx = self.event_sender().clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
@@ -130,7 +96,7 @@ where
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
                 let topo = topology_snapshot.load();
-                for (certified_header, sender, public_key, sender_signature) in unverified_items {
+                for (certified_header, sender, public_key, sender_signature) in items {
                     let gossip = CertifiedBlockHeaderGossip {
                         certified_header,
                         sender,

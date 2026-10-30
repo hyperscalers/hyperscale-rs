@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
@@ -18,10 +19,12 @@ use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
-    GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, ShardAnchor, ShardId, Signer, Stake, TopologySnapshot,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
+    AggregateError, AggregateSignature, BeaconChainConfig, BeaconGenesisConfig, BeaconState,
+    BlockHeight, CertifiedBeaconBlock, ConsensusPublicKey, ConsensusSignature, GenesisConfigHash,
+    GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, Randomness,
+    ShardAnchor, ShardId, Signer, Stake, TopologySnapshot, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verified, VerifiedSignature, Verifier, VrfProof, genesis_config_hash,
+    shard_prefix_path,
 };
 
 use crate::event::{HostEvent, ShardInbox};
@@ -151,8 +154,12 @@ impl Fixture {
 
     /// How every host here builds its replicas and its fold.
     pub fn replica_config(&self) -> ReplicaConfig {
+        self.replica_config_verifying(Arc::new(BlsVerifier))
+    }
+
+    fn replica_config_verifying(&self, verifier: Arc<dyn Verifier>) -> ReplicaConfig {
         ReplicaConfig {
-            verifier: Arc::new(BlsVerifier),
+            verifier,
             derivation: Arc::new(StubVmStatics),
             code: Arc::new(AllCodeRuns),
             beacon_network: NetworkDefinition::simulator(),
@@ -356,6 +363,7 @@ impl Fixture {
             dispatch,
             state,
             (event_tx.clone(), event_tx.into()),
+            Arc::new(BlsVerifier),
         );
         (host, events)
     }
@@ -369,6 +377,17 @@ impl Fixture {
         beacon: Sender<HostEvent>,
         inbox: ShardInbox,
     ) -> Host {
+        self.host_with_inbox_verifying(registry, beacon, inbox, Arc::new(BlsVerifier))
+    }
+
+    /// [`Self::host_with_inbox`], its signatures checked by `verifier`.
+    pub fn host_with_inbox_verifying(
+        &self,
+        registry: Arc<HandlerRegistry>,
+        beacon: Sender<HostEvent>,
+        inbox: ShardInbox,
+        verifier: Arc<dyn Verifier>,
+    ) -> Host {
         self.host_on_inbox(
             (
                 SimShardStorage::new(shard_prefix_path(SHARD)),
@@ -379,6 +398,7 @@ impl Fixture {
             SyncDispatch::new(),
             self.genesis_state.clone(),
             (beacon, inbox),
+            verifier,
         )
     }
 
@@ -389,6 +409,7 @@ impl Fixture {
         dispatch: SyncDispatch,
         state: BeaconState,
         (beacon, inbox): (Sender<HostEvent>, ShardInbox),
+        verifier: Arc<dyn Verifier>,
     ) -> Host {
         let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
         beacon_storage.commit_beacon_block(&self.genesis_block, &Arc::new(state));
@@ -397,7 +418,7 @@ impl Fixture {
             ..RecoveredState::default()
         };
         NodeHost::new(
-            &self.replica_config(),
+            &self.replica_config_verifying(verifier),
             HostResources {
                 beacon_storage,
                 executor: Arc::new(Executor::new(ExecutionMode::Serial)),
@@ -417,6 +438,75 @@ impl Fixture {
             NodeConfig::default(),
             LocalTimestamp::ZERO,
         )
+    }
+}
+
+/// A [`BlsVerifier`] that counts the signature checks it runs.
+#[derive(Debug, Default)]
+pub struct CountingVerifier {
+    checks: AtomicUsize,
+}
+
+impl CountingVerifier {
+    pub fn checked(&self) -> usize {
+        self.checks.load(Ordering::SeqCst)
+    }
+
+    fn tick(&self) {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Verifier for CountingVerifier {
+    fn verify(&self, key: &ConsensusPublicKey, message: &[u8], sig: &ConsensusSignature) -> bool {
+        self.tick();
+        BlsVerifier.verify(key, message, sig)
+    }
+
+    fn aggregate(&self, sigs: &[ConsensusSignature]) -> Result<AggregateSignature, AggregateError> {
+        BlsVerifier.aggregate(sigs)
+    }
+
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError> {
+        BlsVerifier.aggregate_verified(sigs)
+    }
+
+    fn verify_aggregate_same_message(
+        &self,
+        message: &[u8],
+        agg: &AggregateSignature,
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.tick();
+        BlsVerifier.verify_aggregate_same_message(message, agg, keys)
+    }
+
+    fn verify_aggregate_different_messages(
+        &self,
+        messages: &[&[u8]],
+        agg: &AggregateSignature,
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.tick();
+        BlsVerifier.verify_aggregate_different_messages(messages, agg, keys)
+    }
+
+    fn verify_each(
+        &self,
+        messages: &[&[u8]],
+        sigs: &[ConsensusSignature],
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.tick();
+        BlsVerifier.verify_each(messages, sigs, keys)
+    }
+
+    fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
+        self.tick();
+        BlsVerifier.verify_vrf(key, message, proof)
     }
 }
 

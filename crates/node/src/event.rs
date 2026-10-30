@@ -360,10 +360,7 @@ pub enum ShardScopedInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched signature verification.
     CommittedBlockGossipReceived {
-        /// Header carried in the gossip envelope. Wrapped as `Verifiable`
-        /// so a colocated proposer's local-dispatched broadcast can ride
-        /// `Verifiable::Verified` through to the flush step, which then
-        /// fast-paths the verified arm past the sender-signature batch.
+        /// Header carried in a peer's gossip envelope.
         certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
         /// Sender validator id.
         sender: ValidatorId,

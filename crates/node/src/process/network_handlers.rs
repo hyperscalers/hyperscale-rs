@@ -124,6 +124,26 @@ where
                         return Verdict::Ignore;
                     };
                     let sender = gossip.sender;
+                    // The host's own broadcast: no sender to authenticate,
+                    // and a quorum the host certified itself rides its
+                    // mark past a second check.
+                    if provenance == Provenance::Local {
+                        let event = match Arc::unwrap_or_clone(gossip.certified_header)
+                            .into_verified()
+                        {
+                            Ok(certified_header) => ProtocolEvent::VerifiedRemoteHeaderReceived {
+                                certified_header: Arc::new(certified_header),
+                                sender,
+                            },
+                            Err(certified_header) => {
+                                ProtocolEvent::UnverifiedRemoteHeaderReceived {
+                                    certified_header: Arc::new(certified_header),
+                                    sender,
+                                }
+                            }
+                        };
+                        return taken(offer_network_event(tx, target_shard, event, provenance));
+                    }
                     let header = gossip.certified_header.header();
                     let header_shard = header.shard_id();
                     // The committee that signed the header, resolved at
@@ -375,14 +395,15 @@ where
                         );
                         return Verdict::Ignore;
                     };
-                    let topo = topology_snapshot.load();
-                    let verdict = verify_signed_by_proposer(
-                        verifier.as_ref(),
-                        &topo,
-                        &gossip,
-                        "block_header",
-                        "block header",
-                    );
+                    let verdict = provenance.check(|| {
+                        verify_signed_by_proposer(
+                            verifier.as_ref(),
+                            &topology_snapshot.load(),
+                            &gossip,
+                            "block_header",
+                            "block header",
+                        )
+                    });
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
@@ -402,9 +423,8 @@ where
         // Wire decode lands the wrapper as `Verifiable::Unverified`;
         // local-dispatched sends from a colocated source-shard proposer
         // arrive already verified and skip the state machine's
-        // `Action::VerifyProvisions` dispatch. The verified arm also
-        // skips the envelope signature check — same-process delivery means
-        // the sender is us, and sender identity is already implicit.
+        // `Action::VerifyProvisions` dispatch. The envelope signature is
+        // checked only on a peer's copy.
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
@@ -426,34 +446,29 @@ where
                         return Verdict::Ignore;
                     };
 
-                    let source_shard = notification.provisions.source_shard();
-                    let event = if notification.provisions.is_verified() {
-                        let upgraded = Arc::unwrap_or_clone(notification.provisions)
-                            .into_verified()
-                            .unwrap_or_else(|_| {
-                                unreachable!("is_verified() guards the verified arm")
-                            });
-                        ProtocolEvent::VerifiedProvisionsReceived {
-                            provisions: Arc::new(upgraded),
-                        }
-                    } else {
+                    let verdict = provenance.check(|| {
                         let topo = topology_snapshot.load();
-                        let verdict = verify_signed_by_committee(
+                        verify_signed_by_committee(
                             verifier.as_ref(),
                             &topo,
                             &topo,
-                            source_shard,
+                            notification.provisions.source_shard(),
                             &notification,
                             "state_provisions",
                             "state provision",
-                        );
-                        if verdict != Verdict::Accept {
-                            return verdict;
-                        }
-                        let raw = Arc::unwrap_or_clone(notification.provisions).into_unverified();
-                        ProtocolEvent::UnverifiedProvisionsReceived {
-                            provisions: Arc::new(raw),
-                        }
+                        )
+                    });
+                    if verdict != Verdict::Accept {
+                        return verdict;
+                    }
+                    let event = match Arc::unwrap_or_clone(notification.provisions).into_verified()
+                    {
+                        Ok(provisions) => ProtocolEvent::VerifiedProvisionsReceived {
+                            provisions: Arc::new(provisions),
+                        },
+                        Err(provisions) => ProtocolEvent::UnverifiedProvisionsReceived {
+                            provisions: Arc::new(provisions),
+                        },
                     };
                     taken(offer_network_event(tx, target_shard, event, provenance))
                 },
@@ -467,7 +482,8 @@ where
         // resolved at the anchor's own clock, since the head names an
         // empty committee for a split parent's coast blocks and drops a
         // member rotated out since — then each claim's own proof, on
-        // this thread as the signature was.
+        // this thread as the signature was. The host's own push is taken
+        // unchecked.
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
@@ -488,48 +504,55 @@ where
                         record_crossing_push_dropped("unhosted");
                         return Verdict::Ignore;
                     };
-                    let anchor = match crossing_push::shaped(&notification) {
-                        Ok(anchor) => anchor,
-                        Err(reason) => {
+                    let verdict = provenance.check(|| {
+                        let anchor = match crossing_push::shaped(&notification) {
+                            Ok(anchor) => anchor,
+                            Err(reason) => {
+                                record_crossing_push_dropped(reason);
+                                return Verdict::Reject;
+                            }
+                        };
+                        let Some(process) = process.upgrade() else {
+                            return Verdict::Ignore;
+                        };
+                        let schedule = process.topology_schedule();
+                        let Some((signing, _)) = schedule.at_for_shard(anchor.shard, anchor.ts)
+                        else {
+                            record_crossing_push_dropped("unscheduled_anchor");
+                            return Verdict::Ignore;
+                        };
+                        let topo = topology_snapshot.load();
+                        let Some(public_key) = resolve_sender_key(
+                            signing,
+                            &topo,
+                            notification.signer(),
+                            anchor.shard,
+                            "crossing readings",
+                        ) else {
+                            record_crossing_push_dropped("sender");
+                            return Verdict::Ignore;
+                        };
+                        let msg = notification.signing_message(topo.network());
+                        if !verify_sig_with_metrics(
+                            verifier.as_ref(),
+                            &msg,
+                            &public_key,
+                            notification.signature(),
+                            "crossing_readings",
+                        ) {
+                            record_crossing_push_dropped("signature");
+                            return Verdict::Reject;
+                        }
+                        // The claims ride under the producer's signature, so
+                        // a claim that proves nothing is the producer's.
+                        if let Err(reason) = crossing_push::proven(&notification.claims) {
                             record_crossing_push_dropped(reason);
                             return Verdict::Reject;
                         }
-                    };
-                    let Some(process) = process.upgrade() else {
-                        return Verdict::Ignore;
-                    };
-                    let schedule = process.topology_schedule();
-                    let Some((signing, _)) = schedule.at_for_shard(anchor.shard, anchor.ts) else {
-                        record_crossing_push_dropped("unscheduled_anchor");
-                        return Verdict::Ignore;
-                    };
-                    let topo = topology_snapshot.load();
-                    let Some(public_key) = resolve_sender_key(
-                        signing,
-                        &topo,
-                        notification.signer(),
-                        anchor.shard,
-                        "crossing readings",
-                    ) else {
-                        record_crossing_push_dropped("sender");
-                        return Verdict::Ignore;
-                    };
-                    let msg = notification.signing_message(topo.network());
-                    if !verify_sig_with_metrics(
-                        verifier.as_ref(),
-                        &msg,
-                        &public_key,
-                        notification.signature(),
-                        "crossing_readings",
-                    ) {
-                        record_crossing_push_dropped("signature");
-                        return Verdict::Reject;
-                    }
-                    // The claims ride under the producer's signature, so a
-                    // claim that proves nothing is the producer's.
-                    if let Err(reason) = crossing_push::proven(&notification.claims) {
-                        record_crossing_push_dropped(reason);
-                        return Verdict::Reject;
+                        Verdict::Accept
+                    });
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
                     let offered = offer_network_event(
                         tx,
@@ -603,73 +626,75 @@ where
                 move |batch: ExecutionCertificatesNotification,
                       provenance: Provenance|
                       -> Verdict {
-                    // No honest leader sends an empty batch.
-                    if batch.certificates.is_empty() {
-                        return Verdict::Reject;
-                    }
+                    let verdict = provenance.check(|| {
+                        let sender = batch.sender;
+                        // No honest leader sends an empty batch.
+                        if batch.certificates.is_empty() {
+                            return Verdict::Reject;
+                        }
 
-                    let sender = batch.sender;
-                    let source_shard = batch.certificates[0].shard_id();
-                    if batch
-                        .certificates
-                        .iter()
-                        .any(|c| c.shard_id() != source_shard)
-                    {
-                        warn!(
-                            sender = sender.inner(),
-                            "Execution certificate batch contains mixed shard_ids — dropping"
-                        );
-                        return Verdict::Reject;
-                    }
-                    // The sender is the tick leader that aggregated the
-                    // certificates, so it sits in the committee attesting
-                    // each one. At an epoch cut that committee holds members
-                    // the head no longer seats: a departing leader still
-                    // certifies the ticks its window anchored.
-                    let Some(process) = process.upgrade() else {
-                        return Verdict::Ignore;
-                    };
-                    let schedule = process.topology_schedule();
-                    let Some(attesting) = batch
-                        .certificates
-                        .iter()
-                        .map(|cert| {
-                            attesting_committee(&schedule, source_shard, cert.vote_anchor_ts())
-                        })
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        warn!(
-                            sender = sender.inner(),
-                            shard = source_shard.inner(),
-                            "Execution certificate batch at a window the schedule does not hold"
-                        );
-                        return Verdict::Ignore;
-                    };
-                    // The schedule holds every certificate's window, so it
-                    // says who attests there: a sender outside one of those
-                    // committees is false on its face.
-                    if attesting.iter().any(|committee| {
-                        !committee
-                            .committee_for_shard(source_shard)
-                            .contains(&sender)
-                    }) {
-                        warn!(
-                            sender = sender.inner(),
-                            shard = source_shard.inner(),
-                            "Execution certificate batch sender does not attest every certificate"
-                        );
-                        return Verdict::Reject;
-                    }
-                    let topo = topology_snapshot.load();
-                    let verdict = verify_signed_by_committee(
-                        verifier.as_ref(),
-                        attesting[0],
-                        &topo,
-                        source_shard,
-                        &batch,
-                        "exec_cert_batch",
-                        "execution certificate batch",
-                    );
+                        let source_shard = batch.certificates[0].shard_id();
+                        if batch
+                            .certificates
+                            .iter()
+                            .any(|c| c.shard_id() != source_shard)
+                        {
+                            warn!(
+                                sender = sender.inner(),
+                                "Execution certificate batch contains mixed shard_ids — dropping"
+                            );
+                            return Verdict::Reject;
+                        }
+                        // The sender is the tick leader that aggregated the
+                        // certificates, so it sits in the committee attesting
+                        // each one. At an epoch cut that committee holds members
+                        // the head no longer seats: a departing leader still
+                        // certifies the ticks its window anchored.
+                        let Some(process) = process.upgrade() else {
+                            return Verdict::Ignore;
+                        };
+                        let schedule = process.topology_schedule();
+                        let Some(attesting) = batch
+                            .certificates
+                            .iter()
+                            .map(|cert| {
+                                attesting_committee(&schedule, source_shard, cert.vote_anchor_ts())
+                            })
+                            .collect::<Option<Vec<_>>>()
+                        else {
+                            warn!(
+                                sender = sender.inner(),
+                                shard = source_shard.inner(),
+                                "Execution certificate batch at a window the schedule does not hold"
+                            );
+                            return Verdict::Ignore;
+                        };
+                        // The schedule holds every certificate's window, so it
+                        // says who attests there: a sender outside one of those
+                        // committees is false on its face.
+                        if attesting.iter().any(|committee| {
+                            !committee
+                                .committee_for_shard(source_shard)
+                                .contains(&sender)
+                        }) {
+                            warn!(
+                                sender = sender.inner(),
+                                shard = source_shard.inner(),
+                                "Execution certificate batch sender does not attest every certificate"
+                            );
+                            return Verdict::Reject;
+                        }
+                        let topo = topology_snapshot.load();
+                        verify_signed_by_committee(
+                            verifier.as_ref(),
+                            attesting[0],
+                            &topo,
+                            source_shard,
+                            &batch,
+                            "exec_cert_batch",
+                            "execution certificate batch",
+                        )
+                    });
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
@@ -723,28 +748,34 @@ where
                     if targets.peek().is_none() {
                         return Verdict::Ignore;
                     }
-                    let topo = topology_snapshot.load();
-                    let sender = signal.validator_id();
-                    let Some(public_key) = topo.public_key(sender) else {
-                        warn!(
-                            sender = sender.inner(),
-                            "Dropping ready signal: unknown sender"
-                        );
-                        return Verdict::Ignore;
-                    };
-                    let msg = signed_bytes(&signal, topo.network());
-                    if !verify_sig_with_metrics(
-                        verifier.as_ref(),
-                        &msg,
-                        &public_key,
-                        &signal.sig(),
-                        "ready_signal",
-                    ) {
-                        warn!(
-                            sender = sender.inner(),
-                            "Ready signal signature verify failed — dropping"
-                        );
-                        return Verdict::Reject;
+                    let verdict = provenance.check(|| {
+                        let topo = topology_snapshot.load();
+                        let sender = signal.validator_id();
+                        let Some(public_key) = topo.public_key(sender) else {
+                            warn!(
+                                sender = sender.inner(),
+                                "Dropping ready signal: unknown sender"
+                            );
+                            return Verdict::Ignore;
+                        };
+                        let msg = signed_bytes(&signal, topo.network());
+                        if !verify_sig_with_metrics(
+                            verifier.as_ref(),
+                            &msg,
+                            &public_key,
+                            &signal.sig(),
+                            "ready_signal",
+                        ) {
+                            warn!(
+                                sender = sender.inner(),
+                                "Ready signal signature verify failed — dropping"
+                            );
+                            return Verdict::Reject;
+                        }
+                        Verdict::Accept
+                    });
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
                     offer_to_each(
                         targets,
@@ -857,24 +888,25 @@ where
         // accountability — the embedded cert self-authenticates content,
         // the wrapper sig attributes "this validator relayed it" so the
         // coordinator can key per-`(epoch, view, sender)` pipeline slots.
-        // We verify the sig under the sender's pubkey before fanning in;
-        // signature check fails → drop (`verify_signed_by_proposer` already
-        // warns).
+        // A peer's sig is verified under the sender's pubkey before fanning
+        // in; signature check fails → drop (`verify_signed_by_proposer`
+        // already warns).
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
         let beacon_tx = self.process.beacon_event_sender.clone();
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
-                move |gossip: SpcNewViewNotification, _provenance: Provenance| -> Verdict {
-                    let topo = topology_snapshot.load();
-                    let verdict = verify_signed_by_proposer(
-                        verifier.as_ref(),
-                        &topo,
-                        &gossip,
-                        "spc_new_view",
-                        "SPC new view",
-                    );
+                move |gossip: SpcNewViewNotification, provenance: Provenance| -> Verdict {
+                    let verdict = provenance.check(|| {
+                        verify_signed_by_proposer(
+                            verifier.as_ref(),
+                            &topology_snapshot.load(),
+                            &gossip,
+                            "spc_new_view",
+                            "SPC new view",
+                        )
+                    });
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
@@ -895,15 +927,16 @@ where
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
-                move |gossip: SpcNewCommitNotification, _provenance: Provenance| -> Verdict {
-                    let topo = topology_snapshot.load();
-                    let verdict = verify_signed_by_proposer(
-                        verifier.as_ref(),
-                        &topo,
-                        &gossip,
-                        "spc_new_commit",
-                        "SPC new commit",
-                    );
+                move |gossip: SpcNewCommitNotification, provenance: Provenance| -> Verdict {
+                    let verdict = provenance.check(|| {
+                        verify_signed_by_proposer(
+                            verifier.as_ref(),
+                            &topology_snapshot.load(),
+                            &gossip,
+                            "spc_new_commit",
+                            "SPC new commit",
+                        )
+                    });
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
@@ -923,28 +956,27 @@ where
         // authenticate the signer at the relay edge before the coordinator
         // keys a per-`(epoch, view, signer)` verification slot, blocking a
         // peer from squatting another validator's slot with a forged-signer
-        // message. Locally-dispatched sends arrive with the `Verified`
-        // marker and skip the check; the expensive embedded-QC3 verify
-        // still runs async in the coordinator.
+        // message. The host's own sends skip the check; the expensive
+        // embedded-QC3 verify still runs async in the coordinator unless the
+        // message carries its `Verified` marker.
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
         let beacon_tx = self.process.beacon_event_sender.clone();
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
-                move |gossip: SpcEmptyViewMsgNotification, _provenance: Provenance| -> Verdict {
-                    if !gossip.msg.is_verified() {
-                        let topo = topology_snapshot.load();
-                        let verdict = verify_signed_by_proposer(
+                move |gossip: SpcEmptyViewMsgNotification, provenance: Provenance| -> Verdict {
+                    let verdict = provenance.check(|| {
+                        verify_signed_by_proposer(
                             verifier.as_ref(),
-                            &topo,
+                            &topology_snapshot.load(),
                             &gossip,
                             "spc_empty_view",
                             "SPC empty view",
-                        );
-                        if verdict != Verdict::Accept {
-                            return verdict;
-                        }
+                        )
+                    });
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
                     let epoch = gossip.epoch();
                     let event = match Arc::unwrap_or_clone(gossip.msg).into_verified() {
@@ -1340,20 +1372,25 @@ pub fn register_shard_request_handlers<S, N, D>(
 mod tests {
     use std::sync::Arc;
 
-    use crossbeam::channel::{bounded, unbounded};
+    use crossbeam::channel::{Receiver, bounded, unbounded};
     use hyperscale_core::ProtocolEvent;
     use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
     use hyperscale_network::{HandlerRegistry, Provenance, Verdict};
-    use hyperscale_types::network::gossip::TransactionGossip;
-    use hyperscale_types::network::notification::ReadySignalNotification;
+    use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, TransactionGossip};
+    use hyperscale_types::network::notification::{
+        BlockHeaderNotification, ReadySignalNotification,
+    };
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        NetworkDefinition, NetworkMessage, ReadySignal, ShardId, WeightedTimestamp,
+        BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockProposalMessage,
+        CertifiedBlockHeader, ChainOrigin, ConsensusSignature, NetworkDefinition, NetworkMessage,
+        QuorumCertificate, ReadySignal, ShardId, Verifiable, Verified, WeightedTimestamp,
+        signed_bytes,
     };
 
     use crate::event::{HostEvent, ShardInbox, ShardScopedInput};
     use crate::shard::push_shard_input;
-    use crate::shard::test_host::{Fixture, SHARD, loop_of};
+    use crate::shard::test_host::{CountingVerifier, Fixture, Host, SHARD, loop_of};
 
     fn gossip(seed: u8) -> TransactionGossip {
         TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(seed))]))
@@ -1520,5 +1557,137 @@ mod tests {
             "a keeper readying the merged parent"
         );
         assert_eq!(delivered(sibling), 0, "a signal for a shard off the line");
+    }
+
+    /// A host over `verifier`, with its shard's internal and network lanes.
+    fn host_counting(
+        fix: &Fixture,
+        verifier: &Arc<CountingVerifier>,
+    ) -> (
+        Arc<HandlerRegistry>,
+        Host,
+        Receiver<HostEvent>,
+        Receiver<HostEvent>,
+    ) {
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (internal_tx, internal) = unbounded();
+        let (network_tx, network) = unbounded();
+        let (beacon_tx, _beacon) = unbounded();
+        let host = fix.host_with_inbox_verifying(
+            Arc::clone(&registry),
+            beacon_tx,
+            ShardInbox::new(internal_tx, network_tx),
+            Arc::clone(verifier) as _,
+        );
+        while internal.try_recv().is_ok() {}
+        (registry, host, internal, network)
+    }
+
+    /// `committee[proposer]`'s proposal at height 1 of `SHARD`, signed by
+    /// `committee[key]`.
+    fn proposal(fix: &Fixture, proposer: usize, key: usize) -> BlockHeaderNotification {
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: BlockHeight::new(1),
+            proposer: fix.identity(proposer).0,
+            ..Default::default()
+        });
+        let msg = signed_bytes(
+            &BlockProposalMessage {
+                shard_group: SHARD,
+                height: header.height(),
+                round: header.round(),
+                block_hash: header.hash(),
+            },
+            &NetworkDefinition::simulator(),
+        );
+        let signature = fix.identity(key).1.sign(&msg).expect("the key signs");
+        BlockHeaderNotification::new(header, BlockManifest::default(), signature)
+    }
+
+    fn proposals(lane: &Receiver<HostEvent>) -> usize {
+        lane.try_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    HostEvent::Shard(_, ShardScopedInput::ProposalReceived { .. })
+                )
+            })
+            .count()
+    }
+
+    /// The host's own proposal reaches its shard without a signature check;
+    /// a peer's copy of it is checked, and a forged one refused.
+    #[test]
+    fn the_hosts_own_proposal_lands_unchecked_and_a_peers_is_checked() {
+        let fix = Fixture::new();
+        let verifier = Arc::new(CountingVerifier::default());
+        let (registry, _host, internal, network) = host_counting(&fix, &verifier);
+        let handler = registry
+            .get_notification(BlockHeaderNotification::message_type_id())
+            .expect("block headers have a handler");
+
+        assert!(registry.local_dispatch_notification(&proposal(&fix, 1, 1)));
+        assert_eq!(
+            verifier.checked(),
+            0,
+            "the host's own proposal is not checked"
+        );
+        assert_eq!(proposals(&internal), 1, "the host's own proposal lands");
+
+        let wire = |note: &BlockHeaderNotification| hbor_to_vec(note).expect("proposal encodes");
+        assert_eq!(
+            handler(wire(&proposal(&fix, 1, 1)), Provenance::Peer),
+            Verdict::Accept
+        );
+        assert_eq!(verifier.checked(), 1, "a peer's copy is checked");
+        assert_eq!(proposals(&network), 1, "a peer's copy lands");
+
+        assert_eq!(
+            handler(wire(&proposal(&fix, 1, 2)), Provenance::Peer),
+            Verdict::Reject
+        );
+        assert_eq!(proposals(&network), 0, "a forged copy is refused");
+    }
+
+    /// The host's own certified header reaches its other shards as the
+    /// verified header it certified: no sender to authenticate, no
+    /// signature checked, no batch to wait in.
+    #[test]
+    fn the_hosts_own_certified_header_lands_verified() {
+        let fix = Fixture::new();
+        let verifier = Arc::new(CountingVerifier::default());
+        let (registry, _host, internal, network) = host_counting(&fix, &verifier);
+        let source = ShardId::leaf(1, 1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: source,
+            height: BlockHeight::new(1),
+            proposer: fix.identity(1).0,
+            ..Default::default()
+        });
+        let qc = QuorumCertificate::genesis(source, ChainOrigin::root(WeightedTimestamp::ZERO));
+        let certified = Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc));
+        let gossip = CertifiedBlockHeaderGossip {
+            certified_header: Arc::new(Verifiable::from(certified)),
+            sender: fix.identity(1).0,
+            sender_signature: ConsensusSignature::ZERO,
+        };
+
+        assert_eq!(
+            registry.local_dispatch_gossip(&gossip, None),
+            Some(Verdict::Accept)
+        );
+        assert_eq!(verifier.checked(), 0);
+        let landed: Vec<HostEvent> = internal.try_iter().collect();
+        assert!(
+            landed.iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(shard, ShardScopedInput::Protocol(event))
+                    if *shard == SHARD
+                        && matches!(**event, ProtocolEvent::VerifiedRemoteHeaderReceived { .. })
+            )),
+            "the host's own header lands verified",
+        );
+        assert_eq!(network.len(), 0);
     }
 }

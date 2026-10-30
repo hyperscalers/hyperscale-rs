@@ -69,10 +69,25 @@ pub enum RequestError {
 /// Who handed a gossip or notification handler its message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provenance {
-    /// This host sent it and delivered it to its own handlers.
+    /// This host sent it and delivered it to its own handlers: the value is
+    /// the one the host passed to its own broadcast or notify, never bytes
+    /// another party wrote.
     Local,
     /// A peer sent it over the network.
     Peer,
+}
+
+impl Provenance {
+    /// `check`'s verdict on a peer's message. A message this host sent
+    /// itself is taken unchecked: what an ingress check establishes about a
+    /// sender, that it signed what it claims and carries what it proves,
+    /// this host knows of its own messages already.
+    pub fn check(self, check: impl FnOnce() -> Verdict) -> Verdict {
+        match self {
+            Self::Local => Verdict::Accept,
+            Self::Peer => check(),
+        }
+    }
 }
 
 /// What a handler made of an inbound message.
