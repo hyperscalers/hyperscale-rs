@@ -18,16 +18,16 @@ use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
     BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
-    CertifiedBlockHeader, ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex,
-    LocalTimestamp, NetworkDefinition, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
-    RatifyRound, SKIP_TIMEOUT, ShardId, ShardVoteEquivocationContext, ShardWitnessPayload,
-    SlotEffects, TopologySchedule, TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier,
-    WeightedTimestamp,
+    CertifiedBlockHeader, CommitProofVerifyError, ConsensusPublicKey, Epoch, GenesisConfigHash,
+    Hash, LeafIndex, LocalTimestamp, NetworkDefinition, PcVoteEquivocationContext,
+    RATIFY_ROUND_TIMEOUT, RatifyRound, SKIP_TIMEOUT, ShardForkProofVerifyError, ShardId,
+    ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects, TopologySchedule,
+    TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
 use crate::coordinator::{LocalChainAnchors, resumed_schedule, retention_floor, widen_schedule};
-use crate::participant::BeaconParticipant;
+use crate::participant::{BeaconParticipant, ProposalAdmission};
 use crate::shard_source::{ChunkFetchId, ShardSourceTracker};
 use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::BeaconVerificationPipeline;
@@ -1123,56 +1123,80 @@ impl BeaconFold {
 
     /// Verify the equivocation evidence embedded in `proposal` and
     /// return the proposal with each `Verifiable` marker upgraded in
-    /// place, or `None` if any entry is unverifiable. An entry verifies
-    /// when both signatures check out under the named validator's pubkey
-    /// (from `state.validators`); evidence naming an unknown validator
-    /// is unverifiable. A forged sig can't be made to pass, so an honest
-    /// node never votes for it. The upgraded markers ride the pooled
-    /// proposal through to `apply_epoch`.
+    /// place. An entry verifies when both signatures check out under the
+    /// named validator's pubkey (from `state.validators`). A forged sig
+    /// can't be made to pass, so an honest node never votes for it. The
+    /// upgraded markers ride the pooled proposal through to `apply_epoch`.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposalAdmission::Refuted`] when an entry fails under its
+    /// validator's registered key, which never changes, and otherwise
+    /// [`ProposalAdmission::Abstained`] when an entry names a validator
+    /// this fold has not registered yet.
     pub(crate) fn upgrade_proposal_equivocations(
         &self,
         proposal: &Verified<BeaconProposal>,
-    ) -> Option<Verified<BeaconProposal>> {
+    ) -> Result<Verified<BeaconProposal>, ProposalAdmission> {
         let mut equivocations = Vec::with_capacity(proposal.equivocations().len());
+        let mut unjudged = false;
         for ev in proposal.equivocations() {
-            let rec = self.state.validators.get(&ev.validator)?;
+            let Some(rec) = self.state.validators.get(&ev.validator) else {
+                unjudged = true;
+                continue;
+            };
             let mut ev = ev.clone();
             ev.upgrade_in_place(&PcVoteEquivocationContext {
                 verifier: self.verifier.as_ref(),
                 network: &self.network,
                 committee: &[(ev.validator, rec.pubkey)],
             })
-            .ok()?;
+            .map_err(|_| ProposalAdmission::Refuted)?;
             equivocations.push(ev);
+        }
+        if unjudged {
+            return Err(ProposalAdmission::Abstained);
         }
         proposal
             .clone()
             .with_verified_equivocations(
                 Capped::new(equivocations).expect("a list under the cap its source already met"),
             )
-            .ok()
+            .map_err(|_| ProposalAdmission::Abstained)
     }
 
-    /// Marker-upgrade every shard double-vote pair in `proposal`, or
-    /// `None` if any entry names an unregistered validator or fails
-    /// signature verification under the registered key. The registry
-    /// resolves ex-members and revoked keys alike, so evidence about a
-    /// rotated-out signer still admits.
+    /// Marker-upgrade every shard double-vote pair in `proposal`. The
+    /// registry resolves ex-members and revoked keys alike, so evidence
+    /// about a rotated-out signer still admits.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposalAdmission::Refuted`] when a pair fails signature
+    /// verification under its validator's registered key, and otherwise
+    /// [`ProposalAdmission::Abstained`] when a pair names a validator this
+    /// fold has not registered yet.
     pub(crate) fn upgrade_proposal_vote_equivocations(
         &self,
         proposal: &Verified<BeaconProposal>,
-    ) -> Option<Verified<BeaconProposal>> {
+    ) -> Result<Verified<BeaconProposal>, ProposalAdmission> {
         let mut vote_equivocations = Vec::with_capacity(proposal.vote_equivocations().len());
+        let mut unjudged = false;
         for ev in proposal.vote_equivocations() {
-            let rec = self.state.validators.get(&ev.validator)?;
+            let Some(rec) = self.state.validators.get(&ev.validator) else {
+                unjudged = true;
+                continue;
+            };
             let mut ev = ev.clone();
             ev.upgrade_in_place(&ShardVoteEquivocationContext {
                 verifier: self.verifier.as_ref(),
                 network: &self.network,
                 pubkey: &rec.pubkey,
             })
-            .ok()?;
+            .map_err(|_| ProposalAdmission::Refuted)?;
             vote_equivocations.push(ev);
+        }
+        if unjudged {
+            return Err(ProposalAdmission::Abstained);
         }
         proposal
             .clone()
@@ -1180,11 +1204,11 @@ impl BeaconFold {
                 Capped::new(vote_equivocations)
                     .expect("a list under the cap its source already met"),
             )
-            .ok()
+            .map_err(|_| ProposalAdmission::Abstained)
     }
 
-    /// Every fork proof in `proposal` verifies against the local topology
-    /// schedule and sits under its own shard's map key. A proof
+    /// Whether every fork proof in `proposal` verifies against the local
+    /// topology schedule and sits under its own shard's map key. A proof
     /// self-authenticates (each side carries the accused committee's
     /// aggregated signatures), so this re-verifies from scratch — the
     /// `Verifiable` marker is never trusted to skip the gate, exactly as
@@ -1204,15 +1228,35 @@ impl BeaconFold {
     /// before left, so all read the same seating, and a proposer prunes
     /// its own buffer by the same rule
     /// ([`prune_folded_evidence`](crate::participant::BeaconParticipant::prune_folded_evidence)).
-    pub(crate) fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
-        proposal.fork_proofs().iter().all(|(shard, proof)| {
+    ///
+    /// # Errors
+    ///
+    /// [`ProposalAdmission::Refuted`] when a proof is mis-keyed or false
+    /// by its own structure; otherwise [`ProposalAdmission::Abstained`]
+    /// when a proof is judged against the schedule: its QCs' committees
+    /// are resolved from a recovery-bridged view a proposer that verified
+    /// the proof earlier may not have shared.
+    pub(crate) fn fork_proofs_admissible(
+        &self,
+        proposal: &Verified<BeaconProposal>,
+    ) -> Result<(), ProposalAdmission> {
+        let mut verdict = Ok(());
+        for (shard, proof) in proposal.fork_proofs() {
             let proof = proof.as_unverified();
-            *shard == proof.shard()
-                && self.state.next_shard_committees.contains_key(shard)
-                && proof
-                    .verify(self.verifier.as_ref(), &self.topology_schedule)
-                    .is_ok()
-        })
+            if *shard != proof.shard() {
+                return Err(ProposalAdmission::Refuted);
+            }
+            if !self.state.next_shard_committees.contains_key(shard) {
+                verdict = Err(ProposalAdmission::Abstained);
+                continue;
+            }
+            match proof.verify(self.verifier.as_ref(), &self.topology_schedule) {
+                Ok(()) => {}
+                Err(err) if refutes_fork_proof(&err) => return Err(ProposalAdmission::Refuted),
+                Err(_) => verdict = Err(ProposalAdmission::Abstained),
+            }
+        }
+        verdict
     }
 
     /// What `candidate` verifies under, once the fields no signature
@@ -1281,6 +1325,23 @@ impl BeaconFold {
                 None
             }
         }
+    }
+}
+
+/// Whether `err` shows a fork proof false by its own bytes: its commit
+/// proofs do not hold together, or the two do not contradict. A QC that
+/// fails against a schedule-resolved committee, or a committee the
+/// schedule cannot resolve, is a judgement of this member's schedule.
+const fn refutes_fork_proof(err: &ShardForkProofVerifyError) -> bool {
+    match err {
+        ShardForkProofVerifyError::ProofA(proof) | ShardForkProofVerifyError::ProofB(proof) => {
+            !matches!(proof, CommitProofVerifyError::Qc(_))
+        }
+        ShardForkProofVerifyError::ShardMismatch
+        | ShardForkProofVerifyError::HeightMismatch
+        | ShardForkProofVerifyError::NotConflicting => true,
+        ShardForkProofVerifyError::CommitteeUnresolved
+        | ShardForkProofVerifyError::CommitteeCountMismatch => false,
     }
 }
 

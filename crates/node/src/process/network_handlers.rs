@@ -28,7 +28,9 @@ use hyperscale_types::network::request::beacon::{
 };
 use hyperscale_types::network::request::{GetFinalizationsRequest, GetLocalProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ExecutionCertificate, ShardId, Signed, Verifiable, signed_bytes};
+use hyperscale_types::{
+    BeaconProposal, ExecutionCertificate, ShardId, Signed, Verifiable, signed_bytes,
+};
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
@@ -797,7 +799,9 @@ where
         // and skip it. Only a proposal that holds reaches the loop, and
         // the process-level serve cache keeps a copy so
         // `GetBeaconProposalRequest` is answered without reading any
-        // participant's pool.
+        // participant's pool. Only its author notifies a proposal, so a
+        // peer's verdict waits on the participants' check of the
+        // evidence it carries, which the loop settles.
         let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
@@ -805,7 +809,7 @@ where
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
-                move |gossip: BeaconProposalNotification, _provenance: Provenance| -> Verdict {
+                move |gossip: BeaconProposalNotification, provenance: Provenance| -> Verdict {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
                     let Some(sender_pk) = topology_snapshot.load().public_key(from) else {
@@ -820,13 +824,17 @@ where
                     ) else {
                         return Verdict::Reject;
                     };
+                    let key = VerdictKey::of::<BeaconProposal>(&proposal);
                     let event = ProtocolEvent::BeaconProposalReceived {
                         from,
                         epoch,
                         proposal,
                     };
                     let _ = beacon_tx.send(HostEvent::beacon(event));
-                    Verdict::Accept
+                    match provenance {
+                        Provenance::Local => Verdict::Accept,
+                        Provenance::Peer => Verdict::defer(key),
+                    }
                 },
             );
 

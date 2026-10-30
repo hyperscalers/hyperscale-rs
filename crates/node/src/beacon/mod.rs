@@ -37,17 +37,17 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::action_handlers::verify_beacon_block;
 use hyperscale_beacon::coordinator::retention_floor;
-use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration};
+use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration, ProposalAdmission};
 use hyperscale_core::{Action, FetchIds, FetchRequest, ParticipationChange, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::network::gossip::ShardVoteEquivocationGossip;
 use hyperscale_types::{
-    BeaconState, BlockHeight, CandidateBeaconBlock, CandidateVerifyContext, CertifiedBlockHeader,
-    Epoch, GenesisConfigHash, Hash, LocalTimestamp, NetworkDefinition, ShardId,
-    ShardVoteEquivocation, SlotEffects, TopologySchedule, ValidatorId, Verifiable, Verified,
-    Verifier, verify_shard_vote_equivocation,
+    BeaconProposal, BeaconState, BlockHeight, CandidateBeaconBlock, CandidateVerifyContext,
+    CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LocalTimestamp, NetworkDefinition,
+    ShardId, ShardVoteEquivocation, SlotEffects, TopologySchedule, ValidatorId, Verifiable,
+    Verified, Verifier, verify_shard_vote_equivocation,
 };
 use tracing::warn;
 
@@ -394,20 +394,44 @@ where
                 from,
                 epoch,
                 proposal,
-            } => {
-                for validator in self.validator_list() {
-                    let proposal = Arc::clone(&proposal);
-                    self.drive(validator, |p, fold| {
-                        p.on_beacon_proposal_received(fold, from, epoch, proposal)
-                    });
-                }
-            }
+            } => self.admit_proposal(from, epoch, &proposal),
             other => {
                 for validator in self.validator_list() {
                     self.drive(validator, |p, fold| p.on_event(fold, other.clone()));
                 }
             }
         }
+    }
+
+    /// Hand a proposal to every participant, and settle the verdict its
+    /// notification deferred on what they made of it. A proposal is
+    /// notified only by its author, and held against it only when its own
+    /// evidence refutes it: one a participant cannot judge, whether early,
+    /// parked on the boundaries it awaits or resting on state this host
+    /// lacks, is taken in and judged later within the participant's bounds.
+    fn admit_proposal(
+        &mut self,
+        from: ValidatorId,
+        epoch: Epoch,
+        proposal: &Arc<Verified<BeaconProposal>>,
+    ) {
+        let mut admission = ProposalAdmission::Abstained;
+        for validator in self.validator_list() {
+            let proposal = Arc::clone(proposal);
+            self.drive(validator, |p, fold| {
+                let (judged, actions) = p.on_beacon_proposal_received(fold, from, epoch, proposal);
+                admission = admission.max(judged);
+                actions
+            });
+        }
+        self.process.network.settle(
+            VerdictKey::of::<BeaconProposal>(proposal),
+            if admission == ProposalAdmission::Refuted {
+                Verdict::Reject
+            } else {
+                Verdict::Accept
+            },
+        );
     }
 
     /// A fetch's answer. Its ids retire only once what it carries has

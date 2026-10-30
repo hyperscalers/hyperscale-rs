@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -7,8 +8,8 @@ use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_core::{BeaconFetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
-use hyperscale_hbor::{Bytes, Capped};
-use hyperscale_network::ResponseVerdict;
+use hyperscale_hbor::{Bytes, Capped, to_vec as hbor_to_vec};
+use hyperscale_network::{HandlerRegistry, Provenance, ResponseVerdict, Verdict};
 use hyperscale_network_memory::{
     BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, PendingRequest, SimNetworkAdapter,
     SimulatedNetwork,
@@ -32,8 +33,9 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconProposalDraft, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockVote,
     CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ConsensusSignature, Hash,
-    LeafIndex, ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyPhase, RatifyRound,
-    RatifyVote, Round, SignerBitfield, TopologySchedule, Unresolved, ValidatorStatus, VrfProof,
+    LeafIndex, NetworkMessage, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound,
+    ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, Round,
+    SignerBitfield, SpcView, TopologySchedule, Unresolved, ValidatorStatus, VrfProof,
     WeightedTimestamp, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
@@ -595,6 +597,113 @@ fn a_wire_proposal_reaches_the_loop_only_once_checked() {
         })
         .count();
     assert_eq!(received, 1, "only the honest proposal reaches the loop");
+}
+
+/// The verdict a host settles on `author`'s notification of `proposal`
+/// for `epoch` from a peer: the handler defers it, and the participants'
+/// check of the evidence settles it.
+fn settled_on_notified(fix: &Fixture, epoch: Epoch, proposal: BeaconProposal) -> Verdict {
+    let registry = Arc::new(HandlerRegistry::new(BTreeSet::from([SHARD])));
+    let (mut host, events) = fix.host_through_network(
+        SimNetworkAdapter::new(Arc::clone(&registry)),
+        SyncDispatch::new(),
+    );
+    add(&mut host, fix, 0);
+    while let Ok(event) = events.try_recv() {
+        let _ = host.step(event);
+    }
+    let handler = registry
+        .get_notification(BeaconProposalNotification::message_type_id())
+        .expect("the host handles beacon proposals");
+    let notification = BeaconProposalNotification::new(
+        fix.committee.validator_id(1),
+        epoch,
+        Arc::new(Verifiable::from(proposal)),
+    );
+    let Verdict::Defer(deferral) = handler(
+        hbor_to_vec(&notification).expect("encodes"),
+        Provenance::Peer,
+    ) else {
+        panic!("a peer's proposal waits on the participants' check");
+    };
+    let settled = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&settled);
+    let waits = registry.await_answer(
+        &deferral,
+        Box::new(move |verdict: &Verdict| {
+            *record.lock().expect("record lock") = Some(verdict.clone());
+        }),
+    );
+    assert!(waits.is_some(), "nothing settles before the loop runs");
+    while let Ok(event) = events.try_recv() {
+        let _ = host.step(event);
+    }
+    let verdict = settled.lock().expect("record lock").take();
+    verdict.expect("the loop settles the deferred verdict")
+}
+
+/// `author`'s signed proposal for `epoch`, carrying `equivocations`.
+fn signed_proposal(
+    fix: &Fixture,
+    author: usize,
+    epoch: Epoch,
+    equivocations: Vec<PcVoteEquivocation>,
+) -> BeaconProposal {
+    let signer = fix.committee.signer(author);
+    BeaconProposalDraft::new(
+        signer.as_ref(),
+        &NetworkDefinition::simulator(),
+        epoch,
+        BTreeMap::new(),
+        equivocations,
+        BTreeMap::new(),
+        Vec::new(),
+    )
+    .and_then(BeaconProposalDraft::sign)
+    .expect("the author's key signs its proposal")
+    .into_inner()
+}
+
+/// A proposal its author signed over forged equivocation evidence is
+/// held against the peer that notified it: only its author notifies a
+/// proposal, and no honest author carries evidence that fails under the
+/// accused's registered key.
+#[test]
+fn a_peer_notifying_forged_evidence_is_refused() {
+    let fix = Fixture::new();
+    let forged = PcVoteEquivocation {
+        validator: fix.committee.validator_id(2),
+        epoch: Epoch::new(1),
+        view: SpcView::new(0),
+        round: PcVoteRound::Vote1,
+        value_a: PcVector::new([PcValueElement::new([0xAA; 32])]),
+        sig_a: ConsensusSignature::ZERO,
+        value_b: PcVector::new([PcValueElement::new([0xBB; 32])]),
+        sig_b: ConsensusSignature::ZERO,
+    };
+    let proposal = signed_proposal(&fix, 1, Epoch::new(1), vec![forged]);
+    assert_eq!(
+        settled_on_notified(&fix, Epoch::new(1), proposal),
+        Verdict::Reject,
+    );
+}
+
+/// An honest proposal is never held against its author: not when the
+/// pool takes it, and not when it arrives for an epoch no participant
+/// has open yet.
+#[test]
+fn an_honest_proposal_early_or_admitted_is_not_refused() {
+    let fix = Fixture::new();
+    let admitted = signed_proposal(&fix, 1, Epoch::new(1), Vec::new());
+    assert_eq!(
+        settled_on_notified(&fix, Epoch::new(1), admitted),
+        Verdict::Accept,
+    );
+    let early = signed_proposal(&fix, 1, Epoch::new(2), Vec::new());
+    assert_eq!(
+        settled_on_notified(&fix, Epoch::new(2), early),
+        Verdict::Accept,
+    );
 }
 
 /// A peer's beacon gossip reaches a seated host's beacon loop once,

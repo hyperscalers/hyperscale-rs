@@ -97,6 +97,22 @@ impl From<Vec<Action>> for ParticipantStep {
     }
 }
 
+/// What a participant made of a peer's proposal. Ordered by how much
+/// it says about the proposer, so co-hosted participants' judgements of
+/// one copy combine by their maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProposalAdmission {
+    /// Nothing here judged the proposal: it is for another epoch or from
+    /// outside the committee, its proposer was judged already, or it
+    /// rests on state this member does not hold, now or yet.
+    Abstained,
+    /// The pool took it.
+    Admitted,
+    /// Its evidence is false by its own bytes under keys every member
+    /// resolves alike, so no honest proposer sends it.
+    Refuted,
+}
+
 /// One validator's beacon consensus duty.
 pub struct BeaconParticipant {
     me: ValidatorId,
@@ -695,7 +711,7 @@ impl BeaconParticipant {
     /// to the pool gated on committee membership at `epoch`. The
     /// `IoLoop` has already authenticated `from` and verified the
     /// proposal's VRF reveal against `(network.id, epoch)` under
-    /// `from`'s pubkey, so admission here is a pure pool insert.
+    /// `from`'s pubkey; what remains is the evidence it carries.
     ///
     /// Once every committee member's proposal — the local one included,
     /// which arrives back via the action handler's feedback — is pooled,
@@ -710,14 +726,14 @@ impl BeaconParticipant {
         from: ValidatorId,
         epoch: Epoch,
         proposal: Arc<Verified<BeaconProposal>>,
-    ) -> Vec<Action> {
+    ) -> (ProposalAdmission, Vec<Action>) {
         if !fold.state.committee.contains(&from) {
             trace!(
                 ?from,
                 epoch = epoch.inner(),
                 "BeaconProposalReceived from non-committee sender — dropping",
             );
-            return Vec::new();
+            return (ProposalAdmission::Abstained, Vec::new());
         }
         // Witness-admission gate. A peer's proposal only enters the pool —
         // and so only feeds this vnode's PC vote — once every embedded
@@ -742,27 +758,30 @@ impl BeaconParticipant {
                     pool_epoch = self.proposal_pool.epoch().inner(),
                     "BeaconProposalReceived for a non-inflight epoch — dropping",
                 );
-                return Vec::new();
+                return (ProposalAdmission::Abstained, Vec::new());
             }
             if !self.evaluated_proposers.insert(from) {
-                return Vec::new();
+                return (ProposalAdmission::Abstained, Vec::new());
             }
-            let Some(upgraded) = fold.upgrade_proposal_equivocations(&proposal) else {
-                trace!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    "BeaconProposalReceived carries unverifiable equivocation evidence — dropping",
-                );
-                return Vec::new();
+            let upgraded = fold
+                .upgrade_proposal_equivocations(&proposal)
+                .and_then(|upgraded| fold.upgrade_proposal_vote_equivocations(&upgraded))
+                .and_then(|upgraded| fold.fork_proofs_admissible(&upgraded).map(|()| upgraded));
+            let upgraded = match upgraded {
+                Ok(upgraded) => upgraded,
+                Err(admission) => {
+                    trace!(
+                        ?from,
+                        epoch = epoch.inner(),
+                        ?admission,
+                        "BeaconProposalReceived carries unverifiable evidence — dropping",
+                    );
+                    return (admission, Vec::new());
+                }
             };
-            let Some(upgraded) = fold.upgrade_proposal_vote_equivocations(&upgraded) else {
-                trace!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    "BeaconProposalReceived carries an unverifiable double-vote pair — dropping",
-                );
-                return Vec::new();
-            };
+            // A boundary is judged against this member's view of the
+            // shard's chain, which an honest proposer's may lead or trail,
+            // so an inadmissible one never refutes the proposal.
             if !boundary::proposal_boundary_qcs_admissible(
                 fold.verifier.as_ref(),
                 &upgraded,
@@ -774,22 +793,17 @@ impl BeaconParticipant {
             ) {
                 let awaited = boundary::awaited_boundaries(&upgraded, &fold.shard_source);
                 if !awaited.is_empty() && self.asks_for_boundaries(fold) {
-                    return self.await_boundaries(from, Arc::new(upgraded), &awaited);
+                    return (
+                        ProposalAdmission::Abstained,
+                        self.await_boundaries(from, Arc::new(upgraded), &awaited),
+                    );
                 }
                 trace!(
                     ?from,
                     epoch = epoch.inner(),
                     "BeaconProposalReceived carries an unverifiable boundary QC — dropping",
                 );
-                return Vec::new();
-            }
-            if !fold.fork_proofs_admissible(&upgraded) {
-                trace!(
-                    ?from,
-                    epoch = epoch.inner(),
-                    "BeaconProposalReceived carries an unverifiable fork proof — dropping",
-                );
-                return Vec::new();
+                return (ProposalAdmission::Abstained, Vec::new());
             }
             Arc::new(upgraded)
         };
@@ -800,7 +814,7 @@ impl BeaconParticipant {
                 pool_epoch = self.proposal_pool.epoch().inner(),
                 "BeaconProposalReceived rejected — wrong epoch or duplicate sender",
             );
-            return Vec::new();
+            return (ProposalAdmission::Abstained, Vec::new());
         }
         if self.spc.should_feed_view_one_input(epoch) {
             let pooled = fold
@@ -816,10 +830,13 @@ impl BeaconParticipant {
             // [`MAX_INPUT_DWELL_REARMS`]); the dwell handles a member whose
             // proposal never arrives.
             if pooled == fold.state.committee.len() {
-                return self.feed_view_one_input(fold, epoch);
+                return (
+                    ProposalAdmission::Admitted,
+                    self.feed_view_one_input(fold, epoch),
+                );
             }
         }
-        Vec::new()
+        (ProposalAdmission::Admitted, Vec::new())
     }
 
     /// Build view 1's local input vector from the current pool view and
@@ -1120,7 +1137,10 @@ impl BeaconParticipant {
                 continue;
             };
             self.evaluated_proposers.remove(&from);
-            actions.extend(self.on_beacon_proposal_received(fold, from, epoch, proposal));
+            actions.extend(
+                self.on_beacon_proposal_received(fold, from, epoch, proposal)
+                    .1,
+            );
         }
         actions
     }
@@ -1958,7 +1978,9 @@ impl BeaconParticipant {
             if epoch != self.proposal_pool.epoch() || !self.dwell_fetches.remove(&validator) {
                 return Vec::new();
             }
-            return self.on_beacon_proposal_received(fold, validator, epoch, proposal);
+            return self
+                .on_beacon_proposal_received(fold, validator, epoch, proposal)
+                .1;
         }
         let _ = self.proposal_pool.admit(validator, epoch, proposal);
         match self.commit_assembly.on_proposal_resolved(
@@ -1991,6 +2013,7 @@ impl BeaconParticipant {
                 proposal,
             } => self
                 .on_beacon_proposal_received(fold, from, epoch, proposal)
+                .1
                 .into(),
             ProtocolEvent::BeaconCandidateReceived { candidate } => {
                 self.on_beacon_candidate_received(fold, candidate).into()

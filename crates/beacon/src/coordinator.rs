@@ -580,7 +580,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         proposal: Arc<Verified<BeaconProposal>>,
     ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_beacon_proposal_received(fold, from, epoch, proposal))
+        self.drive(|p, fold| p.on_beacon_proposal_received(fold, from, epoch, proposal).1)
     }
 
     /// Buffer a verified shard fork proof for the next proposal.
@@ -894,7 +894,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::participant::MAX_INPUT_DWELL_REARMS;
+    use crate::participant::{MAX_INPUT_DWELL_REARMS, ProposalAdmission};
     use crate::shard_source::ChunkFetchId;
     use crate::{boundary, rules};
 
@@ -2166,6 +2166,21 @@ mod tests {
         assert_eq!(spc_view_first, spc_view_second);
     }
 
+    /// What `coord`'s participant makes of `from`'s proposal for the
+    /// in-flight epoch.
+    fn judge(
+        coord: &mut BeaconCoordinator,
+        from: ValidatorId,
+        proposal: Arc<Verified<BeaconProposal>>,
+    ) -> (ProposalAdmission, Vec<Action>) {
+        coord.participant.on_beacon_proposal_received(
+            &coord.fold,
+            from,
+            Epoch::GENESIS.next(),
+            proposal,
+        )
+    }
+
     fn sample_proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
         use hyperscale_types::VrfProof;
         Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
@@ -2233,9 +2248,14 @@ mod tests {
             VrfProof::ZERO,
         )));
 
-        let actions = coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal);
+        let (admission, actions) = judge(&mut coord, from, proposal);
         assert!(actions.is_empty());
         assert!(!coord.participant.proposal_pool.contains(from));
+        assert_eq!(
+            admission,
+            ProposalAdmission::Abstained,
+            "a QC judged against this member's schedule refutes nothing",
+        );
     }
 
     /// A fork proof keyed under a shard other than its own is inadmissible
@@ -2318,12 +2338,54 @@ mod tests {
                 config_hash,
             )
         };
-        coord2.on_beacon_proposal_received(
-            from,
-            Epoch::GENESIS.next(),
-            proposal(ShardId::leaf(1, 0)),
-        );
+        let (admission, _) = judge(&mut coord2, from, proposal(ShardId::leaf(1, 0)));
         assert!(!coord2.participant.proposal_pool.contains(from));
+        assert_eq!(
+            admission,
+            ProposalAdmission::Refuted,
+            "the proposal's own framing is false",
+        );
+    }
+
+    /// A proposal whose equivocation evidence fails under the accused's
+    /// registered key is refuted: no honest proposer carries it. Evidence
+    /// naming a validator this fold has not registered is not judged.
+    #[test]
+    fn forged_equivocation_evidence_refutes_a_proposal() {
+        use hyperscale_types::{
+            ConsensusSignature, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, SpcView,
+            VrfProof,
+        };
+
+        let accusing = |validator: ValidatorId| {
+            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                BTreeMap::new(),
+                vec![PcVoteEquivocation {
+                    validator,
+                    epoch: Epoch::GENESIS.next(),
+                    view: SpcView::new(0),
+                    round: PcVoteRound::Vote1,
+                    value_a: PcVector::new([PcValueElement::new([0xAA; 32])]),
+                    sig_a: ConsensusSignature::ZERO,
+                    value_b: PcVector::new([PcValueElement::new([0xBB; 32])]),
+                    sig_b: ConsensusSignature::ZERO,
+                }],
+                BTreeMap::new(),
+                Vec::new(),
+                VrfProof::ZERO,
+            )))
+        };
+        let from = ValidatorId::new(1);
+
+        let mut coord = fresh_coord();
+        let (admission, _) = judge(&mut coord, from, accusing(ValidatorId::new(2)));
+        assert_eq!(admission, ProposalAdmission::Refuted);
+        assert!(!coord.participant.proposal_pool.contains(from));
+
+        let mut coord = fresh_coord();
+        let (admission, _) = judge(&mut coord, from, accusing(ValidatorId::new(999)));
+        assert_eq!(admission, ProposalAdmission::Abstained);
+        assert!(!coord.participant.proposal_pool.contains(from));
     }
 
     /// A coordinator at genesis whose root committee holds `pubkeys` in
@@ -2452,7 +2514,9 @@ mod tests {
             b_qc.clone(),
         )));
         let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
-        actions.extend(coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal));
+        let (admission, received) = judge(&mut coord, from, proposal);
+        assert_eq!(admission, ProposalAdmission::Abstained);
+        actions.extend(received);
         actions.extend(coord.on_certified_local_header(&certified(&b, &b_qc)));
         actions.extend(coord.on_certified_local_header(&certified(&c, &c_qc)));
         assert!(
