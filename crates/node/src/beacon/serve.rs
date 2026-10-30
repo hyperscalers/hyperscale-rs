@@ -2,8 +2,7 @@
 //!
 //! Serves `GetBeaconBlockRequest`s from peers catching up the beacon
 //! chain. A `CertifiedBeaconBlock` is self-contained (block + cert, no
-//! provisions to re-attach), so the serve is a thin storage read — much
-//! simpler than the shard `block_serve` dedup-horizon dance.
+//! provisions to re-attach), so the serve is a thin storage read.
 
 use std::sync::Arc;
 

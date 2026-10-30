@@ -81,7 +81,7 @@ where
 {
     /// Process-scoped resources shared with every other driver on the host:
     /// beacon storage, the topology `ArcSwap`, the dispatch pool.
-    pub(crate) process: Arc<ProcessIo<S, N, D>>,
+    process: Arc<ProcessIo<S, N, D>>,
 
     /// The host's one fold of the beacon chain.
     fold: BeaconFold,
@@ -102,7 +102,7 @@ where
     /// Per-step scratch: placement deltas emitted via
     /// `Action::ReconfigureParticipation` — the seat/drain triggers the runner
     /// acts on. Cleared at step entry, drained into the step's `StepOutput`.
-    pub(crate) pending_participation_changes: Vec<ParticipationChange>,
+    pending_participation_changes: Vec<ParticipationChange>,
 
     /// Per-step scratch: every certified header a chain loop reported this
     /// step, its own or a remote shard's, for a host that summarises them
@@ -117,11 +117,11 @@ where
 
     /// Per-step scratch: timer operations, each owned by the participant
     /// that armed it or by the loop for its fetch tick.
-    pub(crate) pending_timer_ops: Vec<TimerOp>,
+    pending_timer_ops: Vec<TimerOp>,
 
     /// Per-step scratch: count of actions the fold and participants
     /// produced.
-    pub(crate) actions_generated: usize,
+    actions_generated: usize,
 
     /// Beacon-block catch-up sync, scope `()`. The fold emits
     /// `Action::StartBeaconBlockSync` when a gossiped block sits more than

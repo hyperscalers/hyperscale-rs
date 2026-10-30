@@ -4,13 +4,13 @@
 //! and the host's [`BeaconLoop`](crate::beacon_loop::BeaconLoop) drives
 //! the FSM, delivering synced blocks to its fold and routing the fetches.
 //!
-//! Unlike shard block-sync this is strictly serial: the config sets
+//! The sync is strictly serial: the config sets
 //! `window_size = 1`, so the generic queues only `committed + 1` and
 //! advances `committed` on `Admitted` (fed from the beacon commit) — the
 //! next epoch isn't fetched until the current one commits. That matches the
 //! fold's `epoch == tip + 1` adoption guard, so no consumer-side ordering
 //! buffer is needed. The binding sets `Key = Epoch`, so the generic
-//! schedules over epochs directly — no `BlockHeight` pun.
+//! schedules over epochs directly.
 
 use hyperscale_types::Epoch;
 

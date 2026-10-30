@@ -1,15 +1,15 @@
 //! Beacon fetch instances and their bindings.
 //!
-//! The beacon coordinator drives three id-keyed fetches: missing beacon
+//! The host's beacon loop drives five id-keyed fetches from the one
+//! [`BeaconFetchState`]. Three serve the beacon itself: missing beacon
 //! proposals (`beacon_proposal`), ratify candidates the pool prevoted and
 //! the local member never received (`beacon_candidate`), and
 //! shard-accumulator witness leaves (`shard_witness`, pulled to build the
-//! windowed beacon-witness commitment). The host's beacon loop carries
-//! the one [`BeaconFetchState`]: its participants' proposal and candidate
-//! asks go past the host, and the fold's witness asks try the host's own
-//! stores first. Beside them it carries the host's record and code
-//! fetches (`instance_record`, `package_artifact`), which every loop on
-//! the host asks through it.
+//! windowed beacon-witness commitment). Its participants' proposal and
+//! candidate asks go past the host, and the fold's witness asks try the
+//! host's own stores first. The other two are the host's record and code
+//! fetches (`instance_record`, `package_artifact`), which every chain loop
+//! on the host asks through it.
 //!
 //! The generic engine, the [`FetchBinding`] trait, and the shared
 //! `partition_solicited` helper live in [`crate::fetch`].
@@ -284,9 +284,10 @@ impl ScopedAnswer for BeaconProposalBinding {
 
     /// A peer that does not hold the proposal releases the slot for
     /// retry against another committee member rather than resolving the
-    /// await: the coordinator keeps awaiting it, `prune_stale` bounds the
+    /// await: the participant keeps awaiting it, `prune_stale` bounds the
     /// rotation once the epoch commits, and the beacon-block gossip path
-    /// is only the last-resort backstop.
+    /// is only the last-resort backstop. The beacon loop VRF-checks a
+    /// returned proposal before the slot retires.
     fn answer(
         (epoch, validator): Self::Scope,
         _keys: Vec<Self::Key>,
@@ -348,9 +349,9 @@ impl ScopedAnswer for BeaconCandidateBinding {
         GetBeaconCandidateRequest::new(epoch, block_hash)
     }
 
-    /// The answer enters the coordinator as a gossiped candidate does,
-    /// so it passes the same checks; a peer answering with a candidate
-    /// other than the one asked for is refused here.
+    /// A peer answering with a candidate other than the one asked for is
+    /// refused here; the beacon loop checks the rest as a gossiped
+    /// candidate is checked before the slot retires.
     fn answer(
         (epoch, block_hash): Self::Scope,
         _keys: Vec<Self::Key>,
