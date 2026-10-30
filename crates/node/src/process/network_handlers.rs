@@ -843,7 +843,7 @@ where
                     let _ = beacon_tx.send(HostEvent::beacon(event));
                     match provenance {
                         Provenance::Local => Verdict::Accept,
-                        Provenance::Peer => Verdict::defer(key),
+                        Provenance::Peer(_) => Verdict::defer(key),
                     }
                 },
             );

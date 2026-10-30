@@ -9,7 +9,7 @@ use hyperscale_core::{BeaconFetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_hbor::{Bytes, Capped, to_vec as hbor_to_vec};
-use hyperscale_network::{HandlerRegistry, Provenance, ResponseVerdict, Verdict};
+use hyperscale_network::{HandlerRegistry, PeerId, Provenance, ResponseVerdict, Verdict};
 use hyperscale_network_memory::{
     BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, PendingRequest, SimNetworkAdapter,
     SimulatedNetwork,
@@ -622,7 +622,7 @@ fn settled_on_notified(fix: &Fixture, epoch: Epoch, proposal: BeaconProposal) ->
     );
     let Verdict::Defer(deferral) = handler(
         hbor_to_vec(&notification).expect("encodes"),
-        Provenance::Peer,
+        Provenance::Peer(PeerId::new(1)),
     ) else {
         panic!("a peer's proposal waits on the participants' check");
     };
