@@ -32,6 +32,7 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{Address, Hash, ShardId};
 
+use super::interest::AskRoute;
 use super::{Asked, Askers, BeaconLoop, Interest};
 use crate::beacon::{BeaconFetchState, BeaconReply};
 use crate::event::{BeaconOwner, BeaconScopedInput, HostEvent};
@@ -177,12 +178,16 @@ impl SolicitedAnswer for PackageArtifactBinding {
 }
 
 impl Asked for InstanceRecordBinding {
+    const ROUTE: AskRoute = AskRoute::ChainsOnly;
+
     fn askers(interest: &mut Interest) -> &mut Askers<Self::Id> {
         &mut interest.records
     }
 }
 
 impl Asked for PackageArtifactBinding {
+    const ROUTE: AskRoute = AskRoute::ChainsOnly;
+
     fn askers(interest: &mut Interest) -> &mut Askers<Self::Id> {
         &mut interest.packages
     }

@@ -28,9 +28,8 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Ask for `ids` on `owner`'s behalf. A witness run goes to its
-    /// source shard's committee; a proposal or candidate ask to the
-    /// committee of the member it prefers.
+    /// Ask for `ids` on `owner`'s behalf, of the committee
+    /// [`Asked::ROUTE`] picks.
     pub(super) fn ask(
         &mut self,
         owner: BeaconOwner,
@@ -46,28 +45,15 @@ where
             );
             return;
         };
-        match ids {
-            BeaconFetchIds::Witnesses(ids) => {
-                self.ask_for::<ShardWitnessBinding>(owner, ids, shard, preferred, class);
-            }
-            BeaconFetchIds::Proposals(ids) => {
-                if let Some(shard) = self.ask_shard(owner, preferred) {
-                    self.ask_for::<BeaconProposalBinding>(owner, ids, shard, preferred, class);
-                } else {
-                    warn!("BeaconLoop: no live shard with a committee to ask; dropping");
-                }
-            }
-            BeaconFetchIds::Candidates(ids) => {
-                if let Some(shard) = self.ask_shard(owner, preferred) {
-                    self.ask_for::<BeaconCandidateBinding>(owner, ids, shard, preferred, class);
-                } else {
-                    warn!("BeaconLoop: no live shard with a committee to ask; dropping");
-                }
-            }
-            BeaconFetchIds::InstanceRecords(_) | BeaconFetchIds::PackageArtifacts(_) => {
-                warn_record_fetch(owner);
-            }
-        }
+        self.visit_ids(
+            ids,
+            &mut Ask {
+                owner,
+                shard,
+                preferred,
+                class,
+            },
+        );
     }
 
     pub(super) fn ask_for<B: Asked>(
@@ -93,18 +79,8 @@ where
     /// `owner` no longer wants `ids`. An id another owner still asks for
     /// stays in flight.
     pub(super) fn abandon(&mut self, owner: BeaconOwner, ids: FetchIds) {
-        let FetchIds::Beacon(ids) = ids else {
-            return;
-        };
-        match ids {
-            BeaconFetchIds::Witnesses(ids) => self.abandon_for::<ShardWitnessBinding>(owner, ids),
-            BeaconFetchIds::Proposals(ids) => self.abandon_for::<BeaconProposalBinding>(owner, ids),
-            BeaconFetchIds::Candidates(ids) => {
-                self.abandon_for::<BeaconCandidateBinding>(owner, ids);
-            }
-            BeaconFetchIds::InstanceRecords(_) | BeaconFetchIds::PackageArtifacts(_) => {
-                warn_record_fetch(owner);
-            }
+        if let FetchIds::Beacon(ids) = ids {
+            self.visit_ids(ids, &mut Abandon(owner));
         }
     }
 
@@ -141,22 +117,46 @@ where
 
     /// A response boundary released `ids`.
     pub(super) fn release(&mut self, ids: FetchIds, how: Release) {
-        let FetchIds::Beacon(ids) = ids else {
-            return;
-        };
+        if let FetchIds::Beacon(ids) = ids {
+            self.visit_ids(ids, &mut Let(how));
+        }
+    }
+
+    /// The loop's fetch tick: every fetch retries what its backoff lets go.
+    pub(super) fn tick_fetches(&mut self) {
+        self.visit_each(&mut Tick);
+    }
+
+    /// Whether any beacon fetch has work outstanding, in flight or queued.
+    pub(super) fn fetches_pending(&mut self) -> bool {
+        let mut pending = Pending(false);
+        self.visit_each(&mut pending);
+        pending.0
+    }
+
+    /// Hand `ids` to `visitor` under the binding whose arm carries them:
+    /// the one place a [`BeaconFetchIds`] arm meets its binding.
+    fn visit_ids(&mut self, ids: BeaconFetchIds, visitor: &mut impl FetchVisitor<S, N, D>) {
         match ids {
-            BeaconFetchIds::Witnesses(ids) => self.release_for::<ShardWitnessBinding>(ids, how),
-            BeaconFetchIds::Proposals(ids) => self.release_for::<BeaconProposalBinding>(ids, how),
-            BeaconFetchIds::Candidates(ids) => {
-                self.release_for::<BeaconCandidateBinding>(ids, how);
-            }
+            BeaconFetchIds::Witnesses(ids) => visitor.visit::<ShardWitnessBinding>(self, ids),
+            BeaconFetchIds::Proposals(ids) => visitor.visit::<BeaconProposalBinding>(self, ids),
+            BeaconFetchIds::Candidates(ids) => visitor.visit::<BeaconCandidateBinding>(self, ids),
             BeaconFetchIds::InstanceRecords(ids) => {
-                self.release_for::<InstanceRecordBinding>(ids, how);
+                visitor.visit::<InstanceRecordBinding>(self, ids);
             }
             BeaconFetchIds::PackageArtifacts(ids) => {
-                self.release_for::<PackageArtifactBinding>(ids, how);
+                visitor.visit::<PackageArtifactBinding>(self, ids);
             }
         }
+    }
+
+    /// Hand every binding to `visitor`, with no ids.
+    fn visit_each(&mut self, visitor: &mut impl FetchVisitor<S, N, D>) {
+        visitor.visit::<ShardWitnessBinding>(self, Vec::new());
+        visitor.visit::<BeaconProposalBinding>(self, Vec::new());
+        visitor.visit::<BeaconCandidateBinding>(self, Vec::new());
+        visitor.visit::<InstanceRecordBinding>(self, Vec::new());
+        visitor.visit::<PackageArtifactBinding>(self, Vec::new());
     }
 
     fn release_for<B: Asked>(&mut self, ids: Vec<B::Id>, how: Release) {
@@ -188,7 +188,7 @@ where
     /// its catch-up sync have work pending, or a submission waits to be
     /// swept at its window's end.
     pub(super) fn update_fetch_tick_timer(&mut self) {
-        let pending = self.fetches.has_pending()
+        let pending = self.fetches_pending()
             || beacon::has_pending(&self.beacon_block)
             || !self.submissions.is_empty();
         if let Some(op) = self
@@ -240,10 +240,8 @@ where
     }
 }
 
-/// A record or artifact is wanted by a chain's loop through
-/// [`BeaconInput::RecordsWanted`], which tells it when each arrives; the
-/// fold and the participants want none, so a fetch action naming one is
-/// dropped.
+/// Drop a record or artifact fetch the fold or a participant named; see
+/// [`AskRoute::ChainsOnly`].
 fn warn_record_fetch(owner: BeaconOwner) {
     warn!(
         ?owner,
@@ -275,22 +273,119 @@ pub(super) struct Interest {
 
 /// A beacon fetch the loop drives on behalf of several owners.
 pub(super) trait Asked: FetchedBy<BeaconFetchState> {
+    /// Whose committee an ask for this binding's ids goes to.
+    const ROUTE: AskRoute;
+
     fn askers(interest: &mut Interest) -> &mut Askers<Self::Id>;
 }
 
+/// Whose committee a beacon fetch asks.
+pub(super) enum AskRoute {
+    /// The shard the ask names: a witness run's source shard.
+    Named,
+    /// The shard of the member the ask prefers, or a live leaf with a
+    /// committee when it sits on none.
+    Preferred,
+    /// None from the fold or a participant: a record or artifact is
+    /// wanted only by a chain's loop, through
+    /// [`BeaconInput::RecordsWanted`](crate::event::BeaconInput::RecordsWanted),
+    /// which tells it when each arrives.
+    ChainsOnly,
+}
+
+/// What the loop does to one beacon fetch, whichever binding it is.
+trait FetchVisitor<S, N, D>
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    fn visit<B: Asked>(&mut self, beacon: &mut BeaconLoop<S, N, D>, ids: Vec<B::Id>);
+}
+
+/// An owner's ask.
+struct Ask {
+    owner: BeaconOwner,
+    shard: ShardId,
+    preferred: Option<ValidatorId>,
+    class: Option<MessageClass>,
+}
+
+impl<S: ShardStorage, N: Network, D: Dispatch> FetchVisitor<S, N, D> for Ask {
+    fn visit<B: Asked>(&mut self, beacon: &mut BeaconLoop<S, N, D>, ids: Vec<B::Id>) {
+        let shard = match B::ROUTE {
+            AskRoute::Named => self.shard,
+            AskRoute::Preferred => {
+                let Some(shard) = beacon.ask_shard(self.owner, self.preferred) else {
+                    warn!("BeaconLoop: no live shard with a committee to ask; dropping");
+                    return;
+                };
+                shard
+            }
+            AskRoute::ChainsOnly => return warn_record_fetch(self.owner),
+        };
+        beacon.ask_for::<B>(self.owner, ids, shard, self.preferred, self.class);
+    }
+}
+
+/// An owner's abandon.
+struct Abandon(BeaconOwner);
+
+impl<S: ShardStorage, N: Network, D: Dispatch> FetchVisitor<S, N, D> for Abandon {
+    fn visit<B: Asked>(&mut self, beacon: &mut BeaconLoop<S, N, D>, ids: Vec<B::Id>) {
+        match B::ROUTE {
+            AskRoute::ChainsOnly => warn_record_fetch(self.0),
+            AskRoute::Named | AskRoute::Preferred => beacon.abandon_for::<B>(self.0, ids),
+        }
+    }
+}
+
+/// A response boundary's release.
+struct Let(Release);
+
+impl<S: ShardStorage, N: Network, D: Dispatch> FetchVisitor<S, N, D> for Let {
+    fn visit<B: Asked>(&mut self, beacon: &mut BeaconLoop<S, N, D>, ids: Vec<B::Id>) {
+        beacon.release_for::<B>(ids, self.0);
+    }
+}
+
+/// The fetch tick.
+struct Tick;
+
+impl<S: ShardStorage, N: Network, D: Dispatch> FetchVisitor<S, N, D> for Tick {
+    fn visit<B: Asked>(&mut self, beacon: &mut BeaconLoop<S, N, D>, _: Vec<B::Id>) {
+        beacon.drive_fetch::<B>(FetchInput::Tick);
+    }
+}
+
+/// Whether any fetch has work outstanding.
+struct Pending(bool);
+
+impl<S: ShardStorage, N: Network, D: Dispatch> FetchVisitor<S, N, D> for Pending {
+    fn visit<B: Asked>(&mut self, beacon: &mut BeaconLoop<S, N, D>, _: Vec<B::Id>) {
+        self.0 |= B::fetch_mut(&mut beacon.fetches).has_pending();
+    }
+}
+
 impl Asked for ShardWitnessBinding {
+    const ROUTE: AskRoute = AskRoute::Named;
+
     fn askers(interest: &mut Interest) -> &mut Askers<Self::Id> {
         &mut interest.witnesses
     }
 }
 
 impl Asked for BeaconProposalBinding {
+    const ROUTE: AskRoute = AskRoute::Preferred;
+
     fn askers(interest: &mut Interest) -> &mut Askers<Self::Id> {
         &mut interest.proposals
     }
 }
 
 impl Asked for BeaconCandidateBinding {
+    const ROUTE: AskRoute = AskRoute::Preferred;
+
     fn askers(interest: &mut Interest) -> &mut Askers<Self::Id> {
         &mut interest.candidates
     }

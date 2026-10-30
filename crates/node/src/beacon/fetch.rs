@@ -117,18 +117,6 @@ impl BeaconFetchState {
             ),
         }
     }
-
-    /// True if any beacon fetch has work outstanding (in-flight or
-    /// queued). Keeps the owning loop's fetch tick alive so deferred ids
-    /// eventually retry.
-    #[must_use]
-    pub(crate) fn has_pending(&self) -> bool {
-        self.shard_witness.has_pending()
-            || self.beacon_proposal.has_pending()
-            || self.beacon_candidate.has_pending()
-            || self.instance_record.has_pending()
-            || self.package_artifact.has_pending()
-    }
 }
 
 /// `config` with its batch clamped to what one request may carry.

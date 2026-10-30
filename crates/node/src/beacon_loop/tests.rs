@@ -35,6 +35,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
+use super::records::InstanceRecordBinding;
 use super::*;
 use crate::HostedChain;
 use crate::event::{BeaconInput, FetchFailureKind};
@@ -95,7 +96,7 @@ fn every_host_runs_a_beacon_loop_with_no_participant() {
     let mut host = fix.host(BlockHeight::GENESIS);
     assert_eq!(host.participants().count(), 0);
     ask(&mut host.beacon, participant(2), &[PROPOSAL]);
-    assert!(host.beacon.fetches.has_pending());
+    assert!(host.beacon.fetches_pending());
     host.beacon.update_fetch_tick_timer();
     let out = host.drain_pending_output();
     assert_eq!(fetch_ticks(&out.timer_ops), vec![true]);

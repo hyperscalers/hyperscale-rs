@@ -43,13 +43,10 @@ use hyperscale_types::{
 };
 use tracing::warn;
 
-use crate::beacon::{
-    self, BeaconBlockSync, BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding,
-    BeaconReply, ProposalKeys, ShardWitnessBinding,
-};
+use crate::beacon::{self, BeaconBlockSync, BeaconFetchState, BeaconReply, ProposalKeys};
 use crate::config::NodeConfig;
 use crate::event::{Attachment, BeaconOwner, BeaconScopedInput, HostEvent};
-use crate::fetch::{FetchInput, Release};
+use crate::fetch::Release;
 use crate::process::ProcessIo;
 use crate::shard::mempool::DeferredForRecords;
 use crate::shard::{FetchTicker, StepOutput, TimerOp, TimerOwner};
@@ -64,7 +61,6 @@ mod submissions;
 use interest::{Asked, Askers, Interest};
 use participants::{Participant, SharedCheck};
 pub(crate) use records::custodian;
-use records::{InstanceRecordBinding, PackageArtifactBinding};
 
 /// The host's beacon driver.
 pub struct BeaconLoop<S, N, D>
@@ -326,11 +322,7 @@ where
             BeaconScopedInput::Answered { ids, event } => self.on_answer(ids, *event),
             BeaconScopedInput::FetchTick => {
                 self.fetch_tick.fired();
-                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Tick);
-                self.drive_fetch::<BeaconProposalBinding>(FetchInput::Tick);
-                self.drive_fetch::<BeaconCandidateBinding>(FetchInput::Tick);
-                self.drive_fetch::<InstanceRecordBinding>(FetchInput::Tick);
-                self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
+                self.tick_fetches();
                 self.on_sync_tick();
                 self.sweep_submissions();
             }
