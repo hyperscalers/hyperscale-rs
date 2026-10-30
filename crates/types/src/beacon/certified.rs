@@ -18,6 +18,8 @@
 //! at decode (manual `Decode` impl below). Wire bytes carrying a
 //! mismatched pairing reject with `DecodeError::InvalidCustomValue`.
 
+use std::sync::Arc;
+
 use hyperscale_crypto::Verifier;
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
@@ -32,8 +34,16 @@ use crate::{
 };
 
 /// A beacon block paired with the cert that authenticates it.
+///
+/// Every clone shares one allocation, so moving a block between its raw,
+/// verifiable and verified forms, or serving it from storage, copies a
+/// pointer rather than its proposals and cert.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CertifiedBeaconBlock {
+pub struct CertifiedBeaconBlock(Arc<Carried>);
+
+/// What every clone of one [`CertifiedBeaconBlock`] shares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Carried {
     block: BeaconBlock,
     cert: BeaconCert,
 }
@@ -71,7 +81,7 @@ impl CertifiedBeaconBlock {
         cert: BeaconCert,
     ) -> Result<Self, CertifiedBeaconBlockPairingError> {
         Self::check_pairing(&block, &cert)?;
-        Ok(Self { block, cert })
+        Ok(Self(Arc::new(Carried { block, cert })))
     }
 
     /// Pair a block with a cert, panicking on pairing mismatch. Use at
@@ -95,53 +105,54 @@ impl CertifiedBeaconBlock {
     /// Genesis bootstrap pair.
     #[must_use]
     pub fn genesis(config_hash: GenesisConfigHash) -> Self {
-        Self {
+        Self(Arc::new(Carried {
             block: BeaconBlock::genesis(),
             cert: BeaconCert::Genesis(config_hash),
-        }
+        }))
     }
 
     /// Inner block.
     #[must_use]
-    pub const fn block(&self) -> &BeaconBlock {
-        &self.block
+    pub fn block(&self) -> &BeaconBlock {
+        &self.0.block
     }
 
     /// Authenticating cert.
     #[must_use]
-    pub const fn cert(&self) -> &BeaconCert {
-        &self.cert
+    pub fn cert(&self) -> &BeaconCert {
+        &self.0.cert
     }
 
     /// Block hash — chain-linkage identity. Delegates to the inner
     /// block; the wrapper is never hashed.
     #[must_use]
     pub fn block_hash(&self) -> BeaconBlockHash {
-        self.block.block_hash()
+        self.0.block.block_hash()
     }
 
     /// Epoch of the inner block.
     #[must_use]
-    pub const fn epoch(&self) -> Epoch {
-        self.block.epoch()
+    pub fn epoch(&self) -> Epoch {
+        self.0.block.epoch()
     }
 
     /// `prev_block_hash` of the inner block.
     #[must_use]
-    pub const fn prev_block_hash(&self) -> BeaconBlockHash {
-        self.block.prev_block_hash()
+    pub fn prev_block_hash(&self) -> BeaconBlockHash {
+        self.0.block.prev_block_hash()
     }
 
     /// Whether the inner block is the genesis block.
     #[must_use]
     pub fn is_genesis(&self) -> bool {
-        self.block.is_genesis()
+        self.0.block.is_genesis()
     }
 
     /// Consume and return parts.
     #[must_use]
     pub fn into_parts(self) -> (BeaconBlock, BeaconCert) {
-        (self.block, self.cert)
+        let Carried { block, cert } = Arc::unwrap_or_clone(self.0);
+        (block, cert)
     }
 
     fn check_pairing(
@@ -460,8 +471,8 @@ impl HborWidth for CertifiedBeaconBlock {
 
 impl HborEncode for CertifiedBeaconBlock {
     fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
-        encoder.nested(&self.block)?;
-        encoder.nested(&self.cert)
+        encoder.nested(&self.0.block)?;
+        encoder.nested(&self.0.cert)
     }
 }
 
@@ -488,7 +499,7 @@ mod tests {
     use crate::{
         AggregateSignature, BeaconBlockHash, BeaconProposal, Hash, PcQc2, PcQc3, PcSignerLengths,
         PcVector, PcXpProof, RatifyRound, SignerBitfield, SpcCert, SpcView, VRF_PROOF_BYTES,
-        ValidatorId, VrfProof,
+        ValidatorId, Verifiable, VrfProof,
     };
 
     fn proposal(seed: u8) -> BeaconProposal {
@@ -616,6 +627,24 @@ mod tests {
         let bytes = hbor_to_vec(&pair).unwrap();
         let decoded: CertifiedBeaconBlock = hbor_from_slice(&bytes).unwrap();
         assert_eq!(pair, decoded);
+    }
+
+    /// Storage holds the verified form and a sync answer carries the
+    /// verifiable one; moving between them must hand over the one body
+    /// rather than copy its proposals and cert.
+    #[test]
+    fn every_form_of_a_certified_block_shares_one_body() {
+        let block = BeaconBlock::new(
+            Epoch::new(5),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
+            Capped::from_array([(ValidatorId::new(0), proposal(0))]),
+        );
+        let cert = normal_cert_for(&block);
+        let raw = CertifiedBeaconBlock::new_checked(block, cert).unwrap();
+        let stored = Verified::<CertifiedBeaconBlock>::from_persisted(raw.clone());
+        let wire: Verifiable<CertifiedBeaconBlock> = stored.clone().into();
+        assert!(Arc::ptr_eq(&raw.0, &stored.0));
+        assert!(Arc::ptr_eq(&raw.0, &wire.as_unverified().0));
     }
 
     #[test]
