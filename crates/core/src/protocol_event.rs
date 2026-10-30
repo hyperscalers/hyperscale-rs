@@ -542,17 +542,6 @@ pub enum ProtocolEvent {
         target_shard: ShardId,
     },
 
-    /// An execution certificate from a remote shard — for a tick that
-    /// depended on state provisions from *this* shard — has been verified.
-    /// The tracker uses `tx_outcomes` to drain pending transactions from
-    /// outbound batches; `Executed` and `Aborted` are both terminal.
-    OutboundEcObserved {
-        /// Shard whose EC was observed.
-        target_shard: ShardId,
-        /// Per-tx outcomes from the EC, used to drain matching outbound entries.
-        tx_outcomes: Vec<TxOutcome>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════

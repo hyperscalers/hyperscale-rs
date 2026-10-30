@@ -454,8 +454,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::CrossingReadingsReceived { .. }
             | ProtocolEvent::StateProvisionsVerified { .. }
             | ProtocolEvent::ProvisionsAdmitted { .. }
-            | ProtocolEvent::OutboundProvisionBroadcast { .. }
-            | ProtocolEvent::OutboundEcObserved { .. }) => {
+            | ProtocolEvent::OutboundProvisionBroadcast { .. }) => {
                 self.on_shard(move |s, sched| s.handle_provisions(sched, evt))
             }
 

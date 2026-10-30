@@ -3,10 +3,9 @@
 //! Covers tick-based voting (votes received, aggregated, certificate
 //! verified) and the engine results path (`ExecutionBatchCompleted`).
 //!
-//! Cross-shard EC admission has a quirk: if an admitted EC names the local
-//! shard among `tick_id.remote_shards`, that EC's `tx_outcomes` ack the
-//! outbound batches we sent — the admission arm captures that ACK and emits
-//! a follow-up `OutboundEcObserved` to feed the outbound provision tracker.
+//! An admitted certificate from another shard also acknowledges the
+//! outbound batches this shard sent it: its outcomes go straight to the
+//! outbound provision tracker.
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::TopologySchedule;
@@ -87,27 +86,16 @@ impl ShardParticipation {
                 .execution_coordinator
                 .on_certificate_verified(topology_schedule, result),
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
-                let local_shard = self.local_shard;
-                let mut actions = Vec::new();
-                // If the EC is for a remote tick where we were a source, the
-                // target shard's tx_outcomes acknowledge outbound batches we
-                // sent. Surface the ACK to the outbound tracker.
-                // A remote batch acknowledging outbound work of ours: its
-                // outcomes name transactions, and the tracker keys on
-                // those, so an outcome for nothing we sent is a no-op
-                // rather than something to filter on identity here.
-                if certificate.shard_id() != local_shard && !certificate.tx_outcomes().is_empty() {
-                    actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
-                        target_shard: certificate.shard_id(),
-                        tx_outcomes: certificate.tx_outcomes().clone(),
-                    }));
+                // A remote certificate's outcomes acknowledge the outbound
+                // batches this shard sent it. The tracker keys on the
+                // transaction, so an outcome for nothing sent is a no-op.
+                if certificate.shard_id() != self.local_shard {
+                    self.outbound_provisions
+                        .on_ec_observed(certificate.shard_id(), certificate.tx_outcomes());
                 }
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
-                actions.extend(
-                    self.execution_coordinator
-                        .emit_vote_actions(topology_schedule),
-                );
-                actions
+                self.execution_coordinator
+                    .emit_vote_actions(topology_schedule)
             }
             ProtocolEvent::ExecutionBatchUnavailable {
                 tick,
@@ -129,16 +117,16 @@ mod tests {
 
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+    use hyperscale_core::{ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-        LocalTimestamp, ShardId, SignerBitfield, TickId, TxHash, TxOutcome, Verified,
-        WeightedTimestamp,
+        Hash, LocalTimestamp, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
+        SignerBitfield, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp,
     };
 
+    use crate::state::NodeStateMachine;
     use crate::state::test_support::TestNode;
-    use crate::{assert_no_emit, extract_one};
 
     fn make_ec(
         shard: ShardId,
@@ -156,81 +144,81 @@ mod tests {
         )))
     }
 
-    /// `ExecutionCertificateAdmitted` for a remote-shard certificate must
-    /// surface an `OutboundEcObserved` continuation carrying its
-    /// `tx_outcomes` — that's how the outbound provision tracker learns
-    /// its batches were ack'd.
-    #[test]
-    fn execution_certificate_admitted_emits_outbound_ec_continuation_when_we_were_a_source() {
-        // Local home shard is the root; the EC names a distinct leaf shard.
+    /// A node on the root shard that has broadcast one batch carrying
+    /// `tx` to the leaf `target`.
+    fn sent_one_batch(target: ShardId, tx: TxHash) -> NodeStateMachine {
         let TestNode { mut node, .. } = TestNode::builder().build();
-
-        let ec = make_ec(
-            ShardId::leaf(1, 1),
+        let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
+            ShardId::ROOT,
+            target,
             BlockHeight::new(1),
-            vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
-        );
-
-        let actions = node.handle(
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(tx, Capped::empty())]),
+        )));
+        let _ = node.handle(
             LocalTimestamp::ZERO,
-            ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec },
+            ProtocolEvent::OutboundProvisionBroadcast {
+                provisions,
+                target_shard: target,
+            },
         );
-
-        let cont = extract_one!(
-            actions,
-            Action::Continuation(ProtocolEvent::OutboundEcObserved { .. })
+        assert_eq!(
+            node.outbound_provisions().memory_stats().tracked_provisions,
+            1
         );
-        if let Action::Continuation(ProtocolEvent::OutboundEcObserved {
-            target_shard,
-            tx_outcomes,
-        }) = cont
-        {
-            assert_eq!(*target_shard, ShardId::leaf(1, 1));
-            assert_eq!(tx_outcomes.len(), 1);
-        } else {
-            unreachable!()
-        }
+        node
     }
 
-    /// Same-shard EC: the EC's `shard_id` matches local, so the
-    /// "remote ack" path doesn't apply and no `OutboundEcObserved`
-    /// continuation must be emitted.
-    #[test]
-    fn execution_certificate_admitted_skips_continuation_for_same_shard_ec() {
-        let TestNode { mut node, .. } = TestNode::new();
-
-        let ec = make_ec(ShardId::ROOT, BlockHeight::new(1), vec![]);
-
-        let actions = node.handle(
+    fn admit(node: &mut NodeStateMachine, certificate: Arc<Verified<ExecutionCertificate>>) {
+        let _ = node.handle(
             LocalTimestamp::ZERO,
-            ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec },
-        );
-
-        assert_no_emit!(
-            actions,
-            Action::Continuation(ProtocolEvent::OutboundEcObserved { .. })
+            ProtocolEvent::ExecutionCertificateAdmitted { certificate },
         );
     }
 
-    /// A certificate attesting nothing carries no acknowledgement, so
-    /// there is nothing to surface. Which of its outcomes we were a source
-    /// for is the outbound tracker's question — it keys on the
-    /// transaction and ignores one it never sent — rather than one this
-    /// seam can answer from the certificate's identity.
+    /// The target shard's certificate naming the transaction a batch
+    /// carried acknowledges the batch, which the tracker then drops.
     #[test]
-    fn execution_certificate_admitted_surfaces_nothing_for_an_empty_certificate() {
-        let TestNode { mut node, .. } = TestNode::builder().build();
+    fn a_remote_certificate_acknowledges_the_batch_sent_to_it() {
+        let target = ShardId::leaf(1, 1);
+        let tx = TxHash::from(Hash::from_bytes(b"outbound-tx"));
+        let mut node = sent_one_batch(target, tx);
 
-        let ec = make_ec(ShardId::leaf(1, 0), BlockHeight::new(1), vec![]);
-
-        let actions = node.handle(
-            LocalTimestamp::ZERO,
-            ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec },
+        admit(
+            &mut node,
+            make_ec(
+                target,
+                BlockHeight::new(1),
+                vec![TxOutcome::new(tx, ExecutionOutcome::Failed)],
+            ),
         );
 
-        assert_no_emit!(
-            actions,
-            Action::Continuation(ProtocolEvent::OutboundEcObserved { .. })
+        assert_eq!(
+            node.outbound_provisions().memory_stats().tracked_provisions,
+            0
+        );
+    }
+
+    /// A certificate of this shard's own acknowledges nothing it sent,
+    /// even where it names the same transaction.
+    #[test]
+    fn a_local_certificate_acknowledges_no_outbound_batch() {
+        let tx = TxHash::from(Hash::from_bytes(b"outbound-tx"));
+        let mut node = sent_one_batch(ShardId::leaf(1, 1), tx);
+
+        admit(
+            &mut node,
+            make_ec(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                vec![TxOutcome::new(tx, ExecutionOutcome::Failed)],
+            ),
+        );
+
+        assert_eq!(
+            node.outbound_provisions().memory_stats().tracked_provisions,
+            1
         );
     }
 }

@@ -71,14 +71,6 @@ impl ShardParticipation {
                     .on_broadcast(&provisions, target_shard);
                 vec![]
             }
-            ProtocolEvent::OutboundEcObserved {
-                target_shard,
-                tx_outcomes,
-            } => {
-                self.outbound_provisions
-                    .on_ec_observed(target_shard, &tx_outcomes);
-                vec![]
-            }
             _ => unreachable!("non-provision event routed to handle_provisions"),
         }
     }
