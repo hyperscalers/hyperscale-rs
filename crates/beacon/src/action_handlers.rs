@@ -291,20 +291,15 @@ where
                 tracing::error!(?epoch, "cannot sign beacon proposal; skipping");
                 return;
             };
-            let proposal = Arc::new(verified);
-            (ctx.cache_beacon_proposal)(me, epoch, Arc::clone(&proposal));
+            (ctx.cache_beacon_proposal)(me, epoch, verified.clone());
             ctx.network.notify(
                 &recipients,
-                &BeaconProposalNotification::new(
-                    me,
-                    epoch,
-                    Arc::new(Verifiable::from((*proposal).clone())),
-                ),
+                &BeaconProposalNotification::new(me, epoch, verified.clone()),
             );
             ctx.notify_protocol(ProtocolEvent::BeaconProposalReceived {
                 from: me,
                 epoch,
-                proposal,
+                proposal: verified,
             });
         }
         Action::BroadcastBeaconBlock { block } => {

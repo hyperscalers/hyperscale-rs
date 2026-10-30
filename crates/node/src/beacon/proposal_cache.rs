@@ -25,7 +25,7 @@ use hyperscale_types::{
 /// this host's did.
 const EPOCHS_AHEAD: u64 = 2;
 
-type Proposals = BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>;
+type Proposals = BTreeMap<ValidatorId, Verified<BeaconProposal>>;
 
 /// Per-epoch cache of beacon proposals for inbound fetch serving.
 ///
@@ -59,7 +59,7 @@ impl BeaconProposalCache {
         &self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) {
         let Some(in_flight) = self.beacon.latest_committed_epoch().map(Epoch::next) else {
             return;
@@ -87,10 +87,10 @@ impl BeaconProposalCache {
         verifier: &dyn Verifier,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Verifiable<BeaconProposal>,
         sender_pk: ConsensusPublicKey,
-    ) -> Option<Arc<Verified<BeaconProposal>>> {
-        let admitted = match Arc::unwrap_or_clone(proposal).into_verified() {
+    ) -> Option<Verified<BeaconProposal>> {
+        let admitted = match proposal.into_verified() {
             Ok(sealed) => sealed,
             Err(raw) => {
                 let ctx = BeaconProposalVerifyContext {
@@ -102,8 +102,7 @@ impl BeaconProposalCache {
                 raw.verify(&ctx).ok()?
             }
         };
-        let admitted = Arc::new(admitted);
-        self.admit(from, epoch, Arc::clone(&admitted));
+        self.admit(from, epoch, admitted.clone());
         Some(admitted)
     }
 
@@ -115,9 +114,7 @@ impl BeaconProposalCache {
             .expect("beacon proposal cache lock")
             .get(&req.epoch)
             .and_then(|proposals| proposals.get(&req.validator).cloned());
-        let response = GetBeaconProposalResponse::new(
-            held.map(|verified| Arc::new(Verifiable::from((*verified).clone()))),
-        );
+        let response = GetBeaconProposalResponse::new(held.map(Verifiable::from));
         record_fetch_response_sent("beacon_proposal", usize::from(response.proposal.is_some()));
         response
     }
@@ -173,10 +170,8 @@ mod tests {
         (cache, chain)
     }
 
-    fn proposal() -> Arc<Verified<BeaconProposal>> {
-        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfProof::new([0xAB; 96]),
-        )))
+    fn proposal() -> Verified<BeaconProposal> {
+        Verified::new_unchecked_for_test(BeaconProposal::vrf_only(VrfProof::new([0xAB; 96])))
     }
 
     fn served(cache: &BeaconProposalCache, epoch: u64, validator: u64) -> bool {

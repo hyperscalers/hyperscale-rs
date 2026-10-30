@@ -1298,8 +1298,8 @@ impl BeaconFold {
         &self,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
-    ) -> Option<Arc<Verified<BeaconProposal>>> {
+        proposal: Verifiable<BeaconProposal>,
+    ) -> Option<Verified<BeaconProposal>> {
         let Some(record) = self.state.validators.get(&validator) else {
             warn!(
                 ?validator,
@@ -1313,8 +1313,8 @@ impl BeaconFold {
             epoch,
             sender_pk: record.pubkey,
         };
-        match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
-            Ok(verified) => Some(Arc::new(verified)),
+        match proposal.upgrade(&ctx) {
+            Ok(verified) => Some(verified),
             Err((_, err)) => {
                 warn!(
                     ?validator,

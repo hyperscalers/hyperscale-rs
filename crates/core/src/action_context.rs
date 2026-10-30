@@ -141,7 +141,7 @@ pub struct BeaconActionContext<'a, N: Network> {
     /// Hand the locally signed `BeaconProposal` to the process-level
     /// cache that serves inbound `GetBeaconProposalRequest`s.
     pub cache_beacon_proposal:
-        &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
+        &'a (dyn Fn(ValidatorId, Epoch, Verified<BeaconProposal>) + Send + Sync),
     /// Hand a candidate this participant assembled or verified to the
     /// process-level cache that serves inbound
     /// `GetBeaconCandidateRequest`s.

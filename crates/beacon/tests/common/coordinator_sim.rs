@@ -123,7 +123,7 @@ enum SimEvent {
     BeaconProposal {
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     },
     BeaconBlock {
         block: Arc<Verified<CertifiedBeaconBlock>>,
@@ -137,7 +137,7 @@ enum SimEvent {
     BeaconProposalFetched {
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Verifiable<BeaconProposal>,
     },
     CommitProven {
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
@@ -1305,7 +1305,7 @@ impl CoordinatorSim {
                 }
                 let sk = self.sks[emitter_idx].as_ref();
                 let vrf_proof = beacon_reveal_sign(sk, &self.network, epoch).expect("sign");
-                let redated_copy = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                let redated_copy = Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs
                         .iter()
                         .map(|(shard, qc)| (*shard, qc.as_ref().map(redated)))
@@ -1314,14 +1314,14 @@ impl CoordinatorSim {
                     fork_proofs.clone(),
                     vote_equivocations.clone(),
                     vrf_proof,
-                )));
-                let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                ));
+                let proposal = Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
                     equivocations,
                     fork_proofs,
                     vote_equivocations,
                     vrf_proof,
-                )));
+                ));
                 for rcpt in &recipients {
                     if self.blocked_proposal_pairs.remove(&(me, *rcpt)) {
                         // Single-shot test filter: simulate a dropped
@@ -1339,7 +1339,7 @@ impl CoordinatorSim {
                         event: SimEvent::BeaconProposal {
                             from: me,
                             epoch,
-                            proposal: Arc::clone(handed),
+                            proposal: handed.clone(),
                         },
                     });
                 }
@@ -1362,14 +1362,13 @@ impl CoordinatorSim {
                 ) {
                     self.byzantine[emitter_idx] = None;
                     self.byzantine_fires[emitter_idx] += 1;
-                    let conflicting =
-                        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
-                            BTreeMap::new(),
-                            Vec::new(),
-                            BTreeMap::new(),
-                            Vec::new(),
-                            vrf_proof,
-                        )));
+                    let conflicting = Verified::new_unchecked_for_test(BeaconProposal::new(
+                        BTreeMap::new(),
+                        Vec::new(),
+                        BTreeMap::new(),
+                        Vec::new(),
+                        vrf_proof,
+                    ));
                     for rcpt in &recipients {
                         let to_idx = self.idx_of(*rcpt);
                         self.network_q.push_back(Envelope {
@@ -1377,7 +1376,7 @@ impl CoordinatorSim {
                             event: SimEvent::BeaconProposal {
                                 from: me,
                                 epoch,
-                                proposal: Arc::clone(&conflicting),
+                                proposal: conflicting.clone(),
                             },
                         });
                     }
@@ -1853,8 +1852,7 @@ impl CoordinatorSim {
                     if pool.epoch() != epoch {
                         return None;
                     }
-                    pool.get(validator)
-                        .map(|verified| Arc::new(Verifiable::from((*verified).clone())))
+                    pool.get(validator).map(Verifiable::from)
                 });
                 if let Some(proposal) = proposal {
                     self.loopback_q.push_back(Envelope {

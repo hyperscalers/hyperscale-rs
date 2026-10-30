@@ -242,7 +242,7 @@ where
                     }));
                 });
                 let cache_beacon_proposal =
-                    |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
+                    |from: ValidatorId, epoch: Epoch, proposal: Verified<BeaconProposal>| {
                         handles.beacon_proposal_cache.admit(from, epoch, proposal);
                     };
                 let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {

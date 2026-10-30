@@ -192,14 +192,14 @@ impl BeaconReply {
             epoch,
             sender_pk,
         };
-        match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
+        match proposal.upgrade(&ctx) {
             Ok(checked) => {
                 self.answered(
                     ids,
                     ProtocolEvent::BeaconProposalFetched {
                         epoch,
                         validator,
-                        proposal: Arc::new(checked),
+                        proposal: checked,
                     },
                 );
                 ResponseVerdict::Accept
@@ -477,8 +477,8 @@ mod tests {
         let author = fix.committee.validator_id(1);
         let id = (Epoch::new(1), author);
         let answer = |proposal: BeaconProposal| {
-            Ok(GetBeaconProposalResponse::new(Some(Arc::new(
-                Verifiable::from(proposal),
+            Ok(GetBeaconProposalResponse::new(Some(Verifiable::from(
+                proposal,
             ))))
         };
 

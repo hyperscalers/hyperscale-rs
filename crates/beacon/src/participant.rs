@@ -215,7 +215,7 @@ pub struct BeaconParticipant {
     /// it completes. Asked and re-evaluated only until the view-1 input
     /// is fed, the window the input dwell holds open; cleared on epoch
     /// advance.
-    pub(crate) awaiting_boundaries: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
+    pub(crate) awaiting_boundaries: BTreeMap<ValidatorId, Verified<BeaconProposal>>,
 
     /// Blocks asked for this epoch, as `(shard, height)`: one ask per
     /// block. A chain commits one block per height, so the proven answer
@@ -725,7 +725,7 @@ impl BeaconParticipant {
         fold: &BeaconFold,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) -> (ProposalAdmission, Vec<Action>) {
         if !fold.state.committee.contains(&from) {
             trace!(
@@ -795,7 +795,7 @@ impl BeaconParticipant {
                 if !awaited.is_empty() && self.asks_for_boundaries(fold) {
                     return (
                         ProposalAdmission::Abstained,
-                        self.await_boundaries(from, Arc::new(upgraded), &awaited),
+                        self.await_boundaries(from, upgraded, &awaited),
                     );
                 }
                 trace!(
@@ -805,7 +805,7 @@ impl BeaconParticipant {
                 );
                 return (ProposalAdmission::Abstained, Vec::new());
             }
-            Arc::new(upgraded)
+            upgraded
         };
         if !self.proposal_pool.admit(from, epoch, proposal) {
             trace!(
@@ -1062,7 +1062,7 @@ impl BeaconParticipant {
     fn await_boundaries(
         &mut self,
         from: ValidatorId,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
         awaited: &[(ShardId, BlockHeight)],
     ) -> Vec<Action> {
         debug!(
@@ -1972,7 +1972,7 @@ impl BeaconParticipant {
         fold: &BeaconFold,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) -> Vec<Action> {
         if !self.commit_assembly.is_awaiting(epoch, validator) {
             if epoch != self.proposal_pool.epoch() || !self.dwell_fetches.remove(&validator) {

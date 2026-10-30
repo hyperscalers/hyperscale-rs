@@ -493,7 +493,7 @@ fn a_participant_on_the_spc_committee_recovers_a_lost_proposal_through_the_host_
 
     let network = NetworkDefinition::simulator();
     let signer = fix.committee.signer(1);
-    let lost = Arc::new(Verifiable::from(
+    let lost: Verifiable<BeaconProposal> = Verifiable::from(
         BeaconProposalDraft::new(
             signer.as_ref(),
             &network,
@@ -505,10 +505,10 @@ fn a_participant_on_the_spc_committee_recovers_a_lost_proposal_through_the_host_
         )
         .and_then(BeaconProposalDraft::sign)
         .expect("the author's key signs its proposal"),
-    ));
+    );
     wire.peer
         .register_request_handler(SHARD, move |request: GetBeaconProposalRequest| {
-            GetBeaconProposalResponse::new((request.validator == author).then(|| Arc::clone(&lost)))
+            GetBeaconProposalResponse::new((request.validator == author).then(|| lost.clone()))
         });
 
     let participant = attachment(&host, 2, &fix);
@@ -573,11 +573,7 @@ fn a_wire_proposal_reaches_the_loop_only_once_checked() {
     for proposal in [forged, honest] {
         wire.peer.notify(
             &[fix.committee.validator_id(0)],
-            &BeaconProposalNotification::new(
-                author,
-                Epoch::new(1),
-                Arc::new(Verifiable::from(proposal)),
-            ),
+            &BeaconProposalNotification::new(author, Epoch::new(1), proposal),
         );
     }
     let pending = wire.peer.drain_pending_notifications();
@@ -615,11 +611,8 @@ fn settled_on_notified(fix: &Fixture, epoch: Epoch, proposal: BeaconProposal) ->
     let handler = registry
         .get_notification(BeaconProposalNotification::message_type_id())
         .expect("the host handles beacon proposals");
-    let notification = BeaconProposalNotification::new(
-        fix.committee.validator_id(1),
-        epoch,
-        Arc::new(Verifiable::from(proposal)),
-    );
+    let notification =
+        BeaconProposalNotification::new(fix.committee.validator_id(1), epoch, proposal);
     let Verdict::Defer(deferral) = handler(
         hbor_to_vec(&notification).expect("encodes"),
         Provenance::Peer(PeerId::new(1)),
@@ -1738,7 +1731,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
         ProtocolEvent::BeaconProposalReceived {
             from,
             epoch: Epoch::GENESIS.next(),
-            proposal: Arc::new(proposal),
+            proposal,
         },
     ))));
     for (header, qc) in [(&b, &b_qc), (&c, &c_qc)] {

@@ -1012,7 +1012,7 @@ pub enum ProtocolEvent {
         /// Received proposal, sealed via
         /// [`BeaconProposalDraft::sign`](hyperscale_types::BeaconProposalDraft::sign)
         /// when its producer held the signing key.
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     },
 
     /// A [`RatifyVote`] arrived over the wire. Wire decode lands the
@@ -1091,7 +1091,7 @@ pub enum ProtocolEvent {
         /// Validator whose proposal was requested.
         validator: ValidatorId,
         /// The returned proposal.
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     },
 
     /// Result of an [`Action::VerifyBeaconBlock`](crate::Action::VerifyBeaconBlock) dispatch. The

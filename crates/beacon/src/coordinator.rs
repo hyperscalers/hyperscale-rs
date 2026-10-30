@@ -578,7 +578,7 @@ impl BeaconCoordinator {
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) -> Vec<Action> {
         self.drive(|p, fold| p.on_beacon_proposal_received(fold, from, epoch, proposal).1)
     }
@@ -767,7 +767,7 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Verifiable<BeaconProposal>,
     ) -> Vec<Action> {
         let Some(proposal) = self
             .fold
@@ -2171,7 +2171,7 @@ mod tests {
     fn judge(
         coord: &mut BeaconCoordinator,
         from: ValidatorId,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) -> (ProposalAdmission, Vec<Action>) {
         coord.participant.on_beacon_proposal_received(
             &coord.fold,
@@ -2181,11 +2181,9 @@ mod tests {
         )
     }
 
-    fn sample_proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
+    fn sample_proposal(seed: u8) -> Verified<BeaconProposal> {
         use hyperscale_types::VrfProof;
-        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfProof::new([seed; 96]),
-        )))
+        Verified::new_unchecked_for_test(BeaconProposal::vrf_only(VrfProof::new([seed; 96])))
     }
 
     #[test]
@@ -2240,13 +2238,13 @@ mod tests {
         let proof = shard_fork_proof(&committee, ShardId::ROOT, BlockHeight::new(5));
         let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
             std::iter::once((ShardId::ROOT, proof)).collect();
-        let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+        let proposal = Verified::new_unchecked_for_test(BeaconProposal::new(
             BTreeMap::new(),
             Vec::new(),
             fork_proofs,
             Vec::new(),
             VrfProof::ZERO,
-        )));
+        ));
 
         let (admission, actions) = judge(&mut coord, from, proposal);
         assert!(actions.is_empty());
@@ -2310,13 +2308,13 @@ mod tests {
         let proposal = |key: ShardId| {
             let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
                 std::iter::once((key, proof.clone())).collect();
-            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+            Verified::new_unchecked_for_test(BeaconProposal::new(
                 BTreeMap::new(),
                 Vec::new(),
                 fork_proofs,
                 Vec::new(),
                 VrfProof::ZERO,
-            )))
+            ))
         };
 
         // Control: keyed under its own shard, the proposal pools.
@@ -2358,7 +2356,7 @@ mod tests {
         };
 
         let accusing = |validator: ValidatorId| {
-            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+            Verified::new_unchecked_for_test(BeaconProposal::new(
                 BTreeMap::new(),
                 vec![PcVoteEquivocation {
                     validator,
@@ -2373,7 +2371,7 @@ mod tests {
                 BTreeMap::new(),
                 Vec::new(),
                 VrfProof::ZERO,
-            )))
+            ))
         };
         let from = ValidatorId::new(1);
 
@@ -2509,10 +2507,8 @@ mod tests {
         let d_qc = qc_over(&d, cut + 3);
 
         let from = ValidatorId::new(1);
-        let proposal = Arc::new(Verified::new_unchecked_for_test(proposal_with_boundary(
-            shard,
-            b_qc.clone(),
-        )));
+        let proposal =
+            Verified::new_unchecked_for_test(proposal_with_boundary(shard, b_qc.clone()));
         let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
         let (admission, received) = judge(&mut coord, from, proposal);
         assert_eq!(admission, ProposalAdmission::Abstained);
@@ -2624,10 +2620,8 @@ mod tests {
         let d_qc = qc_over(&d, cut + 3);
 
         let from = ValidatorId::new(1);
-        let proposal = Arc::new(Verified::new_unchecked_for_test(proposal_with_boundary(
-            shard,
-            b_qc.clone(),
-        )));
+        let proposal =
+            Verified::new_unchecked_for_test(proposal_with_boundary(shard, b_qc.clone()));
         let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
         actions.extend(coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal));
         actions.extend(coord.on_certified_local_header(&certified(&b, &b_qc)));
@@ -2701,13 +2695,13 @@ mod tests {
         let proposal = || {
             let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
                 std::iter::once((ShardId::ROOT, proof.clone())).collect();
-            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+            Verified::new_unchecked_for_test(BeaconProposal::new(
                 BTreeMap::new(),
                 Vec::new(),
                 fork_proofs,
                 Vec::new(),
                 VrfProof::ZERO,
-            )))
+            ))
         };
         // The root's split has applied: its children hold the lookahead
         // and the root is in its last window.

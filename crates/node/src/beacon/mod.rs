@@ -413,11 +413,11 @@ where
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: &Arc<Verified<BeaconProposal>>,
+        proposal: &Verified<BeaconProposal>,
     ) {
         let mut admission = ProposalAdmission::Abstained;
         for validator in self.validator_list() {
-            let proposal = Arc::clone(proposal);
+            let proposal = proposal.clone();
             self.drive(validator, |p, fold| {
                 let (judged, actions) = p.on_beacon_proposal_received(fold, from, epoch, proposal);
                 admission = admission.max(judged);
@@ -469,7 +469,7 @@ where
             } => {
                 self.release(ids, Release::Admitted);
                 for validator in self.validator_list() {
-                    let proposal = Arc::clone(&proposal);
+                    let proposal = proposal.clone();
                     self.drive(validator, |p, fold| {
                         p.on_beacon_proposal_fetched(fold, epoch, author, proposal)
                     });
