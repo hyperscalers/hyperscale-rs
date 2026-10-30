@@ -4541,12 +4541,16 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         // Already-finalized short-circuit — a second fetch arrival for a
         // finalization we've already admitted is wasted verification work.
+        // The fetch that carried it is still owed a release: its ids stay
+        // in flight until a verdict, and none follows from here.
         if self.finalized.get(&tick.receipt_hash()).is_some() {
             tracing::debug!(
                 tick = %tick.tick_id(),
                 "Finalization already in canonical store — skipping verification"
             );
-            return Vec::new();
+            return vec![Action::AbandonFetch(FetchIds::Finalizations(vec![
+                tick.receipt_hash(),
+            ]))];
         }
         // A legs half carries no certificate to verify: what holds it is
         // the receipts it names, each recomputing to its named hash, which
@@ -8135,7 +8139,7 @@ mod tests {
     }
 
     /// A `Finalization` already in the canonical store short-circuits
-    /// before any verify dispatch.
+    /// before any verify dispatch, and releases the fetch that carried it.
     #[test]
     fn admit_finalization_skips_when_already_finalized() {
         let topo = make_test_topology();
@@ -8166,8 +8170,15 @@ mod tests {
         // does on the local-aggregation path).
         state.finalized.insert(tick_id, verifiable_finalization);
 
+        let receipt_hash = raw_finalization.receipt_hash();
         let actions = state.admit_finalization(&topo, Arc::new(Verifiable::from(raw_finalization)));
-        assert!(actions.is_empty());
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::AbandonFetch(FetchIds::Finalizations(ids))] if ids == &[receipt_hash]
+            ),
+            "only the carrying fetch is released: {actions:?}"
+        );
     }
 
     /// A `Finalization` delivered by `admit_finalization` (the fetch
