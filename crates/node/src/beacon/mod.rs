@@ -25,7 +25,7 @@
 //! The host's beacon subsystems live beside the driver. [`sync`] holds the
 //! beacon-block catch-up binding the beacon loop drives. [`proposal_cache`]
 //! backs the beacon-proposal serve path and [`candidate_cache`] the
-//! ratify-candidate one. [`serve`] answers inbound `GetBeaconBlockRequest`s;
+//! ratify-candidate one. [`block_serve`] answers inbound `GetBeaconBlockRequest`s;
 //! [`gossip`] registers the beacon gossip handlers. [`fetch`] holds the beacon
 //! fetches (missing proposals, ratify candidates, shard-witness leaves) and
 //! their bindings; [`witness_serve`] answers inbound
@@ -58,6 +58,7 @@ use crate::process::ProcessIo;
 use crate::shard::mempool::DeferredForRecords;
 use crate::shard::{FetchTicker, StepOutput, TimerOp};
 
+pub mod block_serve;
 mod block_sync;
 mod candidate_cache;
 mod chains;
@@ -67,7 +68,6 @@ mod interest;
 mod participants;
 mod proposal_cache;
 mod records;
-pub mod serve;
 mod submissions;
 mod sync;
 pub mod witness_serve;

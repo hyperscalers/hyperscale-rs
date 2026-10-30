@@ -1046,7 +1046,7 @@ pub fn register_shard_request_handlers<S, N, D>(
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
     };
 
-    use crate::beacon::serve::serve_beacon_block_request;
+    use crate::beacon::block_serve::serve_beacon_block_request;
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
     use crate::bootstrap::state_range_serve::serve_state_range_request;
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
