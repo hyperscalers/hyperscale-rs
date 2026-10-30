@@ -56,7 +56,7 @@ use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
 use hyperscale_metrics::record_network_input_refused;
-use hyperscale_network::Network;
+use hyperscale_network::{Network, dispatching_locally};
 use hyperscale_storage::{
     AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
 };
@@ -310,8 +310,11 @@ pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event:
 ///
 /// `false` when the lane is full: the input is dropped and counted, never
 /// queued past the lane's bound, and the handler answers the message as
-/// [`Verdict::Busy`](hyperscale_network::Verdict::Busy). A closed lane takes the input as
-/// [`push_shard_input`] does.
+/// [`Verdict::Busy`](hyperscale_network::Verdict::Busy). A closed lane
+/// takes the input as [`push_shard_input`] does. A message this host sent
+/// itself, handed back to its own shards by a local dispatch (see
+/// [`dispatching_locally`]), goes on the internal lane instead: the bound
+/// is on what peers may queue here, not on what the host itself produced.
 #[must_use]
 pub(crate) fn offer_network_input(
     inbox: &ShardInbox,
@@ -332,6 +335,10 @@ pub(crate) fn offer_network_event(
 }
 
 fn offer_network(inbox: &ShardInbox, event: HostEvent) -> bool {
+    if dispatching_locally() {
+        let _ = inbox.internal().send(event);
+        return true;
+    }
     match inbox.network().try_send(event) {
         Ok(()) | Err(TrySendError::Disconnected(_)) => true,
         Err(TrySendError::Full(event)) => {

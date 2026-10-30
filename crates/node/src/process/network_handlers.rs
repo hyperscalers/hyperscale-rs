@@ -1309,16 +1309,44 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::{bounded, unbounded};
-    use hyperscale_hbor::Capped;
+    use hyperscale_core::ProtocolEvent;
+    use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
     use hyperscale_network::{HandlerRegistry, Verdict};
     use hyperscale_types::network::gossip::TransactionGossip;
+    use hyperscale_types::network::notification::ReadySignalNotification;
     use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::{
+        NetworkDefinition, NetworkMessage, ReadySignal, ShardId, WeightedTimestamp,
+    };
 
     use crate::shard::test_host::{Fixture, SHARD, loop_of};
     use crate::shard::{HostEvent, ShardInbox, ShardScopedInput, push_shard_input};
 
     fn gossip(seed: u8) -> TransactionGossip {
         TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(seed))]))
+    }
+
+    /// `gossip` as a peer's copy reaches the registry: as wire bytes.
+    fn from_peer(registry: &HandlerRegistry, gossip: &TransactionGossip) -> Option<Verdict> {
+        let handler = registry
+            .get_gossip(TransactionGossip::message_type_id())
+            .expect("transaction gossip has a handler");
+        handler(hbor_to_vec(gossip).expect("gossip encodes"), Some(SHARD))
+    }
+
+    fn ready_signal(fix: &Fixture, shard: ShardId) -> ReadySignalNotification {
+        let (validator, signer) = fix.identity(2);
+        ReadySignalNotification::new(
+            ReadySignal::sign(
+                &NetworkDefinition::simulator(),
+                validator,
+                shard,
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::ZERO,
+                signer.as_ref(),
+            )
+            .expect("the validator's key signs"),
+        )
     }
 
     /// Gossip that finds its shard's network lane full is refused as gossip
@@ -1339,12 +1367,9 @@ mod tests {
         );
         while internal.try_recv().is_ok() {}
 
+        assert_eq!(from_peer(&registry, &gossip(1)), Some(Verdict::Accept));
         assert_eq!(
-            registry.local_dispatch_gossip(&gossip(1), Some(SHARD)),
-            Some(Verdict::Accept),
-        );
-        assert_eq!(
-            registry.local_dispatch_gossip(&gossip(2), Some(SHARD)),
+            from_peer(&registry, &gossip(2)),
             Some(Verdict::Busy),
             "gossip past the lane's bound is refused, not queued",
         );
@@ -1364,20 +1389,58 @@ mod tests {
 
         let _ = network.try_recv();
         assert_eq!(
-            registry.local_dispatch_gossip(&gossip(2), Some(SHARD)),
+            from_peer(&registry, &gossip(2)),
             Some(Verdict::Accept),
             "a refused copy is taken once the lane has room",
         );
+    }
+
+    /// What the host sends its own co-hosted shards lands on their internal
+    /// lane, however full the network lane peers fill is.
+    #[test]
+    fn the_hosts_own_messages_land_past_a_full_network_lane() {
+        let fix = Fixture::new();
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (internal_tx, internal) = unbounded();
+        let (network_tx, network) = bounded(1);
+        let (beacon_tx, _beacon) = unbounded();
+        let _host = fix.host_with_inbox(
+            Arc::clone(&registry),
+            beacon_tx,
+            ShardInbox::new(internal_tx, network_tx),
+        );
+        while internal.try_recv().is_ok() {}
+        assert_eq!(from_peer(&registry, &gossip(1)), Some(Verdict::Accept));
+        assert_eq!(network.len(), 1, "the network lane is full");
+
+        assert!(registry.local_dispatch_notification(&ready_signal(&fix, SHARD)));
+        assert_eq!(
+            registry.local_dispatch_gossip(&gossip(2), Some(SHARD)),
+            Some(Verdict::Accept),
+        );
+        let landed: Vec<HostEvent> = internal.try_iter().collect();
+        assert!(
+            landed.iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(_, ShardScopedInput::Protocol(event))
+                    if matches!(**event, ProtocolEvent::ReadySignalReceived { .. })
+            )),
+            "the host's own notification lands",
+        );
+        assert!(
+            landed.iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(_, ShardScopedInput::TransactionGossipReceived { .. })
+            )),
+            "the host's own gossip lands",
+        );
+        assert_eq!(network.len(), 1, "nothing of the host's joins the lane");
     }
     /// A ready signal reaches the hosted shards on its shard's trie line,
     /// the splitting parent of the child it readies among them, and no
     /// hosted shard off that line.
     #[test]
     fn a_ready_signal_reaches_only_the_shards_on_its_line() {
-        use hyperscale_core::ProtocolEvent;
-        use hyperscale_types::network::notification::ReadySignalNotification;
-        use hyperscale_types::{NetworkDefinition, ReadySignal, ShardId, WeightedTimestamp};
-
         let fix = Fixture::new();
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
         let (internal_tx, _internal) = unbounded();
@@ -1388,24 +1451,13 @@ mod tests {
             beacon_tx,
             ShardInbox::new(internal_tx, network_tx),
         );
-        let (validator, signer) = fix.identity(2);
-        let signal_for = |shard: ShardId| {
-            ReadySignalNotification::new(
-                ReadySignal::sign(
-                    &NetworkDefinition::simulator(),
-                    validator,
-                    shard,
-                    WeightedTimestamp::ZERO,
-                    WeightedTimestamp::ZERO,
-                    signer.as_ref(),
-                )
-                .expect("the validator's key signs"),
-            )
-        };
+        let handler = registry
+            .get_notification(ReadySignalNotification::message_type_id())
+            .expect("ready signals have a handler");
         let (left, right) = SHARD.children();
         let sibling = ShardId::leaf(1, 1);
         let delivered = |shard: ShardId| {
-            assert!(registry.local_dispatch_notification(&signal_for(shard)));
+            let _ = handler(hbor_to_vec(&ready_signal(&fix, shard)).expect("signal encodes"));
             network
                 .try_iter()
                 .filter(|event| {

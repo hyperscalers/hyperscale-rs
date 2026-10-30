@@ -18,6 +18,7 @@
 //! only from the single thread driving shard reconfiguration.
 
 use std::any::{Any, TypeId};
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,36 @@ use crate::deferred::{Deferred, WaitId, Waiting};
 use crate::traits::{
     Deferral, GossipHandler, NotificationHandler, RequestHandler, Verdict, VerdictKey,
 };
+
+thread_local! {
+    static LOCAL_DISPATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the handler running on this thread was handed its message by
+/// this host itself rather than by a peer.
+///
+/// True inside [`HandlerRegistry`]'s local dispatches. A handler that
+/// bounds what peers may queue on this host lets its own messages past
+/// that bound.
+#[must_use]
+pub fn dispatching_locally() -> bool {
+    LOCAL_DISPATCH.with(Cell::get)
+}
+
+/// Marks the handlers run while it lives as dispatched locally.
+struct LocalDispatch(bool);
+
+impl LocalDispatch {
+    fn enter() -> Self {
+        Self(LOCAL_DISPATCH.with(|local| local.replace(true)))
+    }
+}
+
+impl Drop for LocalDispatch {
+    fn drop(&mut self) {
+        LOCAL_DISPATCH.with(|local| local.set(self.0));
+    }
+}
 
 /// Type-erased gossip handler: receives decompressed wire bytes plus the
 /// shard the topic encoded (`None` for global-scoped topics), and returns
@@ -722,6 +753,7 @@ impl HandlerRegistry {
     where
         M: NetworkMessage + 'static,
     {
+        let _local = LocalDispatch::enter();
         let verdict = self
             .local_gossip
             .load()
@@ -818,6 +850,7 @@ impl HandlerRegistry {
     where
         M: NetworkMessage + 'static,
     {
+        let _local = LocalDispatch::enter();
         self.local_notification
             .load()
             .get(&TypeId::of::<M>())

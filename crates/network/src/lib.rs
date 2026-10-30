@@ -21,7 +21,7 @@ mod traits;
 pub use compression::CompressionError;
 pub use registry::{
     AnswerScore, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, RawNotificationHandler,
-    RawRequestHandler,
+    RawRequestHandler, dispatching_locally,
 };
 pub use traits::{
     Answerers, Deferral, GossipHandler, GossipScope, Network, NotificationHandler, RequestError,
