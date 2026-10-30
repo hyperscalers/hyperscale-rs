@@ -35,6 +35,7 @@ use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::ProcessIo;
+use crate::process::single_flight::{Flight, SingleFlight};
 use crate::shard::cross_shard::crossing_push;
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
@@ -950,7 +951,6 @@ pub fn register_shard_request_handlers<S, N, D>(
     N: Network,
     D: Dispatch,
 {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use hyperscale_engine::Executor;
@@ -976,45 +976,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     };
     use crate::shard::mempool::serve_transaction_request;
 
-    type ProvisionResponse = GetProvisionResponse;
-    type ProvisionWaiter = Arc<(
-        std::sync::Mutex<Option<ProvisionResponse>>,
-        std::sync::Condvar,
-    )>;
-
-    struct InFlightSlot {
-        waiter: ProvisionWaiter,
-        waiters: usize,
-    }
-
-    struct ProvisionsRequestDedup {
-        cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
-        in_flight: HashMap<(u64, u64), InFlightSlot>,
-    }
-
-    // Single-flight guard: clears the `in_flight` slot and wakes waiters
-    // when the producer's stack unwinds — including on panic, where the
-    // explicit cleanup below would be skipped. Waiters treat a still-`None`
-    // slot after wake as a failure response.
-    struct InFlightGuard {
-        dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>>,
-        waiter: ProvisionWaiter,
-        cache_key: (u64, u64),
-    }
-    impl Drop for InFlightGuard {
-        fn drop(&mut self) {
-            if let Ok(mut g) = self.dedup.lock() {
-                g.in_flight.remove(&self.cache_key);
-            }
-            self.waiter.1.notify_all();
-        }
-    }
-
     // Cap how long a waiter blocks on a producer. Request handlers run on
     // tokio blocking-pool threads; without a bound, a stalled producer can
-    // pin every waiter thread and eventually starve the pool. The guard
-    // above already wakes waiters on producer panic — this bound covers
-    // the rest (deadlock, deep stalls, runaway work).
+    // pin every waiter thread and eventually starve the pool.
     const PRODUCER_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     // Cap concurrent waiters on a single producer. Honest fan-out from
@@ -1025,6 +989,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     // by then the producer has typically published a result that the
     // cache fast path will serve.
     const MAX_WAITERS_PER_KEY: usize = 64;
+
+    // Produced provisions kept per shard, by (height, target shard).
+    const PROVISION_CACHE_CAPACITY: usize = 256;
 
     // Each handler closure captures this shard's `PendingChain` and
     // per-protocol caches. Every CHAIN read goes through
@@ -1146,11 +1113,11 @@ pub fn register_shard_request_handlers<S, N, D>(
     let outbound_cache = Arc::clone(&io.caches.provision_store);
     let derivation = process.derivation();
 
-    let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
-        Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
-            cache: std::collections::BTreeMap::new(),
-            in_flight: HashMap::new(),
-        }));
+    let provisions_flight = SingleFlight::new(
+        PROVISION_CACHE_CAPACITY,
+        MAX_WAITERS_PER_KEY,
+        PRODUCER_WAIT_BUDGET,
+    );
 
     process
         .network
@@ -1158,7 +1125,6 @@ pub fn register_shard_request_handlers<S, N, D>(
             shard,
             move |req: GetProvisionsRequest| {
                 let height = req.height;
-                let cache_key = (height.inner(), req.target_shard.inner());
 
                 // Outbound fast path: if we still hold the exact batch we
                 // generated for this (source_block_height, target_shard),
@@ -1171,102 +1137,28 @@ pub fn register_shard_request_handlers<S, N, D>(
                     };
                 }
 
-                // Fast path: check cache or join an existing in-flight
-                // computation. Reservation happens under `dedup` lock so
-                // the per-key waiter cap is checked atomically with the
-                // count increment.
-                let waiter_to_join = {
-                    let mut guard = dedup.lock().unwrap();
-                    if let Some(cached) = guard.cache.get(&cache_key) {
-                        if let Some(p) = &cached.provisions {
-                            record_fetch_response_sent("provision", p.transactions().len().max(1));
-                        }
-                        return cached.clone();
+                let cache_key = (height.inner(), req.target_shard.inner());
+                let provisions = match provisions_flight.get_or_produce(cache_key, || {
+                    serve_provision_request(
+                        &pending_chain,
+                        derivation.as_ref(),
+                        shard,
+                        topology_snapshot.load().shard_trie(),
+                        &req,
+                    )
+                    .provisions
+                }) {
+                    Flight::Cached(provisions) => {
+                        record_fetch_response_sent(
+                            "provision",
+                            provisions.transactions().len().max(1),
+                        );
+                        Some(provisions)
                     }
-                    if let Some(slot) = guard.in_flight.get_mut(&cache_key) {
-                        if slot.waiters >= MAX_WAITERS_PER_KEY {
-                            // Cap reached — return a soft failure so the
-                            // caller can retry once the producer publishes;
-                            // the cache fast path will then serve.
-                            return GetProvisionResponse { provisions: None };
-                        }
-                        slot.waiters += 1;
-                        Some(Arc::clone(&slot.waiter))
-                    } else {
-                        None
-                    }
+                    Flight::Joined(provisions) | Flight::Produced(provisions) => Some(provisions),
+                    Flight::Unavailable => None,
                 };
-
-                if let Some(waiter) = waiter_to_join {
-                    let (lock, cvar) = &*waiter;
-                    let wait_result =
-                        cvar.wait_timeout_while(lock.lock().unwrap(), PRODUCER_WAIT_BUDGET, |r| {
-                            r.is_none()
-                        });
-                    // Decrement the per-key waiter count regardless of how
-                    // we left the wait (timeout, success, or producer drop).
-                    // The producer's `InFlightGuard` may have already
-                    // removed the slot, and a fresh producer may have
-                    // inserted a new one under the same key — `ptr_eq`
-                    // ensures we only decrement against the slot we
-                    // actually joined.
-                    if let Ok(mut g) = dedup.lock()
-                        && let Some(slot) = g.in_flight.get_mut(&cache_key)
-                        && Arc::ptr_eq(&slot.waiter, &waiter)
-                    {
-                        slot.waiters = slot.waiters.saturating_sub(1);
-                    }
-                    let (result, wait_outcome) = wait_result.unwrap();
-                    if wait_outcome.timed_out() {
-                        return GetProvisionResponse { provisions: None };
-                    }
-                    return result
-                        .clone()
-                        .unwrap_or(GetProvisionResponse { provisions: None });
-                }
-
-                // We're the producer — register the in-flight slot and let
-                // the guard handle cleanup + waiter wake-up on every exit
-                // path, including panic.
-                let waiter: ProvisionWaiter = Arc::new((
-                    std::sync::Mutex::new(None::<GetProvisionResponse>),
-                    std::sync::Condvar::new(),
-                ));
-                dedup.lock().unwrap().in_flight.insert(
-                    cache_key,
-                    InFlightSlot {
-                        waiter: Arc::clone(&waiter),
-                        waiters: 0,
-                    },
-                );
-
-                let _guard = InFlightGuard {
-                    dedup: Arc::clone(&dedup),
-                    waiter: Arc::clone(&waiter),
-                    cache_key,
-                };
-
-                let response = serve_provision_request(
-                    &pending_chain,
-                    derivation.as_ref(),
-                    shard,
-                    topology_snapshot.load().shard_trie(),
-                    &req,
-                );
-
-                if response.provisions.is_some() {
-                    let mut g = dedup.lock().unwrap();
-                    g.cache.insert(cache_key, response.clone());
-                    // Evict oldest entry (keep last 256)
-                    if g.cache.len() > 256 {
-                        g.cache.pop_first();
-                    }
-                }
-
-                // Publish the result before the guard's notify_all fires.
-                *waiter.0.lock().unwrap() = Some(response.clone());
-
-                response
+                GetProvisionResponse { provisions }
             },
         );
 

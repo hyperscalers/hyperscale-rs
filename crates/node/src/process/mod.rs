@@ -11,6 +11,7 @@
 mod canonical_txs;
 mod fan_out;
 mod network_handlers;
+mod single_flight;
 mod tx_status;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
