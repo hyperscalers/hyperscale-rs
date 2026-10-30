@@ -18,10 +18,12 @@ use hyperscale_storage::test_helpers::commit_one;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::notification::beacon::BeaconProposalNotification;
 use hyperscale_types::network::request::GetInstanceRecordsRequest;
-use hyperscale_types::network::request::beacon::{GetBeaconBlockRequest, GetBeaconProposalRequest};
+use hyperscale_types::network::request::beacon::{
+    GetBeaconBlockRequest, GetBeaconCandidateRequest, GetBeaconProposalRequest,
+};
 use hyperscale_types::network::response::GetInstanceRecordsResponse;
 use hyperscale_types::network::response::beacon::{
-    GetBeaconBlockResponse, GetBeaconProposalResponse,
+    GetBeaconBlockResponse, GetBeaconCandidateResponse, GetBeaconProposalResponse,
 };
 use hyperscale_types::test_utils::{certify, make_live_block, test_pool, test_transaction};
 use hyperscale_types::{
@@ -233,15 +235,11 @@ fn a_fetched_proposal_failing_verification_is_asked_again() {
     assert_eq!(in_flight(&host.beacon), 1, "it is asked again at once");
 }
 
-/// A fetched candidate whose certificate does not verify resolves
-/// nothing: its id is asked again rather than retired once the
-/// loop's check fails.
-#[test]
-fn a_fetched_candidate_failing_verification_is_asked_again() {
+/// A candidate extending the fixture's genesis whose certificate's
+/// aggregate signatures are forged.
+fn forged_candidate(fix: &Fixture) -> CandidateBeaconBlock {
     use hyperscale_types::{PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, SpcCert, SpcView};
 
-    let fix = Fixture::new();
-    let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
     let block = BeaconBlock::new(
         Epoch::new(1),
         fix.genesis_block().block_hash(),
@@ -262,14 +260,24 @@ fn a_fetched_candidate_failing_verification_is_asked_again() {
         PcSignerLengths::Uniform(0),
         AggregateSignature::new([0x11; 96]),
     );
-    let forged = CandidateBeaconBlock::new(
+    CandidateBeaconBlock::new(
         block,
         Box::new(SpcCert::Direct {
             prev_view: SpcView::INITIAL,
             value: PcVector::empty(),
             proof: qc3.into(),
         }),
-    );
+    )
+}
+
+/// A fetched candidate whose certificate does not verify resolves
+/// nothing: its id is asked again rather than retired once the
+/// loop's check fails.
+#[test]
+fn a_fetched_candidate_failing_verification_is_asked_again() {
+    let fix = Fixture::new();
+    let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+    let forged = forged_candidate(&fix);
     let ids = || {
         FetchIds::Beacon(BeaconFetchIds::Candidates(vec![(
             Epoch::new(1),
@@ -294,6 +302,36 @@ fn a_fetched_candidate_failing_verification_is_asked_again() {
         "the forged answer does not retire the id"
     );
     assert_eq!(fetch.in_flight_count(), 1, "it is asked again at once");
+}
+
+/// A peer that answers a candidate fetch with a forged candidate is
+/// distrusted once the loop's off-thread check finds it false.
+#[test]
+fn a_peer_answering_a_forged_candidate_is_distrusted() {
+    let fix = Fixture::new();
+    let (mut wire, mut host, events) = wired(&fix, SyncDispatch::new());
+    let forged = forged_candidate(&fix);
+    let served = Arc::new(Verifiable::from(forged.clone()));
+    wire.peer
+        .register_request_handler(SHARD, move |_: GetBeaconCandidateRequest| {
+            GetBeaconCandidateResponse::new(Some(Arc::clone(&served)))
+        });
+
+    host.beacon.ask(
+        participant(2),
+        FetchIds::Beacon(BeaconFetchIds::Candidates(vec![(
+            Epoch::new(1),
+            forged.block_hash(),
+        )])),
+        SHARD,
+        None,
+        None,
+    );
+    wire.pump(&mut host, &events);
+    assert!(
+        wire.network.distrust(0, 1, wire.now) > 0.5,
+        "the peer that served a forged candidate is distrusted"
+    );
 }
 
 /// A record fetch action from a participant asks nothing and holds

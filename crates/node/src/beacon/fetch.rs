@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_core::{BeaconFetchIds, FetchIds, ProtocolEvent};
 use hyperscale_metrics::record_fetch_response_refused;
-use hyperscale_network::{Network, RequestError, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict, VerdictKey};
 use hyperscale_types::network::request::beacon::{
     GetBeaconCandidateRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
@@ -39,7 +39,7 @@ use crate::config::NodeConfig;
 use crate::event::BeaconScopedInput;
 use crate::fetch::{
     Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, HandsOver, Refusal, Route,
-    ScopedAnswer, defers_to_the_tick, dispatch_scoped, transport_failed,
+    ScopedAnswer, defers_to_the_tick, dispatch_scoped, scored, transport_failed,
 };
 use crate::shard::{HostEvent, SharedTopologySnapshot};
 
@@ -217,6 +217,55 @@ impl BeaconReply {
             }
         }
     }
+
+    /// The response boundary of a candidate fetch for `id`. A peer that
+    /// does not hold the candidate releases `id` at no cost to it, and one
+    /// that answers with another candidate is refused at once. The one
+    /// asked for goes to the beacon loop, whose check needs the fold and
+    /// runs off this thread: the peer answers for it when that check
+    /// settles the candidate's verdict.
+    fn settle_candidate(
+        &self,
+        id: (Epoch, BeaconBlockHash),
+        result: Result<GetBeaconCandidateResponse, RequestError>,
+    ) -> ResponseVerdict {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                return transport_failed::<BeaconCandidateBinding, _>(vec![id], &error, self);
+            }
+        };
+        let ids = BeaconCandidateBinding::ids(vec![id]);
+        let (epoch, block_hash) = id;
+        let candidate = match response.candidate {
+            None => Err(Refusal::NotHeld),
+            Some(candidate)
+                if candidate.epoch() != epoch || candidate.block_hash() != block_hash =>
+            {
+                Err(Refusal::Unusable("candidate_mismatch"))
+            }
+            Some(candidate) => Ok(candidate),
+        };
+        match candidate {
+            Ok(candidate) => {
+                let key = VerdictKey::of(candidate.as_unverified());
+                self.answered(ids, ProtocolEvent::BeaconCandidateReceived { candidate });
+                ResponseVerdict::defer(key)
+            }
+            Err(refusal) => {
+                if let Refusal::Unusable(reason) = refusal {
+                    warn!(
+                        epoch = epoch.inner(),
+                        ?block_hash,
+                        "Fetched BeaconCandidate is not the one asked for — asking another peer"
+                    );
+                    record_fetch_response_refused(BeaconCandidateBinding::NAME, reason);
+                }
+                self.refused(ids);
+                scored(refusal)
+            }
+        }
+    }
 }
 
 impl FetchReply for BeaconReply {
@@ -372,6 +421,8 @@ impl FetchBinding for BeaconCandidateBinding {
     }
 }
 
+/// The wire type addresses a single candidate, so one request carries
+/// one id.
 impl FetchedBy<BeaconFetchState> for BeaconCandidateBinding {
     fn fetch_mut(state: &mut BeaconFetchState) -> &mut Fetch<Self::Id> {
         &mut state.beacon_candidate
@@ -383,42 +434,14 @@ impl FetchedBy<BeaconFetchState> for BeaconCandidateBinding {
         network: &N,
         reply: &BeaconReply,
     ) {
-        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
-    }
-}
-
-/// The wire type addresses a single candidate, so `(epoch, block_hash)`
-/// is the scope and one request carries one.
-impl ScopedAnswer for BeaconCandidateBinding {
-    type Scope = Self::Id;
-    type Key = ();
-    type Request = GetBeaconCandidateRequest;
-
-    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
-        (id, ())
-    }
-
-    fn join(scope: Self::Scope, (): Self::Key) -> Self::Id {
-        scope
-    }
-
-    fn request((epoch, block_hash): Self::Scope, _keys: &[Self::Key]) -> Self::Request {
-        GetBeaconCandidateRequest::new(epoch, block_hash)
-    }
-
-    /// A peer answering with a candidate other than the one asked for is
-    /// refused here; the beacon loop checks the rest as a gossiped
-    /// candidate is checked before the slot retires.
-    fn answer(
-        (epoch, block_hash): Self::Scope,
-        _keys: Vec<Self::Key>,
-        response: GetBeaconCandidateResponse,
-    ) -> Result<ProtocolEvent, Refusal> {
-        let candidate = response.candidate.ok_or(Refusal::NotHeld)?;
-        if candidate.epoch() != epoch || candidate.block_hash() != block_hash {
-            return Err(Refusal::Unusable("candidate_mismatch"));
+        for id @ (epoch, block_hash) in ids {
+            let reply = reply.clone();
+            route.request(
+                network,
+                GetBeaconCandidateRequest::new(epoch, block_hash),
+                Box::new(move |result| reply.settle_candidate(id, result)),
+            );
         }
-        Ok(ProtocolEvent::BeaconCandidateReceived { candidate })
     }
 }
 

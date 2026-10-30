@@ -30,7 +30,7 @@ use hyperscale_beacon::coordinator::retention_floor;
 use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration};
 use hyperscale_core::{Action, FetchIds, FetchRequest, ParticipationChange, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_network::Network;
+use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::network::gossip::ShardVoteEquivocationGossip;
 use hyperscale_types::{
@@ -462,17 +462,22 @@ where
     /// Check a fetched candidate once for every participant, off-thread,
     /// against the fold's tip. A verified one returns to
     /// [`Self::on_answer`] and is kept for serving; one that fails
-    /// releases its ids for another peer's answer.
+    /// releases its ids for another peer's answer. The check settles the
+    /// verdict the fetch deferred, so the peer that gave a false
+    /// candidate answers for it; one the fold cannot place is not held
+    /// against it.
     fn verify_fetched_candidate(
         &mut self,
         ids: FetchIds,
         candidate: Arc<Verifiable<CandidateBeaconBlock>>,
     ) {
+        let key = VerdictKey::of(candidate.as_unverified());
         let Some(CandidateKeys {
             committee,
             equivocation_signers,
         }) = self.fold.candidate_keys(&candidate)
         else {
+            self.process.network.settle(key, Verdict::Ignore);
             self.release(ids, Release::Failed);
             return;
         };
@@ -489,6 +494,14 @@ where
                     equivocation_signers: &equivocation_signers,
                     verifier: verifier.as_ref(),
                 });
+                handles.network.settle(
+                    key,
+                    if checked.is_ok() {
+                        Verdict::Accept
+                    } else {
+                        Verdict::Reject
+                    },
+                );
                 let input = match checked {
                     Ok(candidate) => {
                         let candidate = Arc::new(candidate);

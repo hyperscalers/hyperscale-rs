@@ -859,6 +859,13 @@ impl SimulatedNetwork {
         self.registries[node as usize] = Arc::new(HandlerRegistry::new(hosted));
     }
 
+    /// How far `requester` distrusts `peer` at `now`, from 0 to 1, for
+    /// answers that held up to nothing.
+    #[must_use]
+    pub fn distrust(&self, requester: NodeIndex, peer: NodeIndex, now: Duration) -> f64 {
+        self.peer_health[requester as usize].distrust(peer, now)
+    }
+
     /// Whether `node`'s process is down.
     #[must_use]
     pub fn is_down(&self, node: NodeIndex) -> bool {
