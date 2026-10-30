@@ -22,14 +22,14 @@
 //! [`verify_beacon_block`]. Each outcome returns to its owner as a
 //! [`BeaconScopedInput::Continuation`].
 //!
-//! The host's beacon subsystems live beside the driver. [`sync`] holds the
-//! beacon-block catch-up binding the beacon loop drives. [`proposal_cache`]
-//! backs the beacon-proposal serve path and [`candidate_cache`] the
-//! ratify-candidate one. [`block_serve`] answers inbound `GetBeaconBlockRequest`s;
-//! [`gossip`] registers the beacon gossip handlers. [`fetch`] holds the beacon
-//! fetches (missing proposals, ratify candidates, shard-witness leaves) and
-//! their bindings; [`witness_serve`] answers inbound
-//! `GetShardWitnessesRequest`s.
+//! The host's beacon subsystems live beside the driver. [`block_sync`]
+//! holds the beacon-block catch-up binding and the glue that drives it;
+//! [`block_serve`] answers inbound `GetBeaconBlockRequest`s.
+//! [`proposal_cache`] backs the beacon-proposal serve path and
+//! [`candidate_cache`] the ratify-candidate one. [`gossip`] registers the
+//! beacon gossip handlers. [`fetch`] holds the beacon fetches (missing
+//! proposals, ratify candidates, shard-witness leaves) and their bindings;
+//! [`witness_serve`] answers inbound `GetShardWitnessesRequest`s.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -69,9 +69,11 @@ mod participants;
 mod proposal_cache;
 mod records;
 mod submissions;
-mod sync;
 pub mod witness_serve;
 
+pub use block_sync::{
+    BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, has_pending, resumed_at,
+};
 pub use candidate_cache::BeaconCandidateCache;
 pub use fetch::{
     BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding, BeaconReply, ProposalKeys,
@@ -81,9 +83,6 @@ use interest::{Asked, Askers, Interest};
 use participants::{Participant, SharedCheck};
 pub use proposal_cache::BeaconProposalCache;
 pub(crate) use records::custodian;
-pub use sync::{
-    BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, has_pending, resumed_at,
-};
 
 /// The host's beacon driver.
 pub struct BeaconLoop<S, N, D>
