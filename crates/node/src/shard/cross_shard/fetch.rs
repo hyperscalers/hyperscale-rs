@@ -426,7 +426,7 @@ impl ScopedAnswer for SettledTxsBinding {
         }
         Ok(ProtocolEvent::SettledTxsReconstructed {
             shard: scope.shard,
-            txs: txs.into_iter().collect(),
+            txs: txs.iter().copied().collect(),
             terminal_wt: scope.terminal_wt,
         })
     }

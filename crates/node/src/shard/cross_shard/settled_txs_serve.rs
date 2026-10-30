@@ -149,9 +149,10 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
             window_floor,
             || reconstruct(pending_chain, window_floor, req),
         )
-        .map_or_else(GetSettledTxsResponse::not_found, |window| {
-            GetSettledTxsResponse::found(SettledWindow::clone(&window))
-        })
+        .map_or_else(
+            GetSettledTxsResponse::not_found,
+            GetSettledTxsResponse::found,
+        )
 }
 
 /// The window `req` names, reconstructed off this store, or `None` where
@@ -512,7 +513,10 @@ mod tests {
         let second = serve_settled_txs_request(&pending_chain, &cache, None, &req)
             .txs
             .expect("served from the cache");
-        assert_eq!(first, second);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a cached window is served without copying it"
+        );
         assert_eq!(cache.len(), 1, "the second request adds no entry");
 
         // A different floor is a different window, so it is a different
