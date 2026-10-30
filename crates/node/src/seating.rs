@@ -784,28 +784,33 @@ where
         .collect()
 }
 
-/// The rebuild a running loop of `shard` takes when its store needs a
-/// height beneath every serving peer's chain floor, so block sync cannot
-/// carry it forward and a snap-sync at the attested anchor must.
+/// The rebuild a running loop takes when its store needs a height
+/// beneath every serving peer's chain floor, so block sync cannot carry
+/// it forward and a snap-sync at the attested anchor must.
 ///
 /// The rebuilt store seats [`reseated_validators`]: every validator in
-/// `local` the shard places, and every one the loop `carried` that a
-/// pending recovery did not replace. The rounds signed on the old store
-/// stay consumed ([`Replaced::Behind`]). `None` where the committed `head`
-/// holds no attested anchor to rebuild at.
+/// `local` the shard places, and every one the loop carries
+/// (`view.attached`) that a pending recovery did not replace. The rounds
+/// signed on the old store stay consumed ([`Replaced::Behind`]). `None`
+/// for a loop the plan may not seat on ([`HostedView::seatable`]), whose
+/// rebuild or reshape duty seats it, and where the committed `head` holds
+/// no attested anchor to rebuild at.
 #[must_use]
-pub fn reseat<H: BuildHasher>(
-    shard: ShardId,
+pub fn reseat<R: ?Sized, H: BuildHasher>(
+    view: &HostedView<'_, R>,
     schedule: &TopologySchedule,
     head: &TopologySnapshot,
-    carried: &[ValidatorId],
     local: &HashSet<ValidatorId, H>,
 ) -> Option<SeatChange> {
+    let shard = view.shard;
+    if !view.seatable {
+        return None;
+    }
     head.boundary(shard)?;
     let placed = placed_validators(shard, schedule, |validator| local.contains(&validator));
     Some(SeatChange::Rebuild {
         shard,
-        seats: reseated_validators(shard, schedule, carried, placed),
+        seats: reseated_validators(shard, schedule, &view.attached, placed),
         replaced: Replaced::Behind,
     })
 }
@@ -1480,24 +1485,9 @@ mod tests {
         );
     }
 
-    /// A re-seat rebuilds behind at the attested anchor, carrying what the
-    /// loop carried beside what the shard places; with no anchor it has
-    /// nothing to rebuild at.
-    #[test]
-    fn a_reseat_rebuilds_behind_only_at_an_attested_anchor() {
-        let lagging = validator(3);
-        let local = HashSet::from([HOST]);
-        let unanchored = recovering(vec![HOST], Vec::new(), None);
-        assert_eq!(
-            reseat(
-                ShardId::ROOT,
-                &unanchored,
-                unanchored.head(),
-                &[lagging],
-                &local
-            ),
-            None
-        );
+    /// The host alone on the root, whose committed head carries an
+    /// attested anchor at height four.
+    fn anchored_root() -> TopologySchedule {
         let anchor = ShardAnchor {
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
@@ -1508,28 +1498,49 @@ mod tests {
             handoff_complete: None,
             terminal_epoch: None,
         };
-        let anchored = TopologySchedule::new(
+        TopologySchedule::new(
             WINDOWS,
             Epoch::new(5),
             Arc::new(
                 explicit_head(HashMap::from([(ShardId::ROOT, vec![HOST])]))
                     .with_boundaries(BTreeMap::from([(ShardId::ROOT, anchor)])),
             ),
-        );
+        )
+    }
+
+    /// A re-seat rebuilds behind at the attested anchor, carrying what the
+    /// loop carried beside what the shard places; with no anchor it has
+    /// nothing to rebuild at.
+    #[test]
+    fn a_reseat_rebuilds_behind_only_at_an_attested_anchor() {
+        let lagging = validator(3);
+        let local = HashSet::from([HOST]);
+        let unanchored = recovering(vec![HOST], Vec::new(), None);
+        let loop_view = view(ShardId::ROOT, &[lagging]);
         assert_eq!(
-            reseat(
-                ShardId::ROOT,
-                &anchored,
-                anchored.head(),
-                &[lagging],
-                &local
-            ),
+            reseat(&loop_view, &unanchored, unanchored.head(), &local),
+            None
+        );
+        let anchored = anchored_root();
+        assert_eq!(
+            reseat(&loop_view, &anchored, anchored.head(), &local),
             Some(SeatChange::Rebuild {
                 shard: ShardId::ROOT,
                 seats: vec![HOST, lagging],
                 replaced: Replaced::Behind,
             })
         );
+    }
+
+    /// A loop the plan may not seat on, one a rebuild or a reshape duty
+    /// is seating, is not re-seated, even at an attested anchor.
+    #[test]
+    fn a_reseat_leaves_an_unseatable_loop_alone() {
+        let local = HashSet::from([HOST]);
+        let anchored = anchored_root();
+        let mut seating = view(ShardId::ROOT, &[HOST]);
+        seating.seatable = false;
+        assert_eq!(reseat(&seating, &anchored, anchored.head(), &local), None);
     }
 
     /// A re-seat drops a carried member a pending recovery replaced unless

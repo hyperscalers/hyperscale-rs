@@ -274,21 +274,30 @@ impl SimulationRunner {
     /// below-floor answer.
     fn reseat_step(&mut self) {
         for (host, shard) in std::mem::take(&mut self.pending_reseats) {
-            if !self.hosted_shards_of(host).contains(&shard)
-                || self.reshape[host as usize].is_seating(shard)
-            {
+            if !self.hosted_shards_of(host).contains(&shard) {
                 continue;
             }
-            let schedule = self.hosts[host as usize].process().topology_schedule();
-            let carried = self.hosts[host as usize].signers(shard);
             let local: HashSet<ValidatorId> = self.homed_validators(host).into_iter().collect();
-            let head = self.hosts[host as usize]
-                .process()
-                .topology_snapshot()
-                .load_full();
-            if let Some(change) = reseat(shard, &schedule, &head, &carried, &local) {
+            let process = self.hosts[host as usize].process();
+            let schedule = process.topology_schedule();
+            let head = process.topology_snapshot().load_full();
+            let view = self.hosted_view(host, shard);
+            if let Some(change) = reseat(&view, &schedule, &head, &local) {
                 self.apply_seat_change(host, change);
             }
+        }
+    }
+
+    /// `host`'s loop of `shard` as the seating plan reads it: seatable
+    /// unless a reshape duty is seating the shard.
+    fn hosted_view(&self, host: NodeIndex, shard: ShardId) -> HostedView<'_, SimShardStorage> {
+        let node = &self.hosts[host as usize];
+        HostedView {
+            shard,
+            store: Some(&**node.shard_io(shard).storage()),
+            attached: node.signers(shard),
+            attaching: Vec::new(),
+            seatable: !self.reshape[host as usize].is_seating(shard),
         }
     }
 
@@ -329,13 +338,7 @@ impl SimulationRunner {
             let orchestrator = &self.reshape[host as usize];
             let hosted: Vec<HostedView<'_, SimShardStorage>> = node
                 .hosted_shards()
-                .map(|shard| HostedView {
-                    shard,
-                    store: Some(&**node.shard_io(shard).storage()),
-                    attached: node.signers(shard),
-                    attaching: Vec::new(),
-                    seatable: !orchestrator.is_seating(shard),
-                })
+                .map(|shard| self.hosted_view(host, shard))
                 .collect();
             let changes = reconcile(&schedule, &head, &routing, &hosted, &local, |shard| {
                 !orchestrator.is_seating(shard)

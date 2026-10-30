@@ -407,23 +407,6 @@ impl SeatTable {
             && !self.awaiting_anchor.contains_key(&shard)
     }
 
-    /// The validators `shard`'s running loop carries, if a re-seat may
-    /// rebuild it: it runs here, and no rebuild or join is pending on it.
-    pub fn reseatable(&self, shard: ShardId) -> Option<Vec<ValidatorId>> {
-        if self.rebuilding.contains_key(&shard) || self.bootstrapping.contains_key(&shard) {
-            return None;
-        }
-        let thread = self.shards.get(&shard)?;
-        Some(
-            thread
-                .validator_ids
-                .iter()
-                .copied()
-                .map(ValidatorId::new)
-                .collect(),
-        )
-    }
-
     pub fn is_running(&self, shard: ShardId) -> bool {
         self.shards.contains_key(&shard)
     }
@@ -665,11 +648,6 @@ mod tests {
         assert!(
             !table.holds_store_dir(SHARD),
             "a running loop holds no prep"
-        );
-        assert_eq!(
-            table.reseatable(SHARD),
-            None,
-            "a rebuilding shard is not re-seated",
         );
 
         let departing = table.tear_down(SHARD).expect("running");

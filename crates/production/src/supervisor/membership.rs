@@ -477,20 +477,34 @@ impl ShardSupervisor {
         }
     }
 
-    /// Re-seat `shard` at its attested anchor ([`reseat`]): its loop needs
-    /// a height beneath every serving peer's chain floor, so block sync
-    /// cannot carry the store forward and a snap-sync must. A shard already
-    /// rebuilding, bootstrapping, or not running here has nothing to
-    /// re-seat, and one with no attested anchor has nothing to re-seat on.
+    /// Re-seat `shard` at its attested anchor as [`reseat`] plans: its loop
+    /// needs a height beneath every serving peer's chain floor, so block
+    /// sync cannot carry the store forward and a snap-sync must. A shard
+    /// bootstrapping or not running here has nothing to re-seat, one a
+    /// rebuild or a reshape duty is seating is left to it, and one with no
+    /// attested anchor has nothing to re-seat on.
     pub(super) fn reseat(&mut self, shard: ShardId) {
-        let Some(carried) = self.seats.reseatable(shard) else {
+        if self.seats.is_bootstrapping(shard) {
             return;
-        };
+        }
         let local: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
         let schedule = self.process.topology_schedule();
         let head = self.process.topology_snapshot().load_full();
-        let Some(change) = reseat(shard, &schedule, &head, &carried, &local) else {
-            warn!(shard = ?shard, "Store beneath every peer's chain floor, and no attested anchor to re-seat on");
+        let running = self.running_seats();
+        let storages = self.storages.lock().expect("storages lock");
+        let Some(view) = hosted_views(running, &storages)
+            .into_iter()
+            .find(|view| view.shard == shard)
+        else {
+            return;
+        };
+        let change = reseat(&view, &schedule, &head, &local);
+        let seatable = view.seatable;
+        drop(storages);
+        let Some(change) = change else {
+            if seatable {
+                warn!(shard = ?shard, "Store beneath every peer's chain floor, and no attested anchor to re-seat on");
+            }
             return;
         };
         info!(shard = ?shard, "Re-seating a store beneath every peer's chain floor");
