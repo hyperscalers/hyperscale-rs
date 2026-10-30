@@ -158,6 +158,11 @@ where
     /// the same for each, so the first to ask runs it and the outcome is
     /// handed to all.
     shared_checks: BTreeMap<SharedCheck, BTreeSet<Attachment>>,
+
+    /// Packages an off-thread install is reading from the stores this
+    /// host serves, so a repeat want waits on that install rather than
+    /// starting another.
+    installing: BTreeSet<Hash>,
 }
 
 /// One identity's beacon participation on the loop.
@@ -212,6 +217,7 @@ where
             fetch_tick: FetchTicker::default(),
             submissions: DeferredForRecords::new(),
             shared_checks: BTreeMap::new(),
+            installing: BTreeSet::new(),
         }
     }
 
@@ -493,8 +499,8 @@ where
             BeaconScopedInput::PackageArtifactsFetched { artifacts } => {
                 self.on_package_artifacts_fetched(artifacts);
             }
-            BeaconScopedInput::PackagesInstalled { packages } => {
-                self.on_packages_installed(packages);
+            BeaconScopedInput::PackagesInstalled { packages, unheld } => {
+                self.on_packages_installed(packages, unheld);
             }
             BeaconScopedInput::Shard { chain, input } => self.on_shard_input(chain, input),
             BeaconScopedInput::Register {
@@ -3944,6 +3950,39 @@ mod tests {
         want_record(&mut host, chain, instance);
         assert!(records_asked(&host).is_empty());
         assert_eq!(arrivals(&receiver), vec![instance]);
+    }
+
+    /// A wanted package is looked for in the stores this host serves off
+    /// the loop, once however often it is wanted meanwhile, and only what
+    /// none holds is asked of a peer.
+    #[test]
+    fn a_wanted_package_is_read_from_the_hosts_stores_once_off_the_loop() {
+        let fix = Fixture::new();
+        let jobs = Arc::new(DeferredJobs::new(ProcessingTimes::disk(7), 7));
+        let (_wire, mut host, events) = wired(&fix, SyncDispatch::deferred(Arc::clone(&jobs)));
+        let package = Hash::from_bytes(b"a package no store holds");
+        let (first, _) = chain_on_shard(&mut host);
+        let (second, _) = chain_on_shard(&mut host);
+        for chain in [first, second] {
+            host.beacon
+                .want_records(BeaconOwner::Chain(chain), Vec::new(), vec![package]);
+        }
+        let queued = jobs.take();
+        assert_eq!(queued.len(), 1, "one read covers both wants");
+        assert_eq!(host.beacon.fetches.package_artifact.pending_count(), 0);
+
+        for (_, job) in queued {
+            job();
+        }
+        while let Ok(event) = events.try_recv() {
+            let _ = host.step(event);
+        }
+        assert_eq!(
+            host.beacon.fetches.package_artifact.pending_count(),
+            1,
+            "what no store holds is asked of a peer",
+        );
+        assert!(host.beacon.installing.is_empty());
     }
 
     /// Bytes that derive no record answer for nothing asked: the peer

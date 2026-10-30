@@ -739,6 +739,9 @@ pub enum BeaconScopedInput {
     PackagesInstalled {
         /// The installed packages, by content address.
         packages: Vec<Hash>,
+        /// The packages the install was to read from a store this host
+        /// serves and found in none, to be asked of a peer.
+        unheld: Vec<Hash>,
     },
 
     /// What the replica of the chain `chain` names reported.

@@ -199,13 +199,13 @@ where
     /// What derivation already reads here is answered at once, so an ask
     /// queued behind its own answer costs no round trip; the answer comes
     /// after the asks, since it can settle what `owner` holds and give up
-    /// what it asked for. A package whose
-    /// bytes this host holds and whose metadata it does not is neither
-    /// asked for nor answered: fetching bytes already held seats nothing.
-    /// Code a store this host serves holds is installed from there, since
-    /// a store filled by an import or an adoption holds code the engine
-    /// never saw, and a host alone on the custodian's committee has no
-    /// peer to ask.
+    /// what it asked for. A package whose bytes this host holds and whose
+    /// metadata it does not is neither asked for nor answered: fetching
+    /// bytes already held seats nothing. Code a store this host serves
+    /// holds is installed from there, since a store filled by an import
+    /// or an adoption holds code the engine never saw, and a host alone on
+    /// the custodian's committee has no peer to ask; the stores are read
+    /// off the loop, and only what none holds is asked of a peer.
     pub(super) fn want_records(
         &mut self,
         owner: BeaconOwner,
@@ -227,9 +227,7 @@ where
                     .push(instance);
             }
         }
-        let hosted = self.process.dispatch_handles.per_shard.load_full();
-        let mut held: Vec<(Hash, Vec<u8>)> = Vec::new();
-        let mut artifacts: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
+        let mut from_stores: Vec<(Hash, Option<Vec<u8>>)> = Vec::new();
         let packages: BTreeSet<Hash> = packages.into_iter().collect();
         for package in packages {
             if executor.package_known(package) {
@@ -239,30 +237,19 @@ where
             if !executor.needs_artifact(package) {
                 continue;
             }
-            if let Some(artifact) = hosted
-                .values()
-                .find_map(|handles| handles.storage.package_artifact(package))
-            {
-                PackageArtifactBinding::askers(&mut self.interest)
-                    .entry(package)
-                    .or_default()
-                    .insert(owner);
-                held.push((package, artifact));
-            } else {
-                artifacts
-                    .entry(snapshot.shard_trie().shard_for_prefix(custodian(package)))
-                    .or_default()
-                    .push(package);
+            PackageArtifactBinding::askers(&mut self.interest)
+                .entry(package)
+                .or_default()
+                .insert(owner);
+            if self.installing.insert(package) {
+                from_stores.push((package, None));
             }
         }
         drop(snapshot);
         for (shard, ids) in records {
             self.ask_for::<InstanceRecordBinding>(owner, ids, shard, None, None);
         }
-        for (shard, ids) in artifacts {
-            self.ask_for::<PackageArtifactBinding>(owner, ids, shard, None, None);
-        }
-        self.install_artifacts(held);
+        self.install_artifacts(from_stores);
         self.notify_arrived(owner, arrived);
     }
 
@@ -312,50 +299,93 @@ where
     /// until the install reports, so an ask in between joins it rather
     /// than asking again.
     pub(super) fn on_package_artifacts_fetched(&self, artifacts: Vec<(Hash, Vec<u8>)>) {
-        self.install_artifacts(artifacts);
+        self.install_artifacts(
+            artifacts
+                .into_iter()
+                .map(|(package, artifact)| (package, Some(artifact)))
+                .collect(),
+        );
     }
 
-    /// Install artifacts already checked against their content address:
-    /// code into the engine, bytes into the copy beside the beacon store
-    /// a restart reconciles from, which outlives this host serving the
-    /// store it may have read them from.
+    /// Install artifacts: code into the engine, bytes into the copy
+    /// beside the beacon store a restart reconciles from, which outlives
+    /// this host serving the store it may have read them from. Each comes
+    /// with bytes already checked against its content address, or none,
+    /// to be read from a store this host serves; one no store holds is
+    /// reported unheld.
     ///
-    /// Both halves run off the loop. Admitting an artifact means clearing
-    /// the deterministic wasm profile and parsing every export it
-    /// declares, and persisting it means a synchronous store write — per
-    /// artifact, at a transaction's whole byte budget each — while this
-    /// loop drives the host's beacon participation and its timers.
-    fn install_artifacts(&self, artifacts: Vec<(Hash, Vec<u8>)>) {
+    /// All of it runs off the loop. Reading an artifact and persisting it
+    /// are synchronous store reads and writes, and admitting one means
+    /// clearing the deterministic wasm profile and parsing every export it
+    /// declares — per artifact, at a transaction's whole byte budget each
+    /// — while this loop drives the host's beacon participation and its
+    /// timers.
+    fn install_artifacts(&self, artifacts: Vec<(Hash, Option<Vec<u8>>)>) {
         if artifacts.is_empty() {
             return;
         }
-        let installed: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
         let handles = Arc::clone(&self.process.dispatch_handles);
         let reply = self.reply.clone();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
+                let hosted = handles.per_shard.load_full();
+                let mut installed = Vec::with_capacity(artifacts.len());
+                let mut unheld = Vec::new();
                 for (package, artifact) in artifacts {
                     if !handles.executor.needs_artifact(package) {
+                        installed.push(package);
                         continue;
                     }
+                    let Some(artifact) = artifact.or_else(|| {
+                        hosted
+                            .values()
+                            .find_map(|shard| shard.storage.package_artifact(package))
+                    }) else {
+                        unheld.push(package);
+                        continue;
+                    };
                     handles.executor.install_artifact(&artifact);
                     handles
                         .beacon_storage
                         .store_fetched_package(package, &artifact);
+                    installed.push(package);
                 }
                 // From inside the install: an envelope waiting on this
                 // package derives on the strength of this, and the
                 // metadata has to be seated before that is true.
                 reply.push(BeaconScopedInput::PackagesInstalled {
                     packages: installed,
+                    unheld,
                 });
             });
     }
 
     /// Retire the installed packages' fetch and tell every owner that
-    /// asked.
-    pub(super) fn on_packages_installed(&mut self, packages: Vec<Hash>) {
+    /// asked, and ask a peer for what no store here held and someone
+    /// still wants.
+    pub(super) fn on_packages_installed(&mut self, packages: Vec<Hash>, unheld: Vec<Hash>) {
+        for package in packages.iter().chain(&unheld) {
+            self.installing.remove(package);
+        }
+        let snapshot = self.process.topology_snapshot.load();
+        let mut asks: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
+        for package in unheld {
+            if self.interest.packages.contains_key(&package) {
+                asks.entry(snapshot.shard_trie().shard_for_prefix(custodian(package)))
+                    .or_default()
+                    .push(package);
+            }
+        }
+        drop(snapshot);
+        for (shard, ids) in asks {
+            self.drive_fetch::<PackageArtifactBinding>(FetchInput::Request {
+                ids,
+                shard,
+                preferred: None,
+                class: None,
+            });
+        }
         let askers = take_askers(&mut self.interest.packages, &packages);
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids: packages });
         for (owner, arrived) in askers {
