@@ -1974,6 +1974,152 @@ impl BeaconParticipant {
         }
     }
 
+    /// Feed this participant one beacon consensus event: a peer's message,
+    /// the outcome of a check it dispatched, or one of its timers. Every
+    /// other event is dropped with a warning. A received proposal must
+    /// carry its check; the host checks a peer's reveal before handing it
+    /// over.
+    pub fn on_event(&mut self, fold: &BeaconFold, event: ProtocolEvent) -> ParticipantStep {
+        match event {
+            ProtocolEvent::UnverifiedRatifyVoteReceived { vote } => {
+                self.on_unverified_ratify_vote_received(fold, vote).into()
+            }
+            ProtocolEvent::VerifiedRatifyVoteReceived { vote } => {
+                self.on_verified_ratify_vote_received(fold, vote)
+            }
+            ProtocolEvent::BeaconProposalReceived {
+                from,
+                epoch,
+                proposal,
+            } => {
+                let Ok(proposal) = Arc::unwrap_or_clone(proposal).into_verified() else {
+                    warn!(?from, "beacon proposal without its check — dropping");
+                    return ParticipantStep::default();
+                };
+                self.on_beacon_proposal_received(fold, from, epoch, Arc::new(proposal))
+                    .into()
+            }
+            ProtocolEvent::BeaconCandidateReceived { candidate } => {
+                self.on_beacon_candidate_received(fold, candidate).into()
+            }
+            ProtocolEvent::BeaconCandidateVerified { block_hash, result } => self
+                .on_beacon_candidate_verified(fold, block_hash, result)
+                .into(),
+            ProtocolEvent::RatifyVoteVerified {
+                anchor,
+                epoch,
+                round,
+                phase,
+                signer,
+                result,
+            } => {
+                let key = (anchor, epoch, round, phase, signer);
+                self.on_ratify_vote_verified(fold, key, result)
+            }
+            ProtocolEvent::BeaconCommitteeStartTimer => {
+                self.on_beacon_committee_start_timer(fold).into()
+            }
+            ProtocolEvent::BeaconRatifyTimer => self.on_beacon_ratify_timer(fold).into(),
+            ProtocolEvent::BeaconSpcViewTimer => self.on_beacon_spc_view_timer(fold).into(),
+            ProtocolEvent::BeaconSpcInputDwellTimer => self.on_spc_input_dwell_timer(fold).into(),
+            other => self.on_spc_event(fold, other),
+        }
+    }
+
+    /// The SPC plane's share of [`Self::on_event`]: PC votes and SPC
+    /// messages as they arrive, and the checks they dispatched.
+    fn on_spc_event(&mut self, fold: &BeaconFold, event: ProtocolEvent) -> ParticipantStep {
+        match event {
+            ProtocolEvent::UnverifiedPcVote1Received { epoch, view, vote } => {
+                self.on_pc_vote1_received(epoch, view, vote).into()
+            }
+            ProtocolEvent::UnverifiedPcVote2Received { epoch, view, vote } => {
+                self.on_pc_vote2_received(epoch, view, vote).into()
+            }
+            ProtocolEvent::UnverifiedPcVote3Received { epoch, view, vote } => {
+                self.on_pc_vote3_received(epoch, view, vote).into()
+            }
+            ProtocolEvent::VerifiedPcVote1Received { epoch, view, vote } => self
+                .on_verified_pc_vote1_received(fold, epoch, view, vote)
+                .into(),
+            ProtocolEvent::VerifiedPcVote2Received { epoch, view, vote } => self
+                .on_verified_pc_vote2_received(fold, epoch, view, vote)
+                .into(),
+            ProtocolEvent::VerifiedPcVote3Received { epoch, view, vote } => self
+                .on_verified_pc_vote3_received(fold, epoch, view, vote)
+                .into(),
+            ProtocolEvent::SpcNewViewReceived {
+                epoch,
+                from,
+                proposal,
+            } => self.on_spc_new_view_received(epoch, from, proposal).into(),
+            ProtocolEvent::SpcNewCommitReceived { epoch, from, msg } => {
+                self.on_spc_new_commit_received(epoch, from, msg).into()
+            }
+            ProtocolEvent::UnverifiedSpcEmptyViewReceived { epoch, msg } => self
+                .on_unverified_spc_empty_view_received(epoch, msg)
+                .into(),
+            ProtocolEvent::VerifiedSpcEmptyViewReceived { epoch, msg } => self
+                .on_verified_spc_empty_view_received(fold, epoch, msg)
+                .into(),
+            ProtocolEvent::PcVote1Verified {
+                epoch,
+                view,
+                signer,
+                result,
+            } => self
+                .on_pc_vote1_verified(fold, epoch, view, signer, result)
+                .into(),
+            ProtocolEvent::PcVote2Verified {
+                epoch,
+                view,
+                signer,
+                result,
+            } => self
+                .on_pc_vote2_verified(fold, epoch, view, signer, result)
+                .into(),
+            ProtocolEvent::PcVote3Verified {
+                epoch,
+                view,
+                signer,
+                result,
+            } => self
+                .on_pc_vote3_verified(fold, epoch, view, signer, result)
+                .into(),
+            ProtocolEvent::SpcNewViewVerified {
+                epoch,
+                from,
+                view,
+                result,
+            } => self
+                .on_spc_new_view_verified(fold, epoch, from, view, result)
+                .into(),
+            ProtocolEvent::SpcNewCommitVerified {
+                epoch,
+                from,
+                view,
+                result,
+            } => self
+                .on_spc_new_commit_verified(fold, epoch, from, view, result)
+                .into(),
+            ProtocolEvent::SpcEmptyViewVerified {
+                epoch,
+                from,
+                view,
+                result,
+            } => self
+                .on_spc_empty_view_verified(fold, epoch, from, view, result)
+                .into(),
+            other => {
+                warn!(
+                    event = other.type_name(),
+                    "event no participant handles — dropping"
+                );
+                ParticipantStep::default()
+            }
+        }
+    }
+
     /// This participant's proposal pool — lets tests and sims run
     /// lookups without going through the network path.
     #[must_use]

@@ -304,7 +304,7 @@ where
                     .get(&attachment.validator)
                     .is_some_and(|p| p.attachment == attachment)
                 {
-                    self.on_participant_event(attachment.validator, *event);
+                    self.drive(attachment.validator, |p, fold| p.on_event(fold, *event));
                 }
             }
             BeaconScopedInput::Continuation {
@@ -394,7 +394,7 @@ where
             }
             other => {
                 for validator in self.validator_list() {
-                    self.on_participant_event(validator, other.clone());
+                    self.drive(validator, |p, fold| p.on_event(fold, other.clone()));
                 }
             }
         }
