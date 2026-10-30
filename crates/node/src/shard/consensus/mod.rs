@@ -11,7 +11,7 @@ mod block;
 mod block_serve;
 mod block_sync;
 mod gossip;
-mod proposal;
+mod proposal_fetch;
 
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use hyperscale_types::{
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, LocalTimestamp, ValidatorId,
     Verifiable,
 };
-pub use proposal::{ProposalBinding, ProposalFetch, ProposalStore};
+pub use proposal_fetch::{ProposalBinding, ProposalFetch, ProposalStore};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
