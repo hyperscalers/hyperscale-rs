@@ -214,7 +214,7 @@ pub enum ShardForkProofVerifyError {
 impl ShardForkProof {
     /// The shard the fork is on.
     #[must_use]
-    pub const fn shard(&self) -> ShardId {
+    pub fn shard(&self) -> ShardId {
         let Self::ConflictingCommits { a, .. } = self;
         a.shard()
     }

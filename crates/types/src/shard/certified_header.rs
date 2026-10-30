@@ -5,6 +5,8 @@
 //! ([`impl Verified<CertifiedBlockHeader>::from_qc_attestation`] — the
 //! light-client trust path for remote-shard headers).
 
+use std::sync::Arc;
+
 use blake3::Hasher as Blake3;
 use hyperscale_hbor::{DEFAULT_MAX_DEPTH, Encoder, Hbor, HborEncode, Sink};
 use thiserror::Error;
@@ -36,8 +38,17 @@ pub enum CertifiedHeaderVerifyError {
 /// a remote shard can verify the QC against the source shard's validator public keys
 /// (from topology), confirm the `block_hash` matches `hash(header)`, and then trust
 /// the `state_root` in the header for merkle inclusion proof verification.
+///
+/// Every clone shares one allocation, so moving a header between its raw,
+/// verifiable and verified forms, or bundling it beside each served
+/// provision, copies a pointer rather than the header and its QCs.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-pub struct CertifiedBlockHeader {
+#[hbor(transparent)]
+pub struct CertifiedBlockHeader(Arc<Carried>);
+
+/// What every clone of one [`CertifiedBlockHeader`] shares.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Carried {
     header: BlockHeader,
     qc: Verifiable<QuorumCertificate>,
 }
@@ -46,53 +57,54 @@ impl CertifiedBlockHeader {
     /// Create a new certified block header.
     #[must_use]
     pub fn new(header: BlockHeader, qc: impl Into<Verifiable<QuorumCertificate>>) -> Self {
-        Self {
+        Self(Arc::new(Carried {
             header,
             qc: qc.into(),
-        }
+        }))
     }
 
     /// Header whose `hash()` matches the QC's `block_hash`.
     #[must_use]
-    pub const fn header(&self) -> &BlockHeader {
-        &self.header
+    pub fn header(&self) -> &BlockHeader {
+        &self.0.header
     }
 
     /// QC committing [`Self::header`]; verifiable against the source shard's
     /// validator keys without access to the block body.
     #[must_use]
     pub fn qc(&self) -> &QuorumCertificate {
-        self.qc.as_unverified()
+        self.0.qc.as_unverified()
     }
 
     /// Consume the pair and return its parts.
     #[must_use]
     pub fn into_parts(self) -> (BlockHeader, Verifiable<QuorumCertificate>) {
-        (self.header, self.qc)
+        let Carried { header, qc } = Arc::unwrap_or_clone(self.0);
+        (header, qc)
     }
 
     /// Compute the block hash (hashes the header).
     #[must_use]
     pub fn block_hash(&self) -> BlockHash {
-        self.header.hash()
+        self.0.header.hash()
     }
 
     /// Get the block height.
     #[must_use]
-    pub const fn height(&self) -> BlockHeight {
-        self.header.height()
+    pub fn height(&self) -> BlockHeight {
+        self.0.header.height()
     }
 
     /// Get the shard group this block belongs to.
     #[must_use]
-    pub const fn shard_id(&self) -> ShardId {
-        self.header.shard_id()
+    pub fn shard_id(&self) -> ShardId {
+        self.0.header.shard_id()
     }
 
     /// Get the state root committed by this block.
     #[must_use]
-    pub const fn state_root(&self) -> StateRoot {
-        self.header.state_root()
+    pub fn state_root(&self) -> StateRoot {
+        self.0.header.state_root()
     }
 
     /// A digest naming this exact copy: the header by its cached hash, and
@@ -106,7 +118,7 @@ impl CertifiedBlockHeader {
     pub fn copy_digest(&self) -> Hash {
         let mut hasher = Blake3::new();
         hasher.update(b"hyperscale.verdict.header-copy");
-        hasher.update(self.header.hash().as_bytes());
+        hasher.update(self.0.header.hash().as_bytes());
         self.qc()
             .encode(&mut Encoder::new(
                 HashSink {
@@ -182,10 +194,7 @@ impl Verified<CertifiedBlockHeader> {
         if qc.block_hash() != header.hash() {
             return Err(CertifiedHeaderVerifyError::LinkageMismatch);
         }
-        Ok(Self::new_unchecked(CertifiedBlockHeader {
-            header,
-            qc: qc.into(),
-        }))
+        Ok(Self::new_unchecked(CertifiedBlockHeader::new(header, qc)))
     }
 
     /// Re-wrap a certified header decoded from storage. The header was
