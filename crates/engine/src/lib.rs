@@ -52,6 +52,6 @@ pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,
-    PreviewOutcome, PreviewReport, ResourceChange,
+    PreviewOutcome, PreviewReport, ResourceChange, UnprovenInterval,
 };
 pub use receipt::{CachedOutput, project_to_shard};

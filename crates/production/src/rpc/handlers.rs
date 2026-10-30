@@ -46,7 +46,7 @@ use super::state::RpcState;
 use super::types::{
     ErrorResponse, HealthResponse, NodeStatusResponse, PreviewTransactionRequest,
     PreviewTransactionResponse, ReadyResponse, SubmitTransactionRequest, SubmitTransactionResponse,
-    TransactionStatusResponse,
+    TransactionStatusResponse, UnprovenIntervalJson,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -173,6 +173,16 @@ pub async fn preview_transaction_handler(
             .anchors
             .iter()
             .map(|(shard, height)| (shard.to_string(), height.inner()))
+            .collect(),
+        unproven_intervals: report
+            .unproven_intervals
+            .iter()
+            .map(|interval| UnprovenIntervalJson {
+                owner: hex_encode(interval.owner.to_bytes()),
+                collection: hex_encode(interval.collection.0),
+                lo: interval.lo.to_string(),
+                hi: interval.hi.to_string(),
+            })
             .collect(),
     })
     .into_response()

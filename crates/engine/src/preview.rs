@@ -17,6 +17,11 @@
 //! snapshot cannot serve read absent, so an envelope spanning shards
 //! previews truthfully only at a node holding every cell it touches —
 //! which is a question about the snapshot, not about the preview.
+//!
+//! What another node answered is proven present but, for a collection
+//! interval, not proven whole; the report names every such interval in
+//! [`PreviewReport::unproven_intervals`] rather than presenting a gap a
+//! server left as the collection's own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -304,6 +309,48 @@ pub struct FetchedCells {
     /// is a run over snapshots that were never simultaneous — which is
     /// the optimism the report already declares, stated in heights.
     pub anchors: BTreeMap<ShardId, BlockHeight>,
+    /// The declared intervals another node answered, each of which is
+    /// that node's word on what the interval leaves out.
+    ///
+    /// Every entry an interval returns is proven under its shard's root,
+    /// but nothing proves the interval holds no entry the server
+    /// omitted, so an answer narrower than the collection reads as a
+    /// collection holding less. Two kinds of interval are not here: one
+    /// this node answered out of a store of its own, for the same reason
+    /// the snapshot's own reads are not, since the report is already
+    /// this node's word; and one of a single order whose entry came back,
+    /// which leaves nothing to omit.
+    pub unproven: BTreeSet<UnprovenInterval>,
+}
+
+/// A declared collection interval whose answer is proven present entry
+/// by entry and not proven whole.
+///
+/// Keyed the way the declaration names it, so a caller can tell which of
+/// its reads rests on a server's completeness and ask another for that
+/// interval. The cap is not part of it: an omission is a property of the
+/// interval, and two caps over one interval rest on the same answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnprovenInterval {
+    /// The collection's owner, which fixes the shard that answered.
+    pub owner: Address,
+    /// The collection under that owner.
+    pub collection: CollectionId,
+    /// The first order in the interval, inclusive.
+    pub lo: u128,
+    /// The last order in the interval, inclusive.
+    pub hi: u128,
+}
+
+impl From<&CellRange> for UnprovenInterval {
+    fn from(range: &CellRange) -> Self {
+        Self {
+            owner: range.owner,
+            collection: range.collection,
+            lo: range.lo,
+            hi: range.hi,
+        }
+    }
 }
 
 impl FetchedCells {
@@ -319,6 +366,7 @@ impl FetchedCells {
             self.merge_entries(owner, collection, entries);
         }
         self.anchors.extend(other.anchors);
+        self.unproven.extend(other.unproven);
     }
 
     /// Fold one interval's answer into its collection, keeping the
@@ -495,6 +543,21 @@ pub struct PreviewReport {
     /// Empty for a verdict that read no shard: a refusal before the run,
     /// or a publish, whose answer is a pure function of its bytes.
     pub anchors: BTreeMap<ShardId, BlockHeight>,
+    /// The declared intervals the run read on another node's word that
+    /// they leave nothing out.
+    ///
+    /// Each entry such an interval returned is proven, but the interval
+    /// is not proven whole: a server can answer with fewer entries than
+    /// it holds, and the run reads the gap as empty. A verdict, a fee or
+    /// a ceiling here may rest on that gap, so a caller that cannot
+    /// accept a server's completeness asks another node for these
+    /// intervals or does not sign. Point cells are never here: each is
+    /// proven present or proven absent. See [`FetchedCells::unproven`]
+    /// for the intervals that are whole without a completeness proof.
+    ///
+    /// Empty for a verdict that read no shard, and for a run whose every
+    /// interval this node answered from its own stores.
+    pub unproven_intervals: BTreeSet<UnprovenInterval>,
 }
 
 impl PreviewReport {
@@ -510,6 +573,7 @@ impl PreviewReport {
             ceilings: Vec::new(),
             events: Vec::new(),
             anchors: BTreeMap::new(),
+            unproven_intervals: BTreeSet::new(),
         }
     }
 }
@@ -723,6 +787,7 @@ impl Executor {
             ceilings: report.ceilings,
             events: report.events,
             anchors: inputs.holds.fetched.anchors.clone(),
+            unproven_intervals: inputs.holds.fetched.unproven.clone(),
         }
     }
 }
@@ -761,6 +826,7 @@ fn preview_publish(
         // A publish reads no shard's state: its verdict is a pure
         // function of the artifact's bytes.
         anchors: BTreeMap::new(),
+        unproven_intervals: BTreeSet::new(),
     }
 }
 

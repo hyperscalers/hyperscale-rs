@@ -18,7 +18,7 @@ use hyperscale_engine::legs::{Classified, Member, PlanDefect};
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
     PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
-    TickEnvironment, TickTxInput, build_refusal_receipt, genesis_writes,
+    TickEnvironment, TickTxInput, UnprovenInterval, build_refusal_receipt, genesis_writes,
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
@@ -3433,6 +3433,14 @@ fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
     fetched
         .anchors
         .insert(ShardId::leaf(1, 0), BlockHeight::new(4));
+    // And an interval that shard answered without proving it whole.
+    let interval = UnprovenInterval {
+        owner: bob().into(),
+        collection: CollectionId([0xC0; 16]),
+        lo: 0,
+        hi: u128::MAX,
+    };
+    fetched.unproven.insert(interval);
 
     let report = executor.preview(
         &snapshot_store,
@@ -3465,6 +3473,10 @@ fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
         report.anchors,
         BTreeMap::from([(ShardId::leaf(1, 0), BlockHeight::new(4))]),
     );
+    // As does every interval read on that shard's word: the verdict and
+    // the ceilings may rest on a gap the server left, and a caller that
+    // cannot see which reads those were cannot weigh them.
+    assert_eq!(report.unproven_intervals, BTreeSet::from([interval]));
 }
 
 /// A preview that read no shard's state names no anchor: there is no
@@ -3491,6 +3503,7 @@ fn a_refused_preview_names_no_anchor() {
     );
     assert!(matches!(report.outcome, PreviewOutcome::Refused { .. }));
     assert!(report.anchors.is_empty());
+    assert!(report.unproven_intervals.is_empty());
 }
 
 /// A preview reaches the kernel without deriving, and what it reports
@@ -3601,6 +3614,10 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
+    assert!(
+        report.unproven_intervals.is_empty(),
+        "a run over this node's own state rests on no server's completeness"
+    );
     assert_eq!(
         report.fee, PREVIEW_CEILING,
         "a ceiling below the price is the burn"

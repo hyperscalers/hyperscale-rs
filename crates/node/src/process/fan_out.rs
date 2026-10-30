@@ -35,7 +35,10 @@
 //! collection's and nothing proves the interval holds no entry the
 //! server left out. A server can answer an interval narrower than it
 //! holds, and the run reads the gap as empty. A range-derived read in a
-//! preview is the serving peer's word on what is missing.
+//! preview is the serving peer's word on what is missing, so every
+//! interval a peer answered — short of a single order whose entry came
+//! back — is recorded in the gathering's `unproven` set, which the report
+//! carries out to the caller.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -43,7 +46,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::{Sender, bounded};
-use hyperscale_engine::{DeclaredReads, FetchedCells};
+use hyperscale_engine::{DeclaredReads, FetchedCells, UnprovenInterval};
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::entry_leaf_value;
 use hyperscale_types::network::request::GetCellsRequest;
@@ -87,7 +90,7 @@ fn absorb(
     let Some(attested) = verify_anchor(shard, anchor, topology, verifier) else {
         return false;
     };
-    fold_attested(
+    let folded = fold_attested(
         shard,
         ask,
         response,
@@ -95,7 +98,22 @@ fn absorb(
         attested.header().state_root(),
         attested.header().height(),
         into,
-    )
+    );
+    // Here and not in the fold, because the gap is about who answered:
+    // this node's own store is no more a stranger's word than the
+    // snapshot the run reads itself.
+    if folded {
+        for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
+            // An interval of one order whose entry came back proven has
+            // nothing left in it to omit.
+            let whole =
+                range.lo == range.hi && answer.entries.iter().any(|(order, _)| *order == range.lo);
+            if !whole {
+                into.unproven.insert(UnprovenInterval::from(range));
+            }
+        }
+    }
+    folded
 }
 
 /// Fold an answer whose anchor has already been verified, checking every
@@ -377,6 +395,7 @@ fn absorb_own(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use hyperscale_crypto_bls::BlsVerifier;
@@ -394,7 +413,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
         GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ValidatorId,
-        WitnessSources,
+        WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -485,6 +504,29 @@ mod tests {
                 cap: 4,
             }]),
         }
+    }
+
+    /// `response`, re-anchored on a header `committee` signed over `root`
+    /// so the stranger's path verifies it: the fixture store's own anchor
+    /// carries a placeholder certificate no committee signed.
+    fn signed_by(
+        committee: &TestCommittee,
+        mut response: GetCellsResponse,
+        root: StateRoot,
+    ) -> GetCellsResponse {
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: BlockHeight::new(1),
+            state_root: root,
+            ..Default::default()
+        });
+        let qc = committee.sign_qc(
+            &header,
+            &committee.quorum_indices(),
+            WeightedTimestamp::ZERO,
+        );
+        response.anchor = Some(Box::new(CertifiedBlockHeader::new(header, qc)));
+        response
     }
 
     /// A network that answers every request with `response` and keeps
@@ -795,6 +837,10 @@ mod tests {
             4,
             "with the entries its own store holds, up to the cap the declaration named"
         );
+        assert!(
+            fetched.unproven.is_empty(),
+            "and an interval this node answered itself is not a stranger's word"
+        );
     }
 
     /// A cell the server volunteered under a key nobody asked for is
@@ -835,6 +881,104 @@ mod tests {
         assert!(
             into.cells.is_empty(),
             "and the volunteered cell is not, having no leaf behind it"
+        );
+    }
+
+    /// An interval a peer answered with an entry left out still verifies,
+    /// and the gathering names it as resting on that peer's word.
+    ///
+    /// The peer answers `[0, MAX]` as though it were `[1, MAX]`: every
+    /// entry it returns is a genuine leaf, so the proof reconstructs and
+    /// the shard stands in the anchors, and the run would read order 0 as
+    /// absent. Nothing in the answer can say otherwise, so the interval is
+    /// reported rather than trusted. A width-one interval whose entry did
+    /// not come back is in the same position.
+    #[test]
+    fn an_interval_a_peer_answered_short_is_named_unproven() {
+        let mut ask = one_range();
+        let key = entry_key(OWNER_SEED, 0);
+        let missing_entry = CellRange {
+            owner: key.owner,
+            collection: key.collection,
+            lo: 9,
+            hi: 9,
+            cap: 1,
+        };
+        ask.ranges
+            .push(missing_entry.clone())
+            .expect("two intervals");
+        let mut narrower = ask.clone();
+        narrower.ranges[0].lo = 1;
+        let (response, root) = served(&narrower);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        let peer = Answering::new(signed_by(&committee, response, root), 0);
+        let fetched = gather(
+            &BTreeMap::from([(SHARD, ask.clone())]),
+            &topology,
+            &peer,
+            &verifier,
+            &|_, _| None,
+        );
+        assert!(
+            fetched.anchors.contains_key(&SHARD),
+            "every entry the peer returned stands under the root, so the answer verifies"
+        );
+        assert_eq!(
+            fetched
+                .entries_in_range(key.owner, key.collection, 0, u128::MAX, 8)
+                .iter()
+                .map(|(order, _)| *order)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "and the run would read order 0 as absent"
+        );
+        assert_eq!(
+            fetched.unproven,
+            BTreeSet::from([
+                UnprovenInterval::from(&ask.ranges[0]),
+                UnprovenInterval::from(&missing_entry),
+            ]),
+            "so both intervals are named as the peer's word"
+        );
+    }
+
+    /// Point reads a peer answered are proven present or absent, and a
+    /// width-one interval whose entry came back has nothing left to omit:
+    /// none of them is named unproven.
+    #[test]
+    fn proven_reads_a_peer_answered_are_not_named_unproven() {
+        let key = entry_key(OWNER_SEED, 0);
+        let ask = DeclaredReads {
+            keys: Capped::from_array([test_key(0x5A)]),
+            ranges: Capped::from_array([CellRange {
+                owner: key.owner,
+                collection: key.collection,
+                lo: 2,
+                hi: 2,
+                cap: 1,
+            }]),
+        };
+        let (response, root) = served(&ask);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        let peer = Answering::new(signed_by(&committee, response, root), 0);
+        let fetched = gather(
+            &BTreeMap::from([(SHARD, ask)]),
+            &topology,
+            &peer,
+            &verifier,
+            &|_, _| None,
+        );
+        assert!(fetched.anchors.contains_key(&SHARD), "the answer verifies");
+        assert!(
+            fetched.unproven.is_empty(),
+            "and every read in it is proven: {:?}",
+            fetched.unproven
         );
     }
 
