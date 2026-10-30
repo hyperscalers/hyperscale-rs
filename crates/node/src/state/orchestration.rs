@@ -422,7 +422,7 @@ mod tests {
         let cleanup = |node: &mut TestNode| {
             let now = node.fold.now();
             let _ = node.handle(now, ProtocolEvent::CleanupTimer);
-            node.node.shard.pending_pool_handed_back
+            node.node.shard.pool_handed_back()
         };
         assert!(!cleanup(&mut node), "no schedule shows the terminal yet");
 

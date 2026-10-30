@@ -28,21 +28,23 @@ mod test_support;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
-use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::ExecutionCoordinator;
-use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
-use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator};
+use hyperscale_mempool::MempoolCoordinator;
+#[cfg(test)]
+use hyperscale_provisions::OutboundProvisionTracker;
+use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
-use hyperscale_shard::{SettledTxSet, ShardConsensusConfig, ShardCoordinator};
+use hyperscale_shard::{SettledTxSet, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    Block, BlockHeight, Derivation, Epoch, LocalTimestamp, Round, SafeVoteRegisters, ShardId,
-    StandingAnswers, StateRoot, TopologySchedule, TopologySnapshot, ValidatorId, Verifier,
+    Block, BlockHeight, Epoch, LocalTimestamp, Round, SafeVoteRegisters, ShardId, StandingAnswers,
+    StateRoot, TopologySchedule, TopologySnapshot, ValidatorId,
 };
 use participation::ShardParticipation;
 use tracing::instrument;
 
 use crate::event::BeaconInput;
+use crate::replica::ReplicaConfig;
 
 /// A replica's state machine: the coordinators it runs for its shard,
 /// over the beacon schedule it holds.
@@ -79,37 +81,26 @@ impl std::fmt::Debug for NodeStateMachine {
 
 impl NodeStateMachine {
     /// Create a replica's state machine on `local_shard` with no signer,
-    /// over `schedule`, the schedule the beacon folded at `schedule_epoch`.
-    /// Each validator it signs for joins through [`Self::attach_signer`].
+    /// built with `config`, over `schedule`, the schedule the beacon folded
+    /// at `schedule_epoch`. Each validator it signs for joins through
+    /// [`Self::attach_signer`].
     ///
     /// `persisted_base` is how far the store under the replica's tick
     /// chain is written. Use `RecoveredState::default()` for a fresh
     /// start.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // a replica's whole construction context
-    pub fn new(
-        verifier: Arc<dyn Verifier>,
-        derivation: Arc<dyn Derivation>,
-        code: Arc<dyn CodeAvailability>,
+    pub(crate) fn new(
+        config: &ReplicaConfig,
         local_shard: ShardId,
-        shard_config: &ShardConsensusConfig,
         recovered: &RecoveredState,
-        schedule: Arc<TopologySchedule>,
-        schedule_epoch: Epoch,
-        mempool_config: MempoolConfig,
-        provision_config: ProvisionConfig,
+        (schedule, schedule_epoch): (Arc<TopologySchedule>, Epoch),
         persisted_base: BlockHeight,
     ) -> Self {
         let mut shard = ShardParticipation::new(
-            verifier,
-            derivation,
-            code,
+            config,
             local_shard,
-            shard_config,
             recovered,
             schedule.windows().origin(),
-            mempool_config,
-            provision_config,
             persisted_base,
         );
         shard.shard_coordinator.latch_dissolution(&schedule);
@@ -184,8 +175,9 @@ impl NodeStateMachine {
     }
 
     /// Get a reference to the outbound provision tracker.
+    #[cfg(test)]
     #[must_use]
-    pub const fn outbound_provisions(&self) -> &OutboundProvisionTracker {
+    pub(crate) const fn outbound_provisions(&self) -> &OutboundProvisionTracker {
         &self.shard.outbound_provisions
     }
 

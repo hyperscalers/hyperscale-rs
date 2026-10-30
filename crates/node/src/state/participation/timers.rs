@@ -6,7 +6,7 @@
 //! coordinator, not a timer.
 
 use hyperscale_core::{Action, TimerId};
-use hyperscale_types::TopologySchedule;
+use hyperscale_types::{BlockHeight, TopologySchedule};
 use tracing::instrument;
 
 use super::ShardParticipation;
@@ -15,7 +15,7 @@ use super::ShardParticipation;
 /// cross-shard fallback fetches are flushed. At the default one-second cleanup
 /// interval this is ~5s — aligned with the per-fallback gossip grace, so it
 /// fires only on a genuine stall, not a transient gap between commits.
-pub(in crate::state) const STALL_RECOVERY_TICKS: u32 = 5;
+const STALL_RECOVERY_TICKS: u32 = 5;
 
 /// Cleanup ticks a coasting chain offers its unincluded pool back over
 /// before falling silent until dissolution. At the default one-second
@@ -23,6 +23,56 @@ pub(in crate::state) const STALL_RECOVERY_TICKS: u32 = 5;
 /// terminal cut, which is the common case; the dissolution offer is what
 /// covers a successor that takes longer.
 const HANDBACK_ATTEMPTS: u32 = 5;
+
+/// The pending-pool handback's latch: the offers made so far, and
+/// whether the one made at dissolution has gone out, after which the
+/// pool is never offered again.
+#[derive(Debug, Default)]
+pub(super) struct PoolHandback {
+    finished: bool,
+    attempts: u32,
+}
+
+impl PoolHandback {
+    /// Whether an offer goes out on this tick of a quiescent chain,
+    /// `dissolved` once the beacon shows its successors live. A few go
+    /// out while the chain coasts and one more at dissolution, which
+    /// latches.
+    const fn offer(&mut self, dissolved: bool) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        self.finished = dissolved;
+        dissolved || self.attempts <= HANDBACK_ATTEMPTS
+    }
+
+    const fn finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// The committed height seen at the previous cleanup tick, and how many
+/// consecutive ticks it has stood unchanged.
+#[derive(Debug, Default)]
+pub(super) struct CommitStall {
+    last_height: Option<BlockHeight>,
+    ticks: u32,
+}
+
+impl CommitStall {
+    /// Record `height` at a cleanup tick: whether the chain has now stood
+    /// still for [`STALL_RECOVERY_TICKS`] ticks.
+    fn observe(&mut self, height: BlockHeight) -> bool {
+        if self.last_height == Some(height) {
+            self.ticks = self.ticks.saturating_add(1);
+        } else {
+            self.ticks = 0;
+            self.last_height = Some(height);
+        }
+        self.ticks >= STALL_RECOVERY_TICKS
+    }
+}
 
 impl ShardParticipation {
     #[instrument(skip(self, sched))]
@@ -93,7 +143,7 @@ impl ShardParticipation {
     /// because a dissolved chain has stopped proposing and may commit
     /// nothing further to hang the edge on.
     fn hand_back_pending_pool(&mut self, sched: &TopologySchedule) -> Vec<Action> {
-        if self.pending_pool_handed_back || !self.shard_coordinator.quiescent(sched) {
+        if self.handback.finished() || !self.shard_coordinator.quiescent(sched) {
             return Vec::new();
         }
         // Offered from quiescence rather than once at dissolution. The
@@ -107,9 +157,7 @@ impl ShardParticipation {
         // live, which is the point an offer is certain to have somewhere
         // to go. The repeats cost a duplicate the receiving pool drops.
         let dissolved = self.shard_coordinator.dissolved(sched);
-        self.handback_attempts = self.handback_attempts.saturating_add(1);
-        self.pending_pool_handed_back = dissolved;
-        if !dissolved && self.handback_attempts > HANDBACK_ATTEMPTS {
+        if !self.handback.offer(dissolved) {
             return Vec::new();
         }
         let txs = self.mempool_coordinator.pending_for_handback();
@@ -135,14 +183,10 @@ impl ShardParticipation {
     /// flush all four eagerly. The fetches are idempotent and dedupe in flight,
     /// so flushing while still genuinely waiting is harmless.
     fn recover_stalled_fallback_fetches(&mut self, sched: &TopologySchedule) -> Vec<Action> {
-        let height = self.shard_coordinator.committed_height();
-        if self.last_cleanup_height == Some(height) {
-            self.cleanup_stall_ticks = self.cleanup_stall_ticks.saturating_add(1);
-        } else {
-            self.cleanup_stall_ticks = 0;
-            self.last_cleanup_height = Some(height);
-        }
-        if self.cleanup_stall_ticks < STALL_RECOVERY_TICKS {
+        if !self
+            .stall
+            .observe(self.shard_coordinator.committed_height())
+        {
             return Vec::new();
         }
 
@@ -152,6 +196,13 @@ impl ShardParticipation {
         actions.extend(self.provisions_coordinator.flush_expected_provisions());
         actions.extend(self.mempool_coordinator.flush_expected_txs());
         actions
+    }
+
+    /// Whether the pending pool's last offer, at dissolution, has gone
+    /// out.
+    #[cfg(test)]
+    pub(in crate::state) const fn pool_handed_back(&self) -> bool {
+        self.handback.finished()
     }
 
     pub(in crate::state) fn on_view_change_timer(

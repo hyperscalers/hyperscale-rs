@@ -26,13 +26,14 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
-    GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition,
-    QuorumCertificate, Randomness, RecoveryBinding, Round, ShardId, Stake, Verified,
-    genesis_config_hash,
+    GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
+    NetworkDefinition, QuorumCertificate, Randomness, RecoveryBinding, Round, ShardId, Stake,
+    Verified, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
 use crate::event::BeaconInput;
+use crate::replica::ReplicaConfig;
 
 /// Real `NodeStateMachine` plus the committee that produced its topology
 /// and the fold its chain is registered with. The committee stays alive
@@ -170,17 +171,24 @@ impl TestNodeBuilder {
             self.recovered.committed_height,
         );
 
+        let config = ReplicaConfig {
+            verifier: Arc::new(BlsVerifier),
+            derivation: Arc::new(StubVmStatics),
+            code: Arc::new(AllCodeRuns),
+            beacon_network: NetworkDefinition::simulator(),
+            beacon_config_hash: GenesisConfigHash::ZERO,
+            shard_config: ShardConsensusConfig::default(),
+            mempool_config: MempoolConfig::default(),
+            provision_config: ProvisionConfig::default(),
+        };
         let mut node = NodeStateMachine::new(
-            Arc::new(BlsVerifier),
-            Arc::new(StubVmStatics),
-            Arc::new(AllCodeRuns),
+            &config,
             local_shard,
-            &ShardConsensusConfig::default(),
             &self.recovered,
-            Arc::new(fold.schedule().clone()),
-            fold.state().current_epoch,
-            MempoolConfig::default(),
-            ProvisionConfig::default(),
+            (
+                Arc::new(fold.schedule().clone()),
+                fold.state().current_epoch,
+            ),
             BlockHeight::GENESIS,
         );
         let persisted_qc_round = self

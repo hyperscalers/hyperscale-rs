@@ -58,19 +58,7 @@ pub fn build_replica(
     (schedule, epoch): (Arc<TopologySchedule>, Epoch),
     persisted_base: BlockHeight,
 ) -> NodeStateMachine {
-    NodeStateMachine::new(
-        Arc::clone(&config.verifier),
-        Arc::clone(&config.derivation),
-        Arc::clone(&config.code),
-        shard,
-        &config.shard_config,
-        recovered,
-        schedule,
-        epoch,
-        config.mempool_config.clone(),
-        config.provision_config,
-        persisted_base,
-    )
+    NodeStateMachine::new(config, shard, recovered, (schedule, epoch), persisted_base)
 }
 
 /// A validator identity attached to a replica: the key it signs with,

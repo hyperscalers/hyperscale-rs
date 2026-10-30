@@ -24,20 +24,20 @@ mod transactions;
 
 use std::sync::Arc;
 
-use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{
     CrossingIndexSlot, ExecCertStore, ExecutionCoordinator, FinalizationStore,
 };
-use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
-use hyperscale_provisions::{
-    OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
-};
+use hyperscale_mempool::{MempoolCoordinator, TxStore};
+use hyperscale_provisions::{OutboundProvisionTracker, ProvisionCoordinator, ProvisionStore};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
-use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
+use hyperscale_shard::ShardCoordinator;
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, Verifier, WeightedTimestamp,
+    BlockHeight, Derivation, ForkFence, LocalTimestamp, ShardId, WeightedTimestamp,
 };
+use timers::{CommitStall, PoolHandback};
+
+use crate::replica::ReplicaConfig;
 
 /// The coordinators a replica runs on its shard.
 ///
@@ -77,23 +77,19 @@ pub(in crate::state) struct ShardParticipation {
     /// a consistent stamp without threading it through every signature.
     pub(in crate::state) now: LocalTimestamp,
 
-    /// Latches the pending-pool handback, and counts the offers made
-    /// before it latched. Whatever the local chain admitted and never
-    /// included is offered back to the network as it coasts to its
-    /// dissolution; the terminal abort of in-flight transactions cannot
+    /// The pending-pool handback: whatever the local chain admitted and
+    /// never included is offered back to the network as it coasts to its
+    /// dissolution. The terminal abort of in-flight transactions cannot
     /// reach those entries, because an aborted transaction is a decided
     /// one and these were never decided by anything.
-    pub(in crate::state) pending_pool_handed_back: bool,
-    pub(in crate::state) handback_attempts: u32,
+    handback: PoolHandback,
 
-    /// Committed height observed at the previous cleanup tick, and how many
-    /// consecutive cleanup ticks it has gone unchanged. The cross-shard fallback
-    /// fetches are otherwise only swept on block commit; once the shard has
-    /// stalled for [`timers::STALL_RECOVERY_TICKS`] ticks they are flushed from
-    /// the cleanup timer so a shard stuck on missing cross-shard data can still
-    /// fetch it.
-    pub(in crate::state) last_cleanup_height: Option<BlockHeight>,
-    pub(in crate::state) cleanup_stall_ticks: u32,
+    /// How long the committed height has stood still across cleanup
+    /// ticks. The cross-shard fallback fetches are otherwise only swept on
+    /// block commit; once the shard stalls they are flushed from the
+    /// cleanup timer so a shard stuck on missing cross-shard data can
+    /// still fetch it.
+    stall: CommitStall,
 
     /// The node's one fork fence (see [`ForkFence`]): engaged here on a
     /// verified proof, cleared once per commit as recoveries complete,
@@ -114,17 +110,11 @@ impl ShardParticipation {
     /// keeps only their hashes, so without them a restarted host holds
     /// blocks it cannot serve and legs it cannot replay.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // a replica's whole construction context
     pub(in crate::state) fn new(
-        verifier: Arc<dyn Verifier>,
-        derivation: Arc<dyn Derivation>,
-        code: Arc<dyn CodeAvailability>,
+        config: &ReplicaConfig,
         local_shard: ShardId,
-        shard_config: &ShardConsensusConfig,
         recovered: &RecoveredState,
         genesis: WeightedTimestamp,
-        mempool_config: MempoolConfig,
-        provision_config: ProvisionConfig,
         persisted_base: BlockHeight,
     ) -> Self {
         let provision_store = Arc::new(ProvisionStore::new());
@@ -136,9 +126,9 @@ impl ShardParticipation {
         // coordinator restores, so the first post-restart commit
         // classifies its ticks exactly as a non-restarted peer's does.
         let shard_coordinator = ShardCoordinator::new(
-            verifier,
+            Arc::clone(&config.verifier),
             local_shard,
-            shard_config.clone(),
+            config.shard_config.clone(),
             recovered.clone(),
             genesis,
         );
@@ -153,7 +143,7 @@ impl ShardParticipation {
         let fork_fence = ForkFence::new();
         let mut mempool_coordinator = MempoolCoordinator::with_tx_store(
             local_shard,
-            mempool_config,
+            config.mempool_config.clone(),
             Arc::new(TxStore::new()),
             clock.clone(),
             fork_fence.clone(),
@@ -165,7 +155,7 @@ impl ShardParticipation {
         // questions of them, and two copies could answer differently.
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
             local_shard,
-            code,
+            Arc::clone(&config.code),
             Arc::new(CrossingIndexSlot::default()),
             recovered,
             Arc::new(ExecCertStore::new()),
@@ -183,7 +173,7 @@ impl ShardParticipation {
         // horizon.
         let provisions_coordinator = ProvisionCoordinator::with_config_and_store(
             local_shard,
-            provision_config,
+            config.provision_config,
             Arc::clone(&provision_store),
             committed_provisions,
             clock.clone(),
@@ -191,7 +181,7 @@ impl ShardParticipation {
         );
         Self {
             local_shard,
-            derivation,
+            derivation: Arc::clone(&config.derivation),
             shard_coordinator,
             execution_coordinator,
             mempool_coordinator,
@@ -203,10 +193,8 @@ impl ShardParticipation {
                 fork_fence.clone(),
             ),
             now: LocalTimestamp::ZERO,
-            pending_pool_handed_back: false,
-            handback_attempts: 0,
-            last_cleanup_height: None,
-            cleanup_stall_ticks: 0,
+            handback: PoolHandback::default(),
+            stall: CommitStall::default(),
             fork_fence,
         }
     }
