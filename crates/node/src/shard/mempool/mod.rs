@@ -12,8 +12,8 @@
 //! request-serving cache, cross-cutting and read-only.
 
 mod deferred;
-mod fetch;
-mod serve;
+mod transaction_fetch;
+mod transaction_serve;
 mod validation;
 
 use std::collections::{BTreeMap, HashSet};
@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use deferred::{DeferredForRecords, DeferredTransaction, Orphaned};
-pub use fetch::{TransactionBinding, TransactionFetch};
 use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::{ShardId, Transaction, TxHash};
-pub use serve::serve_transaction_request;
+pub use transaction_fetch::{TransactionBinding, TransactionFetch};
+pub use transaction_serve::serve_transaction_request;
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
