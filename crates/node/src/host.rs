@@ -163,11 +163,11 @@ where
     /// startup and a beacon participant for each of `identities`.
     ///
     /// The beacon loop and its fold are built first, from beacon storage,
-    /// with `now` as their clock. Each startup chain then registers with
-    /// the fold, and its replica is built with no signer from the schedule
-    /// the registration hands back, so a chain anchored below the fold's
-    /// floor widens the schedule before its first event. Each of the
-    /// chain's signers then attaches as the loop's first step.
+    /// with `now` as their clock, and the host-wide gossip and notification
+    /// handlers are registered. Each startup chain is then added as a
+    /// runtime one is ([`Self::add_shard`]): it registers with the fold, so
+    /// a chain anchored below the fold's floor widens the schedule before
+    /// its first event, and its loop is wired in with its signers attached.
     ///
     /// # Panics
     ///
@@ -207,66 +207,23 @@ where
             beacon.add_participant(validator, signer);
         }
 
-        let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
-        let mut shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = BTreeMap::new();
-        let mut built = Vec::new();
-        for chain in chains {
-            let sender = process.shard_event_senders.load()[&chain.shard]
-                .internal()
-                .clone();
-            let registration = beacon.register(
-                chain.shard,
-                chain_anchors(chain.recovered),
-                chain.recovered.committed_height,
-                sender.clone(),
-            );
-            let replica = build_replica(
-                replica_config,
-                chain.shard,
-                chain.recovered,
-                (Arc::clone(&registration.schedule), registration.epoch),
-                chain.storage.jmt_height(),
-            );
-            let (io, handles) = build_shard_io(
-                chain.shard,
-                &replica,
-                chain.storage,
-                &process.topology_snapshot,
-                &config,
-                &registration,
-            );
-            per_shard_dispatch.insert(chain.shard, handles);
-            built.push((
-                chain.shard,
-                sender,
-                io,
-                replica,
-                chain.signers,
-                registration,
-            ));
-        }
-        // Attaching a startup signer dispatches what it owes at once, which
-        // reads its shard's dispatch handles.
-        process
-            .dispatch_handles
-            .per_shard
-            .store(Arc::new(per_shard_dispatch));
-        for (shard, sender, io, replica, signers, registration) in built {
-            let shard_loop =
-                assemble_loop(&process, sender, io, replica, signers, &registration, now);
-            shards.insert(shard, shard_loop);
-        }
-
-        Self {
-            shards,
+        let mut host = Self {
+            shards: BTreeMap::new(),
             beacon,
             process,
             now,
             config,
+        };
+        host.register_gossip_handlers();
+        host.register_notification_handlers();
+        for chain in chains {
+            let sender = host.process.shard_event_senders.load()[&chain.shard].clone();
+            host.add_shard(replica_config, chain, sender);
         }
+        host
     }
 
-    /// Begin hosting `chain` at runtime: register it with the beacon loop,
+    /// Begin hosting `chain`: register it with the beacon loop,
     /// build its replica from the schedule the registration hands back,
     /// and wire its `ShardLoop` in with `chain`'s signers attached (see
     /// [`attach_shard`]).
@@ -761,8 +718,9 @@ where
     shard_loop
 }
 
-/// Wire a runtime-joined chain into the process-scoped maps and build its
-/// `ShardLoop` with its clock at `now`.
+/// Wire a chain into the process-scoped maps and build its `ShardLoop`
+/// with its clock at `now`: the one path every chain a host runs takes,
+/// at startup or at runtime.
 ///
 /// The chain is already registered with the beacon loop, and its replica
 /// is built here from the schedule `registration` handed back. Installs
@@ -835,8 +793,7 @@ where
 }
 
 /// Build one shard's `ShardIo` plus its dispatch-handle entry from the
-/// shard's replica and opened storage. Shared by host construction and
-/// runtime shard addition so both paths produce identically wired shards.
+/// shard's replica and opened storage.
 fn build_shard_io<S: ShardStorage>(
     shard: ShardId,
     replica: &NodeStateMachine,

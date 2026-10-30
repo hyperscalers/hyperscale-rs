@@ -952,19 +952,16 @@ impl ProductionRunner {
         outcome
     }
 
-    /// Start the pinned threads: wire the inbound handlers, resume each
+    /// Start the pinned threads: resume each
     /// hosted shard on its own thread, start the beacon thread, and join
     /// the seats whose store opened fresh. Returns the supervisor that
     /// owns the threads and the receiver that hears the beacon thread end.
     fn start_threads(&mut self) -> (ShardSupervisor, oneshot::Receiver<()>) {
-        // ── 1. Wire the inbound handlers while NodeHost still owns the loops.
-        let mut host = self
+        // ── 1. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
+        let host = self
             .host
             .take()
             .expect("host already taken (run called twice?)");
-        host.register_inbound_handlers();
-
-        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
         let (_process, shards, beacon) = host.into_parts();
 
         let mut shard_channels = self
@@ -972,7 +969,7 @@ impl ProductionRunner {
             .take()
             .expect("shard_channels already taken");
 
-        // ── 3. Resume each hosted shard from its recovered state on its own
+        // ── 2. Resume each hosted shard from its recovered state on its own
         // pinned thread, recorded in the supervisor so runtime membership
         // commands can stop them.
         let mut supervisor = self.supervisor.take().expect("supervisor already taken");

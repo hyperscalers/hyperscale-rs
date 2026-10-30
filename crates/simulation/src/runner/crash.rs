@@ -236,7 +236,6 @@ impl SimulationRunner {
         self.hosts[i].set_time(now);
         let output = self.hosts[i].drain_pending_output();
         self.process_step_output(host, output);
-        self.hosts[i].register_inbound_handlers();
         for (shard, _, recovered, _) in seated.chains {
             let output = self.hosts[i].resume_shard_committed(shard, &recovered);
             self.process_step_output(host, output);

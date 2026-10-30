@@ -294,11 +294,6 @@ impl Hosts {
         self.0.iter().flatten()
     }
 
-    /// Every process that is up, mutably.
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut SimHost> {
-        self.0.iter_mut().flatten()
-    }
-
     /// Whether `index`'s process is up.
     fn is_up(&self, index: usize) -> bool {
         self.get(index).is_some()
@@ -1342,15 +1337,13 @@ impl SimulationRunner {
         self.run_genesis(&self.genesis_config());
     }
 
-    /// Install and commit genesis across the cluster, then wire the hosts
-    /// into the in-memory network.
+    /// Install and commit genesis across the cluster.
     ///
     /// Genesis is a single ROOT shard. Every ROOT-serving host runs the
     /// shared [`NodeHost::build_shard_genesis`] ceremony — identical config
     /// yields an identical block on each — and the certified block is
-    /// *scheduled* for commit rather than stepped inline: deferring it until
-    /// after [`NodeHost::register_inbound_handlers`] keeps genesis consensus
-    /// I/O from firing into an unwired network.
+    /// *scheduled* for commit rather than stepped inline, so genesis
+    /// consensus I/O fires only once every host's genesis is installed.
     fn run_genesis(&mut self, config: &GenesisConfig) {
         let shard = ShardId::ROOT;
         let num_hosts = NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex");
@@ -1377,11 +1370,6 @@ impl SimulationRunner {
         for host_index in 0..num_hosts {
             let output = self.hosts[host_index as usize].drain_pending_output();
             self.process_step_output(host_index, output);
-        }
-
-        // Wire each host into the in-memory network now that genesis is settled.
-        for host in self.hosts.iter_mut() {
-            host.register_inbound_handlers();
         }
     }
 

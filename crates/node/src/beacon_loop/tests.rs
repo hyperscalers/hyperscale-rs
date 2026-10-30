@@ -584,8 +584,7 @@ fn a_participant_on_the_spc_committee_recovers_a_lost_proposal_through_the_host_
 #[test]
 fn a_wire_proposal_reaches_the_loop_only_once_checked() {
     let fix = Fixture::new();
-    let (mut wire, host, events) = wired(&fix, SyncDispatch::new());
-    host.register_notification_handlers();
+    let (mut wire, _host, events) = wired(&fix, SyncDispatch::new());
     let author = fix.committee.validator_id(1);
     let network = NetworkDefinition::simulator();
     let signer = fix.committee.signer(1);
@@ -649,8 +648,7 @@ fn a_wire_proposal_reaches_the_loop_only_once_checked() {
 #[test]
 fn beacon_gossip_reaches_a_seated_hosts_loop_once() {
     let fix = Fixture::new();
-    let (mut wire, host, events) = wired(&fix, SyncDispatch::new());
-    host.register_gossip_handlers();
+    let (mut wire, _host, events) = wired(&fix, SyncDispatch::new());
     wire.peer
         .broadcast_global(&BeaconBlockGossip::new(Arc::new(Verifiable::from(
             (*fix.genesis_block()).clone(),
@@ -732,6 +730,11 @@ fn the_beacon_loops_block_sync_asks_past_the_host() {
     };
     let here = Arc::new(AtomicUsize::new(0));
     let there = Arc::new(AtomicUsize::new(0));
+    // Swap the host's own block handler for one that counts what it is
+    // asked: dropping the shard drops its handlers, and serving it again
+    // takes a fresh one.
+    host.network().unsubscribe_shard(SHARD);
+    host.network().subscribe_shard(SHARD);
     host.network()
         .register_request_handler(SHARD, counter(&here, fix.genesis_block()));
     wire.peer

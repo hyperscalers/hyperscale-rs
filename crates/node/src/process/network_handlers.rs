@@ -50,14 +50,6 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Register per-type request handlers for every hosted shard.
-    pub(crate) fn register_request_handler(&self) {
-        let shards: Vec<ShardId> = self.hosted_shards().collect();
-        for shard in shards {
-            register_shard_request_handlers(&self.process, self.shard_io(shard), shard);
-        }
-    }
-
     /// Register gossip handlers for broadcast message types (transactions
     /// and committed block headers).
     ///

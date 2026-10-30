@@ -289,7 +289,6 @@ fn pooled_ratify_voter_signs_its_skip_prevote() {
 fn ratify_vote_gossip_routes_to_the_beacon_loop() {
     let fix = fixture();
     let (mut host, registry, event_rx) = fix.follower_host(0);
-    host.register_inbound_handlers();
     while event_rx.try_recv().is_ok() {}
 
     // A peer's signed prevote arrives via global gossip.

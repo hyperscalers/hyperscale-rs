@@ -224,7 +224,6 @@ fn add_and_remove_shard_at_runtime() {
         Arc::clone(&fix.topology_snapshot),
         &event_tx,
     );
-    host.register_inbound_handlers();
     // Drain anything startup produced so later assertions see only
     // reconfiguration traffic.
     while event_rx.try_recv().is_ok() {}
@@ -308,7 +307,6 @@ fn a_shard_less_host_receives_beacon_gossip_with_no_route_gate() {
         Arc::clone(&fix.topology_snapshot),
         &event_tx,
     );
-    host.register_inbound_handlers();
     while event_rx.try_recv().is_ok() {}
     assert_eq!(host.hosted_shards().count(), 0);
     assert_eq!(host.participants().count(), 0);
@@ -346,7 +344,6 @@ fn a_beacon_item_the_loop_never_checks_stays_deferred_on_a_hosted_shard_host() {
         Arc::clone(&fix.topology_snapshot),
         &event_tx,
     );
-    host.register_inbound_handlers();
     while event_rx.try_recv().is_ok() {}
 
     let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
@@ -476,15 +473,13 @@ impl Fixture {
         assert!(topology.reshape_handoff_pending(PREDECESSOR));
         let hosted = [PREDECESSOR, UNRELATED];
         let registry = Arc::new(HandlerRegistry::new(hosted.into_iter().collect()));
-        let mut host = self.host(
+        self.host(
             &[(PREDECESSOR, 0), (UNRELATED, 2)],
             &[],
             registry,
             topology,
             event_tx,
-        );
-        host.register_inbound_handlers();
-        host
+        )
     }
 }
 
