@@ -68,9 +68,8 @@ pub(crate) type NodeHostParts<S, N, D> = (
 /// The deterministic product of one shard's genesis ceremony, returned by
 /// [`NodeHost::build_shard_genesis`].
 ///
-/// The caller commits `certified` itself: production steps `BlockCommitted`
-/// inline, while simulation schedules it only after wiring the network, so
-/// the shared ceremony stops short of the commit.
+/// The caller commits `certified` itself, which lets the simulation
+/// schedule the commit only after wiring the network.
 pub struct ShardGenesis {
     /// The genesis block built and persisted into the shard's replica.
     pub block: Block,
@@ -355,10 +354,13 @@ where
 
     /// Stop hosting `shard`: close every signer's gate, deregister its
     /// chain from the beacon loop, exclude it from the network's hosted
-    /// set, drop its request handlers, event sender, and dispatch handles,
-    /// and return its `ShardLoop` for the caller to drain or drop. Inbound
-    /// traffic for the shard is rejected from the moment the maps swap;
-    /// events already queued die with the channel receiver.
+    /// set, and drop its request handlers, event sender, and dispatch
+    /// handles. Inbound traffic for the shard is rejected from the moment
+    /// the maps swap; events already queued die with the channel receiver.
+    ///
+    /// Returns its `ShardLoop` for the caller to drop or take the store
+    /// from. The loop must not step again: an action it dispatches looks up
+    /// the dispatch handles this drops, and panics.
     ///
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {

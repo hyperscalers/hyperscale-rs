@@ -77,10 +77,8 @@ where
     /// replica, and drain the resulting setup output.
     ///
     /// Returns the block, its certified form, and the drained
-    /// [`StepOutput`]. The caller commits the
-    /// certified block — production steps `BlockCommitted` inline, simulation
-    /// schedules it after the network is wired — so this stops short of the
-    /// commit, the one step the two runners can't share.
+    /// [`StepOutput`]. The caller commits the certified block, which lets
+    /// the simulation schedule the commit after the network is wired.
     pub fn build_shard_genesis(&mut self, shard: ShardId, config: &GenesisConfig) -> ShardGenesis
     where
         S: GenesisCommit,
