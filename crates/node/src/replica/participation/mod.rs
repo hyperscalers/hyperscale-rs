@@ -44,38 +44,38 @@ use crate::replica::ReplicaConfig;
 /// Fields are visible across the `state` module tree so the per-domain handlers
 /// here, the orchestrators on [`NodeStateMachine`](super::NodeStateMachine), and
 /// its accessors all read them directly.
-pub(in crate::state) struct ShardParticipation {
+pub(in crate::replica) struct ShardParticipation {
     /// This replica's shard.
-    pub(in crate::state) local_shard: ShardId,
+    pub(in crate::replica) local_shard: ShardId,
 
     /// What this node can resolve an envelope against. Blocks that
     /// arrive already verified carry their derivation; the ones lifted
     /// out of storage carry none, so the handlers that take them derive
     /// through this before any coordinator reads a routed fact.
-    pub(in crate::state) derivation: Arc<dyn Derivation>,
+    pub(in crate::replica) derivation: Arc<dyn Derivation>,
 
     /// Shard consensus state (includes implicit round advancement).
-    pub(in crate::state) shard_coordinator: ShardCoordinator,
+    pub(in crate::replica) shard_coordinator: ShardCoordinator,
 
     /// Execution state.
-    pub(in crate::state) execution_coordinator: ExecutionCoordinator,
+    pub(in crate::replica) execution_coordinator: ExecutionCoordinator,
 
     /// Mempool state.
-    pub(in crate::state) mempool_coordinator: MempoolCoordinator,
+    pub(in crate::replica) mempool_coordinator: MempoolCoordinator,
 
     /// Provision coordination for cross-shard transactions.
-    pub(in crate::state) provisions_coordinator: ProvisionCoordinator,
+    pub(in crate::replica) provisions_coordinator: ProvisionCoordinator,
 
     /// Retains outbound provisions until the target shard's execution
     /// certificates ACK every transaction they contain.
-    pub(in crate::state) outbound_provisions: OutboundProvisionTracker,
+    pub(in crate::replica) outbound_provisions: OutboundProvisionTracker,
 
     /// Remote block header coordination (single source of truth).
-    pub(in crate::state) remote_headers_coordinator: RemoteHeaderCoordinator,
+    pub(in crate::replica) remote_headers_coordinator: RemoteHeaderCoordinator,
 
     /// Current time, mirrored from the enclosing machine so shard handlers read
     /// a consistent stamp without threading it through every signature.
-    pub(in crate::state) now: LocalTimestamp,
+    pub(in crate::replica) now: LocalTimestamp,
 
     /// The pending-pool handback: whatever the local chain admitted and
     /// never included is offered back to the network as it coasts to its
@@ -97,7 +97,7 @@ pub(in crate::state) struct ShardParticipation {
     /// through the handles they hold. It also dedups proofs: a later
     /// proof for an already-fenced shard is ignored, and a re-fork after
     /// a completed recovery can re-engage. Empty under honest operation.
-    pub(in crate::state) fork_fence: ForkFence,
+    pub(in crate::replica) fork_fence: ForkFence,
 }
 
 impl ShardParticipation {
@@ -110,7 +110,7 @@ impl ShardParticipation {
     /// keeps only their hashes, so without them a restarted host holds
     /// blocks it cannot serve and legs it cannot replay.
     #[must_use]
-    pub(in crate::state) fn new(
+    pub(in crate::replica) fn new(
         config: &ReplicaConfig,
         local_shard: ShardId,
         recovered: &RecoveredState,
@@ -199,7 +199,7 @@ impl ShardParticipation {
 
     /// Push the current wall-clock into the shard and mempool coordinators
     /// and the mirrored `now`, before any handler runs.
-    pub(in crate::state) const fn set_time(&mut self, now: LocalTimestamp) {
+    pub(in crate::replica) const fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
         self.shard_coordinator.set_time(now);
         self.mempool_coordinator.set_time(now);

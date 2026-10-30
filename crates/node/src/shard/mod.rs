@@ -74,9 +74,8 @@ pub use crate::event::{
 };
 use crate::fetch::Release;
 use crate::process::ProcessIo;
-use crate::replica::AttachedSigner;
+use crate::replica::{AttachedSigner, NodeStateMachine};
 use crate::shard::commit::PreparedCommitMap;
-use crate::state::NodeStateMachine;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///

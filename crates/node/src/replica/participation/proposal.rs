@@ -151,7 +151,7 @@ impl ShardParticipation {
 
     /// The proposal attempt of the post-dispatch retry hook and the
     /// proposal pace timer.
-    pub(in crate::state) fn try_event_driven_proposal(
+    pub(in crate::replica) fn try_event_driven_proposal(
         &mut self,
         sched: &TopologySchedule,
     ) -> Vec<Action> {

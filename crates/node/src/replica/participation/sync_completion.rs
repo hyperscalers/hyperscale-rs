@@ -21,7 +21,7 @@ use super::ShardParticipation;
 impl ShardParticipation {
     /// A synced block is ready to apply: derive its transactions, then
     /// hand it to shard consensus.
-    pub(in crate::state) fn on_block_sync_ready_to_apply(
+    pub(in crate::replica) fn on_block_sync_ready_to_apply(
         &mut self,
         sched: &TopologySchedule,
         certified: Arc<CertifiedBlock>,
@@ -33,7 +33,7 @@ impl ShardParticipation {
 
     /// Block sync finished fetching: exit shard consensus sync mode, and
     /// flush expected provisions and expected headers, all in one pass.
-    pub(in crate::state) fn on_block_sync_complete(
+    pub(in crate::replica) fn on_block_sync_complete(
         &mut self,
         sched: &TopologySchedule,
     ) -> Vec<Action> {
@@ -52,7 +52,7 @@ impl ShardParticipation {
     /// live commit's are, and the tip is settled once over the last of
     /// them, so the restarted voter refuses by the fold's owed ticks
     /// before its first live commit.
-    pub(in crate::state) fn on_committed_state_restored(
+    pub(in crate::replica) fn on_committed_state_restored(
         &mut self,
         sched: &TopologySchedule,
         height: BlockHeight,
@@ -77,7 +77,7 @@ impl ShardParticipation {
     /// them out; the votes that deferred for want of them re-drive off the
     /// fence's evidence. The execution coordinator reads its own probes
     /// off every proof and ignores keys it never asked.
-    pub(in crate::state) fn on_fetched_state_proof_verified(
+    pub(in crate::replica) fn on_fetched_state_proof_verified(
         &mut self,
         anchor: Anchor,
         keys: &[SubstateKey],
@@ -101,7 +101,7 @@ impl ShardParticipation {
 
     /// A proof for verdict questions verified: the execution coordinator
     /// holds what a hearing row here would take.
-    pub(in crate::state) fn on_fetched_verdict_proof_verified(
+    pub(in crate::replica) fn on_fetched_verdict_proof_verified(
         &mut self,
         sched: &TopologySchedule,
         anchor: Anchor,
@@ -122,7 +122,7 @@ impl ShardParticipation {
     /// ECs, finalized txs), and re-derive the settled sets the fence still
     /// wants. Dispatched from the `BeaconBlockPersisted` arm, once the
     /// schedule it carries is held.
-    pub(in crate::state) fn on_beacon_block_persisted(
+    pub(in crate::replica) fn on_beacon_block_persisted(
         &mut self,
         sched: &TopologySchedule,
     ) -> Vec<Action> {
@@ -155,7 +155,7 @@ impl ShardParticipation {
     /// Once the rule retires the outstanding set is empty rather than
     /// unasked, so the last release still goes out; the terminal is
     /// dropped immediately after, which is what makes this the final pass.
-    pub(in crate::state) fn scan_precut_queries(&mut self) -> Vec<Action> {
+    pub(in crate::replica) fn scan_precut_queries(&mut self) -> Vec<Action> {
         let Some(terminal) = self.shard_coordinator.precut_terminal() else {
             return Vec::new();
         };
@@ -182,7 +182,7 @@ impl ShardParticipation {
     /// Record a past-terminal shard's settled set, which releases what
     /// the execution coordinator held for want of it; the votes that
     /// deferred re-drive off the fence's evidence.
-    pub(in crate::state) fn on_settled_txs_reconstructed(
+    pub(in crate::replica) fn on_settled_txs_reconstructed(
         &mut self,
         topology_schedule: &TopologySchedule,
         shard: ShardId,
@@ -215,8 +215,8 @@ mod tests {
     };
 
     use crate::assert_emits;
-    use crate::state::NodeStateMachine;
-    use crate::state::test_support::TestNode;
+    use crate::replica::NodeStateMachine;
+    use crate::replica::test_support::TestNode;
 
     /// `BlockSyncComplete` fans out to shard consensus, remote-headers, and
     /// provisions in one pass. The provisions flush is the most

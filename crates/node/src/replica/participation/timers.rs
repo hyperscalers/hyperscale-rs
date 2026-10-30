@@ -75,7 +75,7 @@ impl CommitStall {
 
 impl ShardParticipation {
     #[instrument(skip(self, sched))]
-    pub(in crate::state) fn on_cleanup_timer(&mut self, sched: &TopologySchedule) -> Vec<Action> {
+    pub(in crate::replica) fn on_cleanup_timer(&mut self, sched: &TopologySchedule) -> Vec<Action> {
         let mut actions = vec![Action::SetTimer {
             id: TimerId::Cleanup,
             duration: self.shard_coordinator.config().cleanup_interval,
@@ -200,11 +200,11 @@ impl ShardParticipation {
     /// Whether the pending pool's last offer, at dissolution, has gone
     /// out.
     #[cfg(test)]
-    pub(in crate::state) const fn pool_handed_back(&self) -> bool {
+    pub(in crate::replica) const fn pool_handed_back(&self) -> bool {
         self.handback.finished()
     }
 
-    pub(in crate::state) fn on_view_change_timer(
+    pub(in crate::replica) fn on_view_change_timer(
         &mut self,
         sched: &TopologySchedule,
     ) -> Vec<Action> {
@@ -228,7 +228,7 @@ mod tests {
     use hyperscale_types::LocalTimestamp;
 
     use crate::assert_emits;
-    use crate::state::test_support::TestNode;
+    use crate::replica::test_support::TestNode;
 
     /// `CleanupTimer` is the only thing keeping its own loop alive — it
     /// must reschedule itself before doing anything else, so a missed

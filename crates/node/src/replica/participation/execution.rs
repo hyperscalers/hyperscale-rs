@@ -20,7 +20,7 @@ impl ShardParticipation {
     /// One tick's results arrived. They can (a) finalize a tick whose
     /// local certificate landed ahead of the engine, (b) unblock vote
     /// emission, (c) release the next queued tick.
-    pub(in crate::state) fn on_execution_batch_completed(
+    pub(in crate::replica) fn on_execution_batch_completed(
         &mut self,
         sched: &TopologySchedule,
         tick: BlockHeight,
@@ -36,7 +36,7 @@ impl ShardParticipation {
     /// A certificate was admitted. One from another shard acknowledges
     /// the outbound batches this shard sent it; the tracker keys on the
     /// transaction, so an outcome for nothing sent is a no-op.
-    pub(in crate::state) fn on_execution_certificate_admitted(
+    pub(in crate::replica) fn on_execution_certificate_admitted(
         &mut self,
         sched: &TopologySchedule,
         certificate: &ExecutionCertificate,
@@ -50,7 +50,7 @@ impl ShardParticipation {
     }
 
     /// Hand each received certificate to the execution coordinator.
-    pub(in crate::state) fn on_execution_certificates_received(
+    pub(in crate::replica) fn on_execution_certificates_received(
         &mut self,
         sched: &TopologySchedule,
         certificates: Vec<Verifiable<ExecutionCertificate>>,
@@ -66,7 +66,7 @@ impl ShardParticipation {
     }
 
     /// Admit each received finalization.
-    pub(in crate::state) fn on_finalizations_received(
+    pub(in crate::replica) fn on_finalizations_received(
         &mut self,
         sched: &TopologySchedule,
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
@@ -92,8 +92,8 @@ mod tests {
         SignerBitfield, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp,
     };
 
-    use crate::state::NodeStateMachine;
-    use crate::state::test_support::TestNode;
+    use crate::replica::NodeStateMachine;
+    use crate::replica::test_support::TestNode;
 
     fn make_ec(
         shard: ShardId,

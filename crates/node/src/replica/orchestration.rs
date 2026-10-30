@@ -194,7 +194,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::state::test_support::TestNode;
+    use crate::replica::test_support::TestNode;
 
     /// The states a merge of the root's two children leaves: window 1
     /// runs both children, and window 1000 runs the root alone, live past

@@ -43,7 +43,6 @@ pub mod reshape;
 pub mod seating;
 mod serve;
 pub mod shard;
-mod state;
 mod sync;
 
 pub use bootstrap::state_range_serve::serve_state_range_request;
@@ -53,7 +52,7 @@ pub use event::{Registration, RegistrationReply};
 pub use fetch::FetchConfig;
 pub use host::{HostResources, HostedChain, NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
-pub use replica::ReplicaConfig;
+pub use replica::{NodeStateMachine, ReplicaConfig};
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
 pub use shard::cross_shard::{
     serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
@@ -62,4 +61,3 @@ pub use shard::{
     SharedTopologySnapshot, TimerOp, TimerOwner, installed_network_genesis_block,
     network_genesis_block, timer_event,
 };
-pub use state::NodeStateMachine;

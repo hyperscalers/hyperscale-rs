@@ -20,7 +20,7 @@ use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
 
-use crate::state::NodeStateMachine;
+use crate::replica::NodeStateMachine;
 
 /// Default certificate cache capacity.
 pub(super) const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;

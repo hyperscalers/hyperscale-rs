@@ -33,7 +33,7 @@ impl ShardParticipation {
     ///
     /// Execution reads it too: the tick above `height` reads the base as
     /// that block left it, and waits here for the write.
-    pub(in crate::state) fn on_block_persisted(
+    pub(in crate::replica) fn on_block_persisted(
         &mut self,
         sched: &TopologySchedule,
         height: BlockHeight,
@@ -53,7 +53,7 @@ impl ShardParticipation {
     /// Finalizations reached the node's cache: the shard coordinator
     /// fills pending blocks waiting on them, and the next proposal may
     /// carry them.
-    pub(in crate::state) fn on_finalizations_admitted(
+    pub(in crate::replica) fn on_finalizations_admitted(
         &mut self,
         sched: &TopologySchedule,
         finalizations: &[Arc<Verifiable<Finalization>>],
@@ -67,7 +67,7 @@ impl ShardParticipation {
 
     /// A peer's proof finished verification: fence and re-gossip on a
     /// real verdict, discard a forgery.
-    pub(in crate::state) fn on_fork_proof_verified(
+    pub(in crate::replica) fn on_fork_proof_verified(
         &mut self,
         sched: &TopologySchedule,
         proof: ShardForkProof,
@@ -95,7 +95,7 @@ impl ShardParticipation {
     /// stops admitting transactions bound to it, and its headers stop
     /// promoting. Every fence holds until the beacon-attested recovery the
     /// proof arms completes.
-    pub(in crate::state) fn on_fork_proven(
+    pub(in crate::replica) fn on_fork_proven(
         &mut self,
         topology_schedule: &TopologySchedule,
         proof: ShardForkProof,
@@ -137,7 +137,7 @@ impl ShardParticipation {
     /// the local schedule and dispatch off-thread verification (the proof
     /// self-authenticates — no sender trust). An unresolvable epoch drops
     /// the proof; a re-gossip retries.
-    pub(in crate::state) fn on_unverified_fork_proof(
+    pub(in crate::replica) fn on_unverified_fork_proof(
         &self,
         topology_schedule: &TopologySchedule,
         proof: ShardForkProof,
@@ -166,7 +166,7 @@ impl ShardParticipation {
     }
 
     /// Validate in-flight before letting shard ingest a received header.
-    pub(in crate::state) fn on_block_header_received(
+    pub(in crate::replica) fn on_block_header_received(
         &mut self,
         sched: &TopologySchedule,
         header: &BlockHeader,
@@ -251,7 +251,7 @@ impl ShardParticipation {
     }
 
     /// QC formed — may trigger immediate next proposal.
-    pub(in crate::state) fn on_qc_formed(
+    pub(in crate::replica) fn on_qc_formed(
         &mut self,
         sched: &TopologySchedule,
         block_hash: BlockHash,
@@ -269,7 +269,10 @@ impl ShardParticipation {
     ///
     /// Live commits, the restart's replay and a parked commit folded on a
     /// beacon block all come through here.
-    pub(in crate::state) fn apply_commit_effects(&mut self, effects: CommitEffects) -> Vec<Action> {
+    pub(in crate::replica) fn apply_commit_effects(
+        &mut self,
+        effects: CommitEffects,
+    ) -> Vec<Action> {
         let mut actions = self
             .mempool_coordinator
             .on_resolutions(&effects.resolutions);
@@ -289,7 +292,7 @@ impl ShardParticipation {
     ///
     /// Each reads current state, so after a replay that a live commit
     /// beat, it applies the live state and never the replay's.
-    pub(in crate::state) fn settle_tip(&mut self, sched: &TopologySchedule) -> Vec<Action> {
+    pub(in crate::replica) fn settle_tip(&mut self, sched: &TopologySchedule) -> Vec<Action> {
         // The single path to execution voting from a commit: every
         // replica at this tip produces the same votes.
         let mut actions = self.execution_coordinator.emit_vote_actions(sched);
@@ -329,8 +332,8 @@ mod tests {
         ValidatorId, Verified, WeightedTimestamp,
     };
 
-    use crate::state::NodeStateMachine;
-    use crate::state::test_support::TestNode;
+    use crate::replica::NodeStateMachine;
+    use crate::replica::test_support::TestNode;
 
     /// `RemoteHeaderAdmitted` registers the provisions the header's
     /// `provision_tx_roots` promise this shard. The header opens for

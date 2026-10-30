@@ -16,7 +16,7 @@ impl ShardParticipation {
     /// Crossing readings a counterpart pushed. A claim at a height this
     /// node fences against never reaches a block, so it is not worth
     /// parking either.
-    pub(in crate::state) fn on_crossing_readings(
+    pub(in crate::replica) fn on_crossing_readings(
         &mut self,
         sched: &TopologySchedule,
         claims: Vec<StateClaim>,
@@ -43,7 +43,7 @@ impl ShardParticipation {
     /// cross-shard transaction it names, before the proposal latch
     /// gathers ready transactions, so the bundle and its transactions
     /// pair in one proposal.
-    pub(in crate::state) fn on_provisions_admitted(
+    pub(in crate::replica) fn on_provisions_admitted(
         &mut self,
         sched: &TopologySchedule,
         provisions: Arc<Verifiable<Provisions>>,
@@ -72,7 +72,7 @@ mod tests {
         WeightedTimestamp,
     };
 
-    use crate::state::test_support::TestNode;
+    use crate::replica::test_support::TestNode;
 
     /// `ProvisionsAdmitted` latches a proposal-retry the same way
     /// `TransactionsAdmitted` does. Verify the latch+post-dispatch chain

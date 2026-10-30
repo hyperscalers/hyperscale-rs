@@ -19,6 +19,7 @@
 //! [`TopologySchedule`] passed as a parameter; the flows that also report
 //! to the beacon stay here as orchestrators (see [`orchestration`]).
 
+mod config;
 mod orchestration;
 mod participation;
 
@@ -27,6 +28,7 @@ mod test_support;
 
 use std::sync::Arc;
 
+pub use config::{AttachedSigner, ReplicaConfig};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_mempool::MempoolCoordinator;
@@ -44,7 +46,6 @@ use participation::ShardParticipation;
 use tracing::instrument;
 
 use crate::event::BeaconInput;
-use crate::replica::ReplicaConfig;
 
 /// A replica's state machine: the coordinators it runs for its shard,
 /// over the beacon schedule it holds.

@@ -27,7 +27,7 @@ impl ShardParticipation {
     /// refused until a predecessor answers for it. Asking here rather
     /// than waiting for the cleanup tick is what keeps the refusal from
     /// costing a full tick of latency per arrival.
-    pub(in crate::state) fn on_transactions_admitted(
+    pub(in crate::replica) fn on_transactions_admitted(
         &mut self,
         sched: &TopologySchedule,
         txs: &[Arc<Verified<Transaction>>],
@@ -44,7 +44,7 @@ impl ShardParticipation {
     /// the gossip path. Mempool emits `Continuation(TransactionsAdmitted)`
     /// for whatever it admits; that arm latches the proposal-retry — no
     /// need to do it optimistically here.
-    pub(in crate::state) fn on_transaction_validated(
+    pub(in crate::replica) fn on_transaction_validated(
         &mut self,
         sched: &TopologySchedule,
         tx: Arc<Verified<Transaction>>,
@@ -69,7 +69,7 @@ impl ShardParticipation {
     /// dropped before reaching this arm. Mempool emits
     /// `Continuation(TransactionsAdmitted)` for the admitted subset; the
     /// admission arm latches the proposal-retry.
-    pub(in crate::state) fn on_transactions_fetched(
+    pub(in crate::replica) fn on_transactions_fetched(
         &mut self,
         sched: &TopologySchedule,
         txs: Vec<Arc<Verified<Transaction>>>,
@@ -90,7 +90,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_prefixes};
     use hyperscale_types::{LocalTimestamp, Verified};
 
-    use crate::state::test_support::TestNode;
+    use crate::replica::test_support::TestNode;
 
     /// Validated gossip transactions are gated by the local-shard filter
     /// before reaching mempool. A tx with empty reads/writes never
