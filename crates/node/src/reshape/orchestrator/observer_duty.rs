@@ -12,7 +12,8 @@ use hyperscale_types::{
 use super::Advance;
 use super::io::{AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
 use super::shared::{
-    REFETCH_WAIT, ReadyAssert, SeatTail, StageQueue, TerminalFetch, paced, recipients_for, seats_on,
+    REFETCH_WAIT, ReadyAssert, SeatTail, StageQueue, TerminalAnswer, TerminalFetch, paced,
+    recipients_for, seats_on,
 };
 use crate::bootstrap::{BootstrapRequest, StateRangeOutcome};
 use crate::reshape::observer::{ObserverBootstrap, ObserverTail, ProveOutcome};
@@ -29,8 +30,10 @@ pub(super) enum ObserverPhase {
     Following(Box<ObserverTail>),
     /// The follow cannot finish: the child anchored before it applied the
     /// parent's terminal — the parent's blocks above the terminal that
-    /// would prove it are no longer served under the child's id — or the
-    /// store it applied into diverged from the parent's. A parent-half seat
+    /// would prove it are no longer served under the child's id — or past
+    /// its genesis, the store it applied into diverged from the parent's,
+    /// or the parent's recorded terminal derives a genesis other than the
+    /// anchor's. A parent-half seat
     /// this host holds on the child takes the seat over and seeds it from
     /// the local parent; with none, the seat is the ordinary join's, which
     /// snap-syncs against the child's anchor. Inert, and kept so the
@@ -38,7 +41,7 @@ pub(super) enum ObserverPhase {
     /// releases it.
     Relinquished,
     /// The children seeded; fetching the certified terminal to derive genesis.
-    FetchingTerminal(TerminalFetch),
+    FetchingTerminal(Box<TerminalFetch>),
     /// Genesis derived, adopted, and seated. Once seated the duty is inert
     /// until the committed projection releases it, and stays in the map so
     /// `discover_parent_half_duties` keeps deferring a co-hosted parent half
@@ -210,8 +213,12 @@ impl ObserverDuty {
                 paced(tail, outcome, now, child);
             }
             (ObserverPhase::FetchingTerminal(fetch), FetchedKind::Block { response }) => {
-                if let Some(genesis) = fetch.on_block(child, &response, now) {
-                    self.phase = ObserverPhase::Seat(SeatTail::Adopting(Box::new(genesis)));
+                match fetch.on_block(child, &response, now) {
+                    TerminalAnswer::Derived(genesis) => {
+                        self.phase = ObserverPhase::Seat(SeatTail::Adopting(genesis));
+                    }
+                    TerminalAnswer::Missed => {}
+                    TerminalAnswer::Disagrees => self.phase = ObserverPhase::Relinquished,
                 }
             }
             _ => {}
@@ -363,7 +370,8 @@ impl ObserverDuty {
                         );
                         self.phase = ObserverPhase::Relinquished;
                     } else if tail.next_height() >= anchor.height {
-                        self.phase = ObserverPhase::FetchingTerminal(TerminalFetch::new(anchor));
+                        self.phase =
+                            ObserverPhase::FetchingTerminal(Box::new(TerminalFetch::new(anchor)));
                     } else {
                         tracing::info!(
                             ?child,

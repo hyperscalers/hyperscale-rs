@@ -8,8 +8,8 @@ use hyperscale_storage::ImportProgress;
 use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    BlockHeader, LocalTimestamp, QuorumCertificate, ShardAnchor, ShardId, SubstateLeaf,
-    ValidatorId, Verifier, WeightedTimestamp,
+    BlockHash, LocalTimestamp, ShardAnchor, ShardId, SubstateLeaf, ValidatorId, Verifier,
+    WeightedTimestamp,
 };
 
 use super::io::{AdoptKind, ReshapeRequest};
@@ -261,6 +261,24 @@ pub(super) struct TerminalFetch {
     /// The beacon-seeded child anchor the derivation verifies against.
     anchor: ShardAnchor,
     ask: TerminalAsk,
+    /// The terminal the last request named, when the parent's record
+    /// placed it; `None` while the request asks by height alone.
+    named: Option<BlockHash>,
+    /// The last answer asked by height alone that derived a genesis other
+    /// than the anchor's, so a peer repeating it is not reported again.
+    last_mismatch: Option<BlockHash>,
+}
+
+/// What a terminal fetch's answer settled.
+pub(super) enum TerminalAnswer {
+    /// The genesis the anchor names.
+    Derived(Box<DerivedGenesis>),
+    /// Nothing usable; the fetch asks again once the refetch wait passes.
+    Missed,
+    /// The named terminal derives a genesis other than the anchor's. The
+    /// block is the one the network committed, so every answer disagrees
+    /// the same way and the duty cannot adopt.
+    Disagrees,
 }
 
 impl TerminalFetch {
@@ -268,6 +286,8 @@ impl TerminalFetch {
         Self {
             anchor,
             ask: TerminalAsk::NOW,
+            named: None,
+            last_mismatch: None,
         }
     }
 
@@ -278,9 +298,12 @@ impl TerminalFetch {
         parent: ShardId,
         now: LocalTimestamp,
     ) -> Option<GetBlockRequest> {
-        self.ask
-            .begin(now)
-            .then(|| split_terminal_request(view, parent, &self.anchor))
+        if !self.ask.begin(now) {
+            return None;
+        }
+        let request = split_terminal_request(view, parent, &self.anchor);
+        self.named = request.hash;
+        Some(request)
     }
 
     /// The fetch in flight failed at the transport level.
@@ -288,17 +311,60 @@ impl TerminalFetch {
         self.ask.missed(now);
     }
 
-    /// The genesis an answer derives, checked against the anchor; `None`
-    /// when the answer did not deliver it.
+    /// Derive the child's genesis from an answer and check it against the
+    /// anchor the beacon attested.
+    ///
+    /// The derivation is shared with the cut-over flip and the beacon fold,
+    /// so it takes no anchor. This path holds one, so it compares:
+    /// agreement is free, and disagreement means the local parent chain and
+    /// the network disagree about a committed block. The cut-over flip has
+    /// no anchor to compare against yet — its guard is the commitment proof
+    /// at the front.
     pub(super) fn on_block(
         &mut self,
         child: ShardId,
         response: &GetBlockResponse,
         now: LocalTimestamp,
-    ) -> Option<DerivedGenesis> {
+    ) -> TerminalAnswer {
         self.ask.missed(now);
-        let elided = response.block()?;
-        anchored_split_genesis(child, elided.header(), elided.qc(), &self.anchor)
+        let Some(elided) = response.block() else {
+            return TerminalAnswer::Missed;
+        };
+        let terminal = elided.header();
+        let genesis = match split_genesis_from_terminal(child, terminal, elided.qc()) {
+            Ok(genesis) => genesis,
+            Err(error) => {
+                tracing::warn!(?child, %error, "split child genesis derivation failed");
+                return TerminalAnswer::Missed;
+            }
+        };
+        let (derived, anchored) = (genesis.block.hash(), self.anchor.block_hash);
+        if derived == anchored {
+            return TerminalAnswer::Derived(Box::new(genesis));
+        }
+        let served = terminal.hash();
+        if self.named == Some(served) {
+            tracing::error!(
+                ?child,
+                ?derived,
+                ?anchored,
+                "the parent's recorded terminal derives a split-child genesis other than \
+                 the beacon anchor; leaving the child to the join"
+            );
+            return TerminalAnswer::Disagrees;
+        }
+        if self.last_mismatch != Some(served) {
+            self.last_mismatch = Some(served);
+            tracing::error!(
+                ?child,
+                ?served,
+                ?derived,
+                ?anchored,
+                "a terminal served by height derives a split-child genesis other than \
+                 the beacon anchor"
+            );
+        }
+        TerminalAnswer::Missed
     }
 }
 
@@ -337,37 +403,6 @@ pub(super) fn split_terminal_request(
         }
         _ => request,
     }
-}
-
-/// Derive a successor's genesis on the anchor fallback path, checking it
-/// against the anchor the beacon attested.
-///
-/// The derivation is shared with the cut-over flip and the beacon fold, so
-/// it takes no anchor. This path holds one, so it compares: agreement is
-/// free, and disagreement means the local parent chain and the network
-/// disagree about a committed block. The cut-over flip has no anchor to
-/// compare against yet — its guard is the commitment proof at the front.
-pub(super) fn anchored_split_genesis(
-    child: ShardId,
-    terminal: &BlockHeader,
-    qc: &QuorumCertificate,
-    anchor: &ShardAnchor,
-) -> Option<DerivedGenesis> {
-    let genesis = split_genesis_from_terminal(child, terminal, qc)
-        .inspect_err(|error| {
-            tracing::warn!(?child, %error, "split child genesis derivation failed");
-        })
-        .ok()?;
-    if genesis.block.hash() != anchor.block_hash {
-        tracing::error!(
-            ?child,
-            derived = ?genesis.block.hash(),
-            anchored = ?anchor.block_hash,
-            "derived split-child genesis does not reconstruct the beacon anchor"
-        );
-        return None;
-    }
-    Some(genesis)
 }
 
 /// Whether a recognizing walk's terminal of `shard` is commit-proven — the

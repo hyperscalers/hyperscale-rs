@@ -176,11 +176,11 @@ impl ReshapeOrchestrator {
 
     /// Whether this host's split duty for `shard` relinquished the child's
     /// seat to the adapter's ordinary join — a parent half with no parent
-    /// store to seed from (see [`ReshapeEvent::SeedUnavailable`]) or whose
-    /// child anchored past its genesis, or an observer whose follow the
-    /// child's anchor overtook, whose child anchored past its genesis, or
-    /// that diverged, and that no parent half
-    /// took over from. The adapter reads the committed cohort as reshape
+    /// store to seed from (see [`ReshapeEvent::SeedUnavailable`]), or an
+    /// observer whose follow the child's anchor overtook or that diverged
+    /// and that no parent half took over from; or either, once the child
+    /// anchored past its genesis or the parent's recorded terminal derives
+    /// a genesis other than the anchor's. The adapter reads the committed cohort as reshape
     /// ownership; a relinquished seat is not, and a store the duty prepared
     /// for it is the adapter's to discard.
     #[must_use]
@@ -346,20 +346,23 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_storage::ImportProgress;
-    use hyperscale_storage::test_helpers::make_test_block;
+    use hyperscale_storage::test_helpers::{make_test_block, make_test_certified};
     use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
-    use hyperscale_types::test_utils::StubVmStatics;
+    use hyperscale_types::network::response::GetBlockResponse;
+    use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, signed_split_terminal};
     use hyperscale_types::{
-        BlockHash, BlockHeight, ChainOrigin, Epoch, FrontierInputs, Hash, ShardAnchor, ShardId,
-        StateRoot, WeightedTimestamp,
+        Block, BlockHash, BlockHeight, ChainOrigin, ElidedCertifiedBlock, Epoch, FrontierInputs,
+        Hash, Inventory, Round, ShardAnchor, ShardId, SplitChildRoots, StateRoot,
+        WeightedTimestamp,
     };
 
     use super::*;
     use crate::reshape::genesis::DerivedGenesis;
     use crate::reshape::orchestrator::io::{
-        AdoptKind, FetchKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
+        AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
     };
     use crate::reshape::orchestrator::observer_duty::ObserverPhase;
+    use crate::reshape::orchestrator::parent_half::{ParentHalfDuty, ParentHalfPhase};
     use crate::reshape::orchestrator::shared::{TerminalFetch, split_terminal_request};
     use crate::reshape::orchestrator::test_support::*;
     use crate::reshape::view::ReshapeView;
@@ -540,6 +543,121 @@ mod tests {
         );
     }
 
+    /// A terminal served at `height` of the parent: a composing split
+    /// terminal, certified, whose derived child genesis is not the seeded
+    /// [`anchor`].
+    fn disagreeing_terminal() -> Block {
+        let committee = TestCommittee::new(4, 3);
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right")),
+        };
+        signed_split_terminal(
+            &committee,
+            &make_test_block(BlockHeight::new(6)),
+            Round::new(2),
+            WeightedTimestamp::from_millis(100),
+            pair,
+        )
+    }
+
+    fn terminal_served(child: ShardId, from: ShardId, terminal: &Block) -> ReshapeEvent {
+        ReshapeEvent::Fetched {
+            duty: child,
+            from,
+            kind: FetchedKind::Block {
+                response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                    terminal,
+                    make_test_certified(terminal.clone()).qc().clone(),
+                    &Inventory::empty(),
+                ))),
+            },
+        }
+    }
+
+    /// A split duty asking for the parent's recorded terminal by hash, whose
+    /// answer derives a genesis other than the anchor's, relinquishes: the
+    /// block is the committed one, so asking again disagrees the same way.
+    /// Asked by height alone, the answer may be another block, so the duty
+    /// asks again once the refetch wait passes.
+    #[test]
+    fn a_split_terminal_that_disagrees_with_the_anchor_relinquishes_only_when_named() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let terminal = disagreeing_terminal();
+        assert_eq!(terminal.height(), BlockHeight::new(7));
+        for (record_height, observer) in [(7, true), (7, false), (5, true), (5, false)] {
+            let record = ShardAnchor {
+                block_hash: terminal.hash(),
+                height: BlockHeight::new(record_height),
+                terminal_epoch: Some(Epoch::new(3)),
+                ..anchor()
+            };
+            // The parent-half cohort keeps the child named, so a relinquished
+            // duty lingers; beside the observer it names another host's seat,
+            // so no parent half here takes the child over.
+            let half_seat = if observer { 9 } else { 5 };
+            let snap = build(
+                &[(child, &[1, 5])],
+                &[],
+                &[],
+                &[(child, half_seat, parent)],
+                &[],
+                anchor(),
+            )
+            .with_boundaries(BTreeMap::from([(parent, record), (child, anchor())]));
+            let schedule = windowed(&snap);
+            let view = ReshapeView::new(&schedule);
+            let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+            let fetch = Box::new(TerminalFetch::new(anchor()));
+            if observer {
+                insert_observer(
+                    &mut orch,
+                    child,
+                    observer_duty(parent, child, 5, ObserverPhase::FetchingTerminal(fetch)),
+                );
+            } else {
+                insert_parent_half(
+                    &mut orch,
+                    child,
+                    ParentHalfDuty {
+                        parent,
+                        child,
+                        validators: vec![vid(5)],
+                        phase: ParentHalfPhase::FetchingTerminal(fetch),
+                        store_seeded: true,
+                    },
+                );
+            }
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+            assert!(
+                !block_fetches(&requests, parent).is_empty(),
+                "got {requests:?}"
+            );
+
+            let served = vec![terminal_served(child, parent, &terminal)];
+            let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, served, at(0));
+            let requests = orch.step(
+                &view,
+                &BlsVerifier,
+                &StubVmStatics,
+                Vec::new(),
+                at(refetch_ms()),
+            );
+            let named = record_height == 7;
+            assert_eq!(
+                orch.relinquished(child),
+                named,
+                "record at {record_height}, observer {observer}"
+            );
+            assert_eq!(
+                block_fetches(&requests, parent).is_empty(),
+                named,
+                "record at {record_height}, observer {observer}: got {requests:?}"
+            );
+        }
+    }
+
     /// A split's terminal fetch names the parent's terminal crossing, the
     /// block the parent's own boundary records one below the child's
     /// seeded genesis; a record at another height is not that crossing,
@@ -573,7 +691,7 @@ mod tests {
                     parent,
                     child,
                     5,
-                    ObserverPhase::FetchingTerminal(TerminalFetch::new(anchor())),
+                    ObserverPhase::FetchingTerminal(Box::new(TerminalFetch::new(anchor()))),
                 ),
             );
             let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));

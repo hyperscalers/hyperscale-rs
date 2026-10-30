@@ -6,7 +6,9 @@ use std::time::Duration;
 use hyperscale_types::{LocalTimestamp, ShardId, ValidatorId, Verifier};
 
 use super::io::{AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
-use super::shared::{REFETCH_WAIT, SeatTail, TerminalFetch, paced, seats_on, terminal_commit};
+use super::shared::{
+    REFETCH_WAIT, SeatTail, TerminalAnswer, TerminalFetch, paced, seats_on, terminal_commit,
+};
 use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::observer::{ObserverTail, TwoChainCheck};
 use crate::reshape::view::ReshapeView;
@@ -65,13 +67,16 @@ pub(super) enum ParentHalfPhase {
     },
     /// Store seeded; fetching the parent's certified terminal to derive the
     /// child genesis.
-    FetchingTerminal(TerminalFetch),
+    FetchingTerminal(Box<TerminalFetch>),
     /// Genesis derived, adopted, and seated; once seated, inert until the
     /// committed projection releases the duty.
     Seat(SeatTail),
-    /// The host holds no parent store to seed the child from, so the child's
-    /// seat is the adapter's ordinary join's. Inert, and kept only so the
-    /// duty is not rediscovered, until the committed projection releases it.
+    /// The duty cannot seat the child: the host holds no parent store to
+    /// seed it from, the child anchored past its genesis, or the parent's
+    /// recorded terminal derives a genesis other than the anchor's. The
+    /// child's seat is the adapter's ordinary join's. Inert, and kept only
+    /// so the duty is not rediscovered, until the committed projection
+    /// releases it.
     Relinquished,
 }
 
@@ -170,8 +175,12 @@ impl ParentHalfDuty {
                 paced(tail, outcome, now, child);
             }
             (ParentHalfPhase::FetchingTerminal(fetch), FetchedKind::Block { response }) => {
-                if let Some(genesis) = fetch.on_block(child, &response, now) {
-                    self.phase = ParentHalfPhase::Seat(SeatTail::Adopting(Box::new(genesis)));
+                match fetch.on_block(child, &response, now) {
+                    TerminalAnswer::Derived(genesis) => {
+                        self.phase = ParentHalfPhase::Seat(SeatTail::Adopting(genesis));
+                    }
+                    TerminalAnswer::Missed => {}
+                    TerminalAnswer::Disagrees => self.phase = ParentHalfPhase::Relinquished,
                 }
             }
             _ => {}
@@ -223,7 +232,8 @@ impl ParentHalfDuty {
                         );
                         self.phase = ParentHalfPhase::Relinquished;
                     } else if self.store_seeded {
-                        self.phase = ParentHalfPhase::FetchingTerminal(TerminalFetch::new(anchor));
+                        self.phase =
+                            ParentHalfPhase::FetchingTerminal(Box::new(TerminalFetch::new(anchor)));
                     } else if seed.begin(now) {
                         out.push(ReshapeRequest::SeedFromParent {
                             parent,
