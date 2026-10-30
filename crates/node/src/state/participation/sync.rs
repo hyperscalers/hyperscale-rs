@@ -60,10 +60,6 @@ impl ShardParticipation {
                 actions.extend(self.settle_tip(topology_schedule));
                 actions
             }
-            // Remote-header catch-up finished. The coordinator keeps no
-            // sync-mode state to reconcile on completion, so the event is
-            // an acknowledged no-op.
-            ProtocolEvent::RemoteHeaderSyncComplete { .. } => vec![],
             // A past-terminal shard's settled set is reconstructed: record
             // it for the split-boundary fence, then re-drive any votes
             // that deferred for want of it.

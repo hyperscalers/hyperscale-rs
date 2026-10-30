@@ -810,19 +810,6 @@ pub enum ProtocolEvent {
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
     },
 
-    /// The `io_loop`'s [`RemoteHeaderSync`] state machine caught
-    /// `source_shard`'s certified header chain up to `height`.
-    /// `RemoteHeaderCoordinator` uses this to clear any "syncing" flag for
-    /// that shard and resume normal per-gap behaviour.
-    ///
-    /// [`RemoteHeaderSync`]: ../../node/io_loop/sync/remote_header/type.RemoteHeaderSync.html
-    RemoteHeaderSyncComplete {
-        /// Source shard whose chain caught up.
-        source_shard: ShardId,
-        /// Height the sync caught up to.
-        height: BlockHeight,
-    },
-
     /// A cross-shard consumer is parked on a source block whose height sits
     /// at or below the shard's beacon-attested boundary — below the
     /// remote-header sync anchor, where forward sync never delivers the

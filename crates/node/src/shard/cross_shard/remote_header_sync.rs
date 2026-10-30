@@ -258,12 +258,9 @@ where
 
     // ─── Output processing ──────────────────────────────────────────────
 
-    /// Route FSM outputs: `Fetch` → network request, `Complete` →
-    /// `RemoteHeaderSyncComplete` event.
-    pub(crate) fn process_remote_header_sync_outputs(
-        &mut self,
-        outputs: Vec<RemoteHeaderSyncOutput>,
-    ) {
+    /// Route FSM outputs: `Fetch` → network request, `Complete` → a log
+    /// line.
+    pub(crate) fn process_remote_header_sync_outputs(&self, outputs: Vec<RemoteHeaderSyncOutput>) {
         let local_shard = self.shard;
         for output in outputs {
             match output {
@@ -306,10 +303,6 @@ where
                         height = height.inner(),
                         "remote-header sync caught up"
                     );
-                    self.dispatch_event(ProtocolEvent::RemoteHeaderSyncComplete {
-                        source_shard,
-                        height,
-                    });
                 }
             }
         }

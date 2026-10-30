@@ -60,9 +60,6 @@ pub struct NodeStateMachine {
     schedule: Arc<TopologySchedule>,
     schedule_epoch: Epoch,
 
-    /// Current time.
-    now: LocalTimestamp,
-
     /// The coordinators this replica runs for its shard.
     shard: ShardParticipation,
 
@@ -75,7 +72,6 @@ impl std::fmt::Debug for NodeStateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeStateMachine")
             .field("shard", &self.shard.local_shard)
-            .field("now", &self.now)
             .finish_non_exhaustive()
     }
 }
@@ -119,7 +115,6 @@ impl NodeStateMachine {
         Self {
             schedule,
             schedule_epoch,
-            now: LocalTimestamp::ZERO,
             shard,
             beacon_inputs: Vec::new(),
         }
@@ -222,7 +217,6 @@ impl NodeStateMachine {
         genesis: &Block,
         genesis_bytes: u64,
     ) -> Vec<Action> {
-        self.now = now;
         self.shard.set_time(now);
         self.shard
             .shard_coordinator
@@ -287,7 +281,6 @@ impl NodeStateMachine {
         schedule: Arc<TopologySchedule>,
         epoch: Epoch,
     ) -> Vec<Action> {
-        self.now = now;
         self.shard.set_time(now);
         let mut actions = self.install_schedule(epoch, schedule);
         actions.extend(self.shard.shard_coordinator.attach_signer(
@@ -371,7 +364,6 @@ impl StateMachine for NodeStateMachine {
     ))]
     #[allow(clippy::too_many_lines)] // single dispatch over ProtocolEvent variants
     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
-        self.now = now;
         self.shard.set_time(now);
 
         let mut inputs = Vec::new();
@@ -493,7 +485,6 @@ impl StateMachine for NodeStateMachine {
             // ── Sync ─────────────────────────────────────────────────────
             evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
             | ProtocolEvent::BlockSyncComplete { .. }
-            | ProtocolEvent::RemoteHeaderSyncComplete { .. }
             | ProtocolEvent::SettledTxsReconstructed { .. }
             | ProtocolEvent::FetchedStateProofVerified { .. }
             | ProtocolEvent::FetchedVerdictProofVerified { .. }) => {
