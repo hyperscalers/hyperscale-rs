@@ -231,6 +231,25 @@ where
     N: Network,
     D: Dispatch,
 {
+    /// Handle `ShardScopedInput::FetchTick`, which fires on the periodic
+    /// `FetchTick` timer this shard schedules for itself. It advances every
+    /// fetch protocol's idle clock so retries / chunk emission progresses
+    /// without waiting for an admission event. Pending entries are drained
+    /// by `drive_fetch_admission` on canonical admission events and by
+    /// explicit `Action::AbandonFetch` actions emitted from the originating
+    /// coordinator at every expected-set drop site.
+    pub(crate) fn handle_fetch_tick(&mut self) {
+        self.fetch_tick.fired();
+        let now = self.now;
+        let outputs = self.io.consensus.block_tick(now);
+        self.process_block_sync_outputs(outputs);
+
+        let outputs = self.io.cross_shard.remote_header_tick(now);
+        self.process_remote_header_sync_outputs(outputs);
+
+        self.tick_every_fetch();
+    }
+
     /// Refresh this shard's `FetchTick` timer based on whether any of its
     /// subsystems (mempool, consensus block-sync, cross-shard) has pending
     /// work. Each shard manages its own ticker

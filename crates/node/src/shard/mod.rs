@@ -42,7 +42,6 @@ mod metrics;
 mod protocol_event;
 #[cfg(test)]
 pub(crate) mod test_host;
-mod timer;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
