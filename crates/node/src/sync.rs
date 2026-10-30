@@ -429,7 +429,6 @@ impl<K: SyncKey> ScopeState<K> {
 
 /// Inputs to the generic sync state machine.
 #[derive(Debug)]
-#[allow(missing_docs)] // payloads are self-describing
 pub enum SyncInput<B: SyncBinding> {
     /// Set or raise the sync target for `scope`. Idempotent if `target`
     /// hasn't moved forward.
@@ -482,7 +481,6 @@ pub enum SyncInput<B: SyncBinding> {
 
 /// Outputs from the generic sync state machine.
 #[derive(Debug)]
-#[allow(missing_docs)]
 pub enum SyncOutput<B: SyncBinding> {
     /// Issue a fetch covering `[from, from + count)` for `scope`.
     Fetch {

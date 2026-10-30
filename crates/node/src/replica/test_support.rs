@@ -41,7 +41,6 @@ use crate::replica::ReplicaConfig;
 /// the node sees.
 pub struct TestNode {
     pub(crate) node: NodeStateMachine,
-    #[allow(dead_code)] // exposed for tests that mint signed messages
     pub(crate) committee: TestCommittee,
     /// The fold the node's chain is registered with, standing in for the
     /// host's beacon loop.

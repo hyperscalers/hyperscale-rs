@@ -741,8 +741,9 @@ mod tests {
         Deadline, Engagement, EngagementRoot, ExecutionCertificate, ExecutionOutcome, Finalization,
         GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
         ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, SectionRoots, SetRoot, ShardId,
-        SignerBitfield, StateClaimsRoot, StoredReceipt, TickHalf, TickId, TransactionRoot, TxHash,
-        TxOutcome, UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        SignerBitfield, StateClaimsRoot, StateWrites, StoredReceipt, TickHalf, TickId,
+        TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources,
     };
 
     use super::*;
@@ -824,8 +825,7 @@ mod tests {
             consensus: Arc::new(if success {
                 ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    #[allow(clippy::default_trait_access)]
-                    writes: Default::default(),
+                    writes: StateWrites::default(),
                     beacon_witness_events: Capped::empty(),
                     events: Capped::empty(),
                 }

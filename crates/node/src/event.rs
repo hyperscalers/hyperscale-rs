@@ -434,7 +434,6 @@ pub enum ShardScopedInput {
 impl ShardScopedInput {
     /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
-    #[allow(clippy::match_same_arms)] // explicit per-variant arms document intent
     pub(crate) fn priority(&self) -> EventPriority {
         match self {
             Self::Protocol(event) => match event.as_ref() {
@@ -464,8 +463,8 @@ impl ShardScopedInput {
             | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::RecordsArrived { .. }
-            | Self::RecordsWanted { .. } => EventPriority::Network,
-            Self::CommittedBlockGossipReceived { .. }
+            | Self::RecordsWanted { .. }
+            | Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. } => EventPriority::Network,
             Self::AdmitTransaction { .. }
             | Self::AdmitAndGossipTransaction { .. }
