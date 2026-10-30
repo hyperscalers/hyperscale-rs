@@ -634,6 +634,9 @@ impl<B: SyncBinding> Sync<B> {
             return Vec::new();
         };
         state.in_flight_ranges = state.in_flight_ranges.saturating_sub(1);
+        // A lowered target can end the sync here, with nothing left for an
+        // admission to close.
+        let was_syncing = state.is_syncing();
 
         let delivered: HashSet<B::Key> = delivered_heights.iter().copied().collect();
         let pending_deadline = now.plus(PENDING_ADMISSION_TIMEOUT);
@@ -718,6 +721,11 @@ impl<B: SyncBinding> Sync<B> {
             state.target = max_delivered.min(cap);
         }
 
+        if was_syncing && !state.is_syncing() {
+            let mut outputs = vec![self.complete(scope)];
+            outputs.extend(self.emit_fetches());
+            return outputs;
+        }
         Self::queue_window(state, &self.config);
         self.emit_fetches()
     }
@@ -1791,6 +1799,34 @@ mod tests {
         let st = s.scopes.get(&1).unwrap();
         assert_eq!(st.target, st.committed);
         assert!(st.deferred.is_empty());
+    }
+
+    #[test]
+    fn an_empty_prefix_response_that_ends_the_sync_completes_it() {
+        let mut s: Sync<PrefixBinding> = Sync::new(cfg_range());
+        let _ = s.handle(SyncInput::Admitted {
+            scope: 1,
+            height: BlockHeight::new(4),
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(12),
+        });
+        let outputs = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight::new(5),
+            count: 8,
+            delivered_heights: vec![],
+            now: LocalTimestamp::from_millis(0),
+        });
+        assert!(
+            outputs.iter().any(|o| matches!(
+                o,
+                SyncOutput::Complete { scope: 1, height } if *height == BlockHeight::new(4)
+            )),
+            "the scope stopped syncing, so it completes"
+        );
+        assert!(!s.is_syncing());
     }
 
     #[test]
