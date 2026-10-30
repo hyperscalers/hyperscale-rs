@@ -14,7 +14,6 @@ mod fetch;
 mod finalization_serve;
 mod local_provision_serve;
 mod provision_serve;
-mod remote_header;
 mod remote_header_serve;
 mod remote_header_sync;
 mod settled_txs_serve;
@@ -30,9 +29,9 @@ use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
 use hyperscale_types::LocalTimestamp;
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
-pub use remote_header::RemoteHeaderSyncInput;
-use remote_header::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
+pub use remote_header_sync::RemoteHeaderSyncInput;
+use remote_header_sync::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
 pub use state_proof_serve::{serve_cells_request, serve_state_proof_request};
 
@@ -100,7 +99,7 @@ impl CrossShardState {
     #[must_use]
     pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
-            remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
+            remote_header_sync: RemoteHeaderSync::new(remote_header_sync::default_config()),
             provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
             finalization: FinalizationFetch::new(
                 "finalization",
