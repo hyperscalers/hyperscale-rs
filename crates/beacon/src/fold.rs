@@ -125,7 +125,7 @@ pub struct BeaconFold {
     /// timestamp over the window from [`retention_floor`] through
     /// `current_epoch + 1`. The `+1` lookahead entry is finalized an epoch
     /// before its window opens. A node-local cache, not consensus-critical.
-    pub(crate) topology_schedule: TopologySchedule,
+    pub(crate) topology_schedule: Arc<TopologySchedule>,
 
     /// The shard chains registered with the fold, each with its committed
     /// frontier.
@@ -162,7 +162,7 @@ impl BeaconFold {
     pub fn new(
         verifier: Arc<dyn Verifier>,
         latest_block: Arc<Verified<CertifiedBeaconBlock>>,
-        history: Vec<BeaconState>,
+        history: Vec<impl Borrow<BeaconState>>,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
     ) -> Self {
@@ -173,7 +173,7 @@ impl BeaconFold {
                 "genesis block config_hash doesn't match operator config",
             );
         }
-        let latest = history.last().expect(LATEST_STATE_EXPECT);
+        let latest = history.last().expect(LATEST_STATE_EXPECT).borrow();
         let latest_epoch = latest.current_epoch;
         let mut topology_schedule = resumed_schedule(&history, &network);
         // No fold published the genesis window, so at genesis it is its
@@ -188,13 +188,18 @@ impl BeaconFold {
         // fold when the loaded history carries one; the live state
         // stands in otherwise (see the field docs).
         let tip_epoch_source = if history.len() >= 2 {
-            &history[history.len() - 2]
+            history[history.len() - 2].borrow()
         } else {
             latest
         };
         let tip_epoch_committee = tip_epoch_source.derive_beacon_committee();
         let tip_epoch_pool = tip_epoch_source.derive_active_pool();
-        let state = history.into_iter().next_back().expect(LATEST_STATE_EXPECT);
+        let state = history
+            .into_iter()
+            .next_back()
+            .expect(LATEST_STATE_EXPECT)
+            .borrow()
+            .clone();
         Self {
             verifier,
             state,
@@ -204,7 +209,7 @@ impl BeaconFold {
             verification: BeaconVerificationPipeline::new(),
             shard_source: ShardSourceTracker::new(),
             host_on_committee: false,
-            topology_schedule,
+            topology_schedule: Arc::new(topology_schedule),
             hosted: BTreeMap::new(),
             next_registration: 0,
             network,
@@ -286,14 +291,25 @@ impl BeaconFold {
     /// The topology schedule the fold keeps, from the retention floor
     /// through the lookahead.
     #[must_use]
-    pub const fn schedule(&self) -> &TopologySchedule {
+    pub fn schedule(&self) -> &TopologySchedule {
+        &self.topology_schedule
+    }
+
+    /// [`Self::schedule`], shared: the copy the fold's next adoption
+    /// leaves alone, cloning its own before it changes it.
+    #[must_use]
+    pub const fn shared_schedule(&self) -> &Arc<TopologySchedule> {
         &self.topology_schedule
     }
 
     /// Insert the windows `history` carries below the schedule's oldest
     /// retained epoch — see [`widen_schedule`](crate::coordinator::widen_schedule).
     pub fn widen<B: Borrow<BeaconState>>(&mut self, history: &[B]) {
-        widen_schedule(&mut self.topology_schedule, history, &self.network);
+        widen_schedule(
+            Arc::make_mut(&mut self.topology_schedule),
+            history,
+            &self.network,
+        );
     }
 
     /// The source-shard headers and witness chunks the fold holds.
@@ -338,7 +354,7 @@ impl BeaconFold {
 
     /// The live topology snapshot: the schedule's head.
     #[must_use]
-    pub(crate) const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
+    pub(crate) fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         self.topology_schedule.head()
     }
 
@@ -610,25 +626,22 @@ impl BeaconFold {
         // resolve its committee a full epoch before its window opens.
         let head = Arc::new(self.state.derive_topology_snapshot(self.network.clone()));
         let epoch = self.state.current_epoch;
-        self.topology_schedule.set_head(Arc::clone(&head));
-        self.topology_schedule.insert(epoch, head);
+        let schedule = Arc::make_mut(&mut self.topology_schedule);
+        schedule.set_head(Arc::clone(&head));
+        schedule.insert(epoch, head);
         let lookahead = Arc::new(
             self.state
                 .derive_next_topology_snapshot(self.network.clone()),
         );
-        self.topology_schedule
-            .insert_lookahead(epoch.next(), lookahead);
+        schedule.insert_lookahead(epoch.next(), lookahead);
         // Latched before the eviction reads the floor: a chain caught up
         // to its terminal whose last commit preceded this fold reads past
         // its terminal only now, and only while its window is held.
         for chain in self.hosted.values_mut() {
             latch_terminal(&self.topology_schedule, chain);
         }
-        self.topology_schedule.evict_below(retention_floor(
-            &self.state,
-            self.hosted_committee_floor(),
-            self.now,
-        ));
+        let floor = retention_floor(&self.state, self.hosted_committee_floor(), self.now);
+        Arc::make_mut(&mut self.topology_schedule).evict_below(floor);
 
         // Evict chunks the boundary fold has now consumed — those starting
         // below each shard's advanced applied watermark
@@ -656,7 +669,7 @@ impl BeaconFold {
             },
             Action::TopologyChanged {
                 epoch: self.state.current_epoch,
-                schedule: Arc::new(self.topology_schedule.clone()),
+                schedule: Arc::clone(&self.topology_schedule),
             },
         ];
         // Release in-flight witness fetches the boundary fold just consumed

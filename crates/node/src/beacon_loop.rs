@@ -248,14 +248,14 @@ where
             .is_some_and(|(oldest, _)| anchor_epoch < oldest)
         {
             let floor = retention_floor(self.fold.state(), Some(anchors.committee), self.now);
-            let history = states_since(self.process.beacon_storage.as_ref(), floor);
+            let history = self.process.beacon_storage.states_since(floor);
             self.fold.widen(&history);
         }
         let token = self.fold.register_chain(shard, anchors, height);
         self.shard_senders.insert(token, (shard, sender));
         Registration {
             token,
-            schedule: Arc::new(self.fold.schedule().clone()),
+            schedule: Arc::clone(self.fold.shared_schedule()),
             epoch: self.fold.state().current_epoch,
             chain_config: self.fold.state().chain_config,
         }
@@ -418,7 +418,7 @@ where
     /// The topology schedule the fold keeps: every retained epoch's
     /// committees, by which a reported header's signers resolve.
     #[must_use]
-    pub const fn schedule(&self) -> &TopologySchedule {
+    pub fn schedule(&self) -> &TopologySchedule {
         self.fold.schedule()
     }
 
@@ -1550,19 +1550,10 @@ pub(crate) fn resume_fold(
     let (latest_block, latest_state) = storage
         .latest_committed()
         .expect("beacon chain is non-empty after the genesis commit");
-    let history = states_since(storage, retention_floor(&latest_state, None, now));
+    let history = storage.states_since(retention_floor(&latest_state, None, now));
     let mut fold = BeaconFold::new(verifier, latest_block, history, network, config_hash);
     fold.set_now(now);
     fold
-}
-
-/// The states beacon storage holds from `floor` on, oldest first.
-fn states_since(storage: &dyn BeaconStorage, floor: Epoch) -> Vec<BeaconState> {
-    storage
-        .states_since(floor)
-        .into_iter()
-        .map(|state| state.as_ref().clone())
-        .collect()
 }
 
 /// Close every participant's release gate on every way the loop goes

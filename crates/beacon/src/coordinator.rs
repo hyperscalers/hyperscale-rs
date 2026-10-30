@@ -827,7 +827,7 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
+    pub fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         self.fold.current_topology_snapshot()
     }
 
@@ -837,7 +837,7 @@ impl BeaconCoordinator {
     /// head ([`TopologySchedule::head`]) through it, so no consensus-layer type
     /// crosses into their verification paths.
     #[must_use]
-    pub const fn topology_schedule(&self) -> &TopologySchedule {
+    pub fn topology_schedule(&self) -> &TopologySchedule {
         &self.fold.topology_schedule
     }
 
