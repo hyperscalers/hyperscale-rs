@@ -52,7 +52,7 @@ pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
 pub use event::{Registration, RegistrationReply};
 pub use fetch::FetchConfig;
-pub use host::{HostedChain, NodeHost, ShardGenesis};
+pub use host::{HostResources, HostedChain, NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
 pub use replica::ReplicaConfig;
 pub use seating as startup;

@@ -25,7 +25,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::{HostedChain, NodeConfig, NodeHost, ReplicaConfig, TimerOp};
+use hyperscale_node::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig, TimerOp};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -163,16 +163,18 @@ impl Fixture {
         let network = SimNetworkAdapter::new(Arc::clone(&registry));
         let (event_tx, event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage: Arc::clone(&self.beacon_storage),
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network,
+                dispatch: SyncDispatch::new(),
+                shard_event_senders: BTreeMap::new(),
+                beacon_event_sender: event_tx,
+                topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            },
             Vec::new(),
             vec![self.identity(idx)],
-            Arc::clone(&self.beacon_storage),
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            network,
-            SyncDispatch::new(),
-            BTreeMap::new(),
-            event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
         );

@@ -25,7 +25,7 @@ use hyperscale_types::{
 };
 
 use crate::shard::{HostEvent, ShardLoop};
-use crate::{HostedChain, NodeConfig, NodeHost, ReplicaConfig};
+use crate::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 
 pub const SHARD: ShardId = ShardId::leaf(1, 0);
 
@@ -249,16 +249,18 @@ impl Fixture {
         }
         let registry = Arc::new(HandlerRegistry::new(BTreeSet::new()));
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network: SimNetworkAdapter::new(registry),
+                dispatch: SyncDispatch::new(),
+                shard_event_senders: BTreeMap::new(),
+                beacon_event_sender: event_tx,
+                topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            },
             Vec::new(),
             Vec::new(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
-            BTreeMap::new(),
-            event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             now,
         );
@@ -282,7 +284,16 @@ impl Fixture {
         let recovered = storage.load_recovered_state(SHARD);
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network: SimNetworkAdapter::new(registry),
+                dispatch: SyncDispatch::new(),
+                shard_event_senders: std::iter::once((SHARD, event_tx.clone())).collect(),
+                beacon_event_sender: event_tx,
+                topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            },
             vec![HostedChain {
                 shard: SHARD,
                 storage,
@@ -290,13 +301,6 @@ impl Fixture {
                 signers: vec![self.identity(0)],
             }],
             Vec::new(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
-            std::iter::once((SHARD, event_tx.clone())).collect(),
-            event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             now,
         );
@@ -353,7 +357,16 @@ impl Fixture {
             ..RecoveredState::default()
         };
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network,
+                dispatch,
+                shard_event_senders: std::iter::once((SHARD, event_tx.clone())).collect(),
+                beacon_event_sender: event_tx,
+                topology_snapshot: Arc::new(ArcSwap::from(topology)),
+            },
             vec![HostedChain {
                 shard: SHARD,
                 storage,
@@ -361,13 +374,6 @@ impl Fixture {
                 signers: vec![self.identity(0)],
             }],
             Vec::new(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            network,
-            dispatch,
-            std::iter::once((SHARD, event_tx.clone())).collect(),
-            event_tx,
-            Arc::new(ArcSwap::from(topology)),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
         );

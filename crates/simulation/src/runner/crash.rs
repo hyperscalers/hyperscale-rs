@@ -22,7 +22,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::reshape::ReshapeOrchestrator;
 use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
-use hyperscale_node::{HostedChain, NodeHost, ReplicaConfig};
+use hyperscale_node::{HostResources, HostedChain, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
@@ -214,16 +214,18 @@ impl SimulationRunner {
             })
             .collect();
         let restarted = NodeHost::new(
-            config,
+            &config,
+            HostResources {
+                beacon_storage,
+                executor: Arc::clone(&executor),
+                network: self.network.create_adapter(host),
+                dispatch,
+                shard_event_senders,
+                beacon_event_sender: self.event_txs[i].clone(),
+                topology_snapshot: Arc::new(ArcSwap::from(topology)),
+            },
             chains,
             seated.identities,
-            beacon_storage,
-            Arc::clone(&executor),
-            self.network.create_adapter(host),
-            dispatch,
-            shard_event_senders,
-            self.event_txs[i].clone(),
-            Arc::new(ArcSwap::from(topology)),
             self.node_config.clone(),
             now,
         );

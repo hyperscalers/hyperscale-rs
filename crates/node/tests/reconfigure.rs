@@ -19,7 +19,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput, ShardScopedInput};
-use hyperscale_node::{HostedChain, NodeConfig, NodeHost, ReplicaConfig};
+use hyperscale_node::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -151,7 +151,19 @@ impl Fixture {
             .commit_beacon_block(&self.genesis_block, &Arc::new(self.genesis_state.clone()));
         let fresh = RecoveredState::default();
         NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network: SimNetworkAdapter::new(registry),
+                dispatch: SyncDispatch::new(),
+                shard_event_senders: chains
+                    .iter()
+                    .map(|&(shard, _)| (shard, event_tx.clone()))
+                    .collect(),
+                beacon_event_sender: event_tx.clone(),
+                topology_snapshot: Arc::new(ArcSwap::from(topology)),
+            },
             chains
                 .iter()
                 .map(|&(shard, idx)| HostedChain {
@@ -162,16 +174,6 @@ impl Fixture {
                 })
                 .collect(),
             participants.iter().map(|&idx| self.identity(idx)).collect(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
-            chains
-                .iter()
-                .map(|&(shard, _)| (shard, event_tx.clone()))
-                .collect(),
-            event_tx.clone(),
-            Arc::new(ArcSwap::from(topology)),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
         )

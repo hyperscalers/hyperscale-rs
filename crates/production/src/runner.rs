@@ -41,7 +41,8 @@ use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
-    HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot, TxStatusCache,
+    HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot,
+    TxStatusCache,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -566,16 +567,18 @@ impl ProductionRunnerBuilder {
         // beacon thread.
         let (beacon_event_tx, beacon_event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            replica_config,
+            &replica_config,
+            HostResources {
+                beacon_storage: self.beacon_storage,
+                executor,
+                network,
+                dispatch: (*dispatch).clone(),
+                shard_event_senders,
+                beacon_event_sender: beacon_event_tx,
+                topology_snapshot: topology_snapshot.clone(),
+            },
             chains,
             identities,
-            self.beacon_storage,
-            executor,
-            network,
-            (*dispatch).clone(),
-            shard_event_senders,
-            beacon_event_tx,
-            topology_snapshot.clone(),
             NodeConfig::default(),
             now,
         );

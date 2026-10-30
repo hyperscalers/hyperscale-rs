@@ -29,8 +29,8 @@ use hyperscale_network_memory::{
 use hyperscale_node::reshape::{PreparedStores, ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
-    HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig, ShardGenesis, TimerOp,
-    TimerOwner, timer_event,
+    HostResources, HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig,
+    ShardGenesis, TimerOp, TimerOwner, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
@@ -825,18 +825,20 @@ impl SimulationRunner {
             let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> =
                 by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let host = NodeHost::new(
-                replica_config,
+                &replica_config,
+                HostResources {
+                    beacon_storage,
+                    executor,
+                    network: network.create_adapter(
+                        NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
+                    ),
+                    dispatch,
+                    shard_event_senders,
+                    beacon_event_sender: event_tx.clone(),
+                    topology_snapshot: topology_arc_for_host,
+                },
                 chains,
                 identities,
-                beacon_storage,
-                executor,
-                network.create_adapter(
-                    NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
-                ),
-                dispatch,
-                shard_event_senders,
-                event_tx.clone(),
-                topology_arc_for_host,
                 network_config.node_config.clone(),
                 now,
             );
