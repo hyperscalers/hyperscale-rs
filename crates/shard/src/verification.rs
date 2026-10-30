@@ -11,15 +11,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ParentJudgement};
-use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
+use hyperscale_core::{Action, ParentJudgement, StateRootCheck};
+use hyperscale_storage::{MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
     Demands, Finalization, FrontierInputs, LinkageError, QuorumCertificate, ReshapeKind,
-    ReshapeThresholds, RevealChain, SettledTxsRoot, Settling, ShardId, SharedTransactions,
-    SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule,
-    TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
-    VerifiedBlockAssembleError, WeightedTimestamp,
+    ReshapeThresholds, RevealChain, SettledTxsRoot, Settling, ShardId, SplitChildRoots, StateClaim,
+    StateRoot, SubstateKey, TopologySchedule, TopologySnapshot, TxsInFlight, UnsettledTx,
+    Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -66,75 +65,6 @@ enum RootStage {
 pub struct PendingQcVerification {
     /// The block header we're considering voting on.
     pub(crate) header: BlockHeader,
-}
-
-/// State root verification that is ready to dispatch (JMT is at the correct root).
-///
-/// The `NodeStateMachine` drains these after each shard consensus call and emits
-/// `VerifyStateRoot` actions. `parent_state_root` and `finalizations` are
-/// resolved at drain time from the current chain/pending-block state, not
-/// captured at `initiate_state_root_verification` time — capturing at initiate
-/// time produced a stale-snapshot race where an entry deferred before its
-/// parent committed would dispatch with the wrong `parent_state_root`.
-#[derive(Debug)]
-pub struct ReadyStateRootVerification {
-    /// Block whose state root is being verified.
-    pub block_hash: BlockHash,
-    /// Parent block hash; the JMT computation chains on top of this parent's snapshot.
-    pub parent_block_hash: BlockHash,
-    /// State root at the parent block, anchoring the JMT computation.
-    pub parent_state_root: StateRoot,
-    /// The committed height of the parent block (stable anchor for JMT computation).
-    pub parent_block_height: BlockHeight,
-    /// State root the proposer claimed; the verifier rejects on mismatch.
-    pub expected_root: StateRoot,
-    /// Finalizations from the `PendingBlock` — these carry the proposer's receipts,
-    /// ensuring all validators verify against the same execution outputs.
-    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    /// The committed markers the block writes, each with the inherited
-    /// key its transaction is also judged by.
-    pub creations: Vec<CommittedHere>,
-    /// Height of the block being verified.
-    pub block_height: BlockHeight,
-    /// The header's `split_child_roots` claim, verified beside the
-    /// state root.
-    pub claimed_split_child_roots: Option<SplitChildRoots>,
-    /// Whether the block's window requires the claim (the shard's final
-    /// epoch before a split).
-    pub split_child_roots_required: bool,
-    /// Whether the block's window requires the terminal settled root — set on any
-    /// terminating boundary header (a split parent's or a merge child's
-    /// final epoch), broader than [`Self::split_child_roots_required`].
-    pub terminal_settled_txs_required: bool,
-    /// The header's `terminal_settled_txs` claim, verified beside the state root
-    /// over the committed retention window.
-    pub claimed_terminal_settled_txs: Option<SettledTxsRoot>,
-    /// The block's parent-QC weighted timestamp — the settled-transaction window
-    /// anchor.
-    pub parent_weighted_timestamp: WeightedTimestamp,
-    /// The schedule's settled-window floor at the anchor — extends the
-    /// window back to the reshape's admission.
-    pub settled_txs_window_floor: Option<WeightedTimestamp>,
-    /// Where the parent's sweep stopped, which the block's starts above.
-    pub parent_sweep_frontier: SweepFrontier,
-    /// The header's own `sweep_frontier` claim: recomputed beside the
-    /// state root for a voter, the end of the interval removed for a
-    /// certified block.
-    pub claimed_sweep_frontier: SweepFrontier,
-    /// What the block's claims do to the read frontier, folded under
-    /// the root being verified.
-    pub frontier: FrontierInputs,
-    /// What the block writes to tick membership, folded under the root
-    /// being verified.
-    pub members: MemberInputs,
-    /// What a voter judges the block by at the parent, or `None` for a
-    /// certified block, which is not judged there.
-    pub parent_judgement: Option<ParentJudgement>,
-    /// The block's claims: what the fold settles on, and among which
-    /// the parent-anchored ones are re-read from the parent view.
-    pub state_claims: Vec<StateClaim>,
-    /// The block's transactions, whose fees the parent state judges.
-    pub transactions: SharedTransactions,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -1809,7 +1739,7 @@ impl VerificationPipeline {
     pub(crate) fn resolve_ready_state_root_verification(
         pending: &PendingStateRootVerification,
         chain: &ChainView<'_>,
-    ) -> Option<ReadyStateRootVerification> {
+    ) -> Option<StateRootCheck> {
         let block = chain.get_block(pending.block_hash).or_else(|| {
             debug!(
                 block_hash = ?pending.block_hash,
@@ -1825,7 +1755,7 @@ impl VerificationPipeline {
             chain.chain_origin().cut(),
             block.transactions().iter().map(|tx| tx.as_unverified()),
         );
-        Some(ReadyStateRootVerification {
+        Some(StateRootCheck {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,
             parent_state_root,

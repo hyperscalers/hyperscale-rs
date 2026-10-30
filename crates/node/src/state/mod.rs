@@ -303,31 +303,12 @@ impl NodeStateMachine {
     fn drain_dispatch(&mut self, actions: &mut Vec<Action>) {
         let s = &mut self.shard;
         let topology_schedule = &self.schedule;
-        for ready in s.shard_coordinator.drain_ready_state_root_verifications() {
-            actions.push(Action::VerifyStateRoot {
-                block_hash: ready.block_hash,
-                parent_block_hash: ready.parent_block_hash,
-                parent_state_root: ready.parent_state_root,
-                parent_block_height: ready.parent_block_height,
-                expected_root: ready.expected_root,
-                finalizations: ready.finalizations,
-                creations: ready.creations,
-                block_height: ready.block_height,
-                claimed_split_child_roots: ready.claimed_split_child_roots,
-                split_child_roots_required: ready.split_child_roots_required,
-                terminal_settled_txs_required: ready.terminal_settled_txs_required,
-                claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
-                parent_weighted_timestamp: ready.parent_weighted_timestamp,
-                settled_txs_window_floor: ready.settled_txs_window_floor,
-                parent_sweep_frontier: ready.parent_sweep_frontier,
-                claimed_sweep_frontier: ready.claimed_sweep_frontier,
-                frontier: ready.frontier,
-                members: ready.members,
-                parent_judgement: ready.parent_judgement,
-                state_claims: ready.state_claims,
-                transactions: ready.transactions,
-            });
-        }
+        actions.extend(
+            s.shard_coordinator
+                .drain_ready_state_root_verifications()
+                .into_iter()
+                .map(|check| Action::VerifyStateRoot(Box::new(check))),
+        );
 
         // If any emitter latched a proposal-retry during this dispatch (or
         // the shard coordinator's verification path unblocked a deferred

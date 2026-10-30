@@ -79,6 +79,103 @@ pub struct ParentJudgement {
     pub coasting: bool,
 }
 
+/// What one block's state-root verification takes.
+///
+/// The block, its parent's state, and every claim checked beside the
+/// root. The shard coordinator resolves it against its chain view once
+/// the parent's tree is ready, and the state-root handler reads it.
+#[derive(Debug, Clone)]
+pub struct StateRootCheck {
+    /// Block whose state root is being verified.
+    pub block_hash: BlockHash,
+    /// The block's transactions, whose fees the parent state judges.
+    pub transactions: SharedTransactions,
+    /// Parent block hash — used to walk the snapshot chain for the overlay.
+    pub parent_block_hash: BlockHash,
+    /// Base state root (parent block's `state_root`).
+    pub parent_state_root: StateRoot,
+    /// Height of the parent block (stable anchor for JMT computation).
+    pub parent_block_height: BlockHeight,
+    /// Expected state root after applying writes.
+    pub expected_root: StateRoot,
+    /// Finalizations whose receipts the state root covers. The thread
+    /// pool merges the receipts' writes from these.
+    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    /// The committed markers the block writes, derived by the
+    /// coordinator from its transactions and the chain's origin. They
+    /// fold with the receipts' writes under the root being verified,
+    /// and a row whose own or inherited key the parent state holds
+    /// refuses the block.
+    pub creations: Vec<CommittedHere>,
+    /// Block height being verified.
+    pub block_height: BlockHeight,
+    /// The header's `split_child_roots` claim, verified beside the
+    /// state root.
+    pub claimed_split_child_roots: Option<SplitChildRoots>,
+    /// Whether the block's window requires the claim (the shard's
+    /// final epoch before a split), resolved by the coordinator from
+    /// the schedule.
+    pub split_child_roots_required: bool,
+    /// Whether the block's window requires the terminal settled root —
+    /// set on any terminating boundary header (a split parent's or a
+    /// merge child's final epoch), broader than
+    /// `split_child_roots_required`.
+    pub terminal_settled_txs_required: bool,
+    /// The header's `terminal_settled_txs` claim, recomputed beside the
+    /// state root over the committed retention window when the block
+    /// terminates the shard at a boundary.
+    pub claimed_terminal_settled_txs: Option<SettledTxsRoot>,
+    /// The block's parent-QC weighted timestamp — the anchor the
+    /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
+    /// resolved identically by the proposer and every verifier.
+    pub parent_weighted_timestamp: WeightedTimestamp,
+    /// Where the parent's sweep stopped, which the block's starts
+    /// above.
+    pub parent_sweep_frontier: SweepFrontier,
+    /// The header's own `sweep_frontier` claim.
+    ///
+    /// A voter recomputes it beside the state root, and the
+    /// recomputation is the whole check: a walk from the parent's
+    /// frontier under the cap lands on exactly one position, so a
+    /// frontier that matches came from the same removal set, and one
+    /// that does not is either an incomplete sweep or an overreaching
+    /// one. It also carries the obligation to advance, since a
+    /// proposer that swept nothing while cells sat below the clock
+    /// lands short of where the walk does.
+    ///
+    /// For a certified block it is the upper end of the interval the
+    /// block removed, read as stated.
+    pub claimed_sweep_frontier: SweepFrontier,
+    /// The schedule's settled-window floor for the shard at the block's
+    /// anchor — extends the settled-transaction window back to the reshape's
+    /// admission, covering every settlement a counterpart fence can
+    /// still hold a straddler against. `None` when no retained window
+    /// records one.
+    pub settled_txs_window_floor: Option<WeightedTimestamp>,
+    /// What the block's claims do to the read frontier, folded under
+    /// the root being verified.
+    pub frontier: FrontierInputs,
+    /// What the block writes to tick membership, folded under the
+    /// root being verified.
+    pub members: MemberInputs,
+    /// What a voter holds the block to at the parent. A refusal by
+    /// it, or by any other parent rule, refuses the state root.
+    ///
+    /// `None` for a block a quorum has already certified, which is
+    /// not judged at the parent at all: its voters judged it, the
+    /// block commits on its certificate whatever this replica would
+    /// say, and a replica that never voted on it may not route its
+    /// transactions, which the parent rules read, nor hold the
+    /// schedule its proposer built under, which the sweep rule
+    /// reads.
+    pub parent_judgement: Option<ParentJudgement>,
+    /// The block's claims, whose readings license the crossing
+    /// settlements folded under the root, and among which the
+    /// parent-anchored ones are re-read from the verifier's own
+    /// parent view.
+    pub state_claims: Vec<StateClaim>,
+}
+
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
 pub struct CrossShardExecutionRequest {
@@ -729,96 +826,7 @@ pub enum Action {
     /// to build an overlay of uncommitted tree nodes, then calls
     /// `prepare_block_commit` which computes the JMT root and caches a
     /// `PreparedCommit` for efficient commit later.
-    VerifyStateRoot {
-        /// Block whose state root is being verified.
-        block_hash: BlockHash,
-        /// The block's transactions, whose fees the parent state judges.
-        transactions: SharedTransactions,
-        /// Parent block hash — used to walk the snapshot chain for the overlay.
-        parent_block_hash: BlockHash,
-        /// Base state root (parent block's `state_root`).
-        parent_state_root: StateRoot,
-        /// Height of the parent block (stable anchor for JMT computation).
-        parent_block_height: BlockHeight,
-        /// Expected state root after applying writes.
-        expected_root: StateRoot,
-        /// Finalizations whose receipts the state root covers. The thread
-        /// pool merges the receipts' writes from these.
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        /// The committed markers the block writes, derived by the
-        /// coordinator from its transactions and the chain's origin. They
-        /// fold with the receipts' writes under the root being verified,
-        /// and a row whose own or inherited key the parent state holds
-        /// refuses the block.
-        creations: Vec<CommittedHere>,
-        /// Block height being verified.
-        block_height: BlockHeight,
-        /// The header's `split_child_roots` claim, verified beside the
-        /// state root.
-        claimed_split_child_roots: Option<SplitChildRoots>,
-        /// Whether the block's window requires the claim (the shard's
-        /// final epoch before a split), resolved by the coordinator from
-        /// the schedule.
-        split_child_roots_required: bool,
-        /// Whether the block's window requires the terminal settled root —
-        /// set on any terminating boundary header (a split parent's or a
-        /// merge child's final epoch), broader than
-        /// `split_child_roots_required`.
-        terminal_settled_txs_required: bool,
-        /// The header's `terminal_settled_txs` claim, recomputed beside the
-        /// state root over the committed retention window when the block
-        /// terminates the shard at a boundary.
-        claimed_terminal_settled_txs: Option<SettledTxsRoot>,
-        /// The block's parent-QC weighted timestamp — the anchor the
-        /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
-        /// resolved identically by the proposer and every verifier.
-        parent_weighted_timestamp: WeightedTimestamp,
-        /// Where the parent's sweep stopped, which the block's starts
-        /// above.
-        parent_sweep_frontier: SweepFrontier,
-        /// The header's own `sweep_frontier` claim.
-        ///
-        /// A voter recomputes it beside the state root, and the
-        /// recomputation is the whole check: a walk from the parent's
-        /// frontier under the cap lands on exactly one position, so a
-        /// frontier that matches came from the same removal set, and one
-        /// that does not is either an incomplete sweep or an overreaching
-        /// one. It also carries the obligation to advance, since a
-        /// proposer that swept nothing while cells sat below the clock
-        /// lands short of where the walk does.
-        ///
-        /// For a certified block it is the upper end of the interval the
-        /// block removed, read as stated.
-        claimed_sweep_frontier: SweepFrontier,
-        /// The schedule's settled-window floor for the shard at the block's
-        /// anchor — extends the settled-transaction window back to the reshape's
-        /// admission, covering every settlement a counterpart fence can
-        /// still hold a straddler against. `None` when no retained window
-        /// records one.
-        settled_txs_window_floor: Option<WeightedTimestamp>,
-        /// What the block's claims do to the read frontier, folded under
-        /// the root being verified.
-        frontier: FrontierInputs,
-        /// What the block writes to tick membership, folded under the
-        /// root being verified.
-        members: MemberInputs,
-        /// What a voter holds the block to at the parent. A refusal by
-        /// it, or by any other parent rule, refuses the state root.
-        ///
-        /// `None` for a block a quorum has already certified, which is
-        /// not judged at the parent at all: its voters judged it, the
-        /// block commits on its certificate whatever this replica would
-        /// say, and a replica that never voted on it may not route its
-        /// transactions, which the parent rules read, nor hold the
-        /// schedule its proposer built under, which the sweep rule
-        /// reads.
-        parent_judgement: Option<ParentJudgement>,
-        /// The block's claims, whose readings license the crossing
-        /// settlements folded under the root, and among which the
-        /// parent-anchored ones are re-read from the verifier's own
-        /// parent view.
-        state_claims: Vec<StateClaim>,
-    },
+    VerifyStateRoot(Box<StateRootCheck>),
 
     /// Verify a block's beacon-witness root + leaf count.
     ///
@@ -1846,7 +1854,7 @@ impl Action {
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyShardForkProof { .. }
-            | Self::VerifyStateRoot { .. }
+            | Self::VerifyStateRoot(_)
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::VerifyBodyRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
@@ -1922,7 +1930,7 @@ impl Action {
             | Self::VerifyBodyRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyResolutions { .. }
-            | Self::VerifyStateRoot { .. }
+            | Self::VerifyStateRoot(_)
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }

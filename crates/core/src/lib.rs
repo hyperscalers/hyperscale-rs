@@ -42,7 +42,7 @@ mod traits;
 
 pub use action::{
     Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParentJudgement,
-    ParticipationChange, ProvisionsRequest, QcSubject, SyncClaimId,
+    ParticipationChange, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
 pub use fetch_ids::{BeaconFetchIds, FetchIds};

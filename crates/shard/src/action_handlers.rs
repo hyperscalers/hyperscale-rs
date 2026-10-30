@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, StateRootCheck};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
     CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, licensed_lines,
@@ -1269,29 +1269,30 @@ where
             ));
         }
 
-        Action::VerifyStateRoot {
-            block_hash,
-            transactions,
-            parent_block_hash,
-            parent_state_root,
-            parent_block_height,
-            expected_root,
-            finalizations,
-            creations,
-            block_height,
-            claimed_split_child_roots,
-            split_child_roots_required,
-            terminal_settled_txs_required,
-            claimed_terminal_settled_txs,
-            parent_weighted_timestamp,
-            settled_txs_window_floor,
-            parent_sweep_frontier,
-            claimed_sweep_frontier,
-            frontier,
-            members,
-            parent_judgement,
-            state_claims,
-        } => {
+        Action::VerifyStateRoot(check) => {
+            let StateRootCheck {
+                block_hash,
+                transactions,
+                parent_block_hash,
+                parent_state_root,
+                parent_block_height,
+                expected_root,
+                finalizations,
+                creations,
+                block_height,
+                claimed_split_child_roots,
+                split_child_roots_required,
+                terminal_settled_txs_required,
+                claimed_terminal_settled_txs,
+                parent_weighted_timestamp,
+                settled_txs_window_floor,
+                parent_sweep_frontier,
+                claimed_sweep_frontier,
+                frontier,
+                members,
+                parent_judgement,
+                state_claims,
+            } = *check;
             let start = Stopwatch::start();
             let view = ctx
                 .pending_chain

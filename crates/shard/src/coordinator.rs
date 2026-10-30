@@ -15,7 +15,8 @@
 use std::collections::BTreeSet;
 
 use hyperscale_core::{
-    Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, SyncClaimId, TimerId,
+    Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, StateRootCheck,
+    SyncClaimId, TimerId,
 };
 use hyperscale_types::{
     Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
@@ -215,8 +216,7 @@ use crate::validation::{
     validate_coast_block_for_vote, validate_header, validate_proposer,
 };
 use crate::verification::{
-    InFlightCheck, ReadyStateRootVerification, SubstateCountSource, VerificationPipeline,
-    committed_cells_for,
+    InFlightCheck, SubstateCountSource, VerificationPipeline, committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -9930,7 +9930,7 @@ impl ShardCoordinator {
     /// [`VerificationPipeline::take_ready_state_root_verifications`] and
     /// resolves each against the chain view via
     /// [`VerificationPipeline::resolve_ready_state_root_verification`].
-    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
+    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<StateRootCheck> {
         let taken = self.verification.take_ready_state_root_verifications();
         if taken.is_empty() {
             return Vec::new();

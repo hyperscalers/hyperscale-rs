@@ -60,7 +60,7 @@ where
             | Action::VerifyTimeout { .. }
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyShardForkProof { .. }
-            | Action::VerifyStateRoot { .. }
+            | Action::VerifyStateRoot(_)
             | Action::VerifyBeaconWitnessRoot { .. }
             | Action::VerifyBodyRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
@@ -851,7 +851,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, ProtocolEvent};
+    use hyperscale_core::{Action, ProtocolEvent, StateRootCheck};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
@@ -998,7 +998,7 @@ mod tests {
             Fixture::new().host_with_events_over(storage.clone(), parent_block_height);
         while events.try_recv().is_ok() {}
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a certified child"));
-        loop_of(&mut host).drain_actions(vec![Action::VerifyStateRoot {
+        loop_of(&mut host).drain_actions(vec![Action::VerifyStateRoot(Box::new(StateRootCheck {
             block_hash,
             transactions: Arc::new(Capped::empty()),
             parent_block_hash: BlockHash::ZERO,
@@ -1020,7 +1020,7 @@ mod tests {
             members,
             parent_judgement: None,
             state_claims: Vec::new(),
-        }]);
+        }))]);
         events
             .try_iter()
             .find_map(|event| match event {
