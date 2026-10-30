@@ -85,7 +85,7 @@ where
                             shard,
                             ShardScopedInput::TransactionGossipReceived { tx: transaction },
                         ) {
-                            return Verdict::Ignore;
+                            return Verdict::Busy;
                         }
                     }
                     Verdict::Accept
@@ -185,7 +185,7 @@ where
                             sender_signature: gossip.sender_signature,
                         },
                     ) {
-                        return Verdict::Ignore;
+                        return Verdict::Busy;
                     }
                     Verdict::defer_all(checks)
                 },
@@ -932,13 +932,13 @@ where
 }
 
 /// The verdict on a message whose input its shard's network lane took,
-/// or refused for being full: a refusal is this host's backlog, not
-/// the sender's fault.
+/// or refused for being full: a refusal is this host's backlog, which
+/// costs the sender nothing.
 const fn taken(offered: bool) -> Verdict {
     if offered {
         Verdict::Accept
     } else {
-        Verdict::Ignore
+        Verdict::Busy
     }
 }
 
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     /// Gossip that finds its shard's network lane full is refused as gossip
-    /// this host cannot judge now, at once rather than once the lane has
+    /// this host has no room for, at once rather than once the lane has
     /// room, and the lane being full keeps no continuation of the loop's
     /// own off its internal lane.
     #[test]
@@ -1345,7 +1345,7 @@ mod tests {
         );
         assert_eq!(
             registry.local_dispatch_gossip(&gossip(2), Some(SHARD)),
-            Some(Verdict::Ignore),
+            Some(Verdict::Busy),
             "gossip past the lane's bound is refused, not queued",
         );
         assert_eq!(network.len(), 1);

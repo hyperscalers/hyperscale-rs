@@ -310,7 +310,7 @@ pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event:
 ///
 /// `false` when the lane is full: the input is dropped and counted, never
 /// queued past the lane's bound, and the handler answers the message as
-/// one this host cannot judge now. A closed lane takes the input as
+/// [`Verdict::Busy`](hyperscale_network::Verdict::Busy). A closed lane takes the input as
 /// [`push_shard_input`] does.
 #[must_use]
 pub(crate) fn offer_network_input(

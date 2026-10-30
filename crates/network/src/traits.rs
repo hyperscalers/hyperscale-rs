@@ -72,8 +72,8 @@ pub enum RequestError {
 /// [`NotificationHandler::on_notification`] to tell the network layer
 /// whether a gossip message may travel on, and whose fault it is when a
 /// message is refused. A transport that charges senders for refused traffic
-/// charges [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no
-/// one's.
+/// charges [`Self::Reject`] as the sender's fault, [`Self::Ignore`] as no
+/// one's at the work of reading it, and [`Self::Busy`] not at all.
 ///
 /// A handler whose checks of the message finish only after it returns says
 /// [`Self::Defer`], naming every check the message's validity rests on, and
@@ -99,6 +99,12 @@ pub enum Verdict {
     /// sender's fault; a host that is behind refuses honest messages this
     /// way.
     Ignore,
+    /// This host has no room for the message: the queue its input would
+    /// join is full. Dropped and not forwarded, and charged to no one,
+    /// since all it says is that this host is behind on its own work, and
+    /// a long stall here would otherwise run honest peers into a cooldown
+    /// for traffic this host never looked at.
+    Busy,
     /// The message is being checked, and the checks it names settle the
     /// verdict through [`Network::settle`].
     Defer(Deferral),

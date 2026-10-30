@@ -155,6 +155,13 @@ const HONEST_RATE: u32 = 300;
 /// How long the honest peer keeps sending.
 const HONEST_WATCH_SECS: u32 = 15;
 
+/// Size of a header a host with no room refuses: at [`HONEST_RATE`], the
+/// work of reading such headers outruns what time pays down.
+const BUSY_HEADER_BYTES: usize = 128 * 1024;
+
+/// How long the peer keeps sending a host with no room.
+const BUSY_WATCH_SECS: u32 = 6;
+
 /// Items a validator sends from each endpoint it binds as.
 const ROTATION_FLOOD: u64 = 200;
 
@@ -721,6 +728,42 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
         handled.load(Ordering::SeqCst) == sent as usize
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_with_no_room_does_not_cool_down_a_peer_whose_items_it_refuses() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+
+    // The receiver's queues are full and it refuses every header for want
+    // of room. The headers are large enough that reading each one, were
+    // it charged, would cost the sender more than time pays down.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    receiver
+        .network
+        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Verdict::Busy
+        });
+
+    let sent = HONEST_RATE * BUSY_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.broadcast_global(&CommittedHeader {
+            seq: u64::from(seq),
+            body: vec![7; BUSY_HEADER_BYTES],
+        });
+    }
+    wait_for("every refused header is still read", || {
+        handled.load(Ordering::SeqCst) == sent as usize
+    })
+    .await;
+    assert!(
+        !receiver.adapter.cooling_down(vid(1)),
+        "refusing for want of room costs the sender nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -209,7 +209,7 @@ where
             .reduce(combine_verdicts);
         if let Some(key) = content {
             match &verdict {
-                Some(Verdict::Reject | Verdict::Ignore) => {
+                Some(Verdict::Reject | Verdict::Ignore | Verdict::Busy) => {
                     self.dedup.remove(&key);
                 }
                 Some(Verdict::Defer(deferral)) => {
@@ -227,16 +227,18 @@ where
 /// The verdict of several hosted shards on one message. A rejection is the
 /// sender's fault whatever the other shards made of it; otherwise a shard
 /// that accepts the message carries it on, shards still checking it hold it
-/// until every one of their checks holds, and it is ignored only when every
-/// shard ignored it.
+/// until every one of their checks holds, it is ignored when some shard
+/// ignored it and no shard did more, and it is busy only when every shard
+/// had no room for it.
 fn combine_verdicts(a: Verdict, b: Verdict) -> Verdict {
     match (a, b) {
         (Verdict::Reject, _) | (_, Verdict::Reject) => Verdict::Reject,
         (Verdict::Accept, _) | (_, Verdict::Accept) => Verdict::Accept,
         (Verdict::Defer(a), Verdict::Defer(b)) => Verdict::Defer(a.join(b)),
-        (Verdict::Defer(deferral), Verdict::Ignore)
-        | (Verdict::Ignore, Verdict::Defer(deferral)) => Verdict::Defer(deferral),
-        (Verdict::Ignore, Verdict::Ignore) => Verdict::Ignore,
+        (Verdict::Defer(deferral), Verdict::Ignore | Verdict::Busy)
+        | (Verdict::Ignore | Verdict::Busy, Verdict::Defer(deferral)) => Verdict::Defer(deferral),
+        (Verdict::Ignore, _) | (_, Verdict::Ignore) => Verdict::Ignore,
+        (Verdict::Busy, Verdict::Busy) => Verdict::Busy,
     }
 }
 
@@ -758,7 +760,7 @@ impl HandlerRegistry {
             return;
         };
         self.deferred_content.remove(&key);
-        if matches!(verdict, Verdict::Reject | Verdict::Ignore)
+        if matches!(verdict, Verdict::Reject | Verdict::Ignore | Verdict::Busy)
             && let Some(dispatcher) = self.local_gossip.load().get(&message_type)
         {
             dispatcher.forget(content);
@@ -1052,12 +1054,13 @@ mod tests {
 
     /// A message several hosted shards judge carries the strongest verdict:
     /// any rejection, else any acceptance, else every check the shards
-    /// still run; it is ignored only when every shard ignored it.
+    /// still run, else any shard's ignoring it; it is busy only when every
+    /// shard had no room for it.
     #[test]
     fn hosted_shards_verdicts_fold_rejection_first_then_acceptance() {
         use std::sync::Mutex;
 
-        use Verdict::{Accept, Ignore, Reject};
+        use Verdict::{Accept, Busy, Ignore, Reject};
         use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
         use hyperscale_types::NetworkMessage;
 
@@ -1093,6 +1096,9 @@ mod tests {
         assert_eq!(fold(Ignore, Reject), Some(Reject));
         assert_eq!(fold(Ignore, Accept), Some(Accept));
         assert_eq!(fold(Ignore, Ignore), Some(Ignore));
+        assert_eq!(fold(Busy, Accept), Some(Accept));
+        assert_eq!(fold(Busy, Ignore), Some(Ignore));
+        assert_eq!(fold(Busy, Busy), Some(Busy));
 
         let (first, second) = (VerdictKey::of(&1u8), VerdictKey::of(&2u8));
         assert_eq!(
@@ -1105,6 +1111,10 @@ mod tests {
             Some(Verdict::defer(first))
         );
         assert_eq!(fold(Verdict::defer(first), Accept), Some(Accept));
+        assert_eq!(
+            fold(Busy, Verdict::defer(first)),
+            Some(Verdict::defer(first))
+        );
     }
 
     /// A copy of some content, as several senders publish it: `content`

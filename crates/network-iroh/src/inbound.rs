@@ -13,7 +13,8 @@
 //! time pays down (see [`crate::serve_budget`]), so no peer can keep this
 //! host busy for more than one core.
 //! A peer's notifications are judged a few at a time, and each one its
-//! handler does not take is charged against the peer, as is each stream
+//! handler does not take, but for one it had no room for, is charged
+//! against the peer, as is each stream
 //! that broke the protocol, in the budget the host's gossip shares (see
 //! [`crate::cooldown`]). A request refused, for capacity or for its
 //! budget, is answered as such rather than left to time out, and charged
@@ -390,12 +391,13 @@ impl InboundRouter {
     }
 
     /// Act on a handler's verdict on a notification of `bytes` from `peer`.
-    /// Nothing that is not taken goes unpaid: a rejection is charged as the
-    /// peer's fault, a notification this host could not judge at the work
-    /// of reading it, and a deferred verdict when it settles.
+    /// Nothing that is not taken goes unpaid but what this host had no room
+    /// for: a rejection is charged as the peer's fault, a notification this
+    /// host could not judge at the work of reading it, and a deferred
+    /// verdict when it settles.
     fn conclude(&self, peer: Peer, class: MessageClass, bytes: usize, verdict: Verdict) {
         match verdict {
-            Verdict::Accept => {}
+            Verdict::Accept | Verdict::Busy => {}
             Verdict::Reject => self.charge(peer, refused_work(bytes, Refusal::Fault)),
             Verdict::Ignore => self.charge(peer, refused_work(bytes, Refusal::Unjudged)),
             Verdict::Defer(deferral) => match self.fanout() {

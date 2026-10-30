@@ -126,7 +126,7 @@ impl<T> Waiting<T> {
         match verdict {
             Verdict::Accept => self.remember(key, true),
             Verdict::Reject => self.remember(key, false),
-            Verdict::Ignore | Verdict::Defer(_) => {}
+            Verdict::Ignore | Verdict::Busy | Verdict::Defer(_) => {}
         }
         let mut done = Vec::new();
         for id in self.by_part.remove(&key).unwrap_or_default() {
