@@ -1506,10 +1506,10 @@ mod tests {
     }
 
     /// A peer that fills its shard's network lane on its own has its next
-    /// gossip refused as past its share once another peer wants room,
-    /// which its transport charges it for; the other peer, within its
-    /// share, is refused for want of room, for nothing. Once the lane
-    /// drains, the other peer's gossip lands and the first's stays out.
+    /// gossip refused as past its share once another peer has been refused
+    /// room, which its transport charges it for; the other peer, within
+    /// its share, is refused for want of room, for nothing. The room a
+    /// drain frees goes to the other peer.
     #[test]
     fn a_peer_holding_the_lane_past_its_share_is_refused_as_ignored() {
         let fix = Fixture::new();
@@ -1542,7 +1542,7 @@ mod tests {
         assert!(network.try_recv().is_some());
         assert_eq!(
             from(&registry, &gossip(4), flooder),
-            Some(Verdict::Ignore),
+            Some(Verdict::Busy),
             "the room a drain frees is not the flooder's",
         );
         assert_eq!(from(&registry, &gossip(3), honest), Some(Verdict::Accept));

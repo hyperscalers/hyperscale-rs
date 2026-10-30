@@ -5,18 +5,24 @@
 //! A lane full for want of a drain says only that this host is behind, so
 //! a refusal then costs the sender nothing. That alone would let one peer
 //! fill the lane and keep it full, crowding out every other peer's traffic
-//! at no cost to itself. So each peer may hold at most a fair share of the
-//! lane once it is half full: the lane's capacity split evenly among the
-//! peers using it. A peer past its share is refused as an item this host
-//! would not take, which its transport charges it for; a peer within it
-//! that finds the lane full is refused as before, for nothing.
+//! at no cost to itself. So each peer has a fair share of the lane: its
+//! capacity split evenly among the peers using it. A peer refused room
+//! while it holds less than its share is crowded out, and while another
+//! peer is, no peer at or past its share is given room, so the room a
+//! drain frees goes to the crowded. A peer past its share that finds the
+//! lane full while another is crowded out is refused as an item this host
+//! would not take, which its transport charges it for. Every other refusal
+//! of a full lane is for nothing: a lane that fills while no one is
+//! crowded out, however its peers split it, is this host's own stall.
 //!
 //! The peers using a lane are those holding items on it and those that
 //! offered one within the last two generations, a generation being the
 //! time the driver takes to drain a lane's worth of items. A peer refused
 //! for a full lane counts as one of them, so its arrival shrinks the share
-//! of a peer already holding the lane. The record is bounded by the lane's
-//! capacity, past which every share would be under one item.
+//! of a peer already holding the lane. A crowded peer stays crowded until
+//! the lane takes an input of its, or it ages out of the record. The
+//! record is bounded by the lane's capacity, past which every share would
+//! be under one item.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,10 +37,11 @@ use crate::event::HostEvent;
 pub enum Offer {
     /// The lane took it.
     Taken,
-    /// The lane is full and the peer holds no more than its share: this
-    /// host is behind, which is no one's fault.
+    /// The lane has no room for the peer: it is full, or what room it has
+    /// is kept for a peer crowded out. No one's fault.
     Full,
-    /// The peer already holds its share of a lane at least half full.
+    /// The lane is full, the peer holds more than its share of it, and
+    /// another peer is crowded out.
     OverShare,
 }
 
@@ -210,6 +217,8 @@ struct Occupancy {
     held: usize,
     /// The peers using the lane: at most `capacity` of them.
     peers: HashMap<PeerId, Holding>,
+    /// The peers in `peers` that are crowded out.
+    crowded: usize,
     /// Inputs released in the current generation.
     released: usize,
     generation: u64,
@@ -220,6 +229,9 @@ struct Holding {
     held: usize,
     /// The generation of the peer's latest offer.
     offered_in: u64,
+    /// Refused room while it held less than its share, and given none
+    /// since.
+    crowded: bool,
 }
 
 impl Occupancy {
@@ -228,6 +240,7 @@ impl Occupancy {
             capacity,
             held: 0,
             peers: HashMap::new(),
+            crowded: 0,
             released: 0,
             generation: 0,
         }
@@ -244,16 +257,26 @@ impl Occupancy {
         }
         let users = self.peers.len() + usize::from(!known);
         let share = (self.capacity / users).max(1);
+        let full = self.held >= self.capacity;
         let generation = self.generation;
         let holding = self.peers.entry(peer).or_insert(Holding {
             held: 0,
             offered_in: generation,
+            crowded: false,
         });
         holding.offered_in = generation;
-        if holding.held >= share && self.held * 2 >= self.capacity {
-            return Offer::OverShare;
+        let others_crowded = self.crowded > usize::from(holding.crowded);
+        if others_crowded && holding.held >= share {
+            if full && holding.held > share {
+                return Offer::OverShare;
+            }
+            return Offer::Full;
         }
-        if self.held >= self.capacity {
+        if full {
+            if holding.held < share && !holding.crowded {
+                holding.crowded = true;
+                self.crowded += 1;
+            }
             return Offer::Full;
         }
         Offer::Taken
@@ -263,6 +286,10 @@ impl Occupancy {
         self.held += 1;
         if let Some(holding) = self.peers.get_mut(&peer) {
             holding.held += 1;
+            if holding.crowded {
+                holding.crowded = false;
+                self.crowded -= 1;
+            }
         }
     }
 
@@ -283,6 +310,11 @@ impl Occupancy {
         let previous = self.generation - 1;
         self.peers
             .retain(|_, holding| holding.held > 0 || holding.offered_in >= previous);
+        self.crowded = self
+            .peers
+            .values()
+            .filter(|holding| holding.crowded)
+            .count();
     }
 }
 
@@ -301,42 +333,59 @@ mod tests {
         PeerId::new(key)
     }
 
-    /// A lone peer may fill the lane. Once another peer wants room, the
-    /// first is past its share and refused as such, while the second,
-    /// within its share, finds the lane full; the room a drain frees goes
-    /// to the second.
+    /// A lone peer may fill the lane, and a stall that keeps it full
+    /// refuses the peer for nothing, however long it lasts.
     #[test]
-    fn a_peer_past_its_share_is_refused_and_one_within_it_waits_for_room() {
+    fn a_lone_peer_filling_a_stalled_lane_is_never_charged() {
+        let (lane, _stalled) = network_lane(4);
+        for _ in 0..4 {
+            assert_eq!(lane.offer(input(), peer(1)), Offer::Taken);
+        }
+        for _ in 0..100 {
+            assert_eq!(lane.offer(input(), peer(1)), Offer::Full);
+        }
+    }
+
+    /// Peers that fill a stalled lane between them crowd no one out, so
+    /// none is charged, however unevenly they split it.
+    #[test]
+    fn peers_filling_a_stalled_lane_between_them_are_never_charged() {
+        let (lane, _stalled) = network_lane(4);
+        for key in [1, 2, 1, 1] {
+            assert_eq!(lane.offer(input(), peer(key)), Offer::Taken);
+        }
+        for _ in 0..10 {
+            assert_eq!(lane.offer(input(), peer(1)), Offer::Full);
+        }
+        // The second peer holds one of its two places: crowded out.
+        assert_eq!(lane.offer(input(), peer(2)), Offer::Full);
+        assert_eq!(lane.offer(input(), peer(1)), Offer::OverShare);
+    }
+
+    /// A peer holding a full lane past its share is charged only once
+    /// another peer has been refused room; the room a drain frees then
+    /// goes to the crowded peer, and once it has room the first is
+    /// refused for nothing again.
+    #[test]
+    fn a_peer_past_its_share_is_charged_only_once_another_is_crowded_out() {
         let (lane, receiver) = network_lane(4);
         for _ in 0..4 {
             assert_eq!(lane.offer(input(), peer(1)), Offer::Taken);
         }
+        assert_eq!(lane.offer(input(), peer(1)), Offer::Full, "no one crowded");
         assert_eq!(lane.offer(input(), peer(2)), Offer::Full);
         assert_eq!(lane.offer(input(), peer(1)), Offer::OverShare);
 
         assert!(receiver.try_recv().is_some());
-        assert_eq!(lane.offer(input(), peer(1)), Offer::OverShare);
+        assert_eq!(
+            lane.offer(input(), peer(1)),
+            Offer::Full,
+            "the room a drain frees is kept for the crowded peer",
+        );
         assert_eq!(lane.offer(input(), peer(2)), Offer::Taken);
+        assert_eq!(lane.offer(input(), peer(1)), Offer::Full, "no one crowded");
         assert_eq!(lane.held_by(peer(1)), 3);
         assert_eq!(lane.held_by(peer(2)), 1);
-    }
-
-    /// Below half full the lane takes a burst past its sender's share: the
-    /// share binds only once the lane is half full.
-    #[test]
-    fn a_burst_into_a_lane_under_half_full_is_taken() {
-        let (lane, receiver) = network_lane(8);
-        for key in 1..=4 {
-            assert_eq!(lane.offer(input(), peer(key)), Offer::Taken);
-        }
-        assert_eq!(receiver.try_iter().count(), 4);
-        // Four peers share eight places: two each.
-        for _ in 0..4 {
-            assert_eq!(lane.offer(input(), peer(1)), Offer::Taken);
-        }
-        assert_eq!(lane.held_by(peer(1)), 4, "past its share below half full");
-        assert_eq!(lane.offer(input(), peer(1)), Offer::OverShare);
-        assert_eq!(lane.offer(input(), peer(2)), Offer::Taken);
     }
 
     /// Every input the driver takes leaves its peer's share, so a drained
