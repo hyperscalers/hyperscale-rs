@@ -1139,6 +1139,90 @@ mod tests {
         );
     }
 
+    /// Intervals past every order the store holds, asked with no point
+    /// key beside them: an answer that returns no entry at all.
+    fn empty_ranges() -> DeclaredReads {
+        let key = entry_key(OWNER_SEED, 0);
+        let range = |lo: u128, hi: u128, cap: u32| CellRange {
+            owner: key.owner,
+            collection: key.collection,
+            lo,
+            hi,
+            cap,
+        };
+        DeclaredReads {
+            keys: Capped::empty(),
+            ranges: Capped::from_array([
+                range(100, 200, 4),
+                range(8, u128::MAX, 2),
+                range(9, 9, 0),
+            ]),
+        }
+    }
+
+    /// A peer answering intervals that hold nothing, asked with no point
+    /// key, is believed and the intervals it cannot prove empty named.
+    ///
+    /// The answer returns no entry, so it stands on no leaf the asker
+    /// derives; what ties it to the signed root is the claim the server
+    /// makes on each interval's first order. Without one the proof claims
+    /// nothing, which reconstructs no root but the empty one, and the
+    /// shard would be refused for telling the truth.
+    #[test]
+    fn intervals_answered_empty_with_no_point_key_are_kept_and_named() {
+        let ask = empty_ranges();
+        let (response, root) = served(&ask);
+        assert!(
+            response.ranges.iter().all(|range| range.entries.is_empty()),
+            "no interval reaches an order the store holds"
+        );
+
+        let (fetched, verdict) = gathered_from(&ask, response, root);
+        assert!(
+            fetched.anchors.contains_key(&SHARD),
+            "an honest empty answer stands under the signed root"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Accept)));
+        assert_eq!(
+            fetched.unproven,
+            BTreeSet::from([
+                UnprovenInterval::from(&ask.ranges[0]),
+                UnprovenInterval::from(&ask.ranges[1]),
+            ]),
+            "the wider intervals are the peer's word; the single order is proven empty"
+        );
+    }
+
+    /// An answer to intervals that hold nothing carrying an entry the
+    /// root never held, or a proof taken over another tree, is refused.
+    #[test]
+    fn intervals_answered_with_a_forged_entry_are_refused() {
+        let ask = empty_ranges();
+        let (honest, root) = served(&ask);
+
+        let mut invented = honest;
+        invented.ranges[0]
+            .entries
+            .push((150, Bytes::from_array([0xAB; 4])))
+            .expect("under the interval's cap");
+        let (fetched, verdict) = gathered_from(&ask, invented, root);
+        assert!(
+            !fetched.anchors.contains_key(&SHARD),
+            "an entry with no claim behind it refuses the answer"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Reject)));
+
+        let (mut elsewhere, _) = served_over(100..104, &ask);
+        assert!(!elsewhere.ranges[0].entries.is_empty());
+        elsewhere.anchor = None;
+        let (fetched, verdict) = gathered_from(&ask, elsewhere, root);
+        assert!(
+            !fetched.anchors.contains_key(&SHARD),
+            "entries another tree holds do not stand under the signed root"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Reject)));
+    }
+
     /// An interval the server simply left out is refused rather than
     /// read as an empty one.
     ///

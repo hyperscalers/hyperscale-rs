@@ -117,8 +117,10 @@ fn proven(
 /// hold leaks into an answer about committed state.
 ///
 /// The proof covers the point keys asked, present or absent, the entry
-/// leaves the intervals actually returned, and the absent leaf of each
-/// single-order interval that returned nothing. It does not attest that
+/// leaves the intervals actually returned, and the leaf of the first
+/// order of each interval that returned nothing — which proves a
+/// single-order interval empty, and for a wider one only ties the
+/// answer to the root. It does not attest that
 /// a wider interval is complete, and cannot: an entry commits under a
 /// digest of its owner, collection and order, so the tree's key order is
 /// not the collection's and no non-inclusion proof over it says what
@@ -141,9 +143,10 @@ pub fn serve_cells_request<S: ShardStorage>(
     // What the answer would cost before any of it is spent. Nothing
     // here is signed — a preview asks before there is a transaction to
     // sign — so the caps are the asker's word, and a query wider than
-    // any declaration could be is refused rather than walked.
+    // any declaration could be is refused rather than walked. An
+    // interval costs at least the one leaf it always stands on.
     let asked = req.ranges.iter().fold(req.keys.len() as u64, |sum, range| {
-        sum.saturating_add(u64::from(range.cap))
+        sum.saturating_add(u64::from(range.cap.max(1)))
     });
     if asked > MAX_CELLS_PER_QUERY {
         return GetCellsResponse::not_found();
@@ -174,12 +177,15 @@ pub fn serve_cells_request<S: ShardStorage>(
 
     // Every leaf the answer stands on, so one multiproof covers the
     // whole of it: the keys as asked — an absent one is proven absent —
-    // an entry leaf per entry a range returned, and the one leaf of an
-    // interval of a single order that came back empty, which proves it
-    // empty. That last is the only interval whose completeness a leaf
-    // can state, an entry's leaf being keyed by a digest of its order;
-    // it takes the place of the entry the cap already counted, so the
-    // leaves stay inside what was asked.
+    // an entry leaf per entry a range returned, and the leaf of the
+    // first order of an interval that came back empty. Every interval
+    // stands on a leaf, so an answer of nothing but empty intervals
+    // still carries a claim tying it to the root, where a claimless
+    // proof reconstructs none but the empty one. Of a single order that
+    // leaf proves the interval empty, the only interval whose
+    // completeness a leaf can state, an entry's leaf being keyed by a
+    // digest of its order. It takes the place of the entry the interval
+    // was charged for, so the leaves stay inside what was asked.
     let mut leaves = req.keys.to_vec();
     let mut ranges = Vec::with_capacity(req.ranges.len());
     for range in &req.ranges {
@@ -212,7 +218,7 @@ pub fn serve_cells_request<S: ShardStorage>(
             )
         };
         leaves.extend(entries.iter().map(|(order, _)| entry_leaf(*order)));
-        if range.lo == range.hi && range.cap > 0 && entries.is_empty() {
+        if entries.is_empty() {
             leaves.push(entry_leaf(range.lo));
         }
         ranges.push(RangeAnswer {
