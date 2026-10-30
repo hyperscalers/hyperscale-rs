@@ -235,6 +235,11 @@ struct ScheduledNotification {
     sequence: u64,
     record: DeliveryRecord,
     payload: Vec<u8>,
+    /// [`Provenance::Local`] only for a host's own notification to itself,
+    /// carrying the bytes it sent: the one delivery production makes in
+    /// process. A replay, a duplicate or a rewrite on that link is the
+    /// network's copy, which production never hands a host as its own.
+    provenance: Provenance,
 }
 
 impl PartialEq for ScheduledNotification {
@@ -1737,6 +1742,7 @@ impl SimulatedNetwork {
                         wire_bytes,
                     },
                     payload,
+                    provenance: Provenance::Peer,
                 }));
         }
         Self::remember(&mut self.notifications_carried, message_type, carried);
@@ -1841,8 +1847,14 @@ impl SimulatedNetwork {
                         // wrongly, which is the one thing a drop rule cannot
                         // model. Rewriting inside the recipient loop is what
                         // lets one sender equivocate across its peers.
-                        let payload =
+                        let sent =
                             self.rewritten(sender, to, type_id, Tier::Notification, &payload);
+                        let provenance = if sender == to && sent == payload {
+                            Provenance::Local
+                        } else {
+                            Provenance::Peer
+                        };
+                        let payload = sent;
                         stats.messages_sent += 1;
                         if let Some(ref analyzer) = self.traffic_analyzer {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
@@ -1862,6 +1874,7 @@ impl SimulatedNetwork {
                                     wire_bytes: data.len(),
                                 },
                                 payload: payload.clone(),
+                                provenance,
                             }));
                         let carried = Carried {
                             payload,
@@ -2035,7 +2048,9 @@ impl SimulatedNetwork {
                 ..
             } = scheduled;
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
-            let provenance = provenance_of(record.from, to);
+            // A publisher is never scheduled its own publication: the
+            // registry hands its hosted shards the original in process.
+            let provenance = Provenance::Peer;
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -2123,10 +2138,12 @@ impl SimulatedNetwork {
         } = self;
         let delivered = flush_heap(pending_notifications, now, |scheduled| {
             let ScheduledNotification {
-                record, payload, ..
+                record,
+                payload,
+                provenance,
+                ..
             } = scheduled;
             let (to, message_type) = (record.to, record.message_type);
-            let provenance = provenance_of(record.from, to);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -2202,16 +2219,6 @@ fn gossip_message_id(entry: &OutboxEntry) -> u64 {
     let mut id = [0u8; 8];
     id.copy_from_slice(&digest.as_bytes()[..8]);
     u64::from_le_bytes(id)
-}
-
-/// Who handed `to` a message `from` sent: a host's message to itself is its
-/// own, anything else a peer's.
-const fn provenance_of(from: NodeIndex, to: NodeIndex) -> Provenance {
-    if from == to {
-        Provenance::Local
-    } else {
-        Provenance::Peer
-    }
 }
 
 #[cfg(test)]
@@ -4243,5 +4250,114 @@ mod tests {
         let payloads = handlers[1].payloads();
         assert_eq!(payloads.len(), 1);
         assert!(!payloads[0].is_empty());
+    }
+
+    /// What one host's notification handler was handed, and as whose.
+    type Handed = Arc<Mutex<Vec<(Vec<u8>, Provenance)>>>;
+
+    /// What each host's notification handler for `message_type` is handed.
+    fn record_notifications(network: &SimulatedNetwork, message_type: &'static str) -> Vec<Handed> {
+        use hyperscale_network::Verdict;
+        use hyperscale_network::registry::RawNotificationHandler;
+        (0..network.total_nodes() as NodeIndex)
+            .map(|i| {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let sink = Arc::clone(&seen);
+                let raw: Arc<RawNotificationHandler> =
+                    Arc::new(move |payload: Vec<u8>, provenance: Provenance| {
+                        sink.lock().unwrap().push((payload, provenance));
+                        Verdict::Accept
+                    });
+                network
+                    .create_adapter(i)
+                    .registry
+                    .register_raw_notification(message_type, raw);
+                seen
+            })
+            .collect()
+    }
+
+    fn notify(
+        network: &mut SimulatedNetwork,
+        from: NodeIndex,
+        to: u64,
+        message_type: &'static str,
+        bytes: &[u8],
+        streams: &mut LinkStreams,
+    ) {
+        network.accept_notifications(
+            from,
+            Duration::ZERO,
+            vec![PendingNotification {
+                recipients: vec![ValidatorId::new(to)],
+                type_id: message_type,
+                class: MessageClass::Bulk,
+                data: compression::compress(bytes),
+            }],
+            streams,
+        );
+        network.flush_notifications(FAR_FUTURE);
+    }
+
+    /// A host's notification to itself is its own, but a replay the network
+    /// brings along on that link is another host's bytes, and arrives as a
+    /// peer's.
+    #[test]
+    fn a_replay_on_a_hosts_own_link_is_a_peers() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                replay_rate: 1.0,
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+
+        notify(&mut network, 1, 0, TYPE, b"foreign", &mut streams);
+        seen[0].lock().unwrap().clear();
+        notify(&mut network, 0, 0, TYPE, b"own", &mut streams);
+
+        let mut got = seen[0].lock().unwrap().clone();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                (b"foreign".to_vec(), Provenance::Peer),
+                (b"own".to_vec(), Provenance::Local),
+            ]
+        );
+    }
+
+    /// A rewrite installed on a host reaches its notification to itself too,
+    /// and what it hands the host is not what the host sent.
+    #[test]
+    fn a_rewritten_notification_to_oneself_is_a_peers() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+        let _rule = network.rewrite_notifications(
+            0,
+            TYPE,
+            Arc::new(|_asked: &[u8], bytes: &[u8]| [bytes, b"-forged"].concat()),
+        );
+
+        notify(&mut network, 0, 0, TYPE, b"own", &mut streams);
+
+        assert_eq!(
+            *seen[0].lock().unwrap(),
+            vec![(b"own-forged".to_vec(), Provenance::Peer)]
+        );
     }
 }
