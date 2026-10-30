@@ -27,7 +27,7 @@
 //! Caller ──► Sync::handle(SyncInput) ──► Vec<SyncOutput>
 //! ```
 //!
-//! Each `Output::Fetch { scope, from, count }` is a request to fetch a
+//! Each `SyncOutput::Fetch { scope, from, count }` is a request to fetch a
 //! contiguous range of heights. The caller's binding-side glue translates
 //! that into a network round-trip, decodes the response, then feeds the
 //! result back through `SyncInput::FetchSucceeded` (with the list of
@@ -49,6 +49,8 @@ use std::time::Duration;
 use hyperscale_types::{BlockHeight, Epoch, LocalTimestamp};
 use serde::Serialize;
 use tracing::{info, trace};
+
+use crate::event::FetchFailureKind;
 
 /// Initial backoff for a deferred height after its first fetch failure.
 const DEFERRAL_BASE_MS: u64 = 1_000;
@@ -177,7 +179,10 @@ pub struct ScopeStatus {
     pub(crate) target_height: u64,
     /// Highest admitted height.
     pub(crate) current_height: u64,
-    /// Number of heights behind target.
+    /// Highest height held without a gap: the admitted height, or above it
+    /// where applied heights run contiguously from it.
+    pub(crate) frontier_height: u64,
+    /// Heights from the frontier up to the target.
     pub(crate) blocks_behind: u64,
     /// In-flight fetch ranges.
     pub(crate) pending_fetches: usize,
@@ -262,13 +267,11 @@ pub trait SyncBinding: 'static {
     /// Hook fired when a height is admitted. Bindings with per-id
     /// auxiliary state (e.g. block-sync's `force_full_refetch`) clean up
     /// entries at or below `committed` here. Default no-op.
-    #[allow(unused_variables)]
-    fn on_admitted(state: &mut Self::State, scope: &Self::Scope, committed: Self::Key) {}
+    fn on_admitted(_state: &mut Self::State, _scope: &Self::Scope, _committed: Self::Key) {}
 
     /// Hook fired when a scope reaches its target and emits `Complete`.
     /// Binding can clear all per-id state at this point. Default no-op.
-    #[allow(unused_variables)]
-    fn on_complete(state: &mut Self::State, scope: &Self::Scope, height: Self::Key) {}
+    fn on_complete(_state: &mut Self::State, _scope: &Self::Scope, _height: Self::Key) {}
 }
 
 /// Per-scope sliding-window state.
@@ -418,8 +421,6 @@ impl<K: SyncKey> ScopeState<K> {
     }
 }
 
-use crate::event::FetchFailureKind;
-
 /// Inputs to the generic sync state machine.
 #[derive(Debug)]
 #[allow(missing_docs)] // payloads are self-describing
@@ -557,6 +558,7 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes.get(scope).map_or_default(|s| ScopeStatus {
             target_height: s.target.as_u64(),
             current_height: s.committed.as_u64(),
+            frontier_height: s.frontier().as_u64(),
             blocks_behind: s.blocks_behind(),
             pending_fetches: s.in_flight_ranges,
             queued_heights: s.heights_queued.len() + s.deferred.len() + s.pending_admission.len(),
@@ -621,7 +623,6 @@ impl<B: SyncBinding> Sync<B> {
         self.emit_fetches()
     }
 
-    #[allow(clippy::needless_pass_by_value)] // taken by value to mirror SyncInput's owned shape
     fn handle_fetch_succeeded(
         &mut self,
         scope: &B::Scope,
@@ -2593,6 +2594,25 @@ mod tests {
             height: BlockHeight::new(5),
         });
         assert_eq!(s.status(&()).target_height, 5);
+    }
+
+    #[test]
+    fn status_measures_the_lag_from_the_frontier_and_reports_both_heights() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(10),
+        });
+        for height in 1..=3 {
+            let _ = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(height),
+            });
+        }
+        let status = s.status(&());
+        assert_eq!(status.current_height, 0);
+        assert_eq!(status.frontier_height, 3);
+        assert_eq!(status.blocks_behind, 7);
     }
 
     #[test]
