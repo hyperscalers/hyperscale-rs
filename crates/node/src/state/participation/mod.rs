@@ -7,7 +7,7 @@
 //! holds one for its shard.
 //!
 //! The per-domain handlers (the [`shard`], [`execution`], [`provisions`],
-//! [`transactions`], [`sync`], [`timers`], [`proposal`] submodules) live here as
+//! [`transactions`], [`sync_completion`], [`timers`], [`proposal`] submodules) live here as
 //! methods on `ShardParticipation`. Each takes the per-epoch
 //! [`TopologySchedule`] as a parameter — the beacon projection these handlers
 //! verify against — rather than reaching back into the enclosing machine. The
@@ -18,7 +18,7 @@ mod execution;
 mod proposal;
 mod provisions;
 mod shard;
-mod sync;
+mod sync_completion;
 mod timers;
 mod transactions;
 
