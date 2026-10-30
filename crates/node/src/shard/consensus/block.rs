@@ -103,11 +103,14 @@ impl BlockSyncStateKind {
 pub struct BlockSyncStatus {
     /// Idle / Syncing tag.
     pub state: BlockSyncStateKind,
-    /// Highest admitted height.
+    /// Highest admitted height: the commit frontier.
     pub current_height: u64,
+    /// Highest height held without a gap: the admitted height, or above
+    /// it where applied heights run contiguously from it.
+    pub frontier_height: u64,
     /// Highest known target.
     pub target_height: Option<u64>,
-    /// Heights behind target.
+    /// Heights from the frontier up to the target.
     pub blocks_behind: u64,
     /// In-flight fetch ranges.
     pub pending_fetches: usize,
@@ -152,6 +155,7 @@ impl Sync<BlockSyncBinding> {
                 BlockSyncStateKind::Idle
             },
             current_height: scope.current_height,
+            frontier_height: scope.frontier_height,
             target_height: if is_syncing {
                 Some(scope.target_height)
             } else {
@@ -210,5 +214,32 @@ mod tests {
         });
         assert!(!sync.is_syncing());
         assert_eq!(sync.named_block(BlockHeight::new(5)), Some(winner));
+    }
+
+    /// The status reports the admitted height and the frontier apart, and
+    /// counts the lag from the frontier, so the two heights and the lag
+    /// agree.
+    #[test]
+    fn the_status_reports_the_frontier_beside_the_admitted_height() {
+        let mut sync = BlockSync::new(SyncConfig::default());
+        let _ = sync.handle(BlockSyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(10),
+        });
+        let _ = sync.handle(BlockSyncInput::Admitted {
+            scope: (),
+            height: BlockHeight::new(2),
+        });
+        for height in 3..=4 {
+            let _ = sync.handle(BlockSyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(height),
+            });
+        }
+        let status = sync.block_sync_status();
+        assert_eq!(status.current_height, 2);
+        assert_eq!(status.frontier_height, 4);
+        assert_eq!(status.target_height, Some(10));
+        assert_eq!(status.blocks_behind, 6);
     }
 }

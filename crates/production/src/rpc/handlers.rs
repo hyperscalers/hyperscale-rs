@@ -717,6 +717,7 @@ mod tests {
             BlockSyncStatus {
                 state: BlockSyncStateKind::Syncing,
                 current_height: 100u64.saturating_sub(blocks_behind),
+                frontier_height: 100u64.saturating_sub(blocks_behind),
                 target_height: Some(100),
                 blocks_behind,
                 pending_fetches: 1,
