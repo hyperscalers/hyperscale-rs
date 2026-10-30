@@ -129,6 +129,12 @@ where
     /// `GetBeaconBlockRequest` fetches that close the gap.
     beacon_block: BeaconBlockSync,
 
+    /// Where the next catch-up ask lands among the live leaves. Seeded
+    /// by the moment the loop started, so hosts started apart begin
+    /// apart, and advanced by every ask, so a retry goes to another
+    /// leaf's committee.
+    sync_spread: u64,
+
     /// The witness, proposal and candidate fetches the fold and the
     /// participants ask for.
     fetches: BeaconFetchState,
@@ -186,6 +192,7 @@ where
             pending_timer_ops: Vec::new(),
             actions_generated: 0,
             beacon_block,
+            sync_spread: now.as_millis(),
             fetches: BeaconFetchState::new(config),
             interest: Interest::default(),
             fetch_tick: FetchTicker::default(),
@@ -1442,8 +1449,8 @@ where
     fn ask_shard(&self, owner: BeaconOwner, preferred: Option<ValidatorId>) -> Option<ShardId> {
         let topology = self.process.topology_snapshot.load();
         let asker = match owner {
-            BeaconOwner::Participant(attachment) => Some(attachment.validator),
-            BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => None,
+            BeaconOwner::Participant(attachment) => attachment.validator.inner(),
+            BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => 0,
         };
         preferred
             .and_then(
@@ -1460,7 +1467,7 @@ where
     /// member holds the beacon chain, so any live leaf with a committee
     /// answers; spreading by `spread` keeps a host's asks from all
     /// hammering one committee.
-    fn fetch_shard(&self, spread: Option<ValidatorId>) -> Option<ShardId> {
+    fn fetch_shard(&self, spread: u64) -> Option<ShardId> {
         let topology = self.process.topology_snapshot.load();
         let leaves: Vec<ShardId> = topology
             .shard_trie()
@@ -1470,7 +1477,6 @@ where
         if leaves.is_empty() {
             return None;
         }
-        let spread = spread.map_or(0, ValidatorId::inner);
         let idx = usize::try_from(spread % leaves.len() as u64)
             .expect("modulo of leaves.len() fits usize");
         Some(leaves[idx])
@@ -1679,10 +1685,12 @@ where
 
     /// Ask past the host for `epoch`: its own beacon store is filled by
     /// the same commits the sync is waiting on. Whether a live shard with
-    /// a committee took the ask.
-    fn dispatch_sync_fetch(&self, epoch: Epoch) -> bool {
-        let lowest = self.validators().next();
-        let Some(shard) = self.fetch_shard(lowest) else {
+    /// a committee took the ask. The leaf asked moves with every ask,
+    /// spread by the host's lowest identity and [`Self::sync_spread`].
+    fn dispatch_sync_fetch(&mut self, epoch: Epoch) -> bool {
+        let lowest = self.validators().next().map_or(0, ValidatorId::inner);
+        self.sync_spread = self.sync_spread.wrapping_add(1);
+        let Some(shard) = self.fetch_shard(lowest.wrapping_add(self.sync_spread)) else {
             warn!("BeaconLoop: no live shard to fetch beacon blocks from; deferring");
             return false;
         };
@@ -2095,10 +2103,7 @@ mod tests {
             "the fixture's trie carries a leaf with no committee",
         );
         for spread in 0..4 {
-            assert_eq!(
-                host.beacon.fetch_shard(Some(ValidatorId::new(spread))),
-                Some(SHARD),
-            );
+            assert_eq!(host.beacon.fetch_shard(spread), Some(SHARD),);
         }
     }
 
@@ -2304,6 +2309,31 @@ mod tests {
         );
     }
 
+    /// A catch-up ask that fails goes to another leaf's committee next,
+    /// rather than back to the one that just failed it.
+    #[test]
+    fn a_failed_beacon_sync_ask_moves_to_another_leaf() {
+        let fix = Fixture::new();
+        let id = |idx| fix.committee.validator_id(idx);
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let topology = fix.topology(BTreeMap::from([
+            (ShardId::ROOT.children().0, vec![id(0), id(1)]),
+            (ShardId::ROOT.children().1, vec![id(2), id(3)]),
+        ]));
+        host.process.topology_snapshot.store(Arc::new(topology));
+        let _ = host.network().drain_pending_requests();
+        let asked = |host: &mut Host| {
+            let requests = host.network().drain_pending_requests();
+            assert_eq!(requests.len(), 1);
+            requests[0].shard
+        };
+        host.beacon.start_sync(Epoch::new(1));
+        let first = asked(&mut host);
+        host.beacon
+            .on_sync_fetch_failed(Epoch::new(1), FetchFailureKind::Exhausted);
+        assert_ne!(asked(&mut host), first, "the retry asks the other leaf");
+    }
+
     /// Past epoch 0's boundary plus the skip timeout, so a ratify timer
     /// makes the tracker prevote the skip hash.
     fn past_the_skip_timeout() -> LocalTimestamp {
@@ -2402,7 +2432,7 @@ mod tests {
         let spread_of = |host: &Host| {
             host.process.topology_snapshot.store(Arc::clone(&topology));
             host.beacon
-                .fetch_shard(Some(id(2)))
+                .fetch_shard(id(2).inner())
                 .expect("both leaves carry a committee")
         };
         let spread = spread_of(&fix.host(BlockHeight::GENESIS));
