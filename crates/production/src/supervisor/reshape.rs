@@ -129,7 +129,12 @@ impl ShardSupervisor {
             return;
         }
         match request {
-            ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
+            ReshapeRequest::OpenStore { shard } => {
+                // The open wipes the directory, so a store an earlier duty
+                // for the shard prepared there is closed first.
+                self.reshape_stores.remove(shard);
+                self.reshape_open_store(shard);
+            }
             ReshapeRequest::SeedFromParent {
                 parent,
                 child,

@@ -373,13 +373,14 @@ enum ObserverPhase {
     /// Synced; re-asserting ready and following the parent toward its terminal
     /// crossing, until the children seed.
     Following(Box<ObserverTail>),
-    /// The child anchored before the follow applied the parent's terminal.
-    /// The parent's blocks above the terminal that would prove it are no
-    /// longer served under the child's id, so the follow cannot finish. A
-    /// parent-half seat this host holds on the child takes the seat over and
-    /// seeds it from the local parent; with none, the seat is the ordinary
-    /// join's, which snap-syncs against the child's anchor. Inert, and kept
-    /// so the observer is not rediscovered, until the committed projection
+    /// The follow cannot finish: the child anchored before it applied the
+    /// parent's terminal — the parent's blocks above the terminal that
+    /// would prove it are no longer served under the child's id — or the
+    /// store it applied into diverged from the parent's. A parent-half seat
+    /// this host holds on the child takes the seat over and seeds it from
+    /// the local parent; with none, the seat is the ordinary join's, which
+    /// snap-syncs against the child's anchor. Inert, and kept so the
+    /// observer is not rediscovered, until the committed projection
     /// releases it.
     Relinquished,
     /// The children seeded; fetching the certified terminal to derive genesis.
@@ -588,17 +589,21 @@ impl ObserverDuty {
     /// the split executes, and the duty runs on while one of its seats sits
     /// on the child's committee, or the child has none yet.
     ///
-    /// A seated or relinquished observer lingers through the parent-half
-    /// phase so its child stays in `observers` rather than being
-    /// rediscovered; a seated one also defers any co-hosted parent half to
-    /// the seat already issued. Once the projection releases the child the
-    /// duty ends.
+    /// A seated or relinquished observer lingers while its cohort or the
+    /// parent-half phase still names the child, so the child stays in
+    /// `observers` rather than being rediscovered; a seated one also defers
+    /// any co-hosted parent half to the seat already issued. Once the
+    /// projection releases the child the duty ends.
     fn held(&mut self, view: &ReshapeView) -> bool {
         if matches!(
             self.phase,
             ObserverPhase::Seated | ObserverPhase::Relinquished
         ) {
-            return view.parent_half_cohorts().contains_key(&self.child);
+            let named = self
+                .validators
+                .iter()
+                .any(|&validator| view.observer_child(self.parent, validator) == Some(self.child));
+            return named || view.parent_half_cohorts().contains_key(&self.child);
         }
         if view.split_irrevocable(self.parent, self.child) {
             return seats_on(view, self.child, self.validators.iter());
@@ -962,7 +967,8 @@ impl ReshapeOrchestrator {
     /// seat to the adapter's ordinary join — a parent half with no parent
     /// store to seed from (see [`ReshapeEvent::SeedUnavailable`]) or whose
     /// child anchored past its genesis, or an observer whose follow the
-    /// child's anchor overtook and that no parent half took over from. The
+    /// child's anchor overtook or that diverged, and that no parent half
+    /// took over from. The
     /// adapter reads the committed cohort as reshape ownership; a
     /// relinquished seat is not, and a store the duty prepared for it is the
     /// adapter's to discard.
@@ -1087,16 +1093,7 @@ impl ReshapeOrchestrator {
                 }
             }
             ReshapeEvent::Imported { shard, root } => self.apply_imported(shard, root),
-            ReshapeEvent::Applied { shard, root } => {
-                if let Some(duty) = self.live_observer(shard)
-                    && let ObserverPhase::Following(tail) = &mut duty.phase
-                    && tail.on_applied(root).is_err()
-                {
-                    // A diverged follow fails closed: drop the duty so the
-                    // adapter falls back to a fresh snap-sync join.
-                    self.observers.remove(&shard);
-                }
-            }
+            ReshapeEvent::Applied { shard, root } => self.apply_applied(shard, root),
             ReshapeEvent::Adopted { shard } => {
                 if let Some(duty) = self.live_observer(shard)
                     && matches!(duty.phase, ObserverPhase::AwaitingAdopt)
@@ -1193,6 +1190,25 @@ impl ReshapeOrchestrator {
                 ParentHalfPhase::FetchingTerminal { ask, .. } => ask.missed(now),
                 _ => {}
             }
+        }
+    }
+
+    /// Route a follow application's root to the observer awaiting it.
+    fn apply_applied(&mut self, shard: ShardId, root: StateRoot) {
+        if let Some(duty) = self.live_observer(shard)
+            && let ObserverPhase::Following(tail) = &mut duty.phase
+            && let Err(error) = tail.on_applied(root)
+        {
+            // A diverged follow fails closed: the store cannot seat,
+            // and following again from the same anchor diverges the
+            // same way. The seat goes to the ordinary join, which
+            // snap-syncs the child against its own anchor.
+            tracing::warn!(
+                child = ?shard,
+                error,
+                "split follow diverged; relinquishing the observer's seat"
+            );
+            duty.phase = ObserverPhase::Relinquished;
         }
     }
 
@@ -2764,6 +2780,81 @@ mod tests {
             vec![b2.hash()],
             "the committed block is applied once its two-chain verifies",
         );
+    }
+
+    /// A follow whose store diverges from the parent's relinquishes the
+    /// seat to the join, and stays relinquished while the cohort still
+    /// names it: rediscovering it would re-open the store over the one the
+    /// adapter still holds and diverge again from the same anchor.
+    #[test]
+    fn a_diverged_follow_relinquishes_without_re_opening() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let committee = TestCommittee::new(4, 3);
+        let schedule = committee_schedule(parent, &committee, &[(50, child)]);
+        let view = ReshapeView::new(&schedule);
+
+        let wt = WeightedTimestamp::from_millis;
+        let (anchor_block, anchor) = anchored_block();
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
+        let b2 = signed_split_terminal(&committee, &anchor_block, Round::new(2), wt(100), pair);
+        let b3 = signed_child_block(&committee, &b2, Round::new(3), wt(200));
+        let served = |block: &Block| ReshapeEvent::Fetched {
+            duty: child,
+            from: parent,
+            kind: FetchedKind::Block {
+                response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                    block,
+                    committee.sign_qc(block.header(), &committee.quorum_indices(), wt(900)),
+                    &Inventory::empty(),
+                ))),
+            },
+        };
+
+        let mut orch = ReshapeOrchestrator::new(vec![vid(50)]);
+        orch.observers.insert(
+            child,
+            observer_duty(
+                parent,
+                child,
+                50,
+                following(ObserverTail::new(anchor, child)),
+            ),
+        );
+        let mut applies = Vec::new();
+        for event in [Vec::new(), vec![served(&b2)], vec![served(&b3)]] {
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, event, at(0));
+            applies.extend(follow_applies(&requests));
+        }
+        assert_eq!(applies, vec![b2.hash()]);
+
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![ReshapeEvent::Applied {
+                shard: child,
+                root: pair.right,
+            }],
+            at(0),
+        );
+        assert!(orch.relinquished(child));
+        assert!(!orch.is_seating(child));
+        for requests in [
+            requests,
+            orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(5_000)),
+        ] {
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| matches!(r, ReshapeRequest::OpenStore { .. })),
+                "a diverged follow must not re-open the store; got {requests:?}",
+            );
+        }
+        assert!(orch.relinquished(child), "the cohort still names the seat");
     }
 
     /// A transaction a block carries as decoded, with nothing derived.
