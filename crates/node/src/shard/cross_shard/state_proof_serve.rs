@@ -14,14 +14,13 @@ use hyperscale_jmt::TreeReader;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
 use hyperscale_types::network::request::{GetCellsRequest, GetStateProofRequest};
-use hyperscale_types::network::response::{
-    GetCellsResponse, GetStateProofResponse, RangeAnswer, ServedValue,
-};
+use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
 use hyperscale_types::{
     EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, SubstateKey,
     entry_leaf_key,
 };
 use hyperscale_vm_effects::CrossingLeaf;
+use tracing::warn;
 
 /// Serve an inbound state-proof query from the committed chain.
 ///
@@ -64,28 +63,40 @@ pub fn serve_state_proof_request<S: ShardStorage>(
 
 /// The proof of `req`'s keys under `tree` at the height it names, with
 /// the value `value_of` reads for each key present whose leaf is a
-/// crossing record; `None` where the tree holds no root at that height
-/// or the proof is one no asker could decode.
+/// crossing record; `None` where the tree holds no root at that height,
+/// the proof is one no asker could decode, or a record's value is wider
+/// than the answer carries.
 fn proven(
     tree: &impl TreeReader,
     req: &GetStateProofRequest,
     value_of: impl Fn(SubstateKey) -> Option<Vec<u8>>,
 ) -> Option<GetStateProofResponse> {
     let proof = generate_proof(tree, &req.keys, req.height)?;
-    let values: Vec<ServedValue> = req
-        .keys
-        .iter()
-        .filter_map(|&key| {
-            let bytes = value_of(key)?;
-            CrossingLeaf::read(&ProtocolHasher, key, &bytes)?;
-            Some((key, Bytes::new(bytes).ok()?))
-        })
-        .collect();
-    // One value at most per key asked, so the list sits under the
-    // request's own cap.
+    let mut values = Vec::new();
+    for &key in req.keys.iter() {
+        let Some(bytes) = value_of(key) else {
+            continue;
+        };
+        if CrossingLeaf::read(&ProtocolHasher, key, &bytes).is_none() {
+            continue;
+        }
+        // A record is held to the width a served value carries, so one
+        // past it is a store holding what no record writes. Leaving it
+        // out would answer the record as a bare presence, which is a
+        // narrower answer than the asker is owed, so none is given.
+        let Ok(bytes) = Bytes::new(bytes) else {
+            warn!(
+                height = req.height.inner(),
+                ?key,
+                "state proof: a crossing record wider than a served value; serving not_found"
+            );
+            return None;
+        };
+        values.push((key, bytes));
+    }
     Some(GetStateProofResponse::found(
         proof,
-        Capped::new(values).unwrap_or_default(),
+        Capped::new(values).expect("one value at most per key asked, under the cap the ask met"),
     ))
 }
 
