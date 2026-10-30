@@ -53,7 +53,7 @@ use tracing::warn;
 
 use crate::beacon::{
     self, BeaconBlockSync, BeaconBlockSyncInput, BeaconBlockSyncOutput, BeaconCandidateBinding,
-    BeaconFetchState, BeaconProposalBinding, BeaconReply, ShardWitnessBinding,
+    BeaconFetchState, BeaconProposalBinding, BeaconReply, ProposalKeys, ShardWitnessBinding,
 };
 use crate::config::NodeConfig;
 use crate::event::{
@@ -178,7 +178,14 @@ where
         let now = fold.now();
         let beacon_block = beacon::resumed_at(fold.latest_block().epoch());
         Self {
-            reply: BeaconReply(process.beacon_event_sender.clone()),
+            reply: BeaconReply::new(
+                process.beacon_event_sender.clone(),
+                ProposalKeys {
+                    topology: process.topology_snapshot.clone(),
+                    verifier: Arc::clone(&process.verifier),
+                    network: fold.network().clone(),
+                },
+            ),
             process,
             fold,
             participants: BTreeMap::new(),
@@ -561,7 +568,7 @@ where
                 epoch,
                 validator: author,
                 proposal,
-            } => match self.fold.verify_fetched_proposal(epoch, author, proposal) {
+            } => match Self::sealed(author, proposal) {
                 Some(proposal) => {
                     self.release(ids, Release::Admitted);
                     for validator in self.validator_list() {
@@ -1013,10 +1020,11 @@ where
         self.proof_routes.insert((source, height), token);
     }
 
-    /// The verified proposal a received one carries. The wire handler
-    /// checks a peer's VRF reveal before forwarding it and the host's own
-    /// sign and send seal it, so every proposal reaching the loop keeps
-    /// its marker; one that does not is dropped with a warning.
+    /// The verified proposal a received or fetched one carries. The wire
+    /// handler and the fetch's response boundary check a peer's VRF
+    /// reveal before handing it over, and the host's own sign and send
+    /// seal it, so every proposal reaching the loop keeps its marker; one
+    /// that does not is dropped with a warning.
     fn sealed(
         from: ValidatorId,
         proposal: Arc<Verifiable<BeaconProposal>>,
@@ -1026,7 +1034,7 @@ where
             .ok()
             .map(Arc::new);
         if sealed.is_none() {
-            warn!(?from, "BeaconProposalReceived without its check — dropping");
+            warn!(?from, "beacon proposal without its check — dropping");
         }
         sealed
     }

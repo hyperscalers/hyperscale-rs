@@ -20,7 +20,7 @@ pub mod witness_serve;
 
 pub use candidate_cache::BeaconCandidateCache;
 pub use fetch::{
-    BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding, BeaconReply,
+    BeaconCandidateBinding, BeaconFetchState, BeaconProposalBinding, BeaconReply, ProposalKeys,
     ShardWitnessBinding,
 };
 pub use proposal_cache::BeaconProposalCache;

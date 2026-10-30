@@ -14,9 +14,12 @@
 //! The generic engine, the [`FetchBinding`] trait, and the shared
 //! `partition_solicited` helper live in [`crate::fetch`].
 
+use std::sync::Arc;
+
 use crossbeam::channel::Sender;
 use hyperscale_core::{BeaconFetchIds, FetchIds, ProtocolEvent};
-use hyperscale_network::{Network, RequestError};
+use hyperscale_metrics::record_fetch_response_refused;
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_types::network::request::beacon::{
     GetBeaconCandidateRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
@@ -27,16 +30,18 @@ use hyperscale_types::network::response::beacon::{
     GetBeaconCandidateResponse, GetBeaconProposalResponse, GetShardWitnessesResponse,
 };
 use hyperscale_types::{
-    Address, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash, LeafIndex, ShardId, ValidatorId,
+    Address, BeaconBlockHash, BeaconProposalVerifyContext, BlockHash, BlockHeight, Epoch, Hash,
+    LeafIndex, NetworkDefinition, ShardId, ValidatorId, Verifiable, Verifier,
 };
+use tracing::warn;
 
 use crate::config::NodeConfig;
 use crate::event::BeaconScopedInput;
 use crate::fetch::{
     Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, Refusal, Route,
-    ScopedAnswer, defers_to_the_tick, dispatch_scoped,
+    ScopedAnswer, defers_to_the_tick, dispatch_scoped, transport_failed,
 };
-use crate::shard::HostEvent;
+use crate::shard::{HostEvent, SharedTopologySnapshot};
 
 /// Cross-shard beacon-witness fetch keyed by
 /// `(source_shard, block_height, committed_block_hash, lo, hi)`.
@@ -137,13 +142,92 @@ impl FetchOwner for BeaconFetchState {
     type Reply = BeaconReply;
 }
 
-/// The beacon loop's reply handle: the host's beacon channel.
+/// The beacon loop's reply handle: the host's beacon channel, and the
+/// keys a fetched proposal's VRF reveal is checked under at its response
+/// boundary.
 #[derive(Clone)]
-pub struct BeaconReply(pub(crate) Sender<HostEvent>);
+pub struct BeaconReply {
+    sender: Sender<HostEvent>,
+    proposal_keys: ProposalKeys,
+}
+
+/// What a fetched proposal's reveal is checked under: its author's key
+/// in the topology the beacon loop publishes at each adoption, the same
+/// key the wire handler checks a gossiped proposal under.
+#[derive(Clone)]
+pub struct ProposalKeys {
+    pub(crate) topology: SharedTopologySnapshot,
+    pub(crate) verifier: Arc<dyn Verifier>,
+    pub(crate) network: NetworkDefinition,
+}
 
 impl BeaconReply {
+    pub(crate) const fn new(sender: Sender<HostEvent>, proposal_keys: ProposalKeys) -> Self {
+        Self {
+            sender,
+            proposal_keys,
+        }
+    }
+
     pub(crate) fn push(&self, input: BeaconScopedInput) {
-        let _ = self.0.send(HostEvent::Beacon(input));
+        let _ = self.sender.send(HostEvent::Beacon(input));
+    }
+
+    /// The response boundary of a proposal fetch for `id`: a proposal
+    /// whose reveal holds under its author's key retires `id` and is
+    /// handed over checked; one that fails is the peer's fault and is
+    /// asked of another. A peer that does not hold it, or an author this
+    /// host holds no key for, releases `id` at no cost to the peer.
+    fn settle_proposal(
+        &self,
+        id: (Epoch, ValidatorId),
+        result: Result<GetBeaconProposalResponse, RequestError>,
+    ) -> ResponseVerdict {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                return transport_failed::<BeaconProposalBinding, _>(vec![id], &error, self);
+            }
+        };
+        let ids = BeaconProposalBinding::ids(vec![id]);
+        let (epoch, validator) = id;
+        let (Some(proposal), Some(sender_pk)) = (
+            response.proposal,
+            self.proposal_keys.topology.load().public_key(validator),
+        ) else {
+            self.refused(ids);
+            return ResponseVerdict::Accept;
+        };
+        let ctx = BeaconProposalVerifyContext {
+            verifier: self.proposal_keys.verifier.as_ref(),
+            network: &self.proposal_keys.network,
+            epoch,
+            sender_pk,
+        };
+        match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
+            Ok(checked) => {
+                self.answered(
+                    ids,
+                    ProtocolEvent::BeaconProposalFetched {
+                        epoch,
+                        validator,
+                        proposal: Arc::new(Verifiable::from(checked)),
+                    },
+                );
+                ResponseVerdict::Accept
+            }
+            Err((_, err)) => {
+                warn!(
+                    ?validator,
+                    epoch = epoch.inner(),
+                    ?err,
+                    "Fetched BeaconProposal failed VRF verification — asking another peer"
+                );
+                record_fetch_response_refused(BeaconProposalBinding::NAME, "bad_reveal");
+                self.refused(ids);
+                ResponseVerdict::Reject
+            }
+        }
     }
 }
 
@@ -248,6 +332,12 @@ impl FetchBinding for BeaconProposalBinding {
     }
 }
 
+/// The wire type addresses a single proposal, so one request carries
+/// one id. A peer that does not hold the proposal releases the slot for
+/// retry against another committee member rather than resolving the
+/// await: the participant keeps awaiting it, `prune_stale` bounds the
+/// rotation once the epoch commits, and the beacon-block gossip path is
+/// only the last-resort backstop.
 impl FetchedBy<BeaconFetchState> for BeaconProposalBinding {
     fn fetch_mut(state: &mut BeaconFetchState) -> &mut Fetch<Self::Id> {
         &mut state.beacon_proposal
@@ -259,46 +349,14 @@ impl FetchedBy<BeaconFetchState> for BeaconProposalBinding {
         network: &N,
         reply: &BeaconReply,
     ) {
-        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
-    }
-}
-
-/// The wire type addresses a single proposal, so `(epoch, validator)` is
-/// the scope and one request carries one.
-impl ScopedAnswer for BeaconProposalBinding {
-    type Scope = Self::Id;
-    type Key = ();
-    type Request = GetBeaconProposalRequest;
-
-    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
-        (id, ())
-    }
-
-    fn join(scope: Self::Scope, (): Self::Key) -> Self::Id {
-        scope
-    }
-
-    fn request((epoch, validator): Self::Scope, _keys: &[Self::Key]) -> Self::Request {
-        GetBeaconProposalRequest::new(epoch, validator)
-    }
-
-    /// A peer that does not hold the proposal releases the slot for
-    /// retry against another committee member rather than resolving the
-    /// await: the participant keeps awaiting it, `prune_stale` bounds the
-    /// rotation once the epoch commits, and the beacon-block gossip path
-    /// is only the last-resort backstop. The beacon loop VRF-checks a
-    /// returned proposal before the slot retires.
-    fn answer(
-        (epoch, validator): Self::Scope,
-        _keys: Vec<Self::Key>,
-        response: GetBeaconProposalResponse,
-    ) -> Result<ProtocolEvent, Refusal> {
-        let proposal = response.proposal.ok_or(Refusal::NotHeld)?;
-        Ok(ProtocolEvent::BeaconProposalFetched {
-            epoch,
-            validator,
-            proposal,
-        })
+        for id @ (epoch, validator) in ids {
+            let reply = reply.clone();
+            route.request(
+                network,
+                GetBeaconProposalRequest::new(epoch, validator),
+                Box::new(move |result| reply.settle_proposal(id, result)),
+            );
+        }
     }
 }
 
@@ -362,5 +420,84 @@ impl ScopedAnswer for BeaconCandidateBinding {
             return Err(Refusal::Unusable("candidate_mismatch"));
         }
         Ok(ProtocolEvent::BeaconCandidateReceived { candidate })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crossbeam::channel::unbounded;
+    use hyperscale_types::{BeaconProposal, BeaconProposalDraft, BlockHeight, VrfProof};
+
+    use super::*;
+    use crate::shard::test_host::Fixture;
+
+    /// A fetched proposal whose VRF reveal fails under its author's key
+    /// rejects the peer that gave it and is asked of another; one that
+    /// holds is handed over already checked.
+    #[test]
+    fn a_fetched_proposal_failing_its_reveal_rejects_its_peer() {
+        let fix = Fixture::new();
+        let host = fix.host(BlockHeight::GENESIS);
+        let network = NetworkDefinition::simulator();
+        let (tx, events) = unbounded();
+        let reply = BeaconReply::new(
+            tx,
+            ProposalKeys {
+                topology: host.process.topology_snapshot.clone(),
+                verifier: Arc::clone(&host.process.verifier),
+                network: network.clone(),
+            },
+        );
+        let author = fix.committee.validator_id(1);
+        let id = (Epoch::new(1), author);
+        let answer = |proposal: BeaconProposal| {
+            Ok(GetBeaconProposalResponse::new(Some(Arc::new(
+                Verifiable::from(proposal),
+            ))))
+        };
+
+        let forged = BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        assert!(matches!(
+            reply.settle_proposal(id, answer(forged)),
+            ResponseVerdict::Reject
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(HostEvent::Beacon(BeaconScopedInput::FetchFailed(_)))
+        ));
+
+        let signer = fix.committee.signer(1);
+        let honest = BeaconProposalDraft::new(
+            signer.as_ref(),
+            &network,
+            Epoch::new(1),
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .and_then(BeaconProposalDraft::sign)
+        .expect("the author's key signs its proposal")
+        .into_inner();
+        assert!(matches!(
+            reply.settle_proposal(id, answer(honest)),
+            ResponseVerdict::Accept
+        ));
+        let Ok(HostEvent::Beacon(BeaconScopedInput::Answered { event, .. })) = events.try_recv()
+        else {
+            panic!("an honest proposal is handed over");
+        };
+        assert!(matches!(
+            *event,
+            ProtocolEvent::BeaconProposalFetched { proposal, .. } if proposal.verified().is_some()
+        ));
     }
 }

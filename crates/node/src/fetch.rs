@@ -793,7 +793,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
 /// Release `requested` after a request that failed with `error`. The
 /// network has already recorded the failure against its peer, so the
 /// response is not rejected again here.
-fn transport_failed<B: FetchBinding, R: FetchReply>(
+pub fn transport_failed<B: FetchBinding, R: FetchReply>(
     requested: Vec<B::Id>,
     error: &RequestError,
     reply: &R,
