@@ -1751,6 +1751,7 @@ mod tests {
     };
     use hyperscale_storage::RecoveredState;
     use hyperscale_storage::test_helpers::commit_one;
+    use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
     use hyperscale_types::network::notification::beacon::BeaconProposalNotification;
     use hyperscale_types::network::request::GetInstanceRecordsRequest;
     use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
@@ -2334,6 +2335,38 @@ mod tests {
             vec![true],
             "only the honest proposal reaches the loop, already checked",
         );
+    }
+
+    /// A peer's beacon gossip reaches a seated host's beacon loop once,
+    /// through the host-level handler; the per-shard handler only holds
+    /// the item's verdict.
+    #[test]
+    fn beacon_gossip_reaches_a_seated_hosts_loop_once() {
+        let fix = Fixture::new();
+        let (mut wire, host, events) = wired(&fix, SyncDispatch::new());
+        host.register_gossip_handlers();
+        wire.peer
+            .broadcast_global(&BeaconBlockGossip::new(Arc::new(Verifiable::from(
+                (*fix.genesis_block()).clone(),
+            ))));
+        for entry in wire.peer.drain_outbox() {
+            wire.network
+                .accept_gossip(1, wire.now, entry, &mut wire.streams);
+        }
+        wire.network
+            .flush_gossip(wire.now + Duration::from_secs(10));
+
+        let received = events
+            .try_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    HostEvent::Beacon(BeaconScopedInput::Protocol(event))
+                        if matches!(**event, ProtocolEvent::BeaconBlockReceived { .. })
+                )
+            })
+            .count();
+        assert_eq!(received, 1);
     }
 
     /// The catch-up sync asks the committee's other members even where

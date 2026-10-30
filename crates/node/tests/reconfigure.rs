@@ -329,8 +329,9 @@ fn a_shard_less_host_receives_beacon_gossip_with_no_route_gate() {
     assert!(out.participation_changes.is_empty());
 }
 
-/// On a host that runs a shard, the per-shard beacon handler hands the
-/// block to the beacon loop and defers its verdict to the loop's check. A
+/// On a host that runs a shard, the per-shard beacon handler defers its
+/// verdict to the beacon loop's check of the copy the host-level handler
+/// hands the loop. A
 /// block the fold never checks — one at its tip — is never settled: the
 /// loop dispatches nothing for it, so the item stays deferred.
 #[test]
@@ -349,18 +350,15 @@ fn a_beacon_item_the_loop_never_checks_stays_deferred_on_a_hosted_shard_host() {
     while event_rx.try_recv().is_ok() {}
 
     let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
-    let verdict = registry.local_dispatch_gossip(&gossip, Some(SHARD_A));
+    let verdict = registry.local_dispatch_gossip(&gossip, None);
     assert!(
         matches!(verdict, Some(Verdict::Defer(_))),
         "the per-shard handler defers its verdict: got {verdict:?}",
     );
     let events: Vec<HostEvent> = event_rx.try_iter().collect();
     assert!(
-        !events.is_empty()
-            && events
-                .iter()
-                .all(|event| matches!(event, HostEvent::Beacon(_))),
-        "the block goes to the beacon loop, never to a shard's loop",
+        matches!(events.as_slice(), [HostEvent::Beacon(_)]),
+        "the block goes to the beacon loop once, never to a shard's loop",
     );
     for event in events {
         let out = host.step(event);
