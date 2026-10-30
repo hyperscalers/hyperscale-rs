@@ -3,20 +3,23 @@
 //! The [`FetchBinding`] impl for the per-block transaction payload. Its
 //! `fetch_mut` resolves the `Fetch` instance out of this shard's
 //! [`MempoolState`](super::MempoolState). The generic engine, the
-//! `FetchBinding` trait, and the shared `partition_solicited` helper live in
-//! [`crate::fetch`].
+//! `FetchBinding` trait, and the shared [`SolicitedAnswer`] response
+//! boundary live in [`crate::fetch`].
+
+use std::sync::Arc;
 
 use hyperscale_core::FetchIds;
 use hyperscale_hbor::Capped;
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::TxHash;
 use hyperscale_types::network::request::GetTransactionsRequest;
+use hyperscale_types::network::response::GetTransactionsResponse;
+use hyperscale_types::{Transaction, TxHash};
 
 use crate::fetch::{
-    Fetch, FetchBinding, FetchedBy, Route, ShardReply, failed_chunk, partition_solicited,
+    Fetch, FetchBinding, FetchedBy, Route, Settles, ShardReply, SolicitedAnswer, dispatch_solicited,
 };
-use crate::shard::{ShardIo, ShardScopedInput, push_shard_input};
+use crate::shard::{ShardIo, ShardScopedInput};
 
 /// Per-tx fetch keyed by [`TxHash`].
 pub type TransactionFetch = Fetch<TxHash>;
@@ -40,47 +43,34 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for TransactionBinding {
     }
 
     fn dispatch_chunk<N: Network>(ids: Vec<TxHash>, route: Route, network: &N, reply: &ShardReply) {
-        let local_shard = reply.shard;
-        let sender = &reply.sender;
-        let es = sender.clone();
-        let hs = ids.clone();
-        route.request(
-            network,
-            GetTransactionsRequest::new(
-                Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
-            ),
-            Box::new(move |result| {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        push_shard_input(&es, local_shard, failed_chunk(&error, Self::ids(hs)));
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                let split = partition_solicited(resp.into_transactions(), &hs, |tx| [tx.hash()]);
-                if !split.kept.is_empty() {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::TransactionsFetched { batch: split.kept },
-                    );
-                }
-                if !split.missing.is_empty() {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
-                    );
-                }
-                // Reject the response if the peer shipped unsolicited
-                // txs (injection attempt or buggy peer) OR if any
-                // requested hash was missing from the delivery.
-                if split.unsolicited > 0 || !split.missing.is_empty() {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// A transaction is its own hash, so a delivered body is the one asked
+/// for and its ids retire as it lands; the bodies then go to validation.
+impl SolicitedAnswer for TransactionBinding {
+    type Request = GetTransactionsRequest;
+    type Item = Arc<Transaction>;
+    type Input = ShardScopedInput;
+
+    const SETTLES: Settles = Settles::OnAnswer;
+
+    fn request(ids: &[TxHash]) -> GetTransactionsRequest {
+        GetTransactionsRequest::new(
+            Capped::new(ids.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
+        )
+    }
+
+    fn items(response: GetTransactionsResponse) -> Vec<Arc<Transaction>> {
+        response.into_transactions()
+    }
+
+    fn answers_for(tx: &Arc<Transaction>) -> impl IntoIterator<Item = TxHash> + use<> {
+        [tx.hash()]
+    }
+
+    fn deliver(batch: Vec<Arc<Transaction>>) -> Vec<ShardScopedInput> {
+        vec![ShardScopedInput::TransactionsFetched { batch }]
     }
 }

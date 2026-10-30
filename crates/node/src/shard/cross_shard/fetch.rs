@@ -5,32 +5,35 @@
 //! the answers checked against a remote chain's committed state.
 //! Each `fetch_mut` resolves the binding's `Fetch` instance out of this shard's
 //! [`CrossShardState`](super::CrossShardState). The generic engine, the
-//! `FetchBinding` trait, and the shared `partition_solicited` helper live in
-//! [`crate::fetch`].
+//! `FetchBinding` trait, and the [`ScopedAnswer`] and [`SolicitedAnswer`]
+//! response boundaries live in [`crate::fetch`].
 
 use std::sync::Arc;
 
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_hbor::Capped;
-use hyperscale_metrics::record_fetch_response_refused;
-use hyperscale_network::{Network, RequestError, ResponseVerdict};
+use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetFinalizationsRequest, GetLocalProvisionsRequest, GetProvisionsRequest, GetSettledTxsRequest,
     GetStateProofRequest,
 };
-use hyperscale_types::network::response::{GetSettledTxsResponse, GetStateProofResponse};
+use hyperscale_types::network::response::{
+    GetFinalizationsResponse, GetLocalProvisionsResponse, GetProvisionResponse,
+    GetSettledTxsResponse, GetStateProofResponse, LocalProvisionEntry,
+};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, BlockHeight, Finalization, FinalizationHash, ProvisionHash, ShardId, SubstateKey,
-    TerminalEvidence, ValidatorId, VerdictCells, Verifiable, settled_txs_root_from_hashes,
+    Anchor, BlockHeight, Finalization, FinalizationHash, ProvisionHash, Provisions, ShardId,
+    SubstateKey, TerminalEvidence, ValidatorId, VerdictCells, Verifiable,
+    settled_txs_root_from_hashes,
 };
 
 use crate::fetch::{
-    Fetch, FetchBinding, FetchedBy, Refusal, Route, ScopedAnswer, ShardReply, dispatch_scoped,
-    failed_chunk, partition_solicited,
+    Fetch, FetchBinding, FetchedBy, Refusal, Route, ScopedAnswer, Settles, ShardReply,
+    SolicitedAnswer, dispatch_scoped, dispatch_solicited,
 };
-use crate::shard::{ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{ShardIo, ShardScopedInput};
 
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].
@@ -77,66 +80,56 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for LocalProvisionBinding {
         network: &N,
         reply: &ShardReply,
     ) {
-        let local_shard = reply.shard;
-        let sender = &reply.sender;
-        let es = sender.clone();
-        let hs = ids.clone();
-        route.request(
-            network,
-            GetLocalProvisionsRequest::new(
-                Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
-            ),
-            Box::new(move |result| {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        push_shard_input(&es, local_shard, failed_chunk(&error, Self::ids(hs)));
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                let split = partition_solicited(resp.entries.into_inner(), &hs, |entry| {
-                    [entry.provisions.hash()]
-                });
-                // Push the bundled source header BEFORE the provisions
-                // so the verification pipeline has a chance to admit it
-                // first. The header is QC-self-authenticating; sender is
-                // the fetched-header sentinel (no peer attestation).
-                for entry in split.kept {
-                    if let Some(certified_header) = entry.source_header {
-                        push_protocol_event(
-                            &es,
-                            local_shard,
-                            ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                                certified_header,
-                                sender: ValidatorId::new(u64::MAX),
-                            },
-                        );
-                    }
-                    push_protocol_event(
-                        &es,
-                        local_shard,
-                        ProtocolEvent::UnverifiedProvisionsReceived {
-                            provisions: entry.provisions,
-                        },
-                    );
-                }
-                let had_misses = !split.missing.is_empty();
-                if had_misses {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(split.missing)),
-                    );
-                }
-                // Reject the response if the peer shipped unsolicited
-                // provisions OR if any requested hash was missing.
-                if split.unsolicited > 0 || had_misses {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// A bundle's proof is checked against its source header on the
+/// coordinator, which may still be waiting for that header, so the ids
+/// stay in flight until it admits the bundle or fails it.
+impl SolicitedAnswer for LocalProvisionBinding {
+    type Request = GetLocalProvisionsRequest;
+    type Item = LocalProvisionEntry;
+    type Input = ShardScopedInput;
+
+    const SETTLES: Settles = Settles::OnVerdict;
+
+    fn request(ids: &[ProvisionHash]) -> GetLocalProvisionsRequest {
+        GetLocalProvisionsRequest::new(
+            Capped::new(ids.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
+        )
+    }
+
+    fn items(response: GetLocalProvisionsResponse) -> Vec<LocalProvisionEntry> {
+        response.entries.into_inner()
+    }
+
+    fn answers_for(entry: &LocalProvisionEntry) -> impl IntoIterator<Item = ProvisionHash> + use<> {
+        [entry.provisions.hash()]
+    }
+
+    /// The bundled source header goes ahead of its provisions, so the
+    /// verification pipeline has a chance to admit it first. The header
+    /// is QC-self-authenticating; sender is the fetched-header sentinel
+    /// (no peer attestation).
+    fn deliver(kept: Vec<LocalProvisionEntry>) -> Vec<ShardScopedInput> {
+        let mut inputs = Vec::with_capacity(kept.len() * 2);
+        for entry in kept {
+            if let Some(certified_header) = entry.source_header {
+                inputs.push(ShardScopedInput::Protocol(Box::new(
+                    ProtocolEvent::UnverifiedRemoteHeaderReceived {
+                        certified_header,
+                        sender: ValidatorId::new(u64::MAX),
+                    },
+                )));
+            }
+            inputs.push(ShardScopedInput::Protocol(Box::new(
+                ProtocolEvent::UnverifiedProvisionsReceived {
+                    provisions: entry.provisions,
+                },
+            )));
+        }
+        inputs
     }
 }
 
@@ -164,62 +157,46 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for FinalizationBinding {
         network: &N,
         reply: &ShardReply,
     ) {
-        let local_shard = reply.shard;
-        let sender = &reply.sender;
-        let es = sender.clone();
-        let requested_ids = ids.clone();
-        route.request(
-            network,
-            GetFinalizationsRequest::new(
-                Capped::new(ids).expect("the fetch config clamps a chunk below the wire cap"),
-            ),
-            Box::new(move |result| {
-                let resp = match result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            failed_chunk(&error, Self::ids(requested_ids)),
-                        );
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                let split =
-                    partition_solicited(resp.finalizations.into_inner(), &requested_ids, |w| {
-                        [w.receipt_hash()]
-                    });
-                if !split.kept.is_empty() {
-                    // Refcount is 1 right after decode, so each unwrap moves.
-                    let finalizations: Vec<Arc<Verifiable<Finalization>>> = split
-                        .kept
-                        .into_iter()
-                        .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
-                        .collect();
-                    push_protocol_event(
-                        &es,
-                        local_shard,
-                        ProtocolEvent::FinalizationsReceived { finalizations },
-                    );
-                }
-                let had_misses = !split.missing.is_empty();
-                if had_misses {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(split.missing)),
-                    );
-                }
-                // Reject responses with unsolicited ticks (peer scoring;
-                // also avoids wasted signature verification on items we never
-                // asked for) or with any missing requested id.
-                if split.unsolicited > 0 || had_misses {
-                    ResponseVerdict::Reject
-                } else {
-                    ResponseVerdict::Accept
-                }
-            }),
-        );
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// A finalization's certificates are checked on the execution
+/// coordinator, which parks one whose committee the beacon has not
+/// folded yet; the ids stay in flight until it admits or abandons it, so
+/// a pending block's re-ask does not fetch the parked copy again.
+impl SolicitedAnswer for FinalizationBinding {
+    type Request = GetFinalizationsRequest;
+    type Item = Arc<Finalization>;
+    type Input = ShardScopedInput;
+
+    const SETTLES: Settles = Settles::OnVerdict;
+
+    fn request(ids: &[FinalizationHash]) -> GetFinalizationsRequest {
+        GetFinalizationsRequest::new(
+            Capped::new(ids.to_vec()).expect("the fetch config clamps a chunk below the wire cap"),
+        )
+    }
+
+    fn items(response: GetFinalizationsResponse) -> Vec<Arc<Finalization>> {
+        response.finalizations.into_inner()
+    }
+
+    fn answers_for(
+        finalization: &Arc<Finalization>,
+    ) -> impl IntoIterator<Item = FinalizationHash> + use<> {
+        [finalization.receipt_hash()]
+    }
+
+    fn deliver(kept: Vec<Arc<Finalization>>) -> Vec<ShardScopedInput> {
+        // Refcount is 1 right after decode, so each unwrap moves.
+        let finalizations: Vec<Arc<Verifiable<Finalization>>> = kept
+            .into_iter()
+            .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
+            .collect();
+        vec![ShardScopedInput::Protocol(Box::new(
+            ProtocolEvent::FinalizationsReceived { finalizations },
+        ))]
     }
 }
 
@@ -483,75 +460,63 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ProvisionBinding {
         network: &N,
         reply: &ShardReply,
     ) {
-        let local_shard = reply.shard;
-        let sender = &reply.sender;
-        // PER_ID means the dispatcher hands us exactly one id at a time.
-        debug_assert_eq!(ids.len(), 1);
-        let (source_shard, target_shard, block_height) = ids[0];
-        debug_assert_eq!(
-            route.shard, source_shard,
+        debug_assert!(
+            ids.iter()
+                .all(|(source_shard, ..)| route.shard == *source_shard),
             "ProvisionBinding routes to the source shard; the runner sets it from the variant"
         );
-        // `target_shard` (the requester's shard) is the body field: the
-        // source filters provisions by which shard is asking. Routing
-        // shard `shard = source_shard` picks the responding committee.
-        let request = GetProvisionsRequest::new(block_height, target_shard);
-        let es = sender.clone();
-        route.request(
-            network,
-            request,
-            Box::new(move |result| {
-                let ids = || Self::ids(vec![(source_shard, target_shard, block_height)]);
-                let push_fetch_failed = || {
-                    push_shard_input(&es, local_shard, ShardScopedInput::FetchFailed(ids()));
-                };
-                let response = match result {
-                    Ok(response) => response,
-                    Err(error) => {
-                        if matches!(error, RequestError::PeerError(_)) {
-                            record_fetch_response_refused("provision", "unusable_answer");
-                        }
-                        push_shard_input(&es, local_shard, failed_chunk(&error, ids()));
-                        return ResponseVerdict::Accept;
-                    }
-                };
-                let Some(provisions) = response.provisions else {
-                    push_fetch_failed();
-                    return ResponseVerdict::Reject;
-                };
-                if provisions.source_shard() != source_shard
-                    || provisions.target_shard() != target_shard
-                    || provisions.block_height() != block_height
-                {
-                    tracing::warn!(
-                        expected_source = source_shard.inner(),
-                        got_source = provisions.source_shard().inner(),
-                        expected_target = target_shard.inner(),
-                        got_target = provisions.target_shard().inner(),
-                        expected_height = block_height.inner(),
-                        got_height = provisions.block_height().inner(),
-                        "Dropping provision fetch response: scope mismatch"
-                    );
-                    record_fetch_response_refused("provision", "scope_mismatch");
-                    push_fetch_failed();
-                    return ResponseVerdict::Reject;
-                }
-                if provisions.transactions().is_empty() {
-                    // Empty-but-scope-matched response is still a miss for
-                    // the requester: the FSM has nothing to admit, so
-                    // without an explicit `Failed` the id stays in_flight
-                    // forever.
-                    push_fetch_failed();
-                    return ResponseVerdict::Reject;
-                }
-                push_protocol_event(
-                    &es,
-                    local_shard,
-                    ProtocolEvent::UnverifiedProvisionsReceived { provisions },
-                );
-                ResponseVerdict::Accept
-            }),
-        );
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// A bundle answers for the `(source, target, height)` it names, so one
+/// for another scope is unsolicited. Its proof is checked on the
+/// coordinator against the commit-proven source header, and the
+/// expectation that asked does not ask again, so the id stays in flight
+/// until the coordinator admits the bundle or fails it: the fetch's own
+/// retry is the only one there is.
+impl SolicitedAnswer for ProvisionBinding {
+    type Request = GetProvisionsRequest;
+    type Item = Arc<Provisions>;
+    type Input = ShardScopedInput;
+
+    const SETTLES: Settles = Settles::OnVerdict;
+
+    /// `target_shard` (the requester's shard) is the body field: the
+    /// source filters provisions by which shard is asking. The route's
+    /// shard, the source, picks the responding committee.
+    fn request(ids: &[Self::Id]) -> GetProvisionsRequest {
+        debug_assert_eq!(ids.len(), 1, "PER_ID hands over one id at a time");
+        let (_, target_shard, block_height) = ids[0];
+        GetProvisionsRequest::new(block_height, target_shard)
+    }
+
+    /// A bundle with no transactions is a source with nothing owed to
+    /// the asker at that height, which reads as not holding it.
+    fn items(response: GetProvisionResponse) -> Vec<Arc<Provisions>> {
+        response
+            .provisions
+            .into_iter()
+            .filter(|provisions| !provisions.transactions().is_empty())
+            .collect()
+    }
+
+    fn answers_for(provisions: &Arc<Provisions>) -> impl IntoIterator<Item = Self::Id> + use<> {
+        [(
+            provisions.source_shard(),
+            provisions.target_shard(),
+            provisions.block_height(),
+        )]
+    }
+
+    fn deliver(kept: Vec<Arc<Provisions>>) -> Vec<ShardScopedInput> {
+        kept.into_iter()
+            .map(|provisions| {
+                ShardScopedInput::Protocol(Box::new(ProtocolEvent::UnverifiedProvisionsReceived {
+                    provisions,
+                }))
+            })
+            .collect()
     }
 }
 
@@ -799,5 +764,174 @@ mod settled_txs_tests {
             SettledTxsBinding::answer(scope, vec![()], GetSettledTxsResponse::not_found()).err(),
             Some(Refusal::NotHeld)
         );
+    }
+}
+
+#[cfg(test)]
+mod solicited_tests {
+    use crossbeam::channel::unbounded;
+    use hyperscale_network::ResponseVerdict;
+    use hyperscale_types::network::Request;
+    use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash, WeightedTimestamp};
+
+    use super::*;
+    use crate::fetch::settle_solicited;
+    use crate::shard::HostEvent;
+
+    const LOCAL: ShardId = ShardId::leaf(2, 0);
+    const SOURCE: ShardId = ShardId::leaf(2, 1);
+
+    fn bundle(target: ShardId, height: u64, txs: &[&[u8]]) -> Arc<Provisions> {
+        Arc::new(Provisions::new(
+            SOURCE,
+            target,
+            BlockHeight::new(height),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::new(
+                txs.iter()
+                    .map(|tx| {
+                        ProvisionEntry::new(TxHash::from(Hash::from_bytes(tx)), Capped::empty())
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// Settle `response` to a request for `requested` and return the
+    /// verdict beside what reached the loop.
+    fn settle<B>(
+        requested: Vec<B::Id>,
+        response: <B::Request as Request>::Response,
+    ) -> (ResponseVerdict, Vec<ShardScopedInput>)
+    where
+        B: SolicitedAnswer<Input = ShardScopedInput>,
+    {
+        let (sender, events) = unbounded();
+        let verdict = settle_solicited::<B, _>(
+            requested,
+            Ok(response),
+            &ShardReply {
+                shard: LOCAL,
+                sender,
+            },
+        );
+        let inputs = events
+            .try_iter()
+            .map(|event| match event {
+                HostEvent::Shard(_, input) => input,
+                _ => panic!("a shard reply pushes shard inputs"),
+            })
+            .collect();
+        (verdict, inputs)
+    }
+
+    fn is_fulfilled(input: &ShardScopedInput) -> bool {
+        matches!(input, ShardScopedInput::FetchFulfilled(_))
+    }
+
+    /// A peer that trims its answer to its budget is not at fault: what it
+    /// left out is asked again and the answer is accepted. What it did
+    /// send reaches the coordinator and stays in flight for its verdict.
+    #[test]
+    fn a_trimmed_answer_releases_its_misses_without_blame() {
+        let sent = bundle(LOCAL, 10, &[b"a"]);
+        let left_out = bundle(LOCAL, 11, &[b"b"]).hash();
+        let (verdict, inputs) = settle::<LocalProvisionBinding>(
+            vec![sent.hash(), left_out],
+            GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
+                provisions: Arc::clone(&sent),
+                source_header: None,
+            }])),
+        );
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(!inputs.iter().any(is_fulfilled), "held until its verdict");
+        assert!(inputs.iter().any(|input| matches!(
+            input,
+            ShardScopedInput::Protocol(event)
+                if matches!(&**event, ProtocolEvent::UnverifiedProvisionsReceived { provisions }
+                    if provisions.hash() == sent.hash())
+        )));
+        assert!(inputs.iter().any(|input| matches!(
+            input,
+            ShardScopedInput::FetchFailed(FetchIds::LocalProvisions(ids)) if ids == &[left_out]
+        )));
+    }
+
+    /// An item nobody asked for is dropped and rejects the answer.
+    #[test]
+    fn an_unsolicited_item_rejects_the_answer() {
+        let asked = bundle(LOCAL, 10, &[b"a"]);
+        let extra = bundle(LOCAL, 12, &[b"c"]);
+        let (verdict, inputs) = settle::<LocalProvisionBinding>(
+            vec![asked.hash()],
+            GetLocalProvisionsResponse::new(Capped::from_array([&asked, &extra].map(
+                |provisions| LocalProvisionEntry {
+                    provisions: Arc::clone(provisions),
+                    source_header: None,
+                },
+            ))),
+        );
+        assert_eq!(verdict, ResponseVerdict::Reject);
+        let delivered: Vec<_> = inputs
+            .iter()
+            .filter_map(|input| match input {
+                ShardScopedInput::Protocol(event) => match &**event {
+                    ProtocolEvent::UnverifiedProvisionsReceived { provisions } => {
+                        Some(provisions.hash())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered, vec![asked.hash()]);
+    }
+
+    /// A source that does not hold the block, or owes the asker nothing
+    /// at it, answers honestly and is asked again elsewhere; a bundle for
+    /// another scope is no answer and rejects the peer.
+    #[test]
+    fn a_remote_bundle_is_held_to_its_scope_and_a_miss_costs_nothing() {
+        let id = (SOURCE, LOCAL, BlockHeight::new(10));
+        let failed = |inputs: &[ShardScopedInput]| {
+            inputs.iter().any(|input| {
+                matches!(input,
+                    ShardScopedInput::FetchFailed(FetchIds::RemoteProvisions(ids)) if ids == &[id])
+            })
+        };
+
+        for (response, what) in [
+            (GetProvisionResponse { provisions: None }, "not held"),
+            (
+                GetProvisionResponse {
+                    provisions: Some(bundle(LOCAL, 10, &[])),
+                },
+                "nothing owed",
+            ),
+        ] {
+            let (verdict, inputs) = settle::<ProvisionBinding>(vec![id], response);
+            assert_eq!(verdict, ResponseVerdict::Accept, "{what}");
+            assert!(failed(&inputs), "{what}: asked again");
+        }
+
+        let (verdict, inputs) = settle::<ProvisionBinding>(
+            vec![id],
+            GetProvisionResponse {
+                provisions: Some(bundle(ShardId::leaf(2, 3), 10, &[b"a"])),
+            },
+        );
+        assert_eq!(verdict, ResponseVerdict::Reject, "another scope");
+        assert!(failed(&inputs), "another scope: asked again");
+
+        let (verdict, inputs) = settle::<ProvisionBinding>(
+            vec![id],
+            GetProvisionResponse {
+                provisions: Some(bundle(LOCAL, 10, &[b"a"])),
+            },
+        );
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(!failed(&inputs) && !inputs.iter().any(is_fulfilled));
     }
 }

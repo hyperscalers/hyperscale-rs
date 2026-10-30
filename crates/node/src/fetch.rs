@@ -12,8 +12,10 @@
 //! - [`ScopedAnswer`] is the contract for a binding whose request names one
 //!   scope and whose answer is checked against it; [`dispatch_scoped`] is
 //!   the one response boundary those bindings share.
-//! - [`partition_solicited`] is the shared response-boundary filter every
-//!   bag-of-ids binding's admit handler runs.
+//! - [`SolicitedAnswer`] is the contract for a binding whose request is a
+//!   bag of ids and whose answer a bag of items; [`dispatch_solicited`] is
+//!   the response boundary those share, filtering through
+//!   [`partition_solicited`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
@@ -30,7 +32,7 @@ use hyperscale_types::network::Request;
 use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
 use tracing::{debug, trace, warn};
 
-use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_shard_input};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]
@@ -588,7 +590,8 @@ pub trait FetchReply: Clone + Send + 'static {
     /// tick when it never reached a peer, at once otherwise.
     fn failed(&self, ids: FetchIds, error: &RequestError);
 
-    /// Release `ids` for retry after an answer that was refused.
+    /// Release `ids` for retry after an answer that did not settle them:
+    /// one refused, or one that left them out.
     fn refused(&self, ids: FetchIds);
 
     /// Retire `ids` and hand over the event their answer carries. The
@@ -609,7 +612,12 @@ pub struct ShardReply {
 
 impl FetchReply for ShardReply {
     fn failed(&self, ids: FetchIds, error: &RequestError) {
-        push_shard_input(&self.sender, self.shard, failed_chunk(error, ids));
+        let release = if defers_to_the_tick(error) {
+            ShardScopedInput::FetchUnroutable(ids)
+        } else {
+            ShardScopedInput::FetchFailed(ids)
+        };
+        push_shard_input(&self.sender, self.shard, release);
     }
 
     fn refused(&self, ids: FetchIds) {
@@ -617,12 +625,22 @@ impl FetchReply for ShardReply {
     }
 
     fn answered(&self, ids: FetchIds, event: ProtocolEvent) {
-        push_shard_input(
-            &self.sender,
-            self.shard,
-            ShardScopedInput::FetchFulfilled(ids),
-        );
-        push_protocol_event(&self.sender, self.shard, event);
+        self.hand_over(Some(ids), vec![ShardScopedInput::Protocol(Box::new(event))]);
+    }
+}
+
+impl HandsOver<ShardScopedInput> for ShardReply {
+    fn hand_over(&self, fulfilled: Option<FetchIds>, inputs: Vec<ShardScopedInput>) {
+        if let Some(ids) = fulfilled {
+            push_shard_input(
+                &self.sender,
+                self.shard,
+                ShardScopedInput::FetchFulfilled(ids),
+            );
+        }
+        for input in inputs {
+            push_shard_input(&self.sender, self.shard, input);
+        }
     }
 }
 
@@ -722,16 +740,6 @@ pub const fn defers_to_the_tick(error: &RequestError) -> bool {
     )
 }
 
-/// The release for a chunk of `ids` whose request failed with `error`:
-/// on the tick when it never reached a peer, at once otherwise.
-pub const fn failed_chunk(error: &RequestError, ids: FetchIds) -> ShardScopedInput {
-    if defers_to_the_tick(error) {
-        ShardScopedInput::FetchUnroutable(ids)
-    } else {
-        ShardScopedInput::FetchFailed(ids)
-    }
-}
-
 /// Issue one request per scope in `ids` and route each answer through
 /// [`ScopedAnswer::answer`] to `reply`. A transport error releases the
 /// ids without rejecting the response — the network already recorded
@@ -756,13 +764,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
             Box::new(move |result| {
                 let response = match result {
                     Ok(response) => response,
-                    Err(error) => {
-                        if matches!(error, RequestError::PeerError(_)) {
-                            record_fetch_response_refused(B::NAME, "unusable_answer");
-                        }
-                        reply.failed(B::ids(requested), &error);
-                        return ResponseVerdict::Accept;
-                    }
+                    Err(error) => return transport_failed::<B, R>(requested, &error, &reply),
                 };
                 match B::answer(scope, keys, response) {
                     Ok(event) => {
@@ -785,6 +787,141 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
                 }
             }),
         );
+    }
+}
+
+/// Release `requested` after a request that failed with `error`. The
+/// network has already recorded the failure against its peer, so the
+/// response is not rejected again here.
+fn transport_failed<B: FetchBinding, R: FetchReply>(
+    requested: Vec<B::Id>,
+    error: &RequestError,
+    reply: &R,
+) -> ResponseVerdict {
+    if matches!(error, RequestError::PeerError(_)) {
+        record_fetch_response_refused(B::NAME, "unusable_answer");
+    }
+    reply.failed(B::ids(requested), error);
+    ResponseVerdict::Accept
+}
+
+// ─── Solicited answers ─────────────────────────────────────────────────
+
+/// When a kept answer lets go of the ids it answers for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settles {
+    /// The response boundary is the whole check, so a kept item retires
+    /// its ids as it lands.
+    OnAnswer,
+    /// The asker finishes the check after the answer lands, against a
+    /// header or a committee it may not hold yet, so the ids stay in
+    /// flight until its verdict: an admission, or an abandon or failure
+    /// naming them. Retiring them at the answer would let the asker's own
+    /// re-ask fetch the answer again while the first copy is still being
+    /// checked, and leave nothing to ask again when the check fails.
+    OnVerdict,
+}
+
+/// A binding whose request names a bag of ids and whose answer is a bag
+/// of items, each answering for the ids it names. [`dispatch_solicited`]
+/// is the one response boundary these share, with one rule: a kept item
+/// reaches the asker, a requested id nothing answered releases for retry
+/// at no cost to the peer, since a peer trims its answer to a budget or
+/// does not hold the item, and only an item answering for nothing asked
+/// rejects the response.
+pub trait SolicitedAnswer: FetchBinding {
+    /// The wire request one chunk's ids ride in.
+    type Request: Request + Clone + 'static;
+    /// One item of an answer.
+    type Item: Send + 'static;
+    /// What kept items reach the asking loop as.
+    type Input: Send + 'static;
+    /// When a kept item's ids release.
+    const SETTLES: Settles;
+
+    /// One request for `ids`.
+    fn request(ids: &[Self::Id]) -> Self::Request;
+
+    /// The items an answer carries. One that carries nothing the asker
+    /// can use is left out, which reads as the peer not holding it.
+    fn items(response: <Self::Request as Request>::Response) -> Vec<Self::Item>;
+
+    /// The ids `item` answers for. An item that answers for none asked
+    /// is unsolicited.
+    fn answers_for(item: &Self::Item) -> impl IntoIterator<Item = Self::Id> + use<Self>;
+
+    /// What the kept items reach the asker as, in order.
+    fn deliver(kept: Vec<Self::Item>) -> Vec<Self::Input>;
+}
+
+/// A reply that hands a binding's own loop input to the loop that asked:
+/// what a [`SolicitedAnswer`]'s kept items reach it as.
+pub trait HandsOver<Input>: FetchReply {
+    /// Retire `fulfilled`, when given, then hand over `inputs` in order.
+    fn hand_over(&self, fulfilled: Option<FetchIds>, inputs: Vec<Input>);
+}
+
+/// Issue one request for `ids` and route its answer to `reply` under the
+/// [`SolicitedAnswer`] rule.
+pub fn dispatch_solicited<B, N, R>(ids: Vec<B::Id>, route: Route, network: &N, reply: &R)
+where
+    B: SolicitedAnswer,
+    N: Network,
+    R: HandsOver<B::Input>,
+{
+    let request = B::request(&ids);
+    let reply = reply.clone();
+    route.request(
+        network,
+        request,
+        Box::new(move |result| settle_solicited::<B, R>(ids, result, &reply)),
+    );
+}
+
+/// The response boundary of [`dispatch_solicited`]: release and hand over
+/// what `result` answers for `requested`, and say what it says of the peer.
+pub fn settle_solicited<B, R>(
+    requested: Vec<B::Id>,
+    result: Result<<B::Request as Request>::Response, RequestError>,
+    reply: &R,
+) -> ResponseVerdict
+where
+    B: SolicitedAnswer,
+    R: HandsOver<B::Input>,
+{
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => return transport_failed::<B, R>(requested, &error, reply),
+    };
+    let split = partition_solicited(B::items(response), &requested, B::answers_for);
+    if !split.kept.is_empty() {
+        let fulfilled = match B::SETTLES {
+            Settles::OnAnswer => {
+                let missing: HashSet<&B::Id> = split.missing.iter().collect();
+                let kept: Vec<B::Id> = requested
+                    .iter()
+                    .filter(|id| !missing.contains(id))
+                    .cloned()
+                    .collect();
+                Some(B::ids(kept))
+            }
+            Settles::OnVerdict => None,
+        };
+        reply.hand_over(fulfilled, B::deliver(split.kept));
+    }
+    if !split.missing.is_empty() {
+        reply.refused(B::ids(split.missing));
+    }
+    if split.unsolicited > 0 {
+        warn!(
+            binding = B::NAME,
+            unsolicited = split.unsolicited,
+            "Dropping fetched items nobody asked for"
+        );
+        record_fetch_response_refused(B::NAME, "unsolicited");
+        ResponseVerdict::Reject
+    } else {
+        ResponseVerdict::Accept
     }
 }
 

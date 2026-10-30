@@ -14,18 +14,19 @@ use std::sync::Mutex;
 
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_metrics::{record_fetch_response_refused, record_fetch_response_sent};
-use hyperscale_network::{Network, RequestError, ResponseVerdict, Verdict};
+use hyperscale_metrics::record_fetch_response_sent;
+use hyperscale_network::{Network, Verdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::network::request::GetProposalRequest;
 use hyperscale_types::network::response::GetProposalResponse;
 use hyperscale_types::{BlockHash, BlockHeight};
-use tracing::warn;
 
-use crate::fetch::{Fetch, FetchBinding, FetchedBy, Route, ShardReply, defers_to_the_tick};
+use crate::fetch::{
+    Fetch, FetchBinding, FetchedBy, Route, Settles, ShardReply, SolicitedAnswer, dispatch_solicited,
+};
 use crate::shard::verify::verify_signed_by_proposer;
-use crate::shard::{ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{ShardIo, ShardLoop, ShardScopedInput};
 
 /// Proposals held for serving at once. The coordinator admits proposals
 /// only within its own window above the committed tip, and commits prune
@@ -103,73 +104,48 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ProposalBinding {
         &mut shard.consensus.proposal
     }
 
-    /// One request per proposal. The answer is checked against the hash
-    /// asked for here; its proposer's signature is checked on the shard
-    /// loop, as a gossiped header's is at intake.
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         route: Route,
         network: &N,
         reply: &ShardReply,
     ) {
-        let local_shard = reply.shard;
-        let sender = &reply.sender;
-        for block_hash in ids {
-            let es = sender.clone();
-            route.request(
-                network,
-                GetProposalRequest::new(block_hash),
-                Box::new(move |result: Result<GetProposalResponse, RequestError>| {
-                    let requested = FetchIds::Proposals(vec![block_hash]);
-                    let response = match result {
-                        Ok(response) => response,
-                        Err(error) => {
-                            let input = if defers_to_the_tick(&error) {
-                                ShardScopedInput::FetchUnroutable(requested)
-                            } else {
-                                ShardScopedInput::FetchFailed(requested)
-                            };
-                            push_shard_input(&es, local_shard, input);
-                            return ResponseVerdict::Accept;
-                        }
-                    };
-                    let Some(proposal) = response.proposal else {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(requested),
-                        );
-                        return ResponseVerdict::Accept;
-                    };
-                    if proposal.header.hash() != block_hash {
-                        warn!(
-                            ?block_hash,
-                            "Dropping fetched proposal: not the block asked for"
-                        );
-                        record_fetch_response_refused(Self::NAME, "proposal_mismatch");
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(requested),
-                        );
-                        return ResponseVerdict::Reject;
-                    }
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFulfilled(requested),
-                    );
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::ProposalFetched {
-                            proposal: Box::new(proposal),
-                        },
-                    );
-                    ResponseVerdict::Accept
-                }),
-            );
-        }
+        dispatch_solicited::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+/// One request per proposal. The answer is checked against the hash
+/// asked for here, so a proposal for another block is unsolicited; its
+/// proposer's signature is checked on the shard loop, as a gossiped
+/// header's is at intake.
+impl SolicitedAnswer for ProposalBinding {
+    type Request = GetProposalRequest;
+    type Item = BlockHeaderNotification;
+    type Input = ShardScopedInput;
+
+    const SETTLES: Settles = Settles::OnAnswer;
+
+    fn request(ids: &[BlockHash]) -> GetProposalRequest {
+        debug_assert_eq!(ids.len(), 1, "PER_ID hands over one id at a time");
+        GetProposalRequest::new(ids[0])
+    }
+
+    fn items(response: GetProposalResponse) -> Vec<BlockHeaderNotification> {
+        response.proposal.into_iter().collect()
+    }
+
+    fn answers_for(
+        proposal: &BlockHeaderNotification,
+    ) -> impl IntoIterator<Item = BlockHash> + use<> {
+        [proposal.header.hash()]
+    }
+
+    fn deliver(kept: Vec<BlockHeaderNotification>) -> Vec<ShardScopedInput> {
+        kept.into_iter()
+            .map(|proposal| ShardScopedInput::ProposalFetched {
+                proposal: Box::new(proposal),
+            })
+            .collect()
     }
 }
 
@@ -220,6 +196,7 @@ mod tests {
     use std::time::Duration;
 
     use crossbeam::channel::unbounded;
+    use hyperscale_network::ResponseVerdict;
     use hyperscale_network_memory::{HostLayout, LinkStreams, NetworkConfig, SimulatedNetwork};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
@@ -228,7 +205,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::fetch::{FetchConfig, FetchInput, FetchOutput};
+    use crate::fetch::{FetchConfig, FetchInput, FetchOutput, settle_solicited};
     use crate::shard::HostEvent;
 
     fn proposal_at(height: u64, tag: &[u8]) -> BlockHeaderNotification {
@@ -370,5 +347,50 @@ mod tests {
             }
         }
         assert_eq!(fetched, Some(wanted), "the peer's answer lands");
+    }
+
+    /// A proposal's answer settles its fetch as it lands: the boundary is
+    /// the whole check. One the peer does not hold is asked again at no
+    /// cost to it.
+    #[test]
+    fn a_fetched_proposal_retires_its_fetch_as_it_lands() {
+        let wanted = proposal_at(7, b"wanted");
+        let hash = wanted.header.hash();
+        let settle = |response| {
+            let (sender, events) = unbounded();
+            let verdict = settle_solicited::<ProposalBinding, _>(
+                vec![hash],
+                Ok(response),
+                &ShardReply {
+                    shard: ShardId::ROOT,
+                    sender,
+                },
+            );
+            let inputs: Vec<ShardScopedInput> = events
+                .try_iter()
+                .filter_map(|event| match event {
+                    HostEvent::Shard(_, input) => Some(input),
+                    _ => None,
+                })
+                .collect();
+            (verdict, inputs)
+        };
+
+        let (verdict, inputs) = settle(GetProposalResponse::new(Some(wanted)));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(matches!(
+            inputs.as_slice(),
+            [
+                ShardScopedInput::FetchFulfilled(FetchIds::Proposals(_)),
+                ShardScopedInput::ProposalFetched { .. },
+            ]
+        ));
+
+        let (verdict, inputs) = settle(GetProposalResponse::new(None));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(matches!(
+            inputs.as_slice(),
+            [ShardScopedInput::FetchFailed(FetchIds::Proposals(_))]
+        ));
     }
 }
