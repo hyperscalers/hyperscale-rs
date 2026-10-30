@@ -44,7 +44,7 @@ use crate::reshape::genesis::DerivedGenesis;
 /// # Errors
 ///
 /// Fails when a quorum certificate does not certify its terminal block.
-pub(crate) fn merge_genesis_from_terminals(
+pub fn merge_genesis_from_terminals(
     parent: ShardId,
     left: (&BlockHeader, &QuorumCertificate),
     right: (&BlockHeader, &QuorumCertificate),

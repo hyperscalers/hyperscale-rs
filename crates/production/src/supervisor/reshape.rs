@@ -14,16 +14,11 @@ use std::sync::Arc;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::IrohNetwork;
-use hyperscale_node::reshape::adopt::adopt_prepared_store;
-use hyperscale_node::reshape::genesis::DerivedGenesis;
-use hyperscale_node::reshape::observer::ready_notification;
-use hyperscale_node::reshape::orchestrator::{
-    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeOrchestrator,
-    ReshapeRequest, seed_gate,
+use hyperscale_node::reshape::{
+    AdoptKind, DerivedGenesis, FetchKind, FetchedKind, OverRunning, ReshapeCompletion,
+    ReshapeEvent, ReshapeOrchestrator, ReshapeRequest, ReshapeView, Seating, adopt_prepared_store,
+    block_verdict, headers_verdict, ready_notification, seed_gate,
 };
-use hyperscale_node::reshape::prepared::{ReshapeCompletion, Seating};
-use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
-use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::{serve_local_certified_headers, serve_state_range_request};
 use hyperscale_storage::{
     BoundaryStore, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
@@ -765,7 +760,7 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_network::{RequestError, ResponseVerdict};
-    use hyperscale_node::reshape::orchestrator::{FetchedKind, ReshapeEvent};
+    use hyperscale_node::reshape::{FetchedKind, ReshapeEvent};
     use hyperscale_storage::test_helpers::make_test_block;
     use hyperscale_types::network::request::{
         BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,

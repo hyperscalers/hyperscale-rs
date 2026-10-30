@@ -22,15 +22,11 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
-use hyperscale_node::reshape::adopt::adopt_prepared_store;
-use hyperscale_node::reshape::genesis::DerivedGenesis;
-use hyperscale_node::reshape::observer::ready_notification;
-use hyperscale_node::reshape::orchestrator::{
-    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
+use hyperscale_node::reshape::{
+    AdoptKind, DerivedGenesis, FetchKind, FetchedKind, OverRunning, ReshapeCompletion,
+    ReshapeEvent, ReshapeRequest, ReshapeView, Seating, adopt_prepared_store, block_verdict,
+    headers_verdict, ready_notification, seed_gate,
 };
-use hyperscale_node::reshape::prepared::{ReshapeCompletion, Seating};
-use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
-use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::startup::seat_validators;
 use hyperscale_node::{

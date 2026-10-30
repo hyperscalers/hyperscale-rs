@@ -20,7 +20,7 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::Executor;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
+use hyperscale_node::reshape::ReshapeOrchestrator;
 use hyperscale_node::startup::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{HostedChain, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
