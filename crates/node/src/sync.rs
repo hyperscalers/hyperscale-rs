@@ -670,14 +670,15 @@ impl<B: SyncBinding> Sync<B> {
                 };
                 if inferred_tip < state.target {
                     state.target = inferred_tip.max(state.committed);
-                    // Drop deferred entries past the new target so the
-                    // next Tick doesn't promote them back into the queue.
-                    // `heights_queued` was already drained when this
-                    // range went in-flight, and `pending_admission` only
-                    // holds delivered heights ≤ tip, so neither needs
-                    // cleanup.
+                    // Drop every height still waiting to be fetched past
+                    // the new target, from this range and every other:
+                    // deferred ones so the next tick doesn't promote them
+                    // back, queued ones so `emit_fetches` doesn't send
+                    // them. The heap skips what `heights_queued` no
+                    // longer holds.
                     let new_target = state.target;
                     state.deferred.retain(|&h, _| h <= new_target);
+                    state.heights_queued.retain(|&h| h <= new_target);
                 }
             }
         }
@@ -1777,6 +1778,37 @@ mod tests {
             st.pending_admission.len(),
             3,
             "delivered heights park in pending_admission as usual"
+        );
+    }
+
+    /// A short prefix answer that lowers the target drops every height
+    /// queued above the new one, not only those of the range it answers,
+    /// so nothing past the inferred tip is asked for.
+    #[test]
+    fn a_lowered_target_drops_heights_queued_above_it() {
+        let mut s: Sync<PrefixBinding> = Sync::new(cfg_range());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(32),
+        });
+        let outputs = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight::new(1),
+            count: 8,
+            delivered_heights: (1..=3).map(BlockHeight::new).collect(),
+            now: LocalTimestamp::from_millis(0),
+        });
+        assert!(
+            !outputs.iter().any(
+                |o| matches!(o, SyncOutput::Fetch { from, .. } if *from > BlockHeight::new(3))
+            ),
+            "nothing past the inferred tip is fetched"
+        );
+        let st = s.scopes.get(&1).unwrap();
+        assert!(
+            st.heights_queued.iter().all(|&h| h <= BlockHeight::new(3)),
+            "queued above the tip: {:?}",
+            st.heights_queued
         );
     }
 
