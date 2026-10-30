@@ -441,13 +441,14 @@ where
                 passive,
                 touched_shards,
             } => {
-                self.shard_loop_mut(source)
-                    .step(ShardScopedInput::AdmitAndGossipTransaction {
+                self.shard_loop_mut(source.shard).step(
+                    ShardScopedInput::AdmitAndGossipTransaction {
                         tx: Arc::clone(tx),
                         touched_shards,
-                    });
-                for shard in passive {
-                    self.shard_loop_mut(shard)
+                    },
+                );
+                for route in passive {
+                    self.shard_loop_mut(route.shard)
                         .step(ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) });
                 }
             }
@@ -455,7 +456,7 @@ where
                 host,
                 touched_shards,
             } => {
-                self.shard_loop_mut(host)
+                self.shard_loop_mut(host.shard)
                     .step(ShardScopedInput::GossipTransaction {
                         tx: Arc::clone(tx),
                         touched_shards,
