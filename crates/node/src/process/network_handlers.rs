@@ -1,7 +1,9 @@
 //! Network handler registration (gossip, notifications, requests).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_execution::attesting_committee;
@@ -244,7 +246,7 @@ where
                     }
                     let _ = beacon_tx.send(HostEvent::beacon(
                         ProtocolEvent::UnverifiedShardVoteEquivocationReceived {
-                            evidence: Box::new((*gossip.evidence).clone()),
+                            evidence: Box::new(Arc::unwrap_or_clone(gossip.evidence)),
                         },
                     ));
                     Verdict::Accept
@@ -665,15 +667,9 @@ where
                     // shard for a cert isn't known here without inspecting
                     // expected-cert sets, so each hosted shard decides
                     // whether to admit (no-op if unexpected).
-                    for (hosted_shard, tx) in senders.load().iter() {
-                        push_protocol_event(
-                            tx,
-                            *hosted_shard,
-                            ProtocolEvent::ExecutionCertificatesReceived {
-                                certificates: certificates.clone(),
-                            },
-                        );
-                    }
+                    push_to_every_hosted(&senders.load(), certificates, |certificates| {
+                        ProtocolEvent::ExecutionCertificatesReceived { certificates }
+                    });
                     Verdict::Accept
                 },
             );
@@ -716,15 +712,9 @@ where
                         );
                         return Verdict::Reject;
                     }
-                    for (hosted_shard, tx) in senders.load().iter() {
-                        push_protocol_event(
-                            tx,
-                            *hosted_shard,
-                            ProtocolEvent::ReadySignalReceived {
-                                signal: signal.clone(),
-                            },
-                        );
-                    }
+                    push_to_every_hosted(&senders.load(), signal, |signal| {
+                        ProtocolEvent::ReadySignalReceived { signal }
+                    });
                     Verdict::Accept
                 },
             );
@@ -933,6 +923,23 @@ where
                 },
             );
     }
+}
+
+/// Push the event `event` builds from `value` to every hosted shard,
+/// cloning `value` for all but the last, which takes it.
+fn push_to_every_hosted<T: Clone>(
+    senders: &BTreeMap<ShardId, Sender<HostEvent>>,
+    value: T,
+    event: impl Fn(T) -> ProtocolEvent,
+) {
+    let hosted: Vec<_> = senders.iter().collect();
+    let Some(((last_shard, last_tx), rest)) = hosted.split_last() else {
+        return;
+    };
+    for (hosted_shard, tx) in rest {
+        push_protocol_event(tx, **hosted_shard, event(value.clone()));
+    }
+    push_protocol_event(last_tx, **last_shard, event(value));
 }
 
 /// Register `serve` as `R`'s handler on `shard`, recording what each
