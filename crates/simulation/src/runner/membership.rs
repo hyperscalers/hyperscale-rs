@@ -33,15 +33,12 @@ use hyperscale_node::bootstrap::{
     BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
 use hyperscale_node::startup::{
-    Replaced, join_wipes, placed_validators, rebuild_due, record_fork_anchor, reseated_validators,
-    retired_signers, shard_retired,
+    HostedView, Replaced, SeatChange, join_wipe, reconcile, record_fork_anchor, reseat,
 };
 use hyperscale_node::{HostedChain, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{
-    BoundaryStore, RecoveredState, ShardChainReader, carry_signed_rounds, history_floor,
-};
+use hyperscale_storage::{BoundaryStore, RecoveredState, carry_signed_rounds, history_floor};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId};
 
@@ -270,13 +267,11 @@ impl SimulationRunner {
     /// Re-seat every shard a loop asked to: its store needs a height
     /// beneath every serving peer's chain floor, so block sync cannot carry
     /// it forward. The counterpart of the production supervisor's
-    /// `reseat`: the loop is rebuilt at the shard's attested anchor, and
-    /// [`reseated_validators`] seat on it: those the shard places on the
-    /// host, and those it carried that a pending recovery did not replace.
-    /// A shard no longer hosted, one a reshape duty is seating, and one
-    /// with no attested anchor have nothing to re-seat; a rebuild that
-    /// cannot complete yet asks again on the loop's next below-floor
-    /// answer.
+    /// `reseat`: the loop is rebuilt at the shard's attested anchor as
+    /// [`reseat`] plans. A shard no longer hosted, one a reshape duty is
+    /// seating, and one with no attested anchor have nothing to re-seat; a
+    /// rebuild that cannot complete yet asks again on the loop's next
+    /// below-floor answer.
     fn reseat_step(&mut self) {
         for (host, shard) in std::mem::take(&mut self.pending_reseats) {
             if !self.hosted_shards_of(host).contains(&shard)
@@ -285,35 +280,30 @@ impl SimulationRunner {
                 continue;
             }
             let schedule = self.hosts[host as usize].process().topology_schedule();
-            if schedule.head().boundary(shard).is_none() {
-                continue;
-            }
-            let placed = placed_validators(shard, &schedule, |validator| {
-                self.homes_validator(host, validator)
-            });
             let carried = self.hosts[host as usize].signers(shard);
-            let seats = reseated_validators(shard, &schedule, &carried, placed);
-            self.rebuild_shard(host, shard, &seats, Replaced::Behind);
+            let local: HashSet<ValidatorId> = self.homed_validators(host).into_iter().collect();
+            let head = self.hosts[host as usize]
+                .process()
+                .topology_snapshot()
+                .load_full();
+            if let Some(change) = reseat(shard, &schedule, &head, &carried, &local) {
+                self.apply_seat_change(host, change);
+            }
         }
     }
 
-    /// Reconcile this host's physical shard membership against the committed
-    /// beacon placement — the deterministic counterpart of the production
-    /// supervisor's reconcile pair (`reconcile_joins` /
-    /// `reconcile_teardown`). Seats every live leaf the host holds a committed
-    /// `OnShard` placement on but isn't running, and tears down every shard it
-    /// runs that [`shard_retired`] retires. A leaf a reshape duty owns
-    /// (`is_seating`) is left to the orchestrator to seat. Idempotent; safe to
-    /// call every slice.
+    /// Reconcile each host's physical shard membership against the
+    /// committed beacon placement, carrying out the seat changes
+    /// [`reconcile`] plans: the plan the production supervisor carries out
+    /// too. A leaf a reshape duty owns (`is_seating`) is left to the
+    /// orchestrator to seat. Idempotent; safe to call every slice.
     ///
-    /// Placement is [`placed_validators`], the rule the production
-    /// supervisor's join half reads: the head and newest windows' seatable
-    /// committees, minus the committee a pending recovery replaced. The
-    /// placement deltas the hosts emit are drained, since the committed
-    /// projection drives the actual join/leave: the snap-sync usually completes within the slice,
-    /// and a join whose attested anchor has gone stale (a transient fold
-    /// freeze evicted its state) simply defers to a later slice, the same way
-    /// production's async bootstrap retries against the advanced anchor.
+    /// The placement deltas the hosts emit are drained, since the committed
+    /// projection drives the actual join/leave: the snap-sync usually
+    /// completes within the slice, and a join whose attested anchor has
+    /// gone stale (a transient fold freeze evicted its state) simply defers
+    /// to a later slice, the same way production's async bootstrap retries
+    /// against the advanced anchor.
     pub(crate) fn reconcile_placement(&mut self) {
         let _ = self.take_participation_changes();
         for host in 0..self.num_hosts() {
@@ -330,96 +320,74 @@ impl SimulationRunner {
             }
             self.placement_epoch[host as usize] = Some(epoch);
 
-            let Some(snapshot) = self.host_topology(host) else {
-                continue;
-            };
-            let schedule = self.hosts[host as usize].process().topology_schedule();
-            let routing = self.hosts[host as usize]
-                .process()
-                .network()
-                .routing_committees();
-            let leaves: Vec<ShardId> = snapshot.shard_trie().leaves().collect();
-            let hosted: Vec<ShardId> = self.hosted_shards_of(host);
-
-            for &shard in &leaves {
-                if self.reshape[host as usize].is_seating(shard) {
-                    continue;
-                }
-                let placed = placed_validators(shard, &schedule, |validator| {
-                    self.homes_validator(host, validator)
-                });
-                if hosted.contains(&shard) {
-                    let seated = self.hosts[host as usize].signers(shard);
-                    // A loop whose store cannot carry the placed seats —
-                    // on a tail a recovery discarded, or not seated at the
-                    // anchor of the fork now pending — seats them on a
-                    // store rebuilt at the anchor instead.
-                    if let Some(replaced) = rebuild_due(
-                        &**self.hosts[host as usize].shard_io(shard).storage(),
-                        shard,
-                        &snapshot,
-                        schedule.windows(),
-                        &placed,
-                    ) {
-                        self.rebuild_shard(host, shard, &placed, replaced);
-                        continue;
-                    }
-                    // A validator drawn onto a shard this host already
-                    // runs attaches to its running replica.
-                    for validator in placed {
-                        if !seated.contains(&validator) {
-                            self.attach_to_running_loop(host, shard, validator);
-                        }
-                    }
-                    continue;
-                }
-                if !placed.is_empty() {
-                    let schedule = self.hosts[host as usize].process().topology_schedule();
-                    let storage = self
-                        .retained_storages
-                        .remove(&(host, shard))
-                        // The seat has two branches and between them they take a
-                        // store with a chain or a store with nothing. A store
-                        // that snap-synced and left before committing is
-                        // neither: it holds the import's state under no chain,
-                        // so resuming has no tip to resume from and importing
-                        // has nowhere to write. It is not the retained fast
-                        // path; it is an abandoned bootstrap, and the seat
-                        // starts again from an empty store against the anchor
-                        // that has since advanced. Nor is a split child's clone
-                        // no adoption ran over: its chain is its parent's. Nor
-                        // is a store whose tip a recovery's band holds: the
-                        // recovered chain need not extend it.
-                        .filter(|storage| {
-                            storage.load_recovered_state(shard).committed_height
-                                > BlockHeight::GENESIS
-                                && !storage.holds_foreign_chain(shard)
-                                && !join_wipes(storage, shard, &schedule)
-                        })
-                        .unwrap_or_else(|| open_store(shard, self.power_loss));
-                    self.seat_joined_group(host, shard, &placed, storage);
-                    // A join that deferred — no anchor yet, or one whose state
-                    // has aged out — seats nothing; the scan runs again next
-                    // slice rather than at the next committed epoch.
-                    if !self.hosted_shards_of(host).contains(&shard) {
-                        self.placement_epoch[host as usize] = None;
-                    }
-                }
+            let process = self.hosts[host as usize].process();
+            let schedule = process.topology_schedule();
+            let head = process.topology_snapshot().load_full();
+            let routing = process.network().routing_committees();
+            let local: HashSet<ValidatorId> = self.homed_validators(host).into_iter().collect();
+            let node = &self.hosts[host as usize];
+            let orchestrator = &self.reshape[host as usize];
+            let hosted: Vec<HostedView<'_, SimShardStorage>> = node
+                .hosted_shards()
+                .map(|shard| HostedView {
+                    shard,
+                    store: Some(&**node.shard_io(shard).storage()),
+                    attached: node.signers(shard),
+                    attaching: Vec::new(),
+                    seatable: !orchestrator.is_seating(shard),
+                })
+                .collect();
+            let changes = reconcile(&schedule, &head, &routing, &hosted, &local, |shard| {
+                !orchestrator.is_seating(shard)
+            });
+            for change in changes {
+                self.apply_seat_change(host, change);
             }
+        }
+    }
 
-            // Teardown reads the same rule the production supervisor's
-            // reconcile reads, so a change to routing retention or the reshape
-            // handoff lands on both harnesses.
-            let host_ids: HashSet<ValidatorId> = self.homed_validators(host).into_iter().collect();
-            for &shard in &hosted {
-                if shard_retired(shard, &snapshot, &routing, &host_ids) {
-                    let storage = self.leave_shard(host, shard);
-                    self.retained_storages.insert((host, shard), storage);
-                    continue;
-                }
-                let attached = self.hosts[host as usize].signers(shard);
-                for validator in retired_signers(shard, &snapshot, &routing, &attached) {
-                    self.hosts[host as usize].detach_signer(shard, validator);
+    /// Carry out one planned seat change on `host`.
+    fn apply_seat_change(&mut self, host: NodeIndex, change: SeatChange) {
+        match change {
+            SeatChange::Retire(shard) => {
+                let storage = self.leave_shard(host, shard);
+                self.retained_storages.insert((host, shard), storage);
+            }
+            SeatChange::Detach(shard, validator) => {
+                self.hosts[host as usize].detach_signer(shard, validator);
+            }
+            SeatChange::Rebuild {
+                shard,
+                seats,
+                replaced,
+            } => self.rebuild_shard(host, shard, &seats, replaced),
+            SeatChange::Attach(shard, validator) => {
+                self.attach_to_running_loop(host, shard, validator);
+            }
+            SeatChange::Join(shard, validators) => {
+                let schedule = self.hosts[host as usize].process().topology_schedule();
+                let storage = self
+                    .retained_storages
+                    .remove(&(host, shard))
+                    // The seat has two branches and between them they take a
+                    // store with a chain or a store with nothing, so a retained
+                    // store resumes only once it committed past genesis. A
+                    // store that snap-synced and left before committing holds
+                    // the import's state under no chain: it is an abandoned
+                    // bootstrap, and the seat starts again from an empty store
+                    // against the anchor that has since advanced. Nor does a
+                    // store a join wipes ([`join_wipe`]) resume.
+                    .filter(|storage| {
+                        storage.load_recovered_state(shard).committed_height > BlockHeight::GENESIS
+                            && join_wipe(storage, shard, &schedule).is_none()
+                    })
+                    .unwrap_or_else(|| open_store(shard, self.power_loss));
+                self.seat_joined_group(host, shard, &validators, storage);
+                // A join that deferred — no anchor yet, or one whose state
+                // has aged out — seats nothing; the scan runs again next
+                // slice rather than at the next committed epoch.
+                if !self.hosted_shards_of(host).contains(&shard) {
+                    self.placement_epoch[host as usize] = None;
                 }
             }
         }
