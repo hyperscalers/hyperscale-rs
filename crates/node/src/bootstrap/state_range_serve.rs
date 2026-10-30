@@ -20,10 +20,10 @@ type Jmt = Tree<Blake3Hasher, 1>;
 /// its value and its key. A chunk stops short of the leaf that would
 /// pass it and signals continuation, keeping a maximally-adversarial
 /// range (every leaf a max-size substate) inside transport frames.
-const RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// What one leaf weighs against [`RESPONSE_BYTES`].
-const fn leaf_weight(value_len: usize) -> usize {
+pub(crate) const fn leaf_weight(value_len: usize) -> usize {
     value_len + 32
 }
 

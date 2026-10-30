@@ -169,7 +169,9 @@ impl HistoryBackfill {
     /// at or below [`Self::next`] until the line records it. Until then a
     /// floor above the line is no store's floor and is rejected; one at
     /// or beneath it may be true of a height the window asked for early,
-    /// and decides nothing yet. Either way the height re-arms.
+    /// and decides nothing yet. Either way the height re-arms. A floor at
+    /// or below the height asked is no store's answer for it, and is
+    /// rejected.
     pub(crate) fn on_response(
         &mut self,
         height: BlockHeight,
@@ -191,6 +193,13 @@ impl HistoryBackfill {
                 self.finish();
             }
             return HistoryOutcome::Accepted;
+        }
+        // A server answers with its floor only for a height beneath it,
+        // so a floor at or below the height asked settles nothing and is
+        // no honest answer.
+        if let GetBlockResponse::BelowFloor { .. } = response {
+            self.on_failure(height);
+            return HistoryOutcome::Rejected("chain floor claimed at or below the height asked");
         }
         let Some(elided) = response.block() else {
             self.on_failure(height);
@@ -561,6 +570,33 @@ mod tests {
         }
         assert!(walk.is_complete());
         assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5, 4, 3, 2]);
+    }
+
+    /// A chain floor at or below the height asked is no honest answer: a
+    /// server answers with its floor only beneath it. It is rejected and
+    /// the height re-arms.
+    #[test]
+    fn a_chain_floor_at_the_height_asked_is_rejected() {
+        let chain = chain(3);
+        let top = chain.last().expect("a chain of three");
+        let mut walk = HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::ZERO);
+        assert!(!walk.next_requests().is_empty());
+        for floor in [3, 1] {
+            assert_eq!(
+                walk.on_response(
+                    BlockHeight::new(3),
+                    &GetBlockResponse::below_floor(BlockHeight::new(floor)),
+                ),
+                HistoryOutcome::Rejected("chain floor claimed at or below the height asked"),
+            );
+        }
+        assert_eq!(
+            walk.next_requests()
+                .iter()
+                .map(|request| request.height.inner())
+                .collect::<Vec<_>>(),
+            vec![3],
+        );
     }
 
     /// A height nobody can answer for re-arms rather than ending the
