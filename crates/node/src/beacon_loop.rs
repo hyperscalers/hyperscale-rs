@@ -28,9 +28,7 @@ use crossbeam::channel::Sender;
 use hyperscale_beacon::action_handlers::verify_beacon_block;
 use hyperscale_beacon::coordinator::retention_floor;
 use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration};
-use hyperscale_core::{
-    Action, ActionOwner, FetchIds, FetchRequest, ParticipationChange, ProtocolEvent,
-};
+use hyperscale_core::{Action, FetchIds, FetchRequest, ParticipationChange, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
@@ -49,7 +47,7 @@ use crate::event::{Attachment, BeaconOwner, BeaconScopedInput, HostEvent};
 use crate::fetch::Release;
 use crate::process::ProcessIo;
 use crate::shard::mempool::DeferredForRecords;
-use crate::shard::{FetchTicker, StepOutput, TimerOp, TimerOwner};
+use crate::shard::{FetchTicker, StepOutput, TimerOp};
 
 mod block_sync;
 mod chains;
@@ -608,18 +606,33 @@ where
             });
     }
 
+    /// Handle the actions the fold emitted: the effects any owner's
+    /// actions have, and its block checks on the dispatch pool.
     fn run_fold_actions(&mut self, actions: Vec<Action>) {
         self.actions_generated += actions.len();
         for action in actions {
-            self.process_action(BeaconOwner::Fold, action);
+            match self.process_shared_action(BeaconOwner::Fold, action) {
+                None => {}
+                Some(action @ Action::VerifyBeaconBlock { .. }) => {
+                    self.dispatch_block_check(action);
+                }
+                Some(other) => warn!(
+                    action = other.type_name(),
+                    "BeaconLoop: an action the fold does not emit — dropping"
+                ),
+            }
         }
     }
 
-    /// Handle one action the fold or a participant emitted: the loop's
-    /// own effects (commit, topology, seat trigger, timer op, catch-up
-    /// sync, fetches, commit-proof asks) inline, and every beacon-owned
-    /// delegated action on the dispatch pool.
-    fn process_action(&mut self, owner: BeaconOwner, action: Action) {
+    /// Carry out one of the loop's own effects that the fold and the
+    /// participants alike emit — commit, topology, seat trigger, catch-up
+    /// sync, fetches, commit-proof asks — on `owner`'s behalf. Any other
+    /// action comes back for its owner's own handler.
+    pub(super) fn process_shared_action(
+        &mut self,
+        owner: BeaconOwner,
+        action: Action,
+    ) -> Option<Action> {
         match action {
             Action::CommitBeaconBlock { block, state } => {
                 self.process
@@ -646,35 +659,6 @@ where
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);
             }
-            Action::SetTimer { id, duration } => match owner {
-                BeaconOwner::Participant(attachment) => {
-                    self.pending_timer_ops.push(TimerOp::Set {
-                        owner: TimerOwner::Participant(attachment),
-                        id,
-                        duration,
-                    });
-                }
-                BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => {
-                    warn!(
-                        ?id,
-                        "BeaconLoop: only a participant arms a timer — dropping"
-                    );
-                }
-            },
-            Action::CancelTimer { id } => match owner {
-                BeaconOwner::Participant(attachment) => {
-                    self.pending_timer_ops.push(TimerOp::Cancel {
-                        owner: TimerOwner::Participant(attachment),
-                        id,
-                    });
-                }
-                BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => {
-                    warn!(
-                        ?id,
-                        "BeaconLoop: only a participant arms a timer — dropping"
-                    );
-                }
-            },
             Action::StartBeaconBlockSync { target } => {
                 self.start_sync(target);
             }
@@ -689,24 +673,9 @@ where
                 source_shard,
                 block_height,
             }) => self.route_proof_ask((source_shard, block_height)),
-            action @ Action::VerifyBeaconBlock { .. } => self.dispatch_block_check(action),
-            other if other.owner() == ActionOwner::Beacon => match owner {
-                BeaconOwner::Participant(attachment) => {
-                    if self.joins_a_shared_check(attachment, &other) {
-                        return;
-                    }
-                    self.dispatch_participant_action(attachment.validator, other);
-                }
-                BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => warn!(
-                    action = other.type_name(),
-                    "BeaconLoop: a participant action from another owner — dropping"
-                ),
-            },
-            other => warn!(
-                action = other.type_name(),
-                "BeaconLoop: unexpected beacon action — dropping"
-            ),
+            other => return Some(other),
         }
+        None
     }
 
     /// Run the fold's block check on the consensus dispatch pool; its

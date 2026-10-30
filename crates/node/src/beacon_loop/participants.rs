@@ -6,7 +6,7 @@ use std::sync::Arc;
 use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
 use hyperscale_beacon::verification::RatifyVoteSlotKey;
 use hyperscale_beacon::{BeaconFold, BeaconParticipant, ParticipantStep};
-use hyperscale_core::{Action, BeaconActionContext, Gate, ProtocolEvent};
+use hyperscale_core::{Action, ActionOwner, BeaconActionContext, Gate, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -19,7 +19,7 @@ use tracing::warn;
 use super::BeaconLoop;
 use crate::beacon::{BeaconCandidateBinding, BeaconProposalBinding};
 use crate::event::{Attachment, BeaconOwner, BeaconScopedInput, HostEvent};
-use crate::shard::StepOutput;
+use crate::shard::{StepOutput, TimerOp, TimerOwner};
 
 impl<S, N, D> BeaconLoop<S, N, D>
 where
@@ -154,14 +154,48 @@ where
         sealed
     }
 
+    /// Handle the actions `validator`'s participant emitted: the effects
+    /// any owner's actions have, its timers, and its delegated actions on
+    /// the dispatch pool.
     fn run_participant_actions(&mut self, validator: ValidatorId, actions: Vec<Action>) {
         let Some(participant) = self.participants.get(&validator) else {
             return;
         };
-        let owner = BeaconOwner::Participant(participant.attachment);
+        let attachment = participant.attachment;
         self.actions_generated += actions.len();
         for action in actions {
-            self.process_action(owner, action);
+            if let Some(action) =
+                self.process_shared_action(BeaconOwner::Participant(attachment), action)
+            {
+                self.process_participant_action(attachment, action);
+            }
+        }
+    }
+
+    /// Handle one of a participant's own actions: a timer it arms or
+    /// cancels, or a beacon-owned action run on the dispatch pool.
+    fn process_participant_action(&mut self, attachment: Attachment, action: Action) {
+        let owner = TimerOwner::Participant(attachment);
+        match action {
+            Action::SetTimer { id, duration } => {
+                self.pending_timer_ops.push(TimerOp::Set {
+                    owner,
+                    id,
+                    duration,
+                });
+            }
+            Action::CancelTimer { id } => {
+                self.pending_timer_ops.push(TimerOp::Cancel { owner, id });
+            }
+            other if other.owner() == ActionOwner::Beacon => {
+                if !self.joins_a_shared_check(attachment, &other) {
+                    self.dispatch_participant_action(attachment.validator, other);
+                }
+            }
+            other => warn!(
+                action = other.type_name(),
+                "BeaconLoop: unexpected participant action — dropping"
+            ),
         }
     }
 
