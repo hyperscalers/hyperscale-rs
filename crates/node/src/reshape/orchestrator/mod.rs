@@ -178,7 +178,8 @@ impl ReshapeOrchestrator {
     /// seat to the adapter's ordinary join — a parent half with no parent
     /// store to seed from (see [`ReshapeEvent::SeedUnavailable`]) or whose
     /// child anchored past its genesis, or an observer whose follow the
-    /// child's anchor overtook or that diverged, and that no parent half
+    /// child's anchor overtook, whose child anchored past its genesis, or
+    /// that diverged, and that no parent half
     /// took over from. The adapter reads the committed cohort as reshape
     /// ownership; a relinquished seat is not, and a store the duty prepared
     /// for it is the adapter's to discard.

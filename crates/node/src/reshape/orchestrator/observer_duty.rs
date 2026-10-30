@@ -348,11 +348,21 @@ impl ObserverDuty {
                 // it. One that did not cannot: proving the terminal takes the
                 // parent's blocks above it, and the child's committee serves
                 // its own chain at those heights — the follow would refuse
-                // every answer. A parent-half seat this host holds on the
-                // child takes the seat over, cloning the local parent; with
-                // none, the seat goes to the join.
+                // every answer. Nor can any tail once the child crossed on its
+                // own chain: the anchor then names a block of that chain, which
+                // no genesis derived from the parent's terminal reconstructs.
+                // A parent-half seat this host holds on the child takes the
+                // seat over, cloning the local parent; with none, the seat
+                // goes to the join.
                 if let Some(anchor) = view.boundary(child) {
-                    if tail.next_height() >= anchor.height {
+                    if view.advanced_past_genesis(child) {
+                        tracing::info!(
+                            ?child,
+                            anchor_height = anchor.height.inner(),
+                            "split child anchored past its genesis; relinquishing the observer's seat"
+                        );
+                        self.phase = ObserverPhase::Relinquished;
+                    } else if tail.next_height() >= anchor.height {
                         self.phase = ObserverPhase::FetchingTerminal(TerminalFetch::new(anchor));
                     } else {
                         tracing::info!(
@@ -1153,6 +1163,40 @@ mod tests {
                 "the gate must drive a terminal fetch from {source:?}; got {requests:?}",
             );
         }
+    }
+
+    /// A child already crossing on its own chain is anchored at a block of
+    /// that chain, which no terminal of the parent's reconstructs, so a
+    /// follower that reached the anchor's height relinquishes rather than
+    /// fetching a terminal against it.
+    #[test]
+    fn a_follower_of_a_child_past_its_genesis_relinquishes() {
+        let parent = ShardId::ROOT;
+        let (child, sibling) = parent.children();
+        let snap = snapshot(&[(child, &[1, 5])], &[], &[parent, child, sibling])
+            .with_advanced(BTreeSet::from([child]));
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        insert_observer(
+            &mut orch,
+            child,
+            observer_duty(
+                parent,
+                child,
+                5,
+                following(ObserverTail::new(anchor(), child)),
+            ),
+        );
+
+        let mut requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        assert!(orch.relinquished(child), "the seat is the join's");
+        requests.extend(orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0)));
+        assert!(
+            block_fetches(&requests, parent).is_empty()
+                && block_fetches(&requests, child).is_empty(),
+            "no terminal fetch against a crossing anchor; got {requests:?}"
+        );
     }
 
     /// A follower the child's anchor overtook before it applied the parent's

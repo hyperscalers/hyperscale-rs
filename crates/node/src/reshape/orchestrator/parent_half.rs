@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use hyperscale_types::{LocalTimestamp, ShardAnchor, ShardId, ValidatorId, Verifier};
+use hyperscale_types::{LocalTimestamp, ShardId, ValidatorId, Verifier};
 
 use super::io::{AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
 use super::shared::{REFETCH_WAIT, SeatTail, TerminalFetch, paced, seats_on, terminal_commit};
@@ -210,7 +210,7 @@ impl ParentHalfDuty {
                 // folds; it is the version the clone must reach and the
                 // derivation verifies against.
                 else if let Some(anchor) = view.boundary(child) {
-                    if anchor_past_genesis(view, parent, &anchor) {
+                    if view.advanced_past_genesis(child) {
                         // The child crossed since its genesis, so its anchor
                         // names a block of the child's own chain: no clone of
                         // the parent reaches it, and no genesis derived from the
@@ -305,23 +305,9 @@ impl ParentHalfDuty {
     }
 }
 
-/// Whether a split child's attested `anchor` sits past its genesis: the
-/// parent's terminal record names the terminal, and the child's genesis is
-/// the block above it. Without that record nothing places the genesis,
-/// and the anchor is taken to be it.
-pub(super) fn anchor_past_genesis(
-    view: &ReshapeView,
-    parent: ShardId,
-    anchor: &ShardAnchor,
-) -> bool {
-    view.boundary(parent).is_some_and(|record| {
-        record.terminal_epoch.is_some() && anchor.height > record.height.next()
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::{
@@ -632,9 +618,10 @@ mod tests {
             terminal_epoch: Some(Epoch::new(3)),
             ..anchor()
         };
-        let seeding = |child_anchor: ShardAnchor| {
+        let seeding_with = |child_anchor: ShardAnchor, advanced: BTreeSet<ShardId>| {
             let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[])
-                .with_boundaries(BTreeMap::from([(parent, terminal), (child, child_anchor)]));
+                .with_boundaries(BTreeMap::from([(parent, terminal), (child, child_anchor)]))
+                .with_advanced(advanced);
             let schedule = windowed(&snap);
             let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
             let requests = orch.step(
@@ -646,6 +633,8 @@ mod tests {
             );
             (orch, requests)
         };
+        let seeding = |child_anchor| seeding_with(child_anchor, BTreeSet::new());
+        let seeding_advanced = |child_anchor| seeding_with(child_anchor, BTreeSet::from([child]));
 
         let (orch, requests) = seeding(anchor());
         assert!(
@@ -661,7 +650,7 @@ mod tests {
             height: BlockHeight::new(12),
             ..anchor()
         };
-        let (orch, requests) = seeding(crossed);
+        let (orch, requests) = seeding_advanced(crossed);
         assert!(
             requests.is_empty(),
             "an anchor past the genesis seeds nothing; got {requests:?}"
@@ -671,6 +660,31 @@ mod tests {
             !orch.is_seating(child),
             "the relinquished seat is the join's to take"
         );
+    }
+
+    /// A child crossing on its own chain relinquishes the parent half's seat
+    /// even once the parent's terminal record is gone, which leaves nothing
+    /// to place the genesis by height.
+    #[test]
+    fn a_parent_half_relinquishes_a_child_past_its_genesis_without_a_parent_record() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child])
+            .with_advanced(BTreeSet::from([child]));
+        let schedule = windowed(&snap);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let requests = orch.step(
+            &ReshapeView::new(&schedule),
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(0),
+        );
+        assert!(
+            requests.is_empty(),
+            "a crossing anchor seeds nothing; got {requests:?}"
+        );
+        assert!(orch.relinquished(child));
     }
 
     #[test]
