@@ -637,6 +637,25 @@ mod tests {
         );
     }
 
+    /// A parent-half seat whose child committee formed without it has
+    /// nothing to seat, so no duty opens for it and nothing is seeded,
+    /// however often the host steps.
+    #[test]
+    fn a_parent_half_off_the_child_committee_never_seeds() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[1, 2])], &[(child, 5, parent)], &[child]);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+
+        for ms in [0, 1_000, 2_000, 3_000] {
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(ms));
+            assert_eq!(seeds_through(&requests), None, "got {requests:?}");
+            assert!(!orch.is_seating(child));
+        }
+    }
+
     #[test]
     fn a_deferred_seed_re_arms_and_retries() {
         let parent = ShardId::ROOT;

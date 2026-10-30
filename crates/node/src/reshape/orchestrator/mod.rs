@@ -35,6 +35,7 @@ mod shared;
 mod test_support;
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use hyperscale_types::{Derivation, LocalTimestamp, ShardId, ValidatorId, Verifier};
 
@@ -208,26 +209,35 @@ impl ReshapeOrchestrator {
                 duty.apply(event, now);
             }
         }
-        self.discover_observer_duties(view);
-        self.discover_keeper_duties(view);
         // Before any duty advances, so one whose seats are gone emits
         // nothing more.
-        let me = &self.me;
-        self.duties.retain(|_, duty| duty.held(view, me));
+        self.reconcile(view);
 
         let mut requests = Vec::new();
         let observers = |duty: &Duty| matches!(duty, Duty::Observer(_));
         self.advance_each(observers, view, verifier, derivation, now, &mut requests);
-        // After the observers advance, so a parent half takes over an
+        // Again after the observers advance, so a parent half takes over an
         // observer that relinquished in this very step: between steps the
         // adapter would otherwise read the seat as the join's, drop the
         // observer's store and start a join nothing may be able to serve.
-        self.discover_parent_half_duties(view);
+        self.reconcile(view);
         let keepers = |duty: &Duty| matches!(duty, Duty::Keeper(_));
         self.advance_each(keepers, view, verifier, derivation, now, &mut requests);
         let halves = |duty: &Duty| matches!(duty, Duty::ParentHalf(_));
         self.advance_each(halves, view, verifier, derivation, now, &mut requests);
         requests
+    }
+
+    /// Bring the duty map in line with `view`: open a duty for every cohort
+    /// seat this host holds, then drop every duty whose seats are gone. The
+    /// only way a duty enters the map, so none outlives a reconcile that
+    /// [`Duty::held`] refuses, however it was discovered.
+    fn reconcile(&mut self, view: &ReshapeView) {
+        self.discover_observer_duties(view);
+        self.discover_keeper_duties(view);
+        self.discover_parent_half_duties(view);
+        let me = &self.me;
+        self.duties.retain(|_, duty| duty.held(view, me));
     }
 
     /// Advance every duty `pick` selects, dropping the ones that finish.
@@ -313,27 +323,40 @@ impl ReshapeOrchestrator {
     /// the parent half takes the child over in place and seeds it from the
     /// host's own parent chain: the join that takes a relinquished seat
     /// snap-syncs from the child's committee, and when every host on that
-    /// committee relinquished, none of them serves it.
+    /// committee relinquished, none of them serves it. A parent half with no
+    /// seat to take leaves the relinquished observer in place, so the child
+    /// is not rediscovered into a fresh observer.
     fn discover_parent_half_duties(&mut self, view: &ReshapeView) {
         for (&child, cohort) in view.parent_half_cohorts() {
-            for (&validator, &parent) in cohort {
-                if !self.me.contains(&validator) {
-                    continue;
+            let mine: Vec<(ValidatorId, ShardId)> = cohort
+                .iter()
+                .filter(|(validator, _)| self.me.contains(validator))
+                .map(|(&validator, &parent)| (validator, parent))
+                .collect();
+            let Some(&(_, parent)) = mine.first() else {
+                continue;
+            };
+            let mut half = ParentHalfDuty::new(parent, child);
+            half.validators = mine.into_iter().map(|(validator, _)| validator).collect();
+            match self.duties.entry(child) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Duty::ParentHalf(half));
                 }
-                let duty = self
-                    .duties
-                    .entry(child)
-                    .or_insert_with(|| Duty::ParentHalf(ParentHalfDuty::new(parent, child)));
-                if let Duty::Observer(observer) = duty
-                    && observer.relinquished()
-                {
-                    *duty = Duty::ParentHalf(ParentHalfDuty::new(parent, child));
-                }
-                if let Duty::ParentHalf(half) = duty
-                    && !half.validators.contains(&validator)
-                {
-                    half.validators.push(validator);
-                }
+                Entry::Occupied(mut entry) => match entry.get_mut() {
+                    Duty::ParentHalf(running) => {
+                        for validator in half.validators {
+                            if !running.validators.contains(&validator) {
+                                running.validators.push(validator);
+                            }
+                        }
+                    }
+                    Duty::Observer(observer)
+                        if observer.relinquished() && half.held(view, &self.me) =>
+                    {
+                        entry.insert(Duty::ParentHalf(half));
+                    }
+                    Duty::Observer(_) | Duty::Keeper(_) => {}
+                },
             }
         }
     }
@@ -412,6 +435,24 @@ mod tests {
             !block_fetches(&requests, parent).is_empty(),
             "the seeded parent half fetches the parent's terminal; got {requests:?}"
         );
+    }
+
+    /// A co-hosted parent-half seat the child's committee formed without
+    /// takes nothing over: the overtaken follower stays relinquished, so the
+    /// child is neither seeded nor rediscovered into a fresh observer.
+    #[test]
+    fn an_overtaken_follower_keeps_the_seat_from_a_parent_half_off_the_committee() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let schedule = overtaking_view(&[(child, 7, parent)]);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = overtaken_follower(&[5, 7]);
+
+        for _ in 0..3 {
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+            assert_eq!(seeds_through(&requests), None, "got {requests:?}");
+            assert!(orch.relinquished(child), "the seat is the join's");
+        }
     }
 
     /// Every store-prep request names the store it prepares and what it

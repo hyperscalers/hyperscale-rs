@@ -1240,7 +1240,7 @@ mod tests {
         );
 
         let mut requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
-        assert!(orch.relinquished(child), "the seat is the join's");
+        assert!(!orch.is_seating(child), "the seat is the join's");
         requests.extend(orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0)));
         assert!(
             block_fetches(&requests, parent).is_empty()
