@@ -998,11 +998,12 @@ pub enum ProtocolEvent {
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
     },
 
-    /// A `BeaconProposal` arrived. `IoLoop` has already authenticated
-    /// the sender. A wire decode lands the wrapper unverified and the
-    /// VRF reveal is checked before admission; the local
+    /// A `BeaconProposal` arrived, its sender authenticated and its
+    /// wrapper `Verified`: the wire handler checks a peer's VRF reveal
+    /// under the sender's key before pushing the event, and the local
     /// `Action::BuildAndBroadcastBeaconProposal` loopback and a
-    /// colocated sender both keep the marker, and admit directly.
+    /// colocated sender keep the marker their signing set. A proposal
+    /// without the marker is dropped on arrival.
     BeaconProposalReceived {
         /// Authenticated sender id.
         from: ValidatorId,
@@ -1081,10 +1082,11 @@ pub enum ProtocolEvent {
     /// Result of a beacon-proposal fetch dispatch — carries a
     /// proposal the peer returned. A responder that didn't hold the
     /// proposal yields no event: the fetch binding releases the slot for
-    /// retry against another peer instead. Wire decode lands the wrapper
-    /// as `Verifiable::Unverified`; locally-dispatched serves preserve the
-    /// `Verified` marker.
-    ///
+    /// retry against another peer instead. The wrapper arrives
+    /// `Verified`: the fetch's response boundary checks the returned
+    /// proposal's VRF reveal under the requested validator's key and asks
+    /// another peer for one that fails, so a proposal without the marker
+    /// is dropped on arrival.
     BeaconProposalFetched {
         /// Epoch the fetched proposal targets.
         epoch: Epoch,

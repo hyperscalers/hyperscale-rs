@@ -1584,8 +1584,7 @@ pub enum Action {
     /// proposal back to the state machine via
     /// `ProtocolEvent::BeaconProposalReceived` with `from = local
     /// validator` so the same admission path peer proposals use also
-    /// admits our own. Shard witnesses no longer ride the proposal — they
-    /// ride the block's per-shard boundary contributions.
+    /// admits our own.
     BuildAndBroadcastBeaconProposal {
         /// Epoch this proposal targets; bound into the VRF reveal's
         /// signing context.
