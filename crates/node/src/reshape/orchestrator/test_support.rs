@@ -27,40 +27,53 @@ use super::*;
 use crate::reshape::observer::ObserverTail;
 
 pub fn insert_observer(orch: &mut ReshapeOrchestrator, child: ShardId, duty: ObserverDuty) {
-    orch.duties.insert(child, Duty::Observer(duty));
+    orch.duties.insert(child, Slot::new(Duty::Observer(duty)));
 }
 
 pub fn insert_parent_half(orch: &mut ReshapeOrchestrator, child: ShardId, duty: ParentHalfDuty) {
-    orch.duties.insert(child, Duty::ParentHalf(duty));
+    orch.duties.insert(child, Slot::new(Duty::ParentHalf(duty)));
 }
 
 pub fn insert_keeper(orch: &mut ReshapeOrchestrator, parent: ShardId, duty: KeeperDuty) {
-    orch.duties.insert(parent, Duty::Keeper(duty));
+    orch.duties.insert(parent, Slot::new(Duty::Keeper(duty)));
+}
+
+/// The duty keyed by `shard`, if any.
+pub fn duty_at(orch: &ReshapeOrchestrator, shard: ShardId) -> Option<&Duty> {
+    orch.duties.get(&shard).map(|slot| &slot.duty)
+}
+
+/// The oldest ticket the duty keyed by `shard` awaits a completion for.
+pub fn awaited(orch: &ReshapeOrchestrator, shard: ShardId) -> Ticket {
+    orch.duties
+        .get(&shard)
+        .and_then(|slot| slot.awaited.first().copied())
+        .unwrap_or_else(|| panic!("no completion awaited for {shard:?}"))
 }
 
 pub fn observer(orch: &ReshapeOrchestrator, child: ShardId) -> &ObserverDuty {
-    match orch.duties.get(&child) {
+    match duty_at(orch, child) {
         Some(Duty::Observer(duty)) => duty,
         _ => panic!("no observer duty for {child:?}"),
     }
 }
 
 pub fn parent_half(orch: &ReshapeOrchestrator, child: ShardId) -> &ParentHalfDuty {
-    match orch.duties.get(&child) {
+    match duty_at(orch, child) {
         Some(Duty::ParentHalf(duty)) => duty,
         _ => panic!("no parent-half duty for {child:?}"),
     }
 }
 
 pub fn keeper(orch: &ReshapeOrchestrator, parent: ShardId) -> &KeeperDuty {
-    match orch.duties.get(&parent) {
+    match duty_at(orch, parent) {
         Some(Duty::Keeper(duty)) => duty,
         _ => panic!("no keeper duty for {parent:?}"),
     }
 }
 
 pub fn keeper_mut(orch: &mut ReshapeOrchestrator, parent: ShardId) -> &mut KeeperDuty {
-    match orch.duties.get_mut(&parent) {
+    match orch.duties.get_mut(&parent).map(|slot| &mut slot.duty) {
         Some(Duty::Keeper(duty)) => duty,
         _ => panic!("no keeper duty for {parent:?}"),
     }

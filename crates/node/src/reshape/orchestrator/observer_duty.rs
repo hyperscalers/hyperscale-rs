@@ -9,12 +9,12 @@ use hyperscale_types::{
     Verifier, derive_block_transactions,
 };
 
-use super::Advance;
 use super::io::{AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
 use super::shared::{
     REFETCH_WAIT, ReadyAssert, SeatTail, StageQueue, TerminalAnswer, TerminalFetch, paced,
     recipients_for, seats_on,
 };
+use super::{Advance, Outbox};
 use crate::bootstrap::{BootstrapRequest, StateRangeOutcome};
 use crate::reshape::observer::{ObserverBootstrap, ObserverTail, ProveOutcome};
 use crate::reshape::view::ReshapeView;
@@ -233,7 +233,7 @@ impl ObserverDuty {
         verifier: &dyn Verifier,
         derivation: &dyn Derivation,
         now: LocalTimestamp,
-        out: &mut Vec<ReshapeRequest>,
+        out: &mut Outbox<'_>,
     ) -> Advance {
         let (parent, child) = (self.parent, self.child);
         // A duty that flipped from its own follow adopted a genesis before
@@ -277,7 +277,10 @@ impl ObserverDuty {
         match &mut self.phase {
             ObserverPhase::Opening => {
                 if !self.open_requested {
-                    out.push(ReshapeRequest::OpenStore { shard: child });
+                    out.issue(|ticket| ReshapeRequest::OpenStore {
+                        shard: child,
+                        ticket,
+                    });
                     self.open_requested = true;
                 }
                 if self.store_opened
@@ -305,9 +308,10 @@ impl ObserverDuty {
                 if self.stages.is_durable()
                     && let Some(height) = bootstrap.take_finalize()
                 {
-                    out.push(ReshapeRequest::FinalizeImport {
+                    out.issue(|ticket| ReshapeRequest::FinalizeImport {
                         shard: child,
                         height,
+                        ticket,
                     });
                 }
                 if bootstrap.imported_root().is_some() {
@@ -424,11 +428,12 @@ impl ObserverDuty {
                     derive_block_transactions(&block, derivation);
                     let creations = committed_cells_for(&block);
                     let frontier = FrontierInputs::of_block(&block, view.schedule().windows());
-                    out.push(ReshapeRequest::ApplyFollow {
+                    out.issue(|ticket| ReshapeRequest::ApplyFollow {
                         shard: child,
                         block,
                         creations,
                         frontier,
+                        ticket,
                     });
                 }
             }
@@ -463,9 +468,12 @@ impl ObserverDuty {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::Bytes;
+    use hyperscale_storage::test_helpers::pin_snap_sync_replica;
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::response::GetBlockResponse;
     use hyperscale_types::test_utils::{
         StubVmStatics, TestCommittee, signed_child_block, signed_split_terminal, test_key,
@@ -477,11 +485,14 @@ mod tests {
 
     use super::*;
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
-    use crate::reshape::orchestrator::io::{FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
+    use crate::reshape::orchestrator::io::{
+        FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest, Ticket,
+    };
     use crate::reshape::orchestrator::shared::SeatTail;
     use crate::reshape::orchestrator::test_support::*;
     use crate::reshape::orchestrator::{Duty, ReshapeOrchestrator};
     use crate::reshape::view::ReshapeView;
+    use crate::serve_state_range_request;
 
     /// An observer following a parent whose committee is `committee`,
     /// driven end to end through the orchestrator: a losing sibling a peer
@@ -639,6 +650,7 @@ mod tests {
             vec![ReshapeEvent::Applied {
                 shard: child,
                 root: pair.right,
+                ticket: awaited(&orch, child),
             }],
             at(0),
         );
@@ -832,7 +844,7 @@ mod tests {
         );
 
         assert!(
-            matches!(requests.as_slice(), [ReshapeRequest::OpenStore { shard }] if *shard == child),
+            matches!(requests.as_slice(), [ReshapeRequest::OpenStore { shard, .. }] if *shard == child),
             "a held cohort seat must open the child store; got {requests:?}",
         );
     }
@@ -939,6 +951,7 @@ mod tests {
                 shard: child,
                 progress,
                 leaves,
+                ticket: awaited(&orch, child),
             }],
             at(0),
         );
@@ -1195,10 +1208,12 @@ mod tests {
                 ReshapeEvent::Applied {
                     shard: child,
                     root: StateRoot::ZERO,
+                    ticket: Ticket::new(0),
                 },
                 ReshapeEvent::Imported {
                     shard: child,
                     root: StateRoot::ZERO,
+                    ticket: Ticket::new(0),
                 },
             ];
             let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, stale, at(0));
@@ -1213,6 +1228,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Step `orch` until its observer of `child` asks to finalize its
+    /// import, serving every state range from `serving` and acknowledging
+    /// every stage write and open; the finalize's ticket.
+    fn sync_to_finalize(
+        orch: &mut ReshapeOrchestrator,
+        view: &ReshapeView,
+        serving: &Arc<SimShardStorage>,
+        child: ShardId,
+    ) -> Ticket {
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let requests = orch.step(view, &BlsVerifier, &StubVmStatics, events, at(0));
+            events = Vec::new();
+            for request in requests {
+                match request {
+                    ReshapeRequest::OpenStore { shard, ticket } => {
+                        events.push(ReshapeEvent::Opened { shard, ticket });
+                    }
+                    ReshapeRequest::Fetch {
+                        duty,
+                        from,
+                        kind: FetchKind::StateRange { sub_range, request },
+                    } => events.push(ReshapeEvent::Fetched {
+                        duty,
+                        from,
+                        kind: FetchedKind::StateRange {
+                            sub_range,
+                            response: Box::new(serve_state_range_request(serving, &request)),
+                        },
+                    }),
+                    ReshapeRequest::StageChunk { shard, ticket, .. } => {
+                        events.push(ReshapeEvent::Staged { shard, ticket });
+                    }
+                    ReshapeRequest::FinalizeImport { shard, ticket, .. } if shard == child => {
+                        return ticket;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        panic!("the observer never asked to finalize");
+    }
+
+    /// An import answering a finalize the duty no longer awaits — one from
+    /// before the duty was dropped and rediscovered for the same store — is
+    /// not taken as the root of the finalize in flight; that finalize's own
+    /// answer is.
+    #[test]
+    fn an_import_for_an_earlier_finalize_is_not_the_current_ones() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let serving = SimShardStorage::default();
+        let boundary = pin_snap_sync_replica(&serving, 12, &[]);
+        let serving = Arc::new(serving);
+        let snap = build(
+            &[(parent, &[1, 2, 3, 4])],
+            &uncredited(&[(parent, 5, child)]),
+            &[],
+            &[],
+            &[parent],
+            boundary,
+        );
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+
+        let earlier = sync_to_finalize(&mut orch, &view, &serving, child);
+        orch.remove_me(vid(5));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        assert!(!orch.is_seating(child), "the duty is dropped");
+        orch.add_me(vid(5));
+        let current = sync_to_finalize(&mut orch, &view, &serving, child);
+        assert_ne!(earlier, current);
+
+        let imported = |ticket| ReshapeEvent::Imported {
+            shard: child,
+            root: StateRoot::from_raw(Hash::from_bytes(b"imported")),
+            ticket,
+        };
+        let _ = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![imported(earlier)],
+            at(0),
+        );
+        assert!(
+            matches!(observer(&orch, child).phase, ObserverPhase::Syncing(_)),
+            "the earlier finalize's import is not the current one's"
+        );
+        let _ = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![imported(current)],
+            at(0),
+        );
+        assert!(
+            matches!(observer(&orch, child).phase, ObserverPhase::Following(_)),
+            "the current finalize's import completes the sync"
+        );
     }
 
     /// A child already crossing on its own chain is anchored at a block of
@@ -1526,7 +1644,7 @@ mod tests {
             "a matching anchor emits nothing; got {requests:?}"
         );
         assert!(
-            matches!(orch.duties.get(&child), Some(Duty::Observer(_))),
+            matches!(duty_at(&orch, child), Some(Duty::Observer(_))),
             "a matching anchor leaves the duty in place",
         );
         assert!(
@@ -1564,7 +1682,7 @@ mod tests {
             "a producing child must never have its store re-opened; got {requests:?}",
         );
         assert!(
-            matches!(orch.duties.get(&child), Some(Duty::Observer(_))),
+            matches!(duty_at(&orch, child), Some(Duty::Observer(_))),
             "a producing child's duty survives the closed window",
         );
     }
@@ -1596,7 +1714,7 @@ mod tests {
             "a disagreement must not wipe the store; got {requests:?}",
         );
         assert!(
-            !matches!(orch.duties.get(&child), Some(Duty::Observer(_))),
+            !matches!(duty_at(&orch, child), Some(Duty::Observer(_))),
             "a disagreeing duty stops rather than re-seeding",
         );
     }

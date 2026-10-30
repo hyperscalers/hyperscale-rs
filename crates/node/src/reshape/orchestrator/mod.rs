@@ -34,13 +34,13 @@ mod shared;
 #[cfg(test)]
 mod test_support;
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{Derivation, LocalTimestamp, ShardId, ValidatorId, Verifier};
 
 pub use self::io::{
-    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
+    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, Ticket, seed_gate,
 };
 use self::keeper::{KeeperDuty, KeeperMember};
 use self::observer_duty::ObserverDuty;
@@ -54,6 +54,58 @@ enum Advance {
     Continue,
     /// The duty is done and leaves the map.
     Done,
+}
+
+/// A duty and the tickets of its requests still awaiting a completion. The
+/// tickets live and die with the duty, so a duty rediscovered for the same
+/// store, or one taking over another's, awaits none of its predecessor's.
+struct Slot {
+    duty: Duty,
+    awaited: BTreeSet<Ticket>,
+}
+
+impl Slot {
+    const fn new(duty: Duty) -> Self {
+        Self {
+            duty,
+            awaited: BTreeSet::new(),
+        }
+    }
+
+    /// Hand `event` to the duty, unless it completes a request the duty
+    /// no longer awaits.
+    fn apply(&mut self, event: ReshapeEvent, now: LocalTimestamp) {
+        if let Some(ticket) = event.ticket()
+            && !self.awaited.remove(&ticket)
+        {
+            tracing::debug!(?event, "dropping a reshape completion no request awaits");
+            return;
+        }
+        self.duty.apply(event, now);
+    }
+}
+
+/// Where a duty's advance puts the io it asks for.
+pub(super) struct Outbox<'a> {
+    requests: &'a mut Vec<ReshapeRequest>,
+    next_ticket: &'a mut Ticket,
+    awaited: &'a mut BTreeSet<Ticket>,
+}
+
+impl Outbox<'_> {
+    /// Ask for io no completion answers.
+    pub(super) fn push(&mut self, request: ReshapeRequest) {
+        self.requests.push(request);
+    }
+
+    /// Ask for io a completion answers, built around a fresh ticket the
+    /// duty then awaits.
+    pub(super) fn issue(&mut self, request: impl FnOnce(Ticket) -> ReshapeRequest) {
+        let ticket = *self.next_ticket;
+        *self.next_ticket = ticket.successor();
+        self.awaited.insert(ticket);
+        self.requests.push(request(ticket));
+    }
 }
 
 /// One in-flight reshape duty, keyed in [`ReshapeOrchestrator`] by the
@@ -99,7 +151,7 @@ impl Duty {
         verifier: &dyn Verifier,
         derivation: &dyn Derivation,
         now: LocalTimestamp,
-        out: &mut Vec<ReshapeRequest>,
+        out: &mut Outbox<'_>,
     ) -> Advance {
         match self {
             Self::Observer(duty) => duty.advance(view, verifier, derivation, now, out),
@@ -116,14 +168,30 @@ impl ReshapeEvent {
     /// The duty this event answers, by the store shard the duty is keyed by.
     const fn duty(&self) -> ShardId {
         match self {
-            Self::Opened { shard }
-            | Self::Staged { shard }
+            Self::Opened { shard, .. }
+            | Self::Staged { shard, .. }
             | Self::StageFailed { shard, .. }
             | Self::Imported { shard, .. }
             | Self::Applied { shard, .. }
-            | Self::Adopted { shard } => *shard,
+            | Self::Adopted { shard, .. } => *shard,
             Self::Fetched { duty, .. } | Self::FetchFailed { duty, .. } => *duty,
-            Self::SeedDeferred { child } | Self::SeedUnavailable { child } => *child,
+            Self::SeedDeferred { child, .. } | Self::SeedUnavailable { child, .. } => *child,
+        }
+    }
+
+    /// The ticket of the request this event completes; `None` for a fetch
+    /// answer, which its sequencer checks against what it asked for.
+    const fn ticket(&self) -> Option<Ticket> {
+        match self {
+            Self::Opened { ticket, .. }
+            | Self::Staged { ticket, .. }
+            | Self::StageFailed { ticket, .. }
+            | Self::Imported { ticket, .. }
+            | Self::Applied { ticket, .. }
+            | Self::Adopted { ticket, .. }
+            | Self::SeedDeferred { ticket, .. }
+            | Self::SeedUnavailable { ticket, .. } => Some(*ticket),
+            Self::Fetched { .. } | Self::FetchFailed { .. } => None,
         }
     }
 }
@@ -134,7 +202,9 @@ pub struct ReshapeOrchestrator {
     /// This host's validator ids — the seats it may hold.
     me: Vec<ValidatorId>,
     /// In-flight duties, keyed by the store each prepares.
-    duties: BTreeMap<ShardId, Duty>,
+    duties: BTreeMap<ShardId, Slot>,
+    /// The ticket the next request expecting a completion takes.
+    next_ticket: Ticket,
 }
 
 impl ReshapeOrchestrator {
@@ -144,6 +214,7 @@ impl ReshapeOrchestrator {
         Self {
             me,
             duties: BTreeMap::new(),
+            next_ticket: Ticket::new(0),
         }
     }
 
@@ -172,7 +243,7 @@ impl ReshapeOrchestrator {
     pub fn is_seating(&self, shard: ShardId) -> bool {
         self.duties
             .get(&shard)
-            .is_some_and(|duty| !duty.relinquished())
+            .is_some_and(|slot| !slot.duty.relinquished())
     }
 
     /// Whether this host's split duty for `shard` relinquished the child's
@@ -186,7 +257,9 @@ impl ReshapeOrchestrator {
     /// for it is the adapter's to discard.
     #[must_use]
     pub fn relinquished(&self, shard: ShardId) -> bool {
-        self.duties.get(&shard).is_some_and(Duty::relinquished)
+        self.duties
+            .get(&shard)
+            .is_some_and(|slot| slot.duty.relinquished())
     }
 
     /// Advance every duty one step: apply the io results in `events`, discover
@@ -205,8 +278,8 @@ impl ReshapeOrchestrator {
         now: LocalTimestamp,
     ) -> Vec<ReshapeRequest> {
         for event in events {
-            if let Some(duty) = self.duties.get_mut(&event.duty()) {
-                duty.apply(event, now);
+            if let Some(slot) = self.duties.get_mut(&event.duty()) {
+                slot.apply(event, now);
             }
         }
         // Before any duty advances, so one whose seats are gone emits
@@ -237,7 +310,7 @@ impl ReshapeOrchestrator {
         self.discover_keeper_duties(view);
         self.discover_parent_half_duties(view);
         let me = &self.me;
-        self.duties.retain(|_, duty| duty.held(view, me));
+        self.duties.retain(|_, slot| slot.duty.held(view, me));
     }
 
     /// Advance every duty `pick` selects, dropping the ones that finish.
@@ -253,12 +326,22 @@ impl ReshapeOrchestrator {
         let picked: Vec<ShardId> = self
             .duties
             .iter()
-            .filter(|(_, duty)| pick(duty))
+            .filter(|(_, slot)| pick(&slot.duty))
             .map(|(&shard, _)| shard)
             .collect();
         for shard in picked {
-            if let Some(duty) = self.duties.get_mut(&shard)
-                && duty.advance(view, verifier, derivation, now, out) == Advance::Done
+            let Some(slot) = self.duties.get_mut(&shard) else {
+                continue;
+            };
+            let mut outbox = Outbox {
+                requests: out,
+                next_ticket: &mut self.next_ticket,
+                awaited: &mut slot.awaited,
+            };
+            if slot
+                .duty
+                .advance(view, verifier, derivation, now, &mut outbox)
+                == Advance::Done
             {
                 self.duties.remove(&shard);
             }
@@ -274,11 +357,11 @@ impl ReshapeOrchestrator {
                     continue;
                 }
                 let child = seat.shard;
-                let duty = self
+                let slot = self
                     .duties
                     .entry(child)
-                    .or_insert_with(|| Duty::Observer(ObserverDuty::new(parent, child)));
-                if let Duty::Observer(duty) = duty
+                    .or_insert_with(|| Slot::new(Duty::Observer(ObserverDuty::new(parent, child))));
+                if let Duty::Observer(duty) = &mut slot.duty
                     && !duty.validators.contains(&validator)
                 {
                     duty.validators.push(validator);
@@ -296,11 +379,11 @@ impl ReshapeOrchestrator {
                     continue;
                 }
                 let parent = seat.shard;
-                let duty = self
+                let slot = self
                     .duties
                     .entry(parent)
-                    .or_insert_with(|| Duty::Keeper(KeeperDuty::new(parent)));
-                if let Duty::Keeper(duty) = duty
+                    .or_insert_with(|| Slot::new(Duty::Keeper(KeeperDuty::new(parent))));
+                if let Duty::Keeper(duty) = &mut slot.duty
                     && !duty
                         .members
                         .iter()
@@ -340,9 +423,9 @@ impl ReshapeOrchestrator {
             half.validators = mine.into_iter().map(|(validator, _)| validator).collect();
             match self.duties.entry(child) {
                 Entry::Vacant(entry) => {
-                    entry.insert(Duty::ParentHalf(half));
+                    entry.insert(Slot::new(Duty::ParentHalf(half)));
                 }
-                Entry::Occupied(mut entry) => match entry.get_mut() {
+                Entry::Occupied(mut entry) => match &mut entry.get_mut().duty {
                     Duty::ParentHalf(running) => {
                         for validator in half.validators {
                             if !running.validators.contains(&validator) {
@@ -353,7 +436,7 @@ impl ReshapeOrchestrator {
                     Duty::Observer(observer)
                         if observer.relinquished() && half.held(view, &self.me) =>
                     {
-                        entry.insert(Duty::ParentHalf(half));
+                        entry.insert(Slot::new(Duty::ParentHalf(half)));
                     }
                     Duty::Observer(_) | Duty::Keeper(_) => {}
                 },
@@ -405,7 +488,7 @@ mod tests {
 
         let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(
-            matches!(orch.duties.get(&child), Some(Duty::ParentHalf(_))),
+            matches!(duty_at(&orch, child), Some(Duty::ParentHalf(_))),
             "the relinquished observer hands the child to the parent half in place"
         );
         assert_eq!(
@@ -423,7 +506,10 @@ mod tests {
             &view,
             &BlsVerifier,
             &StubVmStatics,
-            vec![ReshapeEvent::Opened { shard: child }],
+            vec![ReshapeEvent::Opened {
+                shard: child,
+                ticket: awaited(&orch, child),
+            }],
             at(0),
         );
         assert!(
@@ -461,18 +547,24 @@ mod tests {
     fn only_store_preps_prepare_a_shard_or_answer_over_a_running_one() {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
-        let open = ReshapeRequest::OpenStore { shard: parent };
+        let ticket = Ticket::new(3);
+        let open = ReshapeRequest::OpenStore {
+            shard: parent,
+            ticket,
+        };
         let seed = ReshapeRequest::SeedFromParent {
             parent,
             child,
             through: BlockHeight::new(8),
+            ticket,
         };
         assert_eq!(open.prepared_shard(), Some(parent));
         assert!(matches!(open.over_running(), Some(OverRunning::Nothing)));
         assert_eq!(seed.prepared_shard(), Some(child));
         assert!(matches!(
             seed.over_running(),
-            Some(OverRunning::Answer(ReshapeEvent::SeedUnavailable { child: c })) if c == child
+            Some(OverRunning::Answer(ReshapeEvent::SeedUnavailable { child: c, ticket: t }))
+                if c == child && t == ticket
         ));
 
         let block = make_test_block(BlockHeight::new(1));
@@ -495,16 +587,19 @@ mod tests {
                     cursors: Vec::new(),
                 },
                 leaves: Vec::new(),
+                ticket,
             },
             ReshapeRequest::FinalizeImport {
                 shard: child,
                 height: BlockHeight::new(8),
+                ticket,
             },
             ReshapeRequest::ApplyFollow {
                 shard: child,
                 block: Arc::new(block.clone()),
                 creations: Vec::new(),
                 frontier: FrontierInputs::still(child),
+                ticket,
             },
             ReshapeRequest::BroadcastReady {
                 validator: vid(1),
@@ -520,6 +615,7 @@ mod tests {
                     origin: ChainOrigin::root(WeightedTimestamp::ZERO),
                     predecessors: Vec::new(),
                 }),
+                ticket,
             },
             ReshapeRequest::Seat { shard: child },
         ];
@@ -535,15 +631,16 @@ mod tests {
     fn the_seed_gate_reads_the_parent_height_against_through() {
         let (child, _) = ShardId::ROOT.children();
         let through = BlockHeight::new(8);
+        let ticket = Ticket::new(3);
         assert!(matches!(
-            seed_gate(None, child, through),
-            Some(ReshapeEvent::SeedUnavailable { child: c }) if c == child
+            seed_gate(None, child, through, ticket),
+            Some(ReshapeEvent::SeedUnavailable { child: c, ticket: t }) if c == child && t == ticket
         ));
         assert!(matches!(
-            seed_gate(Some(BlockHeight::new(7)), child, through),
-            Some(ReshapeEvent::SeedDeferred { child: c }) if c == child
+            seed_gate(Some(BlockHeight::new(7)), child, through, ticket),
+            Some(ReshapeEvent::SeedDeferred { child: c, ticket: t }) if c == child && t == ticket
         ));
-        assert!(seed_gate(Some(through), child, through).is_none());
+        assert!(seed_gate(Some(through), child, through, ticket).is_none());
     }
 
     #[test]
@@ -573,7 +670,7 @@ mod tests {
         assert!(
             requests
                 .iter()
-                .any(|r| matches!(r, ReshapeRequest::OpenStore { shard } if *shard == child)),
+                .any(|r| matches!(r, ReshapeRequest::OpenStore { shard, .. } if *shard == child)),
             "the observer duty opens the child store; got {requests:?}",
         );
         assert!(

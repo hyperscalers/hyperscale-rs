@@ -39,7 +39,7 @@ pub use genesis::DerivedGenesis;
 pub use observer::ready_notification;
 pub use orchestrator::{
     AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeOrchestrator,
-    ReshapeRequest, seed_gate,
+    ReshapeRequest, Ticket, seed_gate,
 };
 pub use prepared::{PreparedStores, ReshapeCompletion, Seating};
 pub use screen::{block_verdict, headers_verdict};

@@ -8,12 +8,12 @@ use hyperscale_types::{
     Verifier, WeightedTimestamp,
 };
 
-use super::Advance;
 use super::io::{AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
 use super::shared::{
     REFETCH_WAIT, ReadyAssert, SeatTail, StageQueue, TerminalAsk, paced, recipients_for, seats_on,
     terminal_commit,
 };
+use super::{Advance, Outbox};
 use crate::bootstrap::{SpanCollect, StateRangeOutcome};
 use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::merge_flip::merge_genesis_from_terminals;
@@ -73,7 +73,7 @@ impl KeeperHalf {
         duty: ShardId,
         view: &ReshapeView,
         now: LocalTimestamp,
-        out: &mut Vec<ReshapeRequest>,
+        out: &mut Outbox<'_>,
     ) {
         for (sub_range, request) in self.span.next_requests() {
             out.push(ReshapeRequest::Fetch {
@@ -361,7 +361,7 @@ impl KeeperDuty {
         view: &ReshapeView,
         verifier: &dyn Verifier,
         now: LocalTimestamp,
-        out: &mut Vec<ReshapeRequest>,
+        out: &mut Outbox<'_>,
     ) -> Advance {
         let parent = self.parent;
         match &mut self.phase {
@@ -516,7 +516,10 @@ impl KeeperDuty {
                 finalize_requested,
             } => {
                 if !self.open_requested {
-                    out.push(ReshapeRequest::OpenStore { shard: parent });
+                    out.issue(|ticket| ReshapeRequest::OpenStore {
+                        shard: parent,
+                        ticket,
+                    });
                     self.open_requested = true;
                 }
                 self.stages.emit(parent, out);
@@ -564,9 +567,10 @@ impl KeeperDuty {
                     && right.span.is_staged()
                     && let Some(genesis) = derived.as_deref()
                 {
-                    out.push(ReshapeRequest::FinalizeImport {
+                    out.issue(|ticket| ReshapeRequest::FinalizeImport {
                         shard: parent,
                         height: genesis.origin.genesis_height,
+                        ticket,
                     });
                     *finalize_requested = true;
                 }
@@ -778,7 +782,7 @@ mod tests {
         assert!(
             requests
                 .iter()
-                .any(|r| matches!(r, ReshapeRequest::OpenStore { shard } if *shard == parent)),
+                .any(|r| matches!(r, ReshapeRequest::OpenStore { shard, .. } if *shard == parent)),
             "the keeper gate must open the parent store; got {requests:?}",
         );
         assert!(
@@ -792,7 +796,10 @@ mod tests {
             &view,
             &BlsVerifier,
             &StubVmStatics,
-            vec![ReshapeEvent::Opened { shard: parent }],
+            vec![ReshapeEvent::Opened {
+                shard: parent,
+                ticket: awaited(&orch, parent),
+            }],
             at(0),
         );
         for half in [left, right] {
@@ -985,7 +992,10 @@ mod tests {
             &view,
             &BlsVerifier,
             &StubVmStatics,
-            vec![ReshapeEvent::Opened { shard: parent }],
+            vec![ReshapeEvent::Opened {
+                shard: parent,
+                ticket: awaited(&orch, parent),
+            }],
             at(0),
         );
         let fetches = block_fetches(&requests, left);

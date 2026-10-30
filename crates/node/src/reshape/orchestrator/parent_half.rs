@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use hyperscale_types::{LocalTimestamp, ShardId, ValidatorId, Verifier};
 
+use super::Outbox;
 use super::io::{AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest};
 use super::shared::{
     REFETCH_WAIT, SeatTail, TerminalAnswer, TerminalFetch, paced, seats_on, terminal_commit,
@@ -199,7 +200,7 @@ impl ParentHalfDuty {
         view: &ReshapeView,
         verifier: &dyn Verifier,
         now: LocalTimestamp,
-        out: &mut Vec<ReshapeRequest>,
+        out: &mut Outbox<'_>,
     ) {
         let (parent, child) = (self.parent, self.child);
         match &mut self.phase {
@@ -241,10 +242,11 @@ impl ParentHalfDuty {
                         self.phase =
                             ParentHalfPhase::FetchingTerminal(Box::new(TerminalFetch::new(anchor)));
                     } else if seed.begin(now) {
-                        out.push(ReshapeRequest::SeedFromParent {
+                        out.issue(|ticket| ReshapeRequest::SeedFromParent {
                             parent,
                             child,
                             through: anchor.height,
+                            ticket,
                         });
                     }
                 }
@@ -298,10 +300,11 @@ impl ParentHalfDuty {
                 if self.store_seeded {
                     self.phase = ParentHalfPhase::Seat(SeatTail::Adopting(genesis.clone()));
                 } else if seed.begin(now) {
-                    out.push(ReshapeRequest::SeedFromParent {
+                    out.issue(|ticket| ReshapeRequest::SeedFromParent {
                         parent,
                         child,
                         through: genesis.origin.genesis_height,
+                        ticket,
                     });
                 }
             }
@@ -684,7 +687,10 @@ mod tests {
             &view,
             &BlsVerifier,
             &StubVmStatics,
-            vec![ReshapeEvent::SeedDeferred { child }],
+            vec![ReshapeEvent::SeedDeferred {
+                child,
+                ticket: awaited(&orch, child),
+            }],
             at(0),
         );
         assert!(
@@ -733,7 +739,10 @@ mod tests {
             &view,
             &BlsVerifier,
             &StubVmStatics,
-            vec![ReshapeEvent::SeedUnavailable { child }],
+            vec![ReshapeEvent::SeedUnavailable {
+                child,
+                ticket: awaited(&orch, child),
+            }],
             at(0),
         );
         assert!(
@@ -761,7 +770,7 @@ mod tests {
         );
         assert!(
             !orch.relinquished(child)
-                && !matches!(orch.duties.get(&child), Some(Duty::ParentHalf(_))),
+                && !matches!(duty_at(&orch, child), Some(Duty::ParentHalf(_))),
             "the released cohort ends the relinquished duty"
         );
     }
@@ -879,7 +888,7 @@ mod tests {
             "a prepared parent half seats once placed; got {requests:?}",
         );
         assert!(
-            matches!(orch.duties.get(&child), Some(Duty::ParentHalf(_))),
+            matches!(duty_at(&orch, child), Some(Duty::ParentHalf(_))),
             "a seated parent half persists while the projection lists it",
         );
 
@@ -894,7 +903,7 @@ mod tests {
             at(0),
         );
         assert!(
-            !matches!(orch.duties.get(&child), Some(Duty::ParentHalf(_))),
+            !matches!(duty_at(&orch, child), Some(Duty::ParentHalf(_))),
             "a released seated parent half is dropped",
         );
     }

@@ -12,6 +12,7 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 
+use super::Outbox;
 use super::io::{AdoptKind, ReshapeRequest};
 use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::observer::{ObserverTail, TailOutcome, TerminalSighting, TwoChainCheck};
@@ -179,13 +180,14 @@ impl SeatTail {
         kind: AdoptKind,
         seats: impl IntoIterator<Item = &'a ValidatorId>,
         view: &ReshapeView,
-        out: &mut Vec<ReshapeRequest>,
+        out: &mut Outbox<'_>,
     ) {
         match std::mem::replace(self, Self::AwaitingAdopt) {
-            Self::Adopting(genesis) => out.push(ReshapeRequest::Adopt {
+            Self::Adopting(genesis) => out.issue(|ticket| ReshapeRequest::Adopt {
                 shard,
                 kind,
                 genesis,
+                ticket,
             }),
             Self::Prepared => {
                 let committee = view.committee(shard);
@@ -225,13 +227,14 @@ impl StageQueue {
     }
 
     /// Emit a stage write into `shard`'s store for every pending chunk.
-    pub(super) fn emit(&mut self, shard: ShardId, out: &mut Vec<ReshapeRequest>) {
+    pub(super) fn emit(&mut self, shard: ShardId, out: &mut Outbox<'_>) {
         for (progress, leaves) in self.pending.drain(..) {
             self.unacked += 1;
-            out.push(ReshapeRequest::StageChunk {
+            out.issue(|ticket| ReshapeRequest::StageChunk {
                 shard,
                 progress,
                 leaves,
+                ticket,
             });
         }
     }

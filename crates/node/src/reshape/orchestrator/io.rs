@@ -43,6 +43,29 @@ pub enum FetchKind {
     },
 }
 
+/// Names one request that expects a completion.
+///
+/// The orchestrator hands each such request a fresh ticket and the adapter
+/// echoes it in the event that answers it; a duty takes a completion only
+/// for a ticket it still awaits,
+/// so one answering an earlier request for the same store, or a request of
+/// a duty since dropped and rediscovered, changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Ticket(u64);
+
+impl Ticket {
+    /// The ticket numbered `raw`.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The ticket issued after this one.
+    pub(super) const fn successor(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 /// Which genesis derivation a [`ReshapeRequest::Adopt`] performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdoptKind {
@@ -64,6 +87,8 @@ pub enum ReshapeRequest {
     OpenStore {
         /// The duty's store shard.
         shard: ShardId,
+        /// Echoed by the answering event.
+        ticket: Ticket,
     },
     /// Seed `child`'s store by cloning the host's local `parent` store onto the
     /// child subtree, once the local parent has committed through the terminal
@@ -82,6 +107,8 @@ pub enum ReshapeRequest {
         /// beacon anchor, which does not exist until an epoch after the
         /// cut and is precisely what the early flip does without.
         through: BlockHeight,
+        /// Echoed by the answering event.
+        ticket: Ticket,
     },
     /// Fetch from `from`'s committee, on behalf of `duty`. Answered by
     /// [`ReshapeEvent::Fetched`] (or [`ReshapeEvent::FetchFailed`]). The
@@ -104,6 +131,8 @@ pub enum ReshapeRequest {
         progress: ImportProgress,
         /// The chunk's verified leaves.
         leaves: Vec<SubstateLeaf>,
+        /// Echoed by the answering event.
+        ticket: Ticket,
     },
     /// Build `shard`'s boundary state at `height` from its staged
     /// chunks. Answered by [`ReshapeEvent::Imported`]. Emitted only
@@ -113,6 +142,8 @@ pub enum ReshapeRequest {
         shard: ShardId,
         /// The boundary height the staged leaves seed.
         height: BlockHeight,
+        /// Echoed by the answering event.
+        ticket: Ticket,
     },
     /// Apply a followed parent block's child-prefix writes into `shard`'s store.
     /// Answered by [`ReshapeEvent::Applied`].
@@ -127,6 +158,8 @@ pub enum ReshapeRequest {
         creations: Vec<(SubstateKey, Vec<u8>)>,
         /// What the block's claims did to the read frontier.
         frontier: FrontierInputs,
+        /// Echoed by the answering event.
+        ticket: Ticket,
     },
     /// Sign a ready signal for `validator` attesting the sync of `child`,
     /// anchored at `anchor`, and notify `recipients` — the target committee
@@ -153,6 +186,8 @@ pub enum ReshapeRequest {
         kind: AdoptKind,
         /// The derived genesis.
         genesis: Box<DerivedGenesis>,
+        /// Echoed by the answering event.
+        ticket: Ticket,
     },
     /// Seat the prepared `shard` — install its genesis and run consensus. No
     /// response (terminal).
@@ -168,7 +203,7 @@ impl ReshapeRequest {
     #[must_use]
     pub const fn prepared_shard(&self) -> Option<ShardId> {
         match self {
-            Self::OpenStore { shard } => Some(*shard),
+            Self::OpenStore { shard, .. } => Some(*shard),
             Self::SeedFromParent { child, .. } => Some(*child),
             _ => None,
         }
@@ -187,9 +222,10 @@ impl ReshapeRequest {
     pub const fn over_running(&self) -> Option<OverRunning> {
         match self {
             Self::OpenStore { .. } => Some(OverRunning::Nothing),
-            Self::SeedFromParent { child, .. } => {
+            Self::SeedFromParent { child, ticket, .. } => {
                 Some(OverRunning::Answer(ReshapeEvent::SeedUnavailable {
                     child: *child,
+                    ticket: *ticket,
                 }))
             }
             _ => None,
@@ -208,7 +244,7 @@ pub enum OverRunning {
 }
 
 /// The seed gate a [`ReshapeRequest::SeedFromParent`] passes before its
-/// clone; `None` when the clone may run.
+/// clone; `None` when the clone may run. `ticket` is the seed's.
 ///
 /// [`ReshapeEvent::SeedUnavailable`] when this host holds no parent store
 /// (`parent_height` is `None`), [`ReshapeEvent::SeedDeferred`] while the
@@ -222,10 +258,11 @@ pub fn seed_gate(
     parent_height: Option<BlockHeight>,
     child: ShardId,
     through: BlockHeight,
+    ticket: Ticket,
 ) -> Option<ReshapeEvent> {
     match parent_height {
-        None => Some(ReshapeEvent::SeedUnavailable { child }),
-        Some(height) if height < through => Some(ReshapeEvent::SeedDeferred { child }),
+        None => Some(ReshapeEvent::SeedUnavailable { child, ticket }),
+        Some(height) if height < through => Some(ReshapeEvent::SeedDeferred { child, ticket }),
         Some(_) => None,
     }
 }
@@ -259,6 +296,8 @@ pub enum ReshapeEvent {
     Opened {
         /// The opened store shard.
         shard: ShardId,
+        /// The open's or seed's ticket.
+        ticket: Ticket,
     },
     /// A fetch returned a response.
     Fetched {
@@ -282,6 +321,8 @@ pub enum ReshapeEvent {
     Staged {
         /// The store shard.
         shard: ShardId,
+        /// The stage write's ticket.
+        ticket: Ticket,
     },
     /// A staged chunk's durable write failed; the chunk comes back for
     /// re-staging on the next advance.
@@ -292,6 +333,8 @@ pub enum ReshapeEvent {
         progress: ImportProgress,
         /// The chunk's verified leaves.
         leaves: Vec<SubstateLeaf>,
+        /// The stage write's ticket.
+        ticket: Ticket,
     },
     /// A boundary import completed with the resulting store root.
     Imported {
@@ -299,6 +342,8 @@ pub enum ReshapeEvent {
         shard: ShardId,
         /// The imported root.
         root: StateRoot,
+        /// The finalize's ticket.
+        ticket: Ticket,
     },
     /// A followed-block application completed with the resulting store root.
     Applied {
@@ -306,12 +351,16 @@ pub enum ReshapeEvent {
         shard: ShardId,
         /// The applied root.
         root: StateRoot,
+        /// The application's ticket.
+        ticket: Ticket,
     },
     /// A genesis adoption completed, its root already verified against the
     /// genesis's.
     Adopted {
         /// The store shard.
         shard: ShardId,
+        /// The adopt's ticket.
+        ticket: Ticket,
     },
     /// A [`ReshapeRequest::SeedFromParent`] could not run yet — the host's local
     /// parent has not committed through the terminal crossing. The duty
@@ -320,6 +369,8 @@ pub enum ReshapeEvent {
     SeedDeferred {
         /// The split child whose seed is deferred.
         child: ShardId,
+        /// The seed's ticket.
+        ticket: Ticket,
     },
     /// A [`ReshapeRequest::SeedFromParent`] found no parent store on this
     /// host to clone — it restarted without one — so the parent half can
@@ -328,5 +379,7 @@ pub enum ReshapeEvent {
     SeedUnavailable {
         /// The split child whose seat is relinquished.
         child: ShardId,
+        /// The seed's ticket.
+        ticket: Ticket,
     },
 }

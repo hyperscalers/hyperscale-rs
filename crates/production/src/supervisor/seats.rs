@@ -473,7 +473,7 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::unbounded;
-    use hyperscale_node::reshape::ReshapeRequest;
+    use hyperscale_node::reshape::{ReshapeRequest, Ticket};
     use hyperscale_storage::RecoveredState;
     use hyperscale_storage_rocksdb::RocksDbShardStorage;
     use hyperscale_types::test_utils::TestCommittee;
@@ -588,7 +588,13 @@ mod tests {
         assert_eq!(running.join(SHARD, &first, || false), JoinStep::OnRunning);
 
         let mut held = SeatTable::default();
-        held.hold_prep(SHARD, ReshapeRequest::OpenStore { shard: SHARD });
+        held.hold_prep(
+            SHARD,
+            ReshapeRequest::OpenStore {
+                shard: SHARD,
+                ticket: Ticket::new(0),
+            },
+        );
         assert_eq!(
             held.join(SHARD, &first, || false),
             JoinStep::Superseded,
@@ -613,7 +619,13 @@ mod tests {
 
         let mut table = SeatTable::default();
         assert!(table.vacant(SHARD));
-        table.hold_prep(SHARD, ReshapeRequest::OpenStore { shard: SHARD });
+        table.hold_prep(
+            SHARD,
+            ReshapeRequest::OpenStore {
+                shard: SHARD,
+                ticket: Ticket::new(0),
+            },
+        );
         assert!(table.vacant(SHARD));
 
         table.sync(SHARD, &vnodes);
@@ -656,7 +668,13 @@ mod tests {
         assert!(!table.is_running(SHARD));
         assert!(table.is_draining(SHARD));
         assert!(table.holds_store_dir(SHARD));
-        table.hold_prep(SHARD, ReshapeRequest::OpenStore { shard: SHARD });
+        table.hold_prep(
+            SHARD,
+            ReshapeRequest::OpenStore {
+                shard: SHARD,
+                ticket: Ticket::new(0),
+            },
+        );
         assert!(table.ready_preps().is_empty(), "the drain holds the prep");
         table.join(SHARD, &vnodes, || false);
 

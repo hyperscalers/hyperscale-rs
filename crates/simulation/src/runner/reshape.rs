@@ -25,8 +25,8 @@ use hyperscale_node::bootstrap::replicate_engine_bootstrap;
 use hyperscale_node::event::HostEvent;
 use hyperscale_node::reshape::{
     AdoptKind, DerivedGenesis, FetchKind, FetchedKind, OverRunning, ReshapeCompletion,
-    ReshapeEvent, ReshapeRequest, ReshapeView, Seating, adopt_prepared_store, block_verdict,
-    headers_verdict, ready_notification, seed_gate,
+    ReshapeEvent, ReshapeRequest, ReshapeView, Seating, Ticket, adopt_prepared_store,
+    block_verdict, headers_verdict, ready_notification, seed_gate,
 };
 use hyperscale_node::seating::seat_validators;
 use hyperscale_node::{
@@ -37,7 +37,8 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ShardId, ValidatorId, Verified, shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ShardAnchor, ShardId, ValidatorId, Verified,
+    shard_prefix_path,
 };
 use tracing::warn;
 
@@ -152,12 +153,15 @@ impl SimulationRunner {
             };
         }
         match request {
-            ReshapeRequest::OpenStore { shard } => self.reshape_open_store(host, shard),
+            ReshapeRequest::OpenStore { shard, ticket } => {
+                self.reshape_open_store(host, shard, ticket)
+            }
             ReshapeRequest::SeedFromParent {
                 parent,
                 child,
                 through,
-            } => self.reshape_seed_from_parent(host, parent, child, through),
+                ticket,
+            } => self.reshape_seed_from_parent(host, parent, child, through, ticket),
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
             }
@@ -165,31 +169,45 @@ impl SimulationRunner {
                 shard,
                 progress,
                 leaves,
+                ticket,
             } => {
                 self.reshape_stores[host as usize]
                     .storage(shard)?
                     .stage_import_chunk(&progress, &leaves)
                     .expect("chunk staging into the opened store");
-                Some(ReshapeEvent::Staged { shard })
+                Some(ReshapeEvent::Staged { shard, ticket })
             }
-            ReshapeRequest::FinalizeImport { shard, height } => {
+            ReshapeRequest::FinalizeImport {
+                shard,
+                height,
+                ticket,
+            } => {
                 let root = self.reshape_stores[host as usize]
                     .storage(shard)?
                     .finalize_boundary_import(height, WitnessSeed::default())
                     .expect("reshape boundary import into the opened store");
-                Some(ReshapeEvent::Imported { shard, root })
+                Some(ReshapeEvent::Imported {
+                    shard,
+                    root,
+                    ticket,
+                })
             }
             ReshapeRequest::ApplyFollow {
                 shard,
                 block,
                 creations,
                 frontier,
+                ticket,
             } => {
                 let root = self.reshape_stores[host as usize]
                     .storage(shard)?
                     .follow_block_writes(&block, &creations, &frontier)
                     .expect("reshape follow apply into the opened store");
-                Some(ReshapeEvent::Applied { shard, root })
+                Some(ReshapeEvent::Applied {
+                    shard,
+                    root,
+                    ticket,
+                })
             }
             ReshapeRequest::BroadcastReady {
                 validator,
@@ -197,38 +215,15 @@ impl SimulationRunner {
                 anchor,
                 recipients,
             } => {
-                // The duty host signs with the keys it holds and notifies from
-                // its own links, so a partition or fault on those links reaches
-                // the readiness gate as it does in production.
-                let idx = usize::try_from(validator.inner()).expect("id fits usize");
-                if self.validator_home.get(idx) != Some(&host) {
-                    warn!(
-                        validator = validator.inner(),
-                        "Reshape ready signal for a validator without a local key; ignored"
-                    );
-                    return None;
-                }
-                if broadcasted.insert(validator)
-                    && let Some(notification) = ready_notification(
-                        &self.beacon_network,
-                        validator,
-                        child,
-                        Some(self.signers[idx].as_ref()),
-                        anchor,
-                        self.epoch_duration_ms,
-                    )
-                {
-                    self.hosts[host as usize]
-                        .network()
-                        .notify(&recipients, &notification);
-                }
+                self.reshape_broadcast(host, validator, child, anchor, &recipients, broadcasted);
                 None
             }
             ReshapeRequest::Adopt {
                 shard,
                 kind,
                 genesis,
-            } => self.reshape_adopt(host, shard, kind, *genesis),
+                ticket,
+            } => self.reshape_adopt(host, shard, kind, *genesis, ticket),
             ReshapeRequest::Seat { shard } => {
                 self.reshape_seat(host, shard);
                 None
@@ -236,9 +231,53 @@ impl SimulationRunner {
         }
     }
 
+    /// Sign `validator`'s ready signal for `child` and notify `recipients`,
+    /// once per validator per pump.
+    ///
+    /// The duty host signs with the keys it holds and notifies from its own
+    /// links, so a partition or fault on those links reaches the readiness
+    /// gate as it does in production.
+    fn reshape_broadcast(
+        &self,
+        host: NodeIndex,
+        validator: ValidatorId,
+        child: ShardId,
+        anchor: ShardAnchor,
+        recipients: &[ValidatorId],
+        broadcasted: &mut HashSet<ValidatorId>,
+    ) {
+        let idx = usize::try_from(validator.inner()).expect("id fits usize");
+        if self.validator_home.get(idx) != Some(&host) {
+            warn!(
+                validator = validator.inner(),
+                "Reshape ready signal for a validator without a local key; ignored"
+            );
+            return;
+        }
+        if broadcasted.insert(validator)
+            && let Some(notification) = ready_notification(
+                &self.beacon_network,
+                validator,
+                child,
+                Some(self.signers[idx].as_ref()),
+                anchor,
+                self.epoch_duration_ms,
+            )
+        {
+            self.hosts[host as usize]
+                .network()
+                .notify(recipients, &notification);
+        }
+    }
+
     /// Open a fresh duty store, replicate the engine bootstrap into it, and
     /// settle it for the duty.
-    fn reshape_open_store(&mut self, host: NodeIndex, shard: ShardId) -> Option<ReshapeEvent> {
+    fn reshape_open_store(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        ticket: Ticket,
+    ) -> Option<ReshapeEvent> {
         let storage = open_store(shard, self.power_loss);
         replicate_engine_bootstrap(&storage, &self.genesis_config());
         let recovered = storage.load_recovered_state(shard);
@@ -246,6 +285,7 @@ impl SimulationRunner {
             shard,
             storage,
             recovered,
+            ticket,
         })
     }
 
@@ -260,11 +300,12 @@ impl SimulationRunner {
         parent: ShardId,
         child: ShardId,
         through: BlockHeight,
+        ticket: Ticket,
     ) -> Option<ReshapeEvent> {
         let parent_height = self
             .hosts_shard(host, parent)
             .map(ShardChainReader::committed_height);
-        if let Some(event) = seed_gate(parent_height, child, through) {
+        if let Some(event) = seed_gate(parent_height, child, through, ticket) {
             return Some(event);
         }
         let storage = self.hosts[host as usize]
@@ -276,6 +317,7 @@ impl SimulationRunner {
             shard: child,
             storage,
             recovered,
+            ticket,
         })
     }
 
@@ -398,6 +440,7 @@ impl SimulationRunner {
         shard: ShardId,
         kind: AdoptKind,
         genesis: DerivedGenesis,
+        ticket: Ticket,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores[host as usize].storage(shard)?.clone();
         let recovered = adopt_prepared_store(&storage, shard, kind, &genesis)
@@ -406,6 +449,7 @@ impl SimulationRunner {
             shard,
             genesis: Box::new(genesis.block),
             recovered,
+            ticket,
         })
     }
 

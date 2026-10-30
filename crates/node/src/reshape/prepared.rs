@@ -13,7 +13,7 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::{Block, ShardId};
 use tracing::warn;
 
-use crate::reshape::orchestrator::ReshapeEvent;
+use crate::reshape::orchestrator::{ReshapeEvent, Ticket};
 
 /// How far a prepared store has come.
 enum Stage {
@@ -46,6 +46,8 @@ pub enum ReshapeCompletion<S> {
         storage: S,
         /// Its recovered state.
         recovered: RecoveredState,
+        /// The open's or seed's ticket.
+        ticket: Ticket,
     },
     /// A genesis adoption landed, its root verified against the genesis's.
     Adopted {
@@ -55,6 +57,8 @@ pub enum ReshapeCompletion<S> {
         genesis: Box<Block>,
         /// The recovered state rebuilt over the adopted genesis.
         recovered: RecoveredState,
+        /// The adopt's ticket.
+        ticket: Ticket,
     },
     /// Any other completion, which touches no prepared store.
     Event(ReshapeEvent),
@@ -96,6 +100,7 @@ impl<S> PreparedStores<S> {
                 shard,
                 storage,
                 recovered,
+                ticket,
             } => {
                 self.0.insert(
                     shard,
@@ -105,12 +110,13 @@ impl<S> PreparedStores<S> {
                         stage: Stage::Opened,
                     },
                 );
-                Some(ReshapeEvent::Opened { shard })
+                Some(ReshapeEvent::Opened { shard, ticket })
             }
             ReshapeCompletion::Adopted {
                 shard,
                 genesis,
                 recovered,
+                ticket,
             } => {
                 let store = self.0.get_mut(&shard)?;
                 debug_assert!(
@@ -119,7 +125,7 @@ impl<S> PreparedStores<S> {
                 );
                 store.stage = Stage::Adopted { genesis };
                 store.recovered = recovered;
-                Some(ReshapeEvent::Adopted { shard })
+                Some(ReshapeEvent::Adopted { shard, ticket })
             }
             ReshapeCompletion::Event(event) => {
                 debug_assert!(
@@ -209,15 +215,16 @@ mod tests {
     use hyperscale_types::{BlockHeight, ShardId};
 
     use super::{PreparedStores, ReshapeCompletion};
-    use crate::reshape::orchestrator::ReshapeEvent;
+    use crate::reshape::orchestrator::{ReshapeEvent, Ticket};
 
     fn opened(stores: &mut PreparedStores<u32>, shard: ShardId, storage: u32) {
         let event = stores.settle(ReshapeCompletion::Opened {
             shard,
             storage,
             recovered: RecoveredState::default(),
+            ticket: Ticket::new(0),
         });
-        assert!(matches!(event, Some(ReshapeEvent::Opened { shard: s }) if s == shard));
+        assert!(matches!(event, Some(ReshapeEvent::Opened { shard: s, .. }) if s == shard));
     }
 
     fn adopt(stores: &mut PreparedStores<u32>, shard: ShardId) -> Option<ReshapeEvent> {
@@ -225,6 +232,7 @@ mod tests {
             shard,
             genesis: Box::new(make_test_block(BlockHeight::new(8))),
             recovered: RecoveredState::default(),
+            ticket: Ticket::new(1),
         })
     }
 
@@ -234,7 +242,7 @@ mod tests {
         let mut stores = PreparedStores::new();
         opened(&mut stores, shard, 7);
         assert!(
-            matches!(adopt(&mut stores, shard), Some(ReshapeEvent::Adopted { shard: s }) if s == shard)
+            matches!(adopt(&mut stores, shard), Some(ReshapeEvent::Adopted { shard: s, .. }) if s == shard)
         );
         let seating = stores.take_for_seat(shard, false).expect("adopted");
         assert_eq!(seating.storage, 7);
