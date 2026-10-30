@@ -1329,6 +1329,7 @@ impl TopologySnapshot {
     /// Each shard executes the whole transaction, so every touched shard
     /// needs every input substate it doesn't own locally — reads and
     /// writes participate symmetrically here.
+    #[must_use]
     pub fn all_shards_for_transaction(&self, tx: &Transaction) -> Vec<ShardId> {
         tx.routing()
             .all_prefixes()
@@ -1340,17 +1341,20 @@ impl TopologySnapshot {
     }
 
     /// Check if a transaction is cross-shard.
+    #[must_use]
     pub fn is_cross_shard_transaction(&self, tx: &Transaction) -> bool {
         self.all_shards_for_transaction(tx).len() > 1
     }
 
     /// Check if a transaction is single-shard.
+    #[must_use]
     pub fn is_single_shard_transaction(&self, tx: &Transaction) -> bool {
         self.all_shards_for_transaction(tx).len() <= 1
     }
 
     /// Check if `shard` is involved in `tx`'s consensus path — i.e. owns at
     /// least one of `tx`'s declared writes.
+    #[must_use]
     pub fn involves_shard_for_consensus(&self, shard: ShardId, tx: &Transaction) -> bool {
         tx.routing()
             .write_prefixes
@@ -1359,6 +1363,7 @@ impl TopologySnapshot {
     }
 
     /// Check if `shard` is involved in `tx` at all (reads or writes).
+    #[must_use]
     pub fn involves_shard(&self, shard: ShardId, tx: &Transaction) -> bool {
         tx.routing()
             .all_prefixes()

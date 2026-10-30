@@ -11,7 +11,7 @@
 //! derivations are cached on the value.
 
 use std::fmt::{self, Debug, Formatter};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use blake3::Hasher;
 use hyperscale_hbor::{Bytes, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
@@ -49,8 +49,18 @@ pub struct TransactionContext<'a> {
 /// encoding and have us key it by another nor mint a second identity for
 /// signed content by re-rolling the signature. Every other field is a
 /// lazily-populated cache, skipped on the wire and rebuilt at each end.
+///
+/// Every clone shares one allocation, caches included: a cache one copy
+/// populates is populated for all of them, and moving a transaction
+/// between its raw, verifiable and verified forms copies a pointer, not
+/// the envelope.
+#[derive(Clone, Hbor)]
+#[hbor(transparent)]
+pub struct Transaction(Arc<Carried>);
+
+/// What every clone of one [`Transaction`] shares.
 #[derive(Hbor)]
-pub struct Transaction {
+struct Carried {
     /// HBOR-encoded [`TransactionEnvelope`] bytes — the canonical wire form.
     serialized_bytes: Bytes<MAX_ENVELOPE_BYTES>,
 
@@ -94,44 +104,6 @@ impl PartialEq for Transaction {
 }
 
 impl Eq for Transaction {}
-
-// Manual Clone - OnceLock doesn't implement Clone. Every populated cache
-// is copied so the clone doesn't pay first-access cost twice; in
-// particular the derivation rides across clones, so the work a fresh tx
-// incurs at admission is amortized over every later raw clone (tick-state
-// extract, mempool block-commit lift, proposal build).
-impl Clone for Transaction {
-    fn clone(&self) -> Self {
-        let body = OnceLock::new();
-        if let Some(t) = self.body.get() {
-            let _ = body.set(t.clone());
-        }
-        let derived = OnceLock::new();
-        if let Some(r) = self.derived.get() {
-            let _ = derived.set(r.clone());
-        }
-        let declared = OnceLock::new();
-        if let Some(d) = self.declared.get() {
-            let _ = declared.set(d.clone());
-        }
-        let hash = OnceLock::new();
-        if let Some(h) = self.hash.get() {
-            let _ = hash.set(*h);
-        }
-        let cached_bytes = OnceLock::new();
-        if let Some(b) = self.cached_bytes.get() {
-            let _ = cached_bytes.set(b.clone());
-        }
-        Self {
-            serialized_bytes: self.serialized_bytes.clone(),
-            body,
-            derived,
-            declared,
-            hash,
-            cached_bytes,
-        }
-    }
-}
 
 // Manual Debug — skip the cached_bytes field.
 impl Debug for Transaction {
@@ -395,7 +367,7 @@ impl Transaction {
         let hash_lock = OnceLock::new();
         let _ = hash_lock.set(hash);
 
-        Self {
+        Self(Arc::new(Carried {
             serialized_bytes: Bytes::new(payload)
                 .expect("a list under the cap its source already met"),
             body: body_lock,
@@ -403,7 +375,7 @@ impl Transaction {
             declared: OnceLock::new(),
             hash: hash_lock,
             cached_bytes: OnceLock::new(),
-        }
+        }))
     }
 
     /// The transaction's identity: the protocol hash of the envelope's
@@ -423,12 +395,13 @@ impl Transaction {
     /// that do not decode as an envelope hash as themselves — such a
     /// transaction is refused at verification and enters nothing, so the
     /// stand-in identity only ever keys the refusal.
+    #[must_use]
     pub fn hash(&self) -> TxHash {
-        TxHash::from(*self.hash.get_or_init(|| {
+        TxHash::from(*self.0.hash.get_or_init(|| {
             self.try_body().map_or_else(
                 |_| {
                     let mut hasher = Hasher::new();
-                    hasher.update(&self.serialized_bytes);
+                    hasher.update(&self.0.serialized_bytes);
                     Hash::from_hash_bytes(hasher.finalize().as_bytes())
                 },
                 EnvelopeExt::signing_hash,
@@ -444,12 +417,12 @@ impl Transaction {
     /// [`TransactionVerifyError::UndecodableBody`] when the bytes
     /// do not decode as an envelope.
     pub fn try_body(&self) -> Result<&TransactionEnvelope, TransactionVerifyError> {
-        if let Some(body) = self.body.get() {
+        if let Some(body) = self.0.body.get() {
             return Ok(body);
         }
-        let decoded = hbor_from_slice::<TransactionEnvelope>(&self.serialized_bytes)
+        let decoded = hbor_from_slice::<TransactionEnvelope>(&self.0.serialized_bytes)
             .map_err(|_| TransactionVerifyError::UndecodableBody)?;
-        Ok(self.body.get_or_init(|| decoded))
+        Ok(self.0.body.get_or_init(|| decoded))
     }
 
     /// The decoded envelope. Constructors pre-populate it; wire-decoded
@@ -460,6 +433,7 @@ impl Transaction {
     /// Panics if `serialized_bytes` does not decode. Wire-decoded
     /// transactions are verified (which decodes fallibly) before this is
     /// invoked.
+    #[must_use]
     pub fn body(&self) -> &TransactionEnvelope {
         self.try_body()
             .expect("Transaction.serialized_bytes failed body decode")
@@ -570,7 +544,7 @@ impl Transaction {
     /// the ones holding the records.
     #[must_use]
     pub fn is_routed(&self) -> bool {
-        self.derived.get().is_some()
+        self.0.derived.get().is_some()
     }
 
     /// The cached declaration, or a panic saying nothing ever derived
@@ -579,7 +553,7 @@ impl Transaction {
     /// only a transaction no path has touched, or one whose tree states
     /// no window, reaches the panic.
     fn declared_facts(&self) -> &Declared {
-        self.declared.get().expect(
+        self.0.declared.get().expect(
             "declared facts read from a transaction no derivation was attempted on; \
              every consensus path derives before it books",
         )
@@ -587,7 +561,7 @@ impl Transaction {
 
     /// The cached derivation, or a panic saying it was never derived.
     fn derived(&self) -> &Derived {
-        self.derived.get().expect(
+        self.0.derived.get().expect(
             "derived facts read from a transaction that was never derived; \
              verification derives, and consensus paths take only verified transactions",
         )
@@ -609,8 +583,8 @@ impl Transaction {
             .clone();
         let tx = Self::new(self.body().clone());
         let derived = Derived { legs, ..base };
-        let _ = tx.declared.set(Declared::from(&derived));
-        let _ = tx.derived.set(derived);
+        let _ = tx.0.declared.set(Declared::from(&derived));
+        let _ = tx.0.derived.set(derived);
         tx
     }
 
@@ -624,7 +598,7 @@ impl Transaction {
     ///
     /// [`DerivationError`] from `derivation`.
     pub fn try_derived(&self, derivation: &dyn Derivation) -> Result<&Derived, DerivationError> {
-        if let Some(derived) = self.derived.get() {
+        if let Some(derived) = self.0.derived.get() {
             return Ok(derived);
         }
         let derived = match derivation.derive(self.body()) {
@@ -637,13 +611,13 @@ impl Transaction {
                 // what lets a certified block this node cannot route be
                 // committed and booked on the same figures as its peers.
                 if let Ok(declared) = derivation.declared(self.body()) {
-                    let _ = self.declared.set(declared);
+                    let _ = self.0.declared.set(declared);
                 }
                 return Err(error);
             }
         };
-        let _ = self.declared.set(Declared::from(&derived));
-        Ok(self.derived.get_or_init(|| derived))
+        let _ = self.0.declared.set(Declared::from(&derived));
+        Ok(self.0.derived.get_or_init(|| derived))
     }
 
     /// The facts the envelope declares of itself, deriving them through
@@ -653,19 +627,20 @@ impl Transaction {
     ///
     /// [`DerivationError::Refused`] on an envelope no node admits.
     pub fn try_declared(&self, derivation: &dyn Derivation) -> Result<&Declared, DerivationError> {
-        if let Some(declared) = self.declared.get() {
+        if let Some(declared) = self.0.declared.get() {
             return Ok(declared);
         }
         let declared = derivation.declared(self.body())?;
-        Ok(self.declared.get_or_init(|| declared))
+        Ok(self.0.declared.get_or_init(|| declared))
     }
 
     /// Get the cached serialized envelope bytes.
     ///
     /// Use this for computing transaction merkle roots (avoids
     /// re-serialization) and for network encoding.
+    #[must_use]
     pub fn serialized_bytes(&self) -> &[u8] {
-        &self.serialized_bytes
+        &self.0.serialized_bytes
     }
 
     /// Pre-serialized wire bytes of the full `Transaction`.
@@ -675,8 +650,10 @@ impl Transaction {
     ///
     /// Panics if HBOR encoding fails — that's a programmer error since
     /// every field is `Hbor` and the type itself is closed.
+    #[must_use]
     pub fn cached_wire_bytes(&self) -> &[u8] {
-        self.cached_bytes
+        self.0
+            .cached_bytes
             .get_or_init(|| hbor_to_vec(self).expect("Transaction HBOR encode is infallible"))
     }
 
@@ -686,6 +663,7 @@ impl Transaction {
     /// active [`ShardTrie`]; this by-count form is for genesis and offline tooling.
     ///
     /// [`TopologySnapshot::is_cross_shard_transaction`]: crate::TopologySnapshot::is_cross_shard_transaction
+    #[must_use]
     pub fn is_cross_shard(&self, num_shards: u64) -> bool {
         let trie = ShardTrie::uniform_from_count(num_shards);
         let mut shards = self
@@ -820,7 +798,7 @@ mod tests {
     use crate::test_utils::{StubTree, envelope_attestations, test_prefix, test_validity_range};
     use crate::{
         Declared, Derivation, Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId,
-        Secp256k1PrivateKey, Unresolved,
+        Secp256k1PrivateKey, Unresolved, Verifiable,
     };
 
     struct StubStatics;
@@ -1019,7 +997,7 @@ mod tests {
             output: 0,
             non_fungible: false,
         };
-        let _ = tx.derived.set(Derived {
+        let _ = tx.0.derived.set(Derived {
             legs: vec![leg(sender, Vec::new()), leg(recipient, vec![edge])],
             nullifiers: vec![SubstateKey {
                 owner: sender,
@@ -1049,6 +1027,18 @@ mod tests {
             1,
             "the nullifier alone: an edge inside one shard writes no escrow"
         );
+    }
+
+    /// The store holds the verified form and the wire carries the
+    /// verifiable one; moving between them, and verifying in the first
+    /// place, must hand over the one body rather than copy it.
+    #[test]
+    fn every_form_of_a_transaction_shares_one_body() {
+        let tx = fixture(b"graph bytes");
+        let verified = tx.verify(ctx(TEST_NETWORK)).expect("the fixture verifies");
+        let wire: Verifiable<Transaction> = verified.clone().into();
+        assert!(Arc::ptr_eq(&tx.0, &verified.0));
+        assert!(Arc::ptr_eq(&tx.0, &wire.as_unverified().0));
     }
 
     #[test]
@@ -1134,14 +1124,14 @@ mod tests {
         // Garbage in the body field is an undecodable body, not a panic.
         let mut bytes = fixture(b"graph bytes").serialized_bytes().to_vec();
         bytes.truncate(3);
-        let garbage = Transaction {
+        let garbage = Transaction(Arc::new(Carried {
             serialized_bytes: Bytes::new(bytes).expect("a list written out in a test"),
             body: OnceLock::new(),
             derived: OnceLock::new(),
             declared: OnceLock::new(),
             hash: OnceLock::new(),
             cached_bytes: OnceLock::new(),
-        };
+        }));
         assert_eq!(
             garbage.verify(ctx(TEST_NETWORK)).unwrap_err(),
             TransactionVerifyError::UndecodableBody
