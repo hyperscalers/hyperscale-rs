@@ -29,6 +29,7 @@ use hyperscale_beacon::action_handlers::{
     handle_action as handle_beacon_action, verify_beacon_block,
 };
 use hyperscale_beacon::coordinator::{LocalChainAnchors, retention_floor};
+use hyperscale_beacon::verification::RatifyVoteSlotKey;
 use hyperscale_beacon::{
     Adopted, BeaconFold, BeaconParticipant, CandidateKeys, ChainRegistration, ParticipantStep,
 };
@@ -150,6 +151,13 @@ where
 
     /// The host's own submissions waiting on the records they name.
     submissions: DeferredForRecords,
+
+    /// Each peer item check in flight, with every participant waiting on
+    /// its outcome. Co-hosted participants are handed the same gossiped
+    /// vote or candidate, and the check against the shared fold comes out
+    /// the same for each, so the first to ask runs it and the outcome is
+    /// handed to all.
+    shared_checks: BTreeMap<SharedCheck, BTreeSet<Attachment>>,
 }
 
 /// One identity's beacon participation on the loop.
@@ -203,6 +211,7 @@ where
             interest: Interest::default(),
             fetch_tick: FetchTicker::default(),
             submissions: DeferredForRecords::new(),
+            shared_checks: BTreeMap::new(),
         }
     }
 
@@ -428,6 +437,10 @@ where
                 owner: BeaconOwner::Fold,
                 event,
             } => self.on_fold_outcome(*event),
+            BeaconScopedInput::Continuation {
+                owner: BeaconOwner::Participant(_),
+                event,
+            } if SharedCheck::of_outcome(&event).is_some() => self.on_shared_check(*event),
             BeaconScopedInput::Continuation {
                 owner: BeaconOwner::Participant(attachment),
                 event,
@@ -1162,6 +1175,9 @@ where
             action @ Action::VerifyBeaconBlock { .. } => self.dispatch_block_check(action),
             other if other.owner() == ActionOwner::Beacon => match owner {
                 BeaconOwner::Participant(attachment) => {
+                    if self.joins_a_shared_check(attachment, &other) {
+                        return;
+                    }
                     self.dispatch_participant_action(attachment.validator, other);
                 }
                 BeaconOwner::Fold | BeaconOwner::Chain(_) | BeaconOwner::Submissions => warn!(
@@ -1173,6 +1189,44 @@ where
                 action = other.type_name(),
                 "BeaconLoop: unexpected beacon action — dropping"
             ),
+        }
+    }
+
+    /// Whether `action` is a check another participant already runs, which
+    /// `attachment` now waits on too. The first to ask runs it.
+    fn joins_a_shared_check(&mut self, attachment: Attachment, action: &Action) -> bool {
+        let Some(check) = SharedCheck::of_action(action) else {
+            return false;
+        };
+        let waiting = self.shared_checks.entry(check).or_default();
+        let joined = !waiting.is_empty();
+        waiting.insert(attachment);
+        joined
+    }
+
+    /// A shared check's outcome: every participant still attached that
+    /// waited on it takes it, as if it had run the check itself.
+    fn on_shared_check(&mut self, event: ProtocolEvent) {
+        let Some(check) = SharedCheck::of_outcome(&event) else {
+            return;
+        };
+        let waiting: Vec<ValidatorId> = self
+            .shared_checks
+            .remove(&check)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|attachment| {
+                self.participants
+                    .get(&attachment.validator)
+                    .is_some_and(|p| p.attachment == *attachment)
+            })
+            .map(|attachment| attachment.validator)
+            .collect();
+        if let Some((&last, rest)) = waiting.split_last() {
+            for &validator in rest {
+                self.on_participant_event(validator, event.clone());
+            }
+            self.on_participant_event(last, event);
         }
     }
 
@@ -1518,6 +1572,50 @@ where
     }
 }
 
+/// A peer item check whose outcome depends on the item and the fold alone,
+/// keyed as each participant keys its own check slot: a ratify vote by
+/// its signer's seat in a round, a candidate by its block hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SharedCheck {
+    RatifyVote(RatifyVoteSlotKey),
+    Candidate(BeaconBlockHash),
+}
+
+impl SharedCheck {
+    fn of_action(action: &Action) -> Option<Self> {
+        match action {
+            Action::VerifyRatifyVote { vote, .. } => Some(Self::RatifyVote((
+                vote.anchor_hash(),
+                vote.epoch(),
+                vote.round(),
+                vote.phase(),
+                vote.signer(),
+            ))),
+            Action::VerifyBeaconCandidate { candidate, .. } => {
+                Some(Self::Candidate(candidate.block_hash()))
+            }
+            _ => None,
+        }
+    }
+
+    const fn of_outcome(event: &ProtocolEvent) -> Option<Self> {
+        match *event {
+            ProtocolEvent::RatifyVoteVerified {
+                anchor,
+                epoch,
+                round,
+                phase,
+                signer,
+                ..
+            } => Some(Self::RatifyVote((anchor, epoch, round, phase, signer))),
+            ProtocolEvent::BeaconCandidateVerified { block_hash, .. } => {
+                Some(Self::Candidate(block_hash))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Whether a beacon ask over `shard` reaches anyone: a live leaf with a
 /// committee.
 fn answers(topology: &TopologySnapshot, shard: ShardId) -> bool {
@@ -1761,9 +1859,10 @@ mod tests {
     use hyperscale_types::{
         AddressClass, AggregateSignature, BeaconBlock, BeaconCert, BeaconChainConfig,
         BeaconProposalDraft, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader,
-        BlockHeaderParts, BlockHeight, BlockVote, CertifiedBlock, CertifiedBlockHeader, Hash,
-        ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyRound, Round, SignerBitfield,
-        TopologySchedule, Unresolved, VrfProof, WeightedTimestamp, shard_prefix_path,
+        BlockHeaderParts, BlockHeight, BlockVote, CertifiedBlock, CertifiedBlockHeader,
+        ConsensusSignature, Hash, ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyPhase,
+        RatifyRound, RatifyVote, Round, SignerBitfield, TopologySchedule, Unresolved, VrfProof,
+        WeightedTimestamp, shard_prefix_path,
     };
     use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
@@ -2367,6 +2466,48 @@ mod tests {
             })
             .count();
         assert_eq!(received, 1);
+    }
+
+    /// Two co-hosted participants handed the same peer ratify vote check
+    /// it once between them, and both take the outcome.
+    #[test]
+    fn co_hosted_participants_check_a_peer_vote_once() {
+        let fix = Fixture::new();
+        let (_wire, mut host, events) = wired(&fix, SyncDispatch::new());
+        add(&mut host, &fix, 2);
+        add(&mut host, &fix, 3);
+        while events.try_recv().is_ok() {}
+        let fold = host.beacon.fold();
+        let vote = Arc::new(Verifiable::from(RatifyVote::new(
+            fold.latest_block().block_hash(),
+            fold.state().current_epoch.next(),
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            BeaconBlockHash::ZERO,
+            fix.committee.validator_id(1),
+            ConsensusSignature::new([0; 96]),
+        )));
+        let _ = host.step(HostEvent::beacon(
+            ProtocolEvent::UnverifiedRatifyVoteReceived { vote },
+        ));
+        let outcomes: Vec<HostEvent> = events
+            .try_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    HostEvent::Beacon(BeaconScopedInput::Continuation { event, .. })
+                        if matches!(**event, ProtocolEvent::RatifyVoteVerified { .. })
+                )
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 1, "one check runs for both participants");
+        for outcome in outcomes {
+            let _ = host.step(outcome);
+        }
+        assert!(
+            host.beacon.shared_checks.is_empty(),
+            "the outcome reaches every participant waiting on it",
+        );
     }
 
     /// The catch-up sync asks the committee's other members even where
