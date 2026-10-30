@@ -18,18 +18,18 @@
 //! and a validator that loses its role in a shard that stays up is
 //! detached the same way.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crossbeam::channel::{Receiver, Sender};
+use crossbeam::channel::Receiver;
 use hyperscale_core::ParticipationChange;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::{AddVnodeError, IrohNetwork};
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::process::ProcessIo;
-use hyperscale_node::reshape::orchestrator::{ReshapeOrchestrator, ReshapeRequest};
+use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
 use hyperscale_node::reshape::prepared::{PreparedStores, ReshapeCompletion};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::{NodeConfig, Registration, TimerOp};
@@ -46,17 +46,17 @@ use tracing::warn;
 
 use crate::rpc::RpcPublishers;
 use crate::runner::{LocalValidator, VnodeConfig, wall_clock_local};
-use crate::shard_thread::{
-    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, spawn_shard_loop,
-};
+use crate::shard_thread::{ProdShardLoop, ShardChannels, ShardLoopConfig, spawn_shard_loop};
 
 mod beacon;
 mod membership;
 mod reshape;
+mod seats;
 
 use beacon::BeaconThread;
 use hyperscale_node::startup::Replaced;
-use membership::{CompletedBootstrap, Rebuild};
+use membership::CompletedBootstrap;
+use seats::{SeatTable, ShardThread};
 
 /// The process-scoped resource bundle as the production runner types it.
 type ProdProcessIo = ProcessIo<RocksDbShardStorage, IrohNetwork, PooledDispatch>;
@@ -198,38 +198,6 @@ pub enum LoopStart<'a> {
     Resume(&'a RecoveredState),
 }
 
-/// A seat whose chain is registering with the host's beacon loop: what
-/// its loop is built from once the registration comes back.
-pub struct Registering {
-    shard: ShardId,
-    vnodes: Vec<VnodeConfig>,
-    storage: Arc<RocksDbShardStorage>,
-    recovered: RecoveredState,
-    genesis: Option<Block>,
-    channels: ShardChannels,
-    sender: Sender<HostEvent>,
-}
-
-/// One hosted shard's runtime: its pinned thread plus the handles the
-/// supervisor needs to stop it.
-/// A torn down shard's thread, joined by whichever comes first: its
-/// off-loop join or [`ShardSupervisor::shutdown_all`].
-type DrainingThread = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
-
-struct ShardThread {
-    join: std::thread::JoinHandle<()>,
-    shutdown_tx: Sender<()>,
-    /// Signer changes into the running loop.
-    control_tx: Sender<ShardControl>,
-    /// Validators whose attach was sent to the loop and not yet reported
-    /// back.
-    queued: Vec<u64>,
-    /// The ids of the validators attached to the shard's replica. The
-    /// shard tears down when the last leaves, and teardown scrubs their
-    /// slots from the validator-keyed RPC state maps.
-    validator_ids: Vec<u64>,
-}
-
 /// Owns the per-shard pinned threads and executes runtime membership
 /// changes. Lives on the runner's tokio loop — never on a shard thread.
 pub struct ShardSupervisor {
@@ -258,21 +226,8 @@ pub struct ShardSupervisor {
     /// Cloned into every spawned shard loop's config so placement
     /// deltas reach the runner's reconfiguration loop.
     participation_tx: mpsc::UnboundedSender<ParticipationChange>,
-    shards: BTreeMap<ShardId, ShardThread>,
-    /// Shards whose join is parked on background work — the off-loop
-    /// storage open or an in-flight snap-sync bootstrap — mapped to the
-    /// validators still pending. Guards against a second `Join` racing a
-    /// double import; a `Leave` meanwhile releases its validator, abandoning
-    /// the join when none is left.
-    bootstrapping: HashMap<ShardId, BTreeSet<ValidatorId>>,
-    /// Running shards rebuilding at their attested anchor, after a fork
-    /// recovery or once block sync can no longer carry the store forward.
-    /// A join for one waits for the swap, which seats every placed local
-    /// validator.
-    rebuilding: HashMap<ShardId, Rebuild>,
-    /// How many rebuilds have started, numbering each so its completion is
-    /// matched to the staging that is still current.
-    rebuilds: u64,
+    /// Every shard's seat here, in whichever phase it holds.
+    seats: SeatTable,
     /// The sans-io reshape orchestrator — discovers this host's observer
     /// and keeper duties from the committed-state projection and sequences
     /// them. The supervisor pumps it on a timer and on every placement
@@ -283,35 +238,9 @@ pub struct ShardSupervisor {
     /// orchestrator's open and seat requests. Seated stores move into
     /// [`Self::storages`].
     reshape_stores: PreparedStores<Arc<RocksDbShardStorage>>,
-    /// Reshape store-prep requests (`OpenStore` / `SeedFromParent`) held while
-    /// an ordinary join is still opening the same shard's store directory, or
-    /// a torn down loop still holds its store there, keyed by that store
-    /// shard. A reshape duty owns its successor's store, but a join that
-    /// slipped past the `reshape_owns` suppression (a lagging topology
-    /// snapshot) may already be mid-open, and a draining thread closes its
-    /// store only once it joins; holding the prep until then keeps the two off
-    /// the same `RocksDB` directory, which the prep wipes and whose exclusive
-    /// lock would otherwise fail the second open. Re-dispatched from
-    /// [`Self::resume_pending_reshape_prep`] once the join or drain clears.
-    pending_reshape_prep: HashMap<ShardId, ReshapeRequest>,
     /// Beacon epoch length, for the keeper's deterministic merged-genesis
     /// cut derivation. Matches the beacon's own chain config.
     epoch_duration_ms: u64,
-    /// Shards whose teardown is parked on the off-loop thread join, each
-    /// with its thread's handle until that join takes it. A `Join`
-    /// arriving meanwhile queues in [`Self::pending_joins`]. The handle
-    /// stays here because the runtime drops a queued blocking job unrun
-    /// when it shuts down; [`Self::shutdown_all`] joins what is left.
-    draining: HashMap<ShardId, DrainingThread>,
-    /// Joins that arrived while their shard was draining, replayed by
-    /// the [`SupervisorEvent::TornDown`] handler. Dropping them instead
-    /// would lose the join until the next reconcile.
-    pending_joins: HashMap<ShardId, Vec<VnodeConfig>>,
-    /// Joins whose fresh store found no attested anchor for a shard that
-    /// did not begin at network genesis. Nothing is seated; the reshape
-    /// tick's [`Self::reconcile_joins`] retries each once this host's
-    /// topology carries the anchor.
-    awaiting_anchor: BTreeMap<ShardId, Vec<VnodeConfig>>,
     /// Background-work completions land here; the runner's select loop
     /// drains the paired receiver into [`Self::on_event`].
     events_tx: mpsc::UnboundedSender<SupervisorEvent>,
@@ -325,14 +254,6 @@ pub struct ShardSupervisor {
     beacon_event_rx: Receiver<HostEvent>,
     /// Signing keys for the host's local validators.
     vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
-    /// Seats whose chain is registering with the beacon loop, by seat
-    /// number, built and spawned once the registration comes back. A
-    /// shard has at most one, and while it does its `bootstrapping` entry
-    /// holds the seat's pending validators.
-    registering: BTreeMap<u64, Registering>,
-    /// How many seats have registered, numbering each so its reply is
-    /// matched to the seat that sent it.
-    registrations: u64,
 }
 
 impl ShardSupervisor {
@@ -373,20 +294,11 @@ impl ShardSupervisor {
             storage_dir,
             engine_bootstrap,
             participation_tx,
-            shards: BTreeMap::new(),
-            bootstrapping: HashMap::new(),
-            rebuilding: HashMap::new(),
-            rebuilds: 0,
+            seats: SeatTable::default(),
             reshape: ReshapeOrchestrator::new(vnode_keys.keys().copied().collect()),
             reshape_stores: PreparedStores::new(),
-            pending_reshape_prep: HashMap::new(),
             epoch_duration_ms,
-            draining: HashMap::new(),
-            pending_joins: HashMap::new(),
-            awaiting_anchor: BTreeMap::new(),
             beacon: None,
-            registering: BTreeMap::new(),
-            registrations: 0,
             beacon_event_rx,
             vnode_keys,
             events_tx,
@@ -458,7 +370,7 @@ impl ShardSupervisor {
         let validator_ids = shard_loop.signers().map(ValidatorId::inner).collect();
         let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
-        self.shards.insert(
+        self.seats.run(
             shard,
             ShardThread {
                 join,
@@ -589,17 +501,18 @@ impl ShardSupervisor {
     /// thread is stopped alongside them.
     pub(crate) fn shutdown_all(&mut self) {
         self.teardown_beacon_loop();
-        for (shard, entry) in &self.shards {
+        let (running, draining) = self.seats.drain_all();
+        for (shard, entry) in &running {
             if entry.shutdown_tx.send(()).is_err() {
                 tracing::debug!(shard = ?shard, "Shard already exited");
             }
         }
-        for entry in std::mem::take(&mut self.shards).into_values() {
+        for entry in running.into_values() {
             if let Err(e) = entry.join.join() {
                 warn!("Shard thread panicked: {e:?}");
             }
         }
-        for draining in std::mem::take(&mut self.draining).into_values() {
+        for draining in draining {
             let join = draining
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

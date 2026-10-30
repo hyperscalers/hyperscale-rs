@@ -9,7 +9,7 @@
 //! lands back on the runner's select loop as a [`SupervisorEvent::Reshape`]
 //! and settles through the host's prepared stores.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
@@ -17,7 +17,8 @@ use hyperscale_network_iroh::IrohNetwork;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
 use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
-    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
+    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeOrchestrator,
+    ReshapeRequest, seed_gate,
 };
 use hyperscale_node::reshape::prepared::{ReshapeCompletion, Seating};
 use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
@@ -33,39 +34,15 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
     Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
-    SubstateKey, SubstateLeaf, ValidatorId,
+    Signer, SubstateKey, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{ShardSupervisor, SupervisorEvent};
+use super::{ProdProcessIo, ShardSupervisor, SupervisorEvent};
 use crate::runner::wall_clock_local;
 
 impl ShardSupervisor {
-    /// Whether a reshape duty on this host owns seating `shard` — one of the
-    /// host's validators holds a parent-half or observer seat for `shard` as a
-    /// split child, or a keeper seat reforming `shard` as a merge parent.
-    ///
-    /// Read straight from the committed projection (the cohorts the beacon fold
-    /// published), so it answers before the orchestrator's discovery step
-    /// populates its own duty maps — the window in which an ordinary join would
-    /// otherwise race the reshape duty for the shard's store directory. A seat
-    /// the orchestrator relinquished to the join is not owned, cohort or not.
-    pub(super) fn reshape_owns(&self, shard: ShardId) -> bool {
-        if self.reshape.relinquished(shard) {
-            return false;
-        }
-        let schedule = self.process.topology_schedule();
-        let view = ReshapeView::new(&schedule);
-        host_reshape_owns(
-            view.parent_half_cohorts(),
-            view.observer_cohorts(),
-            view.keeper_cohorts(),
-            shard,
-            |validator| self.vnode_keys.contains_key(validator),
-        )
-    }
-
     /// The runner's reshape tick: pump the orchestrator with no completion,
     /// so a duty waiting on the clock — a deferred seed, a paced fetch —
     /// re-arms once its wait is out.
@@ -109,31 +86,17 @@ impl ShardSupervisor {
     /// `bootstrapping` or `draining` entry cleared — so the duty opens the
     /// store now that nothing else holds the directory.
     pub(super) fn resume_pending_reshape_prep(&mut self) {
-        let ready: Vec<ShardId> = self
-            .pending_reshape_prep
-            .keys()
-            .copied()
-            .filter(|shard| !self.holds_store_dir(*shard))
-            .collect();
-        for shard in ready {
+        for shard in self.seats.ready_preps() {
+            let Some(request) = self.seats.take_prep(shard) else {
+                continue;
+            };
             // The reshape that requested this prep may have been cancelled while
             // it was held; drop the held prep rather than opening a store no
             // duty will seat.
-            if !self.reshape_owns(shard) {
-                self.pending_reshape_prep.remove(&shard);
-                continue;
-            }
-            if let Some(request) = self.pending_reshape_prep.remove(&shard) {
+            if reshape_owns(&self.reshape, &self.process, &self.vnode_keys, shard) {
                 self.dispatch_reshape(request);
             }
         }
-    }
-
-    /// Whether a join or a teardown still holds `shard`'s store directory:
-    /// a join opening or seating it, or a torn down loop whose thread has
-    /// not yet joined and closed its store.
-    fn holds_store_dir(&self, shard: ShardId) -> bool {
-        self.bootstrapping.contains_key(&shard) || self.draining.contains_key(&shard)
     }
 
     /// Perform one reshape io request, answering with a
@@ -148,16 +111,16 @@ impl ShardSupervisor {
         // `resume_pending_reshape_prep`.
         let store_shard = request.prepared_shard();
         if let Some(shard) = store_shard
-            && self.holds_store_dir(shard)
+            && self.seats.holds_store_dir(shard)
         {
             info!(shard = ?shard, "Reshape store-prep held behind an in-flight join or teardown");
-            self.pending_reshape_prep.insert(shard, request);
+            self.seats.hold_prep(shard, request);
             return;
         }
         // A running target's directory is that loop's live store and is
         // never wiped.
         if let Some(shard) = store_shard
-            && self.shards.contains_key(&shard)
+            && self.seats.is_running(shard)
         {
             info!(shard = ?shard, "Reshape store-prep for a shard already running here; its store stays");
             if let Some(OverRunning::Answer(event)) = request.over_running() {
@@ -595,12 +558,12 @@ impl ShardSupervisor {
     /// store the duty adopted into. The orchestrator owns this seating, so
     /// an ordinary join for the same shard is suppressed.
     fn reshape_seat(&mut self, shard: ShardId) {
-        let draining = self.draining.contains_key(&shard);
+        let draining = self.seats.is_draining(shard);
         debug_assert!(
             !draining || !self.reshape_stores.contains(shard),
             "a store is prepared for {shard:?} while its torn down loop drains",
         );
-        let hosted = self.shards.contains_key(&shard) || draining;
+        let hosted = self.seats.is_running(shard) || draining;
         let Some(Seating {
             storage,
             genesis,
@@ -613,7 +576,7 @@ impl ShardSupervisor {
         // issued while a join is in flight is held behind it, and a prepared
         // store suppresses any later join (`join` reads `reshape_stores`).
         debug_assert!(
-            !self.bootstrapping.contains_key(&shard),
+            !self.seats.is_bootstrapping(shard),
             "a join is bootstrapping {shard:?} under its reshape seat",
         );
         let topology_snapshot = self.process.topology_snapshot().load_full();
@@ -667,6 +630,37 @@ impl ShardSupervisor {
             self.join(child, &vnodes);
         }
     }
+}
+
+/// Whether a reshape duty on this host owns seating `shard` — one of the
+/// host's validators holds a parent-half or observer seat for `shard` as a
+/// split child, or a keeper seat reforming `shard` as a merge parent.
+///
+/// Read straight from the committed projection (the cohorts the beacon fold
+/// published), so it answers before the orchestrator's discovery step
+/// populates its own duty maps — the window in which an ordinary join would
+/// otherwise race the reshape duty for the shard's store directory. A seat
+/// the orchestrator relinquished to the join is not owned, cohort or not.
+/// Takes the supervisor's fields apart so a join can ask it while its seat
+/// table is borrowed.
+pub(super) fn reshape_owns(
+    reshape: &ReshapeOrchestrator,
+    process: &ProdProcessIo,
+    vnode_keys: &HashMap<ValidatorId, Arc<dyn Signer>>,
+    shard: ShardId,
+) -> bool {
+    if reshape.relinquished(shard) {
+        return false;
+    }
+    let schedule = process.topology_schedule();
+    let view = ReshapeView::new(&schedule);
+    host_reshape_owns(
+        view.parent_half_cohorts(),
+        view.observer_cohorts(),
+        view.keeper_cohorts(),
+        shard,
+        |validator| vnode_keys.contains_key(validator),
+    )
 }
 
 /// Send a reshape event back to the supervisor loop. Send failure means
