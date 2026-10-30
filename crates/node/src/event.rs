@@ -22,7 +22,7 @@ use std::time::Duration;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
-use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
+use hyperscale_core::{CommitSource, FetchIds, ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_network::RequestError;
 use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::network::notification::BlockHeaderNotification;
@@ -31,7 +31,7 @@ use hyperscale_types::{
     CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
     ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, MAX_UNSETTLED_PER_BLOCK,
     MAX_UNSETTLED_TXS, ShardForkProof, ShardId, ShardVoteEquivocation, Signer, TopologySchedule,
-    Transaction, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Transaction, TransactionStatus, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -957,5 +957,134 @@ impl HostEvent {
             Self::Process(input) => input.type_name(),
             Self::Beacon(input) => input.type_name(),
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TimerOp — buffered timer operations for the runner
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Whose timer a [`TimerOp`] names, and so whom its fire reaches.
+///
+/// Each beacon participant arms the same [`TimerId`]s against its own
+/// deadlines, so a participant's timer is its own and its fire reaches it
+/// alone. A shard loop's timers, its replica's and its fetch tick, are the
+/// loop's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TimerOwner {
+    /// A hosted shard's loop: its replica's timers and its fetch tick.
+    Loop(ShardId),
+    /// One attached identity's beacon participation on the host's beacon
+    /// loop.
+    Participant(Attachment),
+    /// The host's beacon loop itself: its fetch tick.
+    Beacon,
+}
+
+/// A timer operation buffered by a loop driver for the runner to process.
+///
+/// The runner's timer driver keys handles by `(TimerOwner, TimerId)`, and
+/// the firing path ([`timer_event`]) addresses the envelope to the owner.
+#[derive(Debug, Clone)]
+pub enum TimerOp {
+    /// Set a timer to fire after `duration`.
+    Set {
+        /// Whose timer this is.
+        owner: TimerOwner,
+        /// Logical timer identifier (state-machine-side).
+        id: TimerId,
+        /// How long until the timer should fire.
+        duration: Duration,
+    },
+    /// Cancel a previously set timer.
+    Cancel {
+        /// Whose timer this is.
+        owner: TimerOwner,
+        /// Logical timer identifier to cancel.
+        id: TimerId,
+    },
+}
+
+/// Translate a fired [`TimerId`] back into the [`HostEvent`] the runner
+/// pushes onto its event channel.
+///
+/// The envelope is addressed to the timer's owner: a loop's timer to its
+/// shard, a participant's to that participant alone, and the beacon loop's
+/// fetch tick to the beacon loop.
+#[must_use]
+pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
+    let event = match id {
+        TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
+        TimerId::Cleanup => ProtocolEvent::CleanupTimer,
+        TimerId::ProposalPace => ProtocolEvent::ProposalPaceTimer,
+        TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
+        TimerId::FetchTick => {
+            return match owner {
+                TimerOwner::Loop(shard) => HostEvent::shard(shard, ShardScopedInput::FetchTick),
+                TimerOwner::Participant(_) | TimerOwner::Beacon => HostEvent::beacon_fetch_tick(),
+            };
+        }
+        TimerId::BeaconCommitteeStart => ProtocolEvent::BeaconCommitteeStartTimer,
+        TimerId::BeaconRatifyTrigger => ProtocolEvent::BeaconRatifyTimer,
+        TimerId::BeaconSpcView => ProtocolEvent::BeaconSpcViewTimer,
+        TimerId::BeaconSpcInputDwell => ProtocolEvent::BeaconSpcInputDwellTimer,
+    };
+    match owner {
+        TimerOwner::Loop(shard) => HostEvent::protocol(shard, event),
+        TimerOwner::Participant(participant) => {
+            HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
+                participant,
+                event: Box::new(event),
+            })
+        }
+        TimerOwner::Beacon => HostEvent::beacon(event),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// StepOutput — returned to the caller after processing an event
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Output from processing a single event via `NodeHost::step()`.
+///
+/// Aggregates the per-step scratch from every hosted shard touched by
+/// the event: emitted transaction statuses, timer operations, action
+/// counts. Sync/fetch I/O and block-commit dispatch happen internally
+/// via the `Network` and `Dispatch` traits — the runner only processes
+/// emitted transaction statuses and timer operations.
+#[derive(Default)]
+pub struct StepOutput {
+    /// Transaction status notifications emitted during this step.
+    pub(crate) emitted_statuses: Vec<(TxHash, TransactionStatus)>,
+    /// Number of actions generated by the state machine during this step.
+    pub actions_generated: usize,
+    /// Timer operations (set/cancel) to be processed by the runner.
+    pub timer_ops: Vec<TimerOp>,
+    /// Placement deltas emitted via [`Action::ReconfigureParticipation`]
+    /// during this step. The runner reconfigures physical shard
+    /// membership from these — they are requests to the process layer,
+    /// not state-machine state.
+    pub participation_changes: Vec<ParticipationChange>,
+    /// Validators the loop attached to its replica during this step.
+    pub attached: Vec<ValidatorId>,
+    /// Shards whose store needs a height beneath every serving peer's
+    /// chain floor. Block sync can never carry such a store forward; the
+    /// runner rebuilds it at the shard's attested anchor.
+    pub reseats: Vec<ShardId>,
+}
+
+impl StepOutput {
+    /// Fold another step's output into this one. The whole-host driver
+    /// ([`NodeHost::step`](crate::host::NodeHost::step)) uses this to
+    /// aggregate the per-driver outputs of every shard and the beacon loop a
+    /// single event touched.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.emitted_statuses.extend(other.emitted_statuses);
+        self.actions_generated += other.actions_generated;
+        self.timer_ops.extend(other.timer_ops);
+        self.participation_changes
+            .extend(other.participation_changes);
+        self.attached.extend(other.attached);
+        self.reseats.extend(other.reseats);
     }
 }
