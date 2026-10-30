@@ -1337,7 +1337,6 @@ mod tests {
             beacon_tx,
             ShardInbox::new(internal_tx, network_tx),
         );
-        host.register_gossip_handlers();
         while internal.try_recv().is_ok() {}
 
         assert_eq!(
@@ -1384,12 +1383,11 @@ mod tests {
         let (internal_tx, _internal) = unbounded();
         let (network_tx, network) = unbounded();
         let (beacon_tx, _beacon) = unbounded();
-        let host = fix.host_with_inbox(
+        let _host = fix.host_with_inbox(
             Arc::clone(&registry),
             beacon_tx,
             ShardInbox::new(internal_tx, network_tx),
         );
-        host.register_notification_handlers();
         let (validator, signer) = fix.identity(2);
         let signal_for = |shard: ShardId| {
             ReadySignalNotification::new(
