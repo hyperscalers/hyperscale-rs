@@ -52,9 +52,10 @@ public_key = "850e1b31deb8cf7202b3a060f79ba72d107688cda71f2fa78016c29395e148cb19
 # address = "0123456789abcdef..." # 64 hex chars
 # balance = "1000000"
 
-# Staking pools seated at genesis. Every genesis validator belongs to pool
-# number 0, and genesis fills each pool's founding members from the validator
-# set. A network that seats no pool 0 gets one no key operates.
+# Staking pools seated at genesis. A genesis validator belongs to pool 0
+# unless its entry names another with `pool = <number>`, and genesis fills
+# each pool's founding members from the validator set. A network that seats
+# no pool 0 gets one no key operates.
 #
 # [[genesis.pools]]
 # number = 0

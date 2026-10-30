@@ -1,6 +1,8 @@
 //! The validators a runner projects its initial
 //! [`TopologySnapshot`](super::snapshot::TopologySnapshot) from at genesis.
 
+use std::collections::BTreeMap;
+
 use crate::{NetworkDefinition, ValidatorId, ValidatorSet};
 
 /// The validators that exist at genesis: the network, the full registered
@@ -24,10 +26,14 @@ pub struct GenesisValidators {
     /// The genesis ROOT committee. Any registered validator absent from it
     /// starts `Pooled`; pass every validator id to seat the whole set.
     pub committee: Vec<ValidatorId>,
+    /// The genesis stake pool seat each validator belongs to, by seat
+    /// number. A validator absent here belongs to seat 0.
+    pub seats: BTreeMap<ValidatorId, u32>,
 }
 
 impl GenesisValidators {
-    /// Genesis validators with `committee` seating the single ROOT shard.
+    /// Genesis validators with `committee` seating the single ROOT shard,
+    /// every one in seat 0.
     #[must_use]
     pub const fn new(
         network: NetworkDefinition,
@@ -38,6 +44,13 @@ impl GenesisValidators {
             network,
             validators,
             committee,
+            seats: BTreeMap::new(),
         }
+    }
+
+    /// The seat number `validator` belongs to.
+    #[must_use]
+    pub fn seat_of(&self, validator: ValidatorId) -> u32 {
+        self.seats.get(&validator).copied().unwrap_or(0)
     }
 }

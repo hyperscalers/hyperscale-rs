@@ -214,25 +214,42 @@ impl GenesisBoot {
 /// Genesis is a single ROOT shard. The committee seats it; the committee
 /// validators ordered by id form the beacon committee, capped at
 /// [`BeaconChainConfig::beacon_committee_size`]. Every registered validator,
-/// seated or pooled, joins the single genesis stake pool `founding` — the
-/// address of the pool `pools` seats for it — so the projected global set
-/// carries the pooled surplus a later reshape draws its child cohort from.
+/// seated or pooled, joins the stake pool of the seat `genesis` places it
+/// in — the pool `pool_of` names for that seat among `pools` — so the
+/// projected global set carries the pooled surplus a later reshape draws
+/// its child cohort from. Each pool holds its members' stake at the floor.
+///
+/// # Panics
+///
+/// If a validator's seat is not among `pools`.
 #[must_use]
 pub fn build_genesis(
     genesis: &GenesisValidators,
     chain_config: BeaconChainConfig,
     pools: &[StakePoolSeat],
-    founding: StakePoolId,
+    pool_of: impl Fn(&StakePoolSeat) -> StakePoolId,
 ) -> GenesisBoot {
-    let pool_id = founding;
+    let seat_pools: BTreeMap<u32, StakePoolId> = pools
+        .iter()
+        .map(|seat| (seat.number, pool_of(seat)))
+        .collect();
     let validators: Vec<GenesisValidator> = genesis
         .validators
         .validators
         .iter()
-        .map(|v| GenesisValidator {
-            id: v.validator_id,
-            pool: pool_id,
-            pubkey: v.public_key,
+        .map(|v| {
+            let seat = genesis.seat_of(v.validator_id);
+            let pool = *seat_pools.get(&seat).unwrap_or_else(|| {
+                panic!(
+                    "genesis places validator {} in seat {seat}, which no pool seats",
+                    v.validator_id
+                )
+            });
+            GenesisValidator {
+                id: v.validator_id,
+                pool,
+                pubkey: v.public_key,
+            }
         })
         .collect();
     let seated: BTreeSet<ValidatorId> = genesis.committee.iter().copied().collect();
@@ -241,15 +258,21 @@ pub fn build_genesis(
         .min(chain_config.beacon_committee_size as usize);
     let beacon_committee: Vec<ValidatorId> = seated.into_iter().take(committee_len).collect();
 
-    // One genesis pool holds every validator at the stake floor.
-    let total_stake = Stake::from_quanta(validators.len() as u128 * MIN_STAKE_FLOOR.quanta());
+    let mut members: BTreeMap<StakePoolId, u128> = BTreeMap::new();
+    for v in &validators {
+        *members.entry(v.pool).or_default() += 1;
+    }
+    let initial_pools = members
+        .into_iter()
+        .map(|(id, count)| GenesisPool {
+            id,
+            total_stake: Stake::from_quanta(count * MIN_STAKE_FLOOR.quanta()),
+        })
+        .collect();
     let config = BeaconGenesisConfig {
         chain_config,
         initial_validators: validators,
-        initial_pools: vec![GenesisPool {
-            id: pool_id,
-            total_stake,
-        }],
+        initial_pools,
         initial_beacon_committee: beacon_committee,
         initial_shard_committee: genesis.committee.clone(),
         initial_randomness: Randomness::new([0x42; 32]),
@@ -436,10 +459,11 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
-    use hyperscale_types::test_utils::test_pool;
+    use hyperscale_types::test_utils::{test_pool, test_principal};
     use hyperscale_types::{
         BeaconChainConfig, BlockHeaderParts, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
         NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, TopologySchedule,
+        ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
@@ -632,6 +656,45 @@ mod tests {
         let pool = state.pools.get(&test_pool(0)).unwrap();
         let expected: BTreeSet<ValidatorId> = (0u64..6).map(ValidatorId::new).collect();
         assert_eq!(pool.validators, expected);
+    }
+
+    /// Each validator joins the pool of the seat it names, seat 0 when it
+    /// names none, and each pool holds its own members' stake.
+    #[test]
+    fn genesis_places_each_validator_in_its_seats_pool() {
+        let validators = ValidatorSet::new(
+            (0u64..4)
+                .map(|i| ValidatorInfo {
+                    validator_id: ValidatorId::new(i),
+                    public_key: pubkey(i),
+                })
+                .collect(),
+        );
+        let committee = (0u64..4).map(ValidatorId::new).collect();
+        let mut genesis =
+            GenesisValidators::new(NetworkDefinition::simulator(), validators, committee);
+        genesis.seats = [(ValidatorId::new(2), 1), (ValidatorId::new(3), 1)].into();
+        let seat = |number| StakePoolSeat {
+            number,
+            operator: test_principal(1),
+            founding: Vec::new(),
+        };
+        let boot = build_genesis(
+            &genesis,
+            BeaconChainConfig::at_unix_epoch(),
+            &[seat(0), seat(1)],
+            |seat| test_pool(seat.number),
+        );
+        for (pool, members) in [(0, [0u64, 1]), (1, [2, 3])] {
+            let pool = boot.state.pools.get(&test_pool(pool)).unwrap();
+            let expected: BTreeSet<ValidatorId> =
+                members.into_iter().map(ValidatorId::new).collect();
+            assert_eq!(pool.validators, expected);
+            assert_eq!(
+                pool.total_stake,
+                Stake::from_quanta(2 * MIN_STAKE_FLOOR.quanta())
+            );
+        }
     }
 
     #[test]

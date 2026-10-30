@@ -30,7 +30,7 @@ use hyperscale_core::ParticipationChange;
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
-use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
+use hyperscale_engine::genesis::{genesis_seats, seat_pool};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, PreviewGrants};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_network_peers, set_pool_queue_depths};
@@ -361,12 +361,7 @@ impl ProductionRunnerBuilder {
                 .as_ref()
                 .map_or_default(|config| config.pools.clone()),
         );
-        let boot = build_genesis(
-            &genesis_validators,
-            chain_config,
-            &seat_list,
-            founding_pool(&seat_list),
-        );
+        let boot = build_genesis(&genesis_validators, chain_config, &seat_list, seat_pool);
         // Warm-restart: resume the beacon coordinator from the latest
         // committed (block, state) in storage. On an empty store, commit the
         // genesis pair first so fresh-start and restart converge on the same

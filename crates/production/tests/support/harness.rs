@@ -22,7 +22,7 @@ use std::{iter, thread};
 
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
-use hyperscale_engine::genesis::{founding_pool, genesis_seats, seat_pool};
+use hyperscale_engine::genesis::{genesis_seats, seat_pool};
 use hyperscale_network_iroh::fault::{DropSpec, HostId, Rewrite, RuleHandle};
 use hyperscale_network_iroh::{EndpointAddr, EndpointId, IrohAdapter, SecretKey};
 use hyperscale_node::{SharedTopologySnapshot, network_genesis_block};
@@ -202,7 +202,7 @@ impl ClusterBuild {
             &self.genesis,
             self.beacon_chain_config,
             &config.pools,
-            founding_pool(&config.pools),
+            seat_pool,
         );
         seed_founding_members(&boot.state, &mut config.pools, seat_pool);
         config

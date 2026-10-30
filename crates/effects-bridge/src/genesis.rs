@@ -256,8 +256,8 @@ pub fn seat_pool(seat: &StakePoolSeat) -> StakePoolId {
 /// operated by [`unoperated`], when none is numbered 0.
 ///
 /// Seat 0 is the pool beacon genesis places every genesis validator in
-/// ([`founding_pool`]), so every genesis seats it on its shard: its
-/// configuration is written there, and no one can seal its address
+/// unless it names another seat, so every genesis seats it on its shard:
+/// its configuration is written there, and no one can seal its address
 /// afterwards and take the badge of a pool holding the genesis stake.
 #[must_use]
 pub fn genesis_seats(pools: &[StakePoolSeat]) -> Vec<StakePoolSeat> {
@@ -268,16 +268,6 @@ pub fn genesis_seats(pools: &[StakePoolSeat]) -> Vec<StakePoolSeat> {
     seats.push(unoperated_seat());
     seats.extend_from_slice(pools);
     seats
-}
-
-/// The pool beacon genesis places every genesis validator in: seat 0 of
-/// [`genesis_seats`].
-#[must_use]
-pub fn founding_pool(pools: &[StakePoolSeat]) -> StakePoolId {
-    pools
-        .iter()
-        .find(|seat| seat.number == 0)
-        .map_or_else(|| seat_pool(&unoperated_seat()), seat_pool)
 }
 
 /// Seat 0 as genesis installs it when no configured seat claims it.

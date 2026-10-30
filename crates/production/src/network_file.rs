@@ -5,7 +5,7 @@
 //! [`NetworkFile`]'s both write it. A [`NetworkFile`] adds the rest a host
 //! needs to join: which network, its chain parameters and how to reach it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hex::{decode as hex_decode, encode as hex_encode};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
@@ -63,6 +63,14 @@ pub enum NetworkFileError {
         /// Seats on the genesis shard.
         seats: u32,
     },
+    /// A validator names a pool no `[[genesis.pools]]` entry seats.
+    #[error("validator {id} is in pool {pool}, which no pool entry seats")]
+    UnseatedPool {
+        /// The validator.
+        id: u64,
+        /// The pool number it names.
+        pool: u32,
+    },
     /// A governable parameter the chain section sets is out of the bounds a
     /// vote could not move it past either.
     #[error("chain: {0}")]
@@ -112,9 +120,10 @@ pub struct Genesis {
     #[serde(default)]
     pub accounts: Vec<AccountBalanceEntry>,
 
-    /// Staking pools seated at genesis. Every genesis validator belongs to
-    /// pool number 0, so a network whose validators vote on parameters seats
-    /// it with an operator.
+    /// Staking pools seated at genesis. A genesis validator belongs to the
+    /// pool its entry numbers, pool 0 unless it names another, so a network
+    /// whose validators vote on parameters seats each such pool with an
+    /// operator.
     #[serde(default)]
     pub pools: Vec<PoolEntry>,
 }
@@ -125,7 +134,8 @@ pub struct Genesis {
 #[serde(deny_unknown_fields)]
 pub struct PoolEntry {
     /// The seat's number: the salt its instance's address derives under.
-    /// Number 0 is the pool every genesis validator belongs to.
+    /// Number 0 is the pool a genesis validator belongs to unless its entry
+    /// names another.
     pub number: u32,
 
     /// Hex-encoded 32-byte address of the account that receives the pool's
@@ -153,6 +163,10 @@ pub struct ValidatorEntry {
 
     /// Hex-encoded 48-byte BLS public key.
     pub public_key: String,
+
+    /// The number of the genesis pool this validator belongs to.
+    #[serde(default)]
+    pub pool: u32,
 }
 
 impl ValidatorEntry {
@@ -162,6 +176,7 @@ impl ValidatorEntry {
         Self {
             id,
             public_key: hex_encode(key.as_bytes()),
+            pool: 0,
         }
     }
 
@@ -230,7 +245,14 @@ impl Genesis {
             .iter()
             .map(|v| v.validator_id)
             .collect();
-        Ok(GenesisValidators::new(network, validator_set, committee))
+        let mut genesis = GenesisValidators::new(network, validator_set, committee);
+        genesis.seats = self
+            .validators
+            .iter()
+            .filter(|v| v.pool != 0)
+            .map(|v| (ValidatorId::new(v.id), v.pool))
+            .collect::<BTreeMap<_, _>>();
+        Ok(genesis)
     }
 
     /// The engine's genesis: funded accounts and seated pools.
@@ -363,6 +385,16 @@ impl NetworkFile {
         let mut seen = BTreeSet::new();
         if let Some(repeated) = listed.iter().find(|v| !seen.insert(v.id)) {
             return Err(NetworkFileError::Repeated(repeated.id));
+        }
+        let pools: BTreeSet<u32> = file.genesis.pools.iter().map(|p| p.number).collect();
+        if let Some(unseated) = listed
+            .iter()
+            .find(|v| v.pool != 0 && !pools.contains(&v.pool))
+        {
+            return Err(NetworkFileError::UnseatedPool {
+                id: unseated.id,
+                pool: unseated.pool,
+            });
         }
         let seats = file.beacon_chain().shard_size;
         if listed.len() > seats as usize {
@@ -673,6 +705,28 @@ mod tests {
         let genesis: Genesis = toml_from_str(&toml).expect("pools table parses");
         let engine = genesis.engine().expect("pools build");
         assert_eq!(engine.pools, seats);
+    }
+
+    /// A validator naming a seated pool is placed in it, the rest in seat
+    /// 0; one naming a pool no entry seats is refused.
+    #[test]
+    fn a_genesis_validator_belongs_to_the_pool_it_names() {
+        let operator = hex_encode(world_pools()[0].operator.to_bytes());
+        let pool = format!("[[genesis.pools]]\nnumber = 3\noperator = \"{operator}\"\n");
+        let text = file(&[0, 1], &pool).replacen("id = 1\n", "id = 1\npool = 3\n", 1);
+        let parsed = NetworkFile::from_toml(&text).expect("parses");
+        let genesis = parsed
+            .genesis
+            .validators(parsed.network.clone(), &[])
+            .expect("builds");
+        assert_eq!(genesis.seat_of(ValidatorId::new(0)), 0);
+        assert_eq!(genesis.seat_of(ValidatorId::new(1)), 3);
+
+        let unseated = file(&[0, 1], "").replacen("id = 1\n", "id = 1\npool = 3\n", 1);
+        assert!(matches!(
+            NetworkFile::from_toml(&unseated),
+            Err(NetworkFileError::UnseatedPool { id: 1, pool: 3 })
+        ));
     }
 
     /// Founding members come from the validator set, never the config: a

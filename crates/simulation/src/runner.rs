@@ -19,7 +19,7 @@ use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_crypto_mock::{MockSigner, MockVerifier};
 use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
-use hyperscale_engine::genesis::{GenesisPackages, founding_pool, genesis_seats, seat_pool};
+use hyperscale_engine::genesis::{GenesisPackages, genesis_seats, seat_pool};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
@@ -719,12 +719,7 @@ impl SimulationRunner {
         // committee size, form the genesis beacon committee.
         let beacon_network = genesis_validators.network.clone();
         let mut pools = genesis_seats(&network_config.pools);
-        let boot = build_genesis(
-            &genesis_validators,
-            chain_config,
-            &pools,
-            founding_pool(&pools),
-        );
+        let boot = build_genesis(&genesis_validators, chain_config, &pools, seat_pool);
         seed_founding_members(&boot.state, &mut pools, seat_pool);
         let beacon_config_hash = boot.config_hash;
         let shared_topology = Arc::clone(&boot.topology_snapshot);
