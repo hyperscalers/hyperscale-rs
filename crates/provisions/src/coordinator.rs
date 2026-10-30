@@ -875,26 +875,11 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let mut actions = vec![];
 
-        // Clear the expectation tracker so the in-flight fallback fetch
-        // (if any) is drained — once one batch verifies the shard consensus
-        // expectation is satisfied. The `ProvisionsAdmitted` continuation
-        // emitted below drives that drain via `FetchInput::Admitted` in
-        // `drive_fetch_admission`. Explicit `AbandonFetch` is reserved
-        // for paths where no admission event fires (orphan cleanup in
-        // `on_block_committed`).
-        //
-        // The matching header stays in `self.headers` until
-        // `drop_past_deadline` evicts it alongside the pipeline's
-        // verified entry. Source-shard validators can broadcast distinct
-        // Provisions batches for the same `(source_shard, source_height,
-        // target_shard)` key — competing rounds, JMT history coverage,
-        // proof generation order — and any of them may be the one a
-        // remote proposer later commits. Keeping the header lets every
-        // distinct batch verify against it, so the pending-block lookup
-        // can find whichever hash the proposer committed.
-        self.expected
-            .on_provisions_verified(anchor.shard, anchor.height);
-
+        // A bundle that fails its proof satisfies nothing: the expectation
+        // stays armed, so a fallback fetch not yet sent still goes out on
+        // its timeout. The node releases an in-flight fetch for the bundle
+        // as failed on this same result, which retries it off the peer
+        // that answered.
         let verified = match result {
             Ok(v) => v,
             Err((raw, err)) => {
@@ -907,6 +892,24 @@ impl ProvisionCoordinator {
                 return actions;
             }
         };
+
+        // Once one batch verifies, the expectation is satisfied. The
+        // in-flight fallback fetch (if any) drains on the
+        // `ProvisionsAdmitted` continuation emitted below; explicit
+        // `AbandonFetch` is reserved for paths where no admission event
+        // fires (orphan cleanup in `on_block_committed`).
+        //
+        // The matching header stays in `self.headers` until
+        // `drop_past_deadline` evicts it alongside the pipeline's
+        // verified entry. Source-shard validators can broadcast distinct
+        // Provisions batches for the same `(source_shard, source_height,
+        // target_shard)` key — competing rounds, JMT history coverage,
+        // proof generation order — and any of them may be the one a
+        // remote proposer later commits. Keeping the header lets every
+        // distinct batch verify against it, so the pending-block lookup
+        // can find whichever hash the proposer committed.
+        self.expected
+            .on_provisions_verified(anchor.shard, anchor.height);
         let source_block_ts = anchor.ts;
         let provisions_hash = verified.hash();
         let source_shard = verified.source_shard();
@@ -2421,6 +2424,55 @@ mod tests {
                 "Should not request at height {h} (provision already verified)"
             );
         }
+    }
+
+    /// A bundle that fails its proof leaves the expectation armed: the
+    /// fallback fetch still goes out on its timeout, where a cleared
+    /// expectation would leave nothing to ask for the bundle again.
+    #[test]
+    fn a_bundle_failing_its_proof_leaves_the_fallback_armed() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+
+        let source_shard = ShardId::leaf(2, 1);
+        let header = make_certified_header_with_targets(
+            source_shard,
+            BlockHeight::new(10),
+            vec![ShardId::leaf(2, 0)],
+        );
+        deliver_committed_header(&mut coordinator, &header);
+        for h in 1..=5 {
+            coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(h)));
+        }
+
+        let provisions = make_provisions(
+            TxHash::from(Hash::from_bytes(b"tx1")),
+            source_shard,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        coordinator.on_state_provisions_received(&sched(), provisions.clone());
+        coordinator.on_state_provisions_verified(
+            Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(coordinator.expected.len(), 1);
+
+        let asked = (6..=15).any(|h| {
+            coordinator
+                .on_block_committed(&sched(), &make_block(BlockHeight::new(h)))
+                .iter()
+                .any(|action| {
+                    matches!(
+                        action,
+                        Action::Fetch(FetchRequest::Ask {
+                            ids: FetchIds::RemoteProvisions(_),
+                            ..
+                        })
+                    )
+                })
+        });
+        assert!(asked, "the fallback fetch fires on its timeout");
     }
 
     // ═══════════════════════════════════════════════════════════════════════

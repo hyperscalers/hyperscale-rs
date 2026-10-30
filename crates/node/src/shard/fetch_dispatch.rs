@@ -196,6 +196,26 @@ where
                     )],
                 });
             }
+            // A bundle whose proof fails settles neither fetch that could
+            // have carried it, so both go out again, off the peer that
+            // answered. A gossiped bundle failing while a fetch for the
+            // same key is out sends that fetch again early; the retry
+            // hold bounds how often.
+            ProtocolEvent::StateProvisionsVerified {
+                result: Err((provisions, _)),
+                ..
+            } => {
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed {
+                    ids: vec![provisions.hash()],
+                });
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
+                    ids: vec![(
+                        provisions.source_shard(),
+                        provisions.target_shard(),
+                        provisions.block_height(),
+                    )],
+                });
+            }
             ProtocolEvent::FinalizationsAdmitted { finalizations } => {
                 let ids: Vec<_> = finalizations.iter().map(|w| w.receipt_hash()).collect();
                 self.drive_fetch::<FinalizationBinding>(FetchInput::Admitted { ids });
@@ -280,14 +300,20 @@ impl FetchTicker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_core::BeaconFetchIds;
+    use hyperscale_hbor::Capped;
     use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::network::request::GetProvisionsRequest;
     use hyperscale_types::{
-        Address, AddressClass, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash,
+        Address, AddressClass, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash,
+        MerkleInclusionProof, ProvisionEntry, Provisions, ProvisionsVerifyError, StateRoot, TxHash,
+        WeightedTimestamp,
     };
 
     use super::*;
-    use crate::shard::test_host::{Fixture, Loop, loop_of};
+    use crate::shard::test_host::{Fixture, Host, Loop, loop_of};
 
     const SHARD: ShardId = ShardId::leaf(1, 0);
 
@@ -322,6 +348,55 @@ mod tests {
             shard_loop,
             &BlockHash::from_raw(Hash::from_bytes(b"proposal")),
         ));
+    }
+
+    /// A fetched bundle whose proof fails sends its fetch out again: the
+    /// coordinator emits nothing for it, and an answer left in flight is
+    /// one nothing would ever ask for again.
+    #[test]
+    fn a_bundle_failing_its_proof_asks_for_it_again() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let _ = host.network().drain_pending_requests();
+        let source = ShardId::leaf(1, 1);
+        let height = BlockHeight::new(10);
+        let provisions_asked = |host: &mut Host| {
+            host.network()
+                .drain_pending_requests()
+                .iter()
+                .filter(|pending| pending.request::<GetProvisionsRequest>().is_some())
+                .count()
+        };
+
+        loop_of(&mut host).request_fetch(
+            FetchIds::RemoteProvisions(vec![(source, SHARD, height)]),
+            source,
+            None,
+            None,
+        );
+        assert_eq!(provisions_asked(&mut host), 1);
+
+        let bundle = Provisions::new(
+            source,
+            SHARD,
+            height,
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(
+                TxHash::from(Hash::from_bytes(b"tx")),
+                Capped::empty(),
+            )]),
+        );
+        loop_of(&mut host).drive_fetch_admission(&ProtocolEvent::StateProvisionsVerified {
+            result: Err((Arc::new(bundle), ProvisionsVerifyError::BadInclusion)),
+            anchor: Anchor {
+                shard: source,
+                height,
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::ZERO,
+            },
+        });
+        assert_eq!(provisions_asked(&mut host), 1, "the fetch goes out again");
     }
 
     /// A beacon fetch that reaches a shard loop is dropped: nothing is
