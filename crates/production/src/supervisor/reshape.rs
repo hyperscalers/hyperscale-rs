@@ -68,7 +68,7 @@ impl ShardSupervisor {
         }
         // A store no live duty owns any more is dropped, releasing its
         // directory. A relinquished seat goes to the join now; a dropped
-        // duty's shard is joined by the next `reconcile_joins`.
+        // duty's shard is joined by the next `reconcile_seats`.
         let released = self
             .reshape_stores
             .release(|shard| self.reshape.is_seating(shard));
@@ -599,7 +599,7 @@ impl ShardSupervisor {
     /// until this host's topology carries one. A store the duty prepared is
     /// dropped first, releasing its directory to the join, which wipes what
     /// the duty left there. With no local member placed on the child yet, the
-    /// reshape tick's [`Self::reconcile_joins`] joins it once one is.
+    /// reshape tick's [`Self::reconcile_seats`] joins it once one is.
     fn hand_over_to_join(&mut self, child: ShardId) {
         if !self.reshape.relinquished(child) {
             return;

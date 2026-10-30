@@ -27,8 +27,8 @@ use hyperscale_node::reshape::{
     ReshapeEvent, ReshapeRequest, ReshapeView, Seating, adopt_prepared_store, block_verdict,
     headers_verdict, ready_notification, seed_gate,
 };
+use hyperscale_node::seating::seat_validators;
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::startup::seat_validators;
 use hyperscale_node::{
     serve_block_request, serve_local_certified_headers, serve_state_range_request,
 };

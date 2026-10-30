@@ -55,7 +55,6 @@ pub use fetch::FetchConfig;
 pub use host::{HostResources, HostedChain, NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
 pub use replica::ReplicaConfig;
-pub use seating as startup;
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
 pub use shard::cross_shard::{
     serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
