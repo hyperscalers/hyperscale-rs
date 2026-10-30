@@ -2,9 +2,10 @@
 //!
 //! A [`BeaconLoop`] runs on every host. It owns the host's one
 //! [`BeaconFold`], which follows the beacon chain for every shard chain
-//! the host runs, and one [`BeaconParticipant`] per validator identity the
-//! host holds, each running that identity's SPC, ratification and
-//! proposal duty against the fold. It also owns the host's beacon-block
+//! the host runs, and one
+//! [`BeaconParticipant`](hyperscale_beacon::BeaconParticipant) per
+//! validator identity the host holds, each running that identity's SPC,
+//! ratification and proposal duty against the fold. It also owns the host's beacon-block
 //! catch-up sync and the beacon fetches its fold and participants ask for.
 //!
 //! The loop is the one writer of the host's beacon commits and of the
