@@ -235,11 +235,10 @@ where
         let mut from_stores: Vec<(Hash, Option<Vec<u8>>)> = Vec::new();
         let packages: BTreeSet<Hash> = packages.into_iter().collect();
         for package in packages {
-            if executor.package_known(package) {
-                arrived.push(custodian(package));
-                continue;
-            }
             if !executor.needs_artifact(package) {
+                if executor.package_known(package) {
+                    arrived.push(custodian(package));
+                }
                 continue;
             }
             PackageArtifactBinding::askers(&mut self.interest)
