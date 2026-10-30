@@ -1,7 +1,7 @@
 //! Beacon-block catch-up sync: the binding and its serial config.
 //!
 //! The beacon chain is host-global — one chain per host, `Scope = ()` —
-//! and the host's [`BeaconLoop`](crate::beacon_loop::BeaconLoop) drives
+//! and the host's [`BeaconLoop`](crate::beacon::BeaconLoop) drives
 //! the FSM, delivering synced blocks to its fold and routing the fetches.
 //!
 //! The sync is strictly serial: the config sets

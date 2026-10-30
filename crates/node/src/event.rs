@@ -638,7 +638,7 @@ impl std::fmt::Debug for RegistrationReply {
 }
 
 /// Inputs routed to the host's beacon loop
-/// ([`BeaconLoop`](crate::beacon_loop::BeaconLoop)).
+/// ([`BeaconLoop`](crate::beacon::BeaconLoop)).
 ///
 /// Gossiped beacon blocks and votes arrive as [`Self::Protocol`]; the
 /// outcomes of the loop's own dispatched actions return as
@@ -901,7 +901,7 @@ pub enum HostEvent {
     /// Process-scoped — not anchored to a single shard.
     Process(ProcessScopedInput),
     /// Beacon-scoped — routed to the host's
-    /// [`BeaconLoop`](crate::beacon_loop::BeaconLoop). Carries a
+    /// [`BeaconLoop`](crate::beacon::BeaconLoop). Carries a
     /// [`BeaconScopedInput`]: beacon traffic, what the replicas report,
     /// and the loop's own continuations and fetch answers.
     Beacon(BeaconScopedInput),

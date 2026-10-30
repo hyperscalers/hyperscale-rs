@@ -18,7 +18,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{Address, Hash, LocalTimestamp, Transaction, TxHash, Unresolved};
 
-use crate::beacon_loop::custodian;
+use crate::beacon::custodian;
 use crate::event::{BeaconInput, BeaconScopedInput, HostEvent};
 use crate::shard::ShardLoop;
 use crate::shard::mempool::{DeferredTransaction, Orphaned};

@@ -329,7 +329,7 @@ fn a_held_proposal_fetch_retries_on_the_loops_tick_with_no_block_sync() {
     host.beacon.release(proposals(&[PROPOSAL]), Release::Failed);
     host.beacon.release(proposals(&[PROPOSAL]), Release::Failed);
     assert_eq!(in_flight(&host.beacon), 0);
-    assert!(!beacon::has_pending(&host.beacon.beacon_block));
+    assert!(!has_pending(&host.beacon.beacon_block));
     let _ = host.step(HostEvent::beacon_fetch_tick());
     assert_eq!(in_flight(&host.beacon), 1);
 }

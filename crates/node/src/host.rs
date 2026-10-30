@@ -37,8 +37,7 @@ use hyperscale_types::{
 };
 
 use crate::NodeStateMachine;
-use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
-use crate::beacon_loop::{BeaconLoop, resume_fold};
+use crate::beacon::{BeaconCandidateCache, BeaconLoop, BeaconProposalCache, resume_fold};
 use crate::config::NodeConfig;
 use crate::event::Registration;
 use crate::process::{ProcessIo, register_shard_request_handlers};

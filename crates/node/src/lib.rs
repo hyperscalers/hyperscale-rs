@@ -31,8 +31,7 @@
 //! [`ProcessIo`]: crate::process::ProcessIo
 
 mod batch_accumulator;
-mod beacon;
-pub mod beacon_loop;
+pub mod beacon;
 pub mod bootstrap;
 mod config;
 pub mod event;
