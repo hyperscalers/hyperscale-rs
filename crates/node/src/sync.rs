@@ -319,8 +319,8 @@ struct ScopeState<K: SyncKey> {
     in_flight_ranges: usize,
     /// The highest height verified evidence shows exists: committed,
     /// applied, or reported through [`SyncInput::Proven`]. Never falls, and
-    /// a contiguous-prefix responder's short answer never lowers the
-    /// target below it.
+    /// nothing that lowers the target, a contiguous-prefix responder's
+    /// short answer or a settle, lowers it below this.
     proven: K,
     /// Consecutive not-found answers about the height just above the
     /// frontier, with that height never delivered in between. Counted
@@ -468,11 +468,11 @@ pub enum SyncInput<B: SyncBinding> {
     Reopen { scope: B::Scope, height: B::Key },
     /// The consumer holds verified evidence that `height` exists: a
     /// certified header it checked, contiguous with the frontier or not.
-    /// A short answer from a contiguous-prefix responder never lowers the
-    /// target below it.
+    /// Nothing that lowers the target lowers it below this.
     Proven { scope: B::Scope, height: B::Key },
     /// The consumer gave up on the target: nobody reachable serves the
-    /// height above the frontier. The scope settles there and completes;
+    /// height above the frontier. The scope settles there and completes,
+    /// unless a proven height above the frontier holds the target up;
     /// a later `StartSync` raises the target again.
     Settle { scope: B::Scope },
     /// Periodic tick: promotes deferred heights past their backoff and
@@ -941,18 +941,20 @@ impl<B: SyncBinding> Sync<B> {
     }
 
     /// Stop the scope at what it holds: the target drops to the frontier,
-    /// every queued and deferred height goes, and the consumer hears the
-    /// scope stop syncing the same way a reached target tells it. `None`
-    /// when the scope was not syncing, so a settled scope stays quiet.
+    /// or to the highest proven height where that is above it, every
+    /// queued and deferred height goes, and the consumer hears the scope
+    /// stop syncing the same way a reached target tells it. `None` when
+    /// the scope was not syncing or still is, so a settled scope stays
+    /// quiet and one held up by a proven height carries on toward it.
     fn settle_at_frontier(&mut self, scope: &B::Scope) -> Option<SyncOutput<B>> {
         let state = self.scopes.get_mut(scope)?;
         let was_syncing = state.is_syncing();
-        state.target = state.frontier();
+        state.target = state.target.min(state.frontier().max(state.proven));
         state.heights_to_fetch.clear();
         state.heights_queued.clear();
         state.deferred.clear();
         state.not_found_streak = 0;
-        was_syncing.then(|| self.complete(scope))
+        (was_syncing && !state.is_syncing()).then(|| self.complete(scope))
     }
 
     /// The scope's frontier just reached its target: fire the binding
@@ -2571,6 +2573,30 @@ mod tests {
     /// A settle stops the scope at its frontier: the target drops to it,
     /// the consumer hears the completion, and nothing is fetched until a
     /// later target is raised.
+    /// Settling gives up on what nobody serves, never on what this node
+    /// holds proof of: the target stops at the highest proven height, so
+    /// the scope keeps syncing toward it and does not complete.
+    #[test]
+    fn a_settle_keeps_the_target_at_the_highest_proven_height() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(10),
+        });
+        let _ = s.handle(SyncInput::Proven {
+            scope: (),
+            height: BlockHeight::new(6),
+        });
+
+        let outputs = s.handle(SyncInput::Settle { scope: () });
+        assert!(
+            completed_at(&outputs).is_none(),
+            "the proven height is not reached"
+        );
+        assert!(s.is_syncing());
+        assert_eq!(s.scopes.get(&()).unwrap().target, BlockHeight::new(6));
+    }
+
     #[test]
     fn a_settle_stops_the_sync_at_the_frontier() {
         let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
