@@ -441,6 +441,7 @@ where
             equivocation_signers,
         } => {
             let key = VerdictKey::of(candidate.as_unverified());
+            let block_hash = candidate.block_hash();
             let result = Arc::unwrap_or_clone(candidate)
                 .upgrade(&CandidateVerifyContext {
                     verifier: ctx.verifier,
@@ -454,7 +455,7 @@ where
                 (ctx.cache_beacon_candidate)(Arc::clone(verified));
             }
             ctx.network.settle(key, checked(result.is_ok()));
-            ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { result });
+            ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { block_hash, result });
         }
         Action::VerifyPcVote1 {
             epoch,

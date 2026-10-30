@@ -1053,6 +1053,11 @@ pub enum ProtocolEvent {
     ///
     /// [`Action::VerifyBeaconCandidate`]: crate::Action::VerifyBeaconCandidate
     BeaconCandidateVerified {
+        /// The checked candidate's block hash, on both arms, so a failed
+        /// check frees the slot it held. The hash leaves the SPC cert
+        /// out, so a copy pairing a real block with a forged cert would
+        /// otherwise keep the honest copy from being checked.
+        block_hash: BeaconBlockHash,
         /// Verified candidate on success; the typed error otherwise.
         result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
     },

@@ -926,8 +926,8 @@ impl CoordinatorSim {
         replica_idx: usize,
         candidate: &Arc<Verified<CandidateBeaconBlock>>,
     ) {
-        let actions =
-            self.coordinators[replica_idx].on_beacon_candidate_verified(Ok(Arc::clone(candidate)));
+        let actions = self.coordinators[replica_idx]
+            .on_beacon_candidate_verified(candidate.block_hash(), Ok(Arc::clone(candidate)));
         self.absorb(replica_idx, actions);
     }
 
@@ -964,6 +964,7 @@ impl CoordinatorSim {
                     committee,
                     equivocation_signers,
                 } => {
+                    let block_hash = candidate.block_hash();
                     let result = Arc::unwrap_or_clone(candidate)
                         .upgrade(&CandidateVerifyContext {
                             verifier: &BlsVerifier,
@@ -973,7 +974,8 @@ impl CoordinatorSim {
                         })
                         .map(Arc::new)
                         .map_err(|(_, e)| e);
-                    let post = self.coordinators[replica_idx].on_beacon_candidate_verified(result);
+                    let post = self.coordinators[replica_idx]
+                        .on_beacon_candidate_verified(block_hash, result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
                 Action::VerifyRatifyVote { vote, signers } => {
@@ -1662,6 +1664,7 @@ impl CoordinatorSim {
                 committee,
                 equivocation_signers,
             } => {
+                let block_hash = candidate.block_hash();
                 let result = Arc::unwrap_or_clone(candidate)
                     .upgrade(&CandidateVerifyContext {
                         verifier: &BlsVerifier,
@@ -1671,7 +1674,8 @@ impl CoordinatorSim {
                     })
                     .map(Arc::new)
                     .map_err(|(_, e)| e);
-                let post = self.coordinators[emitter_idx].on_beacon_candidate_verified(result);
+                let post =
+                    self.coordinators[emitter_idx].on_beacon_candidate_verified(block_hash, result);
                 self.absorb(emitter_idx, post);
             }
             Action::VerifyRatifyVote { vote, signers } => {

@@ -579,6 +579,7 @@ where
             }
             ProtocolEvent::BeaconCandidateVerified {
                 result: Ok(candidate),
+                ..
             } => {
                 self.release(ids, Release::Admitted);
                 for validator in self.validator_list() {
@@ -635,6 +636,7 @@ where
                         BeaconScopedInput::Answered {
                             ids,
                             event: Box::new(ProtocolEvent::BeaconCandidateVerified {
+                                block_hash: candidate.block_hash(),
                                 result: Ok(candidate),
                             }),
                         }
@@ -748,9 +750,9 @@ where
                     p.on_beacon_candidate_received(fold, candidate)
                 });
             }
-            ProtocolEvent::BeaconCandidateVerified { result } => {
+            ProtocolEvent::BeaconCandidateVerified { block_hash, result } => {
                 self.drive(validator, |p, fold| {
-                    p.on_beacon_candidate_verified(fold, result)
+                    p.on_beacon_candidate_verified(fold, block_hash, result)
                 });
             }
             ProtocolEvent::RatifyVoteVerified {

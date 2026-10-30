@@ -1882,14 +1882,17 @@ impl BeaconParticipant {
     }
 
     /// A previously-dispatched [`Action::VerifyBeaconCandidate`] has
-    /// returned. Clear the pipeline slot, and on the `Ok` arm hold the
-    /// candidate for cert pairing and feed its hash to the tracker as
-    /// the prevotable value. Drops silently on the `Err` arm.
+    /// returned. Clear `block_hash`'s pipeline slot on both arms, so a
+    /// copy that failed leaves the hash open to another copy's check,
+    /// and on the `Ok` arm hold the candidate for cert pairing and feed
+    /// its hash to the tracker as the prevotable value.
     pub fn on_beacon_candidate_verified(
         &mut self,
         fold: &BeaconFold,
+        block_hash: BeaconBlockHash,
         result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
     ) -> Vec<Action> {
+        self.verification.forget_candidate(block_hash);
         let candidate = match result {
             Ok(c) => c,
             Err(err) => {
@@ -1897,7 +1900,6 @@ impl BeaconParticipant {
                 return Vec::new();
             }
         };
-        self.verification.forget_candidate(candidate.block_hash());
         self.hold_verified_candidate(fold, candidate)
     }
 

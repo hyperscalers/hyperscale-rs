@@ -755,9 +755,10 @@ impl BeaconCoordinator {
     /// returned.
     pub fn on_beacon_candidate_verified(
         &mut self,
+        block_hash: BeaconBlockHash,
         result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
     ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_beacon_candidate_verified(fold, result))
+        self.drive(|p, fold| p.on_beacon_candidate_verified(fold, block_hash, result))
     }
 
     /// A fetched beacon proposal arrived. One that fails VRF
@@ -1486,14 +1487,17 @@ mod tests {
         ));
     }
 
-    /// A gossiped candidate whose `shard_contributions` deviate from
-    /// the canonical projection is dropped before verification is
-    /// dispatched, so honest pool members never prevote a Byzantine
-    /// assembler's variant. The canonical projection of the same
-    /// content dispatches verification normally.
-    #[test]
-    fn malformed_candidate_drops_before_verification_dispatch() {
-        let mut coord = fresh_coord();
+    /// A candidate at `coord`'s pending epoch over one committed boundary
+    /// proposal, built by `contributions` from that boundary's canonical
+    /// contribution: passing it through yields the canonical candidate,
+    /// dropping it a malformed one.
+    fn boundary_candidate(
+        coord: &mut BeaconCoordinator,
+        contributions: impl FnOnce(
+            ShardId,
+            ShardEpochContribution,
+        ) -> BTreeMap<ShardId, ShardEpochContribution>,
+    ) -> Arc<Verifiable<CandidateBeaconBlock>> {
         let shard = ShardId::leaf(1, 0);
         coord
             .fold
@@ -1513,9 +1517,9 @@ mod tests {
         let epoch = coord.fold.state.current_epoch.next();
         let prev = coord.fold.latest_block.block_hash();
 
-        // The cert content is irrelevant here — the contributions gate
-        // runs before any crypto dispatch — but `SpcCert` has no
-        // structural placeholder, so build a real one.
+        // The cert content is irrelevant to the gates before crypto
+        // dispatch, but `SpcCert` has no structural placeholder, so build
+        // a real one.
         let n = coord.fold.state.committee.len();
         let keys: Vec<_> = (0..n as u64).map(keypair).collect();
         let cert_signers: Vec<_> = coord
@@ -1535,21 +1539,31 @@ mod tests {
             &signer_positions,
             &PcVector::empty(),
         );
-        let candidate_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
-            Arc::new(Verifiable::from(CandidateBeaconBlock::new(
-                BeaconBlock::new_with_contributions(
-                    epoch,
-                    prev,
-                    Capped::new(committed.clone()).expect("a list written out in a test"),
-                    Capped::new(contribs).expect("a map written out in a test"),
-                ),
-                Box::new(cert.clone()),
-            )))
-        };
+        Arc::new(Verifiable::from(CandidateBeaconBlock::new(
+            BeaconBlock::new_with_contributions(
+                epoch,
+                prev,
+                Capped::new(committed).expect("a list written out in a test"),
+                Capped::new(contributions(shard, contribution))
+                    .expect("a map written out in a test"),
+            ),
+            Box::new(cert),
+        )))
+    }
+
+    /// A gossiped candidate whose `shard_contributions` deviate from
+    /// the canonical projection is dropped before verification is
+    /// dispatched, so honest pool members never prevote a Byzantine
+    /// assembler's variant. The canonical projection of the same
+    /// content dispatches verification normally.
+    #[test]
+    fn malformed_candidate_drops_before_verification_dispatch() {
+        let mut coord = fresh_coord();
 
         // Omits the committed shard's contribution — dropped, nothing
         // dispatched, no prevotable value held.
-        let actions = coord.on_beacon_candidate_received(candidate_with(BTreeMap::new()));
+        let malformed = boundary_candidate(&mut coord, |_, _| BTreeMap::new());
+        let actions = coord.on_beacon_candidate_received(malformed);
         assert!(
             actions.is_empty(),
             "malformed candidate must not dispatch verification: {actions:?}",
@@ -1558,12 +1572,42 @@ mod tests {
 
         // The canonical projection dispatches verification — the drop
         // above is the contributions gate, not an earlier check.
-        let actions = coord.on_beacon_candidate_received(candidate_with(
-            std::iter::once((shard, contribution)).collect(),
-        ));
+        let canonical = boundary_candidate(&mut coord, |shard, contribution| {
+            std::iter::once((shard, contribution)).collect()
+        });
+        let actions = coord.on_beacon_candidate_received(canonical);
         assert!(
             matches!(actions.as_slice(), [Action::VerifyBeaconCandidate { .. }]),
             "canonical candidate dispatches verification: {actions:?}",
+        );
+    }
+
+    /// A copy of a candidate whose check fails frees its block hash: the
+    /// hash leaves the cert out, so a forged-cert copy that kept the slot
+    /// would keep the honest copy from ever being checked.
+    #[test]
+    fn a_candidate_failing_its_check_lets_another_copy_be_checked() {
+        let mut coord = fresh_coord();
+        let candidate = boundary_candidate(&mut coord, |shard, contribution| {
+            std::iter::once((shard, contribution)).collect()
+        });
+        let block_hash = candidate.block_hash();
+        let actions = coord.on_beacon_candidate_received(Arc::clone(&candidate));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::VerifyBeaconCandidate { .. }]
+        ));
+
+        let actions = coord.on_beacon_candidate_verified(
+            block_hash,
+            Err(CandidateBeaconBlockVerifyError::BadCert),
+        );
+        assert!(actions.is_empty());
+
+        let actions = coord.on_beacon_candidate_received(candidate);
+        assert!(
+            matches!(actions.as_slice(), [Action::VerifyBeaconCandidate { .. }]),
+            "a second copy is checked after the first failed: {actions:?}",
         );
     }
 
@@ -1606,6 +1650,7 @@ mod tests {
                     committee,
                     equivocation_signers,
                 } => {
+                    let block_hash = candidate.block_hash();
                     let result = Arc::unwrap_or_clone(candidate)
                         .upgrade(&CandidateVerifyContext {
                             verifier: &BlsVerifier,
@@ -1615,7 +1660,7 @@ mod tests {
                         })
                         .map(Arc::new)
                         .map_err(|(_, e)| e);
-                    let post = coord.on_beacon_candidate_verified(result);
+                    let post = coord.on_beacon_candidate_verified(block_hash, result);
                     out.extend(complete_verifications(coord, post));
                 }
                 Action::VerifyRatifyVote { vote, signers } => {
