@@ -31,9 +31,10 @@ use super::orchestrator::AdoptKind;
 ///
 /// # Errors
 ///
-/// Returns a description when the store-level adopt fails, or when the
+/// Returns a description when the store-level adopt fails, when the
 /// adopted root does not match the genesis's — the store does not hold the
-/// subtree the genesis names.
+/// subtree the genesis names — or when the store records no substate byte
+/// total at the genesis height.
 pub fn adopt_prepared_store<S: BoundaryStore>(
     storage: &S,
     shard: ShardId,
@@ -50,9 +51,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     let adopted = storage
         .adopt_genesis(origin, genesis, source)
         .map_err(|e| format!("reshape adoption: {e}"))?;
-    let substate_bytes = storage
-        .substate_bytes_at_version(origin.genesis_height.inner())
-        .unwrap_or(0);
+    let substate_bytes = storage.substate_bytes_at_version(origin.genesis_height.inner());
     let read_frontier = storage.read_frontier(shard);
     let members = storage.member_index(shard);
     verified_recovered_state(
@@ -70,12 +69,14 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
 ///
 /// Checks the store's `adopted` root against `expected` and builds the
 /// [`RecoveredState`] the seat boots from over `origin` and the adopted
-/// `substate_bytes`.
+/// `substate_bytes`. The byte total seeds the frontier the seat's
+/// `substate_bytes` header claims build on, so a store that recorded none
+/// at the genesis version fails the adoption rather than claiming zero.
 fn verified_recovered_state(
     adopted: StateRoot,
     expected: StateRoot,
     origin: ChainOrigin,
-    substate_bytes: u64,
+    substate_bytes: Option<u64>,
     predecessors: Vec<Anchor>,
     read_frontier: ReadFrontier,
     members: MemberIndex,
@@ -85,6 +86,12 @@ fn verified_recovered_state(
             "adopted reshape root {adopted:?} does not match the genesis's {expected:?}"
         ));
     }
+    let substate_bytes = substate_bytes.ok_or_else(|| {
+        format!(
+            "adopted reshape store records no substate byte total at its genesis height {}",
+            origin.genesis_height,
+        )
+    })?;
     Ok(RecoveredState {
         substate_bytes,
         chain_origin: Some(origin),
@@ -128,7 +135,7 @@ mod tests {
             root,
             root,
             origin(),
-            4_096,
+            Some(4_096),
             Vec::new(),
             read_frontier.clone(),
             MemberIndex::empty(ShardId::ROOT),
@@ -148,7 +155,27 @@ mod tests {
                 adopted,
                 expected,
                 origin(),
-                0,
+                Some(0),
+                Vec::new(),
+                ReadFrontier::default(),
+                MemberIndex::empty(ShardId::ROOT),
+            )
+            .is_err()
+        );
+    }
+
+    /// The byte total seeds the seat's `substate_bytes` frontier, so a
+    /// store with none at the genesis version fails closed rather than
+    /// claiming an empty state.
+    #[test]
+    fn a_missing_byte_total_fails_closed() {
+        let root = StateRoot::from_raw(Hash::from_bytes(b"adopted"));
+        assert!(
+            verified_recovered_state(
+                root,
+                root,
+                origin(),
+                None,
                 Vec::new(),
                 ReadFrontier::default(),
                 MemberIndex::empty(ShardId::ROOT),
