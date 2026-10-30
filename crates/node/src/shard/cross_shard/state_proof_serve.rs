@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::TreeReader;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
 use hyperscale_types::network::request::{GetCellsRequest, GetStateProofRequest};
@@ -60,9 +59,6 @@ pub fn serve_state_proof_request<S: ShardStorage>(
             .open_boundary(req.height)
             .and_then(|boundary| proven(&boundary, req, |key| boundary.cell(key)))
     };
-    if answer.is_none() {
-        record_fetch_response_sent("state_proof", 0);
-    }
     answer.unwrap_or_else(GetStateProofResponse::not_found)
 }
 
@@ -76,7 +72,6 @@ fn proven(
     value_of: impl Fn(SubstateKey) -> Option<Vec<u8>>,
 ) -> Option<GetStateProofResponse> {
     let proof = generate_proof(tree, &req.keys, req.height)?;
-    record_fetch_response_sent("state_proof", req.keys.len());
     let values: Vec<ServedValue> = req
         .keys
         .iter()
@@ -127,7 +122,6 @@ pub fn serve_cells_request<S: ShardStorage>(
     // The header is what makes the answer checkable, so an anchor this
     // node cannot produce one for is no answer at all.
     let Some(anchor) = pending_chain.certified_header(height) else {
-        record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
     };
     let at = view.base().snapshot_at(height);
@@ -140,7 +134,6 @@ pub fn serve_cells_request<S: ShardStorage>(
         sum.saturating_add(u64::from(range.cap))
     });
     if asked > MAX_CELLS_PER_QUERY {
-        record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
     }
 
@@ -158,14 +151,12 @@ pub fn serve_cells_request<S: ShardStorage>(
         // cannot express, and leaving it out would prove the key absent
         // when it is not — so the whole answer is declined instead.
         let Ok(value) = Bytes::new(value) else {
-            record_fetch_response_sent("cells", 0);
             return GetCellsResponse::not_found();
         };
         carried = carried.saturating_add(value.len());
         cells.push((*key, value));
     }
     if carried > MAX_CELLS_RESPONSE_BYTES {
-        record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
     }
 
@@ -185,14 +176,12 @@ pub fn serve_cells_request<S: ShardStorage>(
         let mut entries = Vec::with_capacity(found.len());
         for (order, value) in found {
             let Ok(value) = Bytes::new(value) else {
-                record_fetch_response_sent("cells", 0);
                 return GetCellsResponse::not_found();
             };
             carried = carried.saturating_add(value.len());
             entries.push((order, value));
         }
         if carried > MAX_CELLS_RESPONSE_BYTES {
-            record_fetch_response_sent("cells", 0);
             return GetCellsResponse::not_found();
         }
         leaves.extend(entries.iter().map(|(order, _)| {
@@ -212,12 +201,8 @@ pub fn serve_cells_request<S: ShardStorage>(
     }
 
     generate_proof(view.as_ref(), &leaves, height).map_or_else(
-        || {
-            record_fetch_response_sent("cells", 0);
-            GetCellsResponse::not_found()
-        },
+        GetCellsResponse::not_found,
         |proof| {
-            record_fetch_response_sent("cells", leaves.len());
             GetCellsResponse::found(
                 Capped::new(cells).expect("no more cells than the request named"),
                 Capped::new(ranges).expect("no more intervals than the request named"),

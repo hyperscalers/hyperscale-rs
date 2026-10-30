@@ -36,6 +36,7 @@ use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::ProcessIo;
 use crate::process::single_flight::{Flight, SingleFlight};
+use crate::serve::Served;
 use crate::shard::cross_shard::crossing_push;
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
@@ -934,6 +935,24 @@ where
     }
 }
 
+/// Register `serve` as `R`'s handler on `shard`, recording what each
+/// answer carried as fetch responses sent under `R`'s own name.
+fn register_served<R, N>(
+    network: &N,
+    shard: ShardId,
+    serve: impl Fn(&R) -> R::Response + Send + Sync + 'static,
+) where
+    R: Served + Send + 'static,
+    R::Response: Send + 'static,
+    N: Network,
+{
+    network.register_request_handler::<R>(shard, move |req: R| {
+        let response = serve(&req);
+        record_fetch_response_sent(R::label(), req.served(&response));
+        response
+    });
+}
+
 /// Register one shard's per-type request handlers with the network.
 ///
 /// Each handler is a closure that captures that shard's state and
@@ -1013,20 +1032,16 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     let pending_chain = Arc::clone(&io.pending_chain);
     let tx_store = Arc::clone(&io.caches.tx_store);
-    process
-        .network
-        .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
-            serve_transaction_request(&pending_chain, &tx_store, &req)
-        });
+    register_served::<GetTransactionsRequest, _>(&*process.network, shard, move |req| {
+        serve_transaction_request(&pending_chain, &tx_store, req)
+    });
 
     // ── state_range.request → snap-sync boundary serving ─────────
 
     let storage = Arc::clone(&io.storage);
-    process
-        .network
-        .register_request_handler::<GetStateRangeRequest>(shard, move |req| {
-            serve_state_range_request(&storage, &req)
-        });
+    register_served::<GetStateRangeRequest, _>(&*process.network, shard, move |req| {
+        serve_state_range_request(&storage, req)
+    });
 
     // ── package_artifact.request → published-code availability ───
 
@@ -1035,26 +1050,24 @@ pub fn register_shard_request_handlers<S, N, D>(
     // content. A point lookup per id — this runs on the blocking pool,
     // where a scan would pin a thread per request.
     let storage = Arc::clone(&io.storage);
-    process
-        .network
-        .register_request_handler::<GetPackageArtifactsRequest>(
-            shard,
-            move |req: GetPackageArtifactsRequest| {
-                // An artifact the publish gate would have refused for
-                // width is one no asker would admit either, so it is
-                // absent from the answer rather than sent to be dropped.
-                let artifacts: Vec<_> = req
-                    .packages
-                    .iter()
-                    .filter_map(|package| storage.package_artifact(*package))
-                    .filter_map(|artifact| Bytes::new(artifact).ok())
-                    .collect();
-                record_fetch_response_sent("package_artifact", artifacts.len());
-                GetPackageArtifactsResponse::new(
-                    Capped::new(artifacts).expect("no more answers than the request named"),
-                )
-            },
-        );
+    register_served::<GetPackageArtifactsRequest, _>(
+        &*process.network,
+        shard,
+        move |req: &GetPackageArtifactsRequest| {
+            // An artifact the publish gate would have refused for
+            // width is one no asker would admit either, so it is
+            // absent from the answer rather than sent to be dropped.
+            let artifacts: Vec<_> = req
+                .packages
+                .iter()
+                .filter_map(|package| storage.package_artifact(*package))
+                .filter_map(|artifact| Bytes::new(artifact).ok())
+                .collect();
+            GetPackageArtifactsResponse::new(
+                Capped::new(artifacts).expect("no more answers than the request named"),
+            )
+        },
+    );
 
     // ── instance_record.request → cross-shard component resolution ─
 
@@ -1065,40 +1078,33 @@ pub fn register_shard_request_handlers<S, N, D>(
     // sealed makes safe — any height at or after the seal answers the
     // same bytes.
     let storage = Arc::clone(&io.storage);
-    process
-        .network
-        .register_request_handler::<GetInstanceRecordsRequest>(
-            shard,
-            move |req: GetInstanceRecordsRequest| {
-                let height = storage.jmt_height();
-                let records: Vec<_> = req
-                    .instances
-                    .iter()
-                    .filter_map(|instance| {
-                        storage
-                            .get_substate_at_height(
-                                Executor::instance_record_key(*instance),
-                                height,
-                            )
-                            .flatten()
-                    })
-                    .filter_map(|record| Bytes::new(record).ok())
-                    .collect();
-                record_fetch_response_sent("instance_record", records.len());
-                GetInstanceRecordsResponse::new(
-                    Capped::new(records).expect("no more answers than the request named"),
-                )
-            },
-        );
+    register_served::<GetInstanceRecordsRequest, _>(
+        &*process.network,
+        shard,
+        move |req: &GetInstanceRecordsRequest| {
+            let height = storage.jmt_height();
+            let records: Vec<_> = req
+                .instances
+                .iter()
+                .filter_map(|instance| {
+                    storage
+                        .get_substate_at_height(Executor::instance_record_key(*instance), height)
+                        .flatten()
+                })
+                .filter_map(|record| Bytes::new(record).ok())
+                .collect();
+            GetInstanceRecordsResponse::new(
+                Capped::new(records).expect("no more answers than the request named"),
+            )
+        },
+    );
 
     // ── witness_history.request → snap-sync accumulator seeding ──
 
     let pending_chain = Arc::clone(&io.pending_chain);
-    process
-        .network
-        .register_request_handler::<GetWitnessHistoryRequest>(shard, move |req| {
-            serve_witness_history_request(&pending_chain, &req)
-        });
+    register_served::<GetWitnessHistoryRequest, _>(&*process.network, shard, move |req| {
+        serve_witness_history_request(&pending_chain, req)
+    });
 
     // ── provision.request → serve from local store ───────────────
     //
@@ -1119,77 +1125,64 @@ pub fn register_shard_request_handlers<S, N, D>(
         PRODUCER_WAIT_BUDGET,
     );
 
-    process
-        .network
-        .register_request_handler::<GetProvisionsRequest>(
-            shard,
-            move |req: GetProvisionsRequest| {
-                let height = req.height;
+    register_served::<GetProvisionsRequest, _>(
+        &*process.network,
+        shard,
+        move |req: &GetProvisionsRequest| {
+            let height = req.height;
 
-                // Outbound fast path: if we still hold the exact batch we
-                // generated for this (source_block_height, target_shard),
-                // rebuild the response from memory — no RocksDB regeneration,
-                // no merkle-proof recomputation.
-                if let Some(provisions) = outbound_cache.get_outbound(height, req.target_shard) {
-                    record_fetch_response_sent("provision", provisions.transactions().len().max(1));
-                    return GetProvisionResponse {
-                        provisions: Some(provisions),
-                    };
-                }
-
-                let cache_key = (height.inner(), req.target_shard.inner());
-                let provisions = match provisions_flight.get_or_produce(cache_key, || {
-                    serve_provision_request(
-                        &pending_chain,
-                        derivation.as_ref(),
-                        shard,
-                        topology_snapshot.load().shard_trie(),
-                        &req,
-                    )
-                    .provisions
-                }) {
-                    Flight::Cached(provisions) => {
-                        record_fetch_response_sent(
-                            "provision",
-                            provisions.transactions().len().max(1),
-                        );
-                        Some(provisions)
-                    }
-                    Flight::Joined(provisions) | Flight::Produced(provisions) => Some(provisions),
-                    Flight::Unavailable => None,
+            // Outbound fast path: if we still hold the exact batch we
+            // generated for this (source_block_height, target_shard),
+            // rebuild the response from memory — no RocksDB regeneration,
+            // no merkle-proof recomputation.
+            if let Some(provisions) = outbound_cache.get_outbound(height, req.target_shard) {
+                return GetProvisionResponse {
+                    provisions: Some(provisions),
                 };
-                GetProvisionResponse { provisions }
-            },
-        );
+            }
+
+            let cache_key = (height.inner(), req.target_shard.inner());
+            let provisions = match provisions_flight.get_or_produce(cache_key, || {
+                serve_provision_request(
+                    &pending_chain,
+                    derivation.as_ref(),
+                    shard,
+                    topology_snapshot.load().shard_trie(),
+                    req,
+                )
+                .provisions
+            }) {
+                Flight::Cached(provisions)
+                | Flight::Joined(provisions)
+                | Flight::Produced(provisions) => Some(provisions),
+                Flight::Unavailable => None,
+            };
+            GetProvisionResponse { provisions }
+        },
+    );
 
     // ── local_provision.request → provision cache lookup ─────────
 
     let provision_store = Arc::clone(&io.caches.provision_store);
     let verified_headers = Arc::clone(&io.caches.verified_headers);
-    process
-        .network
-        .register_request_handler::<GetLocalProvisionsRequest>(shard, move |req| {
-            serve_local_provisions_request(&provision_store, &verified_headers, &req)
-        });
+    register_served::<GetLocalProvisionsRequest, _>(&*process.network, shard, move |req| {
+        serve_local_provisions_request(&provision_store, &verified_headers, req)
+    });
 
     // ── finalization.request → cache lookup + pending_chain fallback ─
 
     let fw_cache = Arc::clone(&io.caches.finalization);
     let pending_chain = Arc::clone(&io.pending_chain);
-    process
-        .network
-        .register_request_handler::<GetFinalizationsRequest>(shard, move |req| {
-            serve_finalizations_request(&pending_chain, &fw_cache, &req)
-        });
+    register_served::<GetFinalizationsRequest, _>(&*process.network, shard, move |req| {
+        serve_finalizations_request(&pending_chain, &fw_cache, req)
+    });
 
     // ── remote_header.request → range header sync ───────────────────
 
     let pending_chain = Arc::clone(&io.pending_chain);
-    process
-        .network
-        .register_request_handler::<GetRemoteHeadersRequest>(shard, move |req| {
-            serve_remote_headers_request(&pending_chain, shard, &req)
-        });
+    register_served::<GetRemoteHeadersRequest, _>(&*process.network, shard, move |req| {
+        serve_remote_headers_request(&pending_chain, shard, req)
+    });
 
     // ── beacon.shard_witnesses.request → witness proof serve ────────
     //
@@ -1220,12 +1213,10 @@ pub fn register_shard_request_handlers<S, N, D>(
     // request below its coverage re-walks the span in full. One
     // reconstruction per terminal serves every peer still asking.
     let settled_txs_cache = Arc::new(SettledTxsCache::default());
-    process
-        .network
-        .register_request_handler::<GetSettledTxsRequest>(shard, move |req| {
-            let window_floor = topology_snapshot.load().settled_window_floor(shard);
-            serve_settled_txs_request(&pending_chain, &settled_txs_cache, window_floor, &req)
-        });
+    register_served::<GetSettledTxsRequest, _>(&*process.network, shard, move |req| {
+        let window_floor = topology_snapshot.load().settled_window_floor(shard);
+        serve_settled_txs_request(&pending_chain, &settled_txs_cache, window_floor, req)
+    });
 
     // ── state_proof.request → proof of keys at a committed height ──
     //
@@ -1237,11 +1228,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     // height outside the JMT's history answers `not_found` and the
     // requester rotates.
     let pending_chain = Arc::clone(&io.pending_chain);
-    process
-        .network
-        .register_request_handler::<GetStateProofRequest>(shard, move |req| {
-            serve_state_proof_request(&pending_chain, &req)
-        });
+    register_served::<GetStateProofRequest, _>(&*process.network, shard, move |req| {
+        serve_state_proof_request(&pending_chain, req)
+    });
 
     // ── cells.request → the cells a declaration reaches ───────────
     //
@@ -1251,11 +1240,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     // root of a header the requester commit-proved, so any node of this
     // shard may answer and none is trusted with the verdict.
     let pending_chain = Arc::clone(&io.pending_chain);
-    process
-        .network
-        .register_request_handler::<GetCellsRequest>(shard, move |req| {
-            serve_cells_request(&pending_chain, &req)
-        });
+    register_served::<GetCellsRequest, _>(&*process.network, shard, move |req| {
+        serve_cells_request(&pending_chain, req)
+    });
 
     // ── block.proposal.request → this shard's admitted proposals ─
     let proposals = Arc::clone(&io.consensus.proposals);

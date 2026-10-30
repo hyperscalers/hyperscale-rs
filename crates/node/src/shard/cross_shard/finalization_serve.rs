@@ -2,35 +2,29 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::cache::BoundedCache;
 use hyperscale_types::network::request::GetFinalizationsRequest;
 use hyperscale_types::network::response::GetFinalizationsResponse;
 use hyperscale_types::{Finalization, FinalizationHash, MAX_FETCH_RESPONSE_BYTES, Verifiable};
 
-/// The longest prefix of `found` that encodes under the response's byte
-/// budget, in the order given, and never less than its first.
+use crate::serve::{Answer, encoded_len};
+
+/// The prefix of `found` an answer to an ask of `asked` carries.
 ///
-/// A response is cut by bytes rather than by count: a stating half
-/// carries the yes receipts of its tick, so a few halves asked by hash
-/// can overrun the frame however few they are, and a message past the
-/// frame is dropped whole. One half alone fits the frame, so the first is
-/// always answered and every request makes progress. What is cut is
-/// simply not answered, and the requester asks for it again.
-fn within_byte_budget(found: Vec<Arc<Finalization>>) -> Vec<Arc<Finalization>> {
-    let mut bytes = 0usize;
-    let mut kept = Vec::with_capacity(found.len());
-    for fw in found {
-        let size = hbor_to_vec(&*fw).map_or(usize::MAX, |encoded| encoded.len());
-        bytes = bytes.saturating_add(size);
-        if bytes > MAX_FETCH_RESPONSE_BYTES && !kept.is_empty() {
-            break;
-        }
-        kept.push(fw);
-    }
-    kept
+/// Cut by bytes as well as by count: a stating half carries the yes
+/// receipts of its tick, so a few halves asked by hash can overrun the
+/// frame however few they are, and a message past the frame is dropped
+/// whole. One half alone fits the frame, so the first is always
+/// answered and every request makes progress. What is cut is simply not
+/// answered, and the requester asks for it again.
+fn answer_of<const N: usize>(
+    asked: usize,
+    found: Vec<Arc<Finalization>>,
+) -> Answer<Arc<Finalization>, N> {
+    let mut answer = Answer::of(asked).within(MAX_FETCH_RESPONSE_BYTES);
+    answer.offer_all(found, |fw| encoded_len(&**fw));
+    answer
 }
 
 /// Serve an inbound finalization fetch request.
@@ -73,22 +67,13 @@ pub fn serve_finalizations_request<S: ShardStorage>(
         );
     }
 
-    // One finalization per hash asked, so the answer meets the cap the
-    // request already met; one past it is simply absent, which is what a
-    // partial answer already means here.
-    let mut finalizations = Capped::empty();
-    for fw in within_byte_budget(found) {
-        if finalizations.push(fw).is_err() {
-            break;
-        }
-    }
-
-    record_fetch_response_sent("finalization", finalizations.len());
+    let finalizations = answer_of(req.finalization_hashes.len(), found).finish();
     GetFinalizationsResponse::new(finalizations)
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, ConsensusReceipt, GlobalReceiptHash, Hash, LocalKey,
         MAX_CELL_VALUE_LEN, MAX_WIRE_MESSAGE_BYTES, ShardId, StateWrites, StoredReceipt,
@@ -140,11 +125,13 @@ mod tests {
             "two heavy halves overrun the frame",
         );
 
-        let kept = within_byte_budget(found.clone());
+        let kept = answer_of::<8>(found.len(), found.clone())
+            .finish()
+            .into_inner();
         assert_eq!(kept, found[..1]);
         assert!(size(&kept[0]) <= MAX_FETCH_RESPONSE_BYTES);
         assert_eq!(
-            within_byte_budget(found[1..].to_vec()),
+            answer_of::<8>(1, found[1..].to_vec()).finish().into_inner(),
             found[1..],
             "and the half cut is answered when asked again",
         );

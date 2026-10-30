@@ -41,6 +41,7 @@ pub mod host;
 pub mod process;
 mod replica;
 pub mod reshape;
+mod serve;
 pub mod shard;
 pub mod startup;
 mod state;

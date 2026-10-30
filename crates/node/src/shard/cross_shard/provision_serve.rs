@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_execution::provision_request;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_provisions::build_provisions;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetProvisionsRequest;
@@ -75,9 +74,6 @@ pub fn serve_provision_request<S: ShardStorage>(
         &requests,
     );
 
-    if let Some(p) = &provisions {
-        record_fetch_response_sent("provision", p.transactions().len());
-    }
     GetProvisionResponse { provisions }
 }
 

@@ -14,7 +14,6 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use hyperscale_hbor::Capped;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetSettledTxsRequest;
 use hyperscale_types::network::response::GetSettledTxsResponse;
@@ -117,11 +116,9 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
     req: &GetSettledTxsRequest,
 ) -> GetSettledTxsResponse {
     let Some(BlockForSync { block, .. }) = pending_chain.block_for_sync(req.terminal_height) else {
-        record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     };
     if block.hash() != req.terminal_block_hash {
-        record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     }
     // The answer is checked against the named block's own
@@ -131,14 +128,12 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
     // would hand any peer a multi-epoch fold per request, on a shard that
     // is not terminating at all.
     if block.header().settled_txs_root().is_none() {
-        record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     }
 
     let shard = block.header().shard_id();
     let Some(parent_height) = block.height().prev() else {
         // Genesis carries no certificates and never terminates a split.
-        record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     };
     let walked = cache.get_or_insert(
@@ -170,7 +165,6 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
             terminal_height = req.terminal_height.inner(),
             "settled-transaction window runs below the blocks held here; serving not_found"
         );
-        record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     };
 
@@ -191,10 +185,8 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
             "settled-transaction window exceeds the wire cap; serving not_found — \
              cross-shard load outran the one-shot transfer"
         );
-        record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
     };
-    record_fetch_response_sent("settled_txs", 1);
     GetSettledTxsResponse::found(txs)
 }
 

@@ -2,36 +2,28 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::Capped;
 use hyperscale_mempool::TxStore;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::network::response::GetTransactionsResponse;
-use hyperscale_types::{MAX_FETCH_RESPONSE_BYTES, Transaction};
+use hyperscale_types::{MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, Transaction};
 use tracing::{debug, trace};
 
-/// Maximum items returned in a single transaction fetch response.
-const MAX_ITEMS_PER_RESPONSE: usize = 500;
+use crate::serve::Answer;
 
-/// The longest prefix of `found` that encodes under the response's byte
-/// budget, in the order given.
+/// The prefix of `found` an answer to an ask of `asked` carries.
 ///
-/// A response is chunked by bytes rather than by count, because the
-/// requester asks by hash and cannot know what it asked for weighs: fifty
-/// maximal envelopes would overrun the frame however few they are. What
-/// is cut is simply not answered, and the requester asks for it again.
-fn within_byte_budget(found: Vec<Arc<Transaction>>) -> Vec<Arc<Transaction>> {
-    let mut bytes = 0usize;
-    let mut kept = Vec::with_capacity(found.len());
-    for tx in found {
-        bytes = bytes.saturating_add(tx.serialized_bytes().len());
-        if bytes > MAX_FETCH_RESPONSE_BYTES {
-            break;
-        }
-        kept.push(tx);
-    }
-    kept
+/// Cut by bytes as well as by count, because the requester asks by hash
+/// and cannot know what it asked for weighs: fifty maximal envelopes
+/// would overrun the frame however few they are. What is cut is simply
+/// not answered, and the requester asks for it again.
+fn answer_of(
+    asked: usize,
+    found: Vec<Arc<Transaction>>,
+) -> Answer<Arc<Transaction>, MAX_TXS_PER_BLOCK> {
+    let mut answer = Answer::of(asked).within(MAX_FETCH_RESPONSE_BYTES);
+    answer.offer_all(found, |tx| tx.serialized_bytes().len());
+    answer
 }
 
 /// Serve an inbound transaction fetch request.
@@ -60,15 +52,9 @@ pub fn serve_transaction_request<S: ShardStorage>(
         "Handling transaction fetch request"
     );
 
-    let hashes = if requested_count > MAX_ITEMS_PER_RESPONSE {
-        &req.tx_hashes[..MAX_ITEMS_PER_RESPONSE]
-    } else {
-        &req.tx_hashes
-    };
-
-    let mut found: Vec<Arc<Transaction>> = Vec::with_capacity(hashes.len());
+    let mut found: Vec<Arc<Transaction>> = Vec::with_capacity(requested_count);
     let mut missing = Vec::new();
-    for hash in hashes {
+    for hash in req.tx_hashes.iter() {
         if let Some(tx) = tx_store.get(hash) {
             found.push(Arc::new((**tx).clone()));
         } else {
@@ -84,22 +70,12 @@ pub fn serve_transaction_request<S: ShardStorage>(
         );
     }
 
-    // The wire's own cap, met where the byte budget is: an answer is a
-    // prefix of what was asked, so trimming it is what a partial answer
-    // already means here.
-    let mut kept = Capped::empty();
-    for tx in within_byte_budget(found) {
-        if kept.push(tx).is_err() {
-            break;
-        }
-    }
-    let found_count = kept.len();
+    let kept = answer_of(requested_count, found).finish();
     debug!(
         requested = requested_count,
-        found = found_count,
+        found = kept.len(),
         "Responding to transaction fetch request"
     );
-    record_fetch_response_sent("transaction", found_count);
     GetTransactionsResponse::new(kept)
 }
 
@@ -136,7 +112,7 @@ mod tests {
     #[test]
     fn a_response_is_cut_at_the_byte_budget() {
         let found: Vec<Arc<Transaction>> = (0..50u8).map(maximal).collect();
-        let kept = within_byte_budget(found.clone());
+        let kept = answer_of(found.len(), found.clone()).finish();
         assert!(
             kept.len() < found.len(),
             "fifty maximal envelopes overrun the budget"
@@ -154,6 +130,6 @@ mod tests {
             "the prefix is kept in the order asked"
         );
         // Under the budget, everything asked for is answered.
-        assert_eq!(within_byte_budget(found[..3].to_vec()).len(), 3);
+        assert_eq!(answer_of(3, found[..3].to_vec()).finish().len(), 3);
     }
 }
