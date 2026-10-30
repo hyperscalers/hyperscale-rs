@@ -1902,25 +1902,28 @@ impl ReshapeOrchestrator {
                         (right_h, right_qc),
                         *cut_wt,
                     )
+                {
                     // On the fallback the beacon has already composed this
                     // parent, so the derivation is checked against it —
                     // agreement is free, and disagreement means the local
                     // child chains and the network disagree about a committed
-                    // block.
-                    && anchor.as_deref().is_none_or(|a| {
-                        let matches = genesis.hash() == a.block_hash;
-                        if !matches {
-                            tracing::error!(
-                                ?parent,
-                                derived = ?genesis.hash(),
-                                anchored = ?a.block_hash,
-                                "derived merged-parent genesis does not reconstruct \
-                                 the beacon anchor"
-                            );
-                        }
-                        matches
-                    })
-                {
+                    // block. The terminals are the anchored blocks and the
+                    // clock is the anchor's, so deriving again disagrees the
+                    // same way: the duty ends, and the parent's seat is the
+                    // ordinary join's, which snap-syncs against that anchor.
+                    if let Some(anchored) = anchor.as_deref().map(|a| a.block_hash)
+                        && genesis.hash() != anchored
+                    {
+                        tracing::error!(
+                            ?parent,
+                            derived = ?genesis.hash(),
+                            ?anchored,
+                            "derived merged-parent genesis does not reconstruct \
+                             the beacon anchor; leaving the parent to the join"
+                        );
+                        self.keepers.remove(&parent);
+                        return;
+                    }
                     *derived = Some((origin, Box::new(genesis), predecessors));
                 }
                 if !*finalize_requested
@@ -4828,6 +4831,51 @@ mod tests {
         };
         assert_eq!(observing(parent_record(7)), Some(terminal_hash));
         assert_eq!(observing(parent_record(5)), None);
+    }
+
+    /// A fallback keeper whose derivation disagrees with the composed
+    /// anchor ends its duty, leaving the parent to the join, rather than
+    /// deriving the same disagreement on every step.
+    #[test]
+    fn a_keeper_whose_genesis_disagrees_with_the_anchor_ends() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let terminal = make_test_block(BlockHeight::new(8));
+        let snap = build(
+            &[(parent, &[5, 6]), (left, &[1, 2]), (right, &[3, 4])],
+            &[],
+            &uncredited(&[(left, 5, parent)]),
+            &[],
+            &[parent, left, right],
+            ShardAnchor {
+                block_hash: terminal.hash(),
+                ..anchor()
+            },
+        );
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        let duty = orch.keepers.get_mut(&parent).expect("the gate fired");
+        let KeeperPhase::Building {
+            left: left_half,
+            right: right_half,
+            ..
+        } = &mut duty.phase
+        else {
+            panic!("the composed parent builds");
+        };
+        let certified = make_test_certified(terminal.clone());
+        for half in [left_half, right_half] {
+            half.terminal = Some((terminal.header().clone(), certified.qc().clone()));
+        }
+
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        assert!(!orch.is_seating(parent), "the disagreeing keeper must end");
+        assert!(
+            orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0))
+                .is_empty()
+        );
     }
 
     /// A keeper records only the anchored terminal: a fetch answered with
