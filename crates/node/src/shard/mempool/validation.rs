@@ -333,8 +333,13 @@ where
     /// Drain this shard's outbound gossip accumulator for destination
     /// shard `dst` and publish it as a single `TransactionGossip` batch.
     /// No-op if empty.
+    ///
+    /// The drained accumulator goes with it, and the next transaction for
+    /// `dst` opens a fresh one: a reshape mints new shard ids, so keeping
+    /// an empty one per destination would grow the map, and every scan of
+    /// it, with each shard this one ever gossiped to.
     pub(crate) fn flush_tx_gossip_batch(&mut self, dst: ShardId) {
-        let Some(batch) = self.io.mempool.outbound_gossip_batches.get_mut(&dst) else {
+        let Some(mut batch) = self.io.mempool.outbound_gossip_batches.remove(&dst) else {
             return;
         };
         let txs = batch.take();
@@ -577,6 +582,28 @@ mod tests {
             }
         }
         named
+    }
+
+    /// A flushed destination leaves no accumulator behind, so the map
+    /// holds only destinations with something waiting to go.
+    #[test]
+    fn a_flushed_gossip_destination_leaves_nothing_behind() {
+        let fixture = Fixture::new();
+        let mut host = fixture.host(BlockHeight::GENESIS);
+        let shard_loop = loop_of(&mut host);
+        let dst = ShardId::leaf(1, 1);
+        shard_loop.enqueue_tx_for_gossip(dst, Arc::new(test_transaction(5)));
+        assert!(
+            shard_loop
+                .io
+                .mempool
+                .outbound_gossip_batches
+                .contains_key(&dst)
+        );
+
+        shard_loop.flush_tx_gossip_batch(dst);
+
+        assert!(shard_loop.io.mempool.outbound_gossip_batches.is_empty());
     }
 
     /// A gossip echo arriving while the first copy is still in the
