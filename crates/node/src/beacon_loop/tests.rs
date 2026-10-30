@@ -3,10 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam::channel::{Receiver, unbounded};
-use hyperscale_core::TimerId;
+use hyperscale_beacon::coordinator::LocalChainAnchors;
+use hyperscale_core::{BeaconFetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_hbor::{Bytes, Capped};
+use hyperscale_network::ResponseVerdict;
 use hyperscale_network_memory::{
     BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, PendingRequest, SimNetworkAdapter,
     SimulatedNetwork,
@@ -16,21 +18,26 @@ use hyperscale_storage::test_helpers::commit_one;
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::notification::beacon::BeaconProposalNotification;
 use hyperscale_types::network::request::GetInstanceRecordsRequest;
-use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
+use hyperscale_types::network::request::beacon::{GetBeaconBlockRequest, GetBeaconProposalRequest};
 use hyperscale_types::network::response::GetInstanceRecordsResponse;
-use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
+use hyperscale_types::network::response::beacon::{
+    GetBeaconBlockResponse, GetBeaconProposalResponse,
+};
 use hyperscale_types::test_utils::{certify, make_live_block, test_pool, test_transaction};
 use hyperscale_types::{
-    AddressClass, AggregateSignature, BeaconBlock, BeaconCert, BeaconChainConfig,
-    BeaconProposalDraft, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeaderParts,
-    BlockHeight, BlockVote, CertifiedBlock, CertifiedBlockHeader, ConsensusSignature, Hash,
-    ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, Round,
-    SignerBitfield, TopologySchedule, Unresolved, VrfProof, WeightedTimestamp, shard_prefix_path,
+    Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert,
+    BeaconChainConfig, BeaconProposal, BeaconProposalDraft, BeaconWitnessLeafCount,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockVote,
+    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ConsensusSignature, Hash,
+    LeafIndex, ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyPhase, RatifyRound,
+    RatifyVote, Round, SignerBitfield, TopologySchedule, Unresolved, ValidatorStatus, VrfProof,
+    WeightedTimestamp, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
 use super::*;
 use crate::HostedChain;
+use crate::event::{BeaconInput, FetchFailureKind};
 use crate::fetch::settle_solicited;
 use crate::shard::mempool::DeferredTransaction;
 use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
