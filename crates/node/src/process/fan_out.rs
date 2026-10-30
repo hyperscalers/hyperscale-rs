@@ -27,6 +27,15 @@
 //! A shard that fails either, or never answers, is simply absent from
 //! the gathered anchors, and the preview refuses by naming it. There is
 //! no arm in which an unverified cell reaches the run.
+//!
+//! What is verified is presence, not completeness. Every point key is
+//! proven present or absent, and every entry an interval returns is
+//! proven under the root; but an entry's leaf is keyed by a digest of
+//! its owner, collection and order, so the tree's order is not the
+//! collection's and nothing proves the interval holds no entry the
+//! server left out. A server can answer an interval narrower than it
+//! holds, and the run reads the gap as empty. A range-derived read in a
+//! preview is the serving peer's word on what is missing.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -94,7 +103,9 @@ fn absorb(
 ///
 /// Split from [`absorb`] because this half is the one that decides
 /// whether a server can lie about *contents*, and it is checkable
-/// against a root without a committee in hand.
+/// against a root without a committee in hand. Contents only: an
+/// interval's entries are each proven present, and the interval is not
+/// proven whole.
 fn fold_attested(
     shard: ShardId,
     ask: &DeclaredReads,
