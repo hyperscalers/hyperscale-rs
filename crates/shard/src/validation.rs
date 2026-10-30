@@ -894,7 +894,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Stated,
-            Some(Arc::new(certificate)),
+            Some(certificate),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -4169,7 +4169,7 @@ pub mod tests {
             Arc::new(Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                Some(Arc::new(ec)),
+                Some(ec),
                 Capped::new(receipts).expect("a list written out in a test"),
             )))
         };
@@ -4525,7 +4525,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Determined,
-            Some(Arc::new(projected)),
+            Some(projected),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -4692,12 +4692,7 @@ pub mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let none = Finalization::new(
-            tick_id,
-            TickHalf::Determined,
-            Some(Arc::new(empty)),
-            Capped::empty(),
-        );
+        let none = Finalization::new(tick_id, TickHalf::Determined, Some(empty), Capped::empty());
         let err = settles(&holding_alone(&[]), &none).unwrap_err();
         assert!(err.contains("settles no member of tick 2"), "{err}");
     }

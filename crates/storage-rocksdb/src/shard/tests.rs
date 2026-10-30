@@ -963,7 +963,7 @@ fn test_ec_survives_reopen() {
     let finalization = Finalization::new(
         tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     );
     let id = finalization.receipt_hash();
@@ -1143,7 +1143,7 @@ fn a_stray_column_family_is_dropped_on_open() {
     let finalization = Finalization::new(
         *ec.tick_id(),
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     );
     let id = finalization.receipt_hash();

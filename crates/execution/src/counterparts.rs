@@ -4260,7 +4260,7 @@ impl Counterparts {
     /// make two answers of one transaction.
     pub(crate) fn on_certificate(
         &mut self,
-        ec: &Arc<Verified<ExecutionCertificate>>,
+        ec: &Verified<ExecutionCertificate>,
         now: WeightedTimestamp,
     ) {
         self.records.certified(

@@ -1277,7 +1277,7 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
     Finalization::new(
         *tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::new(receipts.to_vec()).expect("a list written out in a test"),
     )
 }

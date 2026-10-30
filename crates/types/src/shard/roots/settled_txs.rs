@@ -139,7 +139,7 @@ mod tests {
         Arc::new(Verifiable::from(Finalization::new(
             TickId::new(local, BlockHeight::new(1)),
             TickHalf::Determined,
-            Some(Arc::new(ec)),
+            Some(ec),
             Capped::from_array([]),
         )))
     }

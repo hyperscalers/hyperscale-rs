@@ -272,17 +272,17 @@ mod tests {
         assert_eq!(ec.deadline(), ec.vote_anchor_ts().plus(RETENTION_HORIZON));
     }
 
-    fn make_test_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
+    fn make_test_ec(shard: u64, seed: u8) -> ExecutionCertificate {
         let outcomes = vec![make_outcome(seed)];
         let global_receipt_root = compute_global_receipt_root(&outcomes);
-        Arc::new(ExecutionCertificate::new(
+        ExecutionCertificate::new(
             make_tick_id(shard, BlockHeight::new(42)),
             WeightedTimestamp::from_millis(43),
             global_receipt_root,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     #[test]
@@ -327,10 +327,9 @@ mod tests {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let outcomes = vec![make_outcome(2), make_outcome(3)];
         let wide = make_local_ec(&tick_id, outcomes);
-        let narrowed = Arc::new(
-            wide.project_to(&std::iter::once(make_outcome(2).tx_hash()).collect())
-                .expect("a copy covering one of the two"),
-        );
+        let narrowed = wide
+            .project_to(&std::iter::once(make_outcome(2).tx_hash()).collect())
+            .expect("a copy covering one of the two");
         assert_eq!(
             narrowed.global_receipt_root(),
             wide.global_receipt_root(),
@@ -541,15 +540,15 @@ mod tests {
         assert_eq!(tick_leader(&tick_id, &committee), leader);
     }
 
-    fn make_local_ec(tick_id: &TickId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
+    fn make_local_ec(tick_id: &TickId, outcomes: Vec<TxOutcome>) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             *tick_id,
             WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
             compute_global_receipt_root(&outcomes),
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     fn make_success_receipt() -> Arc<ConsensusReceipt> {

@@ -611,7 +611,7 @@ pub enum ProtocolEvent {
         /// Tick whose EC was aggregated.
         tick_id: TickId,
         /// The newly aggregated execution certificate.
-        certificate: Arc<Verified<ExecutionCertificate>>,
+        certificate: Verified<ExecutionCertificate>,
     },
 
     /// Execution certificates delivered by peer broadcast (post sender-sig
@@ -631,8 +631,8 @@ pub enum ProtocolEvent {
         /// Verified certificate on success; the raw certificate plus
         /// the reason it failed otherwise.
         result: Result<
-            Arc<Verified<ExecutionCertificate>>,
-            (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
+            Verified<ExecutionCertificate>,
+            (ExecutionCertificate, ExecutionCertificateVerifyError),
         >,
     },
 
@@ -668,7 +668,7 @@ pub enum ProtocolEvent {
     /// fan-out (cross-shard ACK observation, vote-action re-scan).
     ExecutionCertificateAdmitted {
         /// The admitted execution certificate.
-        certificate: Arc<Verified<ExecutionCertificate>>,
+        certificate: Verified<ExecutionCertificate>,
     },
 
     /// Finalizations delivered from a peer in response to a fetch request.

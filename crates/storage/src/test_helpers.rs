@@ -226,15 +226,15 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
 /// what a stored finalization needs to decode again: one certificate
 /// whose `tick_id` is the tick's own.
 #[must_use]
-pub fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCertificate> {
-    Arc::new(ExecutionCertificate::new(
+pub fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> ExecutionCertificate {
+    ExecutionCertificate::new(
         TickId::new(shard, height),
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Capped::empty(),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
-    ))
+    )
 }
 
 /// Build a test attestation at the given height, carrying a placeholder

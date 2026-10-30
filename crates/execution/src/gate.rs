@@ -58,7 +58,7 @@ impl Attested for Arc<Verifiable<Finalization>> {
     }
 
     fn certificate(&self) -> Option<&ExecutionCertificate> {
-        Finalization::certificate(self).map(|ec| ec.as_unverified())
+        Finalization::certificate(self).map(Verifiable::as_unverified)
     }
 }
 

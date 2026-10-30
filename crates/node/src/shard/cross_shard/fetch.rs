@@ -601,7 +601,7 @@ mod settled_txs_tests {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
-    fn certificate(tick: TickId, height: u64) -> Arc<ExecutionCertificate> {
+    fn certificate(tick: TickId, height: u64) -> ExecutionCertificate {
         let outcomes = [TxOutcome::new(
             settled_tx(height),
             ExecutionOutcome::Succeeded {
@@ -609,14 +609,14 @@ mod settled_txs_tests {
             },
         )
         .as_role(Role::Leg)];
-        Arc::new(ExecutionCertificate::new(
+        ExecutionCertificate::new(
             tick,
             WeightedTimestamp::from_millis(1),
             compute_global_receipt_root(&outcomes),
             Capped::from_array(outcomes),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A finalization settling one leg that ran: what reaches beyond this

@@ -1231,7 +1231,7 @@ pub fn make_finalization_settling(
     Finalization::new(
         tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([receipt]),
     )
 }
@@ -1267,7 +1267,7 @@ fn finalization_on(
     Finalization::new(
         tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     )
 }
@@ -1297,7 +1297,7 @@ pub fn stating_half_on(
     Finalization::new(
         tick_id,
         TickHalf::Stated,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::new(receipts).expect("a list written out in a test"),
     )
 }

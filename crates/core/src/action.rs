@@ -499,7 +499,7 @@ pub enum Action {
         /// Target shard receiving the EC.
         shard: ShardId,
         /// Aggregated execution certificate.
-        certificate: Arc<Verified<ExecutionCertificate>>,
+        certificate: Verified<ExecutionCertificate>,
         /// Target shard peers (excluding self) for the broadcast.
         recipients: Vec<ValidatorId>,
         /// The signer preferred to sign the envelope. The certificate is

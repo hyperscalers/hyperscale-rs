@@ -11472,14 +11472,14 @@ mod tests {
         Finalization::new(
             tick,
             half,
-            Some(Arc::new(ExecutionCertificate::new(
+            Some(ExecutionCertificate::new(
                 tick,
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
                 Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
-            ))),
+            )),
             Capped::empty(),
         )
     }

@@ -2186,8 +2186,8 @@ mod tests {
 
     /// The tick's certificate, settling one leg that ran: what reaches
     /// beyond this shard, and so what puts it in the settled set.
-    fn ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
+    fn ec_for(tick: &TickId) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             *tick,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
@@ -2200,7 +2200,7 @@ mod tests {
             .as_role(Role::Leg)]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose

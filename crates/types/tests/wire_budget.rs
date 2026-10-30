@@ -1200,7 +1200,7 @@ fn a_stating_half_of_a_full_tick_encodes_within_the_frame() {
     let half = Finalization::new(
         tick_id,
         TickHalf::Stated,
-        Some(Arc::new(certificate)),
+        Some(certificate),
         Capped::new(receipts).expect("a receipt per outcome"),
     );
     assert_eq!(half.validate_against_certificates(), Ok(()));

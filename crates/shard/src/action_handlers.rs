@@ -2115,7 +2115,7 @@ mod tests {
         let determined = Finalization::new(
             *stating.tick_id(),
             TickHalf::Determined,
-            stating.local_ec().cloned().map(Arc::new),
+            stating.local_ec().cloned(),
             Capped::from_array([receipt]),
         );
 

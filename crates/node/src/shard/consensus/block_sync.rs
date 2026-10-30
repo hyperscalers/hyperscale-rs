@@ -837,7 +837,7 @@ mod tests {
             Finalization::new(
                 tick_id,
                 TickHalf::Determined,
-                Some(Arc::new(ec)),
+                Some(ec),
                 Capped::from_array([receipt.clone()]),
             )
             .into(),
@@ -1473,7 +1473,7 @@ mod tests {
             Finalization::new(
                 tick_id,
                 TickHalf::Determined,
-                Some(Arc::new(ec)),
+                Some(ec),
                 Capped::from_array([receipt.clone()]),
             )
             .into(),

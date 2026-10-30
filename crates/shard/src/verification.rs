@@ -2254,7 +2254,7 @@ mod tests {
             Arc::new(Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                Some(Arc::new(ec)),
+                Some(ec),
                 Capped::empty(),
             )))
         };

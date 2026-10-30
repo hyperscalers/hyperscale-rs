@@ -295,6 +295,13 @@ impl ExecutionCertificate {
         })
     }
 
+    /// Whether `other` is a clone of this very certificate, sharing its
+    /// body, rather than an equal copy decoded or built apart from it.
+    #[must_use]
+    pub fn same_body(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// The copy of this certificate a shard party to `keep` needs: the
     /// outcomes naming those transactions, plus a proof binding them to
     /// the same signed root.

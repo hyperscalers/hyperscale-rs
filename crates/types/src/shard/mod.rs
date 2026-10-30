@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_deterministic() {
         let make_fw = |seed: u8| -> Arc<Verifiable<Finalization>> {
-            let ec = Arc::new(ExecutionCertificate::new(
+            let ec = ExecutionCertificate::new(
                 TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
@@ -197,7 +197,7 @@ mod tests {
                 )]),
                 AggregateSignature::new([0u8; 96]),
                 SignerBitfield::new(4),
-            ));
+            );
             Arc::new(
                 Finalization::new(
                     TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_compute_certificate_root_single_cert() {
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
@@ -230,7 +230,7 @@ mod tests {
             )]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ));
+        );
         let cert = Finalization::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             TickHalf::Determined,

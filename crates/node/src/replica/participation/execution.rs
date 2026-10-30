@@ -99,16 +99,16 @@ mod tests {
         shard: ShardId,
         height: BlockHeight,
         outcomes: Vec<TxOutcome>,
-    ) -> Arc<Verified<ExecutionCertificate>> {
+    ) -> Verified<ExecutionCertificate> {
         let tick_id = TickId::new(shard, height);
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(0),
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     /// A node on the root shard that has broadcast one batch carrying
@@ -137,7 +137,7 @@ mod tests {
         node
     }
 
-    fn admit(node: &mut NodeStateMachine, certificate: Arc<Verified<ExecutionCertificate>>) {
+    fn admit(node: &mut NodeStateMachine, certificate: Verified<ExecutionCertificate>) {
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::ExecutionCertificateAdmitted { certificate },

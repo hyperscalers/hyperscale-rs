@@ -450,22 +450,22 @@ mod tests {
     }
 
     /// A certificate of `tick` carrying `outcomes`.
-    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> StdArc<ExecutionCertificate> {
-        StdArc::new(ExecutionCertificate::new(
+    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             tick,
             WeightedTimestamp::from_millis(3),
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A finalization of `local`'s tick at height 3 carrying `certificate`
     /// and `receipts`.
     fn finalization(
         local: ShardId,
-        certificate: StdArc<ExecutionCertificate>,
+        certificate: ExecutionCertificate,
         receipts: Vec<StoredReceipt>,
     ) -> Finalization {
         Finalization::new(

@@ -268,14 +268,14 @@ mod tests {
                 },
             )
             .as_role(Role::Leg)];
-            Arc::new(ExecutionCertificate::new(
+            ExecutionCertificate::new(
                 tick,
                 WeightedTimestamp::from_millis(1),
                 compute_global_receipt_root(&outcomes),
                 Capped::from_array(outcomes),
                 AggregateSignature::new([0u8; 96]),
                 SignerBitfield::new(4),
-            ))
+            )
         };
         Arc::new(Verifiable::from(Finalization::new(
             tick,

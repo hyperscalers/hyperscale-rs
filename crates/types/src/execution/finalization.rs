@@ -119,7 +119,7 @@ struct Carried {
     /// The tick's own certificate: present in a determined or stating
     /// half, absent from a legs half. A sibling's verdict is read from
     /// its committed state, so no finalization carries another tick's.
-    certificate: Option<Arc<Verifiable<ExecutionCertificate>>>,
+    certificate: Option<Verifiable<ExecutionCertificate>>,
     receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     /// The members a legs half settles; empty in a determined half,
     /// which settles every member its certificate attests, and in a
@@ -357,7 +357,7 @@ impl Finalization {
     fn local_certificate(&self) -> Option<&ExecutionCertificate> {
         self.0
             .certificate
-            .as_deref()
+            .as_ref()
             .map(Verifiable::as_unverified)
             .filter(|ec| ec.tick_id() == &self.0.tick_id)
     }
@@ -561,7 +561,7 @@ impl Finalization {
     /// off the wire, `Verifiable::Verified` where it was assembled here
     /// ([`Self::from_verified_ec`]). `None` for a legs half.
     #[must_use]
-    pub fn certificate(&self) -> Option<&Arc<Verifiable<ExecutionCertificate>>> {
+    pub fn certificate(&self) -> Option<&Verifiable<ExecutionCertificate>> {
         self.0.certificate.as_ref()
     }
 
@@ -615,7 +615,7 @@ impl Finalization {
         Some(Self(Arc::new(Carried {
             tick_id: self.0.tick_id,
             half: self.0.half,
-            certificate: Some(Arc::new(Verifiable::from(projected))),
+            certificate: Some(Verifiable::from(projected)),
             receipts: self.0.receipts.clone(),
             named: self.0.named.clone(),
         })))
@@ -838,13 +838,13 @@ impl Finalization {
     pub fn new(
         tick_id: TickId,
         half: TickHalf,
-        certificate: Option<Arc<ExecutionCertificate>>,
+        certificate: Option<ExecutionCertificate>,
         receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
         Self(Arc::new(Carried {
             tick_id,
             half,
-            certificate: certificate.map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec)))),
+            certificate: certificate.map(Verifiable::from),
             receipts,
             named: Capped::empty(),
         }))
@@ -896,7 +896,7 @@ impl Finalization {
         Self(Arc::new(Carried {
             tick_id: *certificate.tick_id(),
             half,
-            certificate: Some(Arc::new(Verifiable::from(certificate))),
+            certificate: Some(Verifiable::from(certificate)),
             receipts: Capped::empty(),
             named: Capped::empty(),
         }))
@@ -1216,18 +1216,18 @@ mod tests {
     #[test]
     fn the_half_a_finalization_settles_is_part_of_its_identity() {
         let local_wid = tick_id(0, 7, &[]);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             local_wid,
             WeightedTimestamp::from_millis(1),
             compute_global_receipt_root(&[make_outcome(1)]),
             Capped::from_array([make_outcome(1)]),
             AggregateSignature::ZERO,
             SignerBitfield::new(2),
-        ));
+        );
         let determined = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            Some(Arc::clone(&ec)),
+            Some(ec.clone()),
             Capped::from_array([]),
         );
         let stating = Finalization::new(
@@ -1562,14 +1562,14 @@ mod tests {
         let yes = core(1, b"effects", 10);
         let local_wid = tick_id(0, 7, &[]);
         let certificate = |wid: TickId, outcome: TxOutcome| {
-            Arc::new(ExecutionCertificate::new(
+            ExecutionCertificate::new(
                 wid,
                 WeightedTimestamp::from_millis(1),
                 compute_global_receipt_root(std::slice::from_ref(&outcome)),
                 Capped::from_array([outcome]),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(2),
-            ))
+            )
         };
         for certificate in [
             certificate(local_wid, yes.clone()),
@@ -1593,14 +1593,14 @@ mod tests {
         Finalization::new(
             local_wid,
             TickHalf::Stated,
-            Some(Arc::new(ExecutionCertificate::new(
+            Some(ExecutionCertificate::new(
                 local_wid,
                 WeightedTimestamp::from_millis(1),
                 compute_global_receipt_root(&outcomes),
                 Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(2),
-            ))),
+            )),
             Capped::empty(),
         )
     }
@@ -1937,7 +1937,7 @@ mod tests {
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            Some(Arc::new(local_ec)),
+            Some(local_ec),
             Capped::from_array([]),
         );
 
@@ -1971,7 +1971,7 @@ mod tests {
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            Some(Arc::new(tampered)),
+            Some(tampered),
             Capped::from_array([]),
         );
 
@@ -2004,7 +2004,7 @@ mod tests {
         let tick = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            Some(Arc::new(ec)),
+            Some(ec),
             Capped::from_array([]),
         );
 
@@ -2023,7 +2023,7 @@ mod tests {
         let determined = Finalization::new(
             local_wid,
             TickHalf::Determined,
-            Some(Arc::new(ec)),
+            Some(ec),
             Capped::from_array([]),
         );
         let legs = Finalization::accepting(local_wid, Capped::from_array([]));

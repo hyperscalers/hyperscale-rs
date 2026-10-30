@@ -201,7 +201,7 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
                 tick_id,
-                certificate: Arc::new(certificate),
+                certificate,
             });
         }
         Action::VerifyAndAggregateExecutionVotes {
@@ -230,10 +230,7 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
             };
-            let result = certificate
-                .upgrade(&ctx_ec)
-                .map(Arc::new)
-                .map_err(|(raw, err)| (Arc::new(raw), err));
+            let result = certificate.upgrade(&ctx_ec);
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified { result });
         }
         Action::VerifyFinalization {
@@ -426,7 +423,7 @@ where
                 tracing::error!("execution certificate dispatched without a signer; skipping");
                 return;
             };
-            let cert = Arc::unwrap_or_clone(certificate).into_inner();
+            let cert = certificate.into_inner();
             let msg = signed_bytes(
                 &ExecutionCertificatesSenderMessage::new(
                     cert.shard_id(),
