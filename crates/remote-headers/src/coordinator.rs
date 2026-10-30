@@ -948,6 +948,14 @@ impl RemoteHeaderCoordinator {
         self.expected.get(&shard).map(|e| e.last_verified_height)
     }
 
+    /// The highest height of any header verified from `shard`, contiguous
+    /// with the frontier or not, or `None` when the replica does not track
+    /// the shard.
+    #[must_use]
+    pub fn verified_tip(&self, shard: ShardId) -> Option<BlockHeight> {
+        self.expected.get(&shard).map(|e| e.verified_tip)
+    }
+
     /// How far a sync of `shard` has to reach while a header verified
     /// from it sits above the contiguous frontier, leaving a gap the sync
     /// has to close. `None` when the frontier holds every verified header,

@@ -64,7 +64,9 @@ where
     }
 
     /// Admit `source_shard`'s scope up to the replica's contiguous verified
-    /// frontier for it, where the replica tracks the shard.
+    /// frontier for it, where the replica tracks the shard, and tell it the
+    /// highest header verified above, which no short answer can then talk
+    /// the target below.
     ///
     /// The frontier only rises while the replica tracks the shard: a shard
     /// it stops tracking loses its scope (see
@@ -82,8 +84,15 @@ where
             return;
         };
         let gap_target = coordinator.gap_sync_target(source_shard);
+        let verified_tip = coordinator.verified_tip(source_shard);
         let sync = &mut self.io.cross_shard.remote_header_sync;
         let held = sync.frontier(&source_shard);
+        if let Some(tip) = verified_tip {
+            let _ = sync.handle(RemoteHeaderSyncInput::Proven {
+                scope: source_shard,
+                height: tip,
+            });
+        }
         if held.is_some_and(|held| held >= height) {
             return;
         }

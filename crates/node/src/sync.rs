@@ -317,6 +317,11 @@ struct ScopeState<K: SyncKey> {
     /// Number of in-flight fetch ranges for this scope. Bounded by
     /// `max_concurrent_per_scope`.
     in_flight_ranges: usize,
+    /// The highest height verified evidence shows exists: committed,
+    /// applied, or reported through [`SyncInput::Proven`]. Never falls, and
+    /// a contiguous-prefix responder's short answer never lowers the
+    /// target below it.
+    proven: K,
     /// Consecutive not-found answers about the height just above the
     /// frontier, with that height never delivered in between. Counted
     /// here rather than on the height's own backoff, which resets every
@@ -339,6 +344,7 @@ impl<K: SyncKey> ScopeState<K> {
             deferred: HashMap::new(),
             pending_admission: HashMap::new(),
             in_flight_ranges: 0,
+            proven: K::GENESIS,
             not_found_streak: 0,
         }
     }
@@ -460,6 +466,11 @@ pub enum SyncInput<B: SyncBinding> {
     /// the block it applied there exists. Re-queues the height if it is
     /// still open. Idempotent while a fetch for it is in flight.
     Reopen { scope: B::Scope, height: B::Key },
+    /// The consumer holds verified evidence that `height` exists: a
+    /// certified header it checked, contiguous with the frontier or not.
+    /// A short answer from a contiguous-prefix responder never lowers the
+    /// target below it.
+    Proven { scope: B::Scope, height: B::Key },
     /// The consumer gave up on the target: nobody reachable serves the
     /// height above the frontier. The scope settles there and completes;
     /// a later `StartSync` raises the target again.
@@ -586,6 +597,7 @@ impl<B: SyncBinding> Sync<B> {
             SyncInput::Admitted { scope, height } => self.handle_admitted(&scope, height),
             SyncInput::Applied { scope, height } => self.handle_applied(&scope, height),
             SyncInput::Reopen { scope, height } => self.handle_reopen(&scope, height),
+            SyncInput::Proven { scope, height } => self.handle_proven(&scope, height),
             SyncInput::Settle { scope } => self.handle_settle(&scope),
             SyncInput::Tick { now } => self.handle_tick(now),
         }
@@ -662,14 +674,16 @@ impl<B: SyncBinding> Sync<B> {
             let is_prefix = (0..len).all(|i| delivered.contains(&from.offset(i)));
             if is_prefix {
                 let inferred_tip = if len == 0 {
-                    // Tip is strictly below `from`; floor at `committed`
-                    // (we never lower `target` past what we already have).
+                    // Tip is strictly below `from`.
                     state.committed
                 } else {
                     from.offset(len - 1)
                 };
-                if inferred_tip < state.target {
-                    state.target = inferred_tip.max(state.committed);
+                // The answer is one peer's word, and never outweighs a
+                // height this node holds proof of.
+                let capped = inferred_tip.max(state.proven);
+                if capped < state.target {
+                    state.target = capped;
                     // Drop every height still waiting to be fetched past
                     // the new target, from this range and every other:
                     // deferred ones so the next tick doesn't promote them
@@ -826,6 +840,7 @@ impl<B: SyncBinding> Sync<B> {
         if height > state.committed {
             state.committed = height;
         }
+        state.proven = state.proven.max(state.committed);
 
         // Drop tracking state for heights at or below the new committed
         // level.
@@ -863,6 +878,7 @@ impl<B: SyncBinding> Sync<B> {
         let was_syncing = state.is_syncing();
 
         state.applied.insert(height);
+        state.proven = state.proven.max(height);
         state.reopened.remove(&height);
         state.heights_queued.remove(&height);
         state.deferred.remove(&height);
@@ -899,6 +915,15 @@ impl<B: SyncBinding> Sync<B> {
             state.queue_height(height);
         }
         self.emit_fetches()
+    }
+
+    fn handle_proven(&mut self, scope: &B::Scope, height: B::Key) -> Vec<SyncOutput<B>> {
+        let state = self
+            .scopes
+            .entry(scope.clone())
+            .or_insert_with(|| ScopeState::new(B::Key::GENESIS));
+        state.proven = state.proven.max(height);
+        Vec::new()
     }
 
     fn handle_settle(&mut self, scope: &B::Scope) -> Vec<SyncOutput<B>> {
@@ -1832,6 +1857,37 @@ mod tests {
         let st = s.scopes.get(&1).unwrap();
         assert_eq!(st.target, st.committed);
         assert!(st.deferred.is_empty());
+    }
+
+    /// An empty prefix answer is a claim by one peer, and a lagging or
+    /// lying one makes it about heights this node holds verified headers
+    /// for. The target stays at the highest of them, so the scope keeps
+    /// syncing toward what it knows exists.
+    #[test]
+    fn an_empty_prefix_answer_does_not_lower_the_target_below_a_proven_height() {
+        let mut s: Sync<PrefixBinding> = Sync::new(cfg_range());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight::new(32),
+        });
+        let _ = s.handle(SyncInput::Proven {
+            scope: 1,
+            height: BlockHeight::new(20),
+        });
+        let outputs = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight::new(1),
+            count: 8,
+            delivered_heights: vec![],
+            now: LocalTimestamp::from_millis(0),
+        });
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Complete { .. })),
+            "the scope has not reached what it holds proof of"
+        );
+        assert_eq!(s.scopes.get(&1).unwrap().target, BlockHeight::new(20));
     }
 
     #[test]
