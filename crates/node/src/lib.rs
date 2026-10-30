@@ -52,7 +52,7 @@ mod sync;
 pub use beacon::BeaconLoop;
 pub use bootstrap::state_range_serve::serve_state_range_request;
 pub use bootstrap::witness_history_serve::serve_witness_history_request;
-pub use config::NodeConfig;
+pub use config::{BatchConfig, NodeConfig};
 pub use fetch::FetchConfig;
 pub use host::{
     HostResources, HostedChain, NodeHost, ShardGenesis, attach_shard, chain_anchors, detach_shard,
