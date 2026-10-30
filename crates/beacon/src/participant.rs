@@ -1976,9 +1976,7 @@ impl BeaconParticipant {
 
     /// Feed this participant one beacon consensus event: a peer's message,
     /// the outcome of a check it dispatched, or one of its timers. Every
-    /// other event is dropped with a warning. A received proposal must
-    /// carry its check; the host checks a peer's reveal before handing it
-    /// over.
+    /// other event is dropped with a warning.
     pub fn on_event(&mut self, fold: &BeaconFold, event: ProtocolEvent) -> ParticipantStep {
         match event {
             ProtocolEvent::UnverifiedRatifyVoteReceived { vote } => {
@@ -1991,14 +1989,9 @@ impl BeaconParticipant {
                 from,
                 epoch,
                 proposal,
-            } => {
-                let Ok(proposal) = Arc::unwrap_or_clone(proposal).into_verified() else {
-                    warn!(?from, "beacon proposal without its check — dropping");
-                    return ParticipantStep::default();
-                };
-                self.on_beacon_proposal_received(fold, from, epoch, Arc::new(proposal))
-                    .into()
-            }
+            } => self
+                .on_beacon_proposal_received(fold, from, epoch, proposal)
+                .into(),
             ProtocolEvent::BeaconCandidateReceived { candidate } => {
                 self.on_beacon_candidate_received(fold, candidate).into()
             }

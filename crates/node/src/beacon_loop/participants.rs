@@ -11,8 +11,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconBlockHash, BeaconProposal, CandidateBeaconBlock, Epoch, Signer, ValidatorId, Verifiable,
-    Verified,
+    BeaconBlockHash, BeaconProposal, CandidateBeaconBlock, Epoch, Signer, ValidatorId, Verified,
 };
 use tracing::warn;
 
@@ -133,25 +132,6 @@ where
             .any(|p| p.duty.is_on_committee(&self.fold));
         let actions = self.fold.set_host_on_committee(on);
         self.run_fold_actions(actions);
-    }
-
-    /// The verified proposal a received or fetched one carries. The wire
-    /// handler and the fetch's response boundary check a peer's VRF
-    /// reveal before handing it over, and the host's own sign and send
-    /// seal it, so every proposal reaching the loop keeps its marker; one
-    /// that does not is dropped with a warning.
-    pub(super) fn sealed(
-        from: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
-    ) -> Option<Arc<Verified<BeaconProposal>>> {
-        let sealed = Arc::unwrap_or_clone(proposal)
-            .into_verified()
-            .ok()
-            .map(Arc::new);
-        if sealed.is_none() {
-            warn!(?from, "beacon proposal without its check — dropping");
-        }
-        sealed
     }
 
     /// Handle the actions `validator`'s participant emitted: the effects

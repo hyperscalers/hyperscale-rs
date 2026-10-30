@@ -31,7 +31,7 @@ use hyperscale_types::network::response::beacon::{
 };
 use hyperscale_types::{
     Address, BeaconBlockHash, BeaconProposalVerifyContext, BlockHash, BlockHeight, Epoch, Hash,
-    LeafIndex, NetworkDefinition, ShardId, ValidatorId, Verifiable, Verifier,
+    LeafIndex, NetworkDefinition, ShardId, ValidatorId, Verifier,
 };
 use tracing::warn;
 
@@ -199,7 +199,7 @@ impl BeaconReply {
                     ProtocolEvent::BeaconProposalFetched {
                         epoch,
                         validator,
-                        proposal: Arc::new(Verifiable::from(checked)),
+                        proposal: Arc::new(checked),
                     },
                 );
                 ResponseVerdict::Accept
@@ -450,7 +450,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crossbeam::channel::unbounded;
-    use hyperscale_types::{BeaconProposal, BeaconProposalDraft, BlockHeight, VrfProof};
+    use hyperscale_types::{
+        BeaconProposal, BeaconProposalDraft, BlockHeight, Verifiable, VrfProof,
+    };
 
     use super::*;
     use crate::shard::test_host::Fixture;
@@ -519,7 +521,7 @@ mod tests {
         };
         assert!(matches!(
             *event,
-            ProtocolEvent::BeaconProposalFetched { proposal, .. } if proposal.verified().is_some()
+            ProtocolEvent::BeaconProposalFetched { .. }
         ));
     }
 }

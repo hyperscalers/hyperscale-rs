@@ -197,44 +197,6 @@ fn a_refused_witness_run_retries_once_and_then_on_the_tick() {
     assert_eq!(in_flight(&host.beacon), 1, "the tick asks again");
 }
 
-/// A fetched proposal whose reveal does not verify under its
-/// author's key resolves nothing: its id is asked again rather than
-/// retired, so the await it was to fill stays open for another
-/// peer's answer.
-#[test]
-fn a_fetched_proposal_failing_verification_is_asked_again() {
-    let fix = Fixture::new();
-    let mut host = fix.host(BlockHeight::GENESIS);
-    let author = fix.committee.validator_id(1);
-    let id = (Epoch::new(1), author);
-    ask(&mut host.beacon, participant(2), &[id]);
-    let forged = BeaconProposalDraft::new(
-        fix.committee.signer(2).as_ref(),
-        &NetworkDefinition::simulator(),
-        Epoch::new(1),
-        BTreeMap::new(),
-        Vec::new(),
-        BTreeMap::new(),
-        Vec::new(),
-    )
-    .and_then(BeaconProposalDraft::sign)
-    .expect("a key signs a proposal");
-    host.beacon.dispatch_event(BeaconScopedInput::Answered {
-        ids: proposals(&[id]),
-        event: Box::new(ProtocolEvent::BeaconProposalFetched {
-            epoch: Epoch::new(1),
-            validator: author,
-            proposal: Arc::new(Verifiable::from(forged.into_inner())),
-        }),
-    });
-    assert_eq!(
-        host.beacon.fetches.beacon_proposal.pending_count(),
-        1,
-        "the forged answer does not retire the id",
-    );
-    assert_eq!(in_flight(&host.beacon), 1, "it is asked again at once");
-}
-
 /// A candidate extending the fixture's genesis whose certificate's
 /// aggregate signatures are forged.
 fn forged_candidate(fix: &Fixture) -> CandidateBeaconBlock {
@@ -623,23 +585,17 @@ fn a_wire_proposal_reaches_the_loop_only_once_checked() {
     wire.network
         .flush_notifications(wire.now + Duration::from_secs(10));
 
-    let received: Vec<bool> = events
+    let received = events
         .try_iter()
-        .filter_map(|event| match event {
-            HostEvent::Beacon(BeaconScopedInput::Protocol(event)) => match *event {
-                ProtocolEvent::BeaconProposalReceived { proposal, .. } => {
-                    Some(proposal.verified().is_some())
-                }
-                _ => None,
-            },
-            _ => None,
+        .filter(|event| {
+            matches!(
+                event,
+                HostEvent::Beacon(BeaconScopedInput::Protocol(event))
+                    if matches!(**event, ProtocolEvent::BeaconProposalReceived { .. })
+            )
         })
-        .collect();
-    assert_eq!(
-        received,
-        vec![true],
-        "only the honest proposal reaches the loop, already checked",
-    );
+        .count();
+    assert_eq!(received, 1, "only the honest proposal reaches the loop");
 }
 
 /// A peer's beacon gossip reaches a seated host's beacon loop once,
@@ -1674,7 +1630,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
         ProtocolEvent::BeaconProposalReceived {
             from,
             epoch: Epoch::GENESIS.next(),
-            proposal: Arc::new(Verifiable::from(proposal)),
+            proposal: Arc::new(proposal),
         },
     ))));
     for (header, qc) in [(&b, &b_qc), (&c, &c_qc)] {

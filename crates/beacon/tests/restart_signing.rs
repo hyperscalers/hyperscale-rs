@@ -201,7 +201,7 @@ impl Member {
             .iter()
             .filter_map(|event| match event {
                 ProtocolEvent::BeaconProposalReceived { proposal, .. } => {
-                    Some(proposal.as_unverified().vote_equivocations().len())
+                    Some(proposal.vote_equivocations().len())
                 }
                 _ => None,
             })

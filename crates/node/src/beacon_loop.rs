@@ -373,13 +373,11 @@ where
                 epoch,
                 proposal,
             } => {
-                if let Some(proposal) = Self::sealed(from, proposal) {
-                    for validator in self.validator_list() {
-                        let proposal = Arc::clone(&proposal);
-                        self.drive(validator, |p, fold| {
-                            p.on_beacon_proposal_received(fold, from, epoch, proposal)
-                        });
-                    }
+                for validator in self.validator_list() {
+                    let proposal = Arc::clone(&proposal);
+                    self.drive(validator, |p, fold| {
+                        p.on_beacon_proposal_received(fold, from, epoch, proposal)
+                    });
                 }
             }
             other => {
@@ -422,18 +420,15 @@ where
                 epoch,
                 validator: author,
                 proposal,
-            } => match Self::sealed(author, proposal) {
-                Some(proposal) => {
-                    self.release(ids, Release::Admitted);
-                    for validator in self.validator_list() {
-                        let proposal = Arc::clone(&proposal);
-                        self.drive(validator, |p, fold| {
-                            p.on_beacon_proposal_fetched(fold, epoch, author, proposal)
-                        });
-                    }
+            } => {
+                self.release(ids, Release::Admitted);
+                for validator in self.validator_list() {
+                    let proposal = Arc::clone(&proposal);
+                    self.drive(validator, |p, fold| {
+                        p.on_beacon_proposal_fetched(fold, epoch, author, proposal)
+                    });
                 }
-                None => self.release(ids, Release::Failed),
-            },
+            }
             ProtocolEvent::BeaconCandidateReceived { candidate } => {
                 self.verify_fetched_candidate(ids, candidate);
             }

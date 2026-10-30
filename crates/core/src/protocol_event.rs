@@ -998,12 +998,11 @@ pub enum ProtocolEvent {
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
     },
 
-    /// A `BeaconProposal` arrived, its sender authenticated and its
-    /// wrapper `Verified`: the wire handler checks a peer's VRF reveal
-    /// under the sender's key before pushing the event, and the local
-    /// `Action::BuildAndBroadcastBeaconProposal` loopback and a
-    /// colocated sender keep the marker their signing set. A proposal
-    /// without the marker is dropped on arrival.
+    /// A `BeaconProposal` arrived, its sender authenticated and its VRF
+    /// reveal checked: the wire handler checks a peer's reveal under the
+    /// sender's key before pushing the event, and the local
+    /// `Action::BuildAndBroadcastBeaconProposal` loopback and a colocated
+    /// sender hand over what their signing checked.
     BeaconProposalReceived {
         /// Authenticated sender id.
         from: ValidatorId,
@@ -1013,7 +1012,7 @@ pub enum ProtocolEvent {
         /// Received proposal, sealed via
         /// [`BeaconProposalDraft::sign`](hyperscale_types::BeaconProposalDraft::sign)
         /// when its producer held the signing key.
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Arc<Verified<BeaconProposal>>,
     },
 
     /// A [`RatifyVote`] arrived over the wire. Wire decode lands the
@@ -1082,18 +1081,17 @@ pub enum ProtocolEvent {
     /// Result of a beacon-proposal fetch dispatch — carries a
     /// proposal the peer returned. A responder that didn't hold the
     /// proposal yields no event: the fetch binding releases the slot for
-    /// retry against another peer instead. The wrapper arrives
-    /// `Verified`: the fetch's response boundary checks the returned
-    /// proposal's VRF reveal under the requested validator's key and asks
-    /// another peer for one that fails, so a proposal without the marker
-    /// is dropped on arrival.
+    /// retry against another peer instead. The fetch's response boundary
+    /// checks the returned proposal's VRF reveal under the requested
+    /// validator's key and asks another peer for one that fails, so only
+    /// a checked proposal arrives.
     BeaconProposalFetched {
         /// Epoch the fetched proposal targets.
         epoch: Epoch,
         /// Validator whose proposal was requested.
         validator: ValidatorId,
         /// The returned proposal.
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Arc<Verified<BeaconProposal>>,
     },
 
     /// Result of an [`Action::VerifyBeaconBlock`](crate::Action::VerifyBeaconBlock) dispatch. The

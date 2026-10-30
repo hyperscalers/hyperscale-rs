@@ -304,7 +304,7 @@ where
             ctx.notify_protocol(ProtocolEvent::BeaconProposalReceived {
                 from: me,
                 epoch,
-                proposal: Arc::new(Verifiable::from(Arc::unwrap_or_clone(proposal))),
+                proposal,
             });
         }
         Action::BroadcastBeaconBlock { block } => {

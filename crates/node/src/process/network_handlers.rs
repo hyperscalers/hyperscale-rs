@@ -759,7 +759,7 @@ where
                     let event = ProtocolEvent::BeaconProposalReceived {
                         from,
                         epoch,
-                        proposal: Arc::new(Verifiable::from(Arc::unwrap_or_clone(proposal))),
+                        proposal,
                     };
                     let _ = beacon_tx.send(HostEvent::beacon(event));
                     Verdict::Accept
