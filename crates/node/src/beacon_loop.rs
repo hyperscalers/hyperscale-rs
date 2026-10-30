@@ -1585,8 +1585,10 @@ where
         self.drive_sync(outputs);
     }
 
-    /// A beacon-block sync response landed. `None` (the peer does not hold
-    /// the epoch) re-queues through the failure path. Otherwise the block
+    /// A beacon-block sync response landed, for the epoch it was asked
+    /// for: the response boundary drops a block naming any other. `None`
+    /// (the peer does not hold the epoch) re-queues through the failure
+    /// path. Otherwise the block
     /// goes to the fold and the FSM learns the epoch's bytes arrived.
     ///
     /// `FetchSucceeded` means "the bytes arrived", not "the block is
@@ -1693,20 +1695,41 @@ where
             None,
             Box::new(
                 move |result: Result<GetBeaconBlockResponse, RequestError>| {
-                    let input = match result {
-                        Ok(resp) => BeaconScopedInput::BeaconBlockSyncResponseReceived {
-                            epoch,
-                            block: resp.block,
-                        },
-                        Err(err) => BeaconScopedInput::BeaconBlockSyncFetchFailed {
-                            epoch,
-                            kind: classify_fetch_error(&err),
-                        },
+                    let (input, verdict) = match result {
+                        // A block for another epoch is no answer for this
+                        // one, and only a peer making it up gives it.
+                        Ok(resp) if resp.block.as_ref().is_some_and(|b| b.epoch() != epoch) => {
+                            warn!(
+                                epoch = epoch.inner(),
+                                "beacon sync answer names another epoch — dropping"
+                            );
+                            (
+                                BeaconScopedInput::BeaconBlockSyncFetchFailed {
+                                    epoch,
+                                    kind: FetchFailureKind::NotFound,
+                                },
+                                ResponseVerdict::Reject,
+                            )
+                        }
+                        // "Peer doesn't have this epoch" is ambiguous (it
+                        // may be behind us) — never Reject.
+                        Ok(resp) => (
+                            BeaconScopedInput::BeaconBlockSyncResponseReceived {
+                                epoch,
+                                block: resp.block,
+                            },
+                            ResponseVerdict::Accept,
+                        ),
+                        Err(err) => (
+                            BeaconScopedInput::BeaconBlockSyncFetchFailed {
+                                epoch,
+                                kind: classify_fetch_error(&err),
+                            },
+                            ResponseVerdict::Accept,
+                        ),
                     };
                     let _ = beacon_tx.send(HostEvent::Beacon(input));
-                    // "Peer doesn't have this epoch" is ambiguous (it may be
-                    // behind us) — never Reject.
-                    ResponseVerdict::Accept
+                    verdict
                 },
             ),
         );
@@ -2259,6 +2282,26 @@ mod tests {
             "the host's own store is not asked"
         );
         assert_eq!(there.load(Ordering::SeqCst), 1);
+    }
+
+    /// A sync answer carrying a block for another epoch is no answer:
+    /// the epoch backs off for another ask instead of parking as if its
+    /// bytes had landed.
+    #[test]
+    fn a_beacon_sync_answer_for_another_epoch_is_refused() {
+        let fix = Fixture::new();
+        let (mut wire, mut host, events) = wired(&fix, SyncDispatch::new());
+        let genesis = fix.genesis_block();
+        wire.peer
+            .register_request_handler(SHARD, move |_: GetBeaconBlockRequest| {
+                GetBeaconBlockResponse::found(Arc::new(Verifiable::from((*genesis).clone())))
+            });
+        host.beacon.start_sync(Epoch::new(1));
+        wire.pump(&mut host, &events);
+        assert!(
+            host.beacon.beacon_block.has_deferred(),
+            "the epoch waits on the backoff, not on an admission"
+        );
     }
 
     /// Past epoch 0's boundary plus the skip timeout, so a ratify timer
