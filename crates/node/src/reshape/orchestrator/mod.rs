@@ -262,6 +262,16 @@ impl ReshapeOrchestrator {
             .is_some_and(|slot| slot.duty.relinquished())
     }
 
+    /// Whether the duty keyed by `shard` awaits the completion `ticket`
+    /// names: the one test a completion passes before
+    /// [`Self::step`] hands it to the duty.
+    #[must_use]
+    pub fn awaits(&self, shard: ShardId, ticket: Ticket) -> bool {
+        self.duties
+            .get(&shard)
+            .is_some_and(|slot| slot.awaited.contains(&ticket))
+    }
+
     /// Advance every duty one step: apply the io results in `events`, discover
     /// new duties from `view`, and return the io the adapter should perform.
     ///

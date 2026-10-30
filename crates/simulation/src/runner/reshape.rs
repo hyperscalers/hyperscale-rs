@@ -96,17 +96,23 @@ impl SimulationRunner {
         // slice, as the production tick does, rather than per round.
         let now = self.local_now(host);
         for _ in 0..MAX_FIXPOINT_ROUNDS {
-            let requests = orch.step(
+            let mut requests = orch.step(
                 &view,
                 self.verifier.as_ref(),
                 derivation.as_ref(),
                 std::mem::take(&mut events),
                 now,
             );
+            requests.extend(
+                self.reshape_stores[host as usize]
+                    .ready_preps(|shard, ticket| orch.awaits(shard, ticket)),
+            );
             let mut progressed = false;
             for request in requests {
-                if let Some(event) =
+                if let Some(completion) =
                     self.dispatch_reshape(host, request, &mut broadcasted, &mut retries)
+                    && let Some(event) = self.reshape_stores[host as usize]
+                        .settle(completion, |shard, ticket| orch.awaits(shard, ticket))
                 {
                     events.push(event);
                     progressed = true;
@@ -134,37 +140,38 @@ impl SimulationRunner {
         self.drain_host_io(host);
     }
 
-    /// Perform one reshape request, answering with the [`ReshapeEvent`] the
-    /// orchestrator consumes (or `None` for the fire-and-forget broadcast and
-    /// the terminal seat).
+    /// Perform one reshape request, answering with the completion the host's
+    /// prepared stores settle (or `None` for the fire-and-forget broadcast,
+    /// the terminal seat, and a prep held behind another).
     fn dispatch_reshape(
         &mut self,
         host: NodeIndex,
         request: ReshapeRequest,
         broadcasted: &mut HashSet<ValidatorId>,
         retries: &mut Vec<ReshapeEvent>,
-    ) -> Option<ReshapeEvent> {
+    ) -> Option<ReshapeCompletion<SimShardStorage>> {
         if let Some(shard) = request.prepared_shard()
             && self.hosts_shard(host, shard).is_some()
         {
             return match request.over_running() {
-                Some(OverRunning::Answer(event)) => Some(event),
+                Some(OverRunning::Answer(event)) => Some(ReshapeCompletion::Event(event)),
                 Some(OverRunning::Nothing) | None => None,
             };
         }
+        let request = self.reshape_stores[host as usize].prep(request)?;
         match request {
             ReshapeRequest::OpenStore { shard, ticket } => {
-                self.reshape_open_store(host, shard, ticket)
+                Some(self.reshape_open_store(shard, ticket))
             }
             ReshapeRequest::SeedFromParent {
                 parent,
                 child,
                 through,
                 ticket,
-            } => self.reshape_seed_from_parent(host, parent, child, through, ticket),
-            ReshapeRequest::Fetch { duty, from, kind } => {
-                self.reshape_fetch(duty, from, kind, retries)
-            }
+            } => Some(self.reshape_seed_from_parent(host, parent, child, through, ticket)),
+            ReshapeRequest::Fetch { duty, from, kind } => self
+                .reshape_fetch(duty, from, kind, retries)
+                .map(ReshapeCompletion::Event),
             ReshapeRequest::StageChunk {
                 shard,
                 progress,
@@ -175,7 +182,10 @@ impl SimulationRunner {
                     .storage(shard)?
                     .stage_import_chunk(&progress, &leaves)
                     .expect("chunk staging into the opened store");
-                Some(ReshapeEvent::Staged { shard, ticket })
+                Some(ReshapeCompletion::Event(ReshapeEvent::Staged {
+                    shard,
+                    ticket,
+                }))
             }
             ReshapeRequest::FinalizeImport {
                 shard,
@@ -186,11 +196,11 @@ impl SimulationRunner {
                     .storage(shard)?
                     .finalize_boundary_import(height, WitnessSeed::default())
                     .expect("reshape boundary import into the opened store");
-                Some(ReshapeEvent::Imported {
+                Some(ReshapeCompletion::Event(ReshapeEvent::Imported {
                     shard,
                     root,
                     ticket,
-                })
+                }))
             }
             ReshapeRequest::ApplyFollow {
                 shard,
@@ -203,11 +213,11 @@ impl SimulationRunner {
                     .storage(shard)?
                     .follow_block_writes(&block, &creations, &frontier)
                     .expect("reshape follow apply into the opened store");
-                Some(ReshapeEvent::Applied {
+                Some(ReshapeCompletion::Event(ReshapeEvent::Applied {
                     shard,
                     root,
                     ticket,
-                })
+                }))
             }
             ReshapeRequest::BroadcastReady {
                 validator,
@@ -270,23 +280,21 @@ impl SimulationRunner {
         }
     }
 
-    /// Open a fresh duty store, replicate the engine bootstrap into it, and
-    /// settle it for the duty.
+    /// Open a fresh duty store and replicate the engine bootstrap into it.
     fn reshape_open_store(
-        &mut self,
-        host: NodeIndex,
+        &self,
         shard: ShardId,
         ticket: Ticket,
-    ) -> Option<ReshapeEvent> {
+    ) -> ReshapeCompletion<SimShardStorage> {
         let storage = open_store(shard, self.power_loss);
         replicate_engine_bootstrap(&storage, &self.genesis_config());
         let recovered = storage.load_recovered_state(shard);
-        self.reshape_stores[host as usize].settle(ReshapeCompletion::Opened {
+        ReshapeCompletion::Opened {
             shard,
             storage,
             recovered,
             ticket,
-        })
+        }
     }
 
     /// Seed a parent half's child store by deep-cloning the host's own retained
@@ -295,30 +303,30 @@ impl SimulationRunner {
     /// answer the gate's event — a deferral the orchestrator paces, or
     /// [`ReshapeEvent::SeedUnavailable`] when the host holds no parent store.
     fn reshape_seed_from_parent(
-        &mut self,
+        &self,
         host: NodeIndex,
         parent: ShardId,
         child: ShardId,
         through: BlockHeight,
         ticket: Ticket,
-    ) -> Option<ReshapeEvent> {
+    ) -> ReshapeCompletion<SimShardStorage> {
         let parent_height = self
             .hosts_shard(host, parent)
             .map(ShardChainReader::committed_height);
         if let Some(event) = seed_gate(parent_height, child, through, ticket) {
-            return Some(event);
+            return ReshapeCompletion::Event(event);
         }
         let storage = self.hosts[host as usize]
             .shard_io(parent)
             .storage()
             .clone_for_split_child(shard_prefix_path(child));
         let recovered = storage.load_recovered_state(child);
-        self.reshape_stores[host as usize].settle(ReshapeCompletion::Opened {
+        ReshapeCompletion::Opened {
             shard: child,
             storage,
             recovered,
             ticket,
-        })
+        }
     }
 
     /// Serve one reshape fetch from a committee host's store. A state range
@@ -432,20 +440,20 @@ impl SimulationRunner {
     }
 
     /// Adopt a duty's derived genesis into its store via the shared
-    /// [`adopt_prepared_store`] gate, caching the genesis plus the recovered
-    /// state the seat boots from.
+    /// [`adopt_prepared_store`] gate, answering with the genesis plus the
+    /// recovered state the seat boots from.
     fn reshape_adopt(
-        &mut self,
+        &self,
         host: NodeIndex,
         shard: ShardId,
         kind: AdoptKind,
         genesis: DerivedGenesis,
         ticket: Ticket,
-    ) -> Option<ReshapeEvent> {
-        let storage = self.reshape_stores[host as usize].storage(shard)?.clone();
-        let recovered = adopt_prepared_store(&storage, shard, kind, &genesis)
+    ) -> Option<ReshapeCompletion<SimShardStorage>> {
+        let storage = self.reshape_stores[host as usize].storage(shard)?;
+        let recovered = adopt_prepared_store(storage, shard, kind, &genesis)
             .expect("adopted reshape root must match the genesis it derived");
-        self.reshape_stores[host as usize].settle(ReshapeCompletion::Adopted {
+        Some(ReshapeCompletion::Adopted {
             shard,
             genesis: Box::new(genesis.block),
             recovered,
