@@ -32,9 +32,8 @@ use hyperscale_types::{
     TransactionContext, TransactionVerifyError, TxHash, Unresolved, Verified, Verify,
 };
 
-use super::{DeferredTransaction, Origin, TransactionBinding};
+use super::{DeferredTransaction, Origin};
 use crate::batch_accumulator::BatchAccumulator;
-use crate::fetch::FetchInput;
 use crate::host::NodeHost;
 use crate::process::SubmitFanout;
 use crate::shard::{
@@ -251,11 +250,10 @@ where
     }
 
     /// Intercept a fetch-delivered batch before it reaches the state
-    /// machine. Drives the fetch-FSM drain for every delivered hash
-    /// (releases in-flight slots regardless of validation outcome,
-    /// so an invalid-signature payload can't pin a slot) and offers the
-    /// batch to validation as asked, flushing at once rather than
-    /// waiting out the batch window a block is stalled behind.
+    /// machine and offer it to validation as asked, flushing at once
+    /// rather than waiting out the batch window a block is stalled
+    /// behind. The response boundary has already retired the delivered
+    /// ids, whatever validation makes of them.
     pub(crate) fn handle_fetched_txs_for_validation(&mut self, batch: Vec<Arc<Transaction>>) {
         if batch.is_empty() {
             return;
@@ -268,9 +266,6 @@ where
             .into_iter()
             .map(|tx| self.process.canonical_txs.canonicalize(&tx))
             .collect();
-
-        let delivered_ids: Vec<TxHash> = batch.iter().map(|tx| tx.hash()).collect();
-        self.drive_fetch::<TransactionBinding>(FetchInput::Admitted { ids: delivered_ids });
 
         for tx in batch {
             self.admit(tx, Origin::Asked);
