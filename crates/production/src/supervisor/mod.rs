@@ -144,10 +144,17 @@ pub enum SupervisorEvent {
     },
     /// A snap-sync bootstrap settled (`Err` carries the failed shard).
     Bootstrapped(Result<CompletedBootstrap, ShardId>),
-    /// A running shard's rebuild staged its store at the attested anchor
-    /// (`Err` carries the shard whose rebuild failed), with why the store
-    /// it replaces is replaced.
-    Rebuilt(Result<CompletedBootstrap, ShardId>, Replaced),
+    /// A running shard's rebuild settled its staging store.
+    Rebuilt {
+        /// Which rebuild settled, so a completion a teardown or a later
+        /// rebuild superseded is dropped.
+        rebuild: u64,
+        /// The store staged at the attested anchor, or the shard whose
+        /// rebuild failed.
+        outcome: Result<CompletedBootstrap, ShardId>,
+        /// Why the store it replaces is replaced.
+        replaced: Replaced,
+    },
     /// A reshape orchestrator io result settled.
     Reshape(ReshapeCompletion<Arc<RocksDbShardStorage>>),
     /// A shard loop attached a validator to its replica.
@@ -263,6 +270,9 @@ pub struct ShardSupervisor {
     /// A join for one waits for the swap, which seats every placed local
     /// validator.
     rebuilding: HashMap<ShardId, Rebuild>,
+    /// How many rebuilds have started, numbering each so its completion is
+    /// matched to the staging that is still current.
+    rebuilds: u64,
     /// The sans-io reshape orchestrator — discovers this host's observer
     /// and keeper duties from the committed-state projection and sequences
     /// them. The supervisor pumps it on a timer and on every placement
@@ -274,13 +284,15 @@ pub struct ShardSupervisor {
     /// [`Self::storages`].
     reshape_stores: PreparedStores<Arc<RocksDbShardStorage>>,
     /// Reshape store-prep requests (`OpenStore` / `SeedFromParent`) held while
-    /// an ordinary join is still opening the same shard's store
-    /// directory, keyed by that store shard. A reshape duty owns its successor's
-    /// store, but a join that slipped past the `reshape_owns` suppression (a
-    /// lagging topology snapshot) may already be mid-open; holding the prep until
-    /// that join's open lands and is abandoned keeps the two off the same
-    /// `RocksDB` directory, whose exclusive lock would otherwise fail the second
-    /// open. Re-dispatched from [`Self::reshape_step`] once the join clears.
+    /// an ordinary join is still opening the same shard's store directory, or
+    /// a torn down loop still holds its store there, keyed by that store
+    /// shard. A reshape duty owns its successor's store, but a join that
+    /// slipped past the `reshape_owns` suppression (a lagging topology
+    /// snapshot) may already be mid-open, and a draining thread closes its
+    /// store only once it joins; holding the prep until then keeps the two off
+    /// the same `RocksDB` directory, which the prep wipes and whose exclusive
+    /// lock would otherwise fail the second open. Re-dispatched from
+    /// [`Self::resume_pending_reshape_prep`] once the join or drain clears.
     pending_reshape_prep: HashMap<ShardId, ReshapeRequest>,
     /// Beacon epoch length, for the keeper's deterministic merged-genesis
     /// cut derivation. Matches the beacon's own chain config.
@@ -364,6 +376,7 @@ impl ShardSupervisor {
             shards: BTreeMap::new(),
             bootstrapping: HashMap::new(),
             rebuilding: HashMap::new(),
+            rebuilds: 0,
             reshape: ReshapeOrchestrator::new(vnode_keys.keys().copied().collect()),
             reshape_stores: PreparedStores::new(),
             pending_reshape_prep: HashMap::new(),
@@ -398,7 +411,11 @@ impl ShardSupervisor {
                 outcome,
             } => self.on_opened(shard, vnodes, outcome),
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
-            SupervisorEvent::Rebuilt(done, replaced) => self.on_rebuilt(done, replaced),
+            SupervisorEvent::Rebuilt {
+                rebuild,
+                outcome,
+                replaced,
+            } => self.on_rebuilt(rebuild, outcome, replaced),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
             SupervisorEvent::Attached { shard, validator } => self.on_attached(shard, validator),
             SupervisorEvent::Reseat { shard } => self.reseat(shard),
