@@ -66,6 +66,15 @@ pub enum RequestError {
     Shutdown,
 }
 
+/// Who handed a gossip or notification handler its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// This host sent it and delivered it to its own handlers.
+    Local,
+    /// A peer sent it over the network.
+    Peer,
+}
+
 /// What a handler made of an inbound message.
 ///
 /// Returned by [`GossipHandler::on_message`] and
@@ -239,18 +248,18 @@ impl ResponseVerdict {
 pub trait GossipHandler<M: GossipMessage>: Send + Sync + 'static {
     /// Process a decoded gossip message for `shard`; return whether to
     /// forward it.
-    fn on_message(&self, message: M, shard: ShardId) -> Verdict;
+    fn on_message(&self, message: M, shard: ShardId, provenance: Provenance) -> Verdict;
 }
 
-/// Blanket impl: any `Fn(M, ShardId) -> Verdict` can serve as
+/// Blanket impl: any `Fn(M, ShardId, Provenance) -> Verdict` can serve as
 /// a typed gossip handler.
 impl<M, F> GossipHandler<M> for F
 where
     M: GossipMessage,
-    F: Fn(M, ShardId) -> Verdict + Send + Sync + 'static,
+    F: Fn(M, ShardId, Provenance) -> Verdict + Send + Sync + 'static,
 {
-    fn on_message(&self, message: M, shard: ShardId) -> Verdict {
-        (self)(message, shard)
+    fn on_message(&self, message: M, shard: ShardId, provenance: Provenance) -> Verdict {
+        (self)(message, shard, provenance)
     }
 }
 
@@ -261,18 +270,18 @@ where
 /// says whether the sender is to blame for the message.
 pub trait NotificationHandler<M: NetworkMessage>: Send + Sync + 'static {
     /// Process a decoded notification.
-    fn on_notification(&self, message: M) -> Verdict;
+    fn on_notification(&self, message: M, provenance: Provenance) -> Verdict;
 }
 
-/// Blanket impl: any `Fn(M) -> Verdict` can serve as a typed notification
-/// handler.
+/// Blanket impl: any `Fn(M, Provenance) -> Verdict` can serve as a typed
+/// notification handler.
 impl<M, F> NotificationHandler<M> for F
 where
     M: NetworkMessage,
-    F: Fn(M) -> Verdict + Send + Sync + 'static,
+    F: Fn(M, Provenance) -> Verdict + Send + Sync + 'static,
 {
-    fn on_notification(&self, message: M) -> Verdict {
-        (self)(message)
+    fn on_notification(&self, message: M, provenance: Provenance) -> Verdict {
+        (self)(message, provenance)
     }
 }
 
@@ -554,11 +563,11 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler = move |_msg: TestMsg, _shard: ShardId| -> Verdict {
+        let handler = move |_msg: TestMsg, _shard: ShardId, _provenance: Provenance| -> Verdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             Verdict::Accept
         };
-        let verdict = handler.on_message(TestMsg(42), ShardId::ROOT);
+        let verdict = handler.on_message(TestMsg(42), ShardId::ROOT, Provenance::Peer);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, Verdict::Accept);
     }

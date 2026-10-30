@@ -56,7 +56,7 @@ use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
 use hyperscale_metrics::record_network_input_refused;
-use hyperscale_network::{Network, dispatching_locally};
+use hyperscale_network::{Network, Provenance};
 use hyperscale_storage::{
     AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
 };
@@ -306,22 +306,23 @@ pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event:
     let _ = tx.send(HostEvent::protocol(shard, event));
 }
 
-/// Offer an input a peer sent unbidden to `shard`'s network lane.
+/// Offer an input a message brought to `shard`'s network lane.
 ///
 /// `false` when the lane is full: the input is dropped and counted, never
 /// queued past the lane's bound, and the handler answers the message as
 /// [`Verdict::Busy`](hyperscale_network::Verdict::Busy). A closed lane
 /// takes the input as [`push_shard_input`] does. A message this host sent
-/// itself, handed back to its own shards by a local dispatch (see
-/// [`dispatching_locally`]), goes on the internal lane instead: the bound
-/// is on what peers may queue here, not on what the host itself produced.
+/// itself ([`Provenance::Local`]) goes on the internal lane instead: the
+/// bound is on what peers may queue here, not on what the host itself
+/// produced.
 #[must_use]
 pub(crate) fn offer_network_input(
     inbox: &ShardInbox,
     shard: ShardId,
     input: ShardScopedInput,
+    provenance: Provenance,
 ) -> bool {
-    offer_network(inbox, HostEvent::shard(shard, input))
+    offer_network(inbox, HostEvent::shard(shard, input), provenance)
 }
 
 /// [`offer_network_input`] for a [`ProtocolEvent`].
@@ -330,12 +331,13 @@ pub(crate) fn offer_network_event(
     inbox: &ShardInbox,
     shard: ShardId,
     event: ProtocolEvent,
+    provenance: Provenance,
 ) -> bool {
-    offer_network(inbox, HostEvent::protocol(shard, event))
+    offer_network(inbox, HostEvent::protocol(shard, event), provenance)
 }
 
-fn offer_network(inbox: &ShardInbox, event: HostEvent) -> bool {
-    if dispatching_locally() {
+fn offer_network(inbox: &ShardInbox, event: HostEvent, provenance: Provenance) -> bool {
+    if provenance == Provenance::Local {
         let _ = inbox.internal().send(event);
         return true;
     }

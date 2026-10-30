@@ -46,7 +46,7 @@ use hyperscale_network::retry::{
 };
 use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
 use hyperscale_network::{
-    Answerers, HandlerRegistry, RequestError, ResponseVerdict, Verdict, compression,
+    Answerers, HandlerRegistry, Provenance, RequestError, ResponseVerdict, Verdict, compression,
 };
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
@@ -2035,6 +2035,7 @@ impl SimulatedNetwork {
                 ..
             } = scheduled;
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
+            let provenance = provenance_of(record.from, to);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -2064,12 +2065,12 @@ impl SimulatedNetwork {
             };
             match (gossip, host_handler) {
                 (Some(gossip), Some(host_handler)) => {
-                    let _ = gossip(payload.clone(), shard);
+                    let _ = gossip(payload.clone(), shard, provenance);
                     host_handler(payload);
                     true
                 }
                 (Some(gossip), None) => {
-                    let _ = gossip(payload, shard);
+                    let _ = gossip(payload, shard, provenance);
                     true
                 }
                 (None, Some(host_handler)) => {
@@ -2125,6 +2126,7 @@ impl SimulatedNetwork {
                 record, payload, ..
             } = scheduled;
             let (to, message_type) = (record.to, record.message_type);
+            let provenance = provenance_of(record.from, to);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -2145,7 +2147,7 @@ impl SimulatedNetwork {
                 return false;
             };
             // The simulator charges no peer, so the verdict changes nothing.
-            let _ = handler(payload);
+            let _ = handler(payload, provenance);
             true
         });
         (delivered, stats)
@@ -2200,6 +2202,16 @@ fn gossip_message_id(entry: &OutboxEntry) -> u64 {
     let mut id = [0u8; 8];
     id.copy_from_slice(&digest.as_bytes()[..8]);
     u64::from_le_bytes(id)
+}
+
+/// Who handed `to` a message `from` sent: a host's message to itself is its
+/// own, anything else a peer's.
+const fn provenance_of(from: NodeIndex, to: NodeIndex) -> Provenance {
+    if from == to {
+        Provenance::Local
+    } else {
+        Provenance::Peer
+    }
 }
 
 #[cfg(test)]
@@ -3389,11 +3401,12 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
+                let raw: Arc<RawGossipHandler> = Arc::new(
+                    move |payload: Vec<u8>, _shard: Option<ShardId>, _: Provenance| {
                         handler_clone.received.lock().unwrap().push(payload);
                         Some(Verdict::Accept)
-                    });
+                    },
+                );
                 adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
             })
@@ -3968,10 +3981,11 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let sink = handler.clone();
-                let raw: Arc<RawNotificationHandler> = Arc::new(move |payload: Vec<u8>| {
-                    sink.received.lock().unwrap().push(payload);
-                    Verdict::Accept
-                });
+                let raw: Arc<RawNotificationHandler> =
+                    Arc::new(move |payload: Vec<u8>, _: Provenance| {
+                        sink.received.lock().unwrap().push(payload);
+                        Verdict::Accept
+                    });
                 adapter.registry.register_raw_notification(TYPE, raw);
                 handler
             })
@@ -4190,11 +4204,12 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
+                let raw: Arc<RawGossipHandler> = Arc::new(
+                    move |payload: Vec<u8>, _shard: Option<ShardId>, _: Provenance| {
                         handler_clone.received.lock().unwrap().push(payload);
                         Some(Verdict::Accept)
-                    });
+                    },
+                );
                 adapter
                     .registry
                     .register_raw_gossip("transaction.gossip", raw);

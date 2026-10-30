@@ -7,7 +7,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_execution::attesting_committee;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::{record_crossing_push_dropped, record_fetch_response_sent};
-use hyperscale_network::{Network, Verdict, VerdictKey};
+use hyperscale_network::{Network, Provenance, Verdict, VerdictKey};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
@@ -66,7 +66,10 @@ where
         self.process
             .network
             .register_gossip_handler::<TransactionGossip>(
-                move |gossip: TransactionGossip, shard: ShardId| -> Verdict {
+                move |gossip: TransactionGossip,
+                      shard: ShardId,
+                      provenance: Provenance|
+                      -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
                         warn!(
@@ -84,6 +87,7 @@ where
                             tx,
                             shard,
                             ShardScopedInput::TransactionGossipReceived { tx: transaction },
+                            provenance,
                         ) {
                             return Verdict::Busy;
                         }
@@ -107,7 +111,10 @@ where
         self.process
             .network
             .register_gossip_handler::<CertifiedBlockHeaderGossip>(
-                move |gossip: CertifiedBlockHeaderGossip, target_shard: ShardId| -> Verdict {
+                move |gossip: CertifiedBlockHeaderGossip,
+                      target_shard: ShardId,
+                      provenance: Provenance|
+                      -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
@@ -184,6 +191,7 @@ where
                             public_key,
                             sender_signature: gossip.sender_signature,
                         },
+                        provenance,
                     ) {
                         return Verdict::Busy;
                     }
@@ -201,7 +209,10 @@ where
         self.process
             .network
             .register_gossip_handler::<ShardForkProofGossip>(
-                move |gossip: ShardForkProofGossip, target_shard: ShardId| -> Verdict {
+                move |gossip: ShardForkProofGossip,
+                      target_shard: ShardId,
+                      provenance: Provenance|
+                      -> Verdict {
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
@@ -216,6 +227,7 @@ where
                         ShardScopedInput::ShardForkProofGossipReceived {
                             proof: gossip.proof,
                         },
+                        provenance,
                     ))
                 },
             );
@@ -229,7 +241,10 @@ where
         self.process
             .network
             .register_gossip_handler::<ShardVoteEquivocationGossip>(
-                move |gossip: ShardVoteEquivocationGossip, target_shard: ShardId| -> Verdict {
+                move |gossip: ShardVoteEquivocationGossip,
+                      target_shard: ShardId,
+                      _provenance: Provenance|
+                      -> Verdict {
                     if !senders.load().contains_key(&target_shard) {
                         warn!(
                             target_shard = target_shard.inner(),
@@ -276,7 +291,7 @@ where
         self.process
             .network
             .register_notification_handler::<BlockVoteNotification>(
-                move |gossip: BlockVoteNotification| -> Verdict {
+                move |gossip: BlockVoteNotification, provenance: Provenance| -> Verdict {
                     let shard = gossip.vote.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -290,7 +305,7 @@ where
                         Ok(vote) => ProtocolEvent::VerifiedBlockVoteReceived { vote },
                         Err(vote) => ProtocolEvent::UnverifiedBlockVoteReceived { vote },
                     };
-                    taken(offer_network_event(tx, shard, event))
+                    taken(offer_network_event(tx, shard, event, provenance))
                 },
             );
 
@@ -299,7 +314,7 @@ where
         self.process
             .network
             .register_notification_handler::<TimeoutNotification>(
-                move |gossip: TimeoutNotification| -> Verdict {
+                move |gossip: TimeoutNotification, provenance: Provenance| -> Verdict {
                     let shard = gossip.timeout.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -313,7 +328,7 @@ where
                         Ok(timeout) => ProtocolEvent::VerifiedTimeoutReceived { timeout },
                         Err(timeout) => ProtocolEvent::UnverifiedTimeoutReceived { timeout },
                     };
-                    taken(offer_network_event(tx, shard, event))
+                    taken(offer_network_event(tx, shard, event, provenance))
                 },
             );
 
@@ -325,7 +340,9 @@ where
         self.process
             .network
             .register_notification_handler::<QcAnnouncementNotification>(
-                move |announcement: QcAnnouncementNotification| -> Verdict {
+                move |announcement: QcAnnouncementNotification,
+                      provenance: Provenance|
+                      -> Verdict {
                     let shard = announcement.qc.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -335,6 +352,7 @@ where
                         tx,
                         shard,
                         ProtocolEvent::QcAnnouncementReceived { announcement },
+                        provenance,
                     ))
                 },
             );
@@ -347,7 +365,7 @@ where
         self.process
             .network
             .register_notification_handler::<BlockHeaderNotification>(
-                move |gossip: BlockHeaderNotification| -> Verdict {
+                move |gossip: BlockHeaderNotification, provenance: Provenance| -> Verdict {
                     let shard = gossip.header.shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -374,6 +392,7 @@ where
                         ShardScopedInput::ProposalReceived {
                             proposal: Box::new(gossip),
                         },
+                        provenance,
                     ))
                 },
             );
@@ -393,7 +412,7 @@ where
         self.process
             .network
             .register_notification_handler::<ProvisionsNotification>(
-                move |notification: ProvisionsNotification| -> Verdict {
+                move |notification: ProvisionsNotification, provenance: Provenance| -> Verdict {
                     let target_shard = notification.provisions.target_shard();
                     // Drop provisions not destined for any hosted shard before
                     // paying the signature verification cost.
@@ -436,7 +455,7 @@ where
                             provisions: Arc::new(raw),
                         }
                     };
-                    taken(offer_network_event(tx, target_shard, event))
+                    taken(offer_network_event(tx, target_shard, event, provenance))
                 },
             );
 
@@ -460,7 +479,9 @@ where
         self.process
             .network
             .register_notification_handler::<CrossingReadingsNotification>(
-                move |notification: CrossingReadingsNotification| -> Verdict {
+                move |notification: CrossingReadingsNotification,
+                      provenance: Provenance|
+                      -> Verdict {
                     let target_shard = notification.target_shard;
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
@@ -516,6 +537,7 @@ where
                         ProtocolEvent::CrossingReadingsReceived {
                             claims: notification.claims.into_inner(),
                         },
+                        provenance,
                     );
                     if !offered {
                         record_crossing_push_dropped("lane_full");
@@ -530,7 +552,7 @@ where
         self.process
             .network
             .register_notification_handler::<ExecutionVoteNotification>(
-                move |gossip: ExecutionVoteNotification| -> Verdict {
+                move |gossip: ExecutionVoteNotification, provenance: Provenance| -> Verdict {
                     let shard = gossip.vote.tick_id().shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
@@ -554,6 +576,7 @@ where
                         ProtocolEvent::ExecutionVoteReceived {
                             vote: gossip.into_vote(),
                         },
+                        provenance,
                     ))
                 },
             );
@@ -577,7 +600,9 @@ where
         self.process
             .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
-                move |batch: ExecutionCertificatesNotification| -> Verdict {
+                move |batch: ExecutionCertificatesNotification,
+                      provenance: Provenance|
+                      -> Verdict {
                     // No honest leader sends an empty batch.
                     if batch.certificates.is_empty() {
                         return Verdict::Reject;
@@ -658,9 +683,14 @@ where
                     // shard for a cert isn't known here without inspecting
                     // expected-cert sets, so each hosted shard decides
                     // whether to admit (no-op if unexpected).
-                    offer_to_each(senders.load().iter(), certificates, |certificates| {
-                        ProtocolEvent::ExecutionCertificatesReceived { certificates }
-                    })
+                    offer_to_each(
+                        senders.load().iter(),
+                        certificates,
+                        |certificates| ProtocolEvent::ExecutionCertificatesReceived {
+                            certificates,
+                        },
+                        provenance,
+                    )
                 },
             );
 
@@ -680,7 +710,7 @@ where
         self.process
             .network
             .register_notification_handler::<ReadySignalNotification>(
-                move |notification: ReadySignalNotification| -> Verdict {
+                move |notification: ReadySignalNotification, provenance: Provenance| -> Verdict {
                     let signal = notification.signal;
                     let line = signal.shard();
                     let senders = senders.load();
@@ -716,9 +746,12 @@ where
                         );
                         return Verdict::Reject;
                     }
-                    offer_to_each(targets, signal, |signal| {
-                        ProtocolEvent::ReadySignalReceived { signal }
-                    })
+                    offer_to_each(
+                        targets,
+                        signal,
+                        |signal| ProtocolEvent::ReadySignalReceived { signal },
+                        provenance,
+                    )
                 },
             );
 
@@ -741,7 +774,7 @@ where
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
-                move |gossip: BeaconProposalNotification| -> Verdict {
+                move |gossip: BeaconProposalNotification, _provenance: Provenance| -> Verdict {
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
                     let Some(sender_pk) = topology_snapshot.load().public_key(from) else {
@@ -774,7 +807,7 @@ where
             ($note_ty:ty, $unv:ident, $ver:ident, $vote_ty:ty $(, $box:tt)?) => {{
                 let beacon_tx = self.process.beacon_event_sender.clone();
                 self.process.network.register_notification_handler::<$note_ty>(
-                    move |gossip: $note_ty| -> Verdict {
+                    move |gossip: $note_ty, _provenance: Provenance| -> Verdict {
                         let epoch = gossip.epoch;
                         let view = gossip.view;
                         let event = match Arc::unwrap_or_clone(gossip.vote).into_verified() {
@@ -833,7 +866,7 @@ where
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
-                move |gossip: SpcNewViewNotification| -> Verdict {
+                move |gossip: SpcNewViewNotification, _provenance: Provenance| -> Verdict {
                     let topo = topology_snapshot.load();
                     let verdict = verify_signed_by_proposer(
                         verifier.as_ref(),
@@ -862,7 +895,7 @@ where
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
-                move |gossip: SpcNewCommitNotification| -> Verdict {
+                move |gossip: SpcNewCommitNotification, _provenance: Provenance| -> Verdict {
                     let topo = topology_snapshot.load();
                     let verdict = verify_signed_by_proposer(
                         verifier.as_ref(),
@@ -899,7 +932,7 @@ where
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
-                move |gossip: SpcEmptyViewMsgNotification| -> Verdict {
+                move |gossip: SpcEmptyViewMsgNotification, _provenance: Provenance| -> Verdict {
                     if !gossip.msg.is_verified() {
                         let topo = topology_snapshot.load();
                         let verdict = verify_signed_by_proposer(
@@ -951,6 +984,7 @@ fn offer_to_each<'a, T: Clone>(
     targets: impl IntoIterator<Item = (&'a ShardId, &'a ShardInbox)>,
     value: T,
     event: impl Fn(T) -> ProtocolEvent,
+    provenance: Provenance,
 ) -> Verdict {
     let targets: Vec<_> = targets.into_iter().collect();
     let Some(((last_shard, last_inbox), rest)) = targets.split_last() else {
@@ -958,9 +992,9 @@ fn offer_to_each<'a, T: Clone>(
     };
     let mut any_taken = false;
     for (shard, inbox) in rest {
-        any_taken |= offer_network_event(inbox, **shard, event(value.clone()));
+        any_taken |= offer_network_event(inbox, **shard, event(value.clone()), provenance);
     }
-    any_taken |= offer_network_event(last_inbox, **last_shard, event(value));
+    any_taken |= offer_network_event(last_inbox, **last_shard, event(value), provenance);
     taken(any_taken)
 }
 
@@ -1311,7 +1345,7 @@ mod tests {
     use crossbeam::channel::{bounded, unbounded};
     use hyperscale_core::ProtocolEvent;
     use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
-    use hyperscale_network::{HandlerRegistry, Verdict};
+    use hyperscale_network::{HandlerRegistry, Provenance, Verdict};
     use hyperscale_types::network::gossip::TransactionGossip;
     use hyperscale_types::network::notification::ReadySignalNotification;
     use hyperscale_types::test_utils::test_transaction;
@@ -1331,7 +1365,11 @@ mod tests {
         let handler = registry
             .get_gossip(TransactionGossip::message_type_id())
             .expect("transaction gossip has a handler");
-        handler(hbor_to_vec(gossip).expect("gossip encodes"), Some(SHARD))
+        handler(
+            hbor_to_vec(gossip).expect("gossip encodes"),
+            Some(SHARD),
+            Provenance::Peer,
+        )
     }
 
     fn ready_signal(fix: &Fixture, shard: ShardId) -> ReadySignalNotification {
@@ -1457,7 +1495,10 @@ mod tests {
         let (left, right) = SHARD.children();
         let sibling = ShardId::leaf(1, 1);
         let delivered = |shard: ShardId| {
-            let _ = handler(hbor_to_vec(&ready_signal(&fix, shard)).expect("signal encodes"));
+            let _ = handler(
+                hbor_to_vec(&ready_signal(&fix, shard)).expect("signal encodes"),
+                Provenance::Peer,
+            );
             network
                 .try_iter()
                 .filter(|event| {

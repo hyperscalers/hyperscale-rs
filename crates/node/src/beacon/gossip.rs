@@ -8,7 +8,7 @@
 
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
-use hyperscale_network::{Network, Verdict, VerdictKey};
+use hyperscale_network::{Network, Provenance, Verdict, VerdictKey};
 use hyperscale_types::ShardId;
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
@@ -43,7 +43,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     // or behind its tip.
     let s = senders.clone();
     network.register_gossip_handler::<BeaconBlockGossip>(
-        move |gossip: BeaconBlockGossip, target_shard: ShardId| -> Verdict {
+        move |gossip: BeaconBlockGossip,
+              target_shard: ShardId,
+              _provenance: Provenance|
+              -> Verdict {
             if !s.load().contains_key(&target_shard) {
                 warn!(
                     target_shard = target_shard.inner(),
@@ -67,7 +70,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     // without it a member can only ever prevote the skip hash.
     let s = senders.clone();
     network.register_gossip_handler::<BeaconCandidateGossip>(
-        move |gossip: BeaconCandidateGossip, target_shard: ShardId| -> Verdict {
+        move |gossip: BeaconCandidateGossip,
+              target_shard: ShardId,
+              _provenance: Provenance|
+              -> Verdict {
             if !s.load().contains_key(&target_shard) {
                 return Verdict::Ignore;
             }
@@ -91,7 +97,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     // observes, so every participant must see its peers' votes.
     let s = senders.clone();
     network.register_gossip_handler::<RatifyVoteGossip>(
-        move |gossip: RatifyVoteGossip, target_shard: ShardId| -> Verdict {
+        move |gossip: RatifyVoteGossip,
+              target_shard: ShardId,
+              _provenance: Provenance|
+              -> Verdict {
             if !s.load().contains_key(&target_shard) {
                 return Verdict::Ignore;
             }

@@ -18,7 +18,6 @@
 //! only from the single thread driving shard reconfiguration.
 
 use std::any::{Any, TypeId};
-use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -30,48 +29,21 @@ use hyperscale_types::{GossipMessage, GossipScope, NetworkMessage, Request, Shar
 
 use crate::deferred::{Deferred, WaitId, Waiting};
 use crate::traits::{
-    Deferral, GossipHandler, NotificationHandler, RequestHandler, Verdict, VerdictKey,
+    Deferral, GossipHandler, NotificationHandler, Provenance, RequestHandler, Verdict, VerdictKey,
 };
 
-thread_local! {
-    static LOCAL_DISPATCH: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Whether the handler running on this thread was handed its message by
-/// this host itself rather than by a peer.
+/// Type-erased gossip handler, returning the verdict of this host's
+/// handlers on a message.
 ///
-/// True inside [`HandlerRegistry`]'s local dispatches. A handler that
-/// bounds what peers may queue on this host lets its own messages past
-/// that bound.
-#[must_use]
-pub fn dispatching_locally() -> bool {
-    LOCAL_DISPATCH.with(Cell::get)
-}
-
-/// Marks the handlers run while it lives as dispatched locally.
-struct LocalDispatch(bool);
-
-impl LocalDispatch {
-    fn enter() -> Self {
-        Self(LOCAL_DISPATCH.with(|local| local.replace(true)))
-    }
-}
-
-impl Drop for LocalDispatch {
-    fn drop(&mut self) {
-        LOCAL_DISPATCH.with(|local| local.set(self.0));
-    }
-}
-
-/// Type-erased gossip handler: receives decompressed wire bytes plus the
-/// shard the topic encoded (`None` for global-scoped topics), and returns
-/// the verdict of this host's handlers on the message.
+/// Receives decompressed wire bytes, the shard the topic encoded (`None`
+/// for global-scoped topics) and who sent them.
 ///
 /// `None` when no handler judged it: it targets no shard this host serves,
 /// or its content was dispatched already under another copy's bytes and
 /// that copy still stands (see [`GossipMessage::dedup_key`]). A message
 /// that does not decode is rejected.
-pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<Verdict> + Send + Sync;
+pub type RawGossipHandler =
+    dyn Fn(Vec<u8>, Option<ShardId>, Provenance) -> Option<Verdict> + Send + Sync;
 
 /// Type-erased host-level gossip handler: receives decompressed wire bytes.
 ///
@@ -82,9 +54,9 @@ pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardId>) -> Option<Verdict> 
 pub type RawHostGossipHandler = dyn Fn(Vec<u8>) + Send + Sync;
 
 /// Type-erased notification handler: receives decompressed wire bytes and
-/// returns the handler's verdict on the message. A message that does not
-/// decode is rejected.
-pub type RawNotificationHandler = dyn Fn(Vec<u8>) -> Verdict + Send + Sync;
+/// who sent them, and returns the handler's verdict on the message. A
+/// message that does not decode is rejected.
+pub type RawNotificationHandler = dyn Fn(Vec<u8>, Provenance) -> Verdict + Send + Sync;
 
 /// Type-erased request handler: receives request wire bytes, returns response wire bytes.
 pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
@@ -225,7 +197,12 @@ where
     /// calls with the same key may both observe "not present" and both
     /// dispatch. The downstream handler's app-level dedup absorbs this;
     /// the cache is purely a perf optimization.
-    fn deliver(&self, typed: &M, topic_shard: Option<ShardId>) -> Option<Verdict> {
+    fn deliver(
+        &self,
+        typed: &M,
+        topic_shard: Option<ShardId>,
+        provenance: Provenance,
+    ) -> Option<Verdict> {
         let content = typed.dedup_key();
         if let Some(key) = content {
             if self.dedup.get(&key).is_some() {
@@ -236,7 +213,7 @@ where
         let verdict = self
             .target_shards(typed, topic_shard)
             .into_iter()
-            .map(|target| self.handler.on_message(typed.clone(), target))
+            .map(|target| self.handler.on_message(typed.clone(), target, provenance))
             .reduce(combine_verdicts);
         if let Some(key) = content {
             match &verdict {
@@ -282,7 +259,7 @@ where
         let typed = msg
             .downcast_ref::<M>()
             .expect("local gossip dispatch type mismatch");
-        self.deliver(typed, shard)
+        self.deliver(typed, shard, Provenance::Local)
     }
 
     fn forget(&self, content: u64) {
@@ -323,7 +300,9 @@ where
             .downcast_ref::<M>()
             .expect("local notification dispatch type mismatch");
         // A message this host sent itself is charged to no one.
-        let _ = self.handler.on_notification(typed.clone());
+        let _ = self
+            .handler
+            .on_notification(typed.clone(), Provenance::Local);
     }
 }
 
@@ -490,10 +469,10 @@ impl HandlerRegistry {
         });
 
         let bytes_dispatcher = Arc::clone(&dispatcher);
-        let raw: Arc<RawGossipHandler> =
-            Arc::new(move |payload: Vec<u8>, shard: Option<ShardId>| {
+        let raw: Arc<RawGossipHandler> = Arc::new(
+            move |payload: Vec<u8>, shard: Option<ShardId>, provenance: Provenance| {
                 match hbor_from_slice::<M>(&payload) {
-                    Ok(msg) => bytes_dispatcher.deliver(&msg, shard),
+                    Ok(msg) => bytes_dispatcher.deliver(&msg, shard, provenance),
                     Err(e) => {
                         tracing::warn!(
                             message_type = M::message_type_id(),
@@ -503,7 +482,8 @@ impl HandlerRegistry {
                         Some(Verdict::Reject)
                     }
                 }
-            });
+            },
+        );
         let prior = arcswap_insert(&self.gossip, M::message_type_id(), raw);
         assert!(
             prior.is_none(),
@@ -645,9 +625,9 @@ impl HandlerRegistry {
 
         let bytes_handler = Arc::clone(&handler);
         let raw: Arc<RawNotificationHandler> =
-            Arc::new(
-                move |payload: Vec<u8>| match hbor_from_slice::<M>(&payload) {
-                    Ok(msg) => bytes_handler.on_notification(msg),
+            Arc::new(move |payload: Vec<u8>, provenance: Provenance| {
+                match hbor_from_slice::<M>(&payload) {
+                    Ok(msg) => bytes_handler.on_notification(msg, provenance),
                     Err(e) => {
                         tracing::warn!(
                             message_type = M::message_type_id(),
@@ -656,8 +636,8 @@ impl HandlerRegistry {
                         );
                         Verdict::Reject
                     }
-                },
-            );
+                }
+            });
         let prior = arcswap_insert(&self.notification, M::message_type_id(), raw);
         assert!(
             prior.is_none(),
@@ -748,12 +728,13 @@ impl HandlerRegistry {
     /// broadcast target shard for shard-scoped publishes and `None`
     /// for global publishes — the handler receives the same value the
     /// inbound transport path supplies.
+    /// The handler is told the message is this host's own,
+    /// [`Provenance::Local`].
     #[must_use]
     pub fn local_dispatch_gossip<M>(&self, msg: &M, shard: Option<ShardId>) -> Option<Verdict>
     where
         M: NetworkMessage + 'static,
     {
-        let _local = LocalDispatch::enter();
         let verdict = self
             .local_gossip
             .load()
@@ -845,12 +826,12 @@ impl HandlerRegistry {
 
     /// Dispatch a typed notification message into its in-process handler,
     /// skipping wire encode/decode. Returns `false` if no handler for
-    /// `M` is registered.
+    /// `M` is registered. The handler is told the message is this host's own,
+    /// [`Provenance::Local`].
     pub fn local_dispatch_notification<M>(&self, msg: &M) -> bool
     where
         M: NetworkMessage + 'static,
     {
-        let _local = LocalDispatch::enter();
         self.local_notification
             .load()
             .get(&TypeId::of::<M>())
@@ -933,19 +914,25 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
-        registry.register_gossip(move |_msg: TestMsg, _shard: ShardId| -> Verdict {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
-            Verdict::Accept
-        });
+        registry.register_gossip(
+            move |_msg: TestMsg, _shard: ShardId, _: Provenance| -> Verdict {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                Verdict::Accept
+            },
+        );
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = hbor_to_vec(&TestMsg(42)).unwrap();
-        let verdict = handler(encoded, Some(ShardId::leaf(1, 0)));
+        let verdict = handler(encoded, Some(ShardId::leaf(1, 0)), Provenance::Peer);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, Some(Verdict::Accept));
 
         // Decode failure should return Reject.
-        let verdict = handler(vec![0xFF, 0xFE], Some(ShardId::leaf(1, 0)));
+        let verdict = handler(
+            vec![0xFF, 0xFE],
+            Some(ShardId::leaf(1, 0)),
+            Provenance::Peer,
+        );
         assert_eq!(verdict, Some(Verdict::Reject));
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
@@ -970,7 +957,7 @@ mod tests {
         }
 
         let registry = HandlerRegistry::default();
-        registry.register_notification(|note: Note| {
+        registry.register_notification(|note: Note, _: Provenance| {
             if note.0 == 0 {
                 Verdict::Ignore
             } else {
@@ -979,9 +966,15 @@ mod tests {
         });
         let handler = registry.get_notification("test.note").unwrap();
 
-        assert_eq!(handler(hbor_to_vec(&Note(1)).unwrap()), Verdict::Accept);
-        assert_eq!(handler(hbor_to_vec(&Note(0)).unwrap()), Verdict::Ignore);
-        assert_eq!(handler(vec![0xFF, 0xFE]), Verdict::Reject);
+        assert_eq!(
+            handler(hbor_to_vec(&Note(1)).unwrap(), Provenance::Peer),
+            Verdict::Accept
+        );
+        assert_eq!(
+            handler(hbor_to_vec(&Note(0)).unwrap(), Provenance::Peer),
+            Verdict::Ignore
+        );
+        assert_eq!(handler(vec![0xFF, 0xFE], Provenance::Peer), Verdict::Reject);
     }
 
     #[test]
@@ -1064,24 +1057,29 @@ mod tests {
         let registry = HandlerRegistry::new(std::iter::once(shard_a).collect());
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_clone = Arc::clone(&hits);
-        registry.register_gossip(move |_msg: SwapMsg, _shard: ShardId| -> Verdict {
-            hits_clone.fetch_add(1, Ordering::SeqCst);
-            Verdict::Accept
-        });
+        registry.register_gossip(
+            move |_msg: SwapMsg, _shard: ShardId, _: Provenance| -> Verdict {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                Verdict::Accept
+            },
+        );
         let handler = registry.get_gossip("test.hosted_swap").unwrap();
         let encoded = hbor_to_vec(&SwapMsg(1)).unwrap();
 
         // Shard B isn't hosted — no handler here judges the message.
-        assert_eq!(handler(encoded.clone(), Some(shard_b)), None);
+        assert_eq!(
+            handler(encoded.clone(), Some(shard_b), Provenance::Peer),
+            None
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
         // After the swap the same registered handler receives shard B and
         // no longer receives shard A.
         registry.add_hosted_shard(shard_b);
         registry.remove_hosted_shard(shard_a);
-        let _ = handler(encoded.clone(), Some(shard_b));
+        let _ = handler(encoded.clone(), Some(shard_b), Provenance::Peer);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        let _ = handler(encoded, Some(shard_a));
+        let _ = handler(encoded, Some(shard_a), Provenance::Peer);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -1116,14 +1114,14 @@ mod tests {
         let registry = HandlerRegistry::new([a, b].into_iter().collect());
         let verdicts: Arc<Mutex<HashMap<ShardId, Verdict>>> = Arc::default();
         let answers = Arc::clone(&verdicts);
-        registry.register_gossip(move |_: FoldMsg, shard: ShardId| {
+        registry.register_gossip(move |_: FoldMsg, shard: ShardId, _: Provenance| {
             answers.lock().unwrap()[&shard].clone()
         });
         let handler = registry.get_gossip("test.fold").unwrap();
 
         let fold = |first: Verdict, second: Verdict| {
             *verdicts.lock().unwrap() = HashMap::from([(a, first), (b, second)]);
-            handler(hbor_to_vec(&FoldMsg(1)).unwrap(), None)
+            handler(hbor_to_vec(&FoldMsg(1)).unwrap(), None, Provenance::Peer)
         };
         assert_eq!(fold(Accept, Reject), Some(Reject));
         assert_eq!(fold(Ignore, Reject), Some(Reject));
@@ -1185,7 +1183,7 @@ mod tests {
         let registry = HandlerRegistry::new(std::iter::once(ShardId::leaf(1, 0)).collect());
         let handled = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&handled);
-        registry.register_gossip(move |copy: Copy, _: ShardId| {
+        registry.register_gossip(move |copy: Copy, _: ShardId, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             verdict(&copy)
         });
@@ -1194,7 +1192,7 @@ mod tests {
 
     fn deliver(registry: &HandlerRegistry, copy: &Copy) -> Option<Verdict> {
         let handler = registry.get_gossip("test.copy").unwrap();
-        handler(hbor_to_vec(copy).unwrap(), None)
+        handler(hbor_to_vec(copy).unwrap(), None, Provenance::Peer)
     }
 
     fn copy(sender: u32, forged: bool) -> Copy {
@@ -1400,8 +1398,12 @@ mod tests {
         }
 
         let registry = HandlerRegistry::default();
-        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> Verdict { Verdict::Accept });
-        registry.register_gossip(|_: TestMsg, _shard: ShardId| -> Verdict { Verdict::Accept });
+        registry.register_gossip(|_: TestMsg, _shard: ShardId, _: Provenance| -> Verdict {
+            Verdict::Accept
+        });
+        registry.register_gossip(|_: TestMsg, _shard: ShardId, _: Provenance| -> Verdict {
+            Verdict::Accept
+        });
     }
 
     /// A `Verifiable::Verified` value handed to [`HandlerRegistry::local_dispatch_gossip`]
@@ -1440,10 +1442,12 @@ mod tests {
         let observed: Arc<Mutex<Option<Verifiable<u32>>>> = Arc::new(Mutex::new(None));
         let observed_clone = Arc::clone(&observed);
 
-        registry.register_gossip(move |msg: VTestMsg, _shard: ShardId| -> Verdict {
-            *observed_clone.lock().unwrap() = Some(msg.payload);
-            Verdict::Accept
-        });
+        registry.register_gossip(
+            move |msg: VTestMsg, _shard: ShardId, _: Provenance| -> Verdict {
+                *observed_clone.lock().unwrap() = Some(msg.payload);
+                Verdict::Accept
+            },
+        );
 
         let verified_msg = VTestMsg {
             payload: Verified::new_unchecked_for_test(42u32).into(),
