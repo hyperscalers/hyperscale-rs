@@ -318,8 +318,9 @@ pub struct FetchedCells {
     /// collection holding less. Two kinds of interval are not here: one
     /// this node answered out of a store of its own, for the same reason
     /// the snapshot's own reads are not, since the report is already
-    /// this node's word; and one of a single order whose entry came back,
-    /// which leaves nothing to omit.
+    /// this node's word; and one of a single order whose leaf the proof
+    /// attests — present with the entry that came back, or absent when
+    /// none did — which leaves nothing to omit.
     pub unproven: BTreeSet<UnprovenInterval>,
 }
 

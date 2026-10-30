@@ -116,13 +116,14 @@ fn proven(
 /// committed tip's view, so no pending descendant this node happens to
 /// hold leaks into an answer about committed state.
 ///
-/// The proof covers the point keys asked, present or absent, and the
-/// entry leaves the intervals actually returned. It does not attest that
-/// an interval is complete, and cannot: an entry commits under a digest
-/// of its owner, collection and order, so the tree's key order is not
-/// the collection's and no non-inclusion proof over it says what lies
-/// between two orders. A server may answer with a narrower collection
-/// than it holds; it cannot answer with a value nobody wrote.
+/// The proof covers the point keys asked, present or absent, the entry
+/// leaves the intervals actually returned, and the absent leaf of each
+/// single-order interval that returned nothing. It does not attest that
+/// a wider interval is complete, and cannot: an entry commits under a
+/// digest of its owner, collection and order, so the tree's key order is
+/// not the collection's and no non-inclusion proof over it says what
+/// lies between two orders. A server may answer with a narrower
+/// collection than it holds; it cannot answer with a value nobody wrote.
 #[must_use]
 pub fn serve_cells_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
@@ -173,7 +174,12 @@ pub fn serve_cells_request<S: ShardStorage>(
 
     // Every leaf the answer stands on, so one multiproof covers the
     // whole of it: the keys as asked — an absent one is proven absent —
-    // and an entry leaf per entry a range returned.
+    // an entry leaf per entry a range returned, and the one leaf of an
+    // interval of a single order that came back empty, which proves it
+    // empty. That last is the only interval whose completeness a leaf
+    // can state, an entry's leaf being keyed by a digest of its order;
+    // it takes the place of the entry the cap already counted, so the
+    // leaves stay inside what was asked.
     let mut leaves = req.keys.to_vec();
     let mut ranges = Vec::with_capacity(req.ranges.len());
     for range in &req.ranges {
@@ -195,16 +201,20 @@ pub fn serve_cells_request<S: ShardStorage>(
         if carried > MAX_CELLS_RESPONSE_BYTES {
             return GetCellsResponse::not_found();
         }
-        leaves.extend(entries.iter().map(|(order, _)| {
+        let entry_leaf = |order: u128| {
             entry_leaf_key(
                 &ProtocolHasher,
                 EntryKey {
                     owner: range.owner,
                     collection: range.collection,
-                    order: *order,
+                    order,
                 },
             )
-        }));
+        };
+        leaves.extend(entries.iter().map(|(order, _)| entry_leaf(*order)));
+        if range.lo == range.hi && range.cap > 0 && entries.is_empty() {
+            leaves.push(entry_leaf(range.lo));
+        }
         ranges.push(RangeAnswer {
             entries: Capped::new(entries)
                 .expect("no more entries than the interval's own cap admits"),
