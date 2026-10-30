@@ -42,7 +42,7 @@ use super::seats::LeaveStep;
 use super::seats::{Departing, Drained, JoinStep, RebuiltStep, Registering};
 use super::{LoopStart, ShardSupervisor, SupervisorEvent};
 use crate::bootstrap::bootstrap_shard_state;
-use crate::runner::VnodeConfig;
+use crate::runner::{VnodeConfig, wall_clock_local};
 use crate::shard_thread::{ShardChannels, ShardControl};
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
@@ -431,6 +431,7 @@ impl ShardSupervisor {
                     .collect(),
             },
             sender,
+            wall_clock_local(),
         );
         let start = genesis
             .as_ref()

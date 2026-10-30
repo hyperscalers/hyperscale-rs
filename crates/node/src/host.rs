@@ -250,7 +250,8 @@ where
             .per_shard
             .store(Arc::new(per_shard_dispatch));
         for (shard, sender, io, replica, signers, registration) in built {
-            let shard_loop = assemble_loop(&process, sender, io, replica, signers, &registration);
+            let shard_loop =
+                assemble_loop(&process, sender, io, replica, signers, &registration, now);
             shards.insert(shard, shard_loop);
         }
 
@@ -291,15 +292,15 @@ where
             chain.recovered.committed_height,
             sender.clone(),
         );
-        let mut shard_loop = attach_shard(
+        let shard_loop = attach_shard(
             &self.process,
             &self.config,
             config,
             &registration,
             chain,
             sender,
+            self.now,
         );
-        shard_loop.set_time(self.now);
         self.shards.insert(shard, shard_loop);
     }
 
@@ -718,8 +719,8 @@ pub fn chain_anchors(recovered: &RecoveredState) -> LocalChainAnchors {
     }
 }
 
-/// Assemble a shard's loop over its built `io` and `replica`, and attach
-/// each of `signers` as its first step.
+/// Assemble a shard's loop over its built `io` and `replica` with its clock
+/// at `now`, and attach each of `signers` as its first step.
 fn assemble_loop<S, N, D>(
     process: &Arc<ProcessIo<S, N, D>>,
     event_tx: Sender<HostEvent>,
@@ -727,6 +728,7 @@ fn assemble_loop<S, N, D>(
     replica: NodeStateMachine,
     signers: Vec<(ValidatorId, Arc<dyn Signer>)>,
     registration: &Registration,
+    now: LocalTimestamp,
 ) -> ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -741,7 +743,7 @@ where
         io,
         replica,
         signers: BTreeMap::new(),
-        now: LocalTimestamp::ZERO,
+        now,
         fetch_tick: FetchTicker::default(),
         pending_timer_ops: Vec::new(),
         emitted_statuses: Vec::new(),
@@ -757,7 +759,7 @@ where
 }
 
 /// Wire a runtime-joined chain into the process-scoped maps and build its
-/// `ShardLoop`.
+/// `ShardLoop` with its clock at `now`.
 ///
 /// The chain is already registered with the beacon loop, and its replica
 /// is built here from the schedule `registration` handed back. Installs
@@ -773,6 +775,7 @@ pub fn attach_shard<S, N, D>(
     registration: &Registration,
     chain: HostedChain<'_, S>,
     sender: Sender<HostEvent>,
+    now: LocalTimestamp,
 ) -> ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -804,7 +807,7 @@ where
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
-    let shard_loop = assemble_loop(process, sender, io, replica, signers, registration);
+    let shard_loop = assemble_loop(process, sender, io, replica, signers, registration, now);
     register_shard_request_handlers(process, &shard_loop.io, shard);
     process.release_parked_submissions();
     shard_loop
