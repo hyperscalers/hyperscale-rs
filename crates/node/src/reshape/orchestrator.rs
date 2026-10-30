@@ -32,12 +32,13 @@ use hyperscale_types::network::response::{
     GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
 };
 use hyperscale_types::{
-    Anchor, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Derivation, FrontierInputs,
-    LocalTimestamp, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey, SubstateLeaf,
-    ValidatorId, Verifier, WeightedTimestamp, derive_block_transactions,
+    Block, BlockHash, BlockHeader, BlockHeight, Derivation, FrontierInputs, LocalTimestamp,
+    QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
+    Verifier, WeightedTimestamp, derive_block_transactions,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
+use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::merge_flip::merge_genesis_from_terminals;
 use crate::reshape::observer::{
     ObserverBootstrap, ObserverTail, ProveOutcome, TailOutcome, TerminalSighting, TwoChainCheck,
@@ -179,14 +180,8 @@ pub enum ReshapeRequest {
         shard: ShardId,
         /// Split vs merge derivation.
         kind: AdoptKind,
-        /// The derived chain origin.
-        origin: ChainOrigin,
-        /// The derived genesis block.
-        genesis: Box<Block>,
-        /// The terminals this duty succeeds, read off the same headers
-        /// the genesis derives from — one for a split child, two for a
-        /// merged parent.
-        predecessors: Vec<Anchor>,
+        /// The derived genesis.
+        genesis: Box<DerivedGenesis>,
     },
     /// Seat the prepared `shard` — install its genesis and run consensus. No
     /// response (terminal).
@@ -385,31 +380,14 @@ enum ObserverPhase {
     /// releases it.
     Relinquished,
     /// The children seeded; fetching the certified terminal to derive genesis.
-    FetchingTerminal {
-        /// The beacon-seeded child anchor the derivation verifies against.
-        anchor: ShardAnchor,
-        ask: TerminalAsk,
-    },
-    /// Terminal fetched and genesis derived; awaiting the next `advance` to emit
-    /// the adopt.
-    Adopting {
-        /// The derived chain origin.
-        origin: ChainOrigin,
-        /// The derived genesis block.
-        genesis: Box<Block>,
-        /// The terminals this duty succeeds.
-        predecessors: Vec<Anchor>,
-    },
-    /// Adopt emitted; awaiting the verified adopted root.
-    AwaitingAdopt,
-    /// Genesis adopted into the store; awaiting the placement that seats it.
-    Prepared,
-    /// Seat emitted; inert until the committed projection releases the duty.
-    /// The duty stays in the map so `discover_parent_half_duties` keeps deferring
-    /// a co-hosted parent half of this child to the observer's seat — which
-    /// installs every homed committee member, parent halves included — rather
-    /// than opening a second duty that would re-seat the child from genesis.
-    Seated,
+    FetchingTerminal(TerminalFetch),
+    /// Genesis derived, adopted, and seated. Once seated the duty is inert
+    /// until the committed projection releases it, and stays in the map so
+    /// `discover_parent_half_duties` keeps deferring a co-hosted parent half
+    /// of this child to the observer's seat — which installs every homed
+    /// committee member, parent halves included — rather than opening a
+    /// second duty that would re-seat the child from genesis.
+    Seat(SeatTail),
 }
 
 /// Wait between a seat's first two ready assertions.
@@ -552,6 +530,179 @@ impl ReadyAssert {
     }
 }
 
+/// The adopt-and-seat tail every duty runs once it holds its derived
+/// genesis.
+enum SeatTail {
+    /// Genesis derived; the next advance emits the adopt.
+    Adopting(Box<DerivedGenesis>),
+    /// Adopt emitted; awaiting the verified adopted root.
+    AwaitingAdopt,
+    /// Genesis adopted into the store; awaiting the placement that seats it.
+    Prepared,
+    /// Seat emitted.
+    Seated,
+}
+
+impl SeatTail {
+    /// Emit the adopt of `shard`'s genesis, and once one of `seats` sits on
+    /// `shard`'s committee, the seat.
+    fn advance<'a>(
+        &mut self,
+        shard: ShardId,
+        kind: AdoptKind,
+        seats: impl IntoIterator<Item = &'a ValidatorId>,
+        view: &ReshapeView,
+        out: &mut Vec<ReshapeRequest>,
+    ) {
+        match std::mem::replace(self, Self::AwaitingAdopt) {
+            Self::Adopting(genesis) => out.push(ReshapeRequest::Adopt {
+                shard,
+                kind,
+                genesis,
+            }),
+            Self::Prepared => {
+                let committee = view.committee(shard);
+                *self = if seats.into_iter().any(|seat| committee.contains(seat)) {
+                    out.push(ReshapeRequest::Seat { shard });
+                    Self::Seated
+                } else {
+                    Self::Prepared
+                };
+            }
+            other => *self = other,
+        }
+    }
+
+    /// The adopt landed, its root verified against the genesis's.
+    fn on_adopted(&mut self) {
+        if matches!(self, Self::AwaitingAdopt) {
+            *self = Self::Prepared;
+        }
+    }
+}
+
+/// The verified snap-sync chunks a duty stages into its store.
+#[derive(Default)]
+struct StageQueue {
+    /// Verified chunks awaiting a [`ReshapeRequest::StageChunk`] emit on
+    /// the next advance.
+    pending: Vec<(ImportProgress, Vec<SubstateLeaf>)>,
+    /// Stage writes emitted but not yet acknowledged; a finalize waits for
+    /// zero so every staged chunk is durable first.
+    unacked: usize,
+}
+
+impl StageQueue {
+    fn push(&mut self, progress: ImportProgress, leaves: Vec<SubstateLeaf>) {
+        self.pending.push((progress, leaves));
+    }
+
+    /// Emit a stage write into `shard`'s store for every pending chunk.
+    fn emit(&mut self, shard: ShardId, out: &mut Vec<ReshapeRequest>) {
+        for (progress, leaves) in self.pending.drain(..) {
+            self.unacked += 1;
+            out.push(ReshapeRequest::StageChunk {
+                shard,
+                progress,
+                leaves,
+            });
+        }
+    }
+
+    const fn on_staged(&mut self) {
+        self.unacked = self.unacked.saturating_sub(1);
+    }
+
+    /// Hand a chunk whose write failed back to the front of the queue: the
+    /// next emit re-sends it, so a transient write failure retries instead
+    /// of pinning the unacked count above zero forever.
+    fn on_stage_failed(&mut self, progress: ImportProgress, leaves: Vec<SubstateLeaf>) {
+        self.unacked = self.unacked.saturating_sub(1);
+        self.pending.insert(0, (progress, leaves));
+    }
+
+    /// Whether every emitted stage write has been acknowledged.
+    const fn is_durable(&self) -> bool {
+        self.unacked == 0
+    }
+}
+
+/// A split duty's fetch of the parent's certified terminal on the anchor
+/// fallback, deriving the child's genesis against the anchor the beacon
+/// seeded it with.
+struct TerminalFetch {
+    /// The beacon-seeded child anchor the derivation verifies against.
+    anchor: ShardAnchor,
+    ask: TerminalAsk,
+}
+
+impl TerminalFetch {
+    const fn new(anchor: ShardAnchor) -> Self {
+        Self {
+            anchor,
+            ask: TerminalAsk::NOW,
+        }
+    }
+
+    /// The terminal fetch to send at `now`, when one is due.
+    fn next_request(
+        &mut self,
+        view: &ReshapeView,
+        parent: ShardId,
+        now: LocalTimestamp,
+    ) -> Option<GetBlockRequest> {
+        self.ask
+            .begin(now)
+            .then(|| split_terminal_request(view, parent, &self.anchor))
+    }
+
+    /// The fetch in flight failed at the transport level.
+    fn on_failure(&mut self, now: LocalTimestamp) {
+        self.ask.missed(now);
+    }
+
+    /// The genesis an answer derives, checked against the anchor; `None`
+    /// when the answer did not deliver it.
+    fn on_block(
+        &mut self,
+        child: ShardId,
+        response: &GetBlockResponse,
+        now: LocalTimestamp,
+    ) -> Option<DerivedGenesis> {
+        self.ask.missed(now);
+        let elided = response.block()?;
+        anchored_split_genesis(child, elided.header(), elided.qc(), &self.anchor)
+    }
+}
+
+/// A parent half's seed of the child store from the host's local parent:
+/// one in flight at a time, and a deferred one asked again only after
+/// [`SEED_RETRY`].
+#[derive(Default)]
+struct SeedRequest {
+    /// Whether the seed request is in flight.
+    requested: bool,
+    /// When a deferred seed may be requested again.
+    retry_at: Option<LocalTimestamp>,
+}
+
+impl SeedRequest {
+    /// Whether a seed goes out at `now`, marking it in flight if so.
+    fn begin(&mut self, now: LocalTimestamp) -> bool {
+        let due = !self.requested && self.retry_at.is_none_or(|at| now >= at);
+        if due {
+            self.requested = true;
+        }
+        due
+    }
+
+    /// The local parent was not ready for the seed in flight.
+    fn deferred(&mut self, now: LocalTimestamp) {
+        self.requested = false;
+        self.retry_at = Some(now.plus(SEED_RETRY));
+    }
+}
+
 /// One split observer duty, keyed by the child it syncs. A host may hold more
 /// than one cohort seat for the same child (multiple co-hosted validators drawn
 /// into it); they share the one child-span sync and store, each re-asserting its
@@ -563,12 +714,7 @@ struct ObserverDuty {
     phase: ObserverPhase,
     open_requested: bool,
     store_opened: bool,
-    /// Verified chunks awaiting a [`ReshapeRequest::StageChunk`] emit on
-    /// the next advance.
-    pending_stage: Vec<(ImportProgress, Vec<SubstateLeaf>)>,
-    /// Stage writes emitted but not yet acknowledged; the finalize waits
-    /// for zero so every staged chunk is durable first.
-    stages_unacked: usize,
+    stages: StageQueue,
     /// Hash of the genesis this duty adopted from its own follow, before
     /// the beacon's anchor existed. Checked against that anchor when it
     /// lands; a mismatch means the parent chain this host followed is not
@@ -601,7 +747,7 @@ impl ObserverDuty {
         self.validators.retain(|validator| me.contains(validator));
         if matches!(
             self.phase,
-            ObserverPhase::Seated | ObserverPhase::Relinquished
+            ObserverPhase::Seat(SeatTail::Seated) | ObserverPhase::Relinquished
         ) {
             let named = self
                 .validators
@@ -722,19 +868,11 @@ enum KeeperPhase {
         anchor: Option<Box<ShardAnchor>>,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
-        derived: Option<(ChainOrigin, Box<Block>, Vec<Anchor>)>,
+        derived: Option<Box<DerivedGenesis>>,
         finalize_requested: bool,
     },
-    /// Union imported; awaiting the next advance to emit the adopt.
-    Adopting {
-        origin: ChainOrigin,
-        genesis: Box<Block>,
-        predecessors: Vec<Anchor>,
-    },
-    /// Adopt emitted; awaiting the verified adopted root.
-    AwaitingAdopt,
-    /// Genesis adopted; awaiting the placement that seats the keepers.
-    Prepared,
+    /// Union imported; adopting the merged genesis and seating the keepers.
+    Seat(SeatTail),
 }
 
 /// One merge keeper duty, keyed by the parent it reforms.
@@ -743,13 +881,8 @@ struct KeeperDuty {
     phase: KeeperPhase,
     open_requested: bool,
     store_opened: bool,
-    /// Verified chunks (from either half — their spans are disjoint)
-    /// awaiting a [`ReshapeRequest::StageChunk`] emit on the next
-    /// advance.
-    pending_stage: Vec<(ImportProgress, Vec<SubstateLeaf>)>,
-    /// Stage writes emitted but not yet acknowledged; the union
-    /// finalize waits for zero so every staged chunk is durable first.
-    stages_unacked: usize,
+    /// Verified chunks from either half — their spans are disjoint.
+    stages: StageQueue,
 }
 
 impl KeeperDuty {
@@ -782,12 +915,7 @@ enum ParentHalfPhase {
     /// Awaiting the child anchor, then seeding the child store by cloning the
     /// host's local parent once it has committed through the terminal crossing.
     /// The fallback entry, for a duty with no scheduled cut to recognise.
-    Seeding {
-        /// Whether the seed request is already in flight.
-        requested: bool,
-        /// When a deferred seed may be requested again.
-        retry_at: Option<LocalTimestamp>,
-    },
+    Seeding(SeedRequest),
     /// Walking the parent's own committed chain to find its terminal
     /// crossing, so the child can be seeded and adopted at the cut rather
     /// than an epoch later when the beacon publishes the child's anchor.
@@ -796,40 +924,16 @@ enum ParentHalfPhase {
     /// Terminal recognised and genesis derived; cloning the local parent
     /// through the child's genesis height.
     SeedingAt {
-        /// The derived chain origin.
-        origin: ChainOrigin,
-        /// The derived genesis block.
-        genesis: Box<Block>,
-        /// The terminals this duty succeeds.
-        predecessors: Vec<Anchor>,
-        /// Whether the seed request is already in flight.
-        requested: bool,
-        /// When a deferred seed may be requested again.
-        retry_at: Option<LocalTimestamp>,
+        /// The derived genesis.
+        genesis: Box<DerivedGenesis>,
+        seed: SeedRequest,
     },
     /// Store seeded; fetching the parent's certified terminal to derive the
     /// child genesis.
-    FetchingTerminal {
-        /// The beacon-seeded child anchor the derivation verifies against.
-        anchor: ShardAnchor,
-        ask: TerminalAsk,
-    },
-    /// Terminal fetched and genesis derived; awaiting the next `advance` to emit
-    /// the adopt.
-    Adopting {
-        /// The derived chain origin.
-        origin: ChainOrigin,
-        /// The derived genesis block.
-        genesis: Box<Block>,
-        /// The terminals this duty succeeds.
-        predecessors: Vec<Anchor>,
-    },
-    /// Adopt emitted; awaiting the verified adopted root.
-    AwaitingAdopt,
-    /// Genesis adopted; awaiting the placement that seats it.
-    Prepared,
-    /// Seated; inert until the committed projection releases the duty.
-    Seated,
+    FetchingTerminal(TerminalFetch),
+    /// Genesis derived, adopted, and seated; once seated, inert until the
+    /// committed projection releases the duty.
+    Seat(SeatTail),
     /// The host holds no parent store to seed the child from, so the child's
     /// seat is the adapter's ordinary join's. Inert, and kept only so the
     /// duty is not rediscovered, until the committed projection releases it.
@@ -859,7 +963,7 @@ impl ParentHalfDuty {
         self.validators.retain(|validator| me.contains(validator));
         if matches!(
             self.phase,
-            ParentHalfPhase::Seated | ParentHalfPhase::Relinquished
+            ParentHalfPhase::Seat(SeatTail::Seated) | ParentHalfPhase::Relinquished
         ) {
             return view.parent_half_cohorts().contains_key(&child);
         }
@@ -879,12 +983,6 @@ fn seats_on<'a>(
 ) -> bool {
     let committee = view.committee(shard);
     committee.is_empty() || seats.any(|seat| committee.contains(seat))
-}
-
-/// Whether a parent half's seed goes out at `now`: none is in flight, and a
-/// deferred one has waited out its [`SEED_RETRY`].
-fn seed_due(requested: bool, retry_at: Option<LocalTimestamp>, now: LocalTimestamp) -> bool {
-    !requested && retry_at.is_none_or(|at| now >= at)
 }
 
 /// The recognition walk covering `from`, when a keeper is still finding
@@ -1079,9 +1177,9 @@ impl ReshapeOrchestrator {
             }
             ReshapeEvent::Staged { shard } => {
                 if let Some(duty) = self.live_observer(shard) {
-                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                    duty.stages.on_staged();
                 } else if let Some(duty) = self.keepers.get_mut(&shard) {
-                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
+                    duty.stages.on_staged();
                 }
             }
             ReshapeEvent::StageFailed {
@@ -1089,59 +1187,43 @@ impl ReshapeOrchestrator {
                 progress,
                 leaves,
             } => {
-                // Hand the chunk back to the front of the queue: the next
-                // advance re-emits it, so a transient write failure retries
-                // instead of pinning `stages_unacked` above zero forever.
                 // With no live duty for the shard the chunk is dropped.
                 if let Some(duty) = self.live_observer(shard) {
-                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
-                    duty.pending_stage.insert(0, (progress, leaves));
+                    duty.stages.on_stage_failed(progress, leaves);
                 } else if let Some(duty) = self.keepers.get_mut(&shard) {
-                    duty.stages_unacked = duty.stages_unacked.saturating_sub(1);
-                    duty.pending_stage.insert(0, (progress, leaves));
+                    duty.stages.on_stage_failed(progress, leaves);
                 }
             }
             ReshapeEvent::Imported { shard, root } => self.apply_imported(shard, root),
             ReshapeEvent::Applied { shard, root } => self.apply_applied(shard, root),
             ReshapeEvent::Adopted { shard } => {
                 if let Some(duty) = self.live_observer(shard)
-                    && matches!(duty.phase, ObserverPhase::AwaitingAdopt)
+                    && let ObserverPhase::Seat(tail) = &mut duty.phase
                 {
-                    duty.phase = ObserverPhase::Prepared;
+                    tail.on_adopted();
                 } else if let Some(duty) = self.keepers.get_mut(&shard)
-                    && matches!(duty.phase, KeeperPhase::AwaitingAdopt)
+                    && let KeeperPhase::Seat(tail) = &mut duty.phase
                 {
-                    duty.phase = KeeperPhase::Prepared;
+                    tail.on_adopted();
                 } else if let Some(duty) = self.parent_halves.get_mut(&shard)
-                    && matches!(duty.phase, ParentHalfPhase::AwaitingAdopt)
+                    && let ParentHalfPhase::Seat(tail) = &mut duty.phase
                 {
-                    duty.phase = ParentHalfPhase::Prepared;
+                    tail.on_adopted();
                 }
             }
             ReshapeEvent::SeedDeferred { child } => {
-                if let Some(duty) = self.parent_halves.get_mut(&child) {
-                    match &mut duty.phase {
-                        ParentHalfPhase::Seeding {
-                            requested,
-                            retry_at,
-                        }
-                        | ParentHalfPhase::SeedingAt {
-                            requested,
-                            retry_at,
-                            ..
-                        } => {
-                            *requested = false;
-                            *retry_at = Some(now.plus(SEED_RETRY));
-                        }
-                        _ => {}
-                    }
+                if let Some(duty) = self.parent_halves.get_mut(&child)
+                    && let ParentHalfPhase::Seeding(seed) | ParentHalfPhase::SeedingAt { seed, .. } =
+                        &mut duty.phase
+                {
+                    seed.deferred(now);
                 }
             }
             ReshapeEvent::SeedUnavailable { child } => {
                 if let Some(duty) = self.parent_halves.get_mut(&child)
                     && matches!(
                         duty.phase,
-                        ParentHalfPhase::Seeding { .. } | ParentHalfPhase::SeedingAt { .. }
+                        ParentHalfPhase::Seeding(_) | ParentHalfPhase::SeedingAt { .. }
                     )
                 {
                     duty.phase = ParentHalfPhase::Relinquished;
@@ -1166,7 +1248,7 @@ impl ReshapeOrchestrator {
                 (ObserverPhase::Following(tail), FetchKind::Block { .. }) => {
                     tail.on_failure();
                 }
-                (ObserverPhase::FetchingTerminal { ask, .. }, _) => ask.missed(now),
+                (ObserverPhase::FetchingTerminal(fetch), _) => fetch.on_failure(now),
                 _ => {}
             }
         } else if let Some(keeper) = self.keepers.get_mut(&duty) {
@@ -1196,7 +1278,7 @@ impl ReshapeOrchestrator {
         } else if let Some(half) = self.parent_halves.get_mut(&duty) {
             match &mut half.phase {
                 ParentHalfPhase::Recognizing(tail) => tail.on_failure(),
-                ParentHalfPhase::FetchingTerminal { ask, .. } => ask.missed(now),
+                ParentHalfPhase::FetchingTerminal(fetch) => fetch.on_failure(now),
                 _ => {}
             }
         }
@@ -1233,12 +1315,8 @@ impl ReshapeOrchestrator {
                 KeeperPhase::Building { derived, .. } => derived.take(),
                 _ => None,
             };
-            if let Some((origin, genesis, predecessors)) = derived {
-                keeper.phase = KeeperPhase::Adopting {
-                    origin,
-                    genesis,
-                    predecessors,
-                };
+            if let Some(genesis) = derived {
+                keeper.phase = KeeperPhase::Seat(SeatTail::Adopting(genesis));
             }
         }
     }
@@ -1277,7 +1355,7 @@ impl ReshapeOrchestrator {
                 if let StateRangeOutcome::Staged { leaves, progress } =
                     half.bootstrap.on_state_range(sub_range, &response)
                 {
-                    keeper.pending_stage.push((progress, leaves));
+                    keeper.stages.push(progress, leaves);
                 }
             }
             // A building half walks no headers.
@@ -1323,25 +1401,16 @@ impl ReshapeOrchestrator {
                 if let StateRangeOutcome::Staged { leaves, progress } =
                     bootstrap.on_state_range(sub_range, &response)
                 {
-                    duty.pending_stage.push((progress, leaves));
+                    duty.stages.push(progress, leaves);
                 }
             }
             (ObserverPhase::Following(tail), FetchedKind::Block { response }) => {
                 let outcome = tail.on_response(&response);
                 paced(tail, outcome, now, child);
             }
-            (ObserverPhase::FetchingTerminal { anchor, ask }, FetchedKind::Block { response }) => {
-                ask.missed(now);
-                let anchor = *anchor;
-                if let Some(elided) = response.block()
-                    && let Some((genesis, origin, predecessor)) =
-                        anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
-                {
-                    next = Some(ObserverPhase::Adopting {
-                        origin,
-                        genesis: Box::new(genesis),
-                        predecessors: predecessor.into_iter().collect(),
-                    });
+            (ObserverPhase::FetchingTerminal(fetch), FetchedKind::Block { response }) => {
+                if let Some(genesis) = fetch.on_block(child, &response, now) {
+                    next = Some(ObserverPhase::Seat(SeatTail::Adopting(Box::new(genesis))));
                 }
             }
             _ => {}
@@ -1369,21 +1438,11 @@ impl ReshapeOrchestrator {
             paced(tail, outcome, now, child);
             return;
         }
-        if let ParentHalfPhase::FetchingTerminal { anchor, ask } = &mut duty.phase
+        if let ParentHalfPhase::FetchingTerminal(fetch) = &mut duty.phase
             && let FetchedKind::Block { response } = kind
+            && let Some(genesis) = fetch.on_block(child, &response, now)
         {
-            ask.missed(now);
-            let anchor = *anchor;
-            if let Some(elided) = response.block()
-                && let Some((genesis, origin, predecessor)) =
-                    anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
-            {
-                next = Some(ParentHalfPhase::Adopting {
-                    origin,
-                    genesis: Box::new(genesis),
-                    predecessors: predecessor.into_iter().collect(),
-                });
-            }
+            next = Some(ParentHalfPhase::Seat(SeatTail::Adopting(Box::new(genesis))));
         }
         if let Some(phase) = next {
             duty.phase = phase;
@@ -1406,8 +1465,7 @@ impl ReshapeOrchestrator {
                     phase: ObserverPhase::Opening,
                     open_requested: false,
                     store_opened: false,
-                    pending_stage: Vec::new(),
-                    stages_unacked: 0,
+                    stages: StageQueue::default(),
                     adopted_genesis: None,
                     ready_asserts: BTreeMap::new(),
                 });
@@ -1491,14 +1549,7 @@ impl ReshapeOrchestrator {
                 }
             }
             ObserverPhase::Syncing(bootstrap) => {
-                for (progress, leaves) in duty.pending_stage.drain(..) {
-                    duty.stages_unacked += 1;
-                    out.push(ReshapeRequest::StageChunk {
-                        shard: child,
-                        progress,
-                        leaves,
-                    });
-                }
+                duty.stages.emit(child, out);
                 for request in bootstrap.next_requests() {
                     // The pending child's witness accumulator starts empty, so
                     // an observer bootstrap only ever emits state ranges.
@@ -1511,7 +1562,7 @@ impl ReshapeOrchestrator {
                         kind: FetchKind::StateRange { sub_range, request },
                     });
                 }
-                if duty.stages_unacked == 0
+                if duty.stages.is_durable()
                     && let Some(height) = bootstrap.take_finalize()
                 {
                     out.push(ReshapeRequest::FinalizeImport {
@@ -1557,11 +1608,7 @@ impl ReshapeOrchestrator {
                         "flipping the split child from its own follow of the parent"
                     );
                     duty.adopted_genesis = Some(derived.block.hash());
-                    duty.phase = ObserverPhase::Adopting {
-                        origin: derived.origin,
-                        genesis: Box::new(derived.block.clone()),
-                        predecessors: derived.predecessor.into_iter().collect(),
-                    };
+                    duty.phase = ObserverPhase::Seat(SeatTail::Adopting(Box::new(derived.clone())));
                     return;
                 }
                 // Once this child's boundary seeds, the parent terminated. A
@@ -1574,10 +1621,7 @@ impl ReshapeOrchestrator {
                 // none, the seat goes to the join.
                 if let Some(anchor) = view.boundary(child) {
                     if tail.next_height() >= anchor.height {
-                        duty.phase = ObserverPhase::FetchingTerminal {
-                            anchor,
-                            ask: TerminalAsk::NOW,
-                        };
+                        duty.phase = ObserverPhase::FetchingTerminal(TerminalFetch::new(anchor));
                     } else {
                         tracing::info!(
                             ?child,
@@ -1638,15 +1682,14 @@ impl ReshapeOrchestrator {
                     });
                 }
             }
-            ObserverPhase::FetchingTerminal { anchor, ask } => {
+            ObserverPhase::FetchingTerminal(fetch) => {
                 // The terminal is the parent's tip, which its members serve
                 // until the children go live and they leave it; from then a
                 // child member that flipped holds it, as the block its
                 // genesis follows. Neither alone holds it throughout, so each
                 // round asks both and the first answer that derives the
                 // genesis takes it.
-                if ask.begin(now) {
-                    let request = split_terminal_request(view, duty.parent, anchor);
+                if let Some(request) = fetch.next_request(view, duty.parent, now) {
                     for from in [duty.parent, child] {
                         out.push(ReshapeRequest::Fetch {
                             duty: child,
@@ -1658,32 +1701,9 @@ impl ReshapeOrchestrator {
                     }
                 }
             }
-            ObserverPhase::Adopting { .. } => {
-                if let ObserverPhase::Adopting {
-                    origin,
-                    genesis,
-                    predecessors,
-                } = std::mem::replace(&mut duty.phase, ObserverPhase::AwaitingAdopt)
-                {
-                    out.push(ReshapeRequest::Adopt {
-                        shard: child,
-                        kind: AdoptKind::Split,
-                        origin,
-                        genesis,
-                        predecessors,
-                    });
-                }
-            }
-            ObserverPhase::AwaitingAdopt | ObserverPhase::Seated | ObserverPhase::Relinquished => {}
-            ObserverPhase::Prepared => {
-                if duty
-                    .validators
-                    .iter()
-                    .any(|validator| view.committee(child).contains(validator))
-                {
-                    out.push(ReshapeRequest::Seat { shard: child });
-                    duty.phase = ObserverPhase::Seated;
-                }
+            ObserverPhase::Relinquished => {}
+            ObserverPhase::Seat(tail) => {
+                tail.advance(child, AdoptKind::Split, &duty.validators, view, out);
             }
         }
     }
@@ -1702,8 +1722,7 @@ impl ReshapeOrchestrator {
                     phase: KeeperPhase::ReassertingReady,
                     open_requested: false,
                     store_opened: false,
-                    pending_stage: Vec::new(),
-                    stages_unacked: 0,
+                    stages: StageQueue::default(),
                 });
                 if !duty
                     .members
@@ -1888,14 +1907,7 @@ impl ReshapeOrchestrator {
                     out.push(ReshapeRequest::OpenStore { shard: parent });
                     duty.open_requested = true;
                 }
-                for (progress, leaves) in duty.pending_stage.drain(..) {
-                    duty.stages_unacked += 1;
-                    out.push(ReshapeRequest::StageChunk {
-                        shard: parent,
-                        progress,
-                        leaves,
-                    });
-                }
+                duty.stages.emit(parent, out);
                 // The halves stage straight into the parent store, so their
                 // fetches wait for it to open.
                 if duty.store_opened {
@@ -1905,7 +1917,7 @@ impl ReshapeOrchestrator {
                 if derived.is_none()
                     && let (Some((left_h, left_qc)), Some((right_h, right_qc))) =
                         (&left.terminal, &right.terminal)
-                    && let Ok((genesis, origin, predecessors)) = merge_genesis_from_terminals(
+                    && let Ok(genesis) = merge_genesis_from_terminals(
                         parent,
                         (left_h, left_qc),
                         (right_h, right_qc),
@@ -1921,11 +1933,11 @@ impl ReshapeOrchestrator {
                     // same way: the duty ends, and the parent's seat is the
                     // ordinary join's, which snap-syncs against that anchor.
                     if let Some(anchored) = anchor.as_deref().map(|a| a.block_hash)
-                        && genesis.hash() != anchored
+                        && genesis.block.hash() != anchored
                     {
                         tracing::error!(
                             ?parent,
-                            derived = ?genesis.hash(),
+                            derived = ?genesis.block.hash(),
                             ?anchored,
                             "derived merged-parent genesis does not reconstruct \
                              the beacon anchor; leaving the parent to the join"
@@ -1933,45 +1945,30 @@ impl ReshapeOrchestrator {
                         self.keepers.remove(&parent);
                         return;
                     }
-                    *derived = Some((origin, Box::new(genesis), predecessors));
+                    *derived = Some(Box::new(genesis));
                 }
                 if !*finalize_requested
-                    && duty.stages_unacked == 0
+                    && duty.stages.is_durable()
                     && left.bootstrap.is_staged()
                     && right.bootstrap.is_staged()
-                    && let Some((origin, _, _)) = derived.as_ref()
+                    && let Some(genesis) = derived.as_deref()
                 {
                     out.push(ReshapeRequest::FinalizeImport {
                         shard: parent,
-                        height: origin.genesis_height,
+                        height: genesis.origin.genesis_height,
                     });
                     *finalize_requested = true;
                 }
             }
-            KeeperPhase::Adopting { .. } => {
-                if let KeeperPhase::Adopting {
-                    origin,
-                    genesis,
-                    predecessors,
-                } = std::mem::replace(&mut duty.phase, KeeperPhase::AwaitingAdopt)
-                {
-                    out.push(ReshapeRequest::Adopt {
-                        shard: parent,
-                        kind: AdoptKind::Merge,
-                        origin,
-                        genesis,
-                        predecessors,
-                    });
-                }
-            }
-            KeeperPhase::AwaitingAdopt => {}
-            KeeperPhase::Prepared => {
-                if duty
-                    .members
-                    .iter()
-                    .any(|m| view.committee(parent).contains(&m.validator))
-                {
-                    out.push(ReshapeRequest::Seat { shard: parent });
+            KeeperPhase::Seat(tail) => {
+                tail.advance(
+                    parent,
+                    AdoptKind::Merge,
+                    duty.members.iter().map(|member| &member.validator),
+                    view,
+                    out,
+                );
+                if matches!(tail, SeatTail::Seated) {
                     self.keepers.remove(&parent);
                 }
             }
@@ -2005,10 +2002,7 @@ impl ReshapeOrchestrator {
                     .or_insert_with(|| ParentHalfDuty {
                         parent,
                         validators: Vec::new(),
-                        phase: ParentHalfPhase::Seeding {
-                            requested: false,
-                            retry_at: None,
-                        },
+                        phase: ParentHalfPhase::Seeding(SeedRequest::default()),
                         store_seeded: false,
                     });
                 if !duty.validators.contains(&validator) {
@@ -2035,10 +2029,7 @@ impl ReshapeOrchestrator {
         let store_seeded = duty.store_seeded;
         let mut next: Option<ParentHalfPhase> = None;
         match &mut duty.phase {
-            ParentHalfPhase::Seeding {
-                requested,
-                retry_at,
-            } => {
+            ParentHalfPhase::Seeding(seed) => {
                 // With the cut scheduled a window ahead, the parent's own
                 // chain says which of its blocks is the terminal — no need
                 // to wait for the beacon to publish the child's anchor.
@@ -2046,7 +2037,7 @@ impl ReshapeOrchestrator {
                 // projects, the parent has terminated and may already have
                 // dissolved, so a walk of its chain would never resolve.
                 // Late-discovered duties take the anchor path below.
-                if !*requested
+                if !seed.requested
                     && view.boundary(child).is_none()
                     && view.terminal_cut(parent).is_some()
                     && let Some(parent_anchor) = view.boundary(parent)
@@ -2072,17 +2063,15 @@ impl ReshapeOrchestrator {
                         );
                         next = Some(ParentHalfPhase::Relinquished);
                     } else if store_seeded {
-                        next = Some(ParentHalfPhase::FetchingTerminal {
+                        next = Some(ParentHalfPhase::FetchingTerminal(TerminalFetch::new(
                             anchor,
-                            ask: TerminalAsk::NOW,
-                        });
-                    } else if seed_due(*requested, *retry_at, now) {
+                        )));
+                    } else if seed.begin(now) {
                         out.push(ReshapeRequest::SeedFromParent {
                             parent,
                             child,
                             through: anchor.height,
                         });
-                        *requested = true;
                     }
                 }
             }
@@ -2105,11 +2094,8 @@ impl ReshapeOrchestrator {
                         "seating the split child's parent half from the local parent chain"
                     );
                     next = Some(ParentHalfPhase::SeedingAt {
-                        origin: derived.origin,
-                        genesis: Box::new(derived.block.clone()),
-                        predecessors: derived.predecessor.into_iter().collect(),
-                        requested: false,
-                        retry_at: None,
+                        genesis: Box::new(derived.clone()),
+                        seed: SeedRequest::default(),
                     });
                 } else if view.boundary(child).is_some() {
                     // The walk ran out of time: the beacon published the
@@ -2122,10 +2108,7 @@ impl ReshapeOrchestrator {
                         "parent terminal walk did not resolve before the child anchored; \
                          falling back to the attested anchor"
                     );
-                    next = Some(ParentHalfPhase::Seeding {
-                        requested: false,
-                        retry_at: None,
-                    });
+                    next = Some(ParentHalfPhase::Seeding(SeedRequest::default()));
                 } else if let Some(request) = tail.next_header_request(parent, now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
@@ -2134,69 +2117,31 @@ impl ReshapeOrchestrator {
                     });
                 }
             }
-            ParentHalfPhase::SeedingAt {
-                origin,
-                genesis,
-                predecessors,
-                requested,
-                retry_at,
-            } => {
+            ParentHalfPhase::SeedingAt { genesis, seed } => {
                 if store_seeded {
-                    next = Some(ParentHalfPhase::Adopting {
-                        origin: *origin,
-                        genesis: genesis.clone(),
-                        predecessors: predecessors.clone(),
-                    });
-                } else if seed_due(*requested, *retry_at, now) {
+                    next = Some(ParentHalfPhase::Seat(SeatTail::Adopting(genesis.clone())));
+                } else if seed.begin(now) {
                     out.push(ReshapeRequest::SeedFromParent {
                         parent,
                         child,
-                        through: origin.genesis_height,
+                        through: genesis.origin.genesis_height,
                     });
-                    *requested = true;
                 }
             }
-            ParentHalfPhase::FetchingTerminal { anchor, ask } => {
+            ParentHalfPhase::FetchingTerminal(fetch) => {
                 // The seed gates on the local parent reaching the terminal, so
                 // the host's own retained chain serves the certified terminal.
-                if ask.begin(now) {
+                if let Some(request) = fetch.next_request(view, parent, now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: parent,
-                        kind: FetchKind::Block {
-                            request: split_terminal_request(view, parent, anchor),
-                        },
+                        kind: FetchKind::Block { request },
                     });
                 }
             }
-            ParentHalfPhase::Adopting { .. } => {
-                if let ParentHalfPhase::Adopting {
-                    origin,
-                    genesis,
-                    predecessors,
-                } = std::mem::replace(&mut duty.phase, ParentHalfPhase::AwaitingAdopt)
-                {
-                    out.push(ReshapeRequest::Adopt {
-                        shard: child,
-                        kind: AdoptKind::ParentHalf,
-                        origin,
-                        genesis,
-                        predecessors,
-                    });
-                }
-            }
-            ParentHalfPhase::AwaitingAdopt
-            | ParentHalfPhase::Seated
-            | ParentHalfPhase::Relinquished => {}
-            ParentHalfPhase::Prepared => {
-                if duty
-                    .validators
-                    .iter()
-                    .any(|validator| view.committee(child).contains(validator))
-                {
-                    out.push(ReshapeRequest::Seat { shard: child });
-                    duty.phase = ParentHalfPhase::Seated;
-                }
+            ParentHalfPhase::Relinquished => {}
+            ParentHalfPhase::Seat(tail) => {
+                tail.advance(child, AdoptKind::ParentHalf, &duty.validators, view, out);
             }
         }
         if let Some(phase) = next {
@@ -2251,22 +2196,22 @@ fn anchored_split_genesis(
     terminal: &BlockHeader,
     qc: &QuorumCertificate,
     anchor: &ShardAnchor,
-) -> Option<(Block, ChainOrigin, Option<Anchor>)> {
-    let (genesis, origin) = split_genesis_from_terminal(child, terminal, qc)
+) -> Option<DerivedGenesis> {
+    let genesis = split_genesis_from_terminal(child, terminal, qc)
         .inspect_err(|error| {
             tracing::warn!(?child, %error, "split child genesis derivation failed");
         })
         .ok()?;
-    if genesis.hash() != anchor.block_hash {
+    if genesis.block.hash() != anchor.block_hash {
         tracing::error!(
             ?child,
-            derived = ?genesis.hash(),
+            derived = ?genesis.block.hash(),
             anchored = ?anchor.block_hash,
             "derived split-child genesis does not reconstruct the beacon anchor"
         );
         return None;
     }
-    Some((genesis, origin, terminal.as_terminal_anchor()))
+    Some(genesis)
 }
 
 /// Whether a recognizing walk's terminal of `shard` is commit-proven — the
@@ -2394,8 +2339,9 @@ mod tests {
         AdoptKind, FetchKind, FetchedKind, KeeperDuty, KeeperMember, KeeperPhase,
         KeeperRecognition, ObserverDuty, ObserverPhase, OverRunning, ParentHalfDuty,
         ParentHalfPhase, REFETCH_WAIT, ReshapeEvent, ReshapeOrchestrator, ReshapeRequest,
-        SEED_RETRY, TerminalAsk, seed_gate, split_terminal_request,
+        SEED_RETRY, SeatTail, StageQueue, TerminalFetch, seed_gate, split_terminal_request,
     };
+    use crate::reshape::genesis::DerivedGenesis;
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
     use crate::reshape::view::ReshapeView;
 
@@ -2603,8 +2549,7 @@ mod tests {
             phase,
             open_requested: true,
             store_opened: true,
-            pending_stage: Vec::new(),
-            stages_unacked: 0,
+            stages: StageQueue::default(),
             adopted_genesis: None,
             ready_asserts: BTreeMap::new(),
         }
@@ -3378,7 +3323,7 @@ mod tests {
             key: test_key(7u8),
             value: Bytes::from_array([7]),
         }];
-        duty.pending_stage.push((progress.clone(), leaves.clone()));
+        duty.stages.push(progress.clone(), leaves.clone());
         orch.observers.insert(child, duty);
 
         let requests = orch.step(
@@ -3394,7 +3339,7 @@ mod tests {
                 .any(|r| matches!(r, ReshapeRequest::StageChunk { shard, .. } if *shard == child)),
             "a pending chunk must emit; got {requests:?}",
         );
-        assert_eq!(orch.observers[&child].stages_unacked, 1);
+        assert_eq!(orch.observers[&child].stages.unacked, 1);
 
         // The durable write failed: the chunk comes back and the same
         // step's advance re-emits it, leaving it unacked again — the
@@ -3417,8 +3362,8 @@ mod tests {
             "a failed stage must re-emit its chunk; got {requests:?}",
         );
         let duty = &orch.observers[&child];
-        assert_eq!(duty.stages_unacked, 1);
-        assert!(duty.pending_stage.is_empty());
+        assert_eq!(duty.stages.unacked, 1);
+        assert!(duty.stages.pending.is_empty());
     }
 
     #[test]
@@ -3819,7 +3764,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
-            observer_duty(parent, child, 5, ObserverPhase::Prepared),
+            observer_duty(parent, child, 5, ObserverPhase::Seat(SeatTail::Prepared)),
         );
 
         let requests = orch.step(
@@ -3845,7 +3790,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
         orch.observers.insert(
             child,
-            observer_duty(parent, child, 5, ObserverPhase::Prepared),
+            observer_duty(parent, child, 5, ObserverPhase::Seat(SeatTail::Prepared)),
         );
 
         assert!(
@@ -4100,11 +4045,10 @@ mod tests {
                     own_child,
                     ready_assert: None,
                 }],
-                phase: KeeperPhase::Prepared,
+                phase: KeeperPhase::Seat(SeatTail::Prepared),
                 open_requested: true,
                 store_opened: true,
-                pending_stage: Vec::new(),
-                stages_unacked: 0,
+                stages: StageQueue::default(),
             },
         );
 
@@ -4217,11 +4161,10 @@ mod tests {
                     own_child,
                     ready_assert: None,
                 }],
-                phase: KeeperPhase::Prepared,
+                phase: KeeperPhase::Seat(SeatTail::Prepared),
                 open_requested: true,
                 store_opened: true,
-                pending_stage: Vec::new(),
-                stages_unacked: 0,
+                stages: StageQueue::default(),
             },
         );
 
@@ -4380,9 +4323,11 @@ mod tests {
             ReshapeRequest::Adopt {
                 shard: child,
                 kind: AdoptKind::ParentHalf,
-                origin: ChainOrigin::root(WeightedTimestamp::ZERO),
-                genesis: Box::new(block),
-                predecessors: Vec::new(),
+                genesis: Box::new(DerivedGenesis {
+                    block,
+                    origin: ChainOrigin::root(WeightedTimestamp::ZERO),
+                    predecessors: Vec::new(),
+                }),
             },
             ReshapeRequest::Seat { shard: child },
         ];
@@ -4566,7 +4511,7 @@ mod tests {
             ParentHalfDuty {
                 parent,
                 validators: vec![vid(5)],
-                phase: ParentHalfPhase::Prepared,
+                phase: ParentHalfPhase::Seat(SeatTail::Prepared),
                 store_seeded: true,
             },
         );
@@ -4611,7 +4556,7 @@ mod tests {
     fn adopted_duty(parent: ShardId, child: ShardId, adopted: BlockHash) -> ObserverDuty {
         ObserverDuty {
             adopted_genesis: Some(adopted),
-            ..observer_duty(parent, child, 5, ObserverPhase::Seated)
+            ..observer_duty(parent, child, 5, ObserverPhase::Seat(SeatTail::Seated))
         }
     }
 
@@ -4801,8 +4746,7 @@ mod tests {
                 },
                 open_requested: false,
                 store_opened: false,
-                pending_stage: Vec::new(),
-                stages_unacked: 0,
+                stages: StageQueue::default(),
             },
         );
 
@@ -4865,10 +4809,7 @@ mod tests {
                     parent,
                     child,
                     5,
-                    ObserverPhase::FetchingTerminal {
-                        anchor: anchor(),
-                        ask: TerminalAsk::NOW,
-                    },
+                    ObserverPhase::FetchingTerminal(TerminalFetch::new(anchor())),
                 ),
             );
             let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));

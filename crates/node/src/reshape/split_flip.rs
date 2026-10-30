@@ -13,7 +13,9 @@
 //! therefore only ever be taken from a `parent_qc`; the served QC confirms
 //! only that `B` is certified.
 
-use hyperscale_types::{Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId};
+use hyperscale_types::{Block, BlockHeader, QuorumCertificate, ShardId};
+
+use crate::reshape::genesis::DerivedGenesis;
 
 /// Derive a split child's genesis block and chain origin from the parent
 /// chain's certified terminal block.
@@ -41,20 +43,26 @@ pub(crate) fn split_genesis_from_terminal(
     child: ShardId,
     terminal_header: &BlockHeader,
     terminal_qc: &QuorumCertificate,
-) -> Result<(Block, ChainOrigin), String> {
+) -> Result<DerivedGenesis, String> {
     if terminal_qc.block_hash() != terminal_header.hash() {
         return Err("the quorum certificate does not certify the terminal block".to_string());
     }
-    Block::split_child_genesis_from_terminal(child, terminal_header)
-        .ok_or_else(|| "the terminal carries no composing split child roots".to_string())
+    let (block, origin) = Block::split_child_genesis_from_terminal(child, terminal_header)
+        .ok_or_else(|| "the terminal carries no composing split child roots".to_string())?;
+    Ok(DerivedGenesis {
+        block,
+        origin,
+        predecessors: terminal_header.as_terminal_anchor().into_iter().collect(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
 
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, Hash, QuorumCertificate,
-        Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot, ValidatorId, WeightedTimestamp,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash,
+        QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -121,8 +129,11 @@ mod tests {
         let clock = terminal.parent_qc().weighted_timestamp();
 
         let stale_qc = certifying_qc(&terminal, 9_999);
-        let (genesis, origin) =
-            split_genesis_from_terminal(left, &terminal, &stale_qc).expect("derives");
+        let DerivedGenesis {
+            block: genesis,
+            origin,
+            ..
+        } = split_genesis_from_terminal(left, &terminal, &stale_qc).expect("derives");
         assert_eq!(
             genesis.hash(),
             Block::split_child_genesis(left, pair.left, &terminal, clock).hash(),

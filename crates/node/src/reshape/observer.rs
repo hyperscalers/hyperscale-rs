@@ -39,14 +39,15 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin,
-    CommitProof, LocalTimestamp, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate,
-    ReadySignal, ShardAnchor, ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp,
-    ready_signal_window, shard_prefix_path,
+    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, CommitProof, LocalTimestamp,
+    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal, ShardAnchor,
+    ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp, ready_signal_window,
+    shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
 use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
+use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::view::CommitteeLookup;
 
 /// The self-signed ready signal a reshape seat holder broadcasts to the
@@ -418,19 +419,6 @@ fn check_two_chain(
     TwoChainCheck::Verified
 }
 
-/// A child genesis derived locally from the parent's terminal block.
-#[derive(Debug, Clone)]
-pub struct DerivedGenesis {
-    /// The genesis block the child adopts.
-    pub block: Block,
-    /// The chain origin it starts from.
-    pub origin: ChainOrigin,
-    /// The parent terminal this child succeeds, carried off the same
-    /// header the genesis derives from. `None` when that header carries
-    /// no terminal settled root.
-    pub predecessor: Option<Anchor>,
-}
-
 /// Derive `child`'s genesis from the parent's terminal header.
 ///
 /// Thin over [`Block::split_child_genesis_from_terminal`], which is the
@@ -440,7 +428,7 @@ fn derive_child_genesis(child: ShardId, terminal: &BlockHeader) -> Option<Derive
     Some(DerivedGenesis {
         block,
         origin,
-        predecessor: terminal.as_terminal_anchor(),
+        predecessors: terminal.as_terminal_anchor().into_iter().collect(),
     })
 }
 

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::IrohNetwork;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
+use hyperscale_node::reshape::genesis::DerivedGenesis;
 use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeOrchestrator,
@@ -33,8 +34,8 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
-    Signer, SubstateKey, SubstateLeaf, ValidatorId,
+    Block, BlockHeight, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId, Signer, SubstateKey,
+    SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -170,10 +171,8 @@ impl ShardSupervisor {
             ReshapeRequest::Adopt {
                 shard,
                 kind,
-                origin,
                 genesis,
-                predecessors,
-            } => self.reshape_adopt(shard, kind, origin, genesis, predecessors),
+            } => self.reshape_adopt(shard, kind, *genesis),
             ReshapeRequest::Seat { shard } => self.reshape_seat(shard),
         }
     }
@@ -522,32 +521,18 @@ impl ShardSupervisor {
     /// [`adopt_prepared_store`] gate, answering with
     /// [`ReshapeCompletion::Adopted`], which carries the genesis back for the
     /// seat; a gate failure logs and strands the duty (the seat never fires).
-    fn reshape_adopt(
-        &self,
-        shard: ShardId,
-        kind: AdoptKind,
-        origin: ChainOrigin,
-        genesis: Box<Block>,
-        predecessors: Vec<Anchor>,
-    ) {
+    fn reshape_adopt(&self, shard: ShardId, kind: AdoptKind, genesis: DerivedGenesis) {
         let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape adopt for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match adopt_prepared_store(
-                storage.as_ref(),
-                shard,
-                kind,
-                origin,
-                &genesis,
-                predecessors,
-            ) {
+            match adopt_prepared_store(storage.as_ref(), shard, kind, &genesis) {
                 Ok(recovered) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Adopted {
                         shard,
-                        genesis,
+                        genesis: Box::new(genesis.block),
                         recovered,
                     }));
                 }

@@ -11,8 +11,9 @@
 //! re-deriving any part of it.
 
 use hyperscale_storage::{AdoptSource, BoundaryStore, MemberIndex, RecoveredState};
-use hyperscale_types::{Anchor, Block, ChainOrigin, ReadFrontier, ShardId, StateRoot};
+use hyperscale_types::{Anchor, ChainOrigin, ReadFrontier, ShardId, StateRoot};
 
+use super::genesis::DerivedGenesis;
 use super::orchestrator::AdoptKind;
 
 /// Install a reshape duty's derived `genesis` into its prepared store and
@@ -40,10 +41,14 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     storage: &S,
     shard: ShardId,
     kind: AdoptKind,
-    origin: ChainOrigin,
-    genesis: &Block,
-    predecessors: Vec<Anchor>,
+    genesis: &DerivedGenesis,
 ) -> Result<RecoveredState, String> {
+    let DerivedGenesis {
+        block: genesis,
+        origin,
+        predecessors,
+    } = genesis;
+    let origin = *origin;
     let source = match kind {
         AdoptKind::Split => AdoptSource::FollowedTip,
         AdoptKind::ParentHalf => AdoptSource::ParentSubtree,
@@ -60,7 +65,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
         genesis.header().state_root(),
         origin,
         substate_bytes,
-        predecessors,
+        predecessors.clone(),
         read_frontier,
         members,
     )

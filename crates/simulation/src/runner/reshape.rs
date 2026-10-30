@@ -23,6 +23,7 @@ use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
+use hyperscale_node::reshape::genesis::DerivedGenesis;
 use hyperscale_node::reshape::observer::ready_notification;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeRequest, seed_gate,
@@ -40,8 +41,7 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
-    shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ShardId, ValidatorId, Verified, shard_prefix_path,
 };
 use tracing::warn;
 
@@ -231,10 +231,8 @@ impl SimulationRunner {
             ReshapeRequest::Adopt {
                 shard,
                 kind,
-                origin,
                 genesis,
-                predecessors,
-            } => self.reshape_adopt(host, shard, kind, origin, genesis, predecessors),
+            } => self.reshape_adopt(host, shard, kind, *genesis),
             ReshapeRequest::Seat { shard } => {
                 self.reshape_seat(host, shard);
                 None
@@ -403,16 +401,14 @@ impl SimulationRunner {
         host: NodeIndex,
         shard: ShardId,
         kind: AdoptKind,
-        origin: ChainOrigin,
-        genesis: Box<Block>,
-        predecessors: Vec<Anchor>,
+        genesis: DerivedGenesis,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores[host as usize].storage(shard)?.clone();
-        let recovered = adopt_prepared_store(&storage, shard, kind, origin, &genesis, predecessors)
+        let recovered = adopt_prepared_store(&storage, shard, kind, &genesis)
             .expect("adopted reshape root must match the genesis it derived");
         self.reshape_stores[host as usize].settle(ReshapeCompletion::Adopted {
             shard,
-            genesis,
+            genesis: Box::new(genesis.block),
             recovered,
         })
     }
