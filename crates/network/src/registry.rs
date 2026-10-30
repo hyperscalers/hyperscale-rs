@@ -888,6 +888,10 @@ mod tests {
     use hyperscale_types::MessageClass;
 
     use super::*;
+    use crate::traits::PeerId;
+
+    /// A message from some peer.
+    const PEER: Provenance = Provenance::Peer(PeerId::new(1));
 
     #[test]
     fn test_register_and_lookup_gossip() {
@@ -923,16 +927,12 @@ mod tests {
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = hbor_to_vec(&TestMsg(42)).unwrap();
-        let verdict = handler(encoded, Some(ShardId::leaf(1, 0)), Provenance::Peer);
+        let verdict = handler(encoded, Some(ShardId::leaf(1, 0)), PEER);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, Some(Verdict::Accept));
 
         // Decode failure should return Reject.
-        let verdict = handler(
-            vec![0xFF, 0xFE],
-            Some(ShardId::leaf(1, 0)),
-            Provenance::Peer,
-        );
+        let verdict = handler(vec![0xFF, 0xFE], Some(ShardId::leaf(1, 0)), PEER);
         assert_eq!(verdict, Some(Verdict::Reject));
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
@@ -967,14 +967,14 @@ mod tests {
         let handler = registry.get_notification("test.note").unwrap();
 
         assert_eq!(
-            handler(hbor_to_vec(&Note(1)).unwrap(), Provenance::Peer),
+            handler(hbor_to_vec(&Note(1)).unwrap(), PEER),
             Verdict::Accept
         );
         assert_eq!(
-            handler(hbor_to_vec(&Note(0)).unwrap(), Provenance::Peer),
+            handler(hbor_to_vec(&Note(0)).unwrap(), PEER),
             Verdict::Ignore
         );
-        assert_eq!(handler(vec![0xFF, 0xFE], Provenance::Peer), Verdict::Reject);
+        assert_eq!(handler(vec![0xFF, 0xFE], PEER), Verdict::Reject);
     }
 
     #[test]
@@ -1067,19 +1067,16 @@ mod tests {
         let encoded = hbor_to_vec(&SwapMsg(1)).unwrap();
 
         // Shard B isn't hosted — no handler here judges the message.
-        assert_eq!(
-            handler(encoded.clone(), Some(shard_b), Provenance::Peer),
-            None
-        );
+        assert_eq!(handler(encoded.clone(), Some(shard_b), PEER), None);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
         // After the swap the same registered handler receives shard B and
         // no longer receives shard A.
         registry.add_hosted_shard(shard_b);
         registry.remove_hosted_shard(shard_a);
-        let _ = handler(encoded.clone(), Some(shard_b), Provenance::Peer);
+        let _ = handler(encoded.clone(), Some(shard_b), PEER);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        let _ = handler(encoded, Some(shard_a), Provenance::Peer);
+        let _ = handler(encoded, Some(shard_a), PEER);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -1121,7 +1118,7 @@ mod tests {
 
         let fold = |first: Verdict, second: Verdict| {
             *verdicts.lock().unwrap() = HashMap::from([(a, first), (b, second)]);
-            handler(hbor_to_vec(&FoldMsg(1)).unwrap(), None, Provenance::Peer)
+            handler(hbor_to_vec(&FoldMsg(1)).unwrap(), None, PEER)
         };
         assert_eq!(fold(Accept, Reject), Some(Reject));
         assert_eq!(fold(Ignore, Reject), Some(Reject));
@@ -1192,7 +1189,7 @@ mod tests {
 
     fn deliver(registry: &HandlerRegistry, copy: &Copy) -> Option<Verdict> {
         let handler = registry.get_gossip("test.copy").unwrap();
-        handler(hbor_to_vec(copy).unwrap(), None, Provenance::Peer)
+        handler(hbor_to_vec(copy).unwrap(), None, PEER)
     }
 
     fn copy(sender: u32, forged: bool) -> Copy {

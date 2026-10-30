@@ -1383,7 +1383,7 @@ mod tests {
     use crossbeam::channel::{Receiver, bounded, unbounded};
     use hyperscale_core::ProtocolEvent;
     use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
-    use hyperscale_network::{HandlerRegistry, Provenance, Verdict};
+    use hyperscale_network::{HandlerRegistry, PeerId, Provenance, Verdict};
     use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, TransactionGossip};
     use hyperscale_types::network::notification::{
         BlockHeaderNotification, ReadySignalNotification,
@@ -1400,6 +1400,9 @@ mod tests {
     use crate::shard::push_shard_input;
     use crate::shard::test_host::{CountingVerifier, Fixture, Host, SHARD, loop_of};
 
+    /// A message from some peer.
+    const PEER: Provenance = Provenance::Peer(PeerId::new(1));
+
     fn gossip(seed: u8) -> TransactionGossip {
         TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(seed))]))
     }
@@ -1412,7 +1415,7 @@ mod tests {
         handler(
             hbor_to_vec(gossip).expect("gossip encodes"),
             Some(SHARD),
-            Provenance::Peer,
+            PEER,
         )
     }
 
@@ -1541,7 +1544,7 @@ mod tests {
         let delivered = |shard: ShardId| {
             let _ = handler(
                 hbor_to_vec(&ready_signal(&fix, shard)).expect("signal encodes"),
-                Provenance::Peer,
+                PEER,
             );
             network
                 .try_iter()
@@ -1644,17 +1647,11 @@ mod tests {
         assert_eq!(proposals(&internal), 1, "the host's own proposal lands");
 
         let wire = |note: &BlockHeaderNotification| hbor_to_vec(note).expect("proposal encodes");
-        assert_eq!(
-            handler(wire(&proposal(&fix, 1, 1)), Provenance::Peer),
-            Verdict::Accept
-        );
+        assert_eq!(handler(wire(&proposal(&fix, 1, 1)), PEER), Verdict::Accept);
         assert_eq!(verifier.checked(), 1, "a peer's copy is checked");
         assert_eq!(proposals(&network), 1, "a peer's copy lands");
 
-        assert_eq!(
-            handler(wire(&proposal(&fix, 1, 2)), Provenance::Peer),
-            Verdict::Reject
-        );
+        assert_eq!(handler(wire(&proposal(&fix, 1, 2)), PEER), Verdict::Reject);
         assert_eq!(proposals(&network), 0, "a forged copy is refused");
     }
 

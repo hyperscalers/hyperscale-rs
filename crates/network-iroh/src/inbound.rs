@@ -33,7 +33,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use hyperscale_metrics::{record_network_bandwidth, set_inbound_streams_in_use};
-use hyperscale_network::{HandlerRegistry, Provenance, Verdict};
+use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -383,7 +383,7 @@ impl InboundRouter {
             let router = Arc::clone(self);
             spawn(async move {
                 let bytes = payload.len();
-                let verdict = handler(payload, Provenance::Peer);
+                let verdict = handler(payload, peer.provenance());
                 drop(turn);
                 router.conclude(peer, class, bytes, verdict);
             });

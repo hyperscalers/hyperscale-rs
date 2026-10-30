@@ -24,6 +24,7 @@ pub use registry::{
     RawRequestHandler,
 };
 pub use traits::{
-    Answerers, Deferral, GossipHandler, GossipScope, Network, NotificationHandler, Provenance,
-    RequestError, RequestHandler, ResponseVerdict, ValidatorKeyMap, Verdict, VerdictKey,
+    Answerers, Deferral, GossipHandler, GossipScope, Network, NotificationHandler, PeerId,
+    Provenance, RequestError, RequestHandler, ResponseVerdict, ValidatorKeyMap, Verdict,
+    VerdictKey,
 };

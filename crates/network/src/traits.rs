@@ -73,8 +73,25 @@ pub enum Provenance {
     /// the one the host passed to its own broadcast or notify, never bytes
     /// another party wrote.
     Local,
-    /// A peer sent it over the network.
-    Peer,
+    /// A peer sent it over the network: the peer that handed it to this
+    /// host, which for gossip is the last hop and not the author.
+    Peer(PeerId),
+}
+
+/// A peer, keyed as its transport keys what that peer may cost this host.
+///
+/// A limit a handler applies per peer so binds the party the transport
+/// charges for it. Two copies from one peer carry the same id; what the
+/// number means is the transport's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeerId(u64);
+
+impl PeerId {
+    /// The peer the transport keys by `key`.
+    #[must_use]
+    pub const fn new(key: u64) -> Self {
+        Self(key)
+    }
 }
 
 impl Provenance {
@@ -85,7 +102,7 @@ impl Provenance {
     pub fn check(self, check: impl FnOnce() -> Verdict) -> Verdict {
         match self {
             Self::Local => Verdict::Accept,
-            Self::Peer => check(),
+            Self::Peer(_) => check(),
         }
     }
 }
@@ -582,7 +599,8 @@ mod tests {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             Verdict::Accept
         };
-        let verdict = handler.on_message(TestMsg(42), ShardId::ROOT, Provenance::Peer);
+        let verdict =
+            handler.on_message(TestMsg(42), ShardId::ROOT, Provenance::Peer(PeerId::new(1)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, Verdict::Accept);
     }

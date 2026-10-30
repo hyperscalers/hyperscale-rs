@@ -46,7 +46,8 @@ use hyperscale_network::retry::{
 };
 use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
 use hyperscale_network::{
-    Answerers, HandlerRegistry, Provenance, RequestError, ResponseVerdict, Verdict, compression,
+    Answerers, HandlerRegistry, PeerId, Provenance, RequestError, ResponseVerdict, Verdict,
+    compression,
 };
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
@@ -615,6 +616,12 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("pending_requests", &self.pending_requests.len())
             .finish_non_exhaustive()
     }
+}
+
+/// What a message from host `from` hands a handler: the simulation keeps
+/// a peer by its host, as it keeps the peer's health.
+fn peer(from: NodeIndex) -> Provenance {
+    Provenance::Peer(PeerId::new(u64::from(from)))
 }
 
 /// Count an answer its requester refused against the peer that gave it.
@@ -1742,7 +1749,7 @@ impl SimulatedNetwork {
                         wire_bytes,
                     },
                     payload,
-                    provenance: Provenance::Peer,
+                    provenance: peer(from),
                 }));
         }
         Self::remember(&mut self.notifications_carried, message_type, carried);
@@ -1852,7 +1859,7 @@ impl SimulatedNetwork {
                         let provenance = if sender == to && sent == payload {
                             Provenance::Local
                         } else {
-                            Provenance::Peer
+                            peer(sender)
                         };
                         let payload = sent;
                         stats.messages_sent += 1;
@@ -2050,7 +2057,7 @@ impl SimulatedNetwork {
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
             // A publisher is never scheduled its own publication: the
             // registry hands its hosted shards the original in process.
-            let provenance = Provenance::Peer;
+            let provenance = peer(record.from);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -4301,7 +4308,7 @@ mod tests {
 
     /// A host's notification to itself is its own, but a replay the network
     /// brings along on that link is another host's bytes, and arrives as a
-    /// peer's.
+    /// peer's: the link's own, for the link is all the network names it by.
     #[test]
     fn a_replay_on_a_hosts_own_link_is_a_peers() {
         const TYPE: &str = "test.notification";
@@ -4326,7 +4333,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (b"foreign".to_vec(), Provenance::Peer),
+                (b"foreign".to_vec(), peer(0)),
                 (b"own".to_vec(), Provenance::Local),
             ]
         );
@@ -4357,7 +4364,7 @@ mod tests {
 
         assert_eq!(
             *seen[0].lock().unwrap(),
-            vec![(b"own-forged".to_vec(), Provenance::Peer)]
+            vec![(b"own-forged".to_vec(), peer(0))]
         );
     }
 }

@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -11,7 +11,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
 use hyperscale_network::{
-    HandlerRegistry, Network, Provenance, ValidatorKeyMap, Verdict, VerdictKey,
+    HandlerRegistry, Network, PeerId, Provenance, ValidatorKeyMap, Verdict, VerdictKey,
 };
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::CountingVerifier;
@@ -1033,6 +1033,54 @@ async fn gossip_does_not_cross_a_partition() {
     assert_eq!(delivered, Some(BeaconBlock(2)));
 }
 
+/// A receiver and two senders bound to it, each known to it by its own
+/// validator.
+async fn counted_trio(fixtures: &TestFixtures) -> (Host, Host, Host) {
+    let (receiver, _counted, first) = counted_pair(fixtures, &[ShardId::ROOT]).await;
+    let second = host(
+        fixtures,
+        2,
+        &[ShardId::ROOT],
+        vec![receiver.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for("the second sender binds", || {
+        receiver.adapter.peer_for_validator(vid(2)).is_some()
+            && second.adapter.peer_for_validator(vid(0)).is_some()
+    })
+    .await;
+    (receiver, first, second)
+}
+
+/// The peer a host carrying validator `index` is to its handlers.
+fn peer_of(index: u32) -> Provenance {
+    Provenance::Peer(PeerId::new(u64::from(index)))
+}
+
+/// A handler is told which peer handed it each notification: the peer as
+/// its budget is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_is_told_which_peer_handed_it_each_notification() {
+    let fixtures = TestFixtures::new(21, 3);
+    let (receiver, first, second) = counted_trio(&fixtures).await;
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&heard);
+    receiver
+        .network
+        .register_notification_handler(move |vote: Vote, provenance: Provenance| {
+            recorded.lock().unwrap().push((vote.0, provenance));
+            Verdict::Accept
+        });
+
+    first.network.notify(&[vid(0)], &Vote(1));
+    second.network.notify(&[vid(0)], &Vote(2));
+    wait_for("both votes are heard", || heard.lock().unwrap().len() == 2).await;
+
+    let mut heard = heard.lock().unwrap().clone();
+    heard.sort_by_key(|(vote, _)| *vote);
+    assert_eq!(heard, vec![(1, peer_of(1)), (2, peer_of(2))]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_cooled_down_for_its_gossip_is_refused_its_notifications_too() {
     let fixtures = TestFixtures::new(21, 2);
@@ -1107,7 +1155,7 @@ async fn a_forged_copy_does_not_keep_an_honest_one_from_its_handler() {
 
     // The receiver finds a forged copy false, as a committed header whose
     // sender signature fails, and takes an honest one.
-    let handled: Arc<std::sync::Mutex<Vec<Copy>>> = Arc::default();
+    let handled: Arc<Mutex<Vec<Copy>>> = Arc::default();
     let seen = Arc::clone(&handled);
     receiver
         .network

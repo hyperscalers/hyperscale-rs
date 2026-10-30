@@ -58,8 +58,7 @@ use hyperscale_metrics::{
 use hyperscale_network::compression::{compress, decompress};
 use hyperscale_network::deferred::{DEFER_TIMEOUT, Deferred, Waiting};
 use hyperscale_network::{
-    Deferral, HandlerRegistry, Provenance, RawGossipHandler, RawHostGossipHandler, Verdict,
-    VerdictKey,
+    Deferral, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, Verdict, VerdictKey,
 };
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
@@ -719,7 +718,8 @@ impl Fanout {
                         host_handler(payload.clone());
                     }
                     // No handler here judged it.
-                    handler(payload, scope.shard(), Provenance::Peer).unwrap_or(Verdict::Ignore)
+                    handler(payload, scope.shard(), arrival.sender.provenance())
+                        .unwrap_or(Verdict::Ignore)
                 }
             };
             if let Verdict::Defer(deferral) = verdict {
