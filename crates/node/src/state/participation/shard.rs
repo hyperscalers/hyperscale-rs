@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ProtocolEvent, TimerId};
+use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_execution::CommitEffects;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
@@ -172,13 +172,6 @@ impl ShardParticipation {
                     substate_bytes,
                     standing_answers,
                 );
-                // If shard consensus just resumed from sync, reschedule the cleanup timer.
-                if !actions.is_empty() {
-                    actions.push(Action::SetTimer {
-                        id: TimerId::Cleanup,
-                        duration: self.shard_coordinator.config().cleanup_interval,
-                    });
-                }
                 actions.extend(
                     self.execution_coordinator
                         .on_block_persisted(topology_schedule, height),
