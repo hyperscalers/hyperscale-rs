@@ -1303,10 +1303,9 @@ where
                     warn!("BeaconLoop: no live shard with a committee to ask; dropping");
                 }
             }
-            // Where a record or an artifact is asked for follows from its
-            // name, whatever shard the asker named.
-            BeaconFetchIds::InstanceRecords(ids) => self.want_records(owner, ids, Vec::new()),
-            BeaconFetchIds::PackageArtifacts(ids) => self.want_records(owner, Vec::new(), ids),
+            BeaconFetchIds::InstanceRecords(_) | BeaconFetchIds::PackageArtifacts(_) => {
+                warn_record_fetch(owner);
+            }
         }
     }
 
@@ -1342,11 +1341,8 @@ where
             BeaconFetchIds::Candidates(ids) => {
                 self.abandon_for::<BeaconCandidateBinding>(owner, ids);
             }
-            BeaconFetchIds::InstanceRecords(ids) => {
-                self.abandon_for::<InstanceRecordBinding>(owner, ids);
-            }
-            BeaconFetchIds::PackageArtifacts(ids) => {
-                self.abandon_for::<PackageArtifactBinding>(owner, ids);
+            BeaconFetchIds::InstanceRecords(_) | BeaconFetchIds::PackageArtifacts(_) => {
+                warn_record_fetch(owner);
             }
         }
     }
@@ -1481,6 +1477,17 @@ where
             .expect("modulo of leaves.len() fits usize");
         Some(leaves[idx])
     }
+}
+
+/// A record or artifact is wanted by a chain's loop through
+/// [`BeaconInput::RecordsWanted`], which tells it when each arrives; the
+/// fold and the participants want none, so a fetch action naming one is
+/// dropped.
+fn warn_record_fetch(owner: BeaconOwner) {
+    warn!(
+        ?owner,
+        "BeaconLoop: a record fetch from a beacon owner — dropping"
+    );
 }
 
 /// The host's fold, resumed from its beacon storage's committed tip with
@@ -1768,11 +1775,11 @@ mod tests {
     use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
     use hyperscale_types::test_utils::{certify, make_live_block, test_pool, test_transaction};
     use hyperscale_types::{
-        AggregateSignature, BeaconBlock, BeaconCert, BeaconChainConfig, BeaconProposalDraft,
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
-        BlockVote, CertifiedBlock, CertifiedBlockHeader, Hash, ProposerTimestamp,
-        QuorumCertificate, RatifyCert, RatifyRound, Round, SignerBitfield, TopologySchedule,
-        Unresolved, VrfProof, WeightedTimestamp, shard_prefix_path,
+        AddressClass, AggregateSignature, BeaconBlock, BeaconCert, BeaconChainConfig,
+        BeaconProposalDraft, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader,
+        BlockHeaderParts, BlockHeight, BlockVote, CertifiedBlock, CertifiedBlockHeader, Hash,
+        ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyRound, Round, SignerBitfield,
+        TopologySchedule, Unresolved, VrfProof, WeightedTimestamp, shard_prefix_path,
     };
     use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
@@ -2034,6 +2041,28 @@ mod tests {
             "the forged answer does not retire the id"
         );
         assert_eq!(fetch.in_flight_count(), 1, "it is asked again at once");
+    }
+
+    /// A record fetch action from a participant asks nothing and holds
+    /// no interest: records are wanted by chain loops alone.
+    #[test]
+    fn a_participants_record_fetch_is_dropped() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let _ = host.network().drain_pending_requests();
+        let instance = Address::new([3; 31], AddressClass::Component);
+        host.beacon.process_action(
+            participant(2),
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::Beacon(BeaconFetchIds::InstanceRecords(vec![instance])),
+                shard: SHARD,
+                preferred: None,
+                class: None,
+            }),
+        );
+        assert!(host.beacon.interest.records.is_empty());
+        assert_eq!(host.beacon.fetches.instance_record.pending_count(), 0);
+        assert!(host.network().drain_pending_requests().is_empty());
     }
 
     /// The loop's own tick retries a held proposal fetch whether or not a
