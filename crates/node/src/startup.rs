@@ -16,7 +16,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{resumed_schedule, retention_floor};
-use hyperscale_storage::{BeaconStorage, BoundaryStore, RecoveryAnchor, ShardChainReader};
+use hyperscale_storage::{
+    BeaconStorage, BoundaryStore, RecoveryAnchor, ShardChainReader, SubstateStore, holds_state,
+};
 use hyperscale_types::{
     BeaconState, BlockHeight, EpochWindows, LocalTimestamp, NetworkDefinition, RecoveryBinding,
     RecoveryCause, RoutingCommittees, ShardBoundary, ShardId, ShardRecovery, Signer,
@@ -311,15 +313,6 @@ fn unanchored_past_fork_frontier<R: ShardChainReader + BoundaryStore + ?Sized>(
 }
 
 /// Whether a join opening `store` for `shard` starts it over.
-///
-/// A store seated at the anchor of the fork now pending
-/// ([`record_fork_anchor`]) is kept: it holds nothing of the replaced
-/// committee's past the frontier, though the fresh committee's own blocks
-/// there sit in the recovery's band. Any other store is started over when
-/// its tip sits in a recovery's band, where the recovered chain need not
-/// extend it, or past a pending fork's frontier
-/// ([`unanchored_past_fork_frontier`]), where it may hold the replaced
-/// committee's branch.
 #[must_use]
 pub fn join_wipes<R: ShardChainReader + BoundaryStore + ?Sized>(
     store: &R,
@@ -333,6 +326,49 @@ pub fn join_wipes<R: ShardChainReader + BoundaryStore + ?Sized>(
     !seated_under_fork
         && (store.committed_in_recovery_band(shard, schedule)
             || unanchored_past_fork_frontier(store, shard, pending))
+}
+
+/// Why a join opening a shard's store wipes it and joins from nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wipe {
+    /// The store holds a reshape's work no adoption finished: a split
+    /// child's clone still holding its parent's chain, or state a child
+    /// span's import wrote under no chain, which a snap-sync import
+    /// refuses to write over.
+    Unadopted,
+    /// A recovery leaves the store's tip behind: the recovered chain need
+    /// not extend it.
+    Recovered,
+}
+
+/// Whether a join opening `store` for `shard` wipes it first, and why.
+///
+/// A store seated at the anchor of the fork now pending
+/// ([`record_fork_anchor`]) holds nothing of the replaced committee's past
+/// the frontier, though the fresh committee's own blocks there sit in the
+/// recovery's band. Any other store is a recovery's to wipe when its tip
+/// sits in a recovery's band, where the recovered chain need not extend
+/// it, or past a pending fork's frontier
+/// ([`unanchored_past_fork_frontier`]), where it may hold the replaced
+/// committee's branch.
+#[must_use]
+pub fn join_wipe<R>(store: &R, shard: ShardId, schedule: &TopologySchedule) -> Option<Wipe>
+where
+    R: ShardChainReader + BoundaryStore + SubstateStore + ?Sized,
+{
+    if store.holds_foreign_chain(shard)
+        || (store.is_fresh() && holds_state(store.jmt_height(), store.state_root()))
+    {
+        return Some(Wipe::Unadopted);
+    }
+    let pending = schedule.head().pending_recoveries().get(&shard);
+    let seated_under_fork = pending
+        .and_then(|recovery| fork_anchor(shard, recovery))
+        .is_some_and(|anchor| store.recovery_anchor() == Some(anchor));
+    (!seated_under_fork
+        && (store.committed_in_recovery_band(shard, schedule)
+            || unanchored_past_fork_frontier(store, shard, pending)))
+    .then_some(Wipe::Recovered)
 }
 
 /// Why a rebuild replaces a shard's store, which decides what the rebuilt
@@ -630,6 +666,163 @@ pub fn retired_signers(
         .collect()
 }
 
+/// A change to the seats a host runs, which its runner carries out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SeatChange {
+    /// Tear the shard's loop down: it has aged out of this host's serving
+    /// duty ([`shard_retired`]).
+    Retire(ShardId),
+    /// Detach the validator from the shard's loop, which stays up
+    /// ([`retired_signers`]).
+    Detach(ShardId, ValidatorId),
+    /// Rebuild a shard's loop at its attested anchor.
+    Rebuild {
+        /// The shard whose loop is rebuilt.
+        shard: ShardId,
+        /// The validators seated on the rebuilt store.
+        seats: Vec<ValidatorId>,
+        /// Why the old store is replaced, which decides what the rebuilt
+        /// one takes from it.
+        replaced: Replaced,
+    },
+    /// Attach the validator to the shard's running loop.
+    Attach(ShardId, ValidatorId),
+    /// Bring the shard up for the validators placed on it.
+    Join(ShardId, Vec<ValidatorId>),
+}
+
+/// One shard a host runs, as [`reconcile`] reads it.
+pub struct HostedView<'a, R: ?Sized> {
+    /// The shard the loop runs; each view names a different one.
+    pub shard: ShardId,
+    /// The loop's store, where the runner holds one.
+    pub store: Option<&'a R>,
+    /// The validators attached to the loop's replica.
+    pub attached: Vec<ValidatorId>,
+    /// Validators whose attach to the loop is in flight: attached again by
+    /// nothing, and not yet counted among those a retirement keeps.
+    pub attaching: Vec<ValidatorId>,
+    /// Whether the plan may seat validators on the loop. A loop a rebuild
+    /// or a reshape duty is seating still retires, and still detaches its
+    /// retired signers, but gains no seat from the plan.
+    pub seatable: bool,
+}
+
+/// The seat changes that bring the shards a host runs in line with the
+/// committed `schedule` and the `routing` its network resolves against,
+/// for the validators in `local`.
+///
+/// The changes come in the order the runner carries them out. Each hosted
+/// shard [`shard_retired`] retires is torn down, and every other one
+/// detaches its [`retired_signers`]. Each surviving seatable loop then
+/// seats the validators [`placed_validators`] places on it
+/// ([`seat_running`]), and last each leaf of the head that `joinable`
+/// admits and no hosted loop covers is joined for the validators placed
+/// on it. A placed validator holds a role in the head's committee or in a
+/// window routing retains, so no shard both retires and gains a seat, and
+/// no signer both detaches and attaches.
+pub fn reconcile<R, H>(
+    schedule: &TopologySchedule,
+    routing: &RoutingCommittees,
+    hosted: &[HostedView<'_, R>],
+    local: &HashSet<ValidatorId, H>,
+    joinable: impl Fn(ShardId) -> bool,
+) -> Vec<SeatChange>
+where
+    R: ShardChainReader + BoundaryStore + ?Sized,
+    H: BuildHasher,
+{
+    let head = schedule.head();
+    let is_local = |validator| local.contains(&validator);
+    let mut changes = Vec::new();
+    let mut staying = Vec::new();
+    for view in hosted {
+        if shard_retired(view.shard, head, routing, local) {
+            changes.push(SeatChange::Retire(view.shard));
+            continue;
+        }
+        changes.extend(
+            retired_signers(view.shard, head, routing, &view.attached)
+                .into_iter()
+                .map(|validator| SeatChange::Detach(view.shard, validator)),
+        );
+        staying.push(view);
+    }
+    for view in staying.into_iter().filter(|view| view.seatable) {
+        let placed = placed_validators(view.shard, schedule, is_local);
+        changes.extend(seat_running(view, schedule, placed));
+    }
+    for shard in head.shard_trie().leaves() {
+        if hosted.iter().any(|view| view.shard == shard) || !joinable(shard) {
+            continue;
+        }
+        let placed = placed_validators(shard, schedule, is_local);
+        if !placed.is_empty() {
+            changes.push(SeatChange::Join(shard, placed));
+        }
+    }
+    changes
+}
+
+/// The changes that seat `placed` on a running loop.
+///
+/// A loop whose store [`rebuild_due`] says cannot carry them is rebuilt at
+/// the attested anchor; otherwise each one the loop neither carries nor is
+/// attaching attaches.
+#[must_use]
+pub fn seat_running<R>(
+    view: &HostedView<'_, R>,
+    schedule: &TopologySchedule,
+    placed: Vec<ValidatorId>,
+) -> Vec<SeatChange>
+where
+    R: ShardChainReader + BoundaryStore + ?Sized,
+{
+    let shard = view.shard;
+    if let Some(replaced) = view
+        .store
+        .and_then(|store| rebuild_due(store, shard, schedule.head(), schedule.windows(), &placed))
+    {
+        return vec![SeatChange::Rebuild {
+            shard,
+            seats: placed,
+            replaced,
+        }];
+    }
+    placed
+        .into_iter()
+        .filter(|validator| {
+            !view.attached.contains(validator) && !view.attaching.contains(validator)
+        })
+        .map(|validator| SeatChange::Attach(shard, validator))
+        .collect()
+}
+
+/// The rebuild a running loop of `shard` takes when its store needs a
+/// height beneath every serving peer's chain floor, so block sync cannot
+/// carry it forward and a snap-sync at the attested anchor must.
+///
+/// The rebuilt store seats [`reseated_validators`]: every validator in
+/// `local` the shard places, and every one the loop `carried` that a
+/// pending recovery did not replace. The rounds signed on the old store
+/// stay consumed ([`Replaced::Behind`]). `None` where the head holds no
+/// attested anchor to rebuild at.
+#[must_use]
+pub fn reseat<H: BuildHasher>(
+    shard: ShardId,
+    schedule: &TopologySchedule,
+    carried: &[ValidatorId],
+    local: &HashSet<ValidatorId, H>,
+) -> Option<SeatChange> {
+    schedule.head().boundary(shard)?;
+    let placed = placed_validators(shard, schedule, |validator| local.contains(&validator));
+    Some(SeatChange::Rebuild {
+        shard,
+        seats: reseated_validators(shard, schedule, carried, placed),
+        replaced: Replaced::Behind,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -641,8 +834,9 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
         BeaconChainConfig, BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, EpochWindows,
-        JailReason, RecoveryCause, ReshapeSeat, ShardCommittee, ShardRecovery, StateRoot,
-        ValidatorInfo, ValidatorRecord, ValidatorSet, WeightedTimestamp, shard_prefix_path,
+        JailReason, RecoveryCause, ReshapeSeat, ShardAnchor, ShardCommittee, ShardRecovery,
+        StateRoot, ValidatorInfo, ValidatorRecord, ValidatorSet, WeightedTimestamp,
+        shard_prefix_path,
     };
 
     use super::*;
@@ -1157,6 +1351,179 @@ mod tests {
             ShardId::ROOT,
             &untouched
         ));
+    }
+
+    /// A join wipes a store holding a chain that is not its shard's, and
+    /// one a pending fork did not seat past its frontier; it keeps one the
+    /// fork seated, and one no recovery touched.
+    #[test]
+    fn a_join_wipes_an_unadopted_clone_and_a_store_a_recovery_leaves() {
+        let child = ShardId::leaf(1, 0);
+        let clone = SimShardStorage::new(shard_prefix_path(child));
+        commit_one(&clone, 1);
+        let untouched = recovering(vec![HOST], Vec::new(), None);
+        assert_eq!(join_wipe(&clone, child, &untouched), Some(Wipe::Unadopted));
+        assert_eq!(
+            join_wipe(
+                &*root_store_certified_at(FRESH_MS),
+                ShardId::ROOT,
+                &untouched
+            ),
+            None
+        );
+
+        let fresh = root_store_certified_at(FRESH_MS);
+        let fork = recovering(
+            vec![HOST],
+            vec![binding(false)],
+            Some(pending(RecoveryCause::Fork, vec![validator(9)])),
+        );
+        assert_eq!(
+            join_wipe(&*fresh, ShardId::ROOT, &fork),
+            Some(Wipe::Recovered)
+        );
+        fresh.record_recovery_anchor(RecoveryAnchor {
+            shard: ShardId::ROOT,
+            rotated_at: ROTATED_AT,
+        });
+        assert_eq!(join_wipe(&*fresh, ShardId::ROOT, &fork), None);
+    }
+
+    /// A view of a hosted shard with no store, carrying `attached`.
+    fn view(shard: ShardId, attached: &[ValidatorId]) -> HostedView<'static, SimShardStorage> {
+        HostedView {
+            shard,
+            store: None,
+            attached: attached.to_vec(),
+            attaching: Vec::new(),
+            seatable: true,
+        }
+    }
+
+    /// Four leaves: `a` seats the host beside another, `b`, `c` and `d`
+    /// each seat one validator.
+    fn four_leaves() -> (TopologySchedule, [ShardId; 4]) {
+        let shards = [
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+            ShardId::leaf(2, 3),
+        ];
+        let head = explicit_head(HashMap::from([
+            (shards[0], vec![HOST, validator(2)]),
+            (shards[1], vec![validator(3)]),
+            (shards[2], vec![validator(10)]),
+            (shards[3], vec![validator(11)]),
+        ]));
+        (TopologySchedule::single(Arc::new(head)), shards)
+    }
+
+    /// Retirements and detaches come first, then the seats a running loop
+    /// gains, then joins of the leaves the runner admits.
+    #[test]
+    fn a_reconcile_tears_down_before_it_seats() {
+        let (schedule, [a, b, c, d]) = four_leaves();
+        let routing = schedule.routing_committees();
+        let local = HashSet::from([
+            HOST,
+            validator(6),
+            validator(7),
+            validator(8),
+            validator(10),
+            validator(11),
+        ]);
+        let hosted = [
+            view(a, &[validator(6), validator(7)]),
+            view(b, &[validator(8)]),
+        ];
+        assert_eq!(
+            reconcile(&schedule, &routing, &hosted, &local, |shard| shard != d),
+            vec![
+                SeatChange::Detach(a, validator(6)),
+                SeatChange::Retire(b),
+                SeatChange::Attach(a, HOST),
+                SeatChange::Join(c, vec![validator(10)]),
+            ]
+        );
+    }
+
+    /// A loop the runner holds unseatable still detaches its retired
+    /// signers but gains no seat, and a validator already attaching is not
+    /// attached again.
+    #[test]
+    fn a_reconcile_seats_nothing_on_a_loop_it_may_not_seat() {
+        let (schedule, [a, ..]) = four_leaves();
+        let routing = schedule.routing_committees();
+        let local = HashSet::from([HOST, validator(6), validator(7)]);
+        let mut busy = view(a, &[validator(6), validator(7)]);
+        busy.seatable = false;
+        assert_eq!(
+            reconcile(&schedule, &routing, &[busy], &local, |_| false),
+            vec![SeatChange::Detach(a, validator(6))]
+        );
+        let mut attaching = view(a, &[]);
+        attaching.attaching = vec![HOST];
+        assert!(reconcile(&schedule, &routing, &[attaching], &local, |_| false).is_empty());
+    }
+
+    /// A running loop on a tail a completed recovery discarded seats its
+    /// placed validators on a rebuilt store instead of attaching them.
+    #[test]
+    fn a_reconcile_rebuilds_a_loop_its_store_cannot_carry() {
+        let schedule = recovering(vec![HOST], vec![binding(true)], None);
+        let routing = schedule.routing_committees();
+        let store = root_store_certified_at(DISCARDED_MS);
+        let hosted = [HostedView {
+            store: Some(&*store),
+            ..view(ShardId::ROOT, &[])
+        }];
+        assert_eq!(
+            reconcile(&schedule, &routing, &hosted, &HashSet::from([HOST]), |_| {
+                true
+            }),
+            vec![SeatChange::Rebuild {
+                shard: ShardId::ROOT,
+                seats: vec![HOST],
+                replaced: Replaced::Forked,
+            }]
+        );
+    }
+
+    /// A re-seat rebuilds behind at the attested anchor, carrying what the
+    /// loop carried beside what the shard places; with no anchor it has
+    /// nothing to rebuild at.
+    #[test]
+    fn a_reseat_rebuilds_behind_only_at_an_attested_anchor() {
+        let lagging = validator(3);
+        let local = HashSet::from([HOST]);
+        let unanchored = recovering(vec![HOST], Vec::new(), None);
+        assert_eq!(reseat(ShardId::ROOT, &unanchored, &[lagging], &local), None);
+        let anchor = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::new(4),
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        };
+        let anchored = TopologySchedule::new(
+            WINDOWS,
+            Epoch::new(5),
+            Arc::new(
+                explicit_head(HashMap::from([(ShardId::ROOT, vec![HOST])]))
+                    .with_boundaries(BTreeMap::from([(ShardId::ROOT, anchor)])),
+            ),
+        );
+        assert_eq!(
+            reseat(ShardId::ROOT, &anchored, &[lagging], &local),
+            Some(SeatChange::Rebuild {
+                shard: ShardId::ROOT,
+                seats: vec![HOST, lagging],
+                replaced: Replaced::Behind,
+            })
+        );
     }
 
     /// A re-seat drops a carried member a pending recovery replaced unless
