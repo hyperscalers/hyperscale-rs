@@ -420,7 +420,10 @@ pub fn recognizing_parent_half(
             parent,
             child,
             validators: vec![vid(50)],
-            phase: ParentHalfPhase::Recognizing(Box::new(tail)),
+            phase: ParentHalfPhase::Recognizing {
+                tail: Box::new(tail),
+                proven: false,
+            },
             store_seeded: false,
         },
     );

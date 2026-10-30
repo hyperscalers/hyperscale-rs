@@ -478,6 +478,20 @@ pub fn signed_split_terminal(
     })
 }
 
+/// [`signed_child_block`] as a terminating shard's terminal carrying no
+/// split child roots: it names the terminal settled root alone.
+#[must_use]
+pub fn signed_terminal(
+    committee: &TestCommittee,
+    parent: &Block,
+    round: Round,
+    pred_wt: WeightedTimestamp,
+) -> Block {
+    signed_child_with(committee, parent, round, pred_wt, |parts| {
+        parts.terminal_settled_txs = Some(SettledTxsRoot::ZERO);
+    })
+}
+
 fn signed_child_with(
     committee: &TestCommittee,
     parent: &Block,

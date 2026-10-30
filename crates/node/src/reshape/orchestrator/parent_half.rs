@@ -57,7 +57,13 @@ pub(super) enum ParentHalfPhase {
     /// crossing, so the child can be seeded and adopted at the cut rather
     /// than an epoch later when the beacon publishes the child's anchor.
     /// Applies nothing — the store comes from cloning the local parent.
-    Recognizing(Box<ObserverTail>),
+    Recognizing {
+        tail: Box<ObserverTail>,
+        /// Whether the walk's settled terminal is commit-proven. Latched so
+        /// the proof is verified once, not on every step a terminal with no
+        /// child genesis waits out for the child's anchor.
+        proven: bool,
+    },
     /// Terminal recognised and genesis derived; cloning the local parent
     /// through the child's genesis height.
     SeedingAt {
@@ -134,7 +140,7 @@ impl ParentHalfDuty {
             ReshapeEvent::Opened { .. } => self.store_seeded = true,
             ReshapeEvent::Fetched { kind, .. } => self.on_fetched(kind, now),
             ReshapeEvent::FetchFailed { .. } => match &mut self.phase {
-                ParentHalfPhase::Recognizing(tail) => tail.on_failure(),
+                ParentHalfPhase::Recognizing { tail, .. } => tail.on_failure(),
                 ParentHalfPhase::FetchingTerminal(fetch) => fetch.on_failure(now),
                 _ => {}
             },
@@ -170,7 +176,7 @@ impl ParentHalfDuty {
     fn on_fetched(&mut self, kind: FetchedKind, now: LocalTimestamp) {
         let child = self.child;
         match (&mut self.phase, kind) {
-            (ParentHalfPhase::Recognizing(tail), FetchedKind::Headers { response }) => {
+            (ParentHalfPhase::Recognizing { tail, .. }, FetchedKind::Headers { response }) => {
                 let outcome = tail.on_certified_headers(&response.headers);
                 paced(tail, outcome, now, child);
             }
@@ -210,10 +216,10 @@ impl ParentHalfDuty {
                     && view.terminal_cut(parent).is_some()
                     && let Some(parent_anchor) = view.boundary(parent)
                 {
-                    self.phase = ParentHalfPhase::Recognizing(Box::new(ObserverTail::recognizing(
-                        parent_anchor,
-                        child,
-                    )));
+                    self.phase = ParentHalfPhase::Recognizing {
+                        tail: Box::new(ObserverTail::recognizing(parent_anchor, child)),
+                        proven: false,
+                    };
                 }
                 // Fallback: the child anchor seeds once the parent's terminal
                 // folds; it is the version the clone must reach and the
@@ -243,16 +249,19 @@ impl ParentHalfDuty {
                     }
                 }
             }
-            ParentHalfPhase::Recognizing(tail) => {
+            ParentHalfPhase::Recognizing { tail, proven } => {
                 tail.set_terminal_cut(view.terminal_cut(parent));
-                let check = tail
-                    .settled_terminal()
-                    .map(|sighting| terminal_commit(parent, sighting, verifier, view));
-                if matches!(check, Some(TwoChainCheck::Refuted(_))) {
-                    tail.restart();
-                    tail.defer(now.plus(REFETCH_WAIT));
+                if !*proven {
+                    let check = tail
+                        .settled_terminal()
+                        .map(|sighting| terminal_commit(parent, sighting, verifier, view));
+                    if matches!(check, Some(TwoChainCheck::Refuted(_))) {
+                        tail.restart();
+                        tail.defer(now.plus(REFETCH_WAIT));
+                    }
+                    *proven = check == Some(TwoChainCheck::Verified);
                 }
-                if check == Some(TwoChainCheck::Verified)
+                if *proven
                     && let Some(sighting) = tail.settled_terminal()
                     && let Some(derived) = &sighting.genesis
                 {
@@ -318,14 +327,16 @@ impl ParentHalfDuty {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::{
-        StubVmStatics, TestCommittee, signed_child_block, signed_split_terminal,
+        StubVmStatics, TestCommittee, signed_child_block, signed_split_terminal, signed_terminal,
     };
     use hyperscale_types::{
-        BlockHeight, Epoch, Hash, LocalTimestamp, Round, ShardAnchor, ShardId, SplitChildRoots,
-        StateRoot, WeightedTimestamp,
+        AggregateError, AggregateSignature, BlockHeight, ConsensusPublicKey, ConsensusSignature,
+        Epoch, Hash, LocalTimestamp, Round, ShardAnchor, ShardId, SplitChildRoots, StateRoot,
+        VerifiedSignature, Verifier, VrfProof, WeightedTimestamp,
     };
 
     use super::*;
@@ -396,7 +407,7 @@ mod tests {
         assert!(
             matches!(
                 parent_half(&orch, child).phase,
-                ParentHalfPhase::Recognizing(_)
+                ParentHalfPhase::Recognizing { .. }
             ),
             "a successor the committee never certified proves nothing",
         );
@@ -419,6 +430,126 @@ mod tests {
             Some(terminal.height().next()),
             "a proven terminal seeds the child through its genesis height",
         );
+    }
+
+    /// A [`BlsVerifier`] that counts the aggregate checks it runs.
+    #[derive(Debug, Default)]
+    struct Counting {
+        checks: AtomicUsize,
+    }
+
+    impl Counting {
+        fn checked(&self) -> usize {
+            self.checks.load(Ordering::SeqCst)
+        }
+
+        fn tick(&self) {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Verifier for Counting {
+        fn verify(
+            &self,
+            key: &ConsensusPublicKey,
+            message: &[u8],
+            sig: &ConsensusSignature,
+        ) -> bool {
+            self.tick();
+            BlsVerifier.verify(key, message, sig)
+        }
+
+        fn aggregate(
+            &self,
+            sigs: &[ConsensusSignature],
+        ) -> Result<AggregateSignature, AggregateError> {
+            BlsVerifier.aggregate(sigs)
+        }
+
+        fn aggregate_verified(
+            &self,
+            sigs: &[VerifiedSignature],
+        ) -> Result<AggregateSignature, AggregateError> {
+            BlsVerifier.aggregate_verified(sigs)
+        }
+
+        fn verify_aggregate_same_message(
+            &self,
+            message: &[u8],
+            agg: &AggregateSignature,
+            keys: &[ConsensusPublicKey],
+        ) -> bool {
+            self.tick();
+            BlsVerifier.verify_aggregate_same_message(message, agg, keys)
+        }
+
+        fn verify_aggregate_different_messages(
+            &self,
+            messages: &[&[u8]],
+            agg: &AggregateSignature,
+            keys: &[ConsensusPublicKey],
+        ) -> bool {
+            self.tick();
+            BlsVerifier.verify_aggregate_different_messages(messages, agg, keys)
+        }
+
+        fn verify_each(
+            &self,
+            messages: &[&[u8]],
+            sigs: &[ConsensusSignature],
+            keys: &[ConsensusPublicKey],
+        ) -> bool {
+            self.tick();
+            BlsVerifier.verify_each(messages, sigs, keys)
+        }
+
+        fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
+            self.tick();
+            BlsVerifier.verify_vrf(key, message, proof)
+        }
+    }
+
+    /// A walk whose proven terminal carries no child genesis waits for the
+    /// child's anchor, and checks the terminal's commit proof once rather
+    /// than on every step it waits.
+    #[test]
+    fn a_parent_half_checks_a_proven_terminal_once() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let committee = TestCommittee::new(4, 3);
+        let schedule = committee_schedule(parent, &committee, &[]);
+        let view = ReshapeView::new(&schedule);
+        let (anchor_block, anchor) = anchored_block();
+        let terminal = signed_terminal(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            WeightedTimestamp::from_millis(200),
+        );
+        let successor = signed_child_block(
+            &committee,
+            &terminal,
+            Round::new(3),
+            WeightedTimestamp::from_millis(300),
+        );
+        let verifier = Counting::default();
+        let mut orch = recognizing_parent_half(parent, child, anchor);
+        let _ = orch.step(&view, &verifier, &StubVmStatics, Vec::new(), at(0));
+        let _ = orch.step(
+            &view,
+            &verifier,
+            &StubVmStatics,
+            vec![walked(child, parent, &committee, &[&terminal, &successor])],
+            at(0),
+        );
+        let _ = orch.step(&view, &verifier, &StubVmStatics, Vec::new(), at(0));
+        let checked = verifier.checked();
+        assert!(checked > 0, "the terminal's proof is checked");
+        for _ in 0..3 {
+            let requests = orch.step(&view, &verifier, &StubVmStatics, Vec::new(), at(0));
+            assert_eq!(seeds_through(&requests), None, "no genesis to seed from");
+        }
+        assert_eq!(verifier.checked(), checked, "the verdict is kept");
     }
 
     /// A recognizing walk at its chain's tip gets an empty batch; the next
@@ -769,10 +900,10 @@ mod tests {
                 parent,
                 child,
                 validators: vec![vid(5)],
-                phase: ParentHalfPhase::Recognizing(Box::new(ObserverTail::recognizing(
-                    anchor(),
-                    child,
-                ))),
+                phase: ParentHalfPhase::Recognizing {
+                    tail: Box::new(ObserverTail::recognizing(anchor(), child)),
+                    proven: false,
+                },
                 store_seeded: false,
             },
         );
