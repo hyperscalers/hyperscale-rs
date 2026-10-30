@@ -132,9 +132,8 @@ impl CommitAssembler {
             .is_some_and(|p| p.awaiting.contains(&validator))
     }
 
-    /// A fetched proposal for `validator` has been resolved into the pool
-    /// (verified + admitted, or dropped on verify failure). Clears the
-    /// await; once `epoch`'s stash has no outstanding fetches, re-decodes
+    /// A fetched proposal for `validator` has been verified and admitted
+    /// to the pool. Clears the await; once `epoch`'s stash has no outstanding fetches, re-decodes
     /// against the now-extended pool and either yields
     /// [`AssemblyDecision::Assemble`] or drops the stash
     /// ([`AssemblyDecision::Idle`] — the node catches up via peer

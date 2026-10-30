@@ -17,11 +17,12 @@ use hyperscale_core::{Action, BeaconFetchIds, FetchIds, FetchRequest, TimerId};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
-    BlockHeight, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader,
-    ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
-    NetworkDefinition, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT, RatifyRound, SKIP_TIMEOUT,
-    ShardId, ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects, TopologySchedule,
-    TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier, WeightedTimestamp,
+    BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
+    CertifiedBlockHeader, ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex,
+    LocalTimestamp, NetworkDefinition, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
+    RatifyRound, SKIP_TIMEOUT, ShardId, ShardVoteEquivocationContext, ShardWitnessPayload,
+    SlotEffects, TopologySchedule, TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier,
+    WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -1201,10 +1202,42 @@ impl BeaconFold {
         })
     }
 
+    /// What `candidate` verifies under, once the fields no signature
+    /// covers hold: it extends the tip, and its shard contributions are
+    /// the canonical projection of its committed proposals. The SPC cert
+    /// authenticates the proposals alone, so a Byzantine assembler's
+    /// variant projection (fabricated, stale, extra or omitted) must
+    /// never become the value an honest member prevotes. `None` when
+    /// either fails.
+    #[must_use]
+    pub fn candidate_keys(&self, candidate: &CandidateBeaconBlock) -> Option<CandidateKeys> {
+        if candidate.prev_block_hash() != self.latest_block.block_hash()
+            || candidate.epoch() != self.state.current_epoch.next()
+        {
+            trace!(
+                epoch = candidate.epoch().inner(),
+                "BeaconCandidate doesn't extend the local tip — dropping",
+            );
+            return None;
+        }
+        if !rules::contributions_well_formed(&self.state, candidate.block()) {
+            warn!(
+                epoch = candidate.epoch().inner(),
+                "BeaconCandidate has malformed shard contributions — dropping",
+            );
+            return None;
+        }
+        Some(CandidateKeys {
+            committee: self.state.derive_beacon_committee(),
+            equivocation_signers: self.equivocation_signers_for(candidate.block()),
+        })
+    }
+
     /// VRF-verify a fetched proposal under `validator`'s registered
     /// pubkey, or `None` with a warn when the validator is unknown or
     /// the reveal fails.
-    pub(crate) fn verify_fetched_proposal(
+    #[must_use]
+    pub fn verify_fetched_proposal(
         &self,
         epoch: Epoch,
         validator: ValidatorId,
@@ -1236,6 +1269,16 @@ impl BeaconFold {
             }
         }
     }
+}
+
+/// The keys a candidate's certificates verify under.
+pub struct CandidateKeys {
+    /// The beacon committee, in the positional order the SPC cert's
+    /// signer bitfields read.
+    pub committee: Vec<(ValidatorId, ConsensusPublicKey)>,
+    /// The validators the committed proposals' equivocation evidence
+    /// names; empty when it names none.
+    pub equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
 }
 
 /// Latch `chain` terminal once `schedule` reads its committed block

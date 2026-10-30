@@ -760,13 +760,20 @@ impl BeaconCoordinator {
         self.drive(|p, fold| p.on_beacon_candidate_verified(fold, result))
     }
 
-    /// A fetched beacon proposal arrived.
+    /// A fetched beacon proposal arrived. One that fails VRF
+    /// verification resolves nothing.
     pub fn on_beacon_proposal_fetched(
         &mut self,
         epoch: Epoch,
         validator: ValidatorId,
         proposal: Arc<Verifiable<BeaconProposal>>,
     ) -> Vec<Action> {
+        let Some(proposal) = self
+            .fold
+            .verify_fetched_proposal(epoch, validator, proposal)
+        else {
+            return Vec::new();
+        };
         self.drive(|p, fold| p.on_beacon_proposal_fetched(fold, epoch, validator, proposal))
     }
 

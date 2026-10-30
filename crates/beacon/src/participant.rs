@@ -29,9 +29,10 @@ use hyperscale_types::{
 };
 use tracing::{debug, error, trace, warn};
 
+use crate::boundary;
 use crate::commit_assembly::{AssemblyDecision, CommitAssembler};
 use crate::equivocations::EquivocationObservations;
-use crate::fold::BeaconFold;
+use crate::fold::{BeaconFold, CandidateKeys};
 use crate::fork_observations::ForkProofObservations;
 use crate::proposal_pool::BeaconProposalPool;
 use crate::ratify::{RatifyEffect, RatifyTracker};
@@ -39,7 +40,6 @@ use crate::spc::SpcEffect;
 use crate::spc_driver::SpcDriver;
 use crate::verification::{BeaconVerificationPipeline, RatifyVoteSlotKey};
 use crate::vote_equivocation_observations::VoteEquivocationObservations;
-use crate::{boundary, rules};
 
 /// How many times the view-1 input dwell re-arms while waiting for full
 /// proposal coverage before giving up and feeding whatever is pooled.
@@ -1804,13 +1804,13 @@ impl BeaconParticipant {
     }
 
     /// A peer's [`CandidateBeaconBlock`] arrived via gossip. Gate the
-    /// non-crypto fields and dispatch SPC-cert + equivocation
-    /// verification; [`Self::on_beacon_candidate_verified`] feeds the
-    /// tracker when the result lands. First verified candidate wins —
-    /// a second distinct candidate (an equivocating committee) is
-    /// ignored, and the pool cert arbitrates. A candidate for an epoch
-    /// past the pending one waits in `early_candidates` for the block it
-    /// extends.
+    /// fields no signature covers ([`BeaconFold::candidate_keys`]) and
+    /// dispatch SPC-cert + equivocation verification;
+    /// [`Self::on_beacon_candidate_verified`] feeds the tracker when the
+    /// result lands. First verified candidate wins — a second distinct
+    /// candidate (an equivocating committee) is ignored, and the pool
+    /// cert arbitrates. A candidate for an epoch past the pending one
+    /// waits in `early_candidates` for the block it extends.
     pub fn on_beacon_candidate_received(
         &mut self,
         fold: &BeaconFold,
@@ -1820,44 +1820,45 @@ impl BeaconParticipant {
             self.hold_early_candidate(candidate);
             return Vec::new();
         }
-        if candidate.prev_block_hash() != fold.latest_block.block_hash()
-            || candidate.epoch() != fold.state.current_epoch.next()
-        {
-            trace!(
-                epoch = candidate.epoch().inner(),
-                "BeaconCandidate doesn't extend the local tip — dropping",
-            );
+        if self.holds_a_candidate() {
             return Vec::new();
         }
-        if self.pending_candidate.is_some() || self.ratify.candidate().is_some() {
+        let Some(CandidateKeys {
+            committee,
+            equivocation_signers,
+        }) = fold.candidate_keys(&candidate)
+        else {
             return Vec::new();
-        }
-        // The SPC cert authenticates `committed_proposals`, not the
-        // `shard_contributions` projected from them. Re-derive the
-        // canonical projection before dispatching verification, so a
-        // Byzantine assembler's variant (fabricated, stale, extra, or
-        // omitted contribution) never becomes the value honest pool
-        // members prevote.
-        if !rules::contributions_well_formed(&fold.state, candidate.block()) {
-            warn!(
-                epoch = candidate.epoch().inner(),
-                "BeaconCandidate has malformed shard contributions — dropping",
-            );
-            return Vec::new();
-        }
+        };
         if !self
             .verification
             .mark_candidate_in_flight(candidate.block_hash())
         {
             return Vec::new();
         }
-        let committee = fold.state.derive_beacon_committee();
-        let equivocation_signers = fold.equivocation_signers_for(candidate.block());
         vec![Action::VerifyBeaconCandidate {
             candidate,
             committee,
             equivocation_signers,
         }]
+    }
+
+    /// A candidate this participant asked for, checked and verified on
+    /// the host's beacon loop. It enters as a gossiped candidate's
+    /// verified result does, unless one is already held.
+    pub fn on_beacon_candidate_fetched(
+        &mut self,
+        fold: &BeaconFold,
+        candidate: Arc<Verified<CandidateBeaconBlock>>,
+    ) -> Vec<Action> {
+        if self.holds_a_candidate() {
+            return Vec::new();
+        }
+        self.hold_verified_candidate(fold, candidate)
+    }
+
+    const fn holds_a_candidate(&self) -> bool {
+        self.pending_candidate.is_some() || self.ratify.candidate().is_some()
     }
 
     /// Hold a candidate for an epoch past the pending one. At the cap it
@@ -1897,6 +1898,16 @@ impl BeaconParticipant {
             }
         };
         self.verification.forget_candidate(candidate.block_hash());
+        self.hold_verified_candidate(fold, candidate)
+    }
+
+    /// Hold a verified candidate for cert pairing and feed its hash to
+    /// the tracker as the prevotable value.
+    fn hold_verified_candidate(
+        &mut self,
+        fold: &BeaconFold,
+        candidate: Arc<Verified<CandidateBeaconBlock>>,
+    ) -> Vec<Action> {
         // Tip may have advanced since dispatch; a stale candidate no
         // longer names a prevotable value.
         if candidate.prev_block_hash() != fold.latest_block.block_hash()
@@ -1908,16 +1919,17 @@ impl BeaconParticipant {
             );
             return Vec::new();
         }
+        let block_hash = candidate.block_hash();
         if self.pending_candidate.is_none() {
-            self.pending_candidate = Some(Arc::clone(&candidate));
+            self.pending_candidate = Some(candidate);
         }
-        let effects = self.ratify.on_candidate(candidate.block_hash());
+        let effects = self.ratify.on_candidate(block_hash);
         self.lift_ratify_effects(fold, effects)
     }
 
-    /// Handle a [`ProtocolEvent::BeaconProposalFetched`] dispatch:
-    /// verify the returned proposal under the named validator's pubkey,
-    /// then hand it to whichever consumer asked.
+    /// A fetched proposal, already VRF-verified under the named
+    /// validator's pubkey ([`BeaconFold::verify_fetched_proposal`]):
+    /// hand it to whichever consumer asked.
     ///
     /// A proposal commit assembly awaits is admitted straight to the
     /// pool, and the stashed assembly for `epoch` resumes once every
@@ -1933,28 +1945,20 @@ impl BeaconParticipant {
     /// exactly as a gossiped copy would.
     ///
     /// Out-of-band responses drop silently.
-    ///
-    /// [`ProtocolEvent::BeaconProposalFetched`]: hyperscale_core::ProtocolEvent::BeaconProposalFetched
     pub fn on_beacon_proposal_fetched(
         &mut self,
         fold: &BeaconFold,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Arc<Verified<BeaconProposal>>,
     ) -> Vec<Action> {
         if !self.commit_assembly.is_awaiting(epoch, validator) {
             if epoch != self.proposal_pool.epoch() || !self.dwell_fetches.remove(&validator) {
                 return Vec::new();
             }
-            return fold
-                .verify_fetched_proposal(epoch, validator, proposal)
-                .map_or_else(Vec::new, |verified| {
-                    self.on_beacon_proposal_received(fold, validator, epoch, verified)
-                });
+            return self.on_beacon_proposal_received(fold, validator, epoch, proposal);
         }
-        if let Some(verified) = fold.verify_fetched_proposal(epoch, validator, proposal) {
-            let _ = self.proposal_pool.admit(validator, epoch, verified);
-        }
+        let _ = self.proposal_pool.admit(validator, epoch, proposal);
         match self.commit_assembly.on_proposal_resolved(
             epoch,
             validator,

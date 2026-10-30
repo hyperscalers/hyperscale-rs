@@ -30,7 +30,7 @@ use hyperscale_beacon::action_handlers::{
 };
 use hyperscale_beacon::coordinator::{LocalChainAnchors, retention_floor};
 use hyperscale_beacon::{
-    Adopted, BeaconFold, BeaconParticipant, ChainRegistration, ParticipantStep,
+    Adopted, BeaconFold, BeaconParticipant, CandidateKeys, ChainRegistration, ParticipantStep,
 };
 use hyperscale_core::{
     Action, ActionOwner, BeaconActionContext, BeaconFetchIds, FetchIds, FetchRequest, Gate,
@@ -44,10 +44,11 @@ use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
     Address, BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
-    BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlockHeader, Epoch,
-    GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MessageClass, NetworkDefinition, ShardId,
-    ShardVoteEquivocation, Signer, SlotEffects, TopologySchedule, TopologySnapshot, ValidatorId,
-    ValidatorStatus, Verifiable, Verified, Verifier, Verify, verify_shard_vote_equivocation,
+    BlockHeight, CandidateBeaconBlock, CandidateVerifyContext, CertifiedBeaconBlock,
+    CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MessageClass,
+    NetworkDefinition, ShardId, ShardVoteEquivocation, Signer, SlotEffects, TopologySchedule,
+    TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified, Verifier, Verify,
+    verify_shard_vote_equivocation,
 };
 use tracing::warn;
 
@@ -522,36 +523,122 @@ where
         }
     }
 
-    /// A fetch's answer. Its ids retire before what it carries is taken,
-    /// so the freed capacity is there for any fetch that re-drives. A
-    /// witness run the fold refuses releases its ids as failed instead,
-    /// which retries it at once the first time and on the tick after.
+    /// A fetch's answer. Its ids retire only once what it carries has
+    /// passed the check its consumers would run, and before what it
+    /// carries is taken, so the freed capacity is there for any fetch
+    /// that re-drives. An answer that fails its check releases its ids
+    /// as failed instead, which retries them at once the first time and
+    /// on the tick after: an await the answer was to resolve stays open
+    /// for another peer's.
     fn on_answer(&mut self, ids: FetchIds, event: ProtocolEvent) {
-        let ProtocolEvent::ShardWitnessesReceived {
-            shard_id,
-            committed_block_hash,
-            lo,
-            payloads,
-            range_proof,
-        } = event
+        match event {
+            ProtocolEvent::ShardWitnessesReceived {
+                shard_id,
+                committed_block_hash,
+                lo,
+                payloads,
+                range_proof,
+            } => match self.fold.on_shard_witnesses_received(
+                shard_id,
+                committed_block_hash,
+                lo,
+                payloads,
+                range_proof,
+            ) {
+                Some(actions) => {
+                    self.release(ids, Release::Admitted);
+                    self.run_fold_actions(actions);
+                }
+                None => self.release(ids, Release::Failed),
+            },
+            ProtocolEvent::BeaconProposalFetched {
+                epoch,
+                validator: author,
+                proposal,
+            } => match self.fold.verify_fetched_proposal(epoch, author, proposal) {
+                Some(proposal) => {
+                    self.release(ids, Release::Admitted);
+                    for validator in self.validator_list() {
+                        let proposal = Arc::clone(&proposal);
+                        self.drive(validator, |p, fold| {
+                            p.on_beacon_proposal_fetched(fold, epoch, author, proposal)
+                        });
+                    }
+                }
+                None => self.release(ids, Release::Failed),
+            },
+            ProtocolEvent::BeaconCandidateReceived { candidate } => {
+                self.verify_fetched_candidate(ids, candidate);
+            }
+            ProtocolEvent::BeaconCandidateVerified {
+                result: Ok(candidate),
+            } => {
+                self.release(ids, Release::Admitted);
+                for validator in self.validator_list() {
+                    let candidate = Arc::clone(&candidate);
+                    self.drive(validator, |p, fold| {
+                        p.on_beacon_candidate_fetched(fold, candidate)
+                    });
+                }
+            }
+            other => {
+                warn!(
+                    event = other.type_name(),
+                    "BeaconLoop: an answer no beacon fetch gives — dropping"
+                );
+                self.release(ids, Release::Failed);
+            }
+        }
+    }
+
+    /// Check a fetched candidate once for every participant, off-thread,
+    /// against the fold's tip. A verified one returns to
+    /// [`Self::on_answer`] and is kept for serving; one that fails
+    /// releases its ids for another peer's answer.
+    fn verify_fetched_candidate(
+        &mut self,
+        ids: FetchIds,
+        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+    ) {
+        let Some(CandidateKeys {
+            committee,
+            equivocation_signers,
+        }) = self.fold.candidate_keys(&candidate)
         else {
-            self.release(ids, Release::Admitted);
-            self.on_protocol(event);
+            self.release(ids, Release::Failed);
             return;
         };
-        match self.fold.on_shard_witnesses_received(
-            shard_id,
-            committed_block_hash,
-            lo,
-            payloads,
-            range_proof,
-        ) {
-            Some(actions) => {
-                self.release(ids, Release::Admitted);
-                self.run_fold_actions(actions);
-            }
-            None => self.release(ids, Release::Failed),
-        }
+        let handles = Arc::clone(&self.process.dispatch_handles);
+        let verifier = Arc::clone(&self.process.verifier);
+        let network = self.fold.network().clone();
+        let beacon_tx = self.process.beacon_event_sender.clone();
+        self.process
+            .dispatch
+            .spawn(DispatchPool::Consensus, move || {
+                let checked = Arc::unwrap_or_clone(candidate).upgrade(&CandidateVerifyContext {
+                    network: &network,
+                    committee: &committee,
+                    equivocation_signers: &equivocation_signers,
+                    verifier: verifier.as_ref(),
+                });
+                let input = match checked {
+                    Ok(candidate) => {
+                        let candidate = Arc::new(candidate);
+                        handles.beacon_candidate_cache.admit(Arc::clone(&candidate));
+                        BeaconScopedInput::Answered {
+                            ids,
+                            event: Box::new(ProtocolEvent::BeaconCandidateVerified {
+                                result: Ok(candidate),
+                            }),
+                        }
+                    }
+                    Err((_, err)) => {
+                        warn!(%err, "fetched BeaconCandidate failed verification — asking again");
+                        BeaconScopedInput::FetchFailed(ids)
+                    }
+                };
+                let _ = beacon_tx.send(HostEvent::Beacon(input));
+            });
     }
 
     /// The outcome of a check the fold dispatched.
@@ -657,15 +744,6 @@ where
             ProtocolEvent::BeaconCandidateVerified { result } => {
                 self.drive(validator, |p, fold| {
                     p.on_beacon_candidate_verified(fold, result)
-                });
-            }
-            ProtocolEvent::BeaconProposalFetched {
-                epoch,
-                validator: author,
-                proposal,
-            } => {
-                self.drive(validator, |p, fold| {
-                    p.on_beacon_proposal_fetched(fold, epoch, author, proposal)
                 });
             }
             ProtocolEvent::RatifyVoteVerified {
@@ -1824,6 +1902,109 @@ mod tests {
         assert_eq!(in_flight(&host.beacon), 1, "the tick asks again");
     }
 
+    /// A fetched proposal whose reveal does not verify under its
+    /// author's key resolves nothing: its id is asked again rather than
+    /// retired, so the await it was to fill stays open for another
+    /// peer's answer.
+    #[test]
+    fn a_fetched_proposal_failing_verification_is_asked_again() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let author = fix.committee.validator_id(1);
+        let id = (Epoch::new(1), author);
+        ask(&mut host.beacon, participant(2), &[id]);
+        let forged = BeaconProposalDraft::new(
+            fix.committee.signer(2).as_ref(),
+            &NetworkDefinition::simulator(),
+            Epoch::new(1),
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .and_then(BeaconProposalDraft::sign)
+        .expect("a key signs a proposal");
+        host.beacon.dispatch_event(BeaconScopedInput::Answered {
+            ids: proposals(&[id]),
+            event: Box::new(ProtocolEvent::BeaconProposalFetched {
+                epoch: Epoch::new(1),
+                validator: author,
+                proposal: Arc::new(Verifiable::from(forged.into_inner())),
+            }),
+        });
+        assert_eq!(
+            host.beacon.fetches.beacon_proposal.pending_count(),
+            1,
+            "the forged answer does not retire the id",
+        );
+        assert_eq!(in_flight(&host.beacon), 1, "it is asked again at once");
+    }
+
+    /// A fetched candidate whose certificate does not verify resolves
+    /// nothing: its id is asked again rather than retired once the
+    /// loop's check fails.
+    #[test]
+    fn a_fetched_candidate_failing_verification_is_asked_again() {
+        use hyperscale_types::{
+            PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, SpcCert, SpcView,
+        };
+
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let block = BeaconBlock::new(
+            Epoch::new(1),
+            fix.genesis_block().block_hash(),
+            Capped::empty(),
+        );
+        let qc2 = PcQc2::new(
+            PcVector::empty(),
+            SignerBitfield::new(4),
+            AggregateSignature::new([0x11; 96]),
+            PcXpProof::Full,
+        );
+        let qc3 = PcQc3::new(
+            PcVector::empty(),
+            qc2,
+            None,
+            None,
+            SignerBitfield::new(4),
+            PcSignerLengths::Uniform(0),
+            AggregateSignature::new([0x11; 96]),
+        );
+        let forged = CandidateBeaconBlock::new(
+            block,
+            Box::new(SpcCert::Direct {
+                prev_view: SpcView::INITIAL,
+                value: PcVector::empty(),
+                proof: qc3.into(),
+            }),
+        );
+        let ids = || {
+            FetchIds::Beacon(BeaconFetchIds::Candidates(vec![(
+                Epoch::new(1),
+                forged.block_hash(),
+            )]))
+        };
+        host.beacon
+            .ask(participant(2), ids(), ShardId::ROOT, None, None);
+        let _ = host.step(HostEvent::Beacon(BeaconScopedInput::Answered {
+            ids: ids(),
+            event: Box::new(ProtocolEvent::BeaconCandidateReceived {
+                candidate: Arc::new(Verifiable::from(forged.clone())),
+            }),
+        }));
+        while let Ok(event) = events.try_recv() {
+            let _ = host.step(event);
+        }
+        let fetch = &host.beacon.fetches.beacon_candidate;
+        assert_eq!(
+            fetch.pending_count(),
+            1,
+            "the forged answer does not retire the id"
+        );
+        assert_eq!(fetch.in_flight_count(), 1, "it is asked again at once");
+    }
+
     /// The loop's own tick retries a held proposal fetch whether or not a
     /// block sync runs.
     #[test]
@@ -1854,12 +2035,11 @@ mod tests {
             vec![true],
             "a pending fetch arms the tick",
         );
-        let out = host.step(HostEvent::Beacon(BeaconScopedInput::Answered {
-            ids: proposals(&[PROPOSAL]),
-            event: Box::new(ProtocolEvent::BeaconRatifyTimer),
-        }));
+        host.beacon
+            .release(proposals(&[PROPOSAL]), Release::Admitted);
+        host.beacon.update_fetch_tick_timer();
         assert_eq!(
-            fetch_ticks(&out.timer_ops),
+            fetch_ticks(&host.drain_pending_output().timer_ops),
             vec![false],
             "an answered fetch leaves nothing pending",
         );
