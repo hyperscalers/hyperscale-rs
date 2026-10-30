@@ -45,7 +45,7 @@ use crate::bind::{
 };
 use crate::bind_gate::{BindGate, Origin, Ticket};
 use crate::bootstrap::{self, RESOLVE_INTERVAL};
-use crate::config::{IrohConfig, MAX_RELAYS};
+use crate::config::IrohConfig;
 use crate::cooldown::Cooldown;
 use crate::error::NetworkError;
 use crate::fanout::Fanout;
@@ -221,8 +221,7 @@ impl IrohAdapter {
     ///
     /// # Errors
     ///
-    /// Returns [`NetworkError::Endpoint`] if the configuration names more
-    /// than [`MAX_RELAYS`] relays or the endpoint cannot bind.
+    /// Returns [`NetworkError::Endpoint`] if the endpoint cannot bind.
     ///
     /// # Panics
     ///
@@ -248,12 +247,6 @@ impl IrohAdapter {
             "hosted vnode count {} exceeds per-bind cap {MAX_VNODES_PER_BIND}",
             vnodes.len(),
         );
-        if config.relays.len() > MAX_RELAYS {
-            return Err(NetworkError::Endpoint(format!(
-                "{} relays configured, at most {MAX_RELAYS} allowed",
-                config.relays.len()
-            )));
-        }
         let local_validator_ids: Vec<ValidatorId> = vnodes.iter().map(|(vid, _)| *vid).collect();
 
         let lookup = MemoryLookup::new();
@@ -424,6 +417,13 @@ impl IrohAdapter {
     #[must_use]
     pub fn address_book(&self) -> &AddressBook {
         &self.inner.address_book
+    }
+
+    /// Whether a verified address record names the endpoint whose 32-byte
+    /// id is `endpoint`: some validator stands behind it.
+    #[must_use]
+    pub fn names_endpoint(&self, endpoint: &[u8; 32]) -> bool {
+        EndpointId::from_bytes(endpoint).is_ok_and(|id| self.inner.address_book.names(id))
     }
 
     /// Verify one gossiped address announcement against the current

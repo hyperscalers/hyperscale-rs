@@ -348,6 +348,7 @@ impl Node {
             shard_stores,
         });
         let network = Arc::clone(runner.network());
+        let book = Arc::clone(&network);
         let calls = Arc::new(HostCalls {
             submit: runner.tx_submission_sender(),
             preview: runner.preview_sender(),
@@ -355,6 +356,7 @@ impl Node {
             publishers: runner.publishers(),
             tx_status: runner.tx_status_cache(),
             peers: Box::new(move || network.cached_peer_count()),
+            names_endpoint: Box::new(move |endpoint| book.names_endpoint(endpoint)),
             commands: runner.reconfigure_handle(),
             runtime: runtime.handle().clone(),
             #[cfg(feature = "test-utils")]

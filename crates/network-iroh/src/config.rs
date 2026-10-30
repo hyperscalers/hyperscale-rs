@@ -14,6 +14,8 @@ use crate::path::{RedialBudget, RedialSchedule};
 /// Most relays a host names in its signed address record. The endpoint
 /// homes on one at a time, so the second is a failover, and more would
 /// only widen what a record can make its readers connect to.
+///
+/// A host may configure more; it homes on the nearest that admits it.
 pub const MAX_RELAYS: usize = 2;
 
 /// Idle time after which a path is abandoned. A dead direct path stalls
@@ -62,8 +64,9 @@ pub struct IrohConfig {
     /// address families.
     pub bind_addr: Option<SocketAddr>,
 
-    /// Relays this host homes on, at most [`MAX_RELAYS`]. Empty disables
-    /// relaying: the host is then reachable only at its socket addresses.
+    /// Relays this host may home on; the endpoint picks the nearest that
+    /// admits it. Empty disables relaying: the host is then reachable only
+    /// at its socket addresses.
     pub relays: Vec<RelayUrl>,
 
     /// Certificate authorities the relays' TLS certificates are checked

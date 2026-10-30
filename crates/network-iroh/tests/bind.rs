@@ -14,7 +14,7 @@ use hyperscale_network_iroh::testing::{CountingSigner, bind_hello};
 use hyperscale_network_iroh::{ALPN, IrohAdapter, IrohAdapterArgs, IrohConfig, LocalVnodeIdentity};
 use hyperscale_types::{NetworkDefinition, ShardId, Signer, ValidatorId};
 use iroh::endpoint::{Builder, presets};
-use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl};
 use tokio::spawn;
 use tokio::time::{sleep, timeout};
 
@@ -51,6 +51,7 @@ struct HostSpec<'a> {
     signers: Option<Vec<Arc<dyn Signer>>>,
     /// Key map the host verifies against instead of its fixtures' own.
     keys: Option<Arc<ValidatorKeyMap>>,
+    relays: Vec<RelayUrl>,
 }
 
 impl<'a> HostSpec<'a> {
@@ -61,6 +62,7 @@ impl<'a> HostSpec<'a> {
             bootstrap: Vec::new(),
             signers: None,
             keys: None,
+            relays: Vec::new(),
         }
     }
 
@@ -68,6 +70,7 @@ impl<'a> HostSpec<'a> {
         let mut config =
             IrohConfig::for_testing(self.fixtures.network_key(self.validators[0]), loopback());
         config.bootstrap_peers = self.bootstrap;
+        config.relays = self.relays;
         let signers = self.signers.unwrap_or_else(|| {
             self.validators
                 .iter()
@@ -234,6 +237,31 @@ async fn a_host_signs_its_records_again_only_when_its_addresses_change() {
             .iter()
             .all(|record| record.sequence > first[0].sequence)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_configured_with_more_relays_than_a_record_names_binds() {
+    let fixtures = TestFixtures::new(7, 1);
+    let mut spec = HostSpec::new(&fixtures, &[0]);
+    spec.relays = (1..=3)
+        .map(|port| format!("http://127.0.0.1:{port}/").parse().unwrap())
+        .collect();
+    let host = spec.bind().await;
+    assert_eq!(host.cached_peer_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_book_names_an_endpoint_once_its_record_arrives() {
+    let fixtures = TestFixtures::new(7, 2);
+    let host0 = HostSpec::new(&fixtures, &[0]).bind().await;
+    let host1 = HostSpec::new(&fixtures, &[1]).bind().await;
+    let id = *host1.endpoint_addr().id.as_bytes();
+    assert!(!host0.names_endpoint(&id));
+    for record in host1.address_records() {
+        let _ = host0.ingest_validator_address(&record);
+    }
+    assert!(host0.names_endpoint(&id));
+    assert!(!host0.names_endpoint(&[0; 32]));
 }
 
 #[tokio::test(flavor = "multi_thread")]

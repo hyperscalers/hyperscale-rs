@@ -29,6 +29,9 @@ use crate::status::SyncStatus;
 #[cfg(feature = "test-utils")]
 use crate::testing::ProbeState;
 
+/// Whether a verified address record names a 32-byte endpoint id.
+pub type NamesEndpoint = Box<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
+
 /// Everything a handle's calls reach. The host's `Node` holds the one
 /// strong reference and drops it only once the gate has closed and every
 /// call has left it.
@@ -40,6 +43,7 @@ pub struct HostCalls {
     pub tx_status: Arc<TxStatusCache>,
     /// The transport's count of connected peer hosts.
     pub peers: Box<dyn Fn() -> usize + Send + Sync>,
+    pub names_endpoint: NamesEndpoint,
     pub commands: mpsc::Sender<RunnerCommand>,
     /// The host's own runtime, which runs a preview's blocking work.
     pub runtime: RuntimeHandle,
@@ -156,6 +160,15 @@ impl NodeHandle {
     #[must_use]
     pub fn peers(&self) -> usize {
         self.with(|calls| (calls.peers)()).unwrap_or(0)
+    }
+
+    /// Whether a verified validator address record names the endpoint
+    /// whose 32-byte id is `endpoint`: some validator stands behind it.
+    /// `false` once the host has stopped.
+    #[must_use]
+    pub fn names_endpoint(&self, endpoint: &[u8; 32]) -> bool {
+        self.with(|calls| (calls.names_endpoint)(endpoint))
+            .unwrap_or(false)
     }
 
     /// What became of a transaction the host has seen, as far as its own
@@ -292,6 +305,7 @@ pub mod test_support {
             publishers: RpcPublishers::default(),
             tx_status: Arc::new(TxStatusCache::new()),
             peers: Box::new(|| 0),
+            names_endpoint: Box::new(|_| false),
             commands: mpsc::channel(1).0,
             runtime: RuntimeHandle::current(),
             #[cfg(feature = "test-utils")]
