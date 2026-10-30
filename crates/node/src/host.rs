@@ -42,7 +42,7 @@ use crate::beacon_loop::{BeaconLoop, resume_fold};
 use crate::config::NodeConfig;
 use crate::event::Registration;
 use crate::process::{ProcessIo, register_shard_request_handlers};
-use crate::replica::{ReplicaConfig, build_replica};
+use crate::replica::ReplicaConfig;
 use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
@@ -644,7 +644,7 @@ where
         topology_snapshot,
         (
             fold.state().current_epoch,
-            Arc::new(fold.schedule().clone()),
+            Arc::clone(fold.shared_schedule()),
         ),
         dispatch_handles,
         beacon_storage,
@@ -749,7 +749,7 @@ where
         recovered,
         signers,
     } = chain;
-    let replica = build_replica(
+    let replica = NodeStateMachine::new(
         replica_config,
         shard,
         recovered,

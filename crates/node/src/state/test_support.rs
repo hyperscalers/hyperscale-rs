@@ -186,7 +186,7 @@ impl TestNodeBuilder {
             local_shard,
             &self.recovered,
             (
-                Arc::new(fold.schedule().clone()),
+                Arc::clone(fold.shared_schedule()),
                 fold.state().current_epoch,
             ),
             BlockHeight::GENESIS,

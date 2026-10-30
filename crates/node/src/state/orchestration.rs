@@ -535,7 +535,7 @@ mod tests {
             "local must be the height-1 proposer for this test",
         );
 
-        let schedule = Arc::new(test.fold.schedule().clone());
+        let schedule = Arc::clone(test.fold.shared_schedule());
         let actions = test.node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::BeaconBlockPersisted {

@@ -6,6 +6,7 @@
 //! shard attaches to it as an [`AttachedSigner`].
 //!
 //! [`ShardLoop`]: crate::shard::ShardLoop
+//! [`NodeStateMachine`]: crate::NodeStateMachine
 
 use std::sync::Arc;
 
@@ -14,13 +15,7 @@ use hyperscale_engine::CodeAvailability;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::RecoveredState;
-use hyperscale_types::{
-    BlockHeight, Derivation, Epoch, GenesisConfigHash, NetworkDefinition, ShardId, Signer,
-    TopologySchedule, Verifier,
-};
-
-use crate::NodeStateMachine;
+use hyperscale_types::{Derivation, GenesisConfigHash, NetworkDefinition, Signer, Verifier};
 
 /// What every replica a host runs is built with, whichever shard it
 /// follows and whenever the host takes it up, and what the host's fold is
@@ -46,19 +41,6 @@ pub struct ReplicaConfig {
     pub mempool_config: MempoolConfig,
     /// Provision coordinator knobs.
     pub provision_config: ProvisionConfig,
-}
-
-/// Build `shard`'s replica with no signer, booted from `recovered` over
-/// `schedule`, the schedule the beacon folded at `epoch`, on a store
-/// written through `persisted_base`.
-pub fn build_replica(
-    config: &ReplicaConfig,
-    shard: ShardId,
-    recovered: &RecoveredState,
-    (schedule, epoch): (Arc<TopologySchedule>, Epoch),
-    persisted_base: BlockHeight,
-) -> NodeStateMachine {
-    NodeStateMachine::new(config, shard, recovered, (schedule, epoch), persisted_base)
 }
 
 /// A validator identity attached to a replica: the key it signs with,
