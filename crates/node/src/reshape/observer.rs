@@ -218,17 +218,13 @@ impl ObserverBootstrap {
         Some(self.anchor.height)
     }
 
-    /// Record the imported child-subtree root and complete.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless the finalize was taken via [`Self::take_finalize`].
+    /// Record the imported child-subtree root and complete. A root arriving
+    /// before the finalize was taken via [`Self::take_finalize`], or after
+    /// the import completed, is a stale completion, and changes nothing.
     pub fn on_imported(&mut self, root: StateRoot) {
-        assert!(
-            matches!(self.phase, Phase::Finalizing),
-            "on_imported outside the finalize phase",
-        );
-        self.phase = Phase::Complete(root);
+        if matches!(self.phase, Phase::Finalizing) {
+            self.phase = Phase::Complete(root);
+        }
     }
 
     /// Whether the bootstrap is still assembling state — the only
@@ -996,7 +992,9 @@ impl ObserverTail {
     }
 
     /// Record the applied root, checking it against the header's
-    /// `split_child_roots` slot when the block carried the pair.
+    /// `split_child_roots` slot when the block carried the pair. A root
+    /// arriving with no application taken via [`Self::take_apply`] is a
+    /// stale completion, and changes nothing.
     ///
     /// # Errors
     ///
@@ -1004,20 +1002,14 @@ impl ObserverTail {
     /// followed header — the store has diverged from the parent's child
     /// subtree and the duty must fail closed (the flip falls back to a
     /// fresh snap-sync).
-    ///
-    /// # Panics
-    ///
-    /// Panics unless an application was taken via [`Self::take_apply`].
     pub fn on_applied(&mut self, root: StateRoot) -> Result<(), String> {
-        assert!(
-            self.apply_in_flight,
-            "on_applied outside a taken application"
-        );
+        if !self.apply_in_flight {
+            return Ok(());
+        }
         self.apply_in_flight = false;
-        let pending = self
-            .proven
-            .pop_front()
-            .expect("a taken application is the oldest proven block");
+        let Some(pending) = self.proven.pop_front() else {
+            return Ok(());
+        };
         if let Some(expected) = pending.expected_root
             && expected != root
         {

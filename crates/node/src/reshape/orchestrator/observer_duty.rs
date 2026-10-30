@@ -1173,6 +1173,48 @@ mod tests {
         }
     }
 
+    /// A completion no sequencer is awaiting — a stale one from before the
+    /// duty was rediscovered — is ignored rather than crashing the host.
+    #[test]
+    fn a_stale_completion_is_ignored() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot(&[(parent, &[1, 2, 3, 4])], &[(parent, 5, child)], &[parent]);
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        for (phase, following_phase) in [
+            (following(ObserverTail::new(anchor(), child)), true),
+            (
+                ObserverPhase::Syncing(Box::new(ObserverBootstrap::new(parent, anchor(), child))),
+                false,
+            ),
+        ] {
+            let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+            insert_observer(&mut orch, child, observer_duty(parent, child, 5, phase));
+            let stale = vec![
+                ReshapeEvent::Applied {
+                    shard: child,
+                    root: StateRoot::ZERO,
+                },
+                ReshapeEvent::Imported {
+                    shard: child,
+                    root: StateRoot::ZERO,
+                },
+            ];
+            let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, stale, at(0));
+            assert!(orch.is_seating(child), "the duty runs on");
+            let phase = &observer(&orch, child).phase;
+            if following_phase {
+                assert!(matches!(phase, ObserverPhase::Following(_)));
+            } else {
+                assert!(
+                    matches!(phase, ObserverPhase::Syncing(_)),
+                    "nothing was imported"
+                );
+            }
+        }
+    }
+
     /// A child already crossing on its own chain is anchored at a block of
     /// that chain, which no terminal of the parent's reconstructs, so a
     /// follower that reached the anchor's height relinquishes rather than
