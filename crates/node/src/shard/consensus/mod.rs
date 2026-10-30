@@ -92,7 +92,7 @@ impl ConsensusState {
     }
 
     /// Drive the block-sync FSM's periodic tick. Returns the outputs the
-    /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
+    /// shard's loop should dispatch (block fetches, deliveries, sync-complete).
     pub(crate) fn block_tick(&mut self, now: LocalTimestamp) -> Vec<BlockSyncOutput> {
         self.block_sync.handle(BlockSyncInput::Tick { now })
     }

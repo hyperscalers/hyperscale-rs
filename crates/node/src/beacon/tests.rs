@@ -15,6 +15,7 @@ use hyperscale_network_memory::{
 };
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage::test_helpers::commit_one;
+use hyperscale_storage_memory::{SimShardStorage, crash_point};
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::notification::beacon::BeaconProposalNotification;
 use hyperscale_types::network::request::GetInstanceRecordsRequest;
@@ -47,8 +48,6 @@ use crate::shard::mempool::DeferredTransaction;
 use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
 
 type Loop = BeaconLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
-
-use hyperscale_storage_memory::{SimShardStorage, crash_point};
 
 const PROPOSAL: (Epoch, ValidatorId) = (Epoch::new(1), ValidatorId::new(1));
 

@@ -4,8 +4,8 @@
 //! one [`ShardLoop`] per hosted shard. It owns the event-routing seam:
 //! [`NodeHost::step`] dispatches `HostEvent::Shard` to the targeted
 //! `ShardLoop::step` and `HostEvent::Process` to cross-shard handlers
-//! (transaction submission fan-out, fetch tick) that need access to
-//! every hosted shard.
+//! (transaction submission fan-out) that need access to every hosted
+//! shard.
 //!
 //! Two runners drive a `NodeHost`, each built via [`NodeHost::new`].
 //! Production decomposes it with [`NodeHost::into_parts`] and runs each

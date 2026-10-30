@@ -1,4 +1,5 @@
-//! Inputs to the I/O loop, partitioned by routing scope.
+//! Inputs to a host's loops, partitioned by routing scope, and what a step
+//! hands back to the runner: its timer operations and output.
 //!
 //! [`HostEvent`] is the envelope the runner pushes into the event
 //! channel. It is a typed sum over the three drivers a
@@ -127,14 +128,14 @@ pub(crate) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind
 /// the shard at dispatch time and stamp every result.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum ShardScopedInput {
-    /// Pass-through to state machine. `NodeHost` extracts the `ProtocolEvent`
+    /// Pass-through to state machine. The shard's loop extracts the `ProtocolEvent`
     /// and feeds it to the envelope's shard's replica. Boxed because
     /// `ProtocolEvent` dwarfs every other variant and would inflate the
     /// event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
     /// A block proposal off the wire, its proposer's signature checked at
-    /// intake. `NodeHost` feeds its header to the replica and holds it for
+    /// intake. The loop feeds its header to the replica and holds it for
     /// serving once the replica admits it.
     ProposalReceived {
         /// The proposal as its proposer signed it.
@@ -142,7 +143,7 @@ pub enum ShardScopedInput {
     },
 
     /// A block proposal fetched by hash, its proposer's signature not yet
-    /// checked. `NodeHost` checks it, then takes it as
+    /// checked. The loop checks it, then takes it as
     /// [`Self::ProposalReceived`].
     ProposalFetched {
         /// The proposal the peer answered with.
@@ -159,7 +160,7 @@ pub enum ShardScopedInput {
     /// [`TimerOp::Cancel`]: crate::event::TimerOp::Cancel
     FetchTick,
 
-    /// Raw gossip-delivered transaction. `NodeHost` queues it for async
+    /// Raw gossip-delivered transaction. The loop queues it for async
     /// validation; the validated form is surfaced as
     /// `ProtocolEvent::TransactionValidated`.
     TransactionGossipReceived {
@@ -168,7 +169,7 @@ pub enum ShardScopedInput {
     },
 
     /// Raw batch delivered by the transaction fetch protocol's response
-    /// callback. `NodeHost` drives the fetch-FSM drain for every
+    /// callback. The loop drives the fetch-FSM drain for every
     /// delivered hash (so invalid-signature payloads don't pin
     /// in-flight slots) and dispatches the batch for async validation;
     /// the validated subset surfaces as
@@ -236,7 +237,7 @@ pub enum ShardScopedInput {
     },
 
     /// Sync block response received from network callback. Carries the
-    /// elided wire shape; the `NodeHost` rehydrates to a full `CertifiedBlock`
+    /// elided wire shape; the loop rehydrates to a full `CertifiedBlock`
     /// by looking up omitted bodies in the local mempool / cert cache /
     /// provision store before handing off to the sync state machine.
     BlockSyncResponseReceived {
@@ -265,7 +266,7 @@ pub enum ShardScopedInput {
     },
 
     /// Sync block passed structural validation off-thread (Merkle roots,
-    /// QC binding, per-tick shape). The pinned-thread `NodeHost` re-enters
+    /// QC binding, per-tick shape). The loop's pinned thread re-enters
     /// the post-validation delivery path on receipt.
     SyncBlockValidated {
         /// Height of the validated block.
@@ -340,7 +341,7 @@ pub enum ShardScopedInput {
     /// itself rides the accompanying `ProtocolEvent`.
     FetchFulfilled(FetchIds),
 
-    /// Transaction validated by the validation pipeline. The `NodeHost`
+    /// Transaction validated by the validation pipeline. The loop
     /// resolves `submitted_locally` from its `locally_submitted` set
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
@@ -348,7 +349,7 @@ pub enum ShardScopedInput {
         tx: Arc<Verified<Transaction>>,
     },
 
-    /// Transactions that failed validation — sent back so the `NodeHost` can
+    /// Transactions that failed validation — sent back so the loop can
     /// remove their hashes from `pending_validation` and `locally_submitted`.
     TransactionValidationsFailed {
         /// Hashes of transactions that failed validation.
@@ -886,7 +887,7 @@ impl From<Sender<HostEvent>> for ShardInbox {
     }
 }
 
-/// An input plus the driver the I/O loop's `step()` routes it to.
+/// An input plus the driver the host's `step()` routes it to.
 ///
 /// The shard variant carries the hosted-shard tag inline; the process and
 /// beacon variants have no tag — the process fan is host-wide, and a host runs
@@ -1059,7 +1060,7 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
-    /// Placement deltas emitted via [`Action::ReconfigureParticipation`]
+    /// Placement deltas emitted via [`Action::ReconfigureParticipation`](hyperscale_core::Action::ReconfigureParticipation)
     /// during this step. The runner reconfigures physical shard
     /// membership from these — they are requests to the process layer,
     /// not state-machine state.

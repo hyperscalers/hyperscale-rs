@@ -253,9 +253,9 @@ where
 
     /// Refresh this shard's `FetchTick` timer based on whether any of its
     /// subsystems (mempool, consensus block-sync, cross-shard) has pending
-    /// work. Each shard manages its own ticker
-    /// — a shard with idle fetches stops paying for the 200ms wake-up while
-    /// busier shards keep ticking.
+    /// work. Each shard manages its own ticker — a shard with idle fetches
+    /// stops paying for the periodic wake-up while busier shards keep
+    /// ticking.
     pub(crate) fn update_fetch_tick_timer(&mut self) {
         let any_pending = self.io.mempool.has_pending()
             || self.io.consensus.has_pending()

@@ -552,7 +552,7 @@ where
     /// The fetch instance lives in this shard's `ShardIo`, not the
     /// routing target's, which rides on the request. `Ask` never emits `Send`s on its own — it only adds the
     /// ids to the pending set; chunks fan out under the per-tick cap. The
-    /// tick timer is refreshed once at the end of `NodeHost::step`.
+    /// tick timer is refreshed once at the end of `ShardLoop::step`.
     ///
     /// The three arms below `Ask` are a different message: the pending
     /// set under a scope is now exactly these ids. Their consumers

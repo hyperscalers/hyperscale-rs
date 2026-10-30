@@ -53,8 +53,8 @@ use crate::event::BeaconInput;
 /// View changes are handled implicitly via local round advancement in
 /// `ShardCoordinator` (HotStuff-2 style).
 ///
-/// The block-sync state machine itself lives on `NodeHost` (in
-/// `shard::consensus`); when a synced block is ready to apply, `NodeHost`
+/// The block-sync state machine itself lives on the shard's loop (in
+/// `shard::consensus`); when a synced block is ready to apply, the loop
 /// fires a `BlockSyncReadyToApply` event into this state machine, which routes
 /// it to shard consensus.
 pub struct NodeStateMachine {

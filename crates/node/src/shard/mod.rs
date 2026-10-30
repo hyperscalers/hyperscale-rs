@@ -10,8 +10,8 @@
 //!
 //! The top-level [`NodeHost`] composes one `ShardLoop` per hosted shard plus
 //! the shared `ProcessIo`. Cross-shard concerns (transaction submission
-//! fan-out, fetch tick, batch flush coordination) live on `NodeHost`; per-shard
-//! concerns live here. The dispatch match below is the thin router; each
+//! fan-out, batch flush coordination) live on `NodeHost`; per-shard concerns,
+//! the fetch tick among them, live here. The dispatch match below is the thin router; each
 //! subsystem's `impl ShardLoop` glue lives beside its state under
 //! [`consensus`], [`cross_shard`], and [`mempool`].
 //!
@@ -732,7 +732,7 @@ where
     /// the commit's genesis arm re-records that height.
     ///
     /// Returns the timer ops the genesis commit produced — chiefly the
-    /// consensus pacemaker's [`TimerId::ViewChange`] arm. The caller spawns
+    /// consensus pacemaker's [`TimerId::ViewChange`](hyperscale_core::TimerId::ViewChange) arm. The caller spawns
     /// the loop after this returns, so it must hand these back as the loop's
     /// initial timer ops; otherwise the first `run_step` clears them and the
     /// shard never arms its pacemaker.

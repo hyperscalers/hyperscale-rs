@@ -1172,9 +1172,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     //
     // Dedup + cache: the proof for (block_height, target_shard) is
     // deterministic, and many validators request the same provisions.
-    // Without dedup each request regenerates the merkle proof (~30ms),
-    // and under load 40+ redundant generations per height cause CPU
-    // thrashing.
+    // Without dedup each request regenerates the merkle proof, and under
+    // load the redundant generations per height thrash the CPU.
 
     let pending_chain = Arc::clone(&io.pending_chain);
     let topology_snapshot = process.topology_snapshot.clone();

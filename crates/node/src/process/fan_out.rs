@@ -212,7 +212,7 @@ fn verify_anchor(
         public_keys: &keys,
         quorum_threshold: topology.quorum_threshold_for_shard(shard),
     };
-    // SAFETY for `from_qc_attestation`: the committee that signed this
+    // Why `from_qc_attestation` holds: the committee that signed this
     // QC accepted the header before voting, and the check above is that
     // the signature is that committee's. Local per-root verification is
     // neither possible here — this node holds none of that shard's

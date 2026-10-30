@@ -26,9 +26,8 @@ use tracing::warn;
 /// `derivation` is this node's: routing is a derived fact, and a block
 /// read back out of storage carries none.
 ///
-/// Takes `local_shard` and the active `ShardTrie` instead of
-/// `&TopologyCoordinator` to avoid a topology dependency in the I/O layer.
-/// The caller loads the trie at serve time so routing always resolves
+/// Takes `local_shard` and the active `ShardTrie` rather than a topology
+/// handle. The caller loads the trie at serve time so routing always resolves
 /// against the current partition.
 pub fn serve_provision_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,

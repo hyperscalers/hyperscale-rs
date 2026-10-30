@@ -6,9 +6,9 @@
 //! - [`Action`]: All possible outputs from the state machine
 //! - [`StateMachine`]: The trait that all state machines implement
 //!
-//! The I/O-loop-specific input types (`HostEvent`, `ShardScopedInput`,
+//! The driver-specific input types (`HostEvent`, `ShardScopedInput`,
 //! `ProcessScopedInput`, `FetchFailureKind`, `EventPriority`) live in
-//! `hyperscale_node::io_loop`, since they're not part of the
+//! `hyperscale_node::event`, since they're not part of the
 //! deterministic state-machine contract.
 //!
 //! # Architecture
@@ -16,7 +16,7 @@
 //! The core is built on a two-level event model:
 //!
 //! ```text
-//! HostEvent → IoLoop (intercepts I/O events) → ProtocolEvent → StateMachine::handle() → Actions
+//! HostEvent → ShardLoop (intercepts I/O events) → ProtocolEvent → StateMachine::handle() → Actions
 //! ```
 //!
 //! The state machine is:
@@ -25,8 +25,8 @@
 //! - **Pure-ish**: Mutates self, but performs no I/O
 //!
 //! All I/O is handled by the runner (simulation or production) which:
-//! 1. Delivers shard / process inputs to the I/O loop
-//! 2. `IoLoop` intercepts I/O events (sync, fetch, validation) and forwards
+//! 1. Delivers shard / process inputs to the shard's loop
+//! 2. `ShardLoop` intercepts I/O events (sync, fetch, validation) and forwards
 //!    `ProtocolEvent`s to the state machine
 //! 3. Executes the returned actions
 //! 4. Converts action results back into shard / process inputs

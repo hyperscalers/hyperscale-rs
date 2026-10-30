@@ -5,13 +5,13 @@
 //!
 //! 1. `CommittedBlockGossipReceived` — the inbound handler closure has
 //!    already verified the sender's committee membership and resolved the
-//!    public key. The header is queued in a batch accumulator for amortized
-//!    signature verification.
+//!    public key. The header is queued in a batch accumulator so one
+//!    dispatched task checks a batch of sender signatures, each on its own.
 //! 2. `flush_certified_header_verifications` — fires when the batch fills
 //!    or its window expires. Verified-marked items (local-dispatched from
 //!    a colocated proposer) emit directly as
 //!    `ProtocolEvent::VerifiedRemoteHeaderReceived` — the typestate
-//!    marker rides through. Unverified items are queued on the crypto
+//!    marker rides through. Unverified items are queued on the throughput
 //!    pool for envelope signature verification; on success they emit as
 //!    `ProtocolEvent::UnverifiedRemoteHeaderReceived` (the marker tracks
 //!    the QC predicate, which the envelope check doesn't establish), and
@@ -46,8 +46,9 @@ where
     D: Dispatch,
 {
     /// Inbound handler closure already verified sender's committee
-    /// membership and resolved the public key. Queue for batched
-    /// verification; fires `flush_certified_header_verifications` when full.
+    /// membership and resolved the public key. Queue it for the next
+    /// verification task; fires `flush_certified_header_verifications` when
+    /// full.
     pub(crate) fn handle_committed_block_gossip_received(
         &mut self,
         certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
@@ -81,8 +82,8 @@ where
     /// Partitions the batch on `is_verified()`: verified items
     /// (local-dispatched from a colocated proposer) emit directly as
     /// `VerifiedRemoteHeaderReceived`, skipping the envelope signature check.
-    /// Unverified items go to the crypto pool for batched signature
-    /// verification; valid ones emit as `UnverifiedRemoteHeaderReceived`,
+    /// Unverified items go to one throughput-pool task that checks each
+    /// sender signature in turn; valid ones emit as `UnverifiedRemoteHeaderReceived`,
     /// invalid ones are warn-dropped.
     pub(crate) fn flush_certified_header_verifications(&mut self) {
         let items = self.io.consensus.certified_header_batch.take();

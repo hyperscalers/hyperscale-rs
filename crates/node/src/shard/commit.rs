@@ -6,13 +6,15 @@
 //!
 //! 1. **Accumulate** — dedup against already-pending and already-persisted
 //!    blocks; record the immediate-notify decision based on persistence lag.
-//! 2. **Flush** — once per `feed_event`, drain the backlog into one closure
-//!    that runs on the execution pool: prune stale prepared commits, sort by
-//!    height (parents before children), call `commit_prepared_blocks` once,
-//!    then emit deferred `BlockCommitted` events and a final `BlockPersisted`.
+//! 2. **Flush** — at the tail of each action drain, sort the backlog by
+//!    height (parents before children), take the contiguous run whose
+//!    prepared commits are in hand, prune stale prepared commits, and hand
+//!    the run to one task on the I/O pool, which writes each block in height
+//!    order with one fsync for the batch, then emits deferred
+//!    `BlockCommitted` events and a final `BlockPersisted`.
 //!
-//! The coordinator does not feed events to the state machine; the `io_loop`
-//! drives that based on the [`AccumulateDecision`] returned from
+//! The coordinator does not feed events to the state machine; the shard's
+//! loop drives that based on the [`AccumulateDecision`] returned from
 //! [`BlockCommitCoordinator::accumulate`].
 
 use std::collections::{HashMap, VecDeque};
@@ -39,7 +41,7 @@ use crate::event::HostEvent;
 use crate::shard::push_protocol_event;
 
 /// Handle to the assembled `Verified<CertifiedBlock>` that the
-/// `io_loop` forwards to `BlockCommitted`. Cloned `Arc` to the commit
+/// shard's loop forwards to `BlockCommitted`. Cloned `Arc` to the commit
 /// just enqueued in the pending backlog.
 pub type NotifyHandle = Arc<Verified<CertifiedBlock>>;
 
@@ -410,7 +412,7 @@ pub enum AccumulateDecision {
         handle: NotifyHandle,
         /// The accepted block's committee anchor, for its `BlockCommitted`.
         committee_anchor: WeightedTimestamp,
-        /// True if the `io_loop` should fire `BlockCommitted` immediately.
+        /// True if the loop should fire `BlockCommitted` immediately.
         /// False under persistence backpressure: the flush closure fires
         /// the event after the disk write completes instead.
         notify_now: bool,
@@ -504,8 +506,8 @@ pub struct BlockCommitCoordinator {
     /// Set while an async commit task is running on the I/O pool. Bouncing
     /// this prevents spawning a second task (the I/O pool does not
     /// guarantee FIFO ordering across separate `spawn()` calls). The task
-    /// clears the flag before sending its final event so the resulting
-    /// `feed_event` → `flush` drains any backlog.
+    /// clears the flag before sending its final event so the flush that
+    /// event's handling triggers drains any backlog.
     commit_in_flight: Arc<AtomicBool>,
 
     /// Pending QC-only commits waiting for the in-flight JMT-prep slot.
@@ -811,7 +813,7 @@ impl BlockCommitCoordinator {
             return;
         }
 
-        // Defer if a previous async commit is still running on the exec pool.
+        // Defer if a previous async commit is still running on the I/O pool.
         if self.commit_in_flight.load(Ordering::Acquire) {
             return;
         }
@@ -820,11 +822,10 @@ impl BlockCommitCoordinator {
 
         // Sort by height to ensure parent blocks are flushed before children.
         // Cascading commits (e.g. QC formation during BlockCommitted processing)
-        // can push child blocks into pending before their parent
-        // (because the parent's push happens after feed_event returns). Without
+        // can push a child block into pending before its parent. Without
         // sorting, the child block (which may lack a PreparedCommit) would defer
         // and block the ready parent, causing a deadlock where BlockPersisted
-        // never fires and sync_awaiting_persistence_height is never satisfied.
+        // never fires.
         commits.sort_by_key(|c| c.certified.block().height().inner());
 
         // Blocks the sync path persisted under us need no write. Their
@@ -925,8 +926,8 @@ impl BlockCommitCoordinator {
 
             // Clear the in-flight flag before sending BlockPersisted. The
             // channel send synchronizes-with recv on the main thread, so
-            // the flag is guaranteed visible when the resulting feed_event
-            // calls flush to drain any backlog.
+            // the flag is guaranteed visible when the flush that event's
+            // handling triggers drains any backlog.
             in_flight.store(false, Ordering::Release);
 
             push_protocol_event(
@@ -1144,11 +1145,11 @@ mod tests {
                 __qc.weighted_timestamp(),
             )
         };
-        let _ = committee; // committee unused here but kept for future signing-required tests
-        // SAFETY: synthetic test fixture, no real signature.
+        let _ = committee;
+        // Synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
         let certified = CertifiedBlock::new_unchecked(block, qc);
-        // SAFETY: synthetic test fixture; block-commit-coordinator tests
+        // Synthetic test fixture; block-commit-coordinator tests
         // don't exercise the `Verified<CertifiedBlock>` predicate.
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             certified,
@@ -2128,9 +2129,9 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
-        // SAFETY: synthetic test fixture, no real signature.
+        // Synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(linked_qc(hash, 0));
-        // SAFETY: synthetic test fixture; trigger tests don't exercise
+        // Synthetic test fixture; trigger tests don't exercise
         // the `Verified<CertifiedBlock>` predicate.
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),

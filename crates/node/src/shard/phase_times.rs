@@ -1,10 +1,10 @@
 //! Per-transaction phase-time tracking for the slow-tx finalization log.
 //!
-//! Stamps wall-clock at each lifecycle transition that the `io_loop` observes
+//! Stamps wall-clock at each lifecycle transition that the shard's loop observes
 //! via `Action::EmitTransactionStatus` and `Action::RecordTxEcCreated`. The
 //! map is purely a diagnostic aid: it drives the
 //! `"Transaction finalization exceeded 10s"` warning's phase breakdown and is
-//! never exposed beyond logs. Lives entirely on the `io_loop` so the mempool
+//! never exposed beyond logs. Lives entirely on the loop so the mempool
 //! state machine stays free of telemetry plumbing.
 //!
 //! An entry opens on a `Pending` status — the one a submission to this
@@ -17,7 +17,7 @@
 //! entry first.
 //!
 //! Stamps are ms-since-Unix-epoch (`LocalTimestamp`), the same unit the
-//! `io_loop`'s clock origin is minted in. They're never compared across
+//! loop's clock is minted in. They're never compared across
 //! validators; each node logs its own observed latency only.
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -53,7 +53,7 @@ impl TxPhaseTimes {
 
     /// Renders the phase breakdown for the slow-tx log, formatting the
     /// completed-at duration relative to `completed_at` (the terminal stamp
-    /// the `io_loop` computed when it observed the `Completed` status).
+    /// the loop computed when it observed the `Completed` status).
     pub(crate) fn display_at(&self, completed_at: LocalTimestamp) -> impl fmt::Display + '_ {
         TxPhaseTimesDisplay {
             phases: self,
@@ -62,7 +62,7 @@ impl TxPhaseTimes {
     }
 }
 
-/// Per-tx side cache. Keys are `TxHash`, values are stamps the `io_loop`
+/// Per-tx side cache. Keys are `TxHash`, values are stamps the loop
 /// records as `EmitTransactionStatus` / `RecordTxEcCreated` actions arrive.
 #[derive(Default)]
 pub struct TxPhaseTimesCache {

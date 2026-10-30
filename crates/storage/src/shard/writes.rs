@@ -111,6 +111,8 @@ pub fn merge_writes_from_receipts(
 /// baseline was fixed when it was made; which block it was fixed at is
 /// the caller's to have got right, and a movement resolved against any
 /// other is as wrong as one resolved live.
+///
+/// [`reclaim_credits`]: crate::shard::crossings::reclaim_credits
 #[must_use]
 pub fn settled_block_at(
     finalizations: &[Arc<Verifiable<Finalization>>],
