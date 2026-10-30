@@ -718,7 +718,7 @@ impl ProvisionCoordinator {
                     block_height = block_height.inner(),
                     "Dropping verified provisions past deadline at receipt"
                 );
-                return vec![];
+                return Self::retire_fetches_for(&provisions);
             }
             // Admit directly via the verified path; reuses the
             // tombstone, queue, and `ProvisionsAdmitted` emission logic.
@@ -839,7 +839,7 @@ impl ProvisionCoordinator {
                     block_height = block_height.inner(),
                     "Dropping provisions past deadline at receipt"
                 );
-                return vec![];
+                return Self::retire_fetches_for(&provisions);
             }
             return build_verify_action(self.local_shard, provisions, &verified_header)
                 .into_iter()
@@ -2173,8 +2173,9 @@ mod tests {
     }
 
     /// The receipt gate drops a bundle whose source block has aged past
-    /// the retention horizon. A restarted coordinator reads the same
-    /// clock its peers do, so it drops the same bundles.
+    /// the retention horizon, and the drop releases whatever fetched it.
+    /// A restarted coordinator reads the same clock its peers do, so it
+    /// drops the same bundles.
     #[test]
     fn a_bundle_past_its_deadline_is_refused_at_receipt_after_a_restart() {
         let mut coordinator = resumed(WeightedTimestamp::from_millis(
@@ -2199,11 +2200,23 @@ mod tests {
             ShardId::leaf(2, 0),
             BlockHeight::new(10),
         );
-        let actions = coordinator.on_state_provisions_received(&sched(), provisions);
+        let actions = coordinator.on_state_provisions_received(&sched(), provisions.clone());
         assert!(
-            actions.is_empty(),
+            actions.iter().all(|a| matches!(a, Action::AbandonFetch(_))),
             "a bundle past its retention horizon dispatches no verification work"
         );
+        assert_abandons_both(&actions);
+
+        let actions = coordinator.on_verified_state_provisions_received(
+            &sched(),
+            Arc::new(Verified::<Provisions>::new_unchecked_for_test(provisions)),
+            LocalTimestamp::ZERO,
+        );
+        assert!(
+            actions.iter().all(|a| matches!(a, Action::AbandonFetch(_))),
+            "nor does one that arrived already verified"
+        );
+        assert_abandons_both(&actions);
     }
 
     #[test]
@@ -2998,9 +3011,10 @@ mod tests {
         );
         let actions = coordinator.on_state_provisions_received(&sched(), provisions);
         assert!(
-            actions.is_empty(),
+            actions.iter().all(|a| matches!(a, Action::AbandonFetch(_))),
             "past-deadline provisions must be dropped without dispatching verification"
         );
+        assert_abandons_both(&actions);
     }
 
     #[test]
