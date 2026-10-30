@@ -159,7 +159,7 @@ impl Fixture {
                 dispatch: SyncDispatch::new(),
                 shard_event_senders: chains
                     .iter()
-                    .map(|&(shard, _)| (shard, event_tx.clone()))
+                    .map(|&(shard, _)| (shard, event_tx.clone().into()))
                     .collect(),
                 beacon_event_sender: event_tx.clone(),
                 topology_snapshot: Arc::new(ArcSwap::from(topology)),

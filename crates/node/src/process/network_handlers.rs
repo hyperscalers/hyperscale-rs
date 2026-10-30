@@ -1,9 +1,7 @@
 //! Network handler registration (gossip, notifications, requests).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_execution::attesting_committee;
@@ -44,7 +42,7 @@ use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
 };
-use crate::shard::{ShardIo, push_protocol_event, push_shard_input};
+use crate::shard::{ShardInbox, ShardIo, offer_network_event, offer_network_input};
 
 impl<S, N, D> NodeHost<S, N, D>
 where
@@ -90,11 +88,13 @@ where
                         // topic, each a fresh decode; canonicalizing here
                         // lets the shards share one validation verdict.
                         let transaction = canonical_txs.canonicalize(&transaction);
-                        push_shard_input(
+                        if !offer_network_input(
                             tx,
                             shard,
                             ShardScopedInput::TransactionGossipReceived { tx: transaction },
-                        );
+                        ) {
+                            return Verdict::Ignore;
+                        }
                     }
                     Verdict::Accept
                 },
@@ -183,7 +183,7 @@ where
                             gossip.certified_header.as_unverified().copy_digest(),
                         ),
                     ];
-                    push_shard_input(
+                    if !offer_network_input(
                         tx,
                         target_shard,
                         ShardScopedInput::CommittedBlockGossipReceived {
@@ -192,7 +192,9 @@ where
                             public_key,
                             sender_signature: gossip.sender_signature,
                         },
-                    );
+                    ) {
+                        return Verdict::Ignore;
+                    }
                     Verdict::defer_all(checks)
                 },
             );
@@ -216,14 +218,13 @@ where
                         );
                         return Verdict::Ignore;
                     };
-                    push_shard_input(
+                    taken(offer_network_input(
                         tx,
                         target_shard,
                         ShardScopedInput::ShardForkProofGossipReceived {
                             proof: gossip.proof,
                         },
-                    );
-                    Verdict::Accept
+                    ))
                 },
             );
 
@@ -297,8 +298,7 @@ where
                         Ok(vote) => ProtocolEvent::VerifiedBlockVoteReceived { vote },
                         Err(vote) => ProtocolEvent::UnverifiedBlockVoteReceived { vote },
                     };
-                    push_protocol_event(tx, shard, event);
-                    Verdict::Accept
+                    taken(offer_network_event(tx, shard, event))
                 },
             );
 
@@ -321,8 +321,7 @@ where
                         Ok(timeout) => ProtocolEvent::VerifiedTimeoutReceived { timeout },
                         Err(timeout) => ProtocolEvent::UnverifiedTimeoutReceived { timeout },
                     };
-                    push_protocol_event(tx, shard, event);
-                    Verdict::Accept
+                    taken(offer_network_event(tx, shard, event))
                 },
             );
 
@@ -340,12 +339,11 @@ where
                     let Some(tx) = senders.get(&shard) else {
                         return Verdict::Ignore;
                     };
-                    push_protocol_event(
+                    taken(offer_network_event(
                         tx,
                         shard,
                         ProtocolEvent::QcAnnouncementReceived { announcement },
-                    );
-                    Verdict::Accept
+                    ))
                 },
             );
 
@@ -375,16 +373,16 @@ where
                         "block_header",
                         "block header",
                     );
-                    if verdict == Verdict::Accept {
-                        push_shard_input(
-                            tx,
-                            shard,
-                            ShardScopedInput::ProposalReceived {
-                                proposal: Box::new(gossip),
-                            },
-                        );
+                    if verdict != Verdict::Accept {
+                        return verdict;
                     }
-                    verdict
+                    taken(offer_network_input(
+                        tx,
+                        shard,
+                        ShardScopedInput::ProposalReceived {
+                            proposal: Box::new(gossip),
+                        },
+                    ))
                 },
             );
 
@@ -446,8 +444,7 @@ where
                             provisions: Arc::new(raw),
                         }
                     };
-                    push_protocol_event(tx, target_shard, event);
-                    Verdict::Accept
+                    taken(offer_network_event(tx, target_shard, event))
                 },
             );
 
@@ -521,14 +518,17 @@ where
                         record_crossing_push_dropped(reason);
                         return Verdict::Reject;
                     }
-                    push_protocol_event(
+                    let offered = offer_network_event(
                         tx,
                         target_shard,
                         ProtocolEvent::CrossingReadingsReceived {
                             claims: notification.claims.into_inner(),
                         },
                     );
-                    Verdict::Accept
+                    if !offered {
+                        record_crossing_push_dropped("lane_full");
+                    }
+                    taken(offered)
                 },
             );
 
@@ -556,14 +556,13 @@ where
                     // is no relay to authenticate: the coordinator holds
                     // it to the committee seated at its anchor and then
                     // to its own signature.
-                    push_protocol_event(
+                    taken(offer_network_event(
                         tx,
                         shard,
                         ProtocolEvent::ExecutionVoteReceived {
                             vote: gossip.into_vote(),
                         },
-                    );
-                    Verdict::Accept
+                    ))
                 },
             );
 
@@ -667,10 +666,9 @@ where
                     // shard for a cert isn't known here without inspecting
                     // expected-cert sets, so each hosted shard decides
                     // whether to admit (no-op if unexpected).
-                    push_to_every_hosted(&senders.load(), certificates, |certificates| {
+                    offer_to_each(senders.load().iter(), certificates, |certificates| {
                         ProtocolEvent::ExecutionCertificatesReceived { certificates }
-                    });
-                    Verdict::Accept
+                    })
                 },
             );
 
@@ -712,10 +710,9 @@ where
                         );
                         return Verdict::Reject;
                     }
-                    push_to_every_hosted(&senders.load(), signal, |signal| {
+                    offer_to_each(senders.load().iter(), signal, |signal| {
                         ProtocolEvent::ReadySignalReceived { signal }
-                    });
-                    Verdict::Accept
+                    })
                 },
             );
 
@@ -928,21 +925,37 @@ where
     }
 }
 
-/// Push the event `event` builds from `value` to every hosted shard,
-/// cloning `value` for all but the last, which takes it.
-fn push_to_every_hosted<T: Clone>(
-    senders: &BTreeMap<ShardId, Sender<HostEvent>>,
+/// The verdict on a message whose input its shard's network lane took,
+/// or refused for being full: a refusal is this host's backlog, not
+/// the sender's fault.
+const fn taken(offered: bool) -> Verdict {
+    if offered {
+        Verdict::Accept
+    } else {
+        Verdict::Ignore
+    }
+}
+
+/// Offer the event `event` builds from `value` to each of `targets`'
+/// network lanes, cloning `value` for all but the last, which takes it.
+/// Each shard decides for itself whether the input is one it wants, so
+/// the message counts as taken once any lane took it; it is refused only
+/// when every lane offered it was full.
+fn offer_to_each<'a, T: Clone>(
+    targets: impl IntoIterator<Item = (&'a ShardId, &'a ShardInbox)>,
     value: T,
     event: impl Fn(T) -> ProtocolEvent,
-) {
-    let hosted: Vec<_> = senders.iter().collect();
-    let Some(((last_shard, last_tx), rest)) = hosted.split_last() else {
-        return;
+) -> Verdict {
+    let targets: Vec<_> = targets.into_iter().collect();
+    let Some(((last_shard, last_inbox), rest)) = targets.split_last() else {
+        return Verdict::Accept;
     };
-    for (hosted_shard, tx) in rest {
-        push_protocol_event(tx, **hosted_shard, event(value.clone()));
+    let mut any_taken = false;
+    for (shard, inbox) in rest {
+        any_taken |= offer_network_event(inbox, **shard, event(value.clone()));
     }
-    push_protocol_event(last_tx, **last_shard, event(value));
+    any_taken |= offer_network_event(last_inbox, **last_shard, event(value));
+    taken(any_taken)
 }
 
 /// Register `serve` as `R`'s handler on `shard`, recording what each
@@ -1283,4 +1296,72 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetBeaconBlockRequest>(shard, move |req| {
             serve_beacon_block_request(beacon_storage.as_ref(), &req)
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crossbeam::channel::{bounded, unbounded};
+    use hyperscale_hbor::Capped;
+    use hyperscale_network::{HandlerRegistry, Verdict};
+    use hyperscale_types::network::gossip::TransactionGossip;
+    use hyperscale_types::test_utils::test_transaction;
+
+    use crate::shard::test_host::{Fixture, SHARD, loop_of};
+    use crate::shard::{HostEvent, ShardInbox, ShardScopedInput, push_shard_input};
+
+    fn gossip(seed: u8) -> TransactionGossip {
+        TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(seed))]))
+    }
+
+    /// Gossip that finds its shard's network lane full is refused as gossip
+    /// this host cannot judge now, at once rather than once the lane has
+    /// room, and the lane being full keeps no continuation of the loop's
+    /// own off its internal lane.
+    #[test]
+    fn a_full_network_lane_refuses_gossip_and_keeps_internal_inputs() {
+        let fix = Fixture::new();
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (internal_tx, internal) = unbounded();
+        let (network_tx, network) = bounded(1);
+        let (beacon_tx, _beacon) = unbounded();
+        let mut host = fix.host_with_inbox(
+            Arc::clone(&registry),
+            beacon_tx,
+            ShardInbox::new(internal_tx, network_tx),
+        );
+        host.register_gossip_handlers();
+        while internal.try_recv().is_ok() {}
+
+        assert_eq!(
+            registry.local_dispatch_gossip(&gossip(1), Some(SHARD)),
+            Some(Verdict::Accept),
+        );
+        assert_eq!(
+            registry.local_dispatch_gossip(&gossip(2), Some(SHARD)),
+            Some(Verdict::Ignore),
+            "gossip past the lane's bound is refused, not queued",
+        );
+        assert_eq!(network.len(), 1);
+
+        push_shard_input(
+            loop_of(&mut host).event_sender(),
+            SHARD,
+            ShardScopedInput::FetchTick,
+        );
+        assert!(
+            internal
+                .try_iter()
+                .any(|event| matches!(event, HostEvent::Shard(_, ShardScopedInput::FetchTick))),
+            "the loop's own continuation lands past a full network lane",
+        );
+
+        let _ = network.try_recv();
+        assert_eq!(
+            registry.local_dispatch_gossip(&gossip(2), Some(SHARD)),
+            Some(Verdict::Accept),
+            "a refused copy is taken once the lane has room",
+        );
+    }
 }

@@ -53,7 +53,7 @@ use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
     DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
-    ShardDispatchHandles, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
+    ShardDispatchHandles, ShardInbox, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
 };
 
 /// Output of [`NodeHost::into_parts`].
@@ -130,8 +130,8 @@ pub struct HostResources<N, D> {
     pub network: N,
     /// The pool the host's actions are dispatched onto.
     pub dispatch: D,
-    /// Each startup chain's event channel, one per chain.
-    pub shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
+    /// Each startup chain's inbox, one per chain.
+    pub shard_event_senders: BTreeMap<ShardId, ShardInbox>,
     /// The beacon loop's channel: beacon gossip, what the replicas report,
     /// and the outcomes of its own dispatched actions and fetches.
     pub beacon_event_sender: Sender<HostEvent>,
@@ -211,7 +211,9 @@ where
         let mut shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = BTreeMap::new();
         let mut built = Vec::new();
         for chain in chains {
-            let sender = process.shard_event_senders.load()[&chain.shard].clone();
+            let sender = process.shard_event_senders.load()[&chain.shard]
+                .internal()
+                .clone();
             let registration = beacon.register(
                 chain.shard,
                 chain_anchors(chain.recovered),
@@ -269,8 +271,8 @@ where
     /// and wire its `ShardLoop` in with `chain`'s signers attached (see
     /// [`attach_shard`]).
     ///
-    /// Events for the shard may queue on the channel from the moment
-    /// the sender is installed; they're processed once the loop steps.
+    /// Events for the shard may queue on its inbox from the moment the
+    /// inbox is installed; they're processed once the loop steps.
     ///
     /// # Panics
     ///
@@ -279,8 +281,9 @@ where
         &mut self,
         config: &ReplicaConfig,
         chain: HostedChain<'_, S>,
-        sender: Sender<HostEvent>,
+        inbox: impl Into<ShardInbox>,
     ) {
+        let inbox = inbox.into();
         let shard = chain.shard;
         assert!(
             !self.shards.contains_key(&shard),
@@ -290,7 +293,7 @@ where
             shard,
             chain_anchors(chain.recovered),
             chain.recovered.committed_height,
-            sender.clone(),
+            inbox.internal().clone(),
         );
         let shard_loop = attach_shard(
             &self.process,
@@ -298,7 +301,7 @@ where
             config,
             &registration,
             chain,
-            sender,
+            inbox,
             self.now,
         );
         self.shards.insert(shard, shard_loop);
@@ -763,7 +766,7 @@ where
 ///
 /// The chain is already registered with the beacon loop, and its replica
 /// is built here from the schedule `registration` handed back. Installs
-/// the event sender, builds the `ShardIo` + dispatch handles, grows the
+/// the shard's inbox, builds the `ShardIo` + dispatch handles, grows the
 /// network hosted sets, registers the shard's request handlers, and
 /// attaches `chain`'s signers. Returns the loop for the caller to drive —
 /// `NodeHost::add_shard` keeps it in the host's map (the sim step path);
@@ -774,7 +777,7 @@ pub fn attach_shard<S, N, D>(
     replica_config: &ReplicaConfig,
     registration: &Registration,
     chain: HostedChain<'_, S>,
-    sender: Sender<HostEvent>,
+    inbox: ShardInbox,
     now: LocalTimestamp,
 ) -> ShardLoop<S, N, D>
 where
@@ -795,7 +798,8 @@ where
         (Arc::clone(&registration.schedule), registration.epoch),
         storage.jmt_height(),
     );
-    process.insert_shard_sender(shard, sender.clone());
+    let sender = inbox.internal().clone();
+    process.insert_shard_sender(shard, inbox);
     let (io, handles) = build_shard_io(
         shard,
         &replica,

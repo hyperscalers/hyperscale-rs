@@ -376,7 +376,7 @@ impl ShardSupervisor {
                 shard,
                 anchors: chain_anchors(recovered),
                 height: recovered.committed_height,
-                sender: callback_tx,
+                sender: callback_tx.internal().clone(),
                 reply,
             },
         ));

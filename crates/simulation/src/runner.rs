@@ -27,7 +27,7 @@ use hyperscale_network_memory::{
     NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::reshape::{PreparedStores, ReshapeEvent, ReshapeOrchestrator};
-use hyperscale_node::shard::{HostEvent, StepOutput};
+use hyperscale_node::shard::{HostEvent, ShardInbox, StepOutput};
 use hyperscale_node::{
     HostResources, HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig,
     ShardGenesis, TimerOp, TimerOwner, timer_event,
@@ -819,11 +819,14 @@ impl SimulationRunner {
                     signers: validator_idxs.iter().copied().map(signer_of).collect(),
                 })
                 .collect();
-            // Single receiver per host: every hosted shard's sender is a
-            // clone of the same `event_tx`, and the harness drains all
-            // shards through `event_rx` deterministically.
-            let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> =
-                by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
+            // Single receiver per host: both lanes of every hosted shard's
+            // inbox are clones of the same unbounded `event_tx`, so no push
+            // is ever refused, and the harness drains all shards through
+            // `event_rx` deterministically.
+            let shard_event_senders: BTreeMap<ShardId, ShardInbox> = by_shard
+                .keys()
+                .map(|s| (*s, ShardInbox::from(event_tx.clone())))
+                .collect();
             let host = NodeHost::new(
                 &replica_config,
                 HostResources {

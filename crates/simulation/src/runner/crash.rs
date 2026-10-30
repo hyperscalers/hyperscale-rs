@@ -201,7 +201,7 @@ impl SimulationRunner {
         let shard_event_senders = seated
             .chains
             .iter()
-            .map(|chain| (chain.0, self.event_txs[i].clone()))
+            .map(|chain| (chain.0, self.event_txs[i].clone().into()))
             .collect();
         let chains = seated
             .chains

@@ -2,18 +2,18 @@
 //! the shared tokio runtime.
 //!
 //! Each shard's thread owns its own [`ShardLoop`], its own
-//! `ProdTimerManager`, and a (timer, callback, shutdown) channel triple
-//! drained in priority order (`timer_rx > callback_rx`). Process-scoped
+//! `ProdTimerManager`, and its timer, input and shutdown channels,
+//! drained timers first. Process-scoped
 //! resources (`Arc<ProcessIo>`: network adapter, dispatch pool, tx
 //! validator, topology snapshot) are cloned across every shard thread.
 //!
 //! The tokio runtime handles the iroh transport, the RPC server (which invokes the
 //! [`TxSubmissionSender`] closure synchronously), the per-shard
 //! `ProdTimerManager`s' `sleep` tasks, and the per-host metrics + GC
-//! tick. Inbound network messages and dispatch callbacks land on the
-//! addressed shard's callback channel; RPC submissions fan out via
-//! [`ProcessIo::compute_submit_fanout`] into the relevant shards'
-//! callback channels.
+//! tick. Inbound network messages land on the addressed shard's bounded
+//! network lane and dispatch callbacks on its internal lane; RPC
+//! submissions fan out via [`ProcessIo::compute_submit_fanout`] into the
+//! relevant shards' internal lanes.
 //!
 //! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Sender, unbounded};
+use crossbeam::channel::unbounded;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::ParticipationChange;
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -39,7 +39,7 @@ use hyperscale_network::ValidatorKeyMap;
 use hyperscale_network_iroh::{IrohAdapter, IrohConfig, IrohNetwork, NetworkError};
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
-use hyperscale_node::shard::HostEvent;
+use hyperscale_node::shard::{HostEvent, ShardInbox};
 use hyperscale_node::{
     HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot,
     TxStatusCache,
@@ -515,13 +515,12 @@ impl ProductionRunnerBuilder {
         }
         let local_shards = local_shards;
 
-        // Build one (timer / callback / shutdown) channel triple per
-        // hosted shard so the per-shard event senders inside `ProcessIo`
-        // can point at each shard's own callback channel. `ShardChannels`
-        // carries both ends; the supervisor keeps the shutdown/callback
-        // senders alive for the shard's lifetime.
+        // Build each hosted shard's channels so the per-shard inboxes
+        // inside `ProcessIo` point at that shard's own input lanes.
+        // `ShardChannels` carries the receiving ends; the supervisor keeps
+        // the shutdown sender alive for the shard's lifetime.
         let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
-        let mut shard_callback_txs: BTreeMap<ShardId, Sender<HostEvent>> = BTreeMap::new();
+        let mut shard_callback_txs: BTreeMap<ShardId, ShardInbox> = BTreeMap::new();
         for shard in &local_shards {
             let (channels, callback_tx) = ShardChannels::new();
             shard_callback_txs.insert(*shard, callback_tx);
@@ -553,11 +552,10 @@ impl ProductionRunnerBuilder {
             verifier: Arc::new(BlsVerifier),
         })?;
 
-        // Each shard's `shard_event_senders` entry points at that
-        // shard's own pinned-thread callback channel — callbacks,
-        // network handlers, and RPC fanout for that shard land on its
-        // thread directly.
-        let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> = shard_callback_txs
+        // Each shard's `shard_event_senders` entry is that shard's own
+        // pinned-thread inbox — callbacks, network handlers, and RPC
+        // fanout for that shard land on its thread directly.
+        let shard_event_senders: BTreeMap<ShardId, ShardInbox> = shard_callback_txs
             .iter()
             .map(|(s, tx)| (*s, tx.clone()))
             .collect();

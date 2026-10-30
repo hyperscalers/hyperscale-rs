@@ -49,12 +49,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::Sender;
+use crossbeam::channel::{Sender, TrySendError};
 pub(crate) use fetch_dispatch::FetchTicker;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
+use hyperscale_metrics::record_network_input_refused;
 use hyperscale_network::Network;
 use hyperscale_storage::{
     AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
@@ -69,8 +70,8 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
 use crate::event::Attachment;
 pub use crate::event::{
-    BeaconScopedInput, EventPriority, FetchFailureKind, HostEvent, ProcessScopedInput,
-    ShardScopedInput,
+    BeaconScopedInput, EventPriority, FetchFailureKind, HostEvent, NETWORK_LANE_CAPACITY,
+    ProcessScopedInput, ShardInbox, ShardScopedInput,
 };
 use crate::fetch::Release;
 use crate::process::ProcessIo;
@@ -303,6 +304,43 @@ pub(crate) fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: Sh
 /// See [`push_shard_input`] for the drop-on-shutdown convention.
 pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: ProtocolEvent) {
     let _ = tx.send(HostEvent::protocol(shard, event));
+}
+
+/// Offer an input a peer sent unbidden to `shard`'s network lane.
+///
+/// `false` when the lane is full: the input is dropped and counted, never
+/// queued past the lane's bound, and the handler answers the message as
+/// one this host cannot judge now. A closed lane takes the input as
+/// [`push_shard_input`] does.
+#[must_use]
+pub(crate) fn offer_network_input(
+    inbox: &ShardInbox,
+    shard: ShardId,
+    input: ShardScopedInput,
+) -> bool {
+    offer_network(inbox, HostEvent::shard(shard, input))
+}
+
+/// [`offer_network_input`] for a [`ProtocolEvent`].
+#[must_use]
+pub(crate) fn offer_network_event(
+    inbox: &ShardInbox,
+    shard: ShardId,
+    event: ProtocolEvent,
+) -> bool {
+    offer_network(inbox, HostEvent::protocol(shard, event))
+}
+
+fn offer_network(inbox: &ShardInbox, event: HostEvent) -> bool {
+    match inbox.network().try_send(event) {
+        Ok(()) | Err(TrySendError::Disconnected(_)) => true,
+        Err(TrySendError::Full(event)) => {
+            if let HostEvent::Shard(shard, _) = &event {
+                record_network_input_refused(shard.inner(), event.type_name());
+            }
+            false
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1644,5 +1682,50 @@ mod tests {
         );
         assert!(host.network().drain_outbox().is_empty());
         assert!(host.network().drain_pending_notifications().is_empty());
+    }
+    /// The answer to one of the loop's own fetches reaches it on the
+    /// internal lane however full the network lane is, so the fetch it
+    /// answers is released rather than stranded behind peer traffic.
+    #[test]
+    fn a_fetch_answer_is_released_past_a_full_network_lane() {
+        use crossbeam::channel::{bounded, unbounded};
+        use hyperscale_core::FetchIds;
+
+        use crate::fetch::{FetchReply, ShardReply};
+        use crate::shard::{ShardInbox, ShardScopedInput};
+
+        let fix = Fixture::new();
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (internal_tx, internal) = unbounded();
+        let (network_tx, _network) = bounded(1);
+        let (beacon_tx, _beacon) = unbounded();
+        let mut host = fix.host_with_inbox(
+            registry,
+            beacon_tx,
+            ShardInbox::new(internal_tx, network_tx.clone()),
+        );
+        network_tx
+            .try_send(HostEvent::shard(SHARD, ShardScopedInput::FetchTick))
+            .expect("the lane has room for one");
+        while internal.try_recv().is_ok() {}
+
+        let sender = loop_of(&mut host).event_sender().clone();
+        assert!(
+            !sender.same_channel(&network_tx),
+            "the loop's own sender is not its network lane",
+        );
+        let ids = FetchIds::Transactions(Vec::new());
+        ShardReply {
+            shard: SHARD,
+            sender,
+        }
+        .answered(ids.clone(), ProtocolEvent::CleanupTimer);
+        assert!(
+            internal.try_iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(_, ShardScopedInput::FetchFulfilled(fulfilled)) if fulfilled == ids
+            )),
+            "the answered fetch is released",
+        );
     }
 }

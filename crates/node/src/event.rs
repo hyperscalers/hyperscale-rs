@@ -24,13 +24,14 @@ use hyperscale_beacon::ChainRegistration;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
+use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock,
     CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
-    ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, ShardForkProof, ShardId,
-    ShardVoteEquivocation, Signer, TopologySchedule, Transaction, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp,
+    ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, MAX_UNSETTLED_PER_BLOCK,
+    MAX_UNSETTLED_TXS, ShardForkProof, ShardId, ShardVoteEquivocation, Signer, TopologySchedule,
+    Transaction, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -825,6 +826,64 @@ impl BeaconScopedInput {
             | Self::Answered { event, .. } => event.type_name(),
             other => other.into(),
         }
+    }
+}
+
+/// Inbound network inputs one hosted shard's network lane holds before it
+/// refuses more.
+///
+/// Per-transaction gossip is the lane's most numerous item, and a chain
+/// holds at most [`MAX_UNSETTLED_TXS`] transactions in flight: a backlog
+/// deeper than that is more than the replica could take in before it
+/// drains. Several full gossip batches fit.
+pub const NETWORK_LANE_CAPACITY: usize = MAX_UNSETTLED_PER_BLOCK;
+
+const _: () = assert!(NETWORK_LANE_CAPACITY as u64 == MAX_UNSETTLED_TXS);
+
+const _: () = assert!(NETWORK_LANE_CAPACITY >= 4 * MAX_GOSSIP_TX_BATCH);
+
+/// The two lanes into one hosted shard's driver.
+///
+/// `network` takes what peers send unbidden (gossip and notifications)
+/// and may be bounded: a push that finds it full is refused, never
+/// queued, so a stalled driver cannot make peer traffic pile up without
+/// bound. `internal` takes everything the host itself produced (the
+/// loop's own continuations, off-thread results, the answers to its own
+/// fetches, the beacon loop's reports, RPC submissions) and is never
+/// bounded: each item there is owed to a state machine that is waiting
+/// on it. The driver drains both, keeping each lane's own order.
+#[derive(Debug, Clone)]
+pub struct ShardInbox {
+    internal: Sender<HostEvent>,
+    network: Sender<HostEvent>,
+}
+
+impl ShardInbox {
+    /// An inbox over its two lanes.
+    #[must_use]
+    pub const fn new(internal: Sender<HostEvent>, network: Sender<HostEvent>) -> Self {
+        Self { internal, network }
+    }
+
+    /// The lane for the host's own continuations and answers.
+    #[must_use]
+    pub const fn internal(&self) -> &Sender<HostEvent> {
+        &self.internal
+    }
+
+    /// The lane for inputs peers send unbidden.
+    #[must_use]
+    pub const fn network(&self) -> &Sender<HostEvent> {
+        &self.network
+    }
+}
+
+/// Both lanes on one channel: one driver draining a single receiver in
+/// the order it was pushed, as the simulation harness does. An unbounded
+/// channel never refuses a push, so the lane's bound never applies.
+impl From<Sender<HostEvent>> for ShardInbox {
+    fn from(sender: Sender<HostEvent>) -> Self {
+        Self::new(sender.clone(), sender)
     }
 }
 

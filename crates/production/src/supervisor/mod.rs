@@ -532,7 +532,7 @@ impl ShardSupervisor {
         ShardLoopConfig {
             timer_tx: channels.timer_tx,
             timer_rx: channels.timer_rx,
-            callback_rx: channels.callback_rx,
+            inputs: channels.inputs,
             shutdown_rx: channels.shutdown_rx,
             control_rx: channels.control_rx,
             tokio_handle: self.tokio_handle.clone(),

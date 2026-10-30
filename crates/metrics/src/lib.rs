@@ -134,8 +134,13 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// and `_sum / threads` gives utilization per pool.
     fn record_pool_task_completed(&self, pool: &str, latency_secs: f64) {}
 
-    /// Set the depths of one shard loop's callback and timer channels.
-    fn set_shard_channel_depths(&self, shard: u64, callback: usize, timer: usize) {}
+    /// Set the depths of one shard loop's callback, network and timer
+    /// channels.
+    fn set_shard_channel_depths(&self, shard: u64, callback: usize, network: usize, timer: usize) {}
+
+    /// An inbound network input refused because its shard's network lane
+    /// was full, by shard and input kind.
+    fn record_network_input_refused(&self, shard: u64, kind: &str) {}
 
     /// Record execution latency.
     fn record_execution_latency(&self, latency_secs: f64) {}
@@ -738,10 +743,18 @@ pub fn record_pool_task_completed(pool: &str, latency_secs: f64) {
     recorder().record_pool_task_completed(pool, latency_secs);
 }
 
-/// Set the depths of one shard loop's callback and timer channels.
+/// Set the depths of one shard loop's callback, network and timer
+/// channels.
 #[inline]
-pub fn set_shard_channel_depths(shard: u64, callback: usize, timer: usize) {
-    recorder().set_shard_channel_depths(shard, callback, timer);
+pub fn set_shard_channel_depths(shard: u64, callback: usize, network: usize, timer: usize) {
+    recorder().set_shard_channel_depths(shard, callback, network, timer);
+}
+
+/// Record an inbound network input refused at its shard's full network
+/// lane.
+#[inline]
+pub fn record_network_input_refused(shard: u64, kind: &str) {
+    recorder().record_network_input_refused(shard, kind);
 }
 
 /// Record execution latency.

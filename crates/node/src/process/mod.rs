@@ -38,7 +38,7 @@ use hyperscale_types::{
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
-use crate::event::{Attachment, BeaconScopedInput, HostEvent, ShardScopedInput};
+use crate::event::{Attachment, BeaconScopedInput, HostEvent, ShardInbox, ShardScopedInput};
 use crate::shard::cross_shard::serve_cells_request;
 use crate::shard::mempool::DeferredTransaction;
 use crate::shard::{DispatchHandles, SharedTopologySnapshot};
@@ -48,7 +48,7 @@ use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 /// Handler closures and RPC fan-out `.load()` for an atomic snapshot on
 /// every use; the map is swapped only when shard participation changes,
 /// and the reconfiguring thread is the sole writer.
-pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<HostEvent>>>>;
+pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, ShardInbox>>>;
 
 /// Process-scoped resources shared across every hosted shard.
 ///
@@ -160,7 +160,7 @@ where
         network: Arc<N>,
         verifier: Arc<dyn Verifier>,
         dispatch: D,
-        shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
+        shard_event_senders: BTreeMap<ShardId, ShardInbox>,
         beacon_event_sender: Sender<HostEvent>,
         topology_snapshot: SharedTopologySnapshot,
         (epoch, topology_schedule): (Epoch, Arc<TopologySchedule>),
@@ -266,7 +266,7 @@ where
     /// Install the event sender for a newly hosted `shard`. The
     /// reconfiguring thread is the sole writer, so the clone-modify-store
     /// needs no CAS retry; concurrent readers keep their loaded snapshot.
-    pub(crate) fn insert_shard_sender(&self, shard: ShardId, sender: Sender<HostEvent>) {
+    pub(crate) fn insert_shard_sender(&self, shard: ShardId, sender: ShardInbox) {
         let mut map = (**self.shard_event_senders.load()).clone();
         map.insert(shard, sender);
         self.shard_event_senders.store(Arc::new(map));
@@ -325,9 +325,9 @@ where
         let Some((hosted, touched_shards)) = self.route_or_park(tx) else {
             return SubmitFanout::Parked;
         };
-        let route = |(&shard, sender): (&ShardId, &Sender<HostEvent>)| ShardRoute {
+        let route = |(&shard, inbox): (&ShardId, &ShardInbox)| ShardRoute {
             shard,
-            sender: sender.clone(),
+            sender: inbox.internal().clone(),
         };
         let mut hosted_touched = hosted
             .iter()
@@ -638,7 +638,7 @@ fn newest_epoch(schedule: &TopologySchedule) -> Option<Epoch> {
 }
 
 /// One loaded snapshot of [`ProcessIo::shard_event_senders`].
-type ShardSenders = Arc<BTreeMap<ShardId, Sender<HostEvent>>>;
+type ShardSenders = Arc<BTreeMap<ShardId, ShardInbox>>;
 
 /// A hosted shard a submission routes to, with the sender it was hosted
 /// under when the route was read. A shard detached since then still takes

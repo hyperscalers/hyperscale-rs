@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Receiver, unbounded};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -24,7 +24,7 @@ use hyperscale_types::{
     ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
 };
 
-use crate::shard::{HostEvent, ShardLoop};
+use crate::shard::{HostEvent, ShardInbox, ShardLoop};
 use crate::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 
 pub const SHARD: ShardId = ShardId::leaf(1, 0);
@@ -290,7 +290,7 @@ impl Fixture {
                 executor: Arc::new(Executor::new(ExecutionMode::Serial)),
                 network: SimNetworkAdapter::new(registry),
                 dispatch: SyncDispatch::new(),
-                shard_event_senders: std::iter::once((SHARD, event_tx.clone())).collect(),
+                shard_event_senders: std::iter::once((SHARD, event_tx.clone().into())).collect(),
                 beacon_event_sender: event_tx,
                 topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             },
@@ -350,21 +350,61 @@ impl Fixture {
         state: BeaconState,
     ) -> (Host, Receiver<HostEvent>) {
         let (event_tx, events) = unbounded();
+        let host = self.host_on_inbox(
+            (storage, committed, topology),
+            network,
+            dispatch,
+            state,
+            (event_tx.clone(), event_tx.into()),
+        );
+        (host, events)
+    }
+
+    /// A host running `SHARD` with `committee[0]` attached at genesis,
+    /// its handlers registered on `registry`, whose shard takes its inputs
+    /// on `inbox` and whose beacon loop's events go to `beacon`.
+    pub fn host_with_inbox(
+        &self,
+        registry: Arc<HandlerRegistry>,
+        beacon: Sender<HostEvent>,
+        inbox: ShardInbox,
+    ) -> Host {
+        self.host_on_inbox(
+            (
+                SimShardStorage::new(shard_prefix_path(SHARD)),
+                BlockHeight::GENESIS,
+                Arc::clone(&self.topology_snapshot),
+            ),
+            SimNetworkAdapter::new(registry),
+            SyncDispatch::new(),
+            self.genesis_state.clone(),
+            (beacon, inbox),
+        )
+    }
+
+    fn host_on_inbox(
+        &self,
+        (storage, committed, topology): (SimShardStorage, BlockHeight, Arc<TopologySnapshot>),
+        network: SimNetworkAdapter,
+        dispatch: SyncDispatch,
+        state: BeaconState,
+        (beacon, inbox): (Sender<HostEvent>, ShardInbox),
+    ) -> Host {
         let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
         beacon_storage.commit_beacon_block(&self.genesis_block, &Arc::new(state));
         let recovered = RecoveredState {
             committed_height: committed,
             ..RecoveredState::default()
         };
-        let host = NodeHost::new(
+        NodeHost::new(
             &self.replica_config(),
             HostResources {
                 beacon_storage,
                 executor: Arc::new(Executor::new(ExecutionMode::Serial)),
                 network,
                 dispatch,
-                shard_event_senders: std::iter::once((SHARD, event_tx.clone())).collect(),
-                beacon_event_sender: event_tx,
+                shard_event_senders: std::iter::once((SHARD, inbox)).collect(),
+                beacon_event_sender: beacon,
                 topology_snapshot: Arc::new(ArcSwap::from(topology)),
             },
             vec![HostedChain {
@@ -376,8 +416,7 @@ impl Fixture {
             Vec::new(),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
-        );
-        (host, events)
+        )
     }
 }
 
