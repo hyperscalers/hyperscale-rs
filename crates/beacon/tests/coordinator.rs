@@ -1459,8 +1459,8 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
         .broadcast_candidate(Epoch::new(2))
         .expect("the connected side broadcast its epoch 2 candidate");
 
-    let early = sim.coordinators[late]
-        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    let early =
+        sim.coordinators[late].on_beacon_candidate_received(Verifiable::from((*candidate).clone()));
     assert!(
         early.is_empty(),
         "a candidate ahead of the tip dispatched work: {early:?}"
@@ -1521,11 +1521,10 @@ fn candidates_further_ahead_give_way_to_a_nearer_one() {
             BeaconBlockHash::ZERO,
             ValidatorId::new(proposer),
         );
-        let actions = sim.coordinators[late].on_beacon_candidate_received(Arc::new(forged.into()));
+        let actions = sim.coordinators[late].on_beacon_candidate_received(forged.into());
         assert!(actions.is_empty(), "a forged candidate dispatched work");
     }
-    sim.coordinators[late]
-        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    sim.coordinators[late].on_beacon_candidate_received(Verifiable::from((*candidate).clone()));
 
     let actions = sim.deliver_block_to(late, &parent);
     assert!(
@@ -1579,8 +1578,8 @@ fn a_candidate_several_blocks_ahead_of_the_tip_is_prevoted_once_its_parent_is_ad
         .broadcast_candidate(Epoch::new(3))
         .expect("the connected side broadcast its epoch 3 candidate");
 
-    let early = sim.coordinators[late]
-        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    let early =
+        sim.coordinators[late].on_beacon_candidate_received(Verifiable::from((*candidate).clone()));
     assert!(
         early.is_empty(),
         "a candidate ahead of the tip dispatched work: {early:?}"

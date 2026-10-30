@@ -145,7 +145,7 @@ pub struct BeaconActionContext<'a, N: Network> {
     /// Hand a candidate this participant assembled or verified to the
     /// process-level cache that serves inbound
     /// `GetBeaconCandidateRequest`s.
-    pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),
+    pub cache_beacon_candidate: &'a (dyn Fn(Verified<CandidateBeaconBlock>) + Send + Sync),
     /// The release gate of the identity that emitted the action. Every
     /// signing handler enters it around its persist, sign and notify.
     pub gate: &'a Gate,

@@ -1043,7 +1043,7 @@ pub enum ProtocolEvent {
     /// tracker directly and never takes this path.
     BeaconCandidateReceived {
         /// Received candidate.
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        candidate: Verifiable<CandidateBeaconBlock>,
     },
 
     /// Result of an [`Action::VerifyBeaconCandidate`] dispatch. The
@@ -1059,7 +1059,7 @@ pub enum ProtocolEvent {
         /// otherwise keep the honest copy from being checked.
         block_hash: BeaconBlockHash,
         /// Verified candidate on success; the typed error otherwise.
-        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
+        result: Result<Verified<CandidateBeaconBlock>, CandidateBeaconBlockVerifyError>,
     },
 
     /// A shard-witness chunk landed. The beacon fold recomputes the

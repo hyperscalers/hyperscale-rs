@@ -252,7 +252,7 @@ fn a_fetched_candidate_failing_verification_is_asked_again() {
     let _ = host.step(HostEvent::Beacon(BeaconScopedInput::Answered {
         ids: ids(),
         event: Box::new(ProtocolEvent::BeaconCandidateReceived {
-            candidate: Arc::new(Verifiable::from(forged.clone())),
+            candidate: Verifiable::from(forged.clone()),
         }),
     }));
     while let Ok(event) = events.try_recv() {
@@ -274,10 +274,10 @@ fn a_peer_answering_a_forged_candidate_is_distrusted() {
     let fix = Fixture::new();
     let (mut wire, mut host, events) = wired(&fix, SyncDispatch::new());
     let forged = forged_candidate(&fix);
-    let served = Arc::new(Verifiable::from(forged.clone()));
+    let served = Verifiable::from(forged.clone());
     wire.peer
         .register_request_handler(SHARD, move |_: GetBeaconCandidateRequest| {
-            GetBeaconCandidateResponse::new(Some(Arc::clone(&served)))
+            GetBeaconCandidateResponse::new(Some(served.clone()))
         });
 
     host.beacon.ask(

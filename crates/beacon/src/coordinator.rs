@@ -746,7 +746,7 @@ impl BeaconCoordinator {
     /// A peer's candidate block arrived via gossip.
     pub fn on_beacon_candidate_received(
         &mut self,
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        candidate: Verifiable<CandidateBeaconBlock>,
     ) -> Vec<Action> {
         self.drive(|p, fold| p.on_beacon_candidate_received(fold, candidate))
     }
@@ -756,7 +756,7 @@ impl BeaconCoordinator {
     pub fn on_beacon_candidate_verified(
         &mut self,
         block_hash: BeaconBlockHash,
-        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
+        result: Result<Verified<CandidateBeaconBlock>, CandidateBeaconBlockVerifyError>,
     ) -> Vec<Action> {
         self.drive(|p, fold| p.on_beacon_candidate_verified(fold, block_hash, result))
     }
@@ -1497,7 +1497,7 @@ mod tests {
             ShardId,
             ShardEpochContribution,
         ) -> BTreeMap<ShardId, ShardEpochContribution>,
-    ) -> Arc<Verifiable<CandidateBeaconBlock>> {
+    ) -> Verifiable<CandidateBeaconBlock> {
         let shard = ShardId::leaf(1, 0);
         coord
             .fold
@@ -1539,7 +1539,7 @@ mod tests {
             &signer_positions,
             &PcVector::empty(),
         );
-        Arc::new(Verifiable::from(CandidateBeaconBlock::new(
+        Verifiable::from(CandidateBeaconBlock::new(
             BeaconBlock::new_with_contributions(
                 epoch,
                 prev,
@@ -1548,7 +1548,7 @@ mod tests {
                     .expect("a map written out in a test"),
             ),
             Box::new(cert),
-        )))
+        ))
     }
 
     /// A gossiped candidate whose `shard_contributions` deviate from
@@ -1592,7 +1592,7 @@ mod tests {
             std::iter::once((shard, contribution)).collect()
         });
         let block_hash = candidate.block_hash();
-        let actions = coord.on_beacon_candidate_received(Arc::clone(&candidate));
+        let actions = coord.on_beacon_candidate_received(candidate.clone());
         assert!(matches!(
             actions.as_slice(),
             [Action::VerifyBeaconCandidate { .. }]
@@ -1651,14 +1651,13 @@ mod tests {
                     equivocation_signers,
                 } => {
                     let block_hash = candidate.block_hash();
-                    let result = Arc::unwrap_or_clone(candidate)
+                    let result = candidate
                         .upgrade(&CandidateVerifyContext {
                             verifier: &BlsVerifier,
                             network: &net,
                             committee: &committee,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
                     let post = coord.on_beacon_candidate_verified(block_hash, result);
                     out.extend(complete_verifications(coord, post));

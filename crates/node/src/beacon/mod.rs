@@ -484,7 +484,7 @@ where
             } => {
                 self.release(ids, Release::Admitted);
                 for validator in self.validator_list() {
-                    let candidate = Arc::clone(&candidate);
+                    let candidate = candidate.clone();
                     self.drive(validator, |p, fold| {
                         p.on_beacon_candidate_fetched(fold, candidate)
                     });
@@ -510,7 +510,7 @@ where
     fn verify_fetched_candidate(
         &mut self,
         ids: FetchIds,
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        candidate: Verifiable<CandidateBeaconBlock>,
     ) {
         let key = VerdictKey::of(candidate.as_unverified());
         let Some(CandidateKeys {
@@ -529,7 +529,7 @@ where
         self.process
             .dispatch
             .spawn(DispatchPool::Consensus, move || {
-                let checked = Arc::unwrap_or_clone(candidate).upgrade(&CandidateVerifyContext {
+                let checked = candidate.upgrade(&CandidateVerifyContext {
                     network: &network,
                     committee: &committee,
                     equivocation_signers: &equivocation_signers,
@@ -545,8 +545,7 @@ where
                 );
                 let input = match checked {
                     Ok(candidate) => {
-                        let candidate = Arc::new(candidate);
-                        handles.beacon_candidate_cache.admit(Arc::clone(&candidate));
+                        handles.beacon_candidate_cache.admit(candidate.clone());
                         BeaconScopedInput::Answered {
                             ids,
                             event: Box::new(ProtocolEvent::BeaconCandidateVerified {

@@ -1691,7 +1691,7 @@ pub enum Action {
     /// needed.
     BroadcastBeaconCandidate {
         /// Candidate to broadcast.
-        candidate: Arc<Verified<CandidateBeaconBlock>>,
+        candidate: Verified<CandidateBeaconBlock>,
     },
 
     /// Verify a [`CandidateBeaconBlock`]: its SPC proposal cert against
@@ -1703,7 +1703,7 @@ pub enum Action {
         /// Candidate whose cert + embedded equivocation witnesses are
         /// being verified. A `Verifiable::Verified` wrapper
         /// short-circuits dispatch.
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        candidate: Verifiable<CandidateBeaconBlock>,
         /// Beacon committee for the candidate's epoch, in positional
         /// order matching the SPC cert's signer bitfields.
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,

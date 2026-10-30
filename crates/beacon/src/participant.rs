@@ -138,7 +138,7 @@ pub struct BeaconParticipant {
     /// verified candidate wins; reset on every adoption. A replica
     /// whose cert names a hash it never held adopts from the
     /// assembler's certified-block broadcast instead.
-    pending_candidate: Option<Arc<Verified<CandidateBeaconBlock>>>,
+    pending_candidate: Option<Verified<CandidateBeaconBlock>>,
 
     /// Candidates the pool prevoted that this member never received and
     /// has asked a prevoter for, as `(epoch, block_hash)`. One ask per
@@ -155,7 +155,7 @@ pub struct BeaconParticipant {
     /// block they extend is the tip; unverified until then, so capped at
     /// [`MAX_EARLY_CANDIDATES`]. Keyed by epoch first, so the last entry
     /// is the furthest ahead.
-    early_candidates: BTreeMap<(Epoch, BeaconBlockHash), Arc<Verifiable<CandidateBeaconBlock>>>,
+    early_candidates: BTreeMap<(Epoch, BeaconBlockHash), Verifiable<CandidateBeaconBlock>>,
 
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
@@ -1341,11 +1341,8 @@ impl BeaconParticipant {
             .is_some_and(|c| c.block_hash() == block_hash)
         {
             let candidate = self.pending_candidate.take().expect("checked above");
-            Verified::<CertifiedBeaconBlock>::from_ratified_candidate(
-                Arc::unwrap_or_clone(candidate),
-                cert,
-            )
-            .expect("candidate pairs with its ratify cert by construction")
+            Verified::<CertifiedBeaconBlock>::from_ratified_candidate(candidate, cert)
+                .expect("candidate pairs with its ratify cert by construction")
         } else {
             warn!(
                 block_hash = ?block_hash,
@@ -1807,15 +1804,15 @@ impl BeaconParticipant {
             return Vec::new();
         };
         let prev_block_hash = fold.latest_block.block_hash();
-        let candidate = Arc::new(Verified::<CandidateBeaconBlock>::assemble(
+        let candidate = Verified::<CandidateBeaconBlock>::assemble(
             epoch,
             prev_block_hash,
             committed,
             shard_contributions,
             cert,
-        ));
+        );
         if self.pending_candidate.is_none() {
-            self.pending_candidate = Some(Arc::clone(&candidate));
+            self.pending_candidate = Some(candidate.clone());
         }
         let effects = self.ratify.on_candidate(candidate.block_hash());
         let mut actions = self.lift_ratify_effects(fold, effects);
@@ -1834,7 +1831,7 @@ impl BeaconParticipant {
     pub fn on_beacon_candidate_received(
         &mut self,
         fold: &BeaconFold,
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        candidate: Verifiable<CandidateBeaconBlock>,
     ) -> Vec<Action> {
         if candidate.epoch() > fold.state.current_epoch.next() {
             self.hold_early_candidate(candidate);
@@ -1869,7 +1866,7 @@ impl BeaconParticipant {
     pub fn on_beacon_candidate_fetched(
         &mut self,
         fold: &BeaconFold,
-        candidate: Arc<Verified<CandidateBeaconBlock>>,
+        candidate: Verified<CandidateBeaconBlock>,
     ) -> Vec<Action> {
         if self.holds_a_candidate() {
             return Vec::new();
@@ -1884,7 +1881,7 @@ impl BeaconParticipant {
     /// Hold a candidate for an epoch past the pending one. At the cap it
     /// displaces the furthest-ahead entry when its own epoch is nearer,
     /// and is dropped otherwise.
-    fn hold_early_candidate(&mut self, candidate: Arc<Verifiable<CandidateBeaconBlock>>) {
+    fn hold_early_candidate(&mut self, candidate: Verifiable<CandidateBeaconBlock>) {
         let key = (candidate.epoch(), candidate.block_hash());
         if self.early_candidates.contains_key(&key) {
             return;
@@ -1910,7 +1907,7 @@ impl BeaconParticipant {
         &mut self,
         fold: &BeaconFold,
         block_hash: BeaconBlockHash,
-        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
+        result: Result<Verified<CandidateBeaconBlock>, CandidateBeaconBlockVerifyError>,
     ) -> Vec<Action> {
         self.verification.forget_candidate(block_hash);
         let candidate = match result {
@@ -1928,7 +1925,7 @@ impl BeaconParticipant {
     fn hold_verified_candidate(
         &mut self,
         fold: &BeaconFold,
-        candidate: Arc<Verified<CandidateBeaconBlock>>,
+        candidate: Verified<CandidateBeaconBlock>,
     ) -> Vec<Action> {
         // Tip may have advanced since dispatch; a stale candidate no
         // longer names a prevotable value.

@@ -245,7 +245,7 @@ where
                     |from: ValidatorId, epoch: Epoch, proposal: Verified<BeaconProposal>| {
                         handles.beacon_proposal_cache.admit(from, epoch, proposal);
                     };
-                let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {
+                let cache_beacon_candidate = |candidate: Verified<CandidateBeaconBlock>| {
                     handles.beacon_candidate_cache.admit(candidate);
                 };
                 let ctx = BeaconActionContext {

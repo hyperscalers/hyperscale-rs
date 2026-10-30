@@ -391,11 +391,9 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedRatifyVoteReceived { vote });
         }
         Action::BroadcastBeaconCandidate { candidate } => {
-            (ctx.cache_beacon_candidate)(Arc::clone(&candidate));
+            (ctx.cache_beacon_candidate)(candidate.clone());
             ctx.network
-                .broadcast_global(&BeaconCandidateGossip::new(Arc::new(Verifiable::from(
-                    Arc::unwrap_or_clone(candidate),
-                ))));
+                .broadcast_global(&BeaconCandidateGossip::new(candidate));
         }
         Action::VerifyRatifyVote { vote, signers } => {
             let anchor = vote.anchor_hash();
@@ -437,17 +435,16 @@ where
         } => {
             let key = VerdictKey::of(candidate.as_unverified());
             let block_hash = candidate.block_hash();
-            let result = Arc::unwrap_or_clone(candidate)
+            let result = candidate
                 .upgrade(&CandidateVerifyContext {
                     verifier: ctx.verifier,
                     network,
                     committee: &committee,
                     equivocation_signers: &equivocation_signers,
                 })
-                .map(Arc::new)
                 .map_err(|(_, e)| e);
             if let Ok(verified) = &result {
-                (ctx.cache_beacon_candidate)(Arc::clone(verified));
+                (ctx.cache_beacon_candidate)(verified.clone());
             }
             ctx.network.settle(key, checked(result.is_ok()));
             ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { block_hash, result });

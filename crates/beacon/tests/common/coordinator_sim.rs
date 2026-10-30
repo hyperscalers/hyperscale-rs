@@ -129,7 +129,7 @@ enum SimEvent {
         block: Arc<Verified<CertifiedBeaconBlock>>,
     },
     BeaconCandidate {
-        candidate: Arc<Verified<CandidateBeaconBlock>>,
+        candidate: Verified<CandidateBeaconBlock>,
     },
     RatifyVote {
         vote: Arc<Verifiable<RatifyVote>>,
@@ -201,7 +201,7 @@ pub struct CoordinatorSim {
     blocked_candidate_receivers: BTreeSet<ValidatorId>,
     /// Every candidate any replica broadcast, by block hash: what a
     /// replica holding one serves a candidate fetch from.
-    broadcast_candidates: BTreeMap<BeaconBlockHash, Arc<Verified<CandidateBeaconBlock>>>,
+    broadcast_candidates: BTreeMap<BeaconBlockHash, Verified<CandidateBeaconBlock>>,
     /// Replicas every delivered crossing skips — its block, its child,
     /// and its witness chunk — as if the shard's headers never reached
     /// them.
@@ -371,7 +371,7 @@ impl CoordinatorSim {
 
     /// The candidate some replica broadcast for `epoch`, if one did.
     #[must_use]
-    pub fn broadcast_candidate(&self, epoch: Epoch) -> Option<Arc<Verified<CandidateBeaconBlock>>> {
+    pub fn broadcast_candidate(&self, epoch: Epoch) -> Option<Verified<CandidateBeaconBlock>> {
         self.broadcast_candidates
             .values()
             .find(|candidate| candidate.epoch() == epoch)
@@ -924,10 +924,10 @@ impl CoordinatorSim {
     pub fn deliver_candidate_to(
         &mut self,
         replica_idx: usize,
-        candidate: &Arc<Verified<CandidateBeaconBlock>>,
+        candidate: &Verified<CandidateBeaconBlock>,
     ) {
         let actions = self.coordinators[replica_idx]
-            .on_beacon_candidate_verified(candidate.block_hash(), Ok(Arc::clone(candidate)));
+            .on_beacon_candidate_verified(candidate.block_hash(), Ok(candidate.clone()));
         self.absorb(replica_idx, actions);
     }
 
@@ -965,14 +965,13 @@ impl CoordinatorSim {
                     equivocation_signers,
                 } => {
                     let block_hash = candidate.block_hash();
-                    let result = Arc::unwrap_or_clone(candidate)
+                    let result = candidate
                         .upgrade(&CandidateVerifyContext {
                             verifier: &BlsVerifier,
                             network: &self.network,
                             committee: &committee,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
                     let post = self.coordinators[replica_idx]
                         .on_beacon_candidate_verified(block_hash, result);
@@ -1252,7 +1251,7 @@ impl CoordinatorSim {
                 self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
             SimEvent::BeaconCandidate { candidate } => {
-                let wrapped = Arc::new(Verifiable::from((**candidate).clone()));
+                let wrapped = Verifiable::from(candidate.into_inner());
                 self.coordinators[env.to_idx].on_beacon_candidate_received(wrapped)
             }
             SimEvent::RatifyVote { vote } => {
@@ -1558,7 +1557,7 @@ impl CoordinatorSim {
             Action::BroadcastBeaconCandidate { candidate } => {
                 self.broadcast_candidates
                     .entry(candidate.block_hash())
-                    .or_insert_with(|| Arc::clone(&candidate));
+                    .or_insert_with(|| candidate.clone());
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
@@ -1572,7 +1571,7 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::BeaconCandidate {
-                            candidate: Arc::clone(&candidate),
+                            candidate: candidate.clone(),
                         },
                     });
                 }
@@ -1664,14 +1663,13 @@ impl CoordinatorSim {
                 equivocation_signers,
             } => {
                 let block_hash = candidate.block_hash();
-                let result = Arc::unwrap_or_clone(candidate)
+                let result = candidate
                     .upgrade(&CandidateVerifyContext {
                         verifier: &BlsVerifier,
                         network: &self.network,
                         committee: &committee,
                         equivocation_signers: &equivocation_signers,
                     })
-                    .map(Arc::new)
                     .map_err(|(_, e)| e);
                 let post =
                     self.coordinators[emitter_idx].on_beacon_candidate_verified(block_hash, result);
@@ -1911,7 +1909,7 @@ impl CoordinatorSim {
                     self.loopback_q.push_back(Envelope {
                         to_idx: emitter_idx,
                         event: SimEvent::BeaconCandidate {
-                            candidate: Arc::clone(candidate),
+                            candidate: candidate.clone(),
                         },
                     });
                 }
