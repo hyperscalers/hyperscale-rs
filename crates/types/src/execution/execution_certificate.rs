@@ -38,7 +38,7 @@ const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.atteste
 ///
 /// The signed value is `global_receipt_root`, a merkle root over the whole
 /// tick's outcome leaves, so a copy can carry any subset of them and still
-/// prove itself: the leaves it holds plus [`Self::proof`] rebuild the
+/// prove itself: the leaves it holds plus its multiproof rebuild the
 /// signed root. The producing shard is party to its entire tick, so its
 /// own copy carries every leaf and needs no proof; a copy sent to a
 /// participating shard carries the outcomes naming that shard, and its

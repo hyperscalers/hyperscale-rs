@@ -750,7 +750,7 @@ impl TopologySchedule {
     /// because a transient lag must hold rather than drop.
     ///
     /// The local-bookkeeping companion of the fence's own inline
-    /// derivation in [`settled_set_verdict`](crate::settled_set_verdict):
+    /// derivation:
     /// caches, prunes, and the settled sets still wanted all read this, so
     /// none of them stops asking while the fence still expects an answer.
     #[must_use]
