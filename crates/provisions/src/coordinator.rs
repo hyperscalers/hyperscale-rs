@@ -311,7 +311,7 @@ impl ProvisionCoordinator {
         // operation a header is retained exactly while its provisions
         // are outstanding; this only catches entries that would otherwise
         // leak indefinitely. Each dropped key emits an `AbandonFetch` so
-        // the io_loop's `ProvisionBinding` clears the matching in-flight.
+        // the shard loop's `ProvisionBinding` clears the matching in-flight.
         let orphaned: Vec<_> = self
             .expected
             .cleanup_orphans(retention_cutoff)
@@ -2508,7 +2508,7 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Expected-tracking entry is cleared; the io_loop's
+        // Expected-tracking entry is cleared; the shard loop's
         // `ProvisionsAdmitted` interception drives any in-flight fetch
         // admission downstream.
         assert_eq!(coordinator.expected.len(), 0);

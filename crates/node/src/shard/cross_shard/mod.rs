@@ -69,7 +69,7 @@ pub struct CrossShardState {
 const STATE_PROOF_FETCH: FetchConfig = FetchConfig {
     max_in_flight: 256,
     max_ids_per_request: 64,
-    parallel_chunks_per_tick: 2,
+    chunks_per_dispatch: 2,
 };
 
 /// How many verdict questions one request carries: each expands to
@@ -90,7 +90,7 @@ const VERDICT_REQUESTS_IN_FLIGHT: usize = 4;
 const VERDICT_PROOF_FETCH: FetchConfig = FetchConfig {
     max_in_flight: VERDICT_REQUESTS_IN_FLIGHT * VERDICT_QUESTIONS_PER_REQUEST,
     max_ids_per_request: VERDICT_QUESTIONS_PER_REQUEST,
-    parallel_chunks_per_tick: VERDICT_REQUESTS_IN_FLIGHT,
+    chunks_per_dispatch: VERDICT_REQUESTS_IN_FLIGHT,
 };
 
 const _: () = assert!(VERDICT_QUESTIONS_PER_REQUEST == MAX_VERDICT_ASKS_PER_SIBLING);
@@ -107,7 +107,7 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 4,
-                    parallel_chunks_per_tick: 1,
+                    chunks_per_dispatch: 1,
                 },
             ),
             local_provision: LocalProvisionFetch::new(
@@ -115,7 +115,7 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 64,
                     max_ids_per_request: 16,
-                    parallel_chunks_per_tick: 2,
+                    chunks_per_dispatch: 2,
                 },
             ),
             state_proof: StateProofFetch::new("state_proof", STATE_PROOF_FETCH),
@@ -125,7 +125,7 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 8,
-                    parallel_chunks_per_tick: 2,
+                    chunks_per_dispatch: 2,
                 },
             ),
         }

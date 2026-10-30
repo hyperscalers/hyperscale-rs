@@ -8,7 +8,7 @@
 //!   request. The concrete impls live with their subsystem state
 //!   (`shard/{consensus,cross_shard,mempool}`, `beacon`); the `ProtocolEvent`
 //!   → in-flight-drain mapping lives outside the binding, in
-//!   `io_loop::drive_fetch_admission`.
+//!   `ShardLoop::drive_fetch_admission`.
 //! - [`ScopedAnswer`] is the contract for a binding whose request names one
 //!   scope and whose answer is checked against it; [`dispatch_scoped`] is
 //!   the one response boundary those bindings share.
@@ -41,13 +41,14 @@ pub struct FetchConfig {
     pub(crate) max_in_flight: usize,
     /// Maximum ids in a single chunked request.
     pub(crate) max_ids_per_request: usize,
-    /// Maximum chunks emitted from a single `Tick`.
-    pub(crate) parallel_chunks_per_tick: usize,
+    /// Maximum chunks one dispatch emits — one input's worth of sends,
+    /// whichever input freed the room.
+    pub(crate) chunks_per_dispatch: usize,
 }
 
 impl FetchConfig {
     /// A fetch schedule with its limits: ids in flight across every
-    /// entry, ids per request, and requests a tick may emit.
+    /// entry, ids per request, and requests one dispatch may emit.
     ///
     /// # Panics
     ///
@@ -56,16 +57,16 @@ impl FetchConfig {
     pub fn new(
         max_in_flight: usize,
         max_ids_per_request: usize,
-        parallel_chunks_per_tick: usize,
+        chunks_per_dispatch: usize,
     ) -> Self {
         assert!(
-            max_in_flight > 0 && max_ids_per_request > 0 && parallel_chunks_per_tick > 0,
+            max_in_flight > 0 && max_ids_per_request > 0 && chunks_per_dispatch > 0,
             "fetch limits must be positive",
         );
         Self {
             max_in_flight,
             max_ids_per_request,
-            parallel_chunks_per_tick,
+            chunks_per_dispatch,
         }
     }
 }
@@ -75,7 +76,7 @@ impl Default for FetchConfig {
         Self {
             max_in_flight: 400,
             max_ids_per_request: 50,
-            parallel_chunks_per_tick: 8,
+            chunks_per_dispatch: 8,
         }
     }
 }
@@ -109,7 +110,7 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
     },
     /// Payload for `ids` landed via fetch response, gossip, or local
-    /// production. Fed by `io_loop::drive_fetch_admission` on canonical
+    /// production. Fed by `ShardLoop::drive_fetch_admission` on canonical
     /// admission `ProtocolEvent`s. Records `record_fetch_completed` per
     /// id removed.
     Admitted {
@@ -117,7 +118,7 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
     },
     /// Consumer coordinator dropped its expectation for `ids`. Fed by
-    /// `io_loop`'s `Action::AbandonFetch` dispatcher. Records
+    /// the loop's `Action::AbandonFetch` dispatcher. Records
     /// `record_fetch_abandoned` per id removed — distinct from `Admitted`
     /// so the two populations are observable separately.
     Abandoned {
@@ -130,7 +131,8 @@ pub enum FetchInput<Id> {
         /// Ids in the chunk.
         ids: Vec<Id>,
     },
-    /// Drive pending fetches: emit chunks up to per-tick and global caps.
+    /// Drive pending fetches: emit chunks up to the per-dispatch and
+    /// global caps.
     /// Every id's inline retry is restored first.
     Tick,
 }
@@ -200,8 +202,7 @@ struct Entry {
     /// `None` while the entry is awaiting dispatch. Wall-clock-derived
     /// because this is observability-only: an alert on
     /// `oldest_in_flight_age_ms` fires when admission stops happening,
-    /// catching novel pin scenarios the existing per-drop notifications
-    /// haven't been wired for yet.
+    /// catching an id pinned in flight by a path that releases nothing.
     dispatched_at: Option<Stopwatch>,
     /// Who the in-flight attempt asked, or who the next one asks. A
     /// failure flips it, so the local seats and the committee's other
@@ -329,8 +330,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// Age in milliseconds of the longest-running in-flight entry, or
     /// `0` if nothing is in flight. Surfaced through `ShardIo::fetch_metrics`
     /// so an alert on `> N` catches admission paths that silently dropped
-    /// without notifying the FSM — the symptom that motivated the
-    /// provision-fetch robustness work in the first place.
+    /// without notifying the FSM.
     #[must_use]
     pub(crate) fn oldest_in_flight_age_ms(&self) -> u64 {
         let oldest = self
@@ -514,7 +514,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         'outer: for route in group_order {
             let ids = groups.remove(&route).expect("route just collected");
             for chunk in ids.chunks(self.config.max_ids_per_request) {
-                if chunks_emitted >= self.config.parallel_chunks_per_tick {
+                if chunks_emitted >= self.config.chunks_per_dispatch {
                     break 'outer;
                 }
                 let dispatched_at = Stopwatch::start();
@@ -971,7 +971,7 @@ impl Release {
 pub enum Intent {
     /// Add the ids to the pending set, to be asked of `shard`'s
     /// committee. No `Send` goes out here — chunks fan out under the
-    /// per-tick cap.
+    /// per-dispatch cap.
     Ask {
         /// Shard whose committee answers.
         shard: ShardId,
@@ -1156,7 +1156,7 @@ mod tests {
         FetchConfig {
             max_in_flight: 100,
             max_ids_per_request: 2,
-            parallel_chunks_per_tick: 4,
+            chunks_per_dispatch: 4,
         }
     }
 
@@ -1532,8 +1532,11 @@ mod tests {
         assert!(!p.has_pending());
     }
 
+    /// A re-ask restates the route of an id already in flight without
+    /// sending it again: the attempt out is unaffected, and the id's next
+    /// attempt goes where the latest ask said.
     #[test]
-    fn duplicate_request_keeps_existing_preferred() {
+    fn a_re_ask_restates_the_route_of_an_id_in_flight() {
         let mut p = Fetch::<TxHash>::new("test", config());
         let first = p.handle(FetchInput::Request {
             ids: vec![tx(1)],
@@ -1541,11 +1544,7 @@ mod tests {
             preferred: Some(vid(1)),
             class: None,
         });
-        // First request marks tx(1) in_flight under vid(1) and emits its Send.
         assert_eq!(first.len(), 1);
-        // Second Request adds tx(2) under vid(2); tx(1) keeps its original
-        // `preferred` because it's already in_flight and the entry is
-        // preserved by `or_insert_with`.
         let second = p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             shard: SHARD,
@@ -1555,7 +1554,17 @@ mod tests {
         assert_eq!(second.len(), 1);
         let FetchOutput::Send { route, ids } = &second[0];
         assert_eq!(route.preferred, Some(vid(2)));
-        assert_eq!(ids, &vec![tx(2)]);
+        assert_eq!(ids, &vec![tx(2)], "the id in flight is not sent again");
+
+        let retry = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(retry.len(), 1);
+        let FetchOutput::Send { route, ids } = &retry[0];
+        assert_eq!(ids, &vec![tx(1)]);
+        assert_eq!(
+            route.preferred,
+            Some(vid(2)),
+            "the retry goes where the latest ask said"
+        );
     }
 
     #[test]
@@ -1565,7 +1574,7 @@ mod tests {
             FetchConfig {
                 max_in_flight: 100,
                 max_ids_per_request: 50,
-                parallel_chunks_per_tick: 8,
+                chunks_per_dispatch: 8,
             },
         );
         let out = p.handle(FetchInput::Request {
@@ -1589,7 +1598,7 @@ mod tests {
             FetchConfig {
                 max_in_flight: 1,
                 max_ids_per_request: 10,
-                parallel_chunks_per_tick: 4,
+                chunks_per_dispatch: 4,
             },
         );
         let out = p.handle(FetchInput::Request {
@@ -1616,7 +1625,7 @@ mod tests {
             FetchConfig {
                 max_in_flight: 3,
                 max_ids_per_request: 10,
-                parallel_chunks_per_tick: 4,
+                chunks_per_dispatch: 4,
             },
         );
         p.handle(FetchInput::Request {

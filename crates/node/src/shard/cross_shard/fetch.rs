@@ -38,7 +38,7 @@ use crate::shard::{ShardIo, ShardScopedInput};
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].
 pub type LocalProvisionFetch = Fetch<ProvisionHash>;
-/// Finalization fetch keyed by [`TickId`].
+/// Finalization fetch keyed by [`FinalizationHash`].
 pub type FinalizationFetch = Fetch<FinalizationHash>;
 /// Cross-shard provision fetch keyed by
 /// `(source_shard, target_shard, block_height)`. `source_shard` selects
