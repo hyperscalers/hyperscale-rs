@@ -41,6 +41,7 @@ mod config;
 pub mod event;
 mod fetch;
 mod host;
+mod network_lane;
 mod process;
 mod replica;
 pub mod reshape;

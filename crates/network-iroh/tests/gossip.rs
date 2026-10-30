@@ -19,6 +19,7 @@ use hyperscale_network_iroh::{
     AddVnodeError, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager,
     RequestManagerConfig, RequestPool, RequestStreams,
 };
+use hyperscale_node::event::{HostEvent, ShardScopedInput, network_lane};
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, GossipScope, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees,
@@ -129,6 +130,27 @@ impl NetworkMessage for Vote {
         MessageClass::Consensus
     }
 }
+
+/// A notification as large as a busy peer's, as far as the transport is
+/// concerned.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Bulk {
+    seq: u64,
+    body: Vec<u8>,
+}
+
+impl NetworkMessage for Bulk {
+    fn message_type_id() -> &'static str {
+        "test.bulk"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Bulk
+    }
+}
+
+/// Places in the shard lane a quota test fills.
+const QUOTA_LANE: usize = 4;
 
 /// Votes a cooled down peer sends while it is watched.
 const VOTES_WHILE_COOLING: u64 = 10;
@@ -1079,6 +1101,64 @@ async fn a_handler_is_told_which_peer_handed_it_each_notification() {
     let mut heard = heard.lock().unwrap().clone();
     heard.sort_by_key(|(vote, _)| *vote);
     assert_eq!(heard, vec![(1, peer_of(1)), (2, peer_of(2))]);
+}
+
+/// A peer that holds a shard's network lane past its share, once another
+/// peer wants room there, is refused as ignored and cooled down; the other
+/// peer, within its share, is refused for want of room and owes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_past_its_share_of_a_full_lane_is_cooled_down_and_one_within_it_is_not() {
+    let fixtures = TestFixtures::new(21, 3);
+    let (receiver, flooder, honest) = counted_trio(&fixtures).await;
+    // The shard's driver is stalled: nothing drains the lane.
+    let (lane, _stalled) = network_lane(QUOTA_LANE);
+    let offered = lane.clone();
+    receiver
+        .network
+        .register_notification_handler(move |_: Bulk, provenance: Provenance| {
+            let Provenance::Peer(peer) = provenance else {
+                return Verdict::Accept;
+            };
+            let event = HostEvent::shard(ShardId::ROOT, ShardScopedInput::FetchTick);
+            offered.offer(event, peer).verdict()
+        });
+    let bulk = |seq| Bulk {
+        seq,
+        body: vec![7; BUSY_HEADER_BYTES],
+    };
+
+    // The flooder fills the lane while it is the only peer using it.
+    for seq in 0..QUOTA_LANE as u64 {
+        flooder.network.notify(&[vid(0)], &bulk(seq));
+    }
+    wait_for("the flooder fills the lane", || lane.held() == QUOTA_LANE).await;
+
+    let flood = Arc::clone(&flooder.network);
+    let flooding = spawn(async move {
+        let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+        let mut seq = QUOTA_LANE as u64;
+        loop {
+            tick.tick().await;
+            flood.notify(&[vid(0)], &bulk(seq));
+            seq += 1;
+        }
+    });
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..u64::from(HONEST_RATE * BUSY_WATCH_SECS) {
+        tick.tick().await;
+        honest.network.notify(&[vid(0)], &bulk(seq));
+    }
+    flooding.abort();
+
+    assert!(
+        receiver.adapter.cooling_down(vid(1)),
+        "the flooder past its share is cooled down"
+    );
+    assert!(
+        !receiver.adapter.cooling_down(vid(2)),
+        "a peer within its share owes nothing for a full lane"
+    );
+    assert_eq!(lane.held_by(PeerId::new(2)), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -47,13 +47,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Sender, TrySendError};
+use crossbeam::channel::Sender;
 pub use fetch_dispatch::FetchTicker;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
-use hyperscale_metrics::record_network_input_refused;
+use hyperscale_metrics::{record_network_input_over_share, record_network_input_refused};
 use hyperscale_network::{Network, Provenance};
 use hyperscale_storage::{
     AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
@@ -67,7 +67,7 @@ pub use io::ShardIo;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
 use crate::event::{
-    BeaconScopedInput, HostEvent, ShardInbox, ShardScopedInput, StepOutput, TimerOp,
+    BeaconScopedInput, HostEvent, Offer, ShardInbox, ShardScopedInput, StepOutput, TimerOp,
 };
 use crate::fetch::Release;
 use crate::process::ProcessIo;
@@ -222,20 +222,22 @@ pub fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: Protoc
 
 /// Offer an input a message brought to `shard`'s network lane.
 ///
-/// `false` when the lane is full: the input is dropped and counted, never
-/// queued past the lane's bound, and the handler answers the message as
-/// [`Verdict::Busy`](hyperscale_network::Verdict::Busy). A closed lane
-/// takes the input as [`push_shard_input`] does. A message this host sent
-/// itself ([`Provenance::Local`]) goes on the internal lane instead: the
-/// bound is on what peers may queue here, not on what the host itself
-/// produced.
+/// A refused input is dropped and counted, never queued past the lane's
+/// bound, and the handler answers the message with the offer's
+/// [`Offer::verdict`]: [`Verdict::Busy`](hyperscale_network::Verdict::Busy)
+/// when the lane is full and the sending peer within its share,
+/// [`Verdict::Ignore`](hyperscale_network::Verdict::Ignore) when the peer
+/// is past it. A closed lane takes the input as [`push_shard_input`]
+/// does. A message this host sent itself ([`Provenance::Local`]) goes on
+/// the internal lane instead: the bound is on what peers may queue here,
+/// not on what the host itself produced.
 #[must_use]
 pub fn offer_network_input(
     inbox: &ShardInbox,
     shard: ShardId,
     input: ShardScopedInput,
     provenance: Provenance,
-) -> bool {
+) -> Offer {
     offer_network(inbox, HostEvent::shard(shard, input), provenance)
 }
 
@@ -246,24 +248,28 @@ pub fn offer_network_event(
     shard: ShardId,
     event: ProtocolEvent,
     provenance: Provenance,
-) -> bool {
+) -> Offer {
     offer_network(inbox, HostEvent::protocol(shard, event), provenance)
 }
 
-fn offer_network(inbox: &ShardInbox, event: HostEvent, provenance: Provenance) -> bool {
-    if provenance == Provenance::Local {
+fn offer_network(inbox: &ShardInbox, event: HostEvent, provenance: Provenance) -> Offer {
+    let Provenance::Peer(peer) = provenance else {
         let _ = inbox.internal().send(event);
-        return true;
-    }
-    match inbox.network().try_send(event) {
-        Ok(()) | Err(TrySendError::Disconnected(_)) => true,
-        Err(TrySendError::Full(event)) => {
-            if let HostEvent::Shard(shard, _) = &event {
-                record_network_input_refused(shard.inner(), event.type_name());
-            }
-            false
+        return Offer::Taken;
+    };
+    let (shard, kind) = match &event {
+        HostEvent::Shard(shard, _) => (Some(*shard), event.type_name()),
+        _ => (None, event.type_name()),
+    };
+    let offer = inbox.offer(event, peer);
+    if let Some(shard) = shard {
+        match offer {
+            Offer::Taken => {}
+            Offer::Full => record_network_input_refused(shard.inner(), kind),
+            Offer::OverShare => record_network_input_over_share(shard.inner()),
         }
     }
+    offer
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1564,31 +1570,34 @@ mod tests {
     /// answers is released rather than stranded behind peer traffic.
     #[test]
     fn a_fetch_answer_is_released_past_a_full_network_lane() {
-        use crossbeam::channel::{bounded, unbounded};
+        use crossbeam::channel::unbounded;
         use hyperscale_core::FetchIds;
+        use hyperscale_network::PeerId;
 
-        use crate::event::{ShardInbox, ShardScopedInput};
+        use crate::event::{Offer, ShardInbox, ShardScopedInput, network_lane};
         use crate::fetch::{FetchReply, ShardReply};
 
         let fix = Fixture::new();
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
         let (internal_tx, internal) = unbounded();
-        let (network_tx, _network) = bounded(1);
+        let (lane, _network) = network_lane(1);
         let (beacon_tx, _beacon) = unbounded();
-        let mut host = fix.host_with_inbox(
-            registry,
-            beacon_tx,
-            ShardInbox::new(internal_tx, network_tx.clone()),
+        let inbox = ShardInbox::new(internal_tx, lane);
+        let mut host = fix.host_with_inbox(registry, beacon_tx, inbox.clone());
+        assert_eq!(
+            inbox.offer(
+                HostEvent::shard(SHARD, ShardScopedInput::FetchTick),
+                PeerId::new(1)
+            ),
+            Offer::Taken,
+            "the lane has room for one",
         );
-        network_tx
-            .try_send(HostEvent::shard(SHARD, ShardScopedInput::FetchTick))
-            .expect("the lane has room for one");
         while internal.try_recv().is_ok() {}
 
         let sender = loop_of(&mut host).event_sender().clone();
         assert!(
-            !sender.same_channel(&network_tx),
-            "the loop's own sender is not its network lane",
+            sender.same_channel(inbox.internal()),
+            "the loop's own sender is its internal lane",
         );
         let ids = FetchIds::Transactions(Vec::new());
         ShardReply {

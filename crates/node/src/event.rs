@@ -24,7 +24,7 @@ use crossbeam::channel::Sender;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_core::{CommitSource, FetchIds, ParticipationChange, ProtocolEvent, TimerId};
-use hyperscale_network::RequestError;
+use hyperscale_network::{PeerId, RequestError};
 use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
@@ -35,6 +35,9 @@ use hyperscale_types::{
     Transaction, TransactionStatus, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
+pub use crate::network_lane::{
+    NetworkInput, NetworkLane, NetworkLaneReceiver, Offer, network_lane,
+};
 use crate::shard::commit::QcOnlyDivergence;
 use crate::shard::mempool::DeferredTransaction;
 
@@ -841,25 +844,31 @@ const _: () = assert!(NETWORK_LANE_CAPACITY >= 4 * MAX_GOSSIP_TX_BATCH);
 
 /// The two lanes into one hosted shard's driver.
 ///
-/// `network` takes what peers send unbidden (gossip and notifications)
-/// and may be bounded: a push that finds it full is refused, never
-/// queued, so a stalled driver cannot make peer traffic pile up without
-/// bound. `internal` takes everything the host itself produced (the
-/// loop's own continuations, off-thread results, the answers to its own
-/// fetches, the beacon loop's reports, RPC submissions) and is never
-/// bounded: each item there is owed to a state machine that is waiting
-/// on it. The driver drains both, keeping each lane's own order.
+/// The network lane takes what peers send unbidden (gossip and
+/// notifications) and is bounded: a push that finds it full, or that
+/// would take its peer past its share of it, is refused, never queued, so
+/// a stalled driver cannot make peer traffic pile up without bound and
+/// no one peer can keep it full. `internal` takes everything the host
+/// itself produced (the loop's own continuations, off-thread results, the
+/// answers to its own fetches, the beacon loop's reports, RPC
+/// submissions) and is never bounded: each item there is owed to a state
+/// machine that is waiting on it. The driver drains both, keeping each
+/// lane's own order.
 #[derive(Debug, Clone)]
 pub struct ShardInbox {
     internal: Sender<HostEvent>,
-    network: Sender<HostEvent>,
+    /// `None` when peers' inputs share the internal lane's channel.
+    network: Option<NetworkLane>,
 }
 
 impl ShardInbox {
     /// An inbox over its two lanes.
     #[must_use]
-    pub const fn new(internal: Sender<HostEvent>, network: Sender<HostEvent>) -> Self {
-        Self { internal, network }
+    pub const fn new(internal: Sender<HostEvent>, network: NetworkLane) -> Self {
+        Self {
+            internal,
+            network: Some(network),
+        }
     }
 
     /// The lane for the host's own continuations and answers.
@@ -868,19 +877,28 @@ impl ShardInbox {
         &self.internal
     }
 
-    /// The lane for inputs peers send unbidden.
+    /// Offer `event`, sent by `peer`, to the lane for inputs peers send
+    /// unbidden. An inbox whose lanes share one channel takes it there.
     #[must_use]
-    pub const fn network(&self) -> &Sender<HostEvent> {
-        &self.network
+    pub fn offer(&self, event: HostEvent, peer: PeerId) -> Offer {
+        if let Some(lane) = &self.network {
+            return lane.offer(event, peer);
+        }
+        let _ = self.internal.send(event);
+        Offer::Taken
     }
 }
 
 /// Both lanes on one channel: one driver draining a single receiver in
 /// the order it was pushed, as the simulation harness does. An unbounded
-/// channel never refuses a push, so the lane's bound never applies.
+/// channel never refuses a push, so neither the lane's bound nor any
+/// peer's share of it applies.
 impl From<Sender<HostEvent>> for ShardInbox {
     fn from(sender: Sender<HostEvent>) -> Self {
-        Self::new(sender.clone(), sender)
+        Self {
+            internal: sender,
+            network: None,
+        }
     }
 }
 

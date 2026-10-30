@@ -142,6 +142,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// was full, by shard and input kind.
     fn record_network_input_refused(&self, shard: u64, kind: &str) {}
 
+    /// An inbound network input refused because its peer already held its
+    /// share of its shard's network lane, by shard.
+    fn record_network_input_over_share(&self, shard: u64) {}
+
     /// Record execution latency.
     fn record_execution_latency(&self, latency_secs: f64) {}
 
@@ -755,6 +759,12 @@ pub fn set_shard_channel_depths(shard: u64, callback: usize, network: usize, tim
 #[inline]
 pub fn record_network_input_refused(shard: u64, kind: &str) {
     recorder().record_network_input_refused(shard, kind);
+}
+
+/// Record an inbound network input refused for its peer's share of the lane.
+#[inline]
+pub fn record_network_input_over_share(shard: u64) {
+    recorder().record_network_input_over_share(shard);
 }
 
 /// Record execution latency.

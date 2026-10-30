@@ -9,14 +9,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{Receiver, Sender, bounded, never, unbounded};
+use crossbeam::channel::{Receiver, Sender, never, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_core::{ParticipationChange, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics::set_shard_channel_depths;
 use hyperscale_network_iroh::IrohNetwork;
 use hyperscale_node::event::{
-    HostEvent, NETWORK_LANE_CAPACITY, ShardInbox, StepOutput, TimerOp, TimerOwner, timer_event,
+    HostEvent, NETWORK_LANE_CAPACITY, NetworkLaneReceiver, ShardInbox, StepOutput, TimerOp,
+    TimerOwner, network_lane, timer_event,
 };
 use hyperscale_node::{ShardLoop, ThreadShardLoop};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
@@ -83,7 +84,8 @@ impl ShardChannels {
 }
 
 /// The receiving ends of a shard's [`ShardInbox`]: an unbounded internal
-/// lane and a network lane bounded at the capacity it was built with.
+/// lane and a network lane bounded at the capacity it was built with,
+/// each input it gives up leaving its peer's share of it.
 ///
 /// The thread takes one input at a time, and while both lanes hold one it
 /// takes them in turn, so neither lane waits on more than one input of
@@ -91,7 +93,7 @@ impl ShardChannels {
 /// pushed.
 pub struct ShardInputs {
     internal: Receiver<HostEvent>,
-    network: Receiver<HostEvent>,
+    network: NetworkLaneReceiver,
     /// Whether the network lane is next when both hold an input.
     network_next: bool,
 }
@@ -106,7 +108,7 @@ enum Lane {
 impl ShardInputs {
     fn new(network_capacity: usize) -> (Self, ShardInbox) {
         let (internal_tx, internal) = unbounded();
-        let (network_tx, network) = bounded(network_capacity);
+        let (network_tx, network) = network_lane(network_capacity);
         (
             Self {
                 internal,
@@ -125,17 +127,13 @@ impl ShardInputs {
             [Lane::Internal, Lane::Network]
         };
         order.into_iter().find_map(|lane| {
-            let event = self.lane(lane).try_recv().ok()?;
+            let event = match lane {
+                Lane::Internal => self.internal.try_recv().ok(),
+                Lane::Network => self.network.try_recv(),
+            }?;
             self.took(lane);
             Some(event)
         })
-    }
-
-    const fn lane(&self, lane: Lane) -> &Receiver<HostEvent> {
-        match lane {
-            Lane::Internal => &self.internal,
-            Lane::Network => &self.network,
-        }
     }
 
     /// Pass the turn to the other lane once `lane` gave an input.
@@ -153,7 +151,7 @@ impl ShardInputs {
         }
         match lane {
             Lane::Internal => self.internal = never(),
-            Lane::Network => self.network = never(),
+            Lane::Network => self.network.close(),
         }
         None
     }
@@ -312,7 +310,9 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
                     break 'recv None;
                 }
                 recv(config.inputs.internal) -> e => (Lane::Internal, e.ok()),
-                recv(config.inputs.network) -> e => (Lane::Network, e.ok()),
+                recv(config.inputs.network.receiver()) -> e => {
+                    (Lane::Network, e.ok().map(|input| config.inputs.network.take(input)))
+                }
                 default(timeout) => break 'recv None,
             };
             config.inputs.received(input.0, input.1)
@@ -505,8 +505,8 @@ pub fn spawn_shard_loop(
 
 #[cfg(test)]
 mod tests {
-    use crossbeam::channel::TrySendError;
-    use hyperscale_node::event::{HostEvent, ShardScopedInput};
+    use hyperscale_network::PeerId;
+    use hyperscale_node::event::{HostEvent, Offer, ShardScopedInput};
     use hyperscale_types::ShardId;
 
     use super::ShardInputs;
@@ -524,6 +524,9 @@ mod tests {
         }
     }
 
+    const PEER: PeerId = PeerId::new(1);
+    const OTHER: PeerId = PeerId::new(2);
+
     /// A full network lane refuses a push at once, and takes nothing from
     /// the internal lane: the thread takes the lanes in turn while both
     /// hold inputs, each lane in the order it was pushed, and drains the
@@ -538,16 +541,11 @@ mod tests {
                 .expect("internal lane open");
         }
         for tag in 10..12 {
-            inbox
-                .network()
-                .try_send(input(tag))
-                .expect("network lane has room");
+            assert_eq!(inbox.offer(input(tag), PEER), Offer::Taken);
         }
-        assert!(
-            matches!(
-                inbox.network().try_send(input(12)),
-                Err(TrySendError::Full(_))
-            ),
+        assert_eq!(
+            inbox.offer(input(12), OTHER),
+            Offer::Full,
             "a full network lane refuses the push",
         );
         inbox
@@ -559,5 +557,24 @@ mod tests {
             .map(|event| tag(&event))
             .collect();
         assert_eq!(order, vec![0, 10, 1, 11, 2, 3, 4]);
+    }
+
+    /// The thread's drain releases each input from its peer's share: a peer
+    /// refused past its share while it held the lane fills it again once
+    /// the thread has drained it.
+    #[test]
+    fn the_threads_drain_returns_each_peers_share() {
+        let (mut inputs, inbox) = ShardInputs::new(4);
+        for tag in 0..4 {
+            assert_eq!(inbox.offer(input(tag), PEER), Offer::Taken);
+        }
+        assert_eq!(inbox.offer(input(4), OTHER), Offer::Full);
+        assert_eq!(inbox.offer(input(5), PEER), Offer::OverShare);
+
+        assert_eq!(std::iter::from_fn(|| inputs.try_recv()).count(), 4);
+        for tag in 0..2 {
+            assert_eq!(inbox.offer(input(tag), PEER), Offer::Taken);
+            assert_eq!(inbox.offer(input(tag), OTHER), Offer::Taken);
+        }
     }
 }
