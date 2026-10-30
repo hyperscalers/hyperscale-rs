@@ -674,10 +674,13 @@ where
 
         // ── ready_signal → verify sender signature, then ProtocolEvent::ReadySignalReceived ─
         //
-        // The signal doesn't carry shard provenance — its only identity
-        // is the sender's `validator_id`. Fan out to every hosted shard
-        // and let each pool drop the signal if the sender isn't in that
-        // shard's committee.
+        // The signal names the shard whose state its sender synced, and
+        // the committees that take it all sit on that shard's trie line:
+        // the shard's own committee for a joining member, the splitting
+        // parent's for an observer readying a child, and each merging
+        // child's for a keeper readying the parent. Only hosted shards on
+        // that line are offered it; each pool drops the signal if the
+        // sender holds no seat it admits.
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
@@ -686,8 +689,19 @@ where
             .network
             .register_notification_handler::<ReadySignalNotification>(
                 move |notification: ReadySignalNotification| -> Verdict {
-                    let topo = topology_snapshot.load();
                     let signal = notification.signal;
+                    let line = signal.shard();
+                    let senders = senders.load();
+                    let mut targets = senders
+                        .iter()
+                        .filter(|(hosted, _)| {
+                            hosted.is_ancestor_of(line) || line.is_ancestor_of(**hosted)
+                        })
+                        .peekable();
+                    if targets.peek().is_none() {
+                        return Verdict::Ignore;
+                    }
+                    let topo = topology_snapshot.load();
                     let sender = signal.validator_id();
                     let Some(public_key) = topo.public_key(sender) else {
                         warn!(
@@ -710,7 +724,7 @@ where
                         );
                         return Verdict::Reject;
                     }
-                    offer_to_each(senders.load().iter(), signal, |signal| {
+                    offer_to_each(targets, signal, |signal| {
                         ProtocolEvent::ReadySignalReceived { signal }
                     })
                 },
@@ -1363,5 +1377,66 @@ mod tests {
             Some(Verdict::Accept),
             "a refused copy is taken once the lane has room",
         );
+    }
+    /// A ready signal reaches the hosted shards on its shard's trie line,
+    /// the splitting parent of the child it readies among them, and no
+    /// hosted shard off that line.
+    #[test]
+    fn a_ready_signal_reaches_only_the_shards_on_its_line() {
+        use hyperscale_core::ProtocolEvent;
+        use hyperscale_types::network::notification::ReadySignalNotification;
+        use hyperscale_types::{NetworkDefinition, ReadySignal, ShardId, WeightedTimestamp};
+
+        let fix = Fixture::new();
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (internal_tx, _internal) = unbounded();
+        let (network_tx, network) = unbounded();
+        let (beacon_tx, _beacon) = unbounded();
+        let host = fix.host_with_inbox(
+            Arc::clone(&registry),
+            beacon_tx,
+            ShardInbox::new(internal_tx, network_tx),
+        );
+        host.register_notification_handlers();
+        let (validator, signer) = fix.identity(2);
+        let signal_for = |shard: ShardId| {
+            ReadySignalNotification::new(
+                ReadySignal::sign(
+                    &NetworkDefinition::simulator(),
+                    validator,
+                    shard,
+                    WeightedTimestamp::ZERO,
+                    WeightedTimestamp::ZERO,
+                    signer.as_ref(),
+                )
+                .expect("the validator's key signs"),
+            )
+        };
+        let (left, right) = SHARD.children();
+        let sibling = ShardId::leaf(1, 1);
+        let delivered = |shard: ShardId| {
+            assert!(registry.local_dispatch_notification(&signal_for(shard)));
+            network
+                .try_iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        HostEvent::Shard(hosted, ShardScopedInput::Protocol(event))
+                            if *hosted == SHARD
+                                && matches!(**event, ProtocolEvent::ReadySignalReceived { .. })
+                    )
+                })
+                .count()
+        };
+
+        assert_eq!(delivered(SHARD), 1, "a signal for the shard itself");
+        assert_eq!(delivered(left), 1, "an observer readying a child");
+        assert_eq!(delivered(right), 1, "an observer readying the other child");
+        assert_eq!(
+            delivered(ShardId::ROOT),
+            1,
+            "a keeper readying the merged parent"
+        );
+        assert_eq!(delivered(sibling), 0, "a signal for a shard off the line");
     }
 }
