@@ -46,9 +46,9 @@ use super::{SimulationRunner, open_store};
 /// Every answer this harness serves comes from an honest host's store, so
 /// the screen production scores peers by must pass it: a rejection here is
 /// a screen that would score honest peers.
-fn honestly_served(verdict: ResponseVerdict) {
+fn honestly_served(verdict: &ResponseVerdict) {
     assert_eq!(
-        verdict,
+        *verdict,
         ResponseVerdict::Accept,
         "the reshape screen rejected an honest store's answer",
     );
@@ -329,7 +329,7 @@ impl SimulationRunner {
                 // empty batch is delivered as production delivers it, and the
                 // walk paces its next ask.
                 let response = self.serve_reshape_headers(from, &request);
-                honestly_served(headers_verdict(&request, &response));
+                honestly_served(&headers_verdict(&request, &response));
                 Some(ReshapeEvent::Fetched {
                     duty,
                     from,
@@ -342,7 +342,7 @@ impl SimulationRunner {
                 // A height no host holds yet is answered `not_found`, as a
                 // production peer answers it, and the duty paces its next ask.
                 let response = self.serve_reshape_block(from, &request);
-                honestly_served(block_verdict(&request, &response));
+                honestly_served(&block_verdict(&request, &response));
                 Some(ReshapeEvent::Fetched {
                     duty,
                     from,

@@ -576,7 +576,21 @@ async fn a_partitioned_peer_gets_neither_notification_nor_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_responder_that_answers_with_garbage_is_seldom_asked() {
-    let fixtures = TestFixtures::new(21, 4);
+    a_garbage_responder_is_seldom_asked(21, false).await;
+}
+
+/// An answer whose verdict waits on a check counts against its responder
+/// once the check finds it false, as one rejected at once does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_responder_whose_deferred_answers_are_found_false_is_seldom_asked() {
+    a_garbage_responder_is_seldom_asked(23, true).await;
+}
+
+/// One of three responders answers every request falsely; the asker
+/// refuses each such answer, at once or, with `deferred`, through a check
+/// that settles after the callback returns.
+async fn a_garbage_responder_is_seldom_asked(seed: u64, deferred: bool) {
+    let fixtures = TestFixtures::new(seed, 4);
     let asker = host(&fixtures, &[0], &[], Vec::new()).await;
     // Each responder, and how many requests it served.
     let mut responders = Vec::new();
@@ -620,20 +634,31 @@ async fn a_responder_that_answers_with_garbage_is_seldom_asked() {
                 Echo(n),
                 None,
                 Box::new(move |outcome: Result<Echoed, RequestError>| {
-                    let good = matches!(outcome, Ok(Echoed(m)) if m == n);
-                    let _ = tx.send(good);
-                    if good {
-                        ResponseVerdict::Accept
-                    } else {
-                        ResponseVerdict::Reject
+                    let answer = match outcome {
+                        Ok(Echoed(m)) => Some(m),
+                        Err(_) => None,
+                    };
+                    let _ = tx.send(answer);
+                    match answer {
+                        Some(m) if deferred => ResponseVerdict::defer(VerdictKey::of(&(n, m))),
+                        Some(m) if m == n => ResponseVerdict::Accept,
+                        _ => ResponseVerdict::Reject,
                     }
                 }),
             );
-            let good = timeout(BUDGET, rx.recv())
+            let answer = timeout(BUDGET, rx.recv())
                 .await
                 .expect("the request resolves")
                 .expect("the callback runs");
-            if good {
+            if deferred && let Some(m) = answer {
+                let verdict = if m == n {
+                    Verdict::Accept
+                } else {
+                    Verdict::Reject
+                };
+                asker.network.settle(VerdictKey::of(&(n, m)), verdict);
+            }
+            if answer == Some(n) {
                 break;
             }
         }

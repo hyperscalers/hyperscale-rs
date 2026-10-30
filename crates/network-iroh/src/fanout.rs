@@ -55,6 +55,7 @@ use hyperscale_metrics::{
     record_network_message_sent,
 };
 use hyperscale_network::compression::{compress, decompress};
+use hyperscale_network::deferred::{DEFER_TIMEOUT, Deferred, Waiting};
 use hyperscale_network::{
     Deferral, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, Verdict, VerdictKey,
 };
@@ -75,7 +76,6 @@ use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
 use crate::cooldown::{Cooldown, Refusal, refused_work};
-use crate::deferred::{Deferred, Waiting};
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
@@ -141,10 +141,6 @@ const JUDGED_AT_ONCE_PER_PEER: usize = 4;
 /// Each check runs on this host's own pools, so the bound is on the work a
 /// peer can have queued before the verdicts that cool it down arrive.
 const DEFERRED_PER_PEER: usize = 64;
-
-/// Longest this host waits on a deferred verdict. An item still unsettled
-/// then is dropped as one it could not judge.
-const DEFER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where a gossip item is addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,14 +20,17 @@
 use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{GossipMessage, GossipScope, NetworkMessage, Request, ShardId};
 
-use crate::traits::{GossipHandler, NotificationHandler, RequestHandler, Verdict, VerdictKey};
+use crate::deferred::{Deferred, WaitId, Waiting};
+use crate::traits::{
+    Deferral, GossipHandler, NotificationHandler, RequestHandler, Verdict, VerdictKey,
+};
 
 /// Type-erased gossip handler: receives decompressed wire bytes plus the
 /// shard the topic encoded (`None` for global-scoped topics), and returns
@@ -130,6 +133,17 @@ const DEFERRED_CACHE_CAPACITY: usize = 4 * DEDUP_CACHE_CAPACITY;
 /// The type and content key of each copy whose verdict a check settles
 /// later, by the item the check settles.
 type DeferredContent = BoundedCache<VerdictKey, (TypeId, u64)>;
+
+/// Definite settlements the answer waits remember. An answer's wait is
+/// recorded only once its callback returns, after it has handed the
+/// answer to the check that settles it, so a check can finish first; the
+/// window spans the few settlements of other items that can land meanwhile
+/// many times over.
+const ANSWERS_SETTLED_REMEMBERED: usize = 4096;
+
+/// How a transport scores the peer behind an answer whose verdict was
+/// deferred, once the checks it waited on settle.
+pub type AnswerScore = Box<dyn FnOnce(&Verdict) + Send>;
 
 struct TypedGossipDispatcher<M, H> {
     handler: Arc<H>,
@@ -352,6 +366,8 @@ pub struct HandlerRegistry {
     local_host_gossip: ArcSwap<HashMap<TypeId, Arc<dyn LocalHostGossipDispatcher>>>,
     /// Copies of keyed content whose verdict a check settles later.
     deferred_content: Arc<DeferredContent>,
+    /// Answers whose peers wait on a deferred verdict to be scored.
+    answers: Mutex<Waiting<AnswerScore>>,
 }
 
 impl HandlerRegistry {
@@ -369,6 +385,7 @@ impl HandlerRegistry {
             local_request: ArcSwap::from_pointee(HashMap::new()),
             local_host_gossip: ArcSwap::from_pointee(HashMap::new()),
             deferred_content: Arc::new(bounded_cache(DEFERRED_CACHE_CAPACITY)),
+            answers: Mutex::new(Waiting::remembering(ANSWERS_SETTLED_REMEMBERED)),
         }
     }
 
@@ -723,7 +740,20 @@ impl HandlerRegistry {
     /// [`crate::Network::settle`]): a copy whose check found it false, or
     /// left this host unable to judge it, no longer keeps later copies of
     /// its content from their handlers.
+    /// Every answer that waited on it and has its verdict now is scored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the answer waits' lock is poisoned.
     pub fn settle(&self, key: VerdictKey, verdict: &Verdict) {
+        let scored = self
+            .answers
+            .lock()
+            .expect("answer waits lock")
+            .settle(key, verdict.clone());
+        for (score, verdict) in scored {
+            score(&verdict);
+        }
         let Some((message_type, content)) = self.deferred_content.get(&key) else {
             return;
         };
@@ -733,6 +763,50 @@ impl HandlerRegistry {
         {
             dispatcher.forget(content);
         }
+    }
+
+    /// Hold `score` for an answer whose verdict `deferral` defers, until the
+    /// checks it names settle through [`Self::settle`]. Returns the wait for
+    /// the transport to give up through [`Self::expire_answer`] after
+    /// [`DEFER_TIMEOUT`](crate::deferred::DEFER_TIMEOUT), or `None` when
+    /// every check had settled already and `score` has run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the answer waits' lock is poisoned.
+    pub fn await_answer(&self, deferral: &Deferral, score: AnswerScore) -> Option<WaitId> {
+        let deferred = self
+            .answers
+            .lock()
+            .expect("answer waits lock")
+            .defer(deferral.keys(), score);
+        match deferred {
+            Deferred::Waits(id) => Some(id),
+            Deferred::Settled(score, verdict) => {
+                score(&verdict);
+                None
+            }
+        }
+    }
+
+    /// Give up on the answer wait `id`, if it still waits: its peer is not
+    /// scored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the answer waits' lock is poisoned.
+    pub fn expire_answer(&self, id: WaitId) {
+        self.answers.lock().expect("answer waits lock").expire(id);
+    }
+
+    /// How many answers wait on a deferred verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the answer waits' lock is poisoned.
+    #[must_use]
+    pub fn awaited_answers(&self) -> usize {
+        self.answers.lock().expect("answer waits lock").len()
     }
 
     /// Dispatch a typed notification message into its in-process handler,
@@ -1121,6 +1195,48 @@ mod tests {
         assert_eq!(deliver(&registry, &copy(1, false)), Some(Verdict::Ignore));
         assert_eq!(deliver(&registry, &copy(2, false)), Some(Verdict::Accept));
         assert_eq!(handled.load(Ordering::SeqCst), 2);
+    }
+
+    /// An answer's deferred verdict scores it once, when its check
+    /// settles, or at once when the check settled before the wait; a
+    /// wait given up scores nothing.
+    #[test]
+    fn a_deferred_answer_is_scored_once_by_its_check() {
+        let registry = HandlerRegistry::new(BTreeSet::new());
+        let scored = Arc::new(Mutex::new(Vec::new()));
+        let score = || -> AnswerScore {
+            let scored = Arc::clone(&scored);
+            Box::new(move |verdict: &Verdict| scored.lock().unwrap().push(verdict.clone()))
+        };
+        let (late, early, never) = (
+            VerdictKey::of(&1u8),
+            VerdictKey::of(&2u8),
+            VerdictKey::of(&3u8),
+        );
+        let deferral = |key| {
+            let Verdict::Defer(deferral) = Verdict::defer(key) else {
+                unreachable!("a deferral");
+            };
+            deferral
+        };
+
+        assert!(registry.await_answer(&deferral(late), score()).is_some());
+        registry.settle(late, &Verdict::Reject);
+        registry.settle(late, &Verdict::Reject);
+        assert_eq!(*scored.lock().unwrap(), vec![Verdict::Reject]);
+
+        registry.settle(early, &Verdict::Reject);
+        assert!(registry.await_answer(&deferral(early), score()).is_none());
+        assert_eq!(scored.lock().unwrap().len(), 2, "a check that came first");
+
+        let wait = registry
+            .await_answer(&deferral(never), score())
+            .expect("nothing settled it");
+        assert_eq!(registry.awaited_answers(), 1);
+        registry.expire_answer(wait);
+        assert_eq!(registry.awaited_answers(), 0);
+        registry.settle(never, &Verdict::Reject);
+        assert_eq!(scored.lock().unwrap().len(), 2, "a wait given up");
     }
 
     #[test]

@@ -13,14 +13,20 @@
 //! not remembered: the host may be able to judge it later.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
-use hyperscale_network::{Verdict, VerdictKey};
+use crate::{Verdict, VerdictKey};
 
-/// Definite settlements remembered. Checks settle every copy they run on,
-/// local ones included, so this is a window over the latest, not a set of
-/// every settlement. It holds minutes of committed headers, two parts each,
-/// from dozens of busy shards, and a large pool's ratify votes besides.
+/// Definite settlements remembered by default. Checks settle every copy
+/// they run on, local ones included, so this is a window over the latest,
+/// not a set of every settlement. It holds minutes of committed headers,
+/// two parts each, from dozens of busy shards, and a large pool's ratify
+/// votes besides.
 const SETTLED_REMEMBERED: usize = 65_536;
+
+/// Longest a transport waits on a deferred verdict. An item still
+/// unsettled then is given up as one this host could not judge.
+pub const DEFER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Names one wait.
 pub type WaitId = u64;
@@ -39,18 +45,14 @@ pub struct Waiting<T> {
     /// Whether each part settled lately held up.
     settled: HashMap<VerdictKey, bool>,
     settled_order: VecDeque<VerdictKey>,
+    /// How many definite settlements `settled` keeps.
+    remembered: usize,
     next: WaitId,
 }
 
 impl<T> Default for Waiting<T> {
     fn default() -> Self {
-        Self {
-            waiters: HashMap::new(),
-            by_part: HashMap::new(),
-            settled: HashMap::new(),
-            settled_order: VecDeque::new(),
-            next: 0,
-        }
+        Self::remembering(SETTLED_REMEMBERED)
     }
 }
 
@@ -64,6 +66,32 @@ pub enum Deferred<T> {
 }
 
 impl<T> Waiting<T> {
+    /// Items waiting, with the latest `remembered` definite settlements
+    /// kept for waits recorded after them.
+    #[must_use]
+    pub fn remembering(remembered: usize) -> Self {
+        Self {
+            waiters: HashMap::new(),
+            by_part: HashMap::new(),
+            settled: HashMap::new(),
+            settled_order: VecDeque::new(),
+            remembered,
+            next: 0,
+        }
+    }
+
+    /// How many items wait.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.waiters.len()
+    }
+
+    /// Whether no item waits.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
     /// Record that `item` waits on the checks of every item `parts` names.
     pub fn defer(&mut self, parts: &[VerdictKey], item: T) -> Deferred<T> {
         let mut outstanding = Vec::with_capacity(parts.len());
@@ -89,6 +117,7 @@ impl<T> Waiting<T> {
 
     /// Settle the part `key` names. Returns every item that has its
     /// verdict now, with that verdict.
+    #[must_use]
     pub fn settle(&mut self, key: VerdictKey, verdict: Verdict) -> Vec<(T, Verdict)> {
         let verdict = match verdict {
             Verdict::Defer(_) => Verdict::Ignore,
@@ -137,7 +166,7 @@ impl<T> Waiting<T> {
     fn remember(&mut self, key: VerdictKey, held: bool) {
         if self.settled.insert(key, held).is_none() {
             self.settled_order.push_back(key);
-            if self.settled_order.len() > SETTLED_REMEMBERED
+            if self.settled_order.len() > self.remembered
                 && let Some(oldest) = self.settled_order.pop_front()
             {
                 self.settled.remove(&oldest);

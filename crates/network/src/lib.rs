@@ -3,6 +3,7 @@
 //! This crate contains transport utilities and the `Network` trait:
 //!
 //! - [`compression`]: LZ4 compress/decompress helpers
+//! - [`deferred`]: items waiting on verdicts that checks settle later
 //! - [`fault`]: portable fault-injection vocabulary; the drop-rule engine behind `test-utils`
 //! - [`registry`]: `HandlerRegistry` for per-message-type handler storage/dispatch
 //! - [`retry`]: the request retry policy and peer health every transport runs
@@ -10,6 +11,7 @@
 //! - [`traits`]: `Network` trait for typed message sends and per-type handler registration
 
 pub mod compression;
+pub mod deferred;
 pub mod fault;
 pub mod registry;
 pub mod retry;
@@ -18,7 +20,7 @@ mod traits;
 
 pub use compression::CompressionError;
 pub use registry::{
-    HandlerRegistry, RawGossipHandler, RawHostGossipHandler, RawNotificationHandler,
+    AnswerScore, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, RawNotificationHandler,
     RawRequestHandler,
 };
 pub use traits::{

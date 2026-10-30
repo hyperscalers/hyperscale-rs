@@ -33,10 +33,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use blake3::Hasher as Blake3Hasher;
+use hyperscale_network::deferred::{DEFER_TIMEOUT, WaitId};
 use hyperscale_network::fault::{
     Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
@@ -44,7 +45,9 @@ use hyperscale_network::retry::{
     AllHeld, Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig,
 };
 use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
-use hyperscale_network::{Answerers, HandlerRegistry, RequestError, ResponseVerdict, compression};
+use hyperscale_network::{
+    Answerers, HandlerRegistry, RequestError, ResponseVerdict, Verdict, compression,
+};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
@@ -332,6 +335,20 @@ enum RequestEvent {
         on_response: ResponseCallback,
         result: Result<Vec<u8>, RequestError>,
     },
+    /// Give up on an answer's deferred verdict in the registry that held
+    /// it, which a restarted process no longer shares.
+    Expire {
+        registry: Arc<HandlerRegistry>,
+        wait: WaitId,
+    },
+}
+
+/// An answer whose deferred verdict found it false, waiting for the next
+/// flush to count it against its peer.
+struct RefusedAnswer {
+    requester: NodeIndex,
+    peer: NodeIndex,
+    empty: bool,
 }
 
 /// How an attempt ended at its requester.
@@ -576,6 +593,10 @@ pub struct SimulatedNetwork {
     /// Hosts whose process is down: nothing reaches them or leaves them,
     /// whatever the partitions say.
     down: BTreeSet<NodeIndex>,
+    /// Answers refused by a deferred verdict since the last flush. A
+    /// check settles on its host's thread, which holds no handle on the
+    /// requesters' peer health.
+    refused_answers: Arc<Mutex<Vec<RefusedAnswer>>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -588,6 +609,22 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("pending_notifications", &self.pending_notifications.len())
             .field("pending_requests", &self.pending_requests.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Count an answer its requester refused against the peer that gave it.
+/// An empty one says the peer did not hold what was asked; any other, or
+/// one that does not decode, says the peer answered falsely.
+fn refuse_answer(
+    health: &mut PeerHealthBook<NodeIndex>,
+    peer: NodeIndex,
+    empty: bool,
+    now: Duration,
+) {
+    if empty {
+        health.record_rejected(peer);
+    } else {
+        health.record_invalid(peer, now);
     }
 }
 
@@ -628,6 +665,7 @@ impl SimulatedNetwork {
             notifications_carried: BTreeMap::new(),
             geography,
             down: BTreeSet::new(),
+            refused_answers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -794,6 +832,10 @@ impl SimulatedNetwork {
     /// waiting on, the gossip it had seen, what it had learned of its
     /// peers — and its handlers with them, so the adapter a restarted
     /// process takes from [`Self::create_adapter`] starts empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refused answers' lock is poisoned.
     pub fn take_down(&mut self, node: NodeIndex) {
         let i = node as usize;
         self.down.insert(node);
@@ -802,6 +844,10 @@ impl SimulatedNetwork {
         self.gossip_seen[i].clear();
         self.peer_health[i] = PeerHealthBook::default();
         self.stream_backoff[i].clear();
+        self.refused_answers
+            .lock()
+            .expect("refused answers lock")
+            .retain(|refused| refused.requester != node);
     }
 
     /// Bring `node`'s process back up hosting `hosted`, the shards it
@@ -1130,6 +1176,7 @@ impl SimulatedNetwork {
         let mut stats = FulfillmentStats::default();
         let mut answered = 0;
         let mut steps = 0usize;
+        self.count_refused_answers(now);
         while let Some(Reverse(next)) = self.pending_requests.peek() {
             if next.time > now {
                 break;
@@ -1178,9 +1225,25 @@ impl SimulatedNetwork {
                     let _ = on_response(result);
                     answered += 1;
                 }
+                RequestEvent::Expire { registry, wait } => registry.expire_answer(wait),
             }
         }
         (answered, stats)
+    }
+
+    /// Count every answer a deferred verdict has refused since the last
+    /// flush against the peer that gave it, at `now`.
+    fn count_refused_answers(&mut self, now: Duration) {
+        let refused =
+            std::mem::take(&mut *self.refused_answers.lock().expect("refused answers lock"));
+        for RefusedAnswer {
+            requester,
+            peer,
+            empty,
+        } in refused
+        {
+            refuse_answer(&mut self.peer_health[requester as usize], peer, empty, now);
+        }
     }
 
     /// Send `request`'s next attempt to a peer whose stream is not backing
@@ -1505,15 +1568,33 @@ impl SimulatedNetwork {
                 };
                 let peer = open.attempts.peer();
                 let empty = (open.is_empty_response)(&bytes);
-                if (open.on_response)(Ok(bytes)) == ResponseVerdict::Reject {
-                    // An empty answer the caller rejects says the peer did
-                    // not hold what was asked; any other it rejects, or one
-                    // that does not decode, says the peer answered falsely.
-                    let health = &mut self.peer_health[requester as usize];
-                    if empty {
-                        health.record_rejected(peer);
-                    } else {
-                        health.record_invalid(peer, now);
+                match (open.on_response)(Ok(bytes)) {
+                    ResponseVerdict::Accept => {}
+                    ResponseVerdict::Reject => {
+                        refuse_answer(&mut self.peer_health[requester as usize], peer, empty, now);
+                    }
+                    ResponseVerdict::Defer(deferral) => {
+                        let refused = Arc::clone(&self.refused_answers);
+                        let score = Box::new(move |verdict: &Verdict| {
+                            if *verdict == Verdict::Reject {
+                                refused
+                                    .lock()
+                                    .expect("refused answers lock")
+                                    .push(RefusedAnswer {
+                                        requester,
+                                        peer,
+                                        empty,
+                                    });
+                            }
+                        });
+                        let registry = Arc::clone(&self.registries[requester as usize]);
+                        if let Some(wait) = registry.await_answer(&deferral, score) {
+                            self.schedule_request_event(
+                                now + DEFER_TIMEOUT,
+                                RequestEvent::Expire { registry, wait },
+                            );
+                        }
+                        self.count_refused_answers(now);
                     }
                 }
                 1
@@ -2120,12 +2201,12 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_network::retry::stream_timeout;
-    use hyperscale_network::{Network, RawRequestHandler};
+    use hyperscale_network::{Network, RawRequestHandler, VerdictKey};
     use rand::SeedableRng;
 
     use super::*;
 
-    type SharedRequestResult = Arc<std::sync::Mutex<Option<Result<Vec<u8>, RequestError>>>>;
+    type SharedRequestResult = Arc<Mutex<Option<Result<Vec<u8>, RequestError>>>>;
 
     /// Construct a network over a uniform layout (default transport config).
     fn sim_network(num_shards: u32, validators_per_shard: u32) -> SimulatedNetwork {
@@ -2443,7 +2524,7 @@ mod tests {
         shard: ShardId,
         preferred_peer: Option<ValidatorId>,
     ) -> (PendingRequest, SharedRequestResult) {
-        let result = Arc::new(std::sync::Mutex::new(None));
+        let result = Arc::new(Mutex::new(None));
         let result_clone = result.clone();
         let request = PendingRequest {
             shard,
@@ -2668,6 +2749,104 @@ mod tests {
         assert!(
             rejected < 85,
             "the rejected peer answered {rejected} of the last 200"
+        );
+    }
+
+    /// An answer whose verdict waits on a check counts against its peer
+    /// once the check finds it false, as a rejected one does at once.
+    #[test]
+    fn a_deferred_answer_found_false_counts_against_its_peer() {
+        let mut network = sim_network(1, 3);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..3 {
+            let marker = vec![u8::try_from(i).unwrap()];
+            let handler: Arc<RawRequestHandler> =
+                Arc::new(move |_: &[u8]| -> Vec<u8> { marker.clone() });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+        let requester = network.create_adapter(0);
+
+        let from_refused = Arc::new(AtomicU32::new(0));
+        for round in 0..400u64 {
+            let counter = Arc::clone(&from_refused);
+            let request = PendingRequest {
+                shard: ShardId::leaf(1, 0),
+                answerers: Answerers::LocalFirst,
+                preferred_peer: None,
+                type_id: "test.request",
+                class: MessageClass::Recovery,
+                response_class: MessageClass::Recovery,
+                request_bytes: vec![1],
+                is_empty_response: <[u8]>::is_empty,
+                on_response: Box::new(move |answer| {
+                    let answer = answer.unwrap();
+                    if answer == vec![1] && round >= 200 {
+                        counter.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    ResponseVerdict::defer(VerdictKey::of(&(round, answer)))
+                }),
+            };
+            let now = Duration::from_secs(round);
+            network.accept_requests(0, now, vec![request], &mut streams);
+            network.flush_requests(now + Duration::from_secs(1), &mut streams);
+            for peer in 1..3u8 {
+                let verdict = if peer == 1 {
+                    Verdict::Reject
+                } else {
+                    Verdict::Accept
+                };
+                requester.settle(VerdictKey::of(&(round, vec![peer])), verdict);
+            }
+        }
+
+        let refused = from_refused.load(AtomicOrdering::Relaxed);
+        assert!(
+            refused < 85,
+            "the refused peer answered {refused} of the last 200"
+        );
+    }
+
+    /// An answer whose verdict no check settles is given up after the
+    /// deferral timeout, leaving no wait behind and its peer unscored.
+    #[test]
+    fn an_unsettled_deferred_answer_is_given_up() {
+        let mut network = sim_network(1, 2);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let handler: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { vec![1] });
+        network.create_adapter(1).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            handler,
+        );
+        let requester = network.create_adapter(0);
+        let key = VerdictKey::of(&1u8);
+        let request = PendingRequest {
+            shard: ShardId::leaf(1, 0),
+            answerers: Answerers::LocalFirst,
+            preferred_peer: None,
+            type_id: "test.request",
+            class: MessageClass::Recovery,
+            response_class: MessageClass::Recovery,
+            request_bytes: vec![1],
+            is_empty_response: <[u8]>::is_empty,
+            on_response: Box::new(move |_| ResponseVerdict::defer(key)),
+        };
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        network.flush_requests(Duration::from_secs(1), &mut streams);
+        assert_eq!(requester.registry.awaited_answers(), 1);
+
+        network.flush_requests(Duration::from_secs(1) + DEFER_TIMEOUT, &mut streams);
+        assert_eq!(requester.registry.awaited_answers(), 0);
+        requester.settle(key, Verdict::Reject);
+        assert!(
+            network.refused_answers.lock().unwrap().is_empty(),
+            "a verdict after the wait is given up scores nothing"
         );
     }
 
@@ -3168,13 +3347,13 @@ mod tests {
     /// Each handler is registered for a single message type, so the type is
     /// implicit — we only need to record the payloads.
     struct RecordingHandler {
-        received: std::sync::Mutex<Vec<Vec<u8>>>,
+        received: Mutex<Vec<Vec<u8>>>,
     }
 
     impl RecordingHandler {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                received: std::sync::Mutex::new(Vec::new()),
+                received: Mutex::new(Vec::new()),
             })
         }
 

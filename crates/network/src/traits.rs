@@ -189,12 +189,31 @@ impl VerdictKey {
 /// was unusable to the app (peer returned `None`/empty, scope mismatch,
 /// partial response, malformed payload). This deprioritizes the peer for
 /// future selection without any extra plumbing from the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A callback whose check of the answer finishes only after it returns
+/// says [`Self::Defer`], naming every check the answer rests on, as a
+/// gossip handler defers its [`Verdict`]. Each check settles its part
+/// through [`Network::settle`], and the peer is scored once they have: as
+/// for `Reject` when one finds its part false, and not at all when every
+/// part holds, when one could not be judged, or when none settles within
+/// [`DEFER_TIMEOUT`](crate::deferred::DEFER_TIMEOUT).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseVerdict {
     /// Response was usable — record success.
     Accept,
     /// Response was unusable — penalize the serving peer.
     Reject,
+    /// The answer is being checked, and the checks it names settle the
+    /// verdict through [`Network::settle`].
+    Defer(Deferral),
+}
+
+impl ResponseVerdict {
+    /// Defer to the check that settles the item `key` names.
+    #[must_use]
+    pub fn defer(key: VerdictKey) -> Self {
+        Self::Defer(Deferral(vec![key]))
+    }
 }
 
 /// Typed handler for a single gossip message type.
@@ -388,8 +407,10 @@ pub trait Network: Send + Sync + 'static {
     /// holds up, [`Verdict::Reject`] when it is false, [`Verdict::Ignore`]
     /// when this host could not finish judging it; a deferral here is taken
     /// as [`Verdict::Ignore`]. A check runs on every copy, wherever it came
-    /// from, and may run before any handler defers on it; settling an item
-    /// no handler deferred is harmless.
+    /// from, and may run before any handler or response callback defers on
+    /// it; settling an item nothing deferred is harmless. One settlement
+    /// serves gossip and answers alike: a copy that came both ways is one
+    /// item.
     ///
     /// Default is a no-op, for a backend that does not wait for deferred
     /// verdicts.
@@ -415,8 +436,9 @@ pub trait Network: Send + Sync + 'static {
     /// callback returns a [`ResponseVerdict`] so app-level rejections (peer
     /// returned `None`/empty/wrong-scope) feed back into the same peer-health
     /// tracker that timeouts use, deprioritizing the serving peer for future
-    /// selection. Verdict is ignored on the `Err` path (the network already
-    /// recorded the failure).
+    /// selection, or defers it to a check that settles later. Verdict is
+    /// ignored on the `Err` path (the network already recorded the failure)
+    /// and for an answer this host's own seat gave.
     ///
     /// `class_override` lets the caller demote (or, in principle, promote)
     /// the message class on a per-call basis. `None` uses the wire type's
