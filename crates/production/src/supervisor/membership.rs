@@ -15,7 +15,7 @@
 //! (the seatable view, observer riders excluded); teardown asks "does this
 //! host hold any window role" (full membership, riders included).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -60,12 +60,19 @@ pub struct CompletedBootstrap {
 
 /// A running shard's rebuild at its attested anchor.
 pub enum Rebuild {
-    /// The staging store is syncing while the old loop keeps running.
-    Staging,
+    /// The staging store of the numbered rebuild is syncing while the old
+    /// loop keeps running.
+    Staging(u64),
     /// The staging store verified; the old loop is tearing down, and
     /// these vnodes seat on the staging store once it is renamed into
     /// the shard's directory.
     Swapping(Box<CompletedBootstrap>, Replaced),
+}
+
+/// Whether rebuild `number` is the one `shard` is staging: a completion of
+/// any other answers a rebuild a teardown or a later rebuild superseded.
+fn stages(rebuilding: &HashMap<ShardId, Rebuild>, shard: ShardId, number: u64) -> bool {
+    matches!(rebuilding.get(&shard), Some(Rebuild::Staging(current)) if *current == number)
 }
 
 impl ShardSupervisor {
@@ -590,7 +597,9 @@ impl ShardSupervisor {
         let Some(old) = old else {
             return;
         };
-        self.rebuilding.insert(shard, Rebuild::Staging);
+        self.rebuilds += 1;
+        let number = self.rebuilds;
+        self.rebuilding.insert(shard, Rebuild::Staging(number));
         info!(shard = ?shard, "Rebuilding the shard's store at its attested anchor");
         let staging_dir = staging_dir(&(self.storage_dir)(shard));
         let factory = Arc::clone(&self.storage_factory);
@@ -632,13 +641,17 @@ impl ShardSupervisor {
                 }),
                 Err(error) => Err(error),
             };
-            let done = staged.map_err(|error| {
+            let outcome = staged.map_err(|error| {
                 warn!(shard = ?shard, error, "Shard rebuild failed; its loop keeps running");
                 shard
             });
             // Send failure means the runner is shutting down; the rebuild
             // dies with it.
-            let _ = events.send(SupervisorEvent::Rebuilt(done, replaced));
+            let _ = events.send(SupervisorEvent::Rebuilt {
+                rebuild: number,
+                outcome,
+                replaced,
+            });
         });
     }
 
@@ -648,31 +661,37 @@ impl ShardSupervisor {
     /// [`Self::on_torn_down`] has renamed it into place. A validator the
     /// old loop carried and the shard no longer places follows the beacon
     /// on the beacon loop, as any drained validator does.
+    ///
+    /// Only the rebuild the shard is still staging settles. One a teardown
+    /// superseded, or a later rebuild of a re-seated loop, drops its staging
+    /// store and leaves the directory, which every rebuild of the shard
+    /// shares and the next one wipes at its open: a later rebuild may be
+    /// syncing into it, or a later swap renaming it into place.
     pub(super) fn on_rebuilt(
         &mut self,
-        done: Result<CompletedBootstrap, ShardId>,
+        rebuild: u64,
+        outcome: Result<CompletedBootstrap, ShardId>,
         replaced: Replaced,
     ) {
-        let mut done = match done {
-            Ok(done) => done,
-            Err(shard) => {
+        let shard = match &outcome {
+            Ok(done) => done.shard,
+            Err(shard) => *shard,
+        };
+        if !stages(&self.rebuilding, shard, rebuild) {
+            info!(shard = ?shard, rebuild, "A superseded rebuild settled; its staging store dropped");
+            self.drop_staged(outcome);
+            return;
+        }
+        let mut done = match outcome {
+            Ok(done) if self.shards.contains_key(&shard) => done,
+            outcome => {
+                // Failed, or torn down while the staging store synced:
+                // nothing to swap.
                 self.rebuilding.remove(&shard);
+                self.drop_staged(outcome);
                 return;
             }
         };
-        let shard = done.shard;
-        if !self.shards.contains_key(&shard) {
-            // Torn down while the staging store synced: nothing to swap.
-            self.rebuilding.remove(&shard);
-            let staging_dir = staging_dir(&(self.storage_dir)(shard));
-            self.tokio_handle.spawn_blocking(move || {
-                drop(done);
-                if let Err(error) = std::fs::remove_dir_all(&staging_dir) {
-                    warn!(shard = ?shard, %error, "Abandoned staging store left on disk");
-                }
-            });
-            return;
-        }
         let schedule = self.process.topology_schedule();
         let mut vnodes = self.placed_vnodes(&schedule, shard);
         for joiner in std::mem::take(&mut done.vnodes) {
@@ -684,6 +703,13 @@ impl ShardSupervisor {
         self.rebuilding
             .insert(shard, Rebuild::Swapping(Box::new(done), replaced));
         self.tear_down(shard);
+    }
+
+    /// Close a staging store no swap takes, off the loop.
+    fn drop_staged(&self, outcome: Result<CompletedBootstrap, ShardId>) {
+        if let Ok(done) = outcome {
+            self.tokio_handle.spawn_blocking(move || drop(done));
+        }
     }
 
     /// Replace `shard`'s store with its rebuilt one and seat it: carry the
@@ -1020,7 +1046,10 @@ impl ShardSupervisor {
 
     /// Finish a teardown whose thread joined: unwire the process maps,
     /// drop the storage handle, scrub the RPC slots, and replay any
-    /// join that queued behind the drain.
+    /// join that queued behind the drain. A drain that carries a rebuild's
+    /// swap seats the queued join's validators with the swap, whose
+    /// `bootstrapping` entry would otherwise reject the replay. A reshape
+    /// store-prep held behind the drain runs once it settles.
     pub(super) fn on_torn_down(&mut self, shard: ShardId, validator_ids: &[u64]) {
         detach_shard(&self.process, shard);
         let storage = self.storages.lock().expect("storages lock").remove(&shard);
@@ -1047,14 +1076,25 @@ impl ShardSupervisor {
         self.scrub_rpc_state(shard, validator_ids);
         self.draining.remove(&shard);
         info!(shard = ?shard, "Shard left and torn down");
-        if let Some(Rebuild::Swapping(done, replaced)) = self.rebuilding.remove(&shard) {
+        let queued = self.pending_joins.remove(&shard);
+        if let Some(Rebuild::Swapping(mut done, replaced)) = self.rebuilding.remove(&shard) {
+            for joiner in queued.into_iter().flatten() {
+                if !done
+                    .vnodes
+                    .iter()
+                    .any(|v| v.validator_id == joiner.validator_id)
+                {
+                    done.vnodes.push(joiner);
+                }
+            }
             self.swap_rebuilt(*done, storage, replaced);
         } else {
             drop(storage);
+            if let Some(vnodes) = queued {
+                self.join(shard, &vnodes);
+            }
         }
-        if let Some(vnodes) = self.pending_joins.remove(&shard) {
-            self.join(shard, &vnodes);
-        }
+        self.resume_pending_reshape_prep();
     }
 
     /// Remove a departed shard's slots from the shared RPC state maps.
@@ -1165,5 +1205,44 @@ fn await_release(store: Option<Weak<RocksDbShardStorage>>) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use hyperscale_types::ShardId;
+
+    use super::{Rebuild, stages};
+
+    /// A rebuild a teardown cleared and a re-seated loop's later rebuild
+    /// superseded settles nothing, whichever way it settles; only the
+    /// rebuild the shard still stages does.
+    #[test]
+    fn only_the_rebuild_a_shard_still_stages_settles() {
+        let shard = ShardId::ROOT;
+        let other = ShardId::leaf(1, 0);
+        let mut rebuilding = HashMap::new();
+
+        rebuilding.insert(shard, Rebuild::Staging(1));
+        assert!(stages(&rebuilding, shard, 1));
+        assert!(
+            !stages(&rebuilding, other, 1),
+            "another shard stages nothing"
+        );
+
+        rebuilding.remove(&shard);
+        assert!(
+            !stages(&rebuilding, shard, 1),
+            "a teardown orphans the rebuild"
+        );
+
+        rebuilding.insert(shard, Rebuild::Staging(2));
+        assert!(
+            !stages(&rebuilding, shard, 1),
+            "a re-seated loop's rebuild supersedes the orphan",
+        );
+        assert!(stages(&rebuilding, shard, 2));
     }
 }

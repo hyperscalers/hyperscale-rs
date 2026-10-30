@@ -105,14 +105,15 @@ impl ShardSupervisor {
     }
 
     /// Re-dispatch any reshape store-prep held behind an ordinary join whose
-    /// open has now landed — its `bootstrapping` entry cleared — so the duty
-    /// opens the store now that nothing else holds the directory.
+    /// open has now landed, or a teardown whose thread has joined — its
+    /// `bootstrapping` or `draining` entry cleared — so the duty opens the
+    /// store now that nothing else holds the directory.
     pub(super) fn resume_pending_reshape_prep(&mut self) {
         let ready: Vec<ShardId> = self
             .pending_reshape_prep
             .keys()
             .copied()
-            .filter(|shard| !self.bootstrapping.contains_key(shard))
+            .filter(|shard| !self.holds_store_dir(*shard))
             .collect();
         for shard in ready {
             // The reshape that requested this prep may have been cancelled while
@@ -128,19 +129,28 @@ impl ShardSupervisor {
         }
     }
 
+    /// Whether a join or a teardown still holds `shard`'s store directory:
+    /// a join opening or seating it, or a torn down loop whose thread has
+    /// not yet joined and closed its store.
+    fn holds_store_dir(&self, shard: ShardId) -> bool {
+        self.bootstrapping.contains_key(&shard) || self.draining.contains_key(&shard)
+    }
+
     /// Perform one reshape io request, answering with a
     /// [`SupervisorEvent::Reshape`] the runner loop settles through
     /// [`Self::on_reshape_io`].
     fn dispatch_reshape(&mut self, request: ReshapeRequest) {
         // A store-prep for a shard an ordinary join is still opening is held
         // until that join's open lands and is abandoned (`on_opened` ->
-        // `reshape_owns`), so the two never touch the same `RocksDB` directory
-        // at once. Resumed from `resume_pending_reshape_prep`.
+        // `reshape_owns`), and one for a shard still draining until its
+        // thread joins (`on_torn_down`), so the prep's wipe never touches a
+        // `RocksDB` directory another store holds open. Resumed from
+        // `resume_pending_reshape_prep`.
         let store_shard = request.prepared_shard();
         if let Some(shard) = store_shard
-            && self.bootstrapping.contains_key(&shard)
+            && self.holds_store_dir(shard)
         {
-            info!(shard = ?shard, "Reshape store-prep held behind an in-flight join");
+            info!(shard = ?shard, "Reshape store-prep held behind an in-flight join or teardown");
             self.pending_reshape_prep.insert(shard, request);
             return;
         }
@@ -585,7 +595,12 @@ impl ShardSupervisor {
     /// store the duty adopted into. The orchestrator owns this seating, so
     /// an ordinary join for the same shard is suppressed.
     fn reshape_seat(&mut self, shard: ShardId) {
-        let hosted = self.shards.contains_key(&shard);
+        let draining = self.draining.contains_key(&shard);
+        debug_assert!(
+            !draining || !self.reshape_stores.contains(shard),
+            "a store is prepared for {shard:?} while its torn down loop drains",
+        );
+        let hosted = self.shards.contains_key(&shard) || draining;
         let Some(Seating {
             storage,
             genesis,
@@ -594,14 +609,13 @@ impl ShardSupervisor {
         else {
             return;
         };
-        // The reshape duty owns this successor; an ordinary join racing it
-        // yields. Abandon the in-flight join — its opened store drops at
-        // `on_opened` (which finds no `bootstrapping` entry) — and seat from the
-        // prepared store, which carries the reshape's terminal/merged state the
-        // join's snap-sync would not.
-        if self.bootstrapping.remove(&shard).is_some() {
-            warn!(shard = ?shard, "Reshape seat superseding an in-flight join for the shard");
-        }
+        // No join is bootstrapping a shard with a prepared store: a prep
+        // issued while a join is in flight is held behind it, and a prepared
+        // store suppresses any later join (`join` reads `reshape_stores`).
+        debug_assert!(
+            !self.bootstrapping.contains_key(&shard),
+            "a join is bootstrapping {shard:?} under its reshape seat",
+        );
         let topology_snapshot = self.process.topology_snapshot().load_full();
         let vnodes = self.local_committee_vnodes(&topology_snapshot, shard);
         if vnodes.is_empty() {
