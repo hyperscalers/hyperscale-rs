@@ -197,7 +197,9 @@ where
     /// `owner` wants these records and this code.
     ///
     /// What derivation already reads here is answered at once, so an ask
-    /// queued behind its own answer costs no round trip. A package whose
+    /// queued behind its own answer costs no round trip; the answer comes
+    /// after the asks, since it can settle what `owner` holds and give up
+    /// what it asked for. A package whose
     /// bytes this host holds and whose metadata it does not is neither
     /// asked for nor answered: fetching bytes already held seats nothing.
     /// Code a store this host serves holds is installed from there, since
@@ -230,10 +232,11 @@ where
         let mut artifacts: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
         let packages: BTreeSet<Hash> = packages.into_iter().collect();
         for package in packages {
+            if executor.package_known(package) {
+                arrived.push(custodian(package));
+                continue;
+            }
             if !executor.needs_artifact(package) {
-                if executor.package_known(package) {
-                    arrived.push(custodian(package));
-                }
                 continue;
             }
             if let Some(artifact) = hosted
@@ -253,7 +256,6 @@ where
             }
         }
         drop(snapshot);
-        self.notify_arrived(owner, arrived);
         for (shard, ids) in records {
             self.ask_for::<InstanceRecordBinding>(owner, ids, shard, None, None);
         }
@@ -261,6 +263,7 @@ where
             self.ask_for::<PackageArtifactBinding>(owner, ids, shard, None, None);
         }
         self.install_artifacts(held);
+        self.notify_arrived(owner, arrived);
     }
 
     /// Nothing `owner` holds waits on these any more.

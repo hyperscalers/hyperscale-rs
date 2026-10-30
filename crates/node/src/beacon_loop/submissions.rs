@@ -16,7 +16,6 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::{Address, Transaction};
 
 use super::BeaconLoop;
-use super::records::custodian;
 use crate::event::BeaconOwner;
 use crate::process::SubmitFanout;
 use crate::shard::mempool::{DeferredTransaction, Orphaned};
@@ -30,37 +29,17 @@ where
     /// Hold `deferred` and ask for what it names.
     ///
     /// Derivation ran against a view that may be older than this step, so
-    /// what it named may have landed since: that much offers the
-    /// submission again at once, since no arrival is coming for it. The
-    /// check is the question derivation asks of the same view, so a
-    /// submission offered again on it derives past that name.
+    /// what it named may have landed since; [`Self::want_records`]
+    /// answers that much at once, which offers the submission again,
+    /// since no arrival is coming for it.
     pub(super) fn hold_submission(&mut self, deferred: DeferredTransaction) {
-        let executor = Arc::clone(&self.process.dispatch_handles.executor);
-        let mut instances: Vec<Address> = Vec::new();
-        let mut packages = Vec::new();
-        let mut landed: Vec<Address> = Vec::new();
-        for &instance in &deferred.wanted.instances {
-            if executor.instance_known(instance) {
-                landed.push(instance);
-            } else {
-                instances.push(instance);
-            }
-        }
-        for &package in &deferred.wanted.packages {
-            if executor.package_known(package) {
-                landed.push(custodian(package));
-            } else {
-                packages.push(package);
-            }
-        }
+        let instances = deferred.wanted.instances.clone();
+        let packages = deferred.wanted.packages.clone();
         // An evicted submission was reported submitted and goes no
         // further; nothing on this loop guards its hash.
         let (_, orphaned) = self.submissions.defer(deferred);
         self.retire_submission_asks(orphaned);
         self.want_records(BeaconOwner::Submissions, instances, packages);
-        if !landed.is_empty() {
-            self.release_submissions(&landed);
-        }
     }
 
     /// Route every held submission `arrived` releases.
