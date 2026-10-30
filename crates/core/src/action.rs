@@ -1009,7 +1009,7 @@ pub enum Action {
         /// Finalizations to include in the block (carries certs + receipts + ECs).
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// Provisions from remote shards, included in this block.
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        provisions: Vec<Verifiable<Provisions>>,
         /// What departed shards left unresolved of this chain's business
         /// — written down here while the settled sets they were read
         /// from can still be checked against.

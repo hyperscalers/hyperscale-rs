@@ -9,8 +9,6 @@
 //!
 //! [`fetch_and_broadcast_provision`]: crate::action_handlers::fetch_and_broadcast_provision
 
-use std::sync::Arc;
-
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
@@ -44,7 +42,7 @@ pub fn build_provisions<S>(
     source_block_height: BlockHeight,
     source_block_ts: WeightedTimestamp,
     requests: &[ProvisionsRequest],
-) -> Option<Arc<Provisions>>
+) -> Option<Provisions>
 where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
 {
@@ -170,12 +168,12 @@ where
     )
     .ok()?;
 
-    Some(Arc::new(Provisions::new(
+    Some(Provisions::new(
         source_shard,
         target_shard,
         source_block_height,
         source_block_ts,
         proof,
         transactions,
-    )))
+    ))
 }

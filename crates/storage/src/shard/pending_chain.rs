@@ -1531,7 +1531,7 @@ mod tests {
     }
 
     impl ShardChainReader for StubStore {
-        fn provisions_at(&self, _height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+        fn provisions_at(&self, _height: BlockHeight) -> Vec<Verifiable<Provisions>> {
             Vec::new()
         }
 

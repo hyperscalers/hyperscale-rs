@@ -82,8 +82,6 @@ impl ShardParticipation {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
-
     use hyperscale_core::{ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
@@ -115,14 +113,14 @@ mod tests {
     /// `tx` to the leaf `target`.
     fn sent_one_batch(target: ShardId, tx: TxHash) -> NodeStateMachine {
         let TestNode { mut node, .. } = TestNode::builder().build();
-        let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
+        let provisions = Verified::new_unchecked_for_test(Provisions::new(
             ShardId::ROOT,
             target,
             BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
             Capped::from_array([ProvisionEntry::new(tx, Capped::empty())]),
-        )));
+        ));
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::OutboundProvisionBroadcast {

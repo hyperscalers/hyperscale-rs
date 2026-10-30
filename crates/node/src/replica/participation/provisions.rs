@@ -4,8 +4,6 @@
 //! and outbound provision tracking (broadcasts the local shard issued, and
 //! the remote ECs that ack them).
 
-use std::sync::Arc;
-
 use hyperscale_core::Action;
 use hyperscale_metrics::record_crossing_push_dropped;
 use hyperscale_types::{Provisions, StateClaim, TopologySchedule, Verifiable};
@@ -46,7 +44,7 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_provisions_admitted(
         &mut self,
         sched: &TopologySchedule,
-        provisions: Arc<Verifiable<Provisions>>,
+        provisions: Verifiable<Provisions>,
     ) -> Vec<Action> {
         self.mempool_coordinator.on_engagement_evidence(
             sched.head().shard_trie(),
@@ -63,8 +61,6 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
@@ -85,17 +81,15 @@ mod tests {
         // so we are it.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
 
-        let provisions = Arc::new(
-            Verified::new_unchecked_for_test(Provisions::new(
-                ShardId::leaf(1, 1), // source
-                ShardId::ROOT,       // target (local)
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([]),
-            ))
-            .into(),
-        );
+        let provisions = Verified::new_unchecked_for_test(Provisions::new(
+            ShardId::leaf(1, 1), // source
+            ShardId::ROOT,       // target (local)
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([]),
+        ))
+        .into();
 
         let actions = node.handle(
             LocalTimestamp::ZERO,

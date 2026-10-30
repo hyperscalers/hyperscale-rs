@@ -89,7 +89,7 @@ pub struct RecoveredState {
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
     /// back in the shared store a restarted node reads them from.
-    pub retained_provisions: Vec<Arc<Provisions>>,
+    pub retained_provisions: Vec<Provisions>,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,

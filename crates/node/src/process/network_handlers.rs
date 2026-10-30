@@ -470,14 +470,11 @@ where
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
-                    let event = match Arc::unwrap_or_clone(notification.provisions).into_verified()
-                    {
-                        Ok(provisions) => ProtocolEvent::VerifiedProvisionsReceived {
-                            provisions: Arc::new(provisions),
-                        },
-                        Err(provisions) => ProtocolEvent::UnverifiedProvisionsReceived {
-                            provisions: Arc::new(provisions),
-                        },
+                    let event = match notification.provisions.into_verified() {
+                        Ok(provisions) => ProtocolEvent::VerifiedProvisionsReceived { provisions },
+                        Err(provisions) => {
+                            ProtocolEvent::UnverifiedProvisionsReceived { provisions }
+                        }
                     };
                     offer_network_event(tx, target_shard, event, provenance).verdict()
                 },

@@ -2038,7 +2038,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
+            provisions: Arc::new(Capped::from_array([Verifiable::from(bundle)])),
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
@@ -4669,7 +4669,7 @@ pub fn test_committed_bundle_outlives_sealing(
         recovered()
             .retained_provisions
             .iter()
-            .map(|bundle| bundle.hash())
+            .map(Provisions::hash)
             .collect::<Vec<_>>(),
         vec![hash],
         "and the body it dropped is recovered from storage",

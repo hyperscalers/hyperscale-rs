@@ -459,7 +459,7 @@ pub enum ProtocolEvent {
         /// crossings, which the build held to the cap.
         additions: AnswerAdditions,
         /// Provisions included in the block.
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        provisions: Vec<Verifiable<Provisions>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -474,7 +474,7 @@ pub enum ProtocolEvent {
     /// because they originate from a single `FetchAndBroadcastProvisions` action.
     UnverifiedProvisionsReceived {
         /// Provisions batch received from a source shard.
-        provisions: Arc<Provisions>,
+        provisions: Provisions,
     },
 
     /// A producer's pushed record readings, past ingress: routed to a
@@ -498,7 +498,7 @@ pub enum ProtocolEvent {
     VerifiedProvisionsReceived {
         /// Verified provisions batch sealed via
         /// [`Verified::<Provisions>::from_local`].
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Verified<Provisions>,
     },
 
     /// Batch-level provision verification completed.
@@ -510,7 +510,7 @@ pub enum ProtocolEvent {
     StateProvisionsVerified {
         /// Verified provisions on success; the raw bundle paired with
         /// its error on failure.
-        result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
+        result: Result<Verified<Provisions>, (Provisions, ProvisionsVerifyError)>,
         /// The source anchor whose `state_root` the merkle proof was
         /// checked against.
         anchor: Anchor,
@@ -524,7 +524,7 @@ pub enum ProtocolEvent {
     /// deterministic across validators.
     ProvisionsAdmitted {
         /// Verified provisions batch.
-        provisions: Arc<Verifiable<Provisions>>,
+        provisions: Verifiable<Provisions>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
         source_block_ts: WeightedTimestamp,
     },
@@ -537,7 +537,7 @@ pub enum ProtocolEvent {
         /// Provisions batch we just broadcast. Wrapped as `Verified` —
         /// the emitter built the bundle from a local JMT view so the
         /// merkle-proof predicate holds by construction.
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Verified<Provisions>,
         /// Shard the batch was broadcast to.
         target_shard: ShardId,
     },

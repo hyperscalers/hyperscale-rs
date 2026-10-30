@@ -837,7 +837,7 @@ struct ResponseWire {
 /// The provisions payload of [`ResponseWire`], in both forms.
 #[derive(Hbor)]
 enum ProvisionsWire {
-    Live(Vec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>)>),
+    Live(Vec<(ProvisionHash, Option<Verifiable<Provisions>>)>),
     Sealed {
         hashes: Vec<ProvisionHash>,
         engagements: Vec<Engagement>,

@@ -202,7 +202,7 @@ fn settlement_events(
     wt: u64,
     shard: ShardId,
     height: BlockHeight,
-    provisions: &[Arc<Verifiable<Provisions>>],
+    provisions: &[Verifiable<Provisions>],
     state_claims: &[StateClaim],
     certificates: &SharedCertificates,
 ) {

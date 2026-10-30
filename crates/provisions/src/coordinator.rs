@@ -663,7 +663,7 @@ impl ProvisionCoordinator {
     pub fn on_verified_state_provisions_received(
         &mut self,
         topology_schedule: &TopologySchedule,
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Verified<Provisions>,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         if provisions.transactions().is_empty() {
@@ -739,11 +739,9 @@ impl ProvisionCoordinator {
         // fetch for this bundle is still wanted, and a bundle nobody
         // fetched is re-acquired by the expectation the commit-proven
         // header registers.
-        let _buffered = self.pipeline.buffer_pending(
-            key,
-            Arc::unwrap_or_clone(provisions).into_inner(),
-            self.expected.local_ts(),
-        );
+        let _buffered =
+            self.pipeline
+                .buffer_pending(key, provisions.into_inner(), self.expected.local_ts());
         vec![]
     }
 
@@ -869,7 +867,7 @@ impl ProvisionCoordinator {
     /// Uses the verified header returned by the action handler directly (no re-lookup).
     pub fn on_state_provisions_verified(
         &mut self,
-        result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
+        result: Result<Verified<Provisions>, (Provisions, ProvisionsVerifyError)>,
         anchor: Anchor,
         now: LocalTimestamp,
     ) -> Vec<Action> {
@@ -938,8 +936,7 @@ impl ProvisionCoordinator {
         // the dwell-time filter in `queued_provisions()` — peers need time
         // to receive/verify the provisions via gossip before the proposer
         // commits them.
-        self.queue
-            .enqueue(Arc::clone(&provisions), source_block_ts, now);
+        self.queue.enqueue(provisions.clone(), source_block_ts, now);
 
         debug!(
             source_shard = source_shard.inner(),
@@ -951,9 +948,8 @@ impl ProvisionCoordinator {
         // block timestamp anchors retention in the io-loop provision cache.
         // Wrap as verified so the marker rides through the event into the
         // in-process consumers.
-        let provisions_verifiable = Arc::new((*provisions).clone().into());
         actions.push(Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
-            provisions: provisions_verifiable,
+            provisions: provisions.into(),
             source_block_ts,
         }));
 
@@ -969,7 +965,7 @@ impl ProvisionCoordinator {
     /// stay queued for a later call. Batches remain in the underlying queue
     /// until pruned on block commit.
     #[must_use]
-    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Verified<Provisions>>> {
+    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Verified<Provisions>> {
         self.queue.queued(now, self.expected.local_ts())
     }
 
@@ -985,7 +981,7 @@ impl ProvisionCoordinator {
     /// pipeline's verified map (not the raw wire-store), so callers
     /// receive the typed handle when the bundle has cleared verification.
     #[must_use]
-    pub fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Verified<Provisions>>> {
+    pub fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Verified<Provisions>> {
         self.pipeline.get_provisions_by_hash(hash)
     }
 
@@ -1705,9 +1701,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -1751,9 +1745,7 @@ mod tests {
 
         // Verify
         let actions = coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -1785,7 +1777,7 @@ mod tests {
 
         // Verification fails — no certified_header returned
         let actions = coordinator.on_state_provisions_verified(
-            Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
+            Err((provisions, ProvisionsVerifyError::BadInclusion)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -1992,7 +1984,7 @@ mod tests {
 
         // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
-            Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
+            Err((provisions, ProvisionsVerifyError::BadInclusion)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2209,7 +2201,7 @@ mod tests {
 
         let actions = coordinator.on_verified_state_provisions_received(
             &sched(),
-            Arc::new(Verified::<Provisions>::new_unchecked_for_test(provisions)),
+            Verified::<Provisions>::new_unchecked_for_test(provisions),
             LocalTimestamp::ZERO,
         );
         assert!(
@@ -2274,9 +2266,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2421,9 +2411,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2465,7 +2453,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
+            Err((provisions, ProvisionsVerifyError::BadInclusion)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2514,9 +2502,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2534,10 +2520,7 @@ mod tests {
     /// Build a `CertifiedBlock` at `height` carrying a single provisions
     /// batch — needed to exercise `on_block_committed`'s tombstone path
     /// which reads `block.provisions()`.
-    fn make_block_with_provisions(
-        height: BlockHeight,
-        provisions: Arc<Provisions>,
-    ) -> CertifiedBlock {
+    fn make_block_with_provisions(height: BlockHeight, provisions: Provisions) -> CertifiedBlock {
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: ShardId::leaf(2, 0),
             height,
@@ -2546,8 +2529,7 @@ mod tests {
                 .into(),
             ..Default::default()
         });
-        let provisions_verifiable: Arc<Verifiable<Provisions>> =
-            Arc::new(Arc::unwrap_or_clone(provisions).into());
+        let provisions_verifiable: Verifiable<Provisions> = provisions.into();
         let block = Block::Live {
             header,
             transactions: Arc::new(Capped::empty()),
@@ -2628,9 +2610,9 @@ mod tests {
         // First arrival → queued.
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+            Ok(Verified::<Provisions>::new_unchecked_for_test(
                 provisions.clone(),
-            ))),
+            )),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2650,7 +2632,7 @@ mod tests {
         // tombstone registers anchored on this block's commit ts
         // (~50_500ms with TEST_BLOCK_INTERVAL_MS=500).
         let commit_h = BlockHeight::new(101);
-        let committing_block = make_block_with_provisions(commit_h, Arc::new(provisions.clone()));
+        let committing_block = make_block_with_provisions(commit_h, provisions.clone());
         coordinator.on_block_committed(&sched(), &committing_block);
         shard_registers_committed(&coordinator, committing_block.block());
         assert_eq!(coordinator.queue.queue_len(), 0);
@@ -2719,14 +2701,13 @@ mod tests {
         deliver_committed_header(&mut coordinator, &header);
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+            Ok(Verified::<Provisions>::new_unchecked_for_test(
                 provisions.clone(),
-            ))),
+            )),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
-        let committing_block =
-            make_block_with_provisions(BlockHeight::new(2), Arc::new(provisions.clone()));
+        let committing_block = make_block_with_provisions(BlockHeight::new(2), provisions.clone());
         coordinator.on_block_committed(&sched(), &committing_block);
         shard_registers_committed(&coordinator, committing_block.block());
         assert!(coordinator.committed_provisions.contains(&provisions_hash));
@@ -2856,9 +2837,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2937,9 +2916,7 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -3086,9 +3063,7 @@ mod tests {
         let provisions = make_provisions(tx_hash, source_shard, ShardId::leaf(2, 0), height);
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
-                provisions,
-            ))),
+            Ok(Verified::<Provisions>::new_unchecked_for_test(provisions)),
             Anchor::of(&header),
             now,
         );
@@ -3234,9 +3209,9 @@ mod tests {
                     deliver_committed_header(&mut coordinator, &header);
                     coordinator.on_state_provisions_received(&sched(), provisions.clone());
                     coordinator.on_state_provisions_verified(
-                        Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                        Ok(Verified::<Provisions>::new_unchecked_for_test(
                             provisions,
-                        ))),
+                        )),
                         Anchor::of(&header),
                         LocalTimestamp::ZERO,
                     );

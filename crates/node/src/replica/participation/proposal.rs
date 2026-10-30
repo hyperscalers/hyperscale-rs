@@ -17,7 +17,7 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_shard::{ProposalAsk, ProposalInputs, ShardCoordinator};
 use hyperscale_types::{
     LocalTimestamp, MAX_TXS_PER_BLOCK, Provisions, ShardId, TopologySchedule, Transaction, TxHash,
-    Verified,
+    Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -93,10 +93,7 @@ impl ProposalSources<'_> {
         // Provisions coordinator stores `Verified` internally; lift each
         // batch into the `Verifiable` transport shape so the marker
         // survives across the proposal-build action.
-        let provisions = queued
-            .into_iter()
-            .map(|v| Arc::new((*v).clone().into()))
-            .collect();
+        let provisions = queued.into_iter().map(Verifiable::from).collect();
 
         ProposalInputs {
             ready_txs,
@@ -120,7 +117,7 @@ impl ProposalSources<'_> {
     /// bounded only by what commit prunes — a scan per ask would be the
     /// pool times the queue times each bundle's list, for a question
     /// each bundle can answer once.
-    fn riding_this_proposal(queued: &[Arc<Verified<Provisions>>]) -> HashSet<(ShardId, TxHash)> {
+    fn riding_this_proposal(queued: &[Verified<Provisions>]) -> HashSet<(ShardId, TxHash)> {
         queued
             .iter()
             .flat_map(|bundle| {

@@ -96,7 +96,7 @@ type ElidedCertificates = Capped<
 
 /// One row per provision, on the same terms as [`ElidedTransactions`].
 pub type ElidedProvisionBodies =
-    Capped<Vec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>)>, MAX_PROVISIONS_PER_BLOCK>;
+    Capped<Vec<(ProvisionHash, Option<Verifiable<Provisions>>)>, MAX_PROVISIONS_PER_BLOCK>;
 
 /// Per-collection caps mirror [`Block`]'s caps one-to-one — the elided
 /// form is a structural transformation of `Block` and inherits its
@@ -246,7 +246,7 @@ impl ElidedCertifiedBlock {
                         let body = if matches_filter(inventory.provision_have.as_ref(), &hash) {
                             None
                         } else {
-                            Some(Arc::clone(p))
+                            Some(p.clone())
                         };
                         (hash, body)
                     })
@@ -349,7 +349,7 @@ impl ElidedCertifiedBlock {
     where
         FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
         FCert: FnMut(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
-        FProv: FnMut(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
+        FProv: FnMut(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     {
         // Header + QC are always inline, so the pairing can be checked
         // before resolving any bodies. A peer that sends a mismatched
@@ -919,7 +919,7 @@ mod tests {
 
         let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
         let batch = |source: ShardId, height: u64, seeds: &[u8]| {
-            Arc::new(Verifiable::from(Provisions::new(
+            Verifiable::from(Provisions::new(
                 source,
                 ShardId::ROOT,
                 BlockHeight::new(height),
@@ -932,7 +932,7 @@ mod tests {
                         .collect(),
                 )
                 .expect("a list written out in a test"),
-            )))
+            ))
         };
         let left = ShardId::leaf(1, 0);
         let right = ShardId::leaf(1, 1);
@@ -953,7 +953,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let live_with = |provisions: Vec<Arc<Verifiable<Provisions>>>| Block::Live {
+        let live_with = |provisions: Vec<Verifiable<Provisions>>| Block::Live {
             header: BlockHeader::new(BlockHeaderParts::default()),
             transactions: Arc::new(Capped::empty()),
             certificates: Arc::new(Capped::empty()),

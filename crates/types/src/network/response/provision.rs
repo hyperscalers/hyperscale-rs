@@ -1,7 +1,5 @@
 //! Provision fetch response for fallback recovery.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::{MessageClass, NetworkMessage, Provisions};
@@ -21,10 +19,7 @@ pub struct GetProvisionResponse {
     /// - `None` — the source shard cannot serve this request (block not
     ///   found, or the historical state version has been garbage-collected).
     ///   The requester should try a different peer.
-    ///
-    /// `Arc`-wrapped to keep server-side cache hits and dedup-slot transit
-    /// from deep-cloning the merkle proof + per-tx entries.
-    pub provisions: Option<Arc<Provisions>>,
+    pub provisions: Option<Provisions>,
 }
 
 impl NetworkMessage for GetProvisionResponse {

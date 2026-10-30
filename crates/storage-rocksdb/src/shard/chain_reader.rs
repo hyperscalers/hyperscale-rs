@@ -22,7 +22,7 @@ impl ShardChainReader for RocksDbShardStorage {
         self.get_block_denormalized(height)
     }
 
-    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Verifiable<Provisions>> {
         let cf = self.cf();
         let provisions_cf = ProvisionsCf::handle(&cf);
         iter_from::<ProvisionsCf>(
@@ -31,7 +31,7 @@ impl ShardChainReader for RocksDbShardStorage {
             &(height, ProvisionHash::from_raw(Hash::ZERO)),
         )
         .take_while(|((at, _), _)| *at == height)
-        .map(|(_, provisions)| Arc::new(Verifiable::from(provisions)))
+        .map(|(_, provisions)| Verifiable::from(provisions))
         .collect()
     }
 

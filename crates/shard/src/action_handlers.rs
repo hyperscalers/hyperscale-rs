@@ -252,7 +252,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     local_shard: ShardId,
     chain_origin: WeightedTimestamp,
     topology_snapshot: &TopologySnapshot,
-    provisions: Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>,
+    provisions: Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>,
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>,
     parent_settled_frontier: BlockHeight,

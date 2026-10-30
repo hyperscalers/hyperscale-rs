@@ -1,7 +1,5 @@
 //! Crash recovery for `RocksDB` storage.
 
-use std::sync::Arc;
-
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{
     BoundaryStore, DedupWindow, RecoveredState, SafeVoteRegisterStore, SubstateStore,
@@ -176,11 +174,11 @@ impl RocksDbShardStorage {
     ///
     /// A full scan rather than a seek: the commit-path sweep is what
     /// bounds the CF, so everything present is everything wanted.
-    fn load_retained_provisions(&self) -> Vec<Arc<Provisions>> {
+    fn load_retained_provisions(&self) -> Vec<Provisions> {
         let cf = self.cf();
         let provisions_cf = ProvisionsCf::handle(&cf);
         iter_all::<ProvisionsCf>(&self.db, provisions_cf)
-            .map(|(_key, provisions)| Arc::new(provisions))
+            .map(|(_key, provisions)| provisions)
             .collect()
     }
 }

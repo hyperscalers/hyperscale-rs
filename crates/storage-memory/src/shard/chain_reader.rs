@@ -22,12 +22,12 @@ impl ShardChainReader for SimShardStorage {
             .certified()
     }
 
-    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Verifiable<Provisions>> {
         read_or_recover(&self.consensus)
             .provisions
             .range((height, ProvisionHash::from_raw(Hash::ZERO))..)
             .take_while(|((at, _), _)| *at == height)
-            .map(|(_, provisions)| Arc::new(Verifiable::from((**provisions).clone())))
+            .map(|(_, provisions)| Verifiable::from(provisions.clone()))
             .collect()
     }
 

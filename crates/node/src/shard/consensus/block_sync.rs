@@ -514,12 +514,7 @@ where
             // `provision_store` holds raw bodies; lift into the unverified
             // transport shape — the tick-cert linkage gates trust on the
             // rehydrated block.
-            |h| {
-                caches
-                    .provision_store
-                    .get(*h)
-                    .map(|p| Arc::new((*p).clone().into()))
-            },
+            |h| caches.provision_store.get(*h).map(Verifiable::from),
         )
     }
 

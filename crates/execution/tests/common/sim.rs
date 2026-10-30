@@ -580,7 +580,7 @@ impl ExecutionSim {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
+                provisions: Arc::new(Capped::from_array([Verifiable::from(bundle)])),
                 abandonment_records,
                 state_claims,
                 tick_manifest: Arc::new(Capped::empty()),

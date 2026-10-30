@@ -48,7 +48,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// A stored block keeps only their hashes, so this is the other half
     /// of reading one back whole. Empty when the block carried none, or
     /// when the bodies have dropped below the retention floor.
-    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>>;
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Verifiable<Provisions>>;
 
     /// Get a committed block header (header + committing QC) by height.
     ///

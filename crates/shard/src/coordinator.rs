@@ -812,7 +812,7 @@ fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<B
         let mut pending = PendingBlock::from_complete_block(
             block,
             block.certificates().iter().map(Arc::clone).collect(),
-            block.provisions().iter().map(Arc::clone).collect(),
+            block.provisions().to_vec(),
             LocalTimestamp::ZERO,
         );
         pending
@@ -4318,7 +4318,7 @@ impl ShardCoordinator {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
         lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height();
@@ -6751,7 +6751,7 @@ impl ShardCoordinator {
         block: &Block,
         block_hash: BlockHash,
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        provisions: Vec<Verifiable<Provisions>>,
         bytes_delta: i64,
         answers: AnswerDelta,
         additions: AnswerAdditions,
@@ -9621,7 +9621,7 @@ impl ShardCoordinator {
     pub fn on_provisions_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        provisions: &[Arc<Verifiable<Provisions>>],
+        provisions: &[Verifiable<Provisions>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {
@@ -10825,7 +10825,7 @@ mod tests {
     fn engaging_chain(from: BlockHash) -> Vec<Block> {
         let half = u64::try_from(RETENTION_HORIZON.as_millis() / 2).expect("fits");
         let bundle = |height: u64, seeds: &[u8]| {
-            Arc::new(Verifiable::from(Provisions::new(
+            Verifiable::from(Provisions::new(
                 ENGAGING_PAYER,
                 ShardId::ROOT,
                 BlockHeight::new(height),
@@ -10838,7 +10838,7 @@ mod tests {
                         .collect(),
                 )
                 .expect("a list written out in a test"),
-            )))
+            ))
         };
         let mut parent = from;
         (1..=4u8)
@@ -14163,7 +14163,7 @@ mod tests {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(engaging))])),
+            provisions: Arc::new(Capped::from_array([Verifiable::from(engaging)])),
             abandonment_records,
             state_claims,
             tick_manifest,
@@ -14810,7 +14810,7 @@ mod tests {
         else {
             unreachable!("a chained block is live")
         };
-        let bundle = Arc::new(Verifiable::from(Provisions::new(
+        let bundle = Verifiable::from(Provisions::new(
             ENGAGING_PAYER,
             ShardId::ROOT,
             header.height(),
@@ -14822,7 +14822,7 @@ mod tests {
                     .collect(),
             )
             .expect("a list written out in a test"),
-        )));
+        ));
         Block::Live {
             header,
             transactions,
@@ -15171,16 +15171,14 @@ mod tests {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
-                Provisions::new(
-                    ENGAGING_PAYER,
-                    local,
-                    BlockHeight::new(7),
-                    WeightedTimestamp::ZERO,
-                    MerkleInclusionProof::dummy(),
-                    Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
-                ),
-            ))])),
+            provisions: Arc::new(Capped::from_array([(Verifiable::from(Provisions::new(
+                ENGAGING_PAYER,
+                local,
+                BlockHeight::new(7),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
+            )))])),
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),

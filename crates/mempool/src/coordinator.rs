@@ -1658,7 +1658,7 @@ mod tests {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(Capped::from_array([Arc::new(provision.into())])),
+                provisions: Arc::new(Capped::from_array([provision.into()])),
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 tick_manifest: Arc::new(Capped::empty()),

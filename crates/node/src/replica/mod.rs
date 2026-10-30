@@ -529,7 +529,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
                 .shard
                 .provisions_coordinator
-                .on_state_provisions_received(sched, Arc::unwrap_or_clone(provisions)),
+                .on_state_provisions_received(sched, provisions),
             ProtocolEvent::VerifiedProvisionsReceived { provisions } => {
                 let now = self.shard.now;
                 self.shard

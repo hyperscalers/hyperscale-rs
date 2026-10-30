@@ -478,7 +478,7 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ProvisionBinding {
 /// retry is the only one there is.
 impl SolicitedAnswer for ProvisionBinding {
     type Request = GetProvisionsRequest;
-    type Item = Arc<Provisions>;
+    type Item = Provisions;
     type Input = ShardScopedInput;
 
     const SETTLES: Settles = Settles::OnVerdict;
@@ -494,7 +494,7 @@ impl SolicitedAnswer for ProvisionBinding {
 
     /// A bundle with no transactions is a source with nothing owed to
     /// the asker at that height, which reads as not holding it.
-    fn items(response: GetProvisionResponse) -> Vec<Arc<Provisions>> {
+    fn items(response: GetProvisionResponse) -> Vec<Provisions> {
         response
             .provisions
             .into_iter()
@@ -502,7 +502,7 @@ impl SolicitedAnswer for ProvisionBinding {
             .collect()
     }
 
-    fn answers_for(provisions: &Arc<Provisions>) -> impl IntoIterator<Item = Self::Id> + use<> {
+    fn answers_for(provisions: &Provisions) -> impl IntoIterator<Item = Self::Id> + use<> {
         [(
             provisions.source_shard(),
             provisions.target_shard(),
@@ -510,7 +510,7 @@ impl SolicitedAnswer for ProvisionBinding {
         )]
     }
 
-    fn deliver(kept: Vec<Arc<Provisions>>) -> Vec<ShardScopedInput> {
+    fn deliver(kept: Vec<Provisions>) -> Vec<ShardScopedInput> {
         kept.into_iter()
             .map(|provisions| {
                 ShardScopedInput::Protocol(Box::new(ProtocolEvent::UnverifiedProvisionsReceived {
@@ -782,8 +782,8 @@ mod solicited_tests {
     const LOCAL: ShardId = ShardId::leaf(2, 0);
     const SOURCE: ShardId = ShardId::leaf(2, 1);
 
-    fn bundle(target: ShardId, height: u64, txs: &[&[u8]]) -> Arc<Provisions> {
-        Arc::new(Provisions::new(
+    fn bundle(target: ShardId, height: u64, txs: &[&[u8]]) -> Provisions {
+        Provisions::new(
             SOURCE,
             target,
             BlockHeight::new(height),
@@ -797,7 +797,7 @@ mod solicited_tests {
                     .collect(),
             )
             .unwrap(),
-        ))
+        )
     }
 
     /// Settle `response` to a request for `requested` and return the
@@ -842,7 +842,7 @@ mod solicited_tests {
         let (verdict, inputs) = settle::<LocalProvisionBinding>(
             vec![sent.hash(), left_out],
             GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-                provisions: Arc::clone(&sent),
+                provisions: sent.clone(),
                 source_header: None,
             }])),
         );
@@ -869,7 +869,7 @@ mod solicited_tests {
             vec![asked.hash()],
             GetLocalProvisionsResponse::new(Capped::from_array([&asked, &extra].map(
                 |provisions| LocalProvisionEntry {
-                    provisions: Arc::clone(provisions),
+                    provisions: provisions.clone(),
                     source_header: None,
                 },
             ))),

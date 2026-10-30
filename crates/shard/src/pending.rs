@@ -288,7 +288,7 @@ impl PendingBlocks {
         now: LocalTimestamp,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
         lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
 
@@ -314,7 +314,7 @@ impl PendingBlocks {
             pending.add_finalization(fw);
         }
 
-        let provisions: Vec<Arc<Verifiable<Provisions>>> = pending
+        let provisions: Vec<Verifiable<Provisions>> = pending
             .manifest()
             .provision_hashes()
             .iter()
@@ -398,12 +398,12 @@ impl PendingBlocks {
     /// Record an arrived provisions batch against any pending block that
     /// needs it. Returns the hashes of blocks that became complete as a
     /// result.
-    pub fn receive_provision(&mut self, batch: &Arc<Verifiable<Provisions>>) -> Vec<BlockHash> {
+    pub fn receive_provision(&mut self, batch: &Verifiable<Provisions>) -> Vec<BlockHash> {
         let provisions_hash = batch.hash();
         self.fold_arrival(
             |pending| pending.needs_provision(&provisions_hash),
             |pending| {
-                pending.add_provision(Arc::clone(batch));
+                pending.add_provision(batch.clone());
             },
         )
     }
@@ -528,7 +528,7 @@ pub struct PendingBlock {
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
-    received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>>,
+    received_provisions: BTreeMap<ProvisionHash, Verifiable<Provisions>>,
 
     /// Set of provisions hashes we're still waiting for.
     missing_provision_hashes: BTreeSet<ProvisionHash>,
@@ -605,7 +605,7 @@ impl PendingBlock {
     pub fn from_complete_block(
         block: &Block,
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        provisions: Vec<Verifiable<Provisions>>,
         created_at: LocalTimestamp,
     ) -> Self {
         let mut provision_hashes: Vec<ProvisionHash> =
@@ -629,7 +629,7 @@ impl PendingBlock {
             terms: block.terms().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         });
-        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
+        let mut received_provisions: BTreeMap<ProvisionHash, Verifiable<Provisions>> =
             BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -754,7 +754,7 @@ impl PendingBlock {
     /// Add a received provisions.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    pub fn add_provision(&mut self, provisions: Arc<Verifiable<Provisions>>) -> bool {
+    pub fn add_provision(&mut self, provisions: Verifiable<Provisions>) -> bool {
         let hash = provisions.hash();
         if self.missing_provision_hashes.remove(&hash) {
             self.received_provisions.insert(hash, provisions);
@@ -823,7 +823,7 @@ impl PendingBlock {
         // Attach provisions in manifest order. `received_provisions` is
         // populated as provisions arrive via gossip / local fetch,
         // and `is_complete()` gates assembly on all of them being present.
-        let provisions: Vec<Arc<Verifiable<Provisions>>> = self
+        let provisions: Vec<Verifiable<Provisions>> = self
             .manifest
             .provision_hashes()
             .iter()

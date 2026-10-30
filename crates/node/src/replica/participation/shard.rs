@@ -244,7 +244,7 @@ impl ShardParticipation {
             |h| {
                 self.provisions_coordinator
                     .get_provisions_by_hash(*h)
-                    .map(|v| Arc::new((*v).clone().into()))
+                    .map(Verifiable::from)
             },
         ));
         actions
@@ -702,7 +702,7 @@ mod tests {
 
         // Register an outbound batch (local root shard → remote leaf shard).
         // Deadline = self.now (ZERO) + RETENTION_HORIZON.
-        let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
+        let provisions = Verified::new_unchecked_for_test(Provisions::new(
             ShardId::ROOT,
             ShardId::leaf(1, 1),
             BlockHeight::new(1),
@@ -712,7 +712,7 @@ mod tests {
                 TxHash::from(Hash::from_bytes(b"outbound-tx")),
                 Capped::empty(),
             )]),
-        )));
+        ));
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::OutboundProvisionBroadcast {

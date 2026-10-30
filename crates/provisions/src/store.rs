@@ -28,15 +28,14 @@
 //! the same key are idempotent.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use hyperscale_types::{BlockHeight, BloomFilter, DEFAULT_FPR, ProvisionHash, Provisions, ShardId};
 use papaya::HashMap;
 
 /// Shared content-addressed store of `Provisions` bodies.
 pub struct ProvisionStore {
-    inner: HashMap<ProvisionHash, Arc<Provisions>>,
-    outbound_index: HashMap<(BlockHeight, ShardId), Arc<Provisions>>,
+    inner: HashMap<ProvisionHash, Provisions>,
+    outbound_index: HashMap<(BlockHeight, ShardId), Provisions>,
 }
 
 impl ProvisionStore {
@@ -53,7 +52,7 @@ impl ProvisionStore {
     ///
     /// Inbound callers use this; the secondary outbound index is not
     /// touched.
-    pub fn insert(&self, provisions: Arc<Provisions>) {
+    pub fn insert(&self, provisions: Provisions) {
         let hash = provisions.hash();
         self.inner.pin().get_or_insert_with(hash, || provisions);
     }
@@ -64,19 +63,19 @@ impl ProvisionStore {
     /// before regenerating from `RocksDB`. Idempotent on the
     /// `(height, shard)` slot — first writer wins, repeated inserts of
     /// the same content are no-ops.
-    pub(crate) fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardId) {
+    pub(crate) fn insert_outbound(&self, provisions: Provisions, target_shard: ShardId) {
         let hash = provisions.hash();
         let block_height = provisions.block_height();
         self.inner
             .pin()
-            .get_or_insert_with(hash, || Arc::clone(&provisions));
+            .get_or_insert_with(hash, || provisions.clone());
         self.outbound_index
             .pin()
             .get_or_insert_with((block_height, target_shard), || provisions);
     }
 
     /// Look up provisions by content hash.
-    pub fn get(&self, hash: ProvisionHash) -> Option<Arc<Provisions>> {
+    pub fn get(&self, hash: ProvisionHash) -> Option<Provisions> {
         self.inner.pin().get(&hash).cloned()
     }
 
@@ -88,7 +87,7 @@ impl ProvisionStore {
         &self,
         block_height: BlockHeight,
         target_shard: ShardId,
-    ) -> Option<Arc<Provisions>> {
+    ) -> Option<Provisions> {
         self.outbound_index
             .pin()
             .get(&(block_height, target_shard))
@@ -153,8 +152,8 @@ mod tests {
 
     use super::*;
 
-    fn make_provisions(tx_seed: u8, height: u64) -> Arc<Provisions> {
-        Arc::new(Provisions::new(
+    fn make_provisions(tx_seed: u8, height: u64) -> Provisions {
+        Provisions::new(
             ShardId::leaf(1, 1),
             ShardId::leaf(1, 0),
             BlockHeight::new(height),
@@ -164,7 +163,7 @@ mod tests {
                 TxHash::from(Hash::from_bytes(&[tx_seed])),
                 Capped::empty(),
             )]),
-        ))
+        )
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl ShardParticipation {
     ) -> Self {
         let provision_store = Arc::new(ProvisionStore::new());
         for provisions in &recovered.retained_provisions {
-            provision_store.insert(Arc::clone(provisions));
+            provision_store.insert(provisions.clone());
         }
         // Execution's commit frontier and its account of what is still in
         // flight both seed from the same recovered tip the shard

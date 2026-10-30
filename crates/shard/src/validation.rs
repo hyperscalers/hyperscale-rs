@@ -413,7 +413,7 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<ProvisionsSection>(
         ctx,
         &mut provisions,
-        block.provisions().iter().map(unwrapped),
+        block.provisions().iter().map(Verifiable::as_unverified),
     )?;
     let mut transactions = TransactionsFold::beside(&provisions);
     admit_all::<TransactionsSection<'_>>(
@@ -5383,11 +5383,9 @@ pub mod tests {
     // validate_no_duplicate_provisions
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_provisions(height: BlockHeight, provisions: Vec<Arc<Provisions>>) -> Block {
-        let wrapped: Vec<Arc<Verifiable<Provisions>>> = provisions
-            .into_iter()
-            .map(|p| Arc::new((*p).clone().into()))
-            .collect();
+    fn block_with_provisions(height: BlockHeight, provisions: Vec<Provisions>) -> Block {
+        let wrapped: Vec<Verifiable<Provisions>> =
+            provisions.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(Capped::empty()),
@@ -5401,16 +5399,16 @@ pub mod tests {
         }
     }
 
-    fn provisions_with_seed(seed: u8) -> Arc<Provisions> {
+    fn provisions_with_seed(seed: u8) -> Provisions {
         let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
-        Arc::new(Provisions::new(
+        Provisions::new(
             ShardId::leaf(1, 0),
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
             Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-        ))
+        )
     }
 
     #[test]
@@ -5439,7 +5437,7 @@ pub mod tests {
     #[test]
     fn validate_no_duplicate_provisions_rejects_retention_dup() {
         let p = provisions_with_seed(1);
-        let block = block_with_provisions(BlockHeight::new(6), vec![Arc::clone(&p)]);
+        let block = block_with_provisions(BlockHeight::new(6), vec![p.clone()]);
         let against = plain();
         against
             .dedup
@@ -5617,7 +5615,7 @@ pub mod tests {
 
     fn block_with_tx(
         tx: &Arc<Verifiable<Transaction>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        provisions: Vec<Verifiable<Provisions>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(BlockHeight::new(1), 100_000),
@@ -5649,7 +5647,7 @@ pub mod tests {
         assert!(err.contains("payer bundle"), "{err}");
 
         // The payer's empty-entry bundle in the same block: engaged.
-        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
+        let bundle: Verifiable<Provisions> =
             Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
                 ShardId::leaf(1, 1),
                 local,
@@ -5658,9 +5656,8 @@ pub mod tests {
                 MerkleInclusionProof::dummy(),
                 Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
-            .into(),
-        );
-        let paired = block_with_tx(&tx, vec![Arc::clone(&bundle)]);
+            .into();
+        let paired = block_with_tx(&tx, vec![bundle]);
         assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
         // A bundle an earlier block committed, registered through that
@@ -5681,7 +5678,7 @@ pub mod tests {
         assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
 
         // A bundle from the wrong source shard is not engagement evidence.
-        let wrong_source: Arc<Verifiable<Provisions>> = Arc::new(
+        let wrong_source: Verifiable<Provisions> =
             Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
                 local,
                 ShardId::leaf(1, 1),
@@ -5690,8 +5687,7 @@ pub mod tests {
                 MerkleInclusionProof::dummy(),
                 Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
-            .into(),
-        );
+            .into();
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
@@ -5704,18 +5700,16 @@ pub mod tests {
         local: ShardId,
         height: u64,
         tx_hash: TxHash,
-    ) -> Arc<Verifiable<Provisions>> {
-        Arc::new(
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                payer,
-                local,
-                BlockHeight::new(height),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into(),
-        )
+    ) -> Verifiable<Provisions> {
+        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+            payer,
+            local,
+            BlockHeight::new(height),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+        ))
+        .into()
     }
 
     /// A committed payer entry engages only while its committing anchor
@@ -6358,7 +6352,7 @@ pub mod tests {
         // bundle in hand: carried. What the ceiling covers is not this
         // chain's question, and asking it here is what would fork the
         // two verdicts across a fold.
-        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
+        let bundle: Verifiable<Provisions> =
             Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
                 payer_shard,
                 local,
@@ -6367,8 +6361,7 @@ pub mod tests {
                 MerkleInclusionProof::dummy(),
                 Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
-            .into(),
-        );
+            .into();
         assert!(admit(&engaged(&topo, local), &block_with_tx(&tx, vec![bundle])).is_ok());
     }
 

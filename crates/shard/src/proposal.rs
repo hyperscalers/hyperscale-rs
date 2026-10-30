@@ -127,7 +127,7 @@ pub struct ProposalInputs {
     /// Finalizations execution holds ready to commit.
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     /// Provision bundles queued from remote shards.
-    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub provisions: Vec<Verifiable<Provisions>>,
     /// What departed counterparts left of this chain's business.
     pub abandonment_records: Vec<AbandonmentRecord>,
     /// Proofs of counterparts' cells this validator's fetches answered.
@@ -207,7 +207,7 @@ impl ProposalKind {
 pub struct ProposalPayload {
     pub(crate) transactions: Vec<Arc<Verified<Transaction>>>,
     pub(crate) finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub(crate) provisions: Vec<Verifiable<Provisions>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
     /// The crossings whose ends share this shard, and those whose record
@@ -1435,9 +1435,9 @@ fn trim_parent_reads((places, spent): (usize, usize), mut offered: ParentReads) 
 pub fn select_provisions(
     ctx: &Committed<'_>,
     fold: &mut ProvisionsFold,
-    provisions: Vec<Arc<Verifiable<Provisions>>>,
-) -> Vec<Arc<Verifiable<Provisions>>> {
-    admit_each::<ProvisionsSection, _>(ctx, fold, provisions, unwrapped).0
+    provisions: Vec<Verifiable<Provisions>>,
+) -> Vec<Verifiable<Provisions>> {
+    admit_each::<ProvisionsSection, _>(ctx, fold, provisions, Verifiable::as_unverified).0
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

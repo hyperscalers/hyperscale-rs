@@ -90,7 +90,7 @@ impl OutboundProvisionTracker {
     /// local JMT view so the merkle predicate holds. The shared
     /// [`ProvisionStore`] holds raw bodies (wire-serving doesn't carry
     /// the marker), so the body is cloned once at the seam.
-    pub fn on_broadcast(&mut self, provisions: &Arc<Verified<Provisions>>, target_shard: ShardId) {
+    pub fn on_broadcast(&mut self, provisions: &Verified<Provisions>, target_shard: ShardId) {
         let provision_hash = provisions.hash();
         if self.entries.contains_key(&provision_hash) {
             return;
@@ -110,7 +110,7 @@ impl OutboundProvisionTracker {
         }
 
         self.store
-            .insert_outbound(Arc::new((***provisions).clone()), target_shard);
+            .insert_outbound(provisions.as_ref().clone(), target_shard);
 
         self.entries.insert(
             provision_hash,
@@ -244,7 +244,7 @@ mod tests {
         TxHash::from(Hash::from_bytes(label))
     }
 
-    fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Verified<Provisions>> {
+    fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Verified<Provisions> {
         make_provisions_at(source_block, WeightedTimestamp::ZERO, txs)
     }
 
@@ -252,21 +252,21 @@ mod tests {
         source_block: BlockHeight,
         source_block_ts: WeightedTimestamp,
         txs: &[TxHash],
-    ) -> Arc<Verified<Provisions>> {
+    ) -> Verified<Provisions> {
         let transactions = Capped::new(
             txs.iter()
                 .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
                 .collect(),
         )
         .expect("a list written out in a test");
-        Arc::new(Verified::new_unchecked_for_test(Provisions::new(
+        Verified::new_unchecked_for_test(Provisions::new(
             ShardId::leaf(2, 0),
             ShardId::leaf(2, 1),
             source_block,
             source_block_ts,
             MerkleInclusionProof::dummy(),
             transactions,
-        )))
+        ))
     }
 
     fn executed(tx_hash: TxHash) -> TxOutcome {

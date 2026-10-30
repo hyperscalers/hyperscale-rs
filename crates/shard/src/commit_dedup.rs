@@ -480,16 +480,16 @@ mod tests {
         )
     }
 
-    fn make_provisions(seed: u8) -> Arc<Provisions> {
+    fn make_provisions(seed: u8) -> Provisions {
         let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
-        Arc::new(Provisions::new(
+        Provisions::new(
             ShardId::leaf(1, 0),
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
             Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-        ))
+        )
     }
 
     // ─── Resolutions ────────────────────────────────────────────────────

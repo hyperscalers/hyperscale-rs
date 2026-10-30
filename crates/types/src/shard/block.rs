@@ -74,7 +74,7 @@ pub type SharedCertificates =
     Arc<Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>>;
 
 /// Shared provision list — same rationale as [`SharedCertificates`].
-pub type SharedProvisions = Arc<Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>>;
+pub type SharedProvisions = Arc<Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>>;
 
 /// What a shard charged across the ticks `certificates` settle, in
 /// quanta.
@@ -542,7 +542,7 @@ impl Block {
     /// verification marker survives across the block boundary; consumers
     /// peek `.verified()` to skip re-verification when the marker is live.
     #[must_use]
-    pub fn provisions(&self) -> &[Arc<Verifiable<Provisions>>] {
+    pub fn provisions(&self) -> &[Verifiable<Provisions>] {
         match self {
             Self::Live { provisions, .. } => provisions,
             Self::Sealed { .. } => &[],

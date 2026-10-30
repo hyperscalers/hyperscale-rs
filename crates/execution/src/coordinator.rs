@@ -1856,9 +1856,9 @@ impl ExecutionCoordinator {
     /// clone. Wire-decoded blocks land at `Unverified`; the
     /// [`Verified::<Provisions>::from_committed_block`] gate then carries
     /// the BFT-transitive trust source via a re-wrap (one body clone).
-    fn apply_committed_provisions(&mut self, batches: &[Arc<Verifiable<Provisions>>]) {
+    fn apply_committed_provisions(&mut self, batches: &[Verifiable<Provisions>]) {
         // Sort for deterministic iteration (logs, action vector order).
-        let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
+        let mut ordered: Vec<&Verifiable<Provisions>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
         for provisions in &ordered {

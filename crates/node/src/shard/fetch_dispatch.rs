@@ -320,8 +320,6 @@ impl FetchTicker {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use hyperscale_core::BeaconFetchIds;
     use hyperscale_hbor::Capped;
     use hyperscale_storage_memory::SimShardStorage;
@@ -408,7 +406,7 @@ mod tests {
             )]),
         );
         loop_of(&mut host).drive_fetch_admission(&ProtocolEvent::StateProvisionsVerified {
-            result: Err((Arc::new(bundle), ProvisionsVerifyError::BadInclusion)),
+            result: Err((bundle, ProvisionsVerifyError::BadInclusion)),
             anchor: Anchor {
                 shard: source,
                 height,
