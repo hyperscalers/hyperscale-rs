@@ -101,9 +101,17 @@ type Named = Capped<Vec<(TxHash, GlobalReceiptHash)>, MAX_TXS_PER_BLOCK>;
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
+///
+/// Every clone shares one allocation, so moving a finalization between
+/// its raw, verifiable and verified forms copies a pointer rather than
+/// its receipts.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-#[hbor(validate = check_finalization)]
-pub struct Finalization {
+#[hbor(transparent, validate = check_finalization)]
+pub struct Finalization(Arc<Carried>);
+
+/// What every clone of one [`Finalization`] shares.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Carried {
     tick_id: TickId,
     /// Which half of `tick_id` this settles. Ordering is per half, so
     /// the identity that orders is too.
@@ -133,11 +141,11 @@ pub struct Finalization {
 /// [`Finalization::reconstruct`] restores and every block that carries
 /// the half is held to by its validation.
 fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
-    if tick.half == TickHalf::Legs {
-        if tick.certificate.is_some() {
+    if tick.0.half == TickHalf::Legs {
+        if tick.0.certificate.is_some() {
             return Err("a legs half carries no certificate");
         }
-        if tick.receipts.is_empty() && !tick.named.is_empty() {
+        if tick.0.receipts.is_empty() && !tick.0.named.is_empty() {
             return Ok(());
         }
         return tick
@@ -145,9 +153,10 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
             .map_err(|_| "a legs half names the receipts it carries, each under its own hash");
     }
     if tick
+        .0
         .certificate
         .as_ref()
-        .is_none_or(|ec| ec.tick_id() != &tick.tick_id)
+        .is_none_or(|ec| ec.tick_id() != &tick.0.tick_id)
     {
         return Err("a determined or stating half carries its own tick's certificate");
     }
@@ -302,28 +311,28 @@ impl Finalization {
     /// Held in-memory until block commit, then written atomically with block metadata.
     #[must_use]
     pub fn receipts(&self) -> &Vec<StoredReceipt> {
-        &self.receipts
+        &self.0.receipts
     }
 
     /// The tick this tick finalizes. Globally unique; `hash(tick_id)` is
     /// the identity key for manifest/storage.
     #[must_use]
-    pub const fn tick_id(&self) -> &TickId {
-        &self.tick_id
+    pub fn tick_id(&self) -> &TickId {
+        &self.0.tick_id
     }
 
     /// Which half of its tick this settles — what settlement order is
     /// measured over.
     #[must_use]
-    pub const fn half(&self) -> TickHalf {
-        self.half
+    pub fn half(&self) -> TickHalf {
+        self.0.half
     }
 
     /// Whether this settles the half that carries writes later ticks can
     /// already read, and so the half the settlement frontier tracks.
     #[must_use]
-    pub const fn is_determined(&self) -> bool {
-        matches!(self.half, TickHalf::Determined)
+    pub fn is_determined(&self) -> bool {
+        matches!(self.0.half, TickHalf::Determined)
     }
 
     /// The same legs half settling only those of its names in `members`,
@@ -332,9 +341,13 @@ impl Finalization {
     /// name nobody and are returned as they are.
     #[must_use]
     pub fn naming(mut self, members: &HashSet<TxHash>) -> Self {
-        if matches!(self.half, TickHalf::Legs) {
-            self.named.retain(|(tx_hash, _)| members.contains(tx_hash));
-            self.receipts
+        if matches!(self.0.half, TickHalf::Legs) {
+            let carried = Arc::make_mut(&mut self.0);
+            carried
+                .named
+                .retain(|(tx_hash, _)| members.contains(tx_hash));
+            carried
+                .receipts
                 .retain(|receipt| members.contains(&receipt.tx_hash));
         }
         self
@@ -342,10 +355,11 @@ impl Finalization {
 
     /// The tick's own certificate, where the finalization carries one.
     fn local_certificate(&self) -> Option<&ExecutionCertificate> {
-        self.certificate
+        self.0
+            .certificate
             .as_deref()
             .map(Verifiable::as_unverified)
-            .filter(|ec| ec.tick_id() == &self.tick_id)
+            .filter(|ec| ec.tick_id() == &self.0.tick_id)
     }
 
     /// The outcomes of the tick's own certificate this finalization
@@ -357,7 +371,7 @@ impl Finalization {
     /// A success a stating half carries is a yes that settles nothing,
     /// read through [`Self::stated_outcomes`].
     pub fn settled_outcomes(&self) -> impl Iterator<Item = &TxOutcome> + '_ {
-        let half = self.half;
+        let half = self.0.half;
         self.local_certificate()
             .into_iter()
             .flat_map(|ec| ec.tx_outcomes().iter())
@@ -372,7 +386,7 @@ impl Finalization {
     /// certificate's order: its successes, each a yes its counterparts
     /// have yet to answer. Nothing of any other half.
     pub fn stated_outcomes(&self) -> impl Iterator<Item = &TxOutcome> + '_ {
-        let stating = self.half == TickHalf::Stated;
+        let stating = self.0.half == TickHalf::Stated;
         self.local_certificate()
             .into_iter()
             .flat_map(|ec| ec.tx_outcomes().iter())
@@ -383,7 +397,7 @@ impl Finalization {
     /// Nothing of any other half.
     #[must_use]
     pub fn accepted_names(&self) -> BTreeSet<TxHash> {
-        self.named.iter().map(|(tx_hash, _)| *tx_hash).collect()
+        self.0.named.iter().map(|(tx_hash, _)| *tx_hash).collect()
     }
 
     /// Whether the half's names stand: a determined half and a stating
@@ -394,19 +408,19 @@ impl Finalization {
     /// the verdict on always runs under. The error is the first name
     /// that fails, where the fault is one name's.
     fn names_stand(&self) -> Result<(), Option<TxHash>> {
-        match self.half {
+        match self.0.half {
             TickHalf::Determined | TickHalf::Stated => {
-                return if self.named.is_empty() {
+                return if self.0.named.is_empty() {
                     Ok(())
                 } else {
                     Err(None)
                 };
             }
-            TickHalf::Legs if self.named.is_empty() => return Err(None),
+            TickHalf::Legs if self.0.named.is_empty() => return Err(None),
             TickHalf::Legs => {}
         }
-        let mut receipts = self.receipts.iter();
-        for &(tx_hash, hash) in self.named.iter() {
+        let mut receipts = self.0.receipts.iter();
+        for &(tx_hash, hash) in self.0.named.iter() {
             let held = receipts
                 .next()
                 .is_some_and(|receipt| receipt.tx_hash == tx_hash && effects_under(receipt, hash));
@@ -450,8 +464,8 @@ impl Finalization {
         let Some(certificate) = self.local_certificate() else {
             return Err(ReceiptValidationError::MissingLocalEc);
         };
-        let stating = self.half == TickHalf::Stated;
-        let mut carried = self.receipts.iter().peekable();
+        let stating = self.0.half == TickHalf::Stated;
+        let mut carried = self.0.receipts.iter().peekable();
         for outcome in certificate.tx_outcomes() {
             let tx_hash = outcome.tx_hash();
             if stating && let ExecutionOutcome::Succeeded { receipt_hash } = outcome.outcome() {
@@ -516,7 +530,8 @@ impl Finalization {
     #[must_use]
     pub fn stated_receipts(&self) -> Vec<StoredReceipt> {
         let stated = self.stated_hashes();
-        self.receipts
+        self.0
+            .receipts
             .iter()
             .filter(|receipt| {
                 stated
@@ -534,7 +549,8 @@ impl Finalization {
     #[must_use]
     pub fn stored_receipts(&self) -> Vec<StoredReceipt> {
         let stated = self.stated_hashes();
-        self.receipts
+        self.0
+            .receipts
             .iter()
             .filter(|receipt| !stated.contains_key(&receipt.tx_hash))
             .cloned()
@@ -545,8 +561,8 @@ impl Finalization {
     /// off the wire, `Verifiable::Verified` where it was assembled here
     /// ([`Self::from_verified_ec`]). `None` for a legs half.
     #[must_use]
-    pub const fn certificate(&self) -> Option<&Arc<Verifiable<ExecutionCertificate>>> {
-        self.certificate.as_ref()
+    pub fn certificate(&self) -> Option<&Arc<Verifiable<ExecutionCertificate>>> {
+        self.0.certificate.as_ref()
     }
 
     /// The tick's own certificate, authoritative for what a determined or
@@ -584,7 +600,7 @@ impl Finalization {
     #[must_use]
     pub fn reanchored(&self, local: &Verified<ExecutionCertificate>) -> Option<Self> {
         let held = self.local_ec()?;
-        if local.tick_id() != &self.tick_id
+        if local.tick_id() != &self.0.tick_id
             || !local.is_complete()
             || local.global_receipt_root() != held.global_receipt_root()
             || local.vote_anchor_ts() <= held.vote_anchor_ts()
@@ -596,13 +612,13 @@ impl Finalization {
         if projected.tx_outcomes() != held.tx_outcomes() {
             return None;
         }
-        Some(Self {
-            tick_id: self.tick_id,
-            half: self.half,
+        Some(Self(Arc::new(Carried {
+            tick_id: self.0.tick_id,
+            half: self.0.half,
             certificate: Some(Arc::new(Verifiable::from(projected))),
-            receipts: self.receipts.clone(),
-            named: self.named.clone(),
-        })
+            receipts: self.0.receipts.clone(),
+            named: self.0.named.clone(),
+        })))
     }
 
     /// The leaf a block's certificates section commits for this
@@ -631,12 +647,12 @@ impl Finalization {
     #[must_use]
     pub fn receipt_hash(&self) -> FinalizationHash {
         let mut hasher = Hasher::new();
-        hasher.update(&hbor_to_vec(&self.tick_id).unwrap());
-        hasher.update(&hbor_to_vec(&self.half).unwrap());
-        if let Some(ec) = &self.certificate {
+        hasher.update(&hbor_to_vec(&self.0.tick_id).unwrap());
+        hasher.update(&hbor_to_vec(&self.0.half).unwrap());
+        if let Some(ec) = &self.0.certificate {
             hasher.update(ec.wire_hash().as_bytes());
         }
-        hasher.update(&hbor_to_vec(&self.named).unwrap());
+        hasher.update(&hbor_to_vec(&self.0.named).unwrap());
         FinalizationHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
     }
 
@@ -655,7 +671,7 @@ impl Finalization {
     /// block's running total.
     #[must_use]
     pub fn charged(&self) -> u128 {
-        match self.half {
+        match self.0.half {
             TickHalf::Determined | TickHalf::Stated => self
                 .settled_outcomes()
                 .chain(self.stated_outcomes())
@@ -670,7 +686,7 @@ impl Finalization {
     pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.settled_outcomes()
             .map(TxOutcome::tx_hash)
-            .chain(self.named.iter().map(|(tx_hash, _)| *tx_hash))
+            .chain(self.0.named.iter().map(|(tx_hash, _)| *tx_hash))
     }
 
     /// The transactions this finalization resolves: those whose local
@@ -682,7 +698,7 @@ impl Finalization {
         self.settled_outcomes()
             .filter(|outcome| outcome.decides())
             .map(TxOutcome::tx_hash)
-            .chain(self.named.iter().map(|(tx_hash, _)| *tx_hash))
+            .chain(self.0.named.iter().map(|(tx_hash, _)| *tx_hash))
     }
 
     /// Whether this finalization settles a given tx.
@@ -708,14 +724,14 @@ impl Finalization {
     /// the same cap.
     #[must_use]
     pub fn attestation(&self) -> Self {
-        Self {
-            tick_id: self.tick_id,
-            half: self.half,
-            certificate: self.certificate.clone(),
+        Self(Arc::new(Carried {
+            tick_id: self.0.tick_id,
+            half: self.0.half,
+            certificate: self.0.certificate.clone(),
             receipts: Capped::new(self.stated_receipts())
                 .expect("a subset of a list under the same cap"),
-            named: self.named.clone(),
-        }
+            named: self.0.named.clone(),
+        }))
     }
 
     /// The key of every receipt this finalization settles, in its order:
@@ -730,8 +746,8 @@ impl Finalization {
     /// one the tick never carried.
     #[must_use]
     pub fn settled_receipts(&self) -> Option<Vec<(TxHash, GlobalReceiptHash)>> {
-        if self.half == TickHalf::Legs {
-            return Some(self.named.to_vec());
+        if self.0.half == TickHalf::Legs {
+            return Some(self.0.named.to_vec());
         }
         self.local_certificate()?;
         Some(
@@ -782,8 +798,9 @@ impl Finalization {
             .into_iter()
             .map(|receipt| (receipt.tx_hash, receipt))
             .collect();
-        let receipts: Vec<StoredReceipt> = if attestation.half == TickHalf::Legs {
+        let receipts: Vec<StoredReceipt> = if attestation.0.half == TickHalf::Legs {
             attestation
+                .0
                 .named
                 .iter()
                 .filter_map(|(tx_hash, _)| settled.remove(tx_hash))
@@ -824,13 +841,13 @@ impl Finalization {
         certificate: Option<Arc<ExecutionCertificate>>,
         receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
-        Self {
+        Self(Arc::new(Carried {
             tick_id,
             half,
             certificate: certificate.map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec)))),
             receipts,
             named: Capped::empty(),
-        }
+        }))
     }
 
     /// The legs half of `tick_id` accepting the member of each of
@@ -853,13 +870,13 @@ impl Finalization {
                 .collect(),
         )
         .expect("one name per receipt, under the receipts' cap");
-        Self {
+        Self(Arc::new(Carried {
             tick_id,
             half: TickHalf::Legs,
             certificate: None,
             receipts,
             named,
-        }
+        }))
     }
 
     /// Build a receiptless determined or stating `Finalization` from the
@@ -876,13 +893,13 @@ impl Finalization {
     /// of re-checking.
     #[must_use]
     pub fn from_verified_ec(half: TickHalf, certificate: Verified<ExecutionCertificate>) -> Self {
-        Self {
+        Self(Arc::new(Carried {
             tick_id: *certificate.tick_id(),
             half,
             certificate: Some(Arc::new(Verifiable::from(certificate))),
             receipts: Capped::empty(),
             named: Capped::empty(),
-        }
+        }))
     }
 
     /// The same tick carrying `receipts`. The receipt-count cap is
@@ -892,7 +909,7 @@ impl Finalization {
         mut self,
         receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
-        self.receipts = receipts;
+        Arc::make_mut(&mut self.0).receipts = receipts;
         self
     }
 
@@ -922,7 +939,7 @@ impl Finalization {
     pub fn validate_against_certificates(&self) -> Result<(), ReceiptValidationError> {
         self.names_stand()
             .map_err(|tx_hash| ReceiptValidationError::Misnamed { tx_hash })?;
-        if self.half == TickHalf::Legs {
+        if self.0.half == TickHalf::Legs {
             return Ok(());
         }
         self.receipts_follow(true)
@@ -951,12 +968,14 @@ impl Finalization {
     /// decided, which is a different question.
     #[must_use]
     pub fn settling_receipts(&self) -> Vec<StoredReceipt> {
-        if self.half == TickHalf::Legs {
+        if self.0.half == TickHalf::Legs {
             return self
+                .0
                 .receipts
                 .iter()
                 .filter(|receipt| {
-                    self.named
+                    self.0
+                        .named
                         .contains(&(receipt.tx_hash, receipt.consensus.receipt_hash()))
                 })
                 .cloned()
@@ -975,8 +994,9 @@ impl Finalization {
                 refusals.insert(outcome.tx_hash(), hash);
             }
         }
-        let stating = self.half == TickHalf::Stated;
-        self.receipts
+        let stating = self.0.half == TickHalf::Stated;
+        self.0
+            .receipts
             .iter()
             .filter(|receipt| {
                 let refusal =
@@ -1036,6 +1056,7 @@ impl Finalization {
     #[must_use]
     pub fn resolutions(&self) -> Vec<(TxHash, TxResolution)> {
         let accepted = self
+            .0
             .named
             .iter()
             .map(|(tx_hash, _)| (*tx_hash, TxResolution::Decided(TransactionDecision::Accept)));
@@ -1472,7 +1493,7 @@ mod tests {
         let (first, second) = (member(1), member(2));
         let (one, two) = (effects_of(first, 1), effects_of(second, 2));
         let whole = legs_half(&[one.clone(), two.clone()]);
-        let names = whole.named.to_vec();
+        let names = whole.0.named.to_vec();
 
         let stripped = StoredReceipt {
             tx_hash: first,
@@ -1510,20 +1531,23 @@ mod tests {
             (vec![names[0], names[1]], vec![one], Some(second)),
         ] {
             let mut misnamed = whole.clone();
-            misnamed.named = Capped::new(named).expect("a list written out in a test");
-            misnamed.receipts = Capped::new(receipts).expect("a list written out in a test");
+            Arc::make_mut(&mut misnamed.0).named =
+                Capped::new(named).expect("a list written out in a test");
+            Arc::make_mut(&mut misnamed.0).receipts =
+                Capped::new(receipts).expect("a list written out in a test");
             assert_eq!(
                 misnamed.validate_against_certificates(),
                 Err(ReceiptValidationError::Misnamed { tx_hash: failing }),
                 "naming {:?}",
-                misnamed.named,
+                misnamed.0.named,
             );
-            assert_eq!(decoded(&misnamed), None, "naming {:?}", misnamed.named);
+            assert_eq!(decoded(&misnamed), None, "naming {:?}", misnamed.0.named);
         }
 
         let mut determined = stating_half(vec![core(1, b"effects", 10)]);
-        determined.half = TickHalf::Determined;
-        determined.named = Capped::new(names).expect("a list written out in a test");
+        Arc::make_mut(&mut determined.0).half = TickHalf::Determined;
+        Arc::make_mut(&mut determined.0).named =
+            Capped::new(names).expect("a list written out in a test");
         assert_eq!(
             determined.validate_against_certificates(),
             Err(ReceiptValidationError::Misnamed { tx_hash: None }),
@@ -1634,7 +1658,7 @@ mod tests {
         assert_eq!(half.settling_receipts(), vec![]);
         assert_eq!(half.tx_decisions(), vec![]);
         assert_eq!(half.resolutions(), vec![]);
-        assert!(half.named.is_empty());
+        assert!(half.0.named.is_empty());
         assert_eq!(
             half.charged(),
             10,
@@ -1643,7 +1667,7 @@ mod tests {
 
         for other in [TickHalf::Determined, TickHalf::Legs] {
             let mut read_as = half.clone();
-            read_as.half = other;
+            Arc::make_mut(&mut read_as.0).half = other;
             assert_eq!(
                 read_as.stated_outcomes().count(),
                 0,
@@ -1848,7 +1872,8 @@ mod tests {
         assert_eq!(decoded(&alone), Some(alone.clone()));
 
         let mut naming = alone;
-        naming.named = Capped::from_array([(yes.tx_hash(), GlobalReceiptHash::ZERO)]);
+        Arc::make_mut(&mut naming.0).named =
+            Capped::from_array([(yes.tx_hash(), GlobalReceiptHash::ZERO)]);
         assert_eq!(
             naming.validate_against_certificates(),
             Err(ReceiptValidationError::Misnamed { tx_hash: None }),
