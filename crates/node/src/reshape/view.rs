@@ -3,11 +3,10 @@
 //! Both harnesses gate reshape on the same committed-state projection: a shard's
 //! boundary anchor projects (`Some`) exactly once it seeds — the projection
 //! drops zeroed genesis placeholders ([`BeaconState::derive_topology_snapshot`]
-//! filters `block_hash == ZERO`), so `boundary(shard).is_some()` is equivalent to
-//! the raw `BeaconState.boundaries[shard].block_hash != ZERO` the simulation used
-//! to read directly. Routing both the production supervisor and the simulation
-//! driver through these predicates gives one definition of the gate, so neither
-//! hand-rolls it and they cannot silently diverge.
+//! filters `block_hash == ZERO`), so `boundary(shard).is_some()` means the
+//! committed `BeaconState.boundaries[shard]` carries a real block. The
+//! production supervisor and the simulation driver both read the gate through
+//! these predicates, so it has one definition.
 //!
 //! [`BeaconState::derive_topology_snapshot`]: hyperscale_types::BeaconState::derive_topology_snapshot
 

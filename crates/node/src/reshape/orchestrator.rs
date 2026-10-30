@@ -11,9 +11,9 @@
 //! Each `step` reads the view, applies the io results the adapter feeds back,
 //! advances every duty, and returns the io the adapter should perform. It is
 //! idempotent: one-shot requests are guarded by duty flags, the sequencers gate
-//! their own in-flight fetches, and the ready re-assert is deliberately repeated
-//! each step (the adapter's step cadence paces it — production's 1s sleep,
-//! simulation's per-slice pump).
+//! their own in-flight fetches, and the ready re-assert backs off on the local
+//! clock (`ReadyAssert`), so however often the adapter pumps a step it
+//! asserts at the same pace.
 //!
 //! It covers all three reshape duties — the **split observer**, the **split
 //! parent half**, and the **merge keeper** — each discovered from its own cohort
@@ -173,7 +173,7 @@ pub enum ReshapeRequest {
         recipients: Vec<ValidatorId>,
     },
     /// Adopt `shard`'s derived genesis, verifying the adopted root against the
-    /// beacon anchor. Answered by [`ReshapeEvent::Adopted`].
+    /// state root the genesis names. Answered by [`ReshapeEvent::Adopted`].
     Adopt {
         /// The duty's store shard.
         shard: ShardId,
@@ -341,7 +341,8 @@ pub enum ReshapeEvent {
         /// The applied root.
         root: StateRoot,
     },
-    /// A genesis adoption completed (root already verified against the anchor).
+    /// A genesis adoption completed, its root already verified against the
+    /// genesis's.
     Adopted {
         /// The store shard.
         shard: ShardId,
@@ -886,7 +887,6 @@ fn seed_due(requested: bool, retry_at: Option<LocalTimestamp>, now: LocalTimesta
     !requested && retry_at.is_none_or(|at| now >= at)
 }
 
-/// The keeper half `from` addresses, when it is one of the duty's children.
 /// The recognition walk covering `from`, when a keeper is still finding
 /// its children's terminals.
 fn recognition_for<'a>(
@@ -903,6 +903,7 @@ fn recognition_for<'a>(
     }
 }
 
+/// The keeper half `from` addresses, when it is one of the duty's children.
 fn half_for<'a>(
     left: &'a mut KeeperHalf,
     right: &'a mut KeeperHalf,

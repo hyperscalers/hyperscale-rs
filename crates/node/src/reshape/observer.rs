@@ -647,8 +647,9 @@ impl ObserverTail {
     /// a coast block past the cut, empty by rule, so it moves no state. But
     /// the adopt reads the child's substate byte total at the genesis
     /// height, which is `terminal + 1`, so that version has to exist. A
-    /// recognizing tail writes nothing, and needs the successor anyway: its
-    /// `parent_qc` is the only canonical source of the genesis clock.
+    /// recognizing tail writes nothing, and walks past the terminal anyway:
+    /// the certificate a sighting carries is the successor's `parent_qc`,
+    /// and the commit proof forms at or above the successor.
     ///
     /// A following tail applies only proven blocks, so a sighting it
     /// returns is of a terminal proven committed, certified canonically by

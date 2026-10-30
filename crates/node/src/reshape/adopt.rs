@@ -2,12 +2,13 @@
 //!
 //! Every reshape duty — a split parent half, a split observer, a merge keeper —
 //! installs its derived genesis into a prepared store, then checks the adopted
-//! root against the beacon-attested anchor before trusting it: a match means the
-//! local derivation and the beacon agree; a mismatch means they have diverged
-//! and the duty must fail closed. [`adopt_prepared_store`] runs the whole
-//! sequence — the per-duty [`BoundaryStore`] adopt call, the expected-root
-//! selection, and the acceptance check — so both harnesses call one gate
-//! rather than re-deriving any part of it.
+//! root against the state root the genesis names before trusting it: a match
+//! means the store holds the subtree the genesis commits to; a mismatch means
+//! the store has diverged from it and the duty must fail closed.
+//! [`adopt_prepared_store`] runs the whole sequence — the per-duty
+//! [`BoundaryStore`] adopt call, the expected-root selection, and the
+//! acceptance check — so both harnesses call one gate rather than
+//! re-deriving any part of it.
 
 use hyperscale_storage::{AdoptSource, BoundaryStore, MemberIndex, RecoveredState};
 use hyperscale_types::{Anchor, Block, ChainOrigin, ReadFrontier, ShardId, StateRoot};

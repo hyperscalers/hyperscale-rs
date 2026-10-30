@@ -47,7 +47,7 @@ pub enum ReshapeCompletion<S> {
         /// Its recovered state.
         recovered: RecoveredState,
     },
-    /// A genesis adoption landed, its root verified against the anchor.
+    /// A genesis adoption landed, its root verified against the genesis's.
     Adopted {
         /// The prepared shard.
         shard: ShardId,
