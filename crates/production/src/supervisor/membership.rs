@@ -429,8 +429,8 @@ impl ShardSupervisor {
                     .iter()
                     .map(|vnode| (vnode.validator_id, Arc::clone(&vnode.signer)))
                     .collect(),
+                inbox: sender,
             },
-            sender,
             wall_clock_local(),
         );
         let start = genesis

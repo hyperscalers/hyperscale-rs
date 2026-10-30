@@ -803,7 +803,11 @@ impl SimulationRunner {
                 .clone()
                 .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
 
-            // One `SimShardStorage` per hosted shard on this host.
+            // One `SimShardStorage` per hosted shard on this host. A single
+            // receiver per host: both lanes of every hosted shard's inbox
+            // are clones of the same unbounded `event_tx`, so no push is
+            // ever refused, and the harness drains all shards through
+            // `event_rx` deterministically.
             let fresh = RecoveredState::default();
             let chains: Vec<HostedChain<'_, SimShardStorage>> = by_shard
                 .iter()
@@ -812,15 +816,8 @@ impl SimulationRunner {
                     storage: open_store(*shard, network_config.power_loss),
                     recovered: &fresh,
                     signers: validator_idxs.iter().copied().map(signer_of).collect(),
+                    inbox: ShardInbox::from(event_tx.clone()),
                 })
-                .collect();
-            // Single receiver per host: both lanes of every hosted shard's
-            // inbox are clones of the same unbounded `event_tx`, so no push
-            // is ever refused, and the harness drains all shards through
-            // `event_rx` deterministically.
-            let shard_event_senders: BTreeMap<ShardId, ShardInbox> = by_shard
-                .keys()
-                .map(|s| (*s, ShardInbox::from(event_tx.clone())))
                 .collect();
             let host = NodeHost::new(
                 &replica_config,
@@ -831,7 +828,6 @@ impl SimulationRunner {
                         NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
                     ),
                     dispatch,
-                    shard_event_senders,
                     beacon_event_sender: event_tx.clone(),
                     topology_snapshot: topology_arc_for_host,
                 },

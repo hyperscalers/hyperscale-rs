@@ -520,10 +520,10 @@ impl ProductionRunnerBuilder {
         // `ShardChannels` carries the receiving ends; the supervisor keeps
         // the shutdown sender alive for the shard's lifetime.
         let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
-        let mut shard_callback_txs: BTreeMap<ShardId, ShardInbox> = BTreeMap::new();
+        let mut shard_inboxes: BTreeMap<ShardId, ShardInbox> = BTreeMap::new();
         for shard in &local_shards {
-            let (channels, callback_tx) = ShardChannels::new();
-            shard_callback_txs.insert(*shard, callback_tx);
+            let (channels, inbox) = ShardChannels::new();
+            shard_inboxes.insert(*shard, inbox);
             shard_channels.insert(*shard, channels);
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -538,6 +538,9 @@ impl ProductionRunnerBuilder {
                 storage: (*storages[&shard]).clone(),
                 recovered: &resumed[&shard],
                 signers,
+                inbox: shard_inboxes
+                    .remove(&shard)
+                    .expect("every seated shard is hosted"),
             })
             .collect();
         let identities: Vec<(ValidatorId, Arc<dyn Signer>)> = bind_vnodes.clone();
@@ -552,13 +555,6 @@ impl ProductionRunnerBuilder {
             verifier: Arc::new(BlsVerifier),
         })?;
 
-        // Each shard's `shard_event_senders` entry is that shard's own
-        // pinned-thread inbox — callbacks, network handlers, and RPC
-        // fanout for that shard land on its thread directly.
-        let shard_event_senders: BTreeMap<ShardId, ShardInbox> = shard_callback_txs
-            .iter()
-            .map(|(s, tx)| (*s, tx.clone()))
-            .collect();
         // Beacon channel for the host's beacon loop: beacon gossip, what
         // the replicas report, and the loop's own continuations and fetch
         // answers arrive on it; the supervisor hands the receiver to the
@@ -571,7 +567,6 @@ impl ProductionRunnerBuilder {
                 executor,
                 network,
                 dispatch: (*dispatch).clone(),
-                shard_event_senders,
                 beacon_event_sender: beacon_event_tx,
                 topology_snapshot: topology_snapshot.clone(),
             },

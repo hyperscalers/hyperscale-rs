@@ -143,8 +143,8 @@ impl Fixture {
                 storage: SimShardStorage::new(shard_prefix_path(shard)),
                 recovered: &RecoveredState::default(),
                 signers: idxs.iter().map(|&idx| self.identity(idx)).collect(),
+                inbox: event_tx.into(),
             },
-            event_tx,
         );
     }
 
@@ -169,7 +169,6 @@ impl Fixture {
                 executor: Arc::new(Executor::new(ExecutionMode::Serial)),
                 network,
                 dispatch: SyncDispatch::new(),
-                shard_event_senders: BTreeMap::new(),
                 beacon_event_sender: event_tx,
                 topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             },

@@ -157,10 +157,6 @@ impl Fixture {
                 executor: Arc::new(Executor::new(ExecutionMode::Serial)),
                 network: SimNetworkAdapter::new(registry),
                 dispatch: SyncDispatch::new(),
-                shard_event_senders: chains
-                    .iter()
-                    .map(|&(shard, _)| (shard, event_tx.clone().into()))
-                    .collect(),
                 beacon_event_sender: event_tx.clone(),
                 topology_snapshot: Arc::new(ArcSwap::from(topology)),
             },
@@ -171,6 +167,7 @@ impl Fixture {
                     storage: SimShardStorage::new(shard_prefix_path(shard)),
                     recovered: &fresh,
                     signers: vec![self.identity(idx)],
+                    inbox: event_tx.clone().into(),
                 })
                 .collect(),
             participants.iter().map(|&idx| self.identity(idx)).collect(),
@@ -202,8 +199,8 @@ impl Fixture {
                 storage: SimShardStorage::new(shard_prefix_path(shard)),
                 recovered: &RecoveredState::default(),
                 signers: vec![self.identity(idx)],
+                inbox: event_tx.into(),
             },
-            event_tx,
         );
     }
 }

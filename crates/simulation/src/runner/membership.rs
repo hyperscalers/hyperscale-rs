@@ -673,7 +673,7 @@ impl SimulationRunner {
             .iter()
             .map(|&validator| (validator, self.signer_of(validator)))
             .collect();
-        let sender = self.event_txs[host as usize].clone();
+        let inbox = self.event_txs[host as usize].clone().into();
         self.hosts[host as usize].add_shard(
             &config,
             HostedChain {
@@ -681,8 +681,8 @@ impl SimulationRunner {
                 storage,
                 recovered,
                 signers,
+                inbox,
             },
-            sender,
         );
     }
 

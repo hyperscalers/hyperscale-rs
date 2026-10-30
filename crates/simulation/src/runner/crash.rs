@@ -198,11 +198,6 @@ impl SimulationRunner {
         let dispatch = self.deferred[i]
             .clone()
             .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
-        let shard_event_senders = seated
-            .chains
-            .iter()
-            .map(|chain| (chain.0, self.event_txs[i].clone().into()))
-            .collect();
         let chains = seated
             .chains
             .iter()
@@ -211,6 +206,7 @@ impl SimulationRunner {
                 storage: store.clone(),
                 recovered,
                 signers: signers.clone(),
+                inbox: self.event_txs[i].clone().into(),
             })
             .collect();
         let restarted = NodeHost::new(
@@ -220,7 +216,6 @@ impl SimulationRunner {
                 executor: Arc::clone(&executor),
                 network: self.network.create_adapter(host),
                 dispatch,
-                shard_event_senders,
                 beacon_event_sender: self.event_txs[i].clone(),
                 topology_snapshot: Arc::new(ArcSwap::from(topology)),
             },

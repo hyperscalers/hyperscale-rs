@@ -1096,8 +1096,8 @@ fn a_runtime_join_builds_its_replica_from_the_registration_reply() {
             storage: SimShardStorage::new(shard_prefix_path(SHARD)),
             recovered: &recovered,
             signers: vec![fix.identity(0)],
+            inbox: sender.into(),
         },
-        sender,
     );
     drop(events);
     let replica = host.replica(SHARD);
@@ -1830,8 +1830,8 @@ fn a_seat_moving_between_shards_keeps_its_participant() {
             storage: SimShardStorage::new(shard_prefix_path(other)),
             recovered: &RecoveredState::default(),
             signers: vec![fix.identity(0)],
+            inbox: sender.into(),
         },
-        sender,
     );
     assert!(host.remove_shard(SHARD).is_some());
     assert_eq!(attachment(&host, 0, &fix), before);

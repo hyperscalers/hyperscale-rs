@@ -17,7 +17,7 @@
 //! `clear_scratch` / `take_output` scratch lifecycle, so the two drivers
 //! cannot drift.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -130,8 +130,6 @@ pub struct HostResources<N, D> {
     pub network: N,
     /// The pool the host's actions are dispatched onto.
     pub dispatch: D,
-    /// Each startup chain's inbox, one per chain.
-    pub shard_event_senders: BTreeMap<ShardId, ShardInbox>,
     /// The beacon loop's channel: beacon gossip, what the replicas report,
     /// and the outcomes of its own dispatched actions and fetches.
     pub beacon_event_sender: Sender<HostEvent>,
@@ -151,6 +149,8 @@ pub struct HostedChain<'a, S> {
     pub recovered: &'a RecoveredState,
     /// `(validator, signer)` per validator attached to the replica.
     pub signers: Vec<(ValidatorId, Arc<dyn Signer>)>,
+    /// The lanes the chain's loop drains.
+    pub inbox: ShardInbox,
 }
 
 impl<S, N, D> NodeHost<S, N, D>
@@ -171,8 +171,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `resources` holds an event sender for a shard other than
-    /// `chains`', or if beacon storage holds no committed block.
+    /// Panics if beacon storage holds no committed block, or if two of
+    /// `chains` are for one shard.
     pub fn new(
         replica_config: &ReplicaConfig,
         resources: HostResources<N, D>,
@@ -181,13 +181,6 @@ where
         config: NodeConfig,
         now: LocalTimestamp,
     ) -> Self {
-        assert!(
-            resources.shard_event_senders.keys().copied().eq(chains
-                .iter()
-                .map(|chain| chain.shard)
-                .collect::<BTreeSet<_>>()),
-            "shard_event_senders must have exactly one entry per startup chain"
-        );
         let fold = resume_fold(
             resources.beacon_storage.as_ref(),
             Arc::clone(&replica_config.verifier),
@@ -217,8 +210,7 @@ where
         host.register_gossip_handlers();
         host.register_notification_handlers();
         for chain in chains {
-            let sender = host.process.shard_event_senders.load()[&chain.shard].clone();
-            host.add_shard(replica_config, chain, sender);
+            host.add_shard(replica_config, chain);
         }
         host
     }
@@ -234,13 +226,7 @@ where
     /// # Panics
     ///
     /// Panics if the host already serves `chain`'s shard.
-    pub fn add_shard(
-        &mut self,
-        config: &ReplicaConfig,
-        chain: HostedChain<'_, S>,
-        inbox: impl Into<ShardInbox>,
-    ) {
-        let inbox = inbox.into();
+    pub fn add_shard(&mut self, config: &ReplicaConfig, chain: HostedChain<'_, S>) {
         let shard = chain.shard;
         assert!(
             !self.shards.contains_key(&shard),
@@ -250,7 +236,7 @@ where
             shard,
             chain_anchors(chain.recovered),
             chain.recovered.committed_height,
-            inbox.internal().clone(),
+            chain.inbox.internal().clone(),
         );
         let shard_loop = attach_shard(
             &self.process,
@@ -258,7 +244,6 @@ where
             config,
             &registration,
             chain,
-            inbox,
             self.now,
         );
         self.shards.insert(shard, shard_loop);
@@ -610,7 +595,6 @@ where
         executor,
         network,
         dispatch,
-        shard_event_senders,
         beacon_event_sender,
         topology_snapshot,
     } = resources;
@@ -639,7 +623,6 @@ where
         network,
         Arc::clone(&replica_config.verifier),
         dispatch,
-        shard_event_senders,
         beacon_event_sender,
         topology_snapshot,
         (
@@ -735,7 +718,6 @@ pub fn attach_shard<S, N, D>(
     replica_config: &ReplicaConfig,
     registration: &Registration,
     chain: HostedChain<'_, S>,
-    inbox: ShardInbox,
     now: LocalTimestamp,
 ) -> ShardLoop<S, N, D>
 where
@@ -748,6 +730,7 @@ where
         storage,
         recovered,
         signers,
+        inbox,
     } = chain;
     let replica = NodeStateMachine::new(
         replica_config,
