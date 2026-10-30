@@ -708,9 +708,13 @@ pub struct HostedView<'a, R: ?Sized> {
     pub seatable: bool,
 }
 
-/// The seat changes that bring the shards a host runs in line with the
-/// committed `schedule` and the `routing` its network resolves against,
-/// for the validators in `local`.
+/// The seat changes that bring the shards a host runs in line with what
+/// it committed.
+///
+/// `schedule` is the committed schedule, `head` the snapshot the host
+/// publishes for it, `routing` the committees its network resolves
+/// against, and `local` the validators it holds keys for. Placement reads the schedule's windows ([`placed_validators`]); every
+/// other question reads `head`.
 ///
 /// The changes come in the order the runner carries them out. Each hosted
 /// shard [`shard_retired`] retires is torn down, and every other one
@@ -723,6 +727,7 @@ pub struct HostedView<'a, R: ?Sized> {
 /// no signer both detaches and attaches.
 pub fn reconcile<R, H>(
     schedule: &TopologySchedule,
+    head: &TopologySnapshot,
     routing: &RoutingCommittees,
     hosted: &[HostedView<'_, R>],
     local: &HashSet<ValidatorId, H>,
@@ -732,7 +737,6 @@ where
     R: ShardChainReader + BoundaryStore + ?Sized,
     H: BuildHasher,
 {
-    let head = schedule.head();
     let is_local = |validator| local.contains(&validator);
     let mut changes = Vec::new();
     let mut staying = Vec::new();
@@ -750,7 +754,7 @@ where
     }
     for view in staying.into_iter().filter(|view| view.seatable) {
         let placed = placed_validators(view.shard, schedule, is_local);
-        changes.extend(seat_running(view, schedule, placed));
+        changes.extend(seat_running(view, head, schedule.windows(), placed));
     }
     for shard in head.shard_trie().leaves() {
         if hosted.iter().any(|view| view.shard == shard) || !joinable(shard) {
@@ -764,7 +768,8 @@ where
     changes
 }
 
-/// The changes that seat `placed` on a running loop.
+/// The changes that seat `placed` on a running loop, read against the
+/// committed `head` on the epoch grid `windows`.
 ///
 /// A loop whose store [`rebuild_due`] says cannot carry them is rebuilt at
 /// the attested anchor; otherwise each one the loop neither carries nor is
@@ -772,7 +777,8 @@ where
 #[must_use]
 pub fn seat_running<R>(
     view: &HostedView<'_, R>,
-    schedule: &TopologySchedule,
+    head: &TopologySnapshot,
+    windows: EpochWindows,
     placed: Vec<ValidatorId>,
 ) -> Vec<SeatChange>
 where
@@ -781,7 +787,7 @@ where
     let shard = view.shard;
     if let Some(replaced) = view
         .store
-        .and_then(|store| rebuild_due(store, shard, schedule.head(), schedule.windows(), &placed))
+        .and_then(|store| rebuild_due(store, shard, head, windows, &placed))
     {
         return vec![SeatChange::Rebuild {
             shard,
@@ -805,16 +811,17 @@ where
 /// The rebuilt store seats [`reseated_validators`]: every validator in
 /// `local` the shard places, and every one the loop `carried` that a
 /// pending recovery did not replace. The rounds signed on the old store
-/// stay consumed ([`Replaced::Behind`]). `None` where the head holds no
-/// attested anchor to rebuild at.
+/// stay consumed ([`Replaced::Behind`]). `None` where the committed `head`
+/// holds no attested anchor to rebuild at.
 #[must_use]
 pub fn reseat<H: BuildHasher>(
     shard: ShardId,
     schedule: &TopologySchedule,
+    head: &TopologySnapshot,
     carried: &[ValidatorId],
     local: &HashSet<ValidatorId, H>,
 ) -> Option<SeatChange> {
-    schedule.head().boundary(shard)?;
+    head.boundary(shard)?;
     let placed = placed_validators(shard, schedule, |validator| local.contains(&validator));
     Some(SeatChange::Rebuild {
         shard,
@@ -1437,7 +1444,14 @@ mod tests {
             view(b, &[validator(8)]),
         ];
         assert_eq!(
-            reconcile(&schedule, &routing, &hosted, &local, |shard| shard != d),
+            reconcile(
+                &schedule,
+                schedule.head(),
+                &routing,
+                &hosted,
+                &local,
+                |shard| shard != d
+            ),
             vec![
                 SeatChange::Detach(a, validator(6)),
                 SeatChange::Retire(b),
@@ -1458,12 +1472,29 @@ mod tests {
         let mut busy = view(a, &[validator(6), validator(7)]);
         busy.seatable = false;
         assert_eq!(
-            reconcile(&schedule, &routing, &[busy], &local, |_| false),
+            reconcile(
+                &schedule,
+                schedule.head(),
+                &routing,
+                &[busy],
+                &local,
+                |_| false
+            ),
             vec![SeatChange::Detach(a, validator(6))]
         );
         let mut attaching = view(a, &[]);
         attaching.attaching = vec![HOST];
-        assert!(reconcile(&schedule, &routing, &[attaching], &local, |_| false).is_empty());
+        assert!(
+            reconcile(
+                &schedule,
+                schedule.head(),
+                &routing,
+                &[attaching],
+                &local,
+                |_| false
+            )
+            .is_empty()
+        );
     }
 
     /// A running loop on a tail a completed recovery discarded seats its
@@ -1478,9 +1509,14 @@ mod tests {
             ..view(ShardId::ROOT, &[])
         }];
         assert_eq!(
-            reconcile(&schedule, &routing, &hosted, &HashSet::from([HOST]), |_| {
-                true
-            }),
+            reconcile(
+                &schedule,
+                schedule.head(),
+                &routing,
+                &hosted,
+                &HashSet::from([HOST]),
+                |_| { true }
+            ),
             vec![SeatChange::Rebuild {
                 shard: ShardId::ROOT,
                 seats: vec![HOST],
@@ -1497,7 +1533,16 @@ mod tests {
         let lagging = validator(3);
         let local = HashSet::from([HOST]);
         let unanchored = recovering(vec![HOST], Vec::new(), None);
-        assert_eq!(reseat(ShardId::ROOT, &unanchored, &[lagging], &local), None);
+        assert_eq!(
+            reseat(
+                ShardId::ROOT,
+                &unanchored,
+                unanchored.head(),
+                &[lagging],
+                &local
+            ),
+            None
+        );
         let anchor = ShardAnchor {
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
@@ -1517,7 +1562,13 @@ mod tests {
             ),
         );
         assert_eq!(
-            reseat(ShardId::ROOT, &anchored, &[lagging], &local),
+            reseat(
+                ShardId::ROOT,
+                &anchored,
+                anchored.head(),
+                &[lagging],
+                &local
+            ),
             Some(SeatChange::Rebuild {
                 shard: ShardId::ROOT,
                 seats: vec![HOST, lagging],

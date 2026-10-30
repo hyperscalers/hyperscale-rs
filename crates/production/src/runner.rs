@@ -930,13 +930,12 @@ impl ProductionRunner {
                     }
                 }
                 _ = reshape_tick.tick() => {
-                    supervisor.reconcile_teardown();
-                    // Drive the reshape duties before reconciling joins: discovery
+                    // Drive the reshape duties before reconciling seats: discovery
                     // marks a reshape-seated shard as in-flight this same tick, so
                     // the join backstop skips it rather than racing a redundant
                     // snap-sync against the orchestrator's seat.
                     supervisor.reshape_tick();
-                    supervisor.reconcile_joins();
+                    supervisor.reconcile_seats();
                 }
             }
         }

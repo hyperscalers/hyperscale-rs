@@ -6,16 +6,11 @@
 //! unless the shard's chain runs from network genesis), and runs the shard's
 //! replica, with its local validators attached as signers, on a new pinned
 //! thread; a leave refcounts memberships down and tears the thread, maps, and
-//! storage down at zero. The reconcile pair drives membership from committed
-//! state: [`ShardSupervisor::reconcile_joins`] brings up any shard
-//! [`placed_validators`] places a local validator on, and
-//! [`ShardSupervisor::reconcile_teardown`] retires a shard once no local
-//! validator holds a committee or routing role in it. The two read different
-//! committee views on purpose: joining asks "must this host run consensus"
-//! (the seatable view, observer riders excluded); teardown asks "does this
-//! host hold any window role" (full membership, riders included).
+//! storage down at zero. [`ShardSupervisor::reconcile_seats`] drives
+//! membership from committed state, carrying out the seat changes
+//! [`reconcile`] plans.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -25,16 +20,14 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, chain_anchors, detach_shard};
 use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
 use hyperscale_node::startup::{
-    Replaced, join_wipes, placed_validators, rebuild_due, reseated_validators, retired_signers,
-    seat_validators, shard_retired,
+    HostedView, Replaced, SeatChange, Wipe, join_wipe, placed_validators, reconcile, reseat,
+    seat_running, seat_validators,
 };
 use hyperscale_node::{
     HostedChain, Registration, RegistrationReply, ReplicaConfig, installed_network_genesis_block,
     network_genesis_block,
 };
-use hyperscale_storage::{
-    RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds, holds_state,
-};
+use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, carry_signed_rounds};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};
 use hyperscale_types::{
     Block, BlockHeight, ShardId, TopologySchedule, TopologySnapshot, ValidatorId,
@@ -140,24 +133,16 @@ impl ShardSupervisor {
         let schedule = self.process.topology_schedule();
         self.tokio_handle.spawn_blocking(move || {
             let outcome = factory(&dir, shard).and_then(|storage| {
-                // A clone of a split parent the reshape never adopted holds
-                // nothing of this shard's chain, and a child span an observer
-                // imported and never adopted holds state under no chain, which
-                // the snap-sync import refuses to write over. A store a
-                // recovery leaves behind ([`join_wipes`]) holds a chain the
-                // recovered shard need not extend. Wipe any of them, and join
-                // from nothing.
-                let unadopted = storage.holds_foreign_chain(shard)
-                    || (storage.is_fresh()
-                        && holds_state(storage.jmt_height(), storage.state_root()));
-                let recovered_past = join_wipes(storage.as_ref(), shard, &schedule);
-                if !unadopted && !recovered_past {
-                    return Ok(storage);
-                }
-                if recovered_past {
-                    info!(shard = ?shard, "Join wiping a store a recovery leaves behind");
-                } else {
-                    info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
+                // A store [`join_wipe`] wipes is dropped, and the join
+                // starts from nothing.
+                match join_wipe(storage.as_ref(), shard, &schedule) {
+                    None => return Ok(storage),
+                    Some(Wipe::Recovered) => {
+                        info!(shard = ?shard, "Join wiping a store a recovery leaves behind");
+                    }
+                    Some(Wipe::Unadopted) => {
+                        info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
+                    }
                 }
                 drop(storage);
                 std::fs::remove_dir_all(&dir).map_err(|e| format!("unadopted store wipe: {e}"))?;
@@ -202,7 +187,7 @@ impl ShardSupervisor {
     ///   past genesis, or has crossed a boundary this host's topology has
     ///   not yet folded, so a genesis replay has nothing to start from.
     ///   The store is dropped unseated and the join parks in
-    ///   `awaiting_anchor`, retried by [`Self::reconcile_joins`] once the
+    ///   `awaiting_anchor`, retried by [`Self::reconcile_seats`] once the
     ///   anchor arrives.
     pub(super) fn on_opened(
         &mut self,
@@ -466,75 +451,49 @@ impl ShardSupervisor {
             .send(HostEvent::Beacon(BeaconScopedInput::Deregister(token)));
     }
 
-    /// Seat `vnodes` on `shard`'s running loop, or rebuild the loop first
-    /// where [`rebuild_due`] says its store cannot carry them. A shard
+    /// Seat `vnodes` on `shard`'s running loop as [`seat_running`] plans:
+    /// rebuild the loop first where its store cannot carry them. A shard
     /// already rebuilding seats every placed validator when its swap lands.
     fn seat_on_running(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
         if self.seats.is_rebuilding(shard) {
             return;
         }
-        match self.rebuild_due(shard, vnodes) {
-            Some(replaced) => self.rebuild(shard, vnodes, replaced),
-            None => self.seat_into_running(shard, vnodes),
-        }
-    }
-
-    /// Whether `shard`'s running loop is rebuilt before it carries
-    /// `vnodes`, and why ([`rebuild_due`]).
-    fn rebuild_due(&self, shard: ShardId, vnodes: &[VnodeConfig]) -> Option<Replaced> {
-        if !self.seats.is_running(shard) {
-            return None;
-        }
-        let placed: Vec<ValidatorId> = vnodes.iter().map(|vnode| vnode.validator_id).collect();
+        let placed = vnodes.iter().map(|vnode| vnode.validator_id).collect();
+        let schedule = self.process.topology_schedule();
+        let running = self.running_seats();
+        let storages = self.storages.lock().expect("storages lock");
+        let Some(view) = hosted_views(running, &storages)
+            .into_iter()
+            .find(|view| view.shard == shard)
+        else {
+            return;
+        };
         let head = self.process.topology_snapshot().load_full();
-        let windows = self.process.topology_schedule().windows();
-        self.storages
-            .lock()
-            .expect("storages lock")
-            .get(&shard)
-            .and_then(|storage| rebuild_due(storage.as_ref(), shard, &head, windows, &placed))
+        let changes = seat_running(&view, &head, schedule.windows(), placed);
+        drop(storages);
+        for change in changes {
+            self.apply_seat_change(change);
+        }
     }
 
-    /// Re-seat `shard` at its attested anchor: its loop needs a height
-    /// beneath every serving peer's chain floor, so block sync cannot
-    /// carry the store forward and a snap-sync must. The rebuild seats
-    /// [`reseated_validators`]: every local validator the shard places,
-    /// and every one the loop carries that a pending recovery did not
-    /// replace. A shard already rebuilding, bootstrapping, or not
-    /// running here has nothing to re-seat, and one with no attested anchor
-    /// has nothing to re-seat on.
+    /// Re-seat `shard` at its attested anchor ([`reseat`]): its loop needs
+    /// a height beneath every serving peer's chain floor, so block sync
+    /// cannot carry the store forward and a snap-sync must. A shard already
+    /// rebuilding, bootstrapping, or not running here has nothing to
+    /// re-seat, and one with no attested anchor has nothing to re-seat on.
     pub(super) fn reseat(&mut self, shard: ShardId) {
         let Some(carried) = self.seats.reseatable(shard) else {
             return;
         };
-        if self
-            .process
-            .topology_snapshot()
-            .load()
-            .boundary(shard)
-            .is_none()
-        {
+        let local: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
+        let schedule = self.process.topology_schedule();
+        let head = self.process.topology_snapshot().load_full();
+        let Some(change) = reseat(shard, &schedule, &head, &carried, &local) else {
             warn!(shard = ?shard, "Store beneath every peer's chain floor, and no attested anchor to re-seat on");
             return;
-        }
-        let schedule = self.process.topology_schedule();
-        let placed = self
-            .placed_vnodes(&schedule, shard)
-            .into_iter()
-            .map(|vnode| vnode.validator_id)
-            .collect();
-        let carried: Vec<VnodeConfig> = reseated_validators(shard, &schedule, &carried, placed)
-            .into_iter()
-            .filter_map(|validator| {
-                self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
-                    validator_id: validator,
-                    local_shard: shard,
-                    signer: Arc::clone(signer),
-                })
-            })
-            .collect();
+        };
         info!(shard = ?shard, "Re-seating a store beneath every peer's chain floor");
-        self.rebuild(shard, &carried, Replaced::Behind);
+        self.apply_seat_change(change);
     }
 
     /// Rebuild `shard` at its attested anchor, make before break: a
@@ -868,46 +827,86 @@ impl ShardSupervisor {
         });
     }
 
-    /// Reconcile hosted shards against the committed routing window: tear
-    /// down a shard once no local validator holds a role in its active
-    /// committee and none sits in its routing committee (no serve
-    /// obligation — the shard aged out of the routable window, or the
-    /// validator rotated off a still-live shard).
+    /// Reconcile hosted shards against the committed view, carrying out
+    /// the changes [`reconcile`] plans. A join parked on its shard's anchor
+    /// is retried first, once this host's topology carries it.
     ///
-    /// The active-committee guard keeps a shard up through its current
-    /// window even after a lookahead delta moved the validator on in
-    /// routing; the routing guard keeps a dissolved shard served for as
-    /// long as a fetch can still resolve this host among its peers, so a
-    /// merge keeper that does not co-host a merging child can still
-    /// snap-sync it. Run on the reshape tick, binding serving and routing
-    /// to one committed lifetime in place of a fixed drain grace.
-    pub(crate) fn reconcile_teardown(&mut self) {
-        let topology_snapshot = self.process.topology_snapshot().load();
-        let routing = self.process.network().routing_committees();
-        let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
-        let expired: Vec<ShardId> = self
-            .seats
-            .running()
-            .filter(|&shard| shard_retired(shard, &topology_snapshot, &routing, &host_ids))
-            .collect();
-        for shard in expired {
-            info!(
-                shard = ?shard,
-                "Shard aged out of the routable window; tearing down"
-            );
-            self.tear_down(shard);
+    /// A loop that is rebuilding or that a reshape duty is seating gains no
+    /// seat here; a shard opening, draining, parked, seated by a reshape
+    /// duty, or holding a store one prepared is not joined. Idempotent: the
+    /// plan skips every shard already accounted for, and [`Self::join`]
+    /// rejects a double bring-up regardless. Run on the reshape tick, after
+    /// the reshape duties, binding serving and routing to one committed
+    /// lifetime in place of a fixed drain grace.
+    pub(crate) fn reconcile_seats(&mut self) {
+        let topology_snapshot = self.process.topology_snapshot().load_full();
+        let anchored = self.seats.unpark(|shard| {
+            topology_snapshot.boundary(shard).is_some()
+                || topology_snapshot.genesis_unanchored(shard)
+        });
+        for (shard, vnodes) in anchored {
+            info!(shard = ?shard, "Retrying a join parked on its anchor");
+            self.join(shard, &vnodes);
         }
-        // A shard that stays up detaches, by the same rule applied per
-        // validator, each signer that no longer holds a role in it, while
-        // another keeps the loop running.
-        for (shard, entry) in self.seats.running_mut() {
-            let attached: Vec<ValidatorId> = entry
-                .validator_ids
-                .iter()
-                .copied()
-                .map(ValidatorId::new)
-                .collect();
-            for validator in retired_signers(shard, &topology_snapshot, &routing, &attached) {
+        let schedule = self.process.topology_schedule();
+        let routing = self.process.network().routing_committees();
+        let local: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
+        let running = self.running_seats();
+        let storages = self.storages.lock().expect("storages lock");
+        let hosted = hosted_views(running, &storages);
+        let changes = reconcile(
+            &schedule,
+            &topology_snapshot,
+            &routing,
+            &hosted,
+            &local,
+            |shard| {
+                self.seats.vacant(shard)
+                    && !self.reshape.is_seating(shard)
+                    && !self.reshape_stores.contains(shard)
+            },
+        );
+        drop(storages);
+        for change in changes {
+            self.apply_seat_change(change);
+        }
+    }
+
+    /// Every running loop's seats as the seating plan reads them: its
+    /// shard, the validators attached and attaching, and whether the plan
+    /// may seat more on it.
+    fn running_seats(&mut self) -> Vec<RunningSeats> {
+        let ids = |ids: &[u64]| ids.iter().copied().map(ValidatorId::new).collect();
+        let shards: Vec<ShardId> = self.seats.running().collect();
+        let mut running = Vec::with_capacity(shards.len());
+        for shard in shards {
+            let seatable = !self.seats.is_rebuilding(shard) && !self.reshape.is_seating(shard);
+            if let Some(entry) = self.seats.thread_mut(shard) {
+                running.push((
+                    shard,
+                    ids(&entry.validator_ids),
+                    ids(&entry.queued),
+                    seatable,
+                ));
+            }
+        }
+        running
+    }
+
+    /// Carry out one planned seat change.
+    fn apply_seat_change(&mut self, change: SeatChange) {
+        match change {
+            SeatChange::Retire(shard) => {
+                info!(
+                    shard = ?shard,
+                    "Shard aged out of the routable window; tearing down"
+                );
+                self.tear_down(shard);
+            }
+            SeatChange::Detach(shard, validator) => {
+                let Some(entry) = self.seats.thread_mut(shard) else {
+                    return;
+                };
                 if entry
                     .control_tx
                     .send(ShardControl::Detach(validator))
@@ -923,59 +922,23 @@ impl ShardSupervisor {
                     );
                 }
             }
-        }
-    }
-
-    /// Reconcile hosted shards against the committed committee assignment: bring
-    /// up any shard [`placed_validators`] places a local validator on that this
-    /// host is not already hosting, bootstrapping, draining, seating from a
-    /// reshape duty, or holding queued behind a drain, and seat a placed
-    /// validator a running shard does not yet carry. A split-observer ride is
-    /// not a seat — the observer's physical work is its child store, driven by
-    /// the reshape orchestrator, never a consensus vnode on the splitting
-    /// parent.
-    ///
-    /// The membership-up mirror of [`Self::reconcile_teardown`]. Idempotent:
-    /// the guards skip every shard already accounted for, and [`Self::join`]
-    /// rejects a double bring-up regardless. A join parked on its shard's
-    /// anchor is retried here once this host's topology carries it. Run on
-    /// the reshape tick.
-    pub(crate) fn reconcile_joins(&mut self) {
-        let topology_snapshot = self.process.topology_snapshot().load_full();
-        let anchored = self.seats.unpark(|shard| {
-            topology_snapshot.boundary(shard).is_some()
-                || topology_snapshot.genesis_unanchored(shard)
-        });
-        for (shard, vnodes) in anchored {
-            info!(shard = ?shard, "Retrying a join parked on its anchor");
-            self.join(shard, &vnodes);
-        }
-        // A running shard seats a local member it does not yet carry.
-        let running: Vec<ShardId> = self
-            .seats
-            .running()
-            .filter(|&shard| !self.reshape.is_seating(shard))
-            .collect();
-        let schedule = self.process.topology_schedule();
-        for shard in running {
-            let vnodes = self.placed_vnodes(&schedule, shard);
-            self.seat_on_running(shard, &vnodes);
-        }
-        let needed: Vec<ShardId> = schedule
-            .head()
-            .shard_trie()
-            .leaves()
-            .filter(|&shard| {
-                !self.placed_vnodes(&schedule, shard).is_empty()
-                    && self.seats.vacant(shard)
-                    && !self.reshape.is_seating(shard)
-                    && !self.reshape_stores.contains(shard)
-            })
-            .collect();
-        for shard in needed {
-            let vnodes = self.placed_vnodes(&schedule, shard);
-            info!(shard = ?shard, "Joining a shard the committed view places a local validator on");
-            self.join(shard, &vnodes);
+            SeatChange::Rebuild {
+                shard,
+                seats,
+                replaced,
+            } => {
+                let vnodes = self.vnodes(shard, &seats);
+                self.rebuild(shard, &vnodes, replaced);
+            }
+            SeatChange::Attach(shard, validator) => {
+                let vnodes = self.vnodes(shard, &[validator]);
+                self.seat_into_running(shard, &vnodes);
+            }
+            SeatChange::Join(shard, validators) => {
+                info!(shard = ?shard, "Joining a shard the committed view places a local validator on");
+                let vnodes = self.vnodes(shard, &validators);
+                self.join(shard, &vnodes);
+            }
         }
     }
 
@@ -1085,16 +1048,25 @@ impl ShardSupervisor {
     /// The vnode configs for every local validator [`placed_validators`]
     /// places on `shard`.
     fn placed_vnodes(&self, schedule: &TopologySchedule, shard: ShardId) -> Vec<VnodeConfig> {
-        placed_validators(shard, schedule, |validator| {
+        let placed = placed_validators(shard, schedule, |validator| {
             self.vnode_keys.contains_key(&validator)
-        })
-        .into_iter()
-        .map(|validator| VnodeConfig {
-            validator_id: validator,
-            local_shard: shard,
-            signer: Arc::clone(&self.vnode_keys[&validator]),
-        })
-        .collect()
+        });
+        self.vnodes(shard, &placed)
+    }
+
+    /// The vnode configs seating each of `validators` whose key this host
+    /// holds on `shard`.
+    fn vnodes(&self, shard: ShardId, validators: &[ValidatorId]) -> Vec<VnodeConfig> {
+        validators
+            .iter()
+            .filter_map(|&validator| {
+                self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
+                    validator_id: validator,
+                    local_shard: shard,
+                    signer: Arc::clone(signer),
+                })
+            })
+            .collect()
     }
 
     /// How this host builds every replica it runs at runtime.
@@ -1110,6 +1082,28 @@ impl ShardSupervisor {
             provision_config: self.provision_config,
         }
     }
+}
+
+/// A running loop's shard, the validators attached to it and attaching,
+/// and whether the seating plan may seat more on it.
+type RunningSeats = (ShardId, Vec<ValidatorId>, Vec<ValidatorId>, bool);
+
+/// The `running` loops as the seating plan reads them, over the `storages`
+/// the supervisor holds.
+fn hosted_views(
+    running: Vec<RunningSeats>,
+    storages: &BTreeMap<ShardId, Arc<RocksDbShardStorage>>,
+) -> Vec<HostedView<'_, RocksDbShardStorage>> {
+    running
+        .into_iter()
+        .map(|(shard, attached, attaching, seatable)| HostedView {
+            shard,
+            store: storages.get(&shard).map(AsRef::as_ref),
+            attached,
+            attaching,
+            seatable,
+        })
+        .collect()
 }
 
 /// How long a swap waits for the replaced store's last handle to drop

@@ -474,12 +474,12 @@ impl ShardSupervisor {
     /// committed view, since a placement change often accompanies the
     /// cohort/keeper draws and boundary seedings its duties gate on.
     ///
-    /// No join or leave is issued here. [`Self::reconcile_joins`] seats
-    /// every validator
-    /// [`placed_validators`](hyperscale_node::startup::placed_validators)
-    /// places, under the rule the simulation reads, and
-    /// [`Self::reconcile_teardown`] tears a shard down once it leaves both
-    /// this host's active committee and its routing committee. The observer
+    /// No join or leave is issued here. [`Self::reconcile_seats`] carries
+    /// out the seat changes
+    /// [`reconcile`](hyperscale_node::startup::reconcile) plans, the plan
+    /// the simulation carries out too: it seats every placed validator and
+    /// tears a shard down once it leaves both this host's active committee
+    /// and its routing committee. The observer
     /// and keeper deltas drive nothing either: the orchestrator
     /// self-determines those duties from the committed projection.
     pub(crate) fn on_participation_change(&mut self, change: &ParticipationChange) {

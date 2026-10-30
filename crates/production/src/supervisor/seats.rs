@@ -450,13 +450,6 @@ impl SeatTable {
         self.shards.keys().copied()
     }
 
-    /// Every running loop, in shard order.
-    pub fn running_mut(&mut self) -> impl Iterator<Item = (ShardId, &mut ShardThread)> {
-        self.shards
-            .iter_mut()
-            .map(|(&shard, thread)| (shard, thread))
-    }
-
     /// Take every running loop and every draining thread, for shutdown.
     pub fn drain_all(&mut self) -> (BTreeMap<ShardId, ShardThread>, Vec<DrainingThread>) {
         let running = std::mem::take(&mut self.shards);
