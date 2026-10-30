@@ -580,7 +580,8 @@ struct ObserverDuty {
 
 impl ObserverDuty {
     /// Whether the duty still has a seat to take, pruning the seats it
-    /// no longer holds.
+    /// no longer holds. A seat whose validator this host no longer runs
+    /// is gone in every phase.
     ///
     /// Until the split is irrevocable the beacon may cancel or lapse it, or
     /// re-staff a seat onto the sibling child, and the cohort projection is
@@ -594,7 +595,9 @@ impl ObserverDuty {
     /// `observers` rather than being rediscovered; a seated one also defers
     /// any co-hosted parent half to the seat already issued. Once the
     /// projection releases the child the duty ends.
-    fn held(&mut self, view: &ReshapeView) -> bool {
+    fn held(&mut self, view: &ReshapeView, me: &[ValidatorId]) -> bool {
+        let (parent, child) = (self.parent, self.child);
+        self.validators.retain(|validator| me.contains(validator));
         if matches!(
             self.phase,
             ObserverPhase::Seated | ObserverPhase::Relinquished
@@ -602,19 +605,19 @@ impl ObserverDuty {
             let named = self
                 .validators
                 .iter()
-                .any(|&validator| view.observer_child(self.parent, validator) == Some(self.child));
-            return named || view.parent_half_cohorts().contains_key(&self.child);
+                .any(|&validator| view.observer_child(parent, validator) == Some(child));
+            return named || view.parent_half_cohorts().contains_key(&child);
         }
-        if view.split_irrevocable(self.parent, self.child) {
-            return seats_on(view, self.child, self.validators.iter());
+        let irrevocable = view.split_irrevocable(parent, child);
+        if !irrevocable {
+            self.validators
+                .retain(|&validator| view.observer_child(parent, validator) == Some(child));
         }
-        let (parent, child) = (self.parent, self.child);
-        self.validators
-            .retain(|&validator| view.observer_child(parent, validator) == Some(child));
         let validators = &self.validators;
         self.ready_asserts
             .retain(|validator, _| validators.contains(validator));
         !self.validators.is_empty()
+            && (!irrevocable || seats_on(view, child, self.validators.iter()))
     }
 }
 
@@ -750,23 +753,25 @@ struct KeeperDuty {
 
 impl KeeperDuty {
     /// Whether the duty still has a seat to take, pruning the seats it no
-    /// longer holds — the merge counterpart of [`ObserverDuty::held`].
-    /// Until the merge is irrevocable a seat stands only while the keeper
+    /// longer holds — the merge counterpart of [`ObserverDuty::held`]. A
+    /// member this host no longer runs is gone; until the merge is irrevocable a seat stands only while the keeper
     /// cohort names it; past that point the duty runs on while one of its
     /// members sits on the reformed parent's committee, or the parent has
     /// none yet.
-    fn held(&mut self, parent: ShardId, view: &ReshapeView) -> bool {
-        if view.merge_irrevocable(parent) {
-            return seats_on(
-                view,
-                parent,
-                self.members.iter().map(|member| &member.validator),
-            );
-        }
+    fn held(&mut self, parent: ShardId, view: &ReshapeView, me: &[ValidatorId]) -> bool {
+        let irrevocable = view.merge_irrevocable(parent);
         self.members.retain(|member| {
-            view.keeper_parent(member.own_child, member.validator) == Some(parent)
+            me.contains(&member.validator)
+                && (irrevocable
+                    || view.keeper_parent(member.own_child, member.validator) == Some(parent))
         });
         !self.members.is_empty()
+            && (!irrevocable
+                || seats_on(
+                    view,
+                    parent,
+                    self.members.iter().map(|member| &member.validator),
+                ))
     }
 }
 
@@ -841,22 +846,23 @@ struct ParentHalfDuty {
 }
 
 impl ParentHalfDuty {
-    /// Whether the duty still has a seat to take. A parent half is
-    /// discovered only once its split has executed, so it runs on while
-    /// one of its seats sits on the child's committee, or the child has
-    /// none yet.
+    /// Whether the duty still has a seat to take, pruning the seats whose
+    /// validators this host no longer runs. A parent half is discovered
+    /// only once its split has executed, so it runs on while one of its
+    /// seats sits on the child's committee, or the child has none yet.
     ///
     /// A seated or relinquished parent half lingers only to keep its child
     /// from being re-discovered; once the projection releases it (the child
     /// committed past genesis) the duty is done.
-    fn held(&self, child: ShardId, view: &ReshapeView) -> bool {
+    fn held(&mut self, child: ShardId, view: &ReshapeView, me: &[ValidatorId]) -> bool {
+        self.validators.retain(|validator| me.contains(validator));
         if matches!(
             self.phase,
             ParentHalfPhase::Seated | ParentHalfPhase::Relinquished
         ) {
             return view.parent_half_cohorts().contains_key(&child);
         }
-        seats_on(view, child, self.validators.iter())
+        !self.validators.is_empty() && seats_on(view, child, self.validators.iter())
     }
 }
 
@@ -946,7 +952,8 @@ impl ReshapeOrchestrator {
 
     /// Stop counting `validator` among this host's: a validator that moved
     /// to another host, which discovers its cohort and keeper seats there.
-    /// Duties already in flight here run on.
+    /// The next step drops its seats from the duties here, and a duty left
+    /// with none ends, unless it already seated or relinquished.
     pub fn remove_me(&mut self, validator: ValidatorId) {
         self.me.retain(|&kept| kept != validator);
     }
@@ -1010,9 +1017,10 @@ impl ReshapeOrchestrator {
         // Before any duty advances, so one whose seats are gone emits
         // nothing more.
         self.parent_halves
-            .retain(|&child, duty| duty.held(child, view));
-        self.observers.retain(|_, duty| duty.held(view));
-        self.keepers.retain(|&parent, duty| duty.held(parent, view));
+            .retain(|&child, duty| duty.held(child, view, &self.me));
+        self.observers.retain(|_, duty| duty.held(view, &self.me));
+        self.keepers
+            .retain(|&parent, duty| duty.held(parent, view, &self.me));
 
         let mut requests = Vec::new();
         let children: Vec<ShardId> = self.observers.keys().copied().collect();
@@ -3874,6 +3882,45 @@ mod tests {
             &[parent],
         )
         .with_scheduled_terminals(BTreeMap::from([(parent, Epoch::new(1))]))
+    }
+
+    /// A validator moved to another host stops asserting here, and a duty
+    /// left with no seat of this host's ends.
+    #[test]
+    fn a_removed_validator_leaves_this_hosts_duties() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot(
+            &[(parent, &[1, 2, 3, 4])],
+            &[(parent, 5, child), (parent, 6, child)],
+            &[parent],
+        );
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5), vid(6)]);
+        let mut duty = observer_duty(
+            parent,
+            child,
+            5,
+            following(ObserverTail::new(anchor(), child)),
+        );
+        duty.validators.push(vid(6));
+        orch.observers.insert(child, duty);
+        orch.remove_me(vid(6));
+
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        let asserted: Vec<ValidatorId> = requests
+            .iter()
+            .filter_map(|r| match r {
+                ReshapeRequest::BroadcastReady { validator, .. } => Some(*validator),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asserted, vec![vid(5)]);
+
+        orch.remove_me(vid(5));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        assert!(!orch.is_seating(child), "a duty with no seat here ends");
     }
 
     /// A split the beacon cancels or lapses before its cut is scheduled
