@@ -312,22 +312,6 @@ fn unanchored_past_fork_frontier<R: ShardChainReader + BoundaryStore + ?Sized>(
     })
 }
 
-/// Whether a join opening `store` for `shard` starts it over.
-#[must_use]
-pub fn join_wipes<R: ShardChainReader + BoundaryStore + ?Sized>(
-    store: &R,
-    shard: ShardId,
-    schedule: &TopologySchedule,
-) -> bool {
-    let pending = schedule.head().pending_recoveries().get(&shard);
-    let seated_under_fork = pending
-        .and_then(|recovery| fork_anchor(shard, recovery))
-        .is_some_and(|anchor| store.recovery_anchor() == Some(anchor));
-    !seated_under_fork
-        && (store.committed_in_recovery_band(shard, schedule)
-            || unanchored_past_fork_frontier(store, shard, pending))
-}
-
 /// Why a join opening a shard's store wipes it and joins from nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wipe {
@@ -400,8 +384,7 @@ pub enum Replaced {
 /// is rebuilt as [`Replaced::Forked`]; one at or below it holds only the
 /// chain the anchor continues and is rebuilt as [`Replaced::Behind`],
 /// keeping its signed rounds.
-#[must_use]
-pub fn rebuild_due<R: ShardChainReader + BoundaryStore + ?Sized>(
+fn rebuild_due<R: ShardChainReader + BoundaryStore + ?Sized>(
     store: &R,
     shard: ShardId,
     head: &TopologySnapshot,
@@ -436,8 +419,7 @@ pub fn rebuild_due<R: ShardChainReader + BoundaryStore + ?Sized>(
 /// reads. When nothing else remains, the loop carries what it did: it
 /// keeps a signer for as long as it stays up, and the replaced committee
 /// keeps serving while routing retains it.
-#[must_use]
-pub fn reseated_validators(
+fn reseated_validators(
     shard: ShardId,
     schedule: &TopologySchedule,
     carried: &[ValidatorId],
@@ -518,8 +500,7 @@ fn departed_shards_on_disk(
 /// Whether a local validator in `host_ids` sits in `shard`'s committed
 /// committee in any window role or in its routing committee: the serving
 /// obligation a hosted shard's replica keeps it up for.
-#[must_use]
-pub fn holds_window_role<H: BuildHasher>(
+fn holds_window_role<H: BuildHasher>(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     routing: &RoutingCommittees,
@@ -537,8 +518,7 @@ pub fn holds_window_role<H: BuildHasher>(
 /// The teardown half's membership question: an observer rides the
 /// committee for serving, gossip, and ready-signal admission, so a shard
 /// it rides stays up.
-#[must_use]
-pub fn host_in_committee<H: BuildHasher>(
+fn host_in_committee<H: BuildHasher>(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     host_ids: &HashSet<ValidatorId, H>,
@@ -623,8 +603,7 @@ pub fn seat_validators(
 /// window: under make-before-break its committee stays seated, serving its
 /// terminal, until the successors are live, so they can seed and finalize
 /// against it.
-#[must_use]
-pub fn shard_retired<H: BuildHasher>(
+fn shard_retired<H: BuildHasher>(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     routing: &RoutingCommittees,
@@ -639,8 +618,7 @@ pub fn shard_retired<H: BuildHasher>(
 /// Each one [`shard_retired`] retires on its own detaches while another
 /// stays attached. The last signer stays with the loop until the shard itself retires,
 /// since the host keeps the shard for a validator not attached yet.
-#[must_use]
-pub fn retired_signers(
+fn retired_signers(
     shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     routing: &RoutingCommittees,
@@ -1333,31 +1311,6 @@ mod tests {
         );
         assert_eq!(due(&discarded, &halt, &placed), None);
         assert_eq!(due(&at_frontier, &halt, &placed), None);
-    }
-
-    /// A join starts over a store past a pending fork's frontier unless it
-    /// was seated under that fork, and keeps a store no recovery touched.
-    #[test]
-    fn a_join_starts_over_a_store_a_pending_fork_did_not_seat() {
-        let fresh = root_store_certified_at(FRESH_MS);
-        let fork = recovering(
-            vec![HOST],
-            vec![binding(false)],
-            Some(pending(RecoveryCause::Fork, vec![validator(9)])),
-        );
-        assert!(join_wipes(&*fresh, ShardId::ROOT, &fork));
-        fresh.record_recovery_anchor(RecoveryAnchor {
-            shard: ShardId::ROOT,
-            rotated_at: ROTATED_AT,
-        });
-        assert!(!join_wipes(&*fresh, ShardId::ROOT, &fork));
-
-        let untouched = recovering(vec![HOST], Vec::new(), None);
-        assert!(!join_wipes(
-            &*root_store_certified_at(FRESH_MS),
-            ShardId::ROOT,
-            &untouched
-        ));
     }
 
     /// A join wipes a store holding a chain that is not its shard's, and
