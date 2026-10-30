@@ -634,6 +634,9 @@ where
                 restored @ ProtocolEvent::CommittedStateRestored { .. } => {
                     self.handle_committed_state_restored(restored);
                 }
+                ProtocolEvent::TransactionsReceived { transactions } => {
+                    self.handle_transactions_received(transactions);
+                }
                 other => self.handle_protocol_passthrough(other),
             },
 
