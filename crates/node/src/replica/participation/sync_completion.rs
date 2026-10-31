@@ -12,9 +12,8 @@ use hyperscale_core::{Action, FetchRequest};
 use hyperscale_shard::SettledTxSet;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, BlockHash, BlockHeight, CertifiedBlock, CheckedStateProof, MerkleInclusionProof,
-    QuorumCertificate, ShardId, SubstateKey, TopologySchedule, VerdictCells, Verified,
-    derive_block_transactions,
+    BlockHash, BlockHeight, CertifiedBlock, CheckedStateProof, QuorumCertificate, ShardId,
+    SubstateKey, TopologySchedule, VerdictCells, Verified, derive_block_transactions,
 };
 
 use super::ShardParticipation;
@@ -102,16 +101,11 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_fetched_verdict_proof_verified(
         &mut self,
         sched: &TopologySchedule,
-        anchor: Anchor,
         questions: &[VerdictCells],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
     ) {
-        self.execution_coordinator.on_verdict_proof_fetched(
-            anchor,
-            questions,
-            proof,
-            sched.windows(),
-        );
+        self.execution_coordinator
+            .on_verdict_proof_fetched(questions, proof, sched.windows());
         self.shard_coordinator.queue_ready_proposal();
     }
 

@@ -74,12 +74,12 @@ use hyperscale_types::{
     CheckedStateProof, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
     DiscardCause, EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
-    GlobalReceiptRoot, Hash, Joins, MerkleInclusionProof, Mode, Movement, ProvenAnchors,
-    Provisions, REATTESTATION_STEP, ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie,
-    StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
-    WeightedTimestamp, derive_block_transactions, tick_leader,
+    GlobalReceiptRoot, Hash, Joins, Mode, Movement, ProvenAnchors, Provisions, REATTESTATION_STEP,
+    ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    VerdictCells, VerdictQuestion, Verifiable, Verified, WeightedTimestamp,
+    derive_block_transactions, tick_leader,
 };
 use tracing::instrument;
 
@@ -2640,17 +2640,16 @@ impl ExecutionCoordinator {
         self.counterparts.take_fetched_proof(proof, values);
     }
 
-    /// Take a proof fetched for verdict questions at `anchor`, each
-    /// question as its cells, and hold what a hearing row would take.
+    /// Take a proof fetched for verdict questions, each question as its
+    /// cells, and hold what a hearing row would take.
     pub fn on_verdict_proof_fetched(
         &mut self,
-        anchor: Anchor,
         questions: &[VerdictCells],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
         windows: EpochWindows,
     ) {
         self.counterparts
-            .on_verdict_proof_fetched(anchor, questions, proof, windows);
+            .on_verdict_proof_fetched(questions, proof, windows);
     }
 
     /// What this validator holds to offer in a block it proposes,
@@ -5032,13 +5031,13 @@ mod tests {
         BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
         Crossings, Deadline, Epoch, EpochSeed, EpochWindows, ExecutionCertificateContext,
         ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash, Hash, Inclusion, LocalKey,
-        MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PriceTable, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
-        RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
-        SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Verify, VoteCount, Window, compute_global_receipt_root,
-        receipt_hash_of, signed_bytes,
+        MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof,
+        NetworkDefinition, PriceTable, QuorumCertificate, RETENTION_HORIZON, Randomness,
+        RecoveryBinding, RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
+        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution,
+        UnsettledTx, ValidatorInfo, ValidatorSet, Verify, VoteCount, Window,
+        compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,

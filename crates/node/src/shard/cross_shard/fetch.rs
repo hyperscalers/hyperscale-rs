@@ -343,11 +343,9 @@ impl ScopedAnswer for VerdictProofBinding {
         response: GetStateProofResponse,
     ) -> Result<ProtocolEvent, Refusal> {
         let proof = response.proof.ok_or(Refusal::NotHeld)?;
-        proof
-            .inclusions(scope.state_root, scope.shard, &cells_of(&keys))
+        let proof = CheckedStateProof::check(scope, cells_of(&keys), proof)
             .map_err(|_| Refusal::Unusable("unusable_proof"))?;
         Ok(ProtocolEvent::FetchedVerdictProofVerified {
-            anchor: scope,
             questions: keys,
             proof,
         })

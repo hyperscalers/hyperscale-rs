@@ -656,13 +656,9 @@ impl StateMachine for NodeStateMachine {
                 self.shard.on_fetched_state_proof_verified(&proof, &values);
                 Vec::new()
             }
-            ProtocolEvent::FetchedVerdictProofVerified {
-                anchor,
-                questions,
-                proof,
-            } => {
+            ProtocolEvent::FetchedVerdictProofVerified { questions, proof } => {
                 self.shard
-                    .on_fetched_verdict_proof_verified(sched, anchor, &questions, &proof);
+                    .on_fetched_verdict_proof_verified(sched, &questions, &proof);
                 Vec::new()
             }
 

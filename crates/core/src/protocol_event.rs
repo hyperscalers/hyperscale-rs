@@ -18,15 +18,15 @@ use hyperscale_types::{
     CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
     CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome,
     CheckedStateProof, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
-    Finalization, FinalizationVerifyError, Hash, HeaderSource, LeafIndex, MerkleInclusionProof,
-    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    Provisions, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId,
-    ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
-    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
-    SpcView, StandingAnswers, StateClaim, StoredReceipt, TickId, Timeout, TopologySchedule,
-    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable,
-    VerificationKind, Verified, WeightedTimestamp,
+    Finalization, FinalizationVerifyError, Hash, HeaderSource, LeafIndex, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions,
+    ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
+    RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
+    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    StandingAnswers, StateClaim, StoredReceipt, TickId, Timeout, TopologySchedule, Transaction,
+    TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable, VerificationKind,
+    Verified, WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, HeaderCommittee, QcSubject};
@@ -835,12 +835,11 @@ pub enum ProtocolEvent {
     /// coordinator keeps what is worth a block's bytes to offer; nothing
     /// reads a verdict off a fetch.
     FetchedVerdictProofVerified {
-        /// The state the proof was checked against.
-        anchor: Anchor,
         /// The questions the proof was asked about, each as its cells.
         questions: Vec<VerdictCells>,
-        /// The proof as fetched, over every cell of `questions`.
-        proof: MerkleInclusionProof,
+        /// The proof as fetched, with what it says of every cell of
+        /// `questions` under the anchor's root.
+        proof: CheckedStateProof,
     },
 
     /// A settled-set fetch verified a past-terminal shard's complete

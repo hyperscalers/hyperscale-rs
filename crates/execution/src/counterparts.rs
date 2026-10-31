@@ -2951,10 +2951,10 @@ impl Counterparts {
         (offers, retirements)
     }
 
-    /// Take a proof fetched at `anchor` for `questions`, each whole, and
-    /// hold what is worth a block's bytes.
+    /// Take a proof fetched for `questions`, each whole, and hold what is
+    /// worth a block's bytes.
     ///
-    /// Every question asked at the anchor that the proof reads is closed
+    /// Every question asked at the proof's anchor that it reads is closed
     /// there. Its reading is the leaf where the leaf reads present, and
     /// the leaf, the row and the marker where it reads absent, and it is
     /// held only where [`VerdictQuestion::offers`] holds and no reading
@@ -2966,22 +2966,13 @@ impl Counterparts {
     /// request asks, so no more than three times that many cells.
     pub(crate) fn on_verdict_proof_fetched(
         &mut self,
-        anchor: Anchor,
         questions: &[VerdictCells],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
         windows: EpochWindows,
     ) {
+        let anchor = proof.anchor();
         let sibling = anchor.shard;
-        let keys: Vec<SubstateKey> = questions.iter().flat_map(VerdictCells::keys).collect();
-        let Ok(inclusions) = proof.inclusions(anchor.state_root, sibling, &keys) else {
-            tracing::warn!(
-                shard = ?sibling,
-                height = anchor.height.inner(),
-                "A fetched verdict proof does not answer for its keys"
-            );
-            return;
-        };
-        let read: BTreeMap<SubstateKey, Inclusion> = inclusions.into_iter().collect();
+        let read: BTreeMap<SubstateKey, Inclusion> = proof.inclusions().iter().copied().collect();
         let mark = ReadMark::of(&anchor, windows);
         let mut cells: Vec<(SubstateKey, Inclusion)> = Vec::new();
         let mut taken: Vec<(TxHash, VerdictCells)> = Vec::new();
@@ -3035,7 +3026,7 @@ impl Counterparts {
             return;
         }
         let kept: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
-        let Ok(cut) = proof.restrict(&kept) else {
+        let Ok(cut) = proof.proof().restrict(&kept) else {
             tracing::warn!(
                 shard = ?sibling,
                 height = anchor.height.inner(),
@@ -8574,7 +8565,9 @@ mod tests {
     ) {
         let keys: Vec<SubstateKey> = questions.iter().flat_map(VerdictCells::keys).collect();
         let (_, proof) = state_and_proof(anchor.shard, present, &keys);
-        counterparts.on_verdict_proof_fetched(anchor, questions, &proof, GRID);
+        let proof = CheckedStateProof::check(anchor, keys, proof)
+            .expect("the fixture proof answers for its keys");
+        counterparts.on_verdict_proof_fetched(questions, &proof, GRID);
     }
 
     /// A claim at `anchor` reading `keys` over a tree holding `present`.
@@ -9256,7 +9249,7 @@ mod tests {
         let cells = verdict_cells(&question);
         anchors.record(producer_at(7, &[]));
         counterparts.ask_verdicts(&[question], FAR);
-        let first = producer_at(8, &[]);
+        let first = producer_at(8, &[cells.leaf]);
         anchors.record(first);
         let fetch = counterparts.ask_verdicts(&[question], FAR);
         assert_eq!(asked(&fetch), vec![(first, cells)]);
