@@ -29,7 +29,7 @@ use hyperscale_types::{
     VerificationKind, Verified, WeightedTimestamp,
 };
 
-use crate::action::{CrossShardExecutionRequest, QcSubject};
+use crate::action::{CrossShardExecutionRequest, HeaderCommittee, QcSubject};
 
 /// What one tick's batch produced.
 #[derive(Debug, Clone)]
@@ -331,6 +331,10 @@ pub enum ProtocolEvent {
         /// QC-level signature/quorum failure or QC↔header linkage
         /// mismatch on error.
         result: Box<Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>>,
+        /// The committee the check ran against, as the request named it:
+        /// a failure under a guessed one waits for the header's parent
+        /// whatever the coordinator holds by the time the result lands.
+        committee: HeaderCommittee,
     },
 
     /// A remote committed block header has been fully verified (QC + structural checks).

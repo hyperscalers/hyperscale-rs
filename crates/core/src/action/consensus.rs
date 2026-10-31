@@ -20,7 +20,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::CrossingId;
 
-use super::{Delegated, QcSubject, StateRootCheck};
+use super::{Delegated, HeaderCommittee, QcSubject, StateRootCheck};
 
 /// Shard consensus work, run on the consensus dispatch pool.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
@@ -273,6 +273,9 @@ pub enum ConsensusAction {
         committee_public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the remote shard.
         quorum_threshold: VoteCount,
+        /// Whether a held parent named the committee. A QC that fails
+        /// under a guessed one is not held against the copy's sender.
+        committee: HeaderCommittee,
     },
 
     /// Verify an assembled shard fork proof off the state-machine thread.

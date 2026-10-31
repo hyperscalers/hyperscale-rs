@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    ActionContext, ConsensusAction, PreparedBlock, ProtocolEvent, StateRootCheck,
+    ActionContext, ConsensusAction, HeaderCommittee, PreparedBlock, ProtocolEvent, StateRootCheck,
 };
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
@@ -1016,6 +1016,7 @@ where
             source,
             committee_public_keys,
             quorum_threshold,
+            committee,
         } => {
             let start = Stopwatch::start();
             let qc_ctx = QcContext {
@@ -1047,20 +1048,15 @@ where
             if matches!(*result, Err(CertifiedHeaderVerifyError::Qc(_))) {
                 record_signature_verification_failure("remote_header_qc");
             }
-            // A gossiped copy of the header travels on only once its
-            // certificate holds; a false one is its sender's to answer for.
             ctx.network.settle(
                 VerdictKey::from_digest(certified_header.copy_digest()),
-                if result.is_ok() {
-                    Verdict::Accept
-                } else {
-                    Verdict::Reject
-                },
+                remote_header_verdict(&result, committee),
             );
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 certified_header,
                 source,
                 result,
+                committee,
             });
         }
 
@@ -2001,6 +1997,25 @@ where
     }
 }
 
+/// The verdict a remote header's check settles for every gossiped copy of
+/// it. A copy travels on only once its certificate holds, and a false one
+/// is its sender's to answer for. A certificate that fails under a guessed
+/// committee is neither: this host cannot judge it until the header's
+/// parent names the committee, and the check it reruns then settles the
+/// copy for good. Settling it [`Verdict::Ignore`] drops the copies waiting
+/// now and leaves nothing remembered, so a copy arriving later waits on
+/// that rerun instead of being refused on arrival.
+const fn remote_header_verdict(
+    result: &Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>,
+    committee: HeaderCommittee,
+) -> Verdict {
+    match (result, committee) {
+        (Ok(_), _) => Verdict::Accept,
+        (Err(CertifiedHeaderVerifyError::Qc(_)), HeaderCommittee::Guessed) => Verdict::Ignore,
+        (Err(_), _) => Verdict::Reject,
+    }
+}
+
 /// The shards that commit each transaction under `topology`.
 ///
 /// Its participants, less any that only take delivery of its owed
@@ -2863,6 +2878,106 @@ mod tests {
         assert!(
             block.header().body_root().verify(&ctx).is_err(),
             "malformed range must reject even when the body root matches"
+        );
+    }
+
+    fn remote_header(height: u64) -> CertifiedBlockHeader {
+        use hyperscale_types::{AggregateSignature, SignerBitfield};
+
+        let shard = ShardId::leaf(1, 1);
+        let height = BlockHeight::new(height);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height,
+            ..Default::default()
+        });
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            shard,
+            height,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        CertifiedBlockHeader::new(header, qc)
+    }
+
+    /// A header across an epoch cut whose parent this host does not hold is
+    /// checked first under the committee its own anchor guesses, and fails
+    /// there however honest it is. That failure drops the copy waiting on
+    /// it without holding it against the forwarder, and remembers nothing:
+    /// a copy with the same bytes arriving meanwhile waits on the check
+    /// rerun under the parent's committee, which settles it Accept.
+    #[test]
+    fn a_header_failing_under_a_guessed_committee_waits_for_the_rerun() {
+        use hyperscale_network::deferred::{Deferred, Waiting};
+        use hyperscale_types::QcVerifyError;
+
+        let header = remote_header(6);
+        let key = VerdictKey::from_digest(header.copy_digest());
+        let mut waiting = Waiting::default();
+
+        assert!(matches!(
+            waiting.defer(&[key], "first copy"),
+            Deferred::Waits(_)
+        ));
+        let guessed = remote_header_verdict(
+            &Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Guessed,
+        );
+        assert_eq!(
+            waiting.settle(key, guessed),
+            vec![("first copy", Verdict::Ignore)],
+            "a failure under a guess is not the forwarder's fault",
+        );
+
+        assert!(
+            matches!(waiting.defer(&[key], "second copy"), Deferred::Waits(_)),
+            "a copy with the same bytes is not refused on arrival",
+        );
+        let rerun = remote_header_verdict(
+            &Ok(Verified::new_unchecked_for_test(header)),
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            waiting.settle(key, rerun),
+            vec![("second copy", Verdict::Accept)],
+        );
+    }
+
+    /// A forged certificate under the committee the header's parent names
+    /// is the forwarder's to answer for, and a copy of it arriving later is
+    /// refused on arrival.
+    #[test]
+    fn a_forged_header_under_a_resolved_committee_rejects() {
+        use hyperscale_network::deferred::{Deferred, Waiting};
+        use hyperscale_types::QcVerifyError;
+
+        let header = remote_header(7);
+        let key = VerdictKey::from_digest(header.copy_digest());
+        let mut waiting = Waiting::default();
+
+        assert!(matches!(
+            waiting.defer(&[key], "forged"),
+            Deferred::Waits(_)
+        ));
+        let verdict = remote_header_verdict(
+            &Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            waiting.settle(key, verdict),
+            vec![("forged", Verdict::Reject)]
+        );
+        assert_eq!(
+            waiting.defer(&[key], "copy"),
+            Deferred::Settled("copy", Verdict::Reject)
         );
     }
 }

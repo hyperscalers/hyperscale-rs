@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
-use hyperscale_core::{Action, ConsensusAction, ProtocolEvent};
+use hyperscale_core::{Action, ConsensusAction, HeaderCommittee, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
@@ -407,7 +407,7 @@ impl RemoteHeaderCoordinator {
         // suffix band — the orphan a beyond-f cohort forged extending the
         // halted tip; drop it rather than admit a forged header into the
         // routing view.
-        let (anchor, _) =
+        let (anchor, named_by) =
             self.committee_anchor_wt(topology_schedule, shard, certified_header.header());
         let committee = match topology_schedule.lookup_for_shard_certified_fenced(
             shard,
@@ -461,7 +461,7 @@ impl RemoteHeaderCoordinator {
         // The first candidate at a (shard, height) triggers QC verification.
         if candidate == Candidate::First {
             // Emit QC verification for the first header at this (shard, height).
-            Self::emit_verify_qc(committee, source, certified_header)
+            Self::emit_verify_qc(committee, named_by, source, certified_header)
         } else {
             vec![]
         }
@@ -474,13 +474,17 @@ impl RemoteHeaderCoordinator {
     /// Handle QC verification result for a remote header.
     ///
     /// On success: promotes to verified, emits `RemoteHeaderAdmitted` continuation.
-    /// On failure: removes the failed candidate and tries the next source's header.
+    /// On failure: removes the failed candidate and tries the next source's
+    /// header. One that failed under a guessed `committee` is checked again
+    /// under the committee its parent names: at once if the parent is held
+    /// by now, otherwise once it arrives.
     pub fn on_remote_header_qc_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
         certified_header: &CertifiedBlockHeader,
         source: HeaderSource,
         result: Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>,
+        committee: HeaderCommittee,
     ) -> Vec<Action> {
         let shard = certified_header.shard_id();
         let height = certified_header.height();
@@ -495,79 +499,21 @@ impl RemoteHeaderCoordinator {
                     "Remote header QC verification failed"
                 );
 
-                // The failed candidate is out. Dispatch the next candidate
-                // whose committee resolves; buffer any whose epoch the beacon
-                // hasn't reached yet so a catch-up retries them, and drop any
-                // keyed below the schedule floor (the epoch can never resolve
-                // again). If none resolve, every remaining candidate is
-                // buffered or removed and the key is gone, so the drain
-                // re-adds the first one with `first_for_key` set and
-                // re-dispatches it cleanly.
-                // A header no held parent anchored may have failed only for
-                // the guess: it waits for its parent instead of going, even
-                // when the retention has already pruned its pending entry.
                 self.drop_candidate(shard, height, source);
-                let mut parked = if self
-                    .committee_anchor_wt(topology_schedule, shard, certified_header.header())
-                    .1
-                {
-                    Vec::new()
-                } else {
-                    self.await_parent(shard, source, certified_header.clone())
-                };
-                loop {
-                    let next = self
-                        .shards
-                        .get(&shard)
-                        .and_then(|store| store.first_candidate(height));
-                    let Some((next_source, next_header)) = next else {
-                        return parked;
-                    };
-                    let (anchor, _) =
-                        self.committee_anchor_wt(topology_schedule, shard, next_header.header());
-                    let qc_wt = next_header.qc().weighted_timestamp();
-                    // A recovery folded (or advanced) after this header
-                    // buffered can turn it into a suffix-band orphan the
-                    // fenced lookup rejects; drop it and drain the next
-                    // candidate.
-                    match topology_schedule
-                        .lookup_for_shard_certified_fenced(shard, anchor, qc_wt)
-                        .map(|(lookup, _)| lookup)
-                    {
-                        None => {
-                            warn!(
-                                shard = shard.inner(),
-                                height = height.inner(),
-                                source = ?next_source,
-                                "Dropping buffered remote header that resolves the retained \
-                                 committee during a halt recovery"
-                            );
-                            self.drop_candidate(shard, height, next_source);
-                        }
-                        Some(ScheduleLookup::Committee(committee)) => {
-                            parked.extend(Self::emit_verify_qc(
-                                committee,
-                                next_source,
-                                next_header,
-                            ));
-                            return parked;
-                        }
-                        Some(ScheduleLookup::NotYetCommitted) => {
-                            self.drop_candidate(shard, height, next_source);
-                            self.awaiting.push(shard, (next_source, next_header));
-                        }
-                        Some(ScheduleLookup::Evicted) => {
-                            warn!(
-                                shard = shard.inner(),
-                                height = height.inner(),
-                                source = ?next_source,
-                                "Pending remote header's committee epoch fell below the \
-                                 schedule floor — dropping"
-                            );
-                            self.drop_candidate(shard, height, next_source);
-                        }
-                    }
+                let mut actions = self.dispatch_next_candidate(topology_schedule, shard, height);
+                // A header that failed under a guess may be honest: it is
+                // checked again under its parent's committee, even when the
+                // retention has already pruned its pending entry. The next
+                // candidate goes first, so a re-offer lands behind it rather
+                // than dispatching the same height twice.
+                if committee == HeaderCommittee::Guessed {
+                    actions.extend(self.retry_under_parent(
+                        topology_schedule,
+                        source,
+                        certified_header.clone(),
+                    ));
                 }
+                return actions;
             }
         };
 
@@ -1656,7 +1602,7 @@ impl RemoteHeaderCoordinator {
         topology_schedule: &TopologySchedule,
         shard: ShardId,
         header: &BlockHeader,
-    ) -> (WeightedTimestamp, bool) {
+    ) -> (WeightedTimestamp, HeaderCommittee) {
         let parent_anchor = header
             .height()
             .prev()
@@ -1666,8 +1612,95 @@ impl RemoteHeaderCoordinator {
             .map(|parent| parent.parent_qc().weighted_timestamp());
         (
             topology_schedule.signing_anchor(shard, header, parent_anchor),
-            parent_anchor.is_some(),
+            if parent_anchor.is_some() {
+                HeaderCommittee::Resolved
+            } else {
+                HeaderCommittee::Guessed
+            },
         )
+    }
+
+    /// Dispatch the next candidate at `(shard, height)` whose committee
+    /// resolves, once the one in flight there failed. Buffer any whose
+    /// epoch the beacon hasn't reached yet so a catch-up retries them, and
+    /// drop any keyed below the schedule floor (the epoch can never resolve
+    /// again). If none resolve, every remaining candidate is buffered or
+    /// removed and the key is gone, so the drain re-adds the first one with
+    /// `first_for_key` set and re-dispatches it cleanly.
+    fn dispatch_next_candidate(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Vec<Action> {
+        loop {
+            let next = self
+                .shards
+                .get(&shard)
+                .and_then(|store| store.first_candidate(height));
+            let Some((next_source, next_header)) = next else {
+                return Vec::new();
+            };
+            let (anchor, named_by) =
+                self.committee_anchor_wt(topology_schedule, shard, next_header.header());
+            let qc_wt = next_header.qc().weighted_timestamp();
+            // A recovery folded (or advanced) after this header buffered can
+            // turn it into a suffix-band orphan the fenced lookup rejects;
+            // drop it and drain the next candidate.
+            match topology_schedule
+                .lookup_for_shard_certified_fenced(shard, anchor, qc_wt)
+                .map(|(lookup, _)| lookup)
+            {
+                None => {
+                    warn!(
+                        shard = shard.inner(),
+                        height = height.inner(),
+                        source = ?next_source,
+                        "Dropping buffered remote header that resolves the retained \
+                         committee during a halt recovery"
+                    );
+                    self.drop_candidate(shard, height, next_source);
+                }
+                Some(ScheduleLookup::Committee(committee)) => {
+                    return Self::emit_verify_qc(committee, named_by, next_source, next_header);
+                }
+                Some(ScheduleLookup::NotYetCommitted) => {
+                    self.drop_candidate(shard, height, next_source);
+                    self.awaiting.push(shard, (next_source, next_header));
+                }
+                Some(ScheduleLookup::Evicted) => {
+                    warn!(
+                        shard = shard.inner(),
+                        height = height.inner(),
+                        source = ?next_source,
+                        "Pending remote header's committee epoch fell below the \
+                         schedule floor — dropping"
+                    );
+                    self.drop_candidate(shard, height, next_source);
+                }
+            }
+        }
+    }
+
+    /// Check `certified_header`, which failed under a guessed committee,
+    /// again under the one its parent names: re-offered at once when the
+    /// parent is held by now, parked for it otherwise.
+    fn retry_under_parent(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        source: HeaderSource,
+        certified_header: CertifiedBlockHeader,
+    ) -> Vec<Action> {
+        let shard = certified_header.shard_id();
+        match self
+            .committee_anchor_wt(topology_schedule, shard, certified_header.header())
+            .1
+        {
+            HeaderCommittee::Resolved => {
+                self.on_remote_header_received(topology_schedule, certified_header, source)
+            }
+            HeaderCommittee::Guessed => self.await_parent(shard, source, certified_header),
+        }
     }
 
     /// Park `certified_header`, which failed verification under a committee
@@ -1720,6 +1753,7 @@ impl RemoteHeaderCoordinator {
             if self
                 .committee_anchor_wt(topology_schedule, shard, header.header())
                 .1
+                == HeaderCommittee::Resolved
             {
                 actions.extend(self.on_remote_header_received(topology_schedule, header, source));
             } else {
@@ -1923,12 +1957,13 @@ impl RemoteHeaderCoordinator {
     /// Emit a `VerifyRemoteHeaderQc` action for the given header.
     fn emit_verify_qc(
         topology_snapshot: &TopologySnapshot,
+        committee: HeaderCommittee,
         source: HeaderSource,
         certified_header: CertifiedBlockHeader,
     ) -> Vec<Action> {
         let shard = certified_header.shard_id();
-        let committee = topology_snapshot.consensus_committee_for_shard(shard);
-        let committee_public_keys: Vec<ConsensusPublicKey> = committee
+        let committee_public_keys: Vec<ConsensusPublicKey> = topology_snapshot
+            .consensus_committee_for_shard(shard)
             .iter()
             .map(|v| {
                 topology_snapshot
@@ -1943,6 +1978,7 @@ impl RemoteHeaderCoordinator {
             source,
             committee_public_keys,
             quorum_threshold,
+            committee,
         })]
     }
 
@@ -1999,7 +2035,7 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch,
-        EpochWindows, Hash, NetworkDefinition, ProposerTimestamp, QuorumCertificate,
+        EpochWindows, Hash, NetworkDefinition, ProposerTimestamp, QcVerifyError, QuorumCertificate,
         RecoveryBinding, Round, ShardId, Signer, SignerBitfield, ValidatorId, ValidatorInfo,
         ValidatorSet,
     };
@@ -2292,6 +2328,7 @@ mod tests {
             &child,
             gossip(1),
             Err(CertifiedHeaderVerifyError::LinkageMismatch),
+            HeaderCommittee::Guessed,
         );
         assert!(
             actions.iter().any(|a| matches!(
@@ -2358,6 +2395,7 @@ mod tests {
             &child,
             gossip(1),
             Err(CertifiedHeaderVerifyError::LinkageMismatch),
+            HeaderCommittee::Resolved,
         );
 
         let keys = verify_qc_keys(&retried).expect("the buffered sibling re-dispatches");
@@ -2365,6 +2403,71 @@ mod tests {
             *keys, expected0,
             "the retried sibling's QC must verify under the window its parent anchors, not the \
              one it dates itself into",
+        );
+    }
+
+    fn verify_qc_committee(actions: &[Action]) -> Option<HeaderCommittee> {
+        actions.iter().find_map(|a| match a {
+            Action::Consensus(ConsensusAction::VerifyRemoteHeaderQc { committee, .. }) => {
+                Some(*committee)
+            }
+            _ => None,
+        })
+    }
+
+    /// A header checked under a guessed committee can fail after its parent
+    /// arrives. The failure is judged by the committee it was checked
+    /// under, not the one the coordinator could resolve by then: the header
+    /// is checked again at once under its parent's window rather than
+    /// dropped as though its own certificate were false.
+    #[test]
+    fn a_header_whose_parent_lands_during_a_guessed_check_is_checked_again() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let epoch0 = Arc::new(shard_snapshot(2, &ids, 0));
+        let epoch1 = Arc::new(shard_snapshot(2, &ids, 1));
+        let expected0: Vec<ConsensusPublicKey> = epoch0
+            .committee_for_shard(remote)
+            .iter()
+            .map(|v| epoch0.public_key(*v).unwrap())
+            .collect();
+        let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), epoch0);
+        schedule.insert(Epoch::new(1), epoch1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+
+        let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Guessed)
+        );
+        let _ = coord.on_verified_remote_header_received(
+            &schedule,
+            Verified::new_unchecked_for_test(parent),
+            ValidatorId::new(1),
+        );
+
+        let actions = coord.on_remote_header_qc_verified(
+            &schedule,
+            &child,
+            gossip(1),
+            Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Guessed,
+        );
+        assert_eq!(
+            verify_qc_keys(&actions),
+            Some(&expected0),
+            "the header is checked again under the window its parent anchors",
+        );
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Resolved)
         );
     }
 
@@ -2411,11 +2514,16 @@ mod tests {
             Some(&expected1),
             "without its parent the header tries its own window",
         );
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Guessed)
+        );
         let actions = coord.on_remote_header_qc_verified(
             &schedule,
             &child,
             gossip(1),
             Err(CertifiedHeaderVerifyError::LinkageMismatch),
+            HeaderCommittee::Guessed,
         );
         assert!(
             actions.iter().any(|a| matches!(
@@ -2435,6 +2543,10 @@ mod tests {
             verify_qc_keys(&actions),
             Some(&expected0),
             "the waiting header re-dispatches under the window its parent anchors",
+        );
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Resolved)
         );
     }
 
@@ -3059,6 +3171,7 @@ mod tests {
             &header,
             gossip(1),
             Err(CertifiedHeaderVerifyError::LinkageMismatch),
+            HeaderCommittee::Resolved,
         );
         assert!(
             verify_qc_keys(&after_fail).is_none(),
@@ -4776,6 +4889,7 @@ mod tests {
                 &unverified(header),
                 gossip(1),
                 Ok(header.clone()),
+                HeaderCommittee::Resolved,
             );
             committed.extend(committed_heights(&verified));
         }
