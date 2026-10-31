@@ -43,7 +43,7 @@ where
     ///   `dispatch_delegated_action`. Crypto, execution, broadcasts.
     /// - **`ShardLoop`-internal effects** — handled inline because the
     ///   work IS `ShardLoop` machinery (timers, caches consumed by serving,
-    ///   RPC observability, block commit pipeline, topology plumbing).
+    ///   RPC observability, block commit pipeline, sync and fetch drivers).
     #[allow(clippy::too_many_lines)] // single dispatch over Action variants; one arm per variant
     pub(super) fn process_action(&mut self, action: Action) {
         match action {
@@ -196,7 +196,7 @@ where
     //
     // These arms are handled inline (not delegated) because the work IS
     // `ShardLoop` state — caches consumed by serving, RPC observability,
-    // topology plumbing. Migrating them to coordinator crates would force
+    // committed-state restore. Migrating them to coordinator crates would force
     // a typed cache reference onto `ActionContext` per arm, with no
     // architectural payoff.
 

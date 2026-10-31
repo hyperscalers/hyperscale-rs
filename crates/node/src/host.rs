@@ -849,8 +849,6 @@ fn build_shard_io<S: ShardStorage>(
     let handles = ShardDispatchHandles {
         storage: Arc::clone(&storage),
         pending_chain: Arc::clone(&pending_chain),
-        tick_chain: Arc::clone(&tick_chain),
-        prepared_commits: block_commit.prepared_commits_handle(),
     };
     let mut io = ShardIo {
         storage,

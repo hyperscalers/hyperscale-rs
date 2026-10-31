@@ -44,7 +44,7 @@ mod protocol_event;
 pub mod test_host;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
@@ -55,9 +55,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
 use hyperscale_metrics::{record_network_input_over_share, record_network_input_refused};
 use hyperscale_network::{Network, Provenance};
-use hyperscale_storage::{
-    AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
-};
+use hyperscale_storage::{AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage};
 use hyperscale_types::{
     Address, Block, CertifiedBlock, Hash, LocalTimestamp, QuorumCertificate, Round, ShardId,
     Signer, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
@@ -72,7 +70,6 @@ use crate::event::{
 use crate::fetch::Release;
 use crate::process::ProcessIo;
 use crate::replica::{AttachedSigner, NodeStateMachine};
-use crate::shard::commit::PreparedCommitMap;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -182,8 +179,6 @@ impl<S: ShardStorage, N> DispatchHandles<S, N> {
 pub struct ShardDispatchHandles<S: ShardStorage> {
     pub(crate) storage: Arc<S>,
     pub(crate) pending_chain: Arc<PendingChain<S>>,
-    pub(crate) tick_chain: Arc<TickChain<S>>,
-    pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap>>,
 }
 
 impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
@@ -191,8 +186,6 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
         Self {
             storage: Arc::clone(&self.storage),
             pending_chain: Arc::clone(&self.pending_chain),
-            tick_chain: Arc::clone(&self.tick_chain),
-            prepared_commits: Arc::clone(&self.prepared_commits),
         }
     }
 }
