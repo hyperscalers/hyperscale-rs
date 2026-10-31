@@ -14,8 +14,6 @@
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
-use std::sync::Arc;
-
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TICK_STAGED_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId,
@@ -26,7 +24,7 @@ use hyperscale_types::{
 use crate::admission::{
     Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_all, unwrapped,
+    TransactionsSection, admit_all,
 };
 use crate::tick_members::{run_by, states_entry};
 
@@ -419,7 +417,7 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<TransactionsSection<'_>>(
         ctx,
         &mut transactions,
-        block.transactions().iter().map(unwrapped),
+        block.transactions().iter().map(Verifiable::as_unverified),
     )?;
     let mut finalizations = FinalizationsFold::from(ctx);
     admit_all::<FinalizationsSection>(
@@ -602,7 +600,7 @@ fn validate_transactions_verified(block: &Block) -> Result<(), String> {
 
 /// Verify that a list of transactions is sorted by hash in strict ascending
 /// order. `section` is used in the error message for diagnostics.
-fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Result<(), String> {
+fn verify_hash_sorted(txs: &[Verifiable<Transaction>], section: &str) -> Result<(), String> {
     for window in txs.windows(2) {
         if window[0].hash() >= window[1].hash() {
             return Err(format!(
@@ -619,6 +617,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 pub mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -1986,7 +1985,7 @@ pub mod tests {
 
     fn block_with_transactions(
         height: BlockHeight,
-        transactions: Vec<Arc<Verifiable<Transaction>>>,
+        transactions: Vec<Verifiable<Transaction>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
@@ -2027,13 +2026,13 @@ pub mod tests {
         let cells = MAX_INTENTS + 1;
         let full = 3;
         let composed = |seed: u32| {
-            Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
+            Verifiable::from(test_utils::stub_transaction_binding(
                 seed,
                 MAX_INTENTS - 1,
                 test_utils::test_validity_range(),
-            )))
+            ))
         };
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
+        let mut txs: Vec<Verifiable<Transaction>> = (0..full)
             .map(|i| composed(u32::try_from(i).expect("fewer than u32 transactions")))
             .collect();
         let against = plain();
@@ -2047,7 +2046,7 @@ pub mod tests {
         admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut at_cap,
-            txs.iter().map(unwrapped),
+            txs.iter().map(Verifiable::as_unverified),
         )
         .expect("a block at the cap is admitted");
         assert_eq!(at_cap.sweepable, MAX_SWEEPABLE_CREATED_PER_BLOCK);
@@ -2056,7 +2055,7 @@ pub mod tests {
         let err = admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut near_cap(),
-            txs.iter().map(unwrapped),
+            txs.iter().map(Verifiable::as_unverified),
         )
         .expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
@@ -2078,7 +2077,7 @@ pub mod tests {
         let (payer_shard, recipient_shard) = ShardId::ROOT.children();
         let payer = PrincipalAddr::new([0x10; 31]);
         let recipient = Address::new([0x90; 31], AddressClass::Component);
-        let transfer = Arc::new(Verifiable::from(
+        let transfer = Verifiable::from(
             test_utils::stub_transaction(
                 payer,
                 &[payer.address(), recipient],
@@ -2092,7 +2091,7 @@ pub mod tests {
                     test_utils::leg_shape(recipient, LegRole::Outbound, &[(0, 0)]),
                 ],
             ),
-        ));
+        );
         let on = |local: ShardId| {
             let mut against = Against::window(TopologySnapshot::new(
                 NetworkDefinition::simulator(),
@@ -2104,7 +2103,7 @@ pub mod tests {
             admit_all::<TransactionsSection<'_>>(
                 &against.ctx(),
                 &mut TransactionsFold::beside(&provisions),
-                std::iter::once(&transfer).map(unwrapped),
+                std::iter::once(&transfer).map(Verifiable::as_unverified),
             )
         };
 
@@ -2966,12 +2965,9 @@ pub mod tests {
 
     /// `transactions` in hash order, as a block carries them and a ready
     /// set offers them.
-    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Verifiable<Transaction>> {
         transactions.sort_by_key(Transaction::hash);
-        transactions
-            .into_iter()
-            .map(|tx| Arc::new(Verifiable::from(tx)))
-            .collect()
+        transactions.into_iter().map(Verifiable::from).collect()
     }
 
     /// A voter refuses a block carrying one transaction more toward a
@@ -3001,10 +2997,10 @@ pub mod tests {
         stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD - 1);
         let toward_near = [awaiting(0x10, 0x50), awaiting(0x11, 0x51)];
         let others = [awaiting(0x12, 0x90), awaiting(0x13, 0x13)];
-        let ready: Vec<Arc<Verified<Transaction>>> =
+        let ready: Vec<Verified<Transaction>> =
             in_hash_order(toward_near.iter().chain(&others).cloned().collect())
                 .into_iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.as_unverified().clone())))
+                .map(|tx| Verified::new_unchecked_for_test(tx.as_unverified().clone()))
                 .collect();
 
         let ctx = against.ctx();
@@ -3032,7 +3028,7 @@ pub mod tests {
 
         let carried = selected
             .iter()
-            .map(|tx| Arc::new(Verifiable::from(tx.as_ref().as_ref().clone())))
+            .map(|tx| Verifiable::from(tx.as_ref().clone()))
             .collect();
         assert_eq!(
             admit(
@@ -3784,11 +3780,11 @@ pub mod tests {
         assert!(err.contains("cumulative fees"), "{err}");
     }
 
-    fn tx(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::test_transaction(seed)))
+    fn tx(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_utils::test_transaction(seed))
     }
 
-    fn sorted_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn sorted_txs(seeds: &[u8]) -> Vec<Verifiable<Transaction>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
@@ -5507,13 +5503,11 @@ pub mod tests {
     // validate_transactions_verified / validate_block_for_vote verified-arm
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn verified_tx(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::verified_test_transaction(
-            seed,
-        )))
+    fn verified_tx(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_utils::verified_test_transaction(seed))
     }
 
-    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Verifiable<Transaction>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| verified_tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
@@ -5586,15 +5580,15 @@ pub mod tests {
 
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`, wrapped verified for block content.
-    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Arc<Verifiable<Transaction>> {
+    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Verifiable<Transaction> {
         test_utils::install_stub_protocol_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(100_000),
         );
-        Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+        Verifiable::from(Verified::new_unchecked_for_test(
             test_utils::stub_transaction(payer, owners, 1_000, validity),
-        )))
+        ))
     }
 
     /// Admission at `local` under `topo`, with nothing committed.
@@ -5611,12 +5605,12 @@ pub mod tests {
     }
 
     fn block_with_tx(
-        tx: &Arc<Verifiable<Transaction>>,
+        tx: &Verifiable<Transaction>,
         provisions: Vec<Verifiable<Provisions>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(BlockHeight::new(1), 100_000),
-            transactions: Arc::new(Capped::from_array([Arc::clone(tx)])),
+            transactions: Arc::new(Capped::from_array([tx.clone()])),
             certificates: Arc::new(Capped::empty()),
             provisions: Arc::new(Capped::new(provisions).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -5935,16 +5929,16 @@ pub mod tests {
     }
 
     /// `count` verified transactions in hash order, each its own payer's.
-    fn transactions_in_order(count: usize) -> Vec<Arc<Verifiable<Transaction>>> {
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..count)
+    fn transactions_in_order(count: usize) -> Vec<Verifiable<Transaction>> {
+        let mut txs: Vec<Verifiable<Transaction>> = (0..count)
             .map(|seed| {
-                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                Verifiable::from(Verified::new_unchecked_for_test(
                     test_utils::stub_transaction_binding(
                         u32::try_from(seed).expect("fewer than u32 transactions"),
                         0,
                         test_utils::test_validity_range(),
                     ),
-                )))
+                ))
             })
             .collect();
         txs.sort_by_key(|tx| tx.hash());
@@ -6086,7 +6080,7 @@ pub mod tests {
     /// A block of `txs` stating stub terms for each of `entries`, every
     /// entry's crossings cleared unless `crossings`, beside `lines`.
     fn carrying_terms(
-        txs: &[Arc<Verifiable<Transaction>>],
+        txs: &[Verifiable<Transaction>],
         entries: Vec<TxHash>,
         crossings: bool,
         lines: Vec<TickLine>,

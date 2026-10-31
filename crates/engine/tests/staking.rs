@@ -278,7 +278,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
+    let verified = Verified::<Transaction>::from_persisted(tx);
     executor
         .execute_batch(
             &ctx,
@@ -342,7 +342,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
     let raw = signed_instantiate(OPERATOR, &sealed_here);
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     let executed = executor
         .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
         .expect("the harness engine holds every package it runs");
@@ -420,7 +420,7 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let seal = Verified::<Transaction>::from_persisted(raw);
     let sealed = holder
         .execute_batch(
             &ctx,
@@ -447,7 +447,7 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     let raw = signed_stake_composed(&unseated, 500);
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let call = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let call = Verified::<Transaction>::from_persisted(raw);
     let by_holder = holder
         .execute_batch(
             &ctx,
@@ -519,7 +519,7 @@ fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let seal = Verified::<Transaction>::from_persisted(raw);
     let sealed = holder
         .execute_batch(
             &ctx,
@@ -651,7 +651,7 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     let executed_tx = executor
         .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
         .expect("the harness engine holds every package it runs")
@@ -930,7 +930,7 @@ struct DividedStake {
     trie: ShardTrie,
     seats: [u32; 2],
     payer: u8,
-    tx: Arc<Verified<Transaction>>,
+    tx: Verified<Transaction>,
     classified: Classified,
     /// The payer's shard: the legs.
     payer_shard: ShardId,
@@ -970,7 +970,7 @@ fn stake_paid_by(payer: u8) -> DividedStake {
     let raw = signed_double_stake(payer, seats, 500);
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     assert!(
         classified
@@ -1997,7 +1997,7 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
     let run = |store: &MapDb, raw: Transaction| {
         raw.try_derived(executor.derivation().as_ref())
             .expect("a fixture transaction derives");
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+        let tx = Verified::<Transaction>::from_persisted(raw);
         executor
             .execute_batch(&ctx, PriceTable::GENESIS, store, std::slice::from_ref(&tx))
             .expect("the harness engine holds every package it runs")
@@ -2280,7 +2280,7 @@ fn run_on(executor: &Executor, store: &MapDb, raw: Transaction) -> ExecutedTx {
     };
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     executor
         .execute_batch(&ctx, PriceTable::GENESIS, store, std::slice::from_ref(&tx))
         .expect("the harness engine holds every package it runs")

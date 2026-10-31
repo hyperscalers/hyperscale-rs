@@ -1954,7 +1954,7 @@ fn a_host_seated_nowhere_publishes_its_own_submission() {
     let fix = Fixture::new();
     let (host, _events) = fix.host_over_history(advanced_history(&fix, 0), far_future());
     let _ = host.network().drain_outbox();
-    let tx = Arc::new(test_transaction(1));
+    let tx = test_transaction(1);
     assert!(host.process.submit_transaction(&tx));
     let sent = host.network().drain_outbox();
     assert!(
@@ -1986,7 +1986,7 @@ fn an_adoption_on_the_beacon_loop_releases_a_parked_submission() {
     );
     assert!(seating.reshape_handoff_pending(SHARD));
     host.process.topology_snapshot.store(Arc::new(seating));
-    let tx = Arc::new(test_transaction(1));
+    let tx = test_transaction(1);
     assert!(host.process.submit_transaction(&tx));
     let routed = |events: &Receiver<HostEvent>| {
         events.try_iter().find_map(|event| match event {
@@ -2035,11 +2035,11 @@ fn a_host_seated_nowhere_holds_a_submission_until_its_record_arrives() {
     let (mut host, _events) = fix.host_over_history(advanced_history(&fix, 0), far_future());
     let (instance, record) = record_on_shard(&host);
     let _ = host.network().drain_outbox();
-    let tx = Arc::new(test_transaction(1));
+    let tx = test_transaction(1);
     let _ = host.step(HostEvent::Beacon(
         BeaconScopedInput::SubmissionWantsRecords {
             deferred: DeferredTransaction::new(
-                Arc::clone(&tx),
+                tx,
                 Unresolved {
                     instances: vec![instance],
                     packages: Vec::new(),

@@ -496,7 +496,7 @@ impl ExecutionSim {
             self.height,
             self.height.inner() * BLOCK_INTERVAL_MS,
             ValidatorId::new(0),
-            txs.into_iter().map(Arc::new).collect(),
+            txs,
             certificates.into_iter().map(Verifiable::from).collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
@@ -1015,7 +1015,7 @@ impl ExecutionSim {
                     self.local_shard,
                     header.height(),
                     header.parent_qc().weighted_timestamp(),
-                    block.transactions().iter().map(|tx| tx.as_unverified()),
+                    block.transactions().iter().map(Verifiable::as_unverified),
                     MemberSections {
                         certificates: block.certificates(),
                         records: block.abandonment_records(),
@@ -1142,7 +1142,7 @@ fn stub_execute(
     trie: &ShardTrie,
     local_shard: ShardId,
     tx_hash: TxHash,
-    tx: &Arc<Verified<Transaction>>,
+    tx: &Verified<Transaction>,
     abortable: bool,
     spend: Option<(SubstateKey, u128)>,
 ) -> ExecutedTx {

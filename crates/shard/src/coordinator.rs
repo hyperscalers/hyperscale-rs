@@ -2804,7 +2804,7 @@ impl ShardCoordinator {
             self.local_shard,
             block.height(),
             anchor,
-            block.transactions().iter().map(|tx| tx.as_unverified()),
+            block.transactions().iter().map(Verifiable::as_unverified),
             MemberSections {
                 certificates: block.certificates(),
                 records: block.abandonment_records(),
@@ -2814,7 +2814,7 @@ impl ShardCoordinator {
             derived_terms(
                 committee,
                 self.local_shard,
-                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.transactions().iter().map(Verifiable::as_unverified),
             ),
         )
     }
@@ -3078,7 +3078,7 @@ impl ShardCoordinator {
                 local,
                 height,
                 anchor,
-                payload.transactions.iter().map(|tx| &***tx),
+                payload.transactions.iter().map(|tx| &**tx),
                 MemberSections {
                     certificates: &payload.finalizations,
                     records: &payload.abandonment_records,
@@ -3088,7 +3088,7 @@ impl ShardCoordinator {
                 derived_terms(
                     committee,
                     local,
-                    payload.transactions.iter().map(|tx| &***tx),
+                    payload.transactions.iter().map(|tx| &**tx),
                 ),
             ));
         }
@@ -4316,7 +4316,7 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         header: &BlockHeader,
         manifest: BlockManifest,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
+        lookup_tx: impl Fn(&TxHash) -> Option<Verifiable<Transaction>>,
         lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) -> Vec<Action> {
@@ -9560,11 +9560,11 @@ impl ShardCoordinator {
     pub fn on_transactions_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        txs: &[Arc<Verified<Transaction>>],
+        txs: &[Verified<Transaction>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tx in txs {
-            let wrapped: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from((**tx).clone()));
+            let wrapped: Verifiable<Transaction> = Verifiable::from(tx.clone());
             for block_hash in self.pending_blocks.receive_transaction(&wrapped) {
                 actions.extend(self.dispatch_block_complete(topology_schedule, block_hash));
             }
@@ -10306,7 +10306,7 @@ mod tests {
 
     use super::*;
     use crate::action_handlers::{Named, Naming, build_proposal};
-    use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all, unwrapped};
+    use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all};
     use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent, within_the_cap};
 
     impl ShardCoordinator {
@@ -10502,9 +10502,9 @@ mod tests {
         .signed_by(ValidatorId::new(0))
     }
 
-    fn precut_tx(seed: u8, opens_ms: u64) -> Arc<Transaction> {
+    fn precut_tx(seed: u8, opens_ms: u64) -> Transaction {
         test_utils::install_stub_protocol_statics();
-        Arc::new(test_utils::stub_transaction(
+        test_utils::stub_transaction(
             test_utils::test_principal(seed),
             &[test_utils::test_prefix(seed)],
             1_000,
@@ -10512,7 +10512,7 @@ mod tests {
                 WeightedTimestamp::from_millis(opens_ms),
                 WeightedTimestamp::from_millis(opens_ms + 100_000),
             ),
-        ))
+        )
     }
 
     /// A probe candidate and the end of its range.
@@ -10574,7 +10574,7 @@ mod tests {
             BlockHeight::new(11),
             10_600,
             ValidatorId::new(1),
-            vec![Arc::clone(&before), Arc::clone(&after)],
+            vec![before.clone(), after],
             vec![],
         );
         install_complete_block(&mut state, &block);
@@ -10916,11 +10916,7 @@ mod tests {
                 Capped::new(
                     transactions
                         .iter()
-                        .map(|tx| {
-                            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                                tx.clone(),
-                            )))
-                        })
+                        .map(|tx| Verifiable::from(Verified::new_unchecked_for_test(tx.clone())))
                         .collect(),
                 )
                 .expect("a list written out in a test"),
@@ -11449,7 +11445,7 @@ mod tests {
         ProposalPayload {
             transactions: transactions
                 .iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.clone())))
+                .map(|tx| Verified::new_unchecked_for_test(tx.clone()))
                 .collect(),
             finalizations: finalizations.into_iter().map(Verifiable::from).collect(),
             provisions: Vec::new(),
@@ -14257,7 +14253,7 @@ mod tests {
         rows: &MemberIndex,
         committee: &TopologySnapshot,
         local: ShardId,
-        transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+        transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
         fitted: bool,
     ) -> Named {
         let manifest = ManifestInputs::default();
@@ -14284,12 +14280,12 @@ mod tests {
     /// `transactions` verified and in hash order, as a block carries them.
     fn in_block_order(
         mut transactions: Vec<Transaction>,
-    ) -> Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK> {
+    ) -> Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK> {
         transactions.sort_by_key(Transaction::hash);
         Capped::new(
             transactions
                 .into_iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx)))
+                .map(Verified::new_unchecked_for_test)
                 .collect(),
         )
         .expect("a list written out in a test")
@@ -14397,7 +14393,7 @@ mod tests {
         assert!(tick_terms_admit_block(stated_weight(&fitted)));
         let dropped = offered.len() - kept.len();
         assert!(dropped > 0);
-        let unnamed = |list: &[Arc<Verified<Transaction>>]| -> Vec<TxHash> {
+        let unnamed = |list: &[Verified<Transaction>]| -> Vec<TxHash> {
             list.iter()
                 .map(|tx| tx.hash())
                 .filter(|tx| !ready.contains(tx))
@@ -14769,9 +14765,9 @@ mod tests {
         };
         let block = Block::Live {
             header,
-            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
+            transactions: Arc::new(Capped::from_array([Verifiable::from(
                 Verified::new_unchecked_for_test(unrouted),
-            ))])),
+            )])),
             certificates,
             provisions,
             abandonment_records,
@@ -15130,8 +15126,8 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let payer_owner = test_utils::test_principal(0x81);
         let local_owner = test_utils::test_principal(0x01);
-        let tx: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_utils::stub_transaction(
+        let tx: Verifiable<Transaction> = Verifiable::from(Verified::new_unchecked_for_test(
+            test_utils::stub_transaction(
                 payer_owner,
                 &[local_owner.address(), payer_owner.address()],
                 1_000,
@@ -15139,7 +15135,7 @@ mod tests {
                     WeightedTimestamp::ZERO,
                     WeightedTimestamp::from_millis(100_000),
                 ),
-            )),
+            ),
         ));
         assert_eq!(
             topo.shard_trie().shard_for_prefix(tx.fee_payer()),
@@ -15196,7 +15192,7 @@ mod tests {
             header: block_chained_on(BlockHeight::new(2), state.committed_hash, 2_000)
                 .header()
                 .clone(),
-            transactions: Arc::new(Capped::from_array([Arc::clone(&tx)])),
+            transactions: Arc::new(Capped::from_array([tx])),
             certificates: Arc::new(Capped::empty()),
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
@@ -15770,7 +15766,7 @@ mod tests {
         for tx in [&crossing, &staying] {
             mempool.on_transaction_gossip(
                 &split,
-                Arc::new(Verified::new_unchecked_for_test(tx.clone())),
+                Verified::new_unchecked_for_test(tx.clone()),
                 LocalTimestamp::ZERO,
             );
         }
@@ -15910,9 +15906,9 @@ mod tests {
         let third = toward(2);
         let mut ready = vec![third.clone(), staying.clone()];
         ready.sort_by_key(Transaction::hash);
-        let ready: Vec<Arc<Verified<Transaction>>> = ready
+        let ready: Vec<Verified<Transaction>> = ready
             .into_iter()
-            .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx)))
+            .map(Verified::new_unchecked_for_test)
             .collect();
 
         let mut rows_at_parent = Vec::new();
@@ -21873,18 +21869,16 @@ mod tests {
 
     /// A transaction admission takes on a root-shard block anchored at
     /// `anchor_ms`.
-    fn admissible_at(anchor_ms: u64) -> Arc<Verified<Transaction>> {
+    fn admissible_at(anchor_ms: u64) -> Verified<Transaction> {
         test_utils::install_stub_protocol_statics();
         let payer = test_utils::test_principal(0x21);
-        Arc::new(Verified::new_unchecked_for_test(
-            test_utils::stub_transaction(
-                payer,
-                &[payer.address()],
-                1_000,
-                TimestampRange::new(
-                    WeightedTimestamp::from_millis(anchor_ms.saturating_sub(1_000)),
-                    WeightedTimestamp::from_millis(anchor_ms + 1_000),
-                ),
+        Verified::new_unchecked_for_test(test_utils::stub_transaction(
+            payer,
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::from_millis(anchor_ms.saturating_sub(1_000)),
+                WeightedTimestamp::from_millis(anchor_ms + 1_000),
             ),
         ))
     }
@@ -21892,12 +21886,12 @@ mod tests {
     /// A gather that records it was asked and offers `tx` alone.
     fn offering<'a>(
         asked: &'a Cell<bool>,
-        tx: &'a Arc<Verified<Transaction>>,
+        tx: &'a Verified<Transaction>,
     ) -> impl Fn(&ProposalAsk<'_>) -> ProposalInputs + 'a {
         |_| {
             asked.set(true);
             ProposalInputs {
-                ready_txs: vec![Arc::clone(tx)],
+                ready_txs: vec![tx.clone()],
                 ..ProposalInputs::default()
             }
         }
@@ -21909,7 +21903,7 @@ mod tests {
         for tx in transactions {
             mempool.on_transaction_gossip(
                 schedule.head(),
-                Arc::new(Verified::new_unchecked_for_test(tx.clone())),
+                Verified::new_unchecked_for_test(tx.clone()),
                 LocalTimestamp::ZERO,
             );
         }
@@ -22848,11 +22842,11 @@ mod tests {
     // Helpers retained for no-duplicate-transactions walk tests below
     // ═══════════════════════════════════════════════════════════════════════════
 
-    fn make_test_tx_with_seed(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_transaction(seed)))
+    fn make_test_tx_with_seed(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_transaction(seed))
     }
 
-    fn sort_txs_by_hash(txs: &mut [Arc<Verifiable<Transaction>>]) {
+    fn sort_txs_by_hash(txs: &mut [Verifiable<Transaction>]) {
         txs.sort_by_key(|tx| tx.hash());
     }
 
@@ -22897,7 +22891,7 @@ mod tests {
         assert!(state.is_block_syncing());
 
         // Ready txs must be dropped — sync blocks are always empty.
-        let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
+        let ready_txs = vec![(test_utils::verified_test_transaction(1))];
         let actions = state.try_propose(&topology_schedule, |_| ProposalInputs {
             ready_txs,
             ..ProposalInputs::default()
@@ -24649,7 +24643,7 @@ mod tests {
             BlockHeight::new(1),
             1_000,
             ValidatorId::new(1),
-            vec![Arc::new(unrouted)],
+            vec![unrouted],
             vec![],
         );
         let qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -24986,7 +24980,7 @@ mod tests {
         let (state, topology) = make_test_state();
         let declaring = |seed: u8, compute: u64| {
             let payer = test_principal(seed);
-            Arc::new(stub_transaction_declaring(
+            stub_transaction_declaring(
                 payer,
                 &[],
                 &[],
@@ -24994,9 +24988,9 @@ mod tests {
                 1_000,
                 vec![compute],
                 test_validity_range(),
-            ))
+            )
         };
-        let block_of = |txs: Vec<Arc<Transaction>>| {
+        let block_of = |txs: Vec<Transaction>| {
             make_live_block(
                 ShardId::ROOT,
                 BlockHeight::new(1),
@@ -25020,7 +25014,7 @@ mod tests {
         // exactly, the ceiling and the signature's verification
         // together; a thirty-third carries it past.
         let share = MAX_BLOCK_COMPUTE / 32 - DeclaredWork::signature(SchemeId::ED25519).compute;
-        let full: Vec<Arc<Transaction>> = (1..=32u8).map(|seed| declaring(seed, share)).collect();
+        let full: Vec<Transaction> = (1..=32u8).map(|seed| declaring(seed, share)).collect();
         state
             .admit_transactions(&topology, &block_of(full.clone()))
             .expect("a block at the cap is admitted");
@@ -25682,7 +25676,7 @@ mod tests {
             admit_all::<TransactionsSection<'_>>(
                 &ctx,
                 &mut TransactionsFold::beside(&provisions),
-                block.transactions().iter().map(unwrapped),
+                block.transactions().iter().map(Verifiable::as_unverified),
             )
         }
 
@@ -27537,14 +27531,13 @@ mod tests {
 
         let parent = Model(BTreeMap::new());
         let kept = |standing: Option<&StandingAnswers>| {
-            let mut offered: Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK> =
-                Capped::new(
-                    transactions
-                        .iter()
-                        .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.clone())))
-                        .collect(),
-                )
-                .expect("within the block");
+            let mut offered: Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK> = Capped::new(
+                transactions
+                    .iter()
+                    .map(|tx| Verified::new_unchecked_for_test(tx.clone()))
+                    .collect(),
+            )
+            .expect("within the block");
             let (claims, cut, dropped) = within_the_cap(
                 standing,
                 trie,

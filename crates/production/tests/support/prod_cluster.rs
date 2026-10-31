@@ -426,13 +426,13 @@ impl Cluster for ProdCluster {
         self.inner.with_derivation(f)
     }
 
-    fn submit(&mut self, tx: Arc<Transaction>) {
+    fn submit(&mut self, tx: Transaction) {
         if let Some(host) = self.host_for_tx(&tx).or_else(|| self.inner.live_host()) {
             self.inner.submit_transaction(host, &tx);
         }
     }
 
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction) {
         let first = self.committee_hosts(shard).first().copied();
         if let Some(host) = first.or_else(|| self.inner.live_host()) {
             self.inner.submit_transaction(host, &tx);
@@ -731,7 +731,7 @@ impl FaultableCluster for ProdCluster {
         self.inner.host_of(validator)
     }
 
-    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+    fn submit_at_host(&mut self, host: usize, tx: Transaction) {
         self.inner.submit_transaction(host, &tx);
     }
 

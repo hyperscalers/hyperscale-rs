@@ -161,12 +161,12 @@ mod tests {
     #[test]
     fn test_compute_transaction_root_deterministic() {
         install_stub_protocol_statics();
-        let tx = Arc::new(Verifiable::from(stub_transaction(
+        let tx = Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(2)],
             1_000,
             test_validity_range(),
-        )));
+        ));
 
         let root1 = Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner();
         let root2 = Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner();

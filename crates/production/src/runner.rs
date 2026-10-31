@@ -791,7 +791,7 @@ impl ProductionRunner {
                 .expect("host must exist for tx_submission_sender")
                 .process(),
         );
-        Arc::new(move |routable: Arc<Transaction>| process.submit_transaction(&routable))
+        Arc::new(move |routable: Transaction| process.submit_transaction(&routable))
     }
 
     /// A closure that asks a hosted shard what a transaction would do.

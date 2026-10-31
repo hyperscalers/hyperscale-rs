@@ -1650,11 +1650,11 @@ mod partition_tests {
 
     use super::*;
 
-    fn tx_arc(seed: u8) -> Arc<Transaction> {
-        Arc::new(test_transaction(seed))
+    fn tx_arc(seed: u8) -> Transaction {
+        test_transaction(seed)
     }
 
-    fn tx_hash(tx: &Arc<Transaction>) -> [TxHash; 1] {
+    fn tx_hash(tx: &Transaction) -> [TxHash; 1] {
         [tx.hash()]
     }
 
@@ -1672,11 +1672,8 @@ mod partition_tests {
         let extra = tx_arc(99);
         let other_requested = tx_arc(2).hash();
 
-        let split = partition_solicited(
-            vec![Arc::clone(&asked), Arc::clone(&extra)],
-            &[asked_hash, other_requested],
-            tx_hash,
-        );
+        let split =
+            partition_solicited(vec![asked, extra], &[asked_hash, other_requested], tx_hash);
         assert_eq!(split.kept.len(), 1);
         assert_eq!(split.kept[0].hash(), asked_hash);
         assert_eq!(split.unsolicited, 1);
@@ -1687,11 +1684,7 @@ mod partition_tests {
     fn partition_full_delivery_yields_no_missing_no_unsolicited() {
         let a = tx_arc(1);
         let b = tx_arc(2);
-        let split = partition_solicited(
-            vec![Arc::clone(&a), Arc::clone(&b)],
-            &[a.hash(), b.hash()],
-            tx_hash,
-        );
+        let split = partition_solicited(vec![a.clone(), b.clone()], &[a.hash(), b.hash()], tx_hash);
         assert_eq!(split.kept.len(), 2);
         assert!(split.missing.is_empty());
         assert_eq!(split.unsolicited, 0);
@@ -1793,11 +1786,7 @@ mod partition_tests {
             )]),
         ));
         let asked_hash = asked.hash();
-        let split = partition_solicited(
-            vec![Arc::clone(&asked), Arc::clone(&extra)],
-            &[asked_hash],
-            |p| [p.hash()],
-        );
+        let split = partition_solicited(vec![asked, extra], &[asked_hash], |p| [p.hash()]);
         assert_eq!(split.kept.len(), 1);
         assert_eq!(split.kept[0].hash(), asked_hash);
         assert_eq!(split.unsolicited, 1);

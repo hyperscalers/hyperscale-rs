@@ -325,7 +325,7 @@ pub fn a_payer_spends_beside_its_pending_leg<C: FaultableCluster>(
     // window it is measured in is the two blocks after the leg's, and a
     // spend that reached the next proposers only by gossip would arrive a
     // hop and a dwell behind wherever the leg's proposer sat.
-    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, spend_tx);
+    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, &spend_tx);
 
     let context = format!(
         "a {spend:?} spend of {amount} beside a pending leg of {reserved} under a {ceiling:?} \
@@ -461,7 +461,7 @@ pub fn a_payer_spends_beside_its_routes_pending_core<C: FaultableCluster>(
     // At every member of the payer's committee at once, so the next
     // proposer holds it after its own dwell rather than a gossip hop
     // later: the window it is measured in is a few blocks wide.
-    let spend_hash = charges.submit_to_committee(c, FIRST_VENUE_SHARD, spend_tx);
+    let spend_hash = charges.submit_to_committee(c, FIRST_VENUE_SHARD, &spend_tx);
 
     let context = format!(
         "a {spend:?} spend of {amount} beside a route's pending core reserving {reserved} of its \
@@ -543,12 +543,12 @@ pub fn a_payer_publishes_beside_its_unsettled_spend<C: FaultableCluster>(
     // proposer holds each after its own dwell rather than a gossip hop
     // later: the window the publish is measured in is a few blocks wide,
     // and two submitted together reach the same proposer together.
-    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, spend);
+    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, &spend);
     between(c, spend_hash);
     let publish = build_publish_tx(&payer_key, artifact, validity_around(c.now()));
     let publish_price = declared_price(c, &publish);
     let pooled = pooled_at(c, PAYER_SHARD);
-    let publish_hash = charges.submit_to_committee(c, PAYER_SHARD, publish);
+    let publish_hash = charges.submit_to_committee(c, PAYER_SHARD, &publish);
 
     let context = "a publish beside an unsettled spend";
     await_pair(

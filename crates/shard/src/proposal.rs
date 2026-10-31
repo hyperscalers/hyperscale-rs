@@ -123,7 +123,7 @@ impl ProposalAsk<'_> {
 #[derive(Debug, Default)]
 pub struct ProposalInputs {
     /// The pool's ready set, in hash order.
-    pub ready_txs: Vec<Arc<Verified<Transaction>>>,
+    pub ready_txs: Vec<Verified<Transaction>>,
     /// Finalizations execution holds ready to commit.
     pub finalizations: Vec<Verifiable<Finalization>>,
     /// Provision bundles queued from remote shards.
@@ -205,7 +205,7 @@ impl ProposalKind {
 /// the chain. Empty for a block that exists only to advance the chain.
 #[derive(Debug, Default)]
 pub struct ProposalPayload {
-    pub(crate) transactions: Vec<Arc<Verified<Transaction>>>,
+    pub(crate) transactions: Vec<Verified<Transaction>>,
     pub(crate) finalizations: Vec<Verifiable<Finalization>>,
     pub(crate) provisions: Vec<Verifiable<Provisions>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
@@ -370,12 +370,12 @@ pub fn select_transactions(
     ctx: &Committed<'_>,
     prefilter: Prefilter<'_>,
     fold: &mut TransactionsFold<'_>,
-    ready_txs: &[Arc<Verified<Transaction>>],
-) -> Vec<Arc<Verified<Transaction>>> {
+    ready_txs: &[Verified<Transaction>],
+) -> Vec<Verified<Transaction>> {
     let before = ready_txs.len();
     let mut expired = 0;
     let mut predates = 0;
-    let candidates: Vec<Arc<Verified<Transaction>>> = ready_txs
+    let candidates: Vec<Verified<Transaction>> = ready_txs
         .iter()
         .filter(|tx| {
             let h = tx.hash();
@@ -1983,14 +1983,14 @@ mod tests {
         WeightedTimestamp::from_millis(ms)
     }
 
-    fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<Verified<Transaction>> {
+    fn tx_with_range(seed: u8, range: TimestampRange) -> Verified<Transaction> {
         install_stub_protocol_statics();
-        Arc::new(Verified::<Transaction>::from_persisted(stub_transaction(
+        Verified::<Transaction>::from_persisted(stub_transaction(
             test_principal(seed),
             &[test_prefix(seed)],
             1_000,
             range,
-        )))
+        ))
     }
 
     fn empty_dedup_index() -> CommitDedupIndex {
@@ -2190,10 +2190,8 @@ mod tests {
         install_stub_protocol_statics();
         let anchor = ts(1_000);
         let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
-        let binding = |seed: u32, bound: usize| -> Arc<Verified<Transaction>> {
-            Arc::new(Verified::<Transaction>::from_persisted(
-                stub_transaction_binding(seed, bound, range),
-            ))
+        let binding = |seed: u32, bound: usize| -> Verified<Transaction> {
+            Verified::<Transaction>::from_persisted(stub_transaction_binding(seed, bound, range))
         };
         // Fill the cap, then offer one that cannot fit followed by one
         // that can. Skipping rather than stopping is what keeps a large
@@ -2209,7 +2207,7 @@ mod tests {
         let provisions = ProvisionsFold::default();
         let mut fold = TransactionsFold::beside(&provisions);
         fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells - (cells / 2);
-        let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
+        let mut txs: Vec<Verified<Transaction>> = (0..full)
             .map(|i| {
                 binding(
                     u32::try_from(i).expect("fewer than u32 transactions"),
@@ -5546,7 +5544,7 @@ mod tests {
         width: usize,
         reaches: bool,
         range: TimestampRange,
-    ) -> Arc<Verified<Transaction>> {
+    ) -> Verified<Transaction> {
         install_stub_protocol_statics();
         let payer = (0u8..=255)
             .map(test_principal)
@@ -5558,7 +5556,7 @@ mod tests {
         }
         let tx = stub_transaction(payer, &owners, u128::MAX >> 1, range);
         assert_eq!(committee.is_single_shard_transaction(&tx), !reaches);
-        Arc::new(Verified::<Transaction>::from_persisted(tx))
+        Verified::<Transaction>::from_persisted(tx)
     }
 
     /// A transaction reaching beyond the shard is charged the entry its
@@ -5582,11 +5580,11 @@ mod tests {
         );
         let local = declaring(committee, 9_001, 1_300, false, range);
 
-        let mut txs: Vec<Arc<Verified<Transaction>>> = (0..=fitting)
+        let mut txs: Vec<Verified<Transaction>> = (0..=fitting)
             .map(|nth| wide(u32::try_from(nth).expect("fewer than u32 transactions")))
             .collect();
-        let past = Arc::clone(&txs[fitting]);
-        txs.extend([Arc::clone(&narrow), Arc::clone(&local)]);
+        let past = txs[fitting].clone();
+        txs.extend([narrow.clone(), local.clone()]);
 
         let provisions = ProvisionsFold::default();
         let selected = select_transactions(
@@ -5637,7 +5635,7 @@ mod tests {
                 precut: &refuses_precut(),
             },
             &mut TransactionsFold::beside(&provisions),
-            &[reaching, Arc::clone(&local), Arc::clone(&behind)],
+            &[reaching, local.clone(), behind.clone()],
         );
         assert_eq!(
             selected.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
@@ -5646,7 +5644,7 @@ mod tests {
         let err = admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut TransactionsFold::beside(&provisions),
-            [&**local],
+            [&*local],
         )
         .expect_err("a voter refuses the block that carries it");
         assert!(err.contains("declares more accesses"), "{err}");

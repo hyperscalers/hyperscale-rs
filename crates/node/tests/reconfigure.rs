@@ -232,7 +232,7 @@ fn add_and_remove_shard_at_runtime() {
             .local_dispatch_request(SHARD_B, block_request())
             .is_none()
     );
-    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(1))]));
+    let gossip = TransactionGossip::new(Capped::from_array([(test_transaction(1))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     assert!(
         event_rx.try_recv().is_err(),
@@ -249,7 +249,7 @@ fn add_and_remove_shard_at_runtime() {
             .is_some(),
         "request handlers for the added shard serve"
     );
-    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(2))]));
+    let gossip = TransactionGossip::new(Capped::from_array([(test_transaction(2))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     let event = event_rx
         .try_recv()
@@ -269,7 +269,7 @@ fn add_and_remove_shard_at_runtime() {
             .is_none(),
         "request handlers for the dropped shard are gone"
     );
-    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(3))]));
+    let gossip = TransactionGossip::new(Capped::from_array([(test_transaction(3))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     assert!(
         event_rx.try_recv().is_err(),
@@ -482,10 +482,10 @@ impl Fixture {
 
 /// Submit a transaction touching only `SUCCESSOR`, returning it once the
 /// host has routed it and its channel is drained.
-fn submit_to_successor(host: &mut Host, event_rx: &Receiver<HostEvent>) -> Arc<Transaction> {
-    let tx = Arc::new(test_transaction(1));
+fn submit_to_successor(host: &mut Host, event_rx: &Receiver<HostEvent>) -> Transaction {
+    let tx = test_transaction(1);
     let _ = host.step(HostEvent::process(ProcessScopedInput::SubmitTransaction {
-        tx: Arc::clone(&tx),
+        tx: tx.clone(),
     }));
     while event_rx.try_recv().is_ok() {}
     tx

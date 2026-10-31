@@ -168,7 +168,7 @@ pub enum ShardScopedInput {
     /// `ProtocolEvent::TransactionValidated`.
     TransactionGossipReceived {
         /// The transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
     },
 
     /// Raw batch delivered by the transaction fetch protocol's response
@@ -179,7 +179,7 @@ pub enum ShardScopedInput {
     /// `ProtocolEvent::TransactionsReceived`.
     TransactionsFetched {
         /// Transactions returned by the peer.
-        batch: Vec<Arc<Transaction>>,
+        batch: Vec<Transaction>,
     },
 
     /// Envelopes a derivation could not resolve, each beside what it
@@ -208,7 +208,7 @@ pub enum ShardScopedInput {
     /// `locally_submitted` — that's the source shard's role.
     AdmitTransaction {
         /// The locally-submitted transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
     },
 
     /// Locally-submitted tx delivered to the source shard (first hosted
@@ -220,7 +220,7 @@ pub enum ShardScopedInput {
     /// may include destinations this node doesn't host.
     AdmitAndGossipTransaction {
         /// The locally-submitted transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each — even non-hosted ones — over the destination
         /// shard's topic.
@@ -233,7 +233,7 @@ pub enum ShardScopedInput {
     /// takes no `locally_submitted` ownership.
     GossipTransaction {
         /// The locally-submitted transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each over the destination shard's topic.
         touched_shards: Vec<ShardId>,
@@ -349,7 +349,7 @@ pub enum ShardScopedInput {
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
         /// Validated transaction ready for the mempool.
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
     },
 
     /// Transactions that failed validation — sent back so the loop can
@@ -512,7 +512,7 @@ pub enum ProcessScopedInput {
     /// Client submitted a transaction.
     SubmitTransaction {
         /// Transaction submitted by the local client; will be validated then gossiped.
-        tx: Arc<Transaction>,
+        tx: Transaction,
     },
 }
 

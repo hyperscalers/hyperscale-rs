@@ -182,7 +182,7 @@ pub struct CrossShardExecutionRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
     /// The transaction to execute.
-    pub transaction: Arc<Verified<Transaction>>,
+    pub transaction: Verified<Transaction>,
     /// State entries provisioned by other shards (one `Arc` per source shard
     /// contribution). Engine layers them on top of the local snapshot.
     pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
@@ -1005,7 +1005,7 @@ pub enum Action {
         /// Height of the parent block (stable anchor for JMT computation).
         parent_block_height: BlockHeight,
         /// Transactions to include in the proposal.
-        transactions: Vec<Arc<Verified<Transaction>>>,
+        transactions: Vec<Verified<Transaction>>,
         /// Finalizations to include in the block (carries certs + receipts + ECs).
         finalizations: Vec<Verifiable<Finalization>>,
         /// Provisions from remote shards, included in this block.
@@ -1486,7 +1486,7 @@ pub enum Action {
     /// successor's pre-cut rule against the predecessor's committed set.
     ReofferTransactions {
         /// Transactions to put back in front of the network.
-        txs: Vec<Arc<Transaction>>,
+        txs: Vec<Transaction>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

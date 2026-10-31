@@ -23,7 +23,6 @@
 //! members that ran it re-sign it for the committee seated a step later,
 //! and that committee certifies it.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ParticipationChange;
@@ -115,7 +114,7 @@ impl Load {
         for leaf_pairs in &self.pairs {
             let (key, from, to) = &leaf_pairs[self.round % PAIRS_PER_LEAF];
             let tx = build_transfer_tx(key, *from, *to, 1, validity_around(cluster.now()));
-            cluster.submit(Arc::new(tx));
+            cluster.submit(tx);
         }
         self.round += 1;
         let runner = cluster.runner_mut();

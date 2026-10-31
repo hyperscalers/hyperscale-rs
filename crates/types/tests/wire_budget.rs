@@ -824,7 +824,7 @@ fn a_terms_entry_encodes_under_its_weight() {
 struct ResponseWire {
     header: BlockHeader,
     qc: QuorumCertificate,
-    transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
+    transactions: Vec<(TxHash, Option<Verifiable<Transaction>>)>,
     certificates: Vec<(FinalizationHash, Option<Verifiable<Finalization>>)>,
     provisions: ProvisionsWire,
     abandonment_records: Vec<AbandonmentRecord>,

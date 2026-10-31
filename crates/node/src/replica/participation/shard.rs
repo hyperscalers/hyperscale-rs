@@ -11,8 +11,6 @@
 //!   returns, for a live commit, the restart's replay and a parked commit
 //!   folded on a beacon block alike.
 
-use std::sync::Arc;
-
 use hyperscale_core::Action;
 use hyperscale_execution::CommitEffects;
 use hyperscale_types::{
@@ -238,7 +236,7 @@ impl ShardParticipation {
             |h| {
                 self.mempool_coordinator
                     .get_transaction(h)
-                    .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+                    .map(Verifiable::from)
             },
             |id| self.execution_coordinator.get_finalization(id),
             |h| {
@@ -629,8 +627,8 @@ mod tests {
     #[test]
     fn block_persisted_releases_the_tick_above_the_written_block() {
         let TestNode { mut node, .. } = TestNode::new();
-        let raw_tx = Arc::new(test_transaction(1));
-        let commit = |node: &mut NodeStateMachine, height: u64, txs: Vec<Arc<Transaction>>| {
+        let raw_tx = test_transaction(1);
+        let commit = |node: &mut NodeStateMachine, height: u64, txs: Vec<Transaction>| {
             let block = make_live_block(
                 ShardId::ROOT,
                 BlockHeight::new(height),
@@ -659,11 +657,11 @@ mod tests {
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::TransactionValidated {
-                tx: Arc::new(Verified::new_unchecked_for_test((*raw_tx).clone())),
+                tx: Verified::new_unchecked_for_test(raw_tx.clone()),
                 submitted_locally: true,
             },
         );
-        let committed = commit(&mut node, 2, vec![Arc::clone(&raw_tx)]);
+        let committed = commit(&mut node, 2, vec![raw_tx]);
         assert!(
             !runs_tick_2(&committed),
             "block 1 is unwritten, so tick 2 waits: {committed:?}",
@@ -1007,14 +1005,14 @@ mod tests {
     fn block_committed_flips_admitted_tx_to_committed_in_mempool() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let raw_tx = Arc::new(test_transaction(/* seed */ 1));
+        let raw_tx = test_transaction(/* seed */ 1);
         let tx_hash = raw_tx.hash();
-        let verified_tx = Arc::new(Verified::new_unchecked_for_test((*raw_tx).clone()));
+        let verified_tx = Verified::new_unchecked_for_test(raw_tx.clone());
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::TransactionValidated {
-                tx: Arc::clone(&verified_tx),
+                tx: verified_tx,
                 submitted_locally: true,
             },
         );
@@ -1051,11 +1049,11 @@ mod tests {
     }
 
     /// Admit `raw_tx` and commit it live at height 1, leaving it in flight.
-    fn commit_in_flight(node: &mut NodeStateMachine, raw_tx: &Arc<Transaction>) -> Vec<Action> {
+    fn commit_in_flight(node: &mut NodeStateMachine, raw_tx: &Transaction) -> Vec<Action> {
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::TransactionValidated {
-                tx: Arc::new(Verified::new_unchecked_for_test((**raw_tx).clone())),
+                tx: Verified::new_unchecked_for_test(raw_tx.clone()),
                 submitted_locally: true,
             },
         );
@@ -1064,7 +1062,7 @@ mod tests {
             BlockHeight::new(1),
             1_000,
             ValidatorId::new(0),
-            vec![Arc::clone(raw_tx)],
+            vec![raw_tx.clone()],
             vec![],
         );
         node.handle(
@@ -1085,7 +1083,7 @@ mod tests {
     #[test]
     fn a_live_commit_emits_its_hooks_in_commit_order() {
         let TestNode { mut node, .. } = TestNode::new();
-        let raw_tx = Arc::new(test_transaction(1));
+        let raw_tx = test_transaction(1);
         let tx_hash = raw_tx.hash();
 
         let actions = commit_in_flight(&mut node, &raw_tx);
@@ -1122,7 +1120,7 @@ mod tests {
     #[test]
     fn the_quiescence_commit_aborts_in_flight_once() {
         let TestNode { mut node, .. } = TestNode::new();
-        let raw_tx = Arc::new(test_transaction(1));
+        let raw_tx = test_transaction(1);
         let tx_hash = raw_tx.hash();
         let _ = commit_in_flight(&mut node, &raw_tx);
         let participation = &mut node.shard;
@@ -1162,7 +1160,7 @@ mod tests {
             let actions = node.handle(
                 LocalTimestamp::ZERO,
                 ProtocolEvent::TransactionValidated {
-                    tx: Arc::new(Verified::new_unchecked_for_test(raw_tx)),
+                    tx: Verified::new_unchecked_for_test(raw_tx),
                     submitted_locally,
                 },
             );

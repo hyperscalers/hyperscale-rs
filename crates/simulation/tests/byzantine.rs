@@ -90,7 +90,7 @@ fn swap_accepts(
         validity_around(c.now()),
     );
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     let verdict = await_tx_terminal(c, hash, epochs(12));
     assert!(
         matches!(
@@ -187,7 +187,7 @@ fn a_forged_state_proof_convinces_nobody() {
         let tx = build_transfer_tx(&payer_key, from, to, 100, validity);
         let price = declared_price(c, &tx);
         let hash = tx.hash();
-        c.submit(Arc::new(tx));
+        c.submit(tx);
 
         let verdict = await_tx_terminal(c, hash, epochs(8));
         assert!(

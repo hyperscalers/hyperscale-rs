@@ -915,8 +915,8 @@ impl SimCluster {
 /// cache hit. A host derives what it admits, and on a miss fetches and
 /// keeps the records it lacks, which its own replay of the commit reads
 /// back after a restart.
-fn underived(tx: &Transaction) -> Arc<Transaction> {
-    Arc::new(Transaction::new(tx.body().clone()))
+fn underived(tx: &Transaction) -> Transaction {
+    Transaction::new(tx.body().clone())
 }
 
 /// A portable `0..host_count` host index as the sim's [`NodeIndex`].
@@ -941,12 +941,12 @@ impl Cluster for SimCluster {
         self.runner.staged_validators()
     }
 
-    fn submit(&mut self, tx: Arc<Transaction>) {
+    fn submit(&mut self, tx: Transaction) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
         self.submit_at(host, &tx);
     }
 
-    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+    fn submit_after(&mut self, delay: Duration, tx: Transaction) -> bool {
         let host = self.host_for_tx(&tx).unwrap_or(0);
         self.runner.schedule_initial_event(
             host,
@@ -956,7 +956,7 @@ impl Cluster for SimCluster {
         true
     }
 
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction) {
         let host = self
             .live_committee_hosts(shard)
             .first()
@@ -1481,7 +1481,7 @@ impl FaultableCluster for SimCluster {
         (host < self.runner.num_hosts()).then_some(host as usize)
     }
 
-    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+    fn submit_at_host(&mut self, host: usize, tx: Transaction) {
         self.submit_at(host_index(host), &tx);
     }
 

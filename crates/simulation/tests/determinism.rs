@@ -16,7 +16,6 @@ mod support;
 
 use std::env;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hex::encode;
@@ -97,7 +96,7 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
         runner.schedule_initial_event(
             0,
             Duration::from_millis(delay_ms),
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
         );
     }
     runner.run_until(Duration::from_secs(10));
@@ -254,7 +253,7 @@ fn grow_and_transfer(seed: u64) -> (Vec<BlockHeight>, u64, u64, [u8; 32]) {
 
     let tx = build_transfer_tx(&payer, from, to, 500, validity_around(cluster.now()));
     let tx_hash = tx.hash();
-    cluster.submit(Arc::new(tx));
+    cluster.submit(tx);
     // Advance to the same deterministic point in both runs — settlement, or
     // the budget cap if it never settles; either is identical per seed.
     cluster.run_until(epochs(4), |c| {

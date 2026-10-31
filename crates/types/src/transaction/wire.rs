@@ -115,6 +115,13 @@ impl Debug for Transaction {
 }
 
 impl Transaction {
+    /// Whether `other` is a clone of this very transaction, sharing its
+    /// body and caches, rather than an equal copy decoded apart from it.
+    #[must_use]
+    pub fn same_body(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// The admission conflict keys for this transaction's reads — the
     /// routed effect sets' shared-mode keys. Nothing key-granular is
     /// carried on the wire.

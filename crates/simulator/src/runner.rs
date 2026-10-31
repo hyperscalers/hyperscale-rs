@@ -231,7 +231,7 @@ impl Simulator {
                         node_idx,
                         Duration::ZERO,
                         HostEvent::process(ProcessScopedInput::SubmitTransaction {
-                            tx: Arc::new(Transaction::new(tx.body().clone())),
+                            tx: Transaction::new(tx.body().clone()),
                         }),
                     );
                 }

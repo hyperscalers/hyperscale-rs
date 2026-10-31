@@ -65,7 +65,7 @@ pub fn submission_shards(snapshot: &TopologySnapshot, tx: &Transaction) -> Vec<S
 /// advance inside `run_until`.
 pub trait Cluster {
     /// Submit a transaction, routed to whichever host serves its source shard.
-    fn submit(&mut self, tx: Arc<Transaction>);
+    fn submit(&mut self, tx: Transaction);
 
     /// Submit a transaction to a host of `shard`, whatever its source
     /// shard would have been.
@@ -75,7 +75,7 @@ pub trait Cluster {
     /// the producing shard is long past the window it could include the
     /// transaction in and refuses it, where the delivering shard admits
     /// it on the record it consumes still standing.
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>);
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction);
 
     /// Runs `f` on a derivation the cluster answers alike to — what a
     /// scenario reads a routed fact off a transaction it built itself
@@ -412,7 +412,7 @@ pub trait Cluster {
     /// whether the delay was kept: a cluster that cannot schedule a
     /// submission makes it at once and says so, so a scenario spreading
     /// its offers can report the arrival it got.
-    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+    fn submit_after(&mut self, delay: Duration, tx: Transaction) -> bool {
         let _ = delay;
         self.submit(tx);
         false

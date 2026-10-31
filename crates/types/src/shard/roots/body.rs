@@ -6,8 +6,6 @@
 //! holds — so a single hash over all of them binds the body to the header
 //! as tightly as a field per section would.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
@@ -222,7 +220,7 @@ impl Verify<&BodyRootContext<'_>> for BodyRoot {
 }
 
 fn check_validity_windows(
-    transactions: &[Arc<Verifiable<Transaction>>],
+    transactions: &[Verifiable<Transaction>],
     anchor: WeightedTimestamp,
 ) -> Result<(), BodyRootVerifyError> {
     for tx in transactions {
@@ -241,6 +239,8 @@ fn check_validity_windows(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_hbor::Capped;
 
     use super::*;

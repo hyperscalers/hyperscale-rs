@@ -114,8 +114,8 @@ pub fn committee_public_keys_for_shard(
 /// replica pairs them identically. In block order.
 pub fn assign_participants(
     topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
-) -> Vec<(Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)> {
+    transactions: &[Verifiable<Transaction>],
+) -> Vec<(Verifiable<Transaction>, BTreeSet<ShardId>)> {
     transactions
         .iter()
         .map(|tx| {
@@ -123,7 +123,7 @@ pub fn assign_participants(
                 .all_shards_for_transaction(tx)
                 .into_iter()
                 .collect();
-            (Arc::clone(tx), all_shards)
+            (tx.clone(), all_shards)
         })
         .collect()
 }
@@ -298,7 +298,7 @@ pub fn record_pushes(
 /// Returns `None` if nothing in the block owes anyone a bundle.
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
+    transactions: &[Verifiable<Transaction>],
     signers: &BTreeSet<ValidatorId>,
     local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
@@ -379,7 +379,7 @@ mod tests {
                 WeightedTimestamp::from_millis(60_000),
             ),
         );
-        let unrouted = Arc::new(Verifiable::from(Transaction::new(signed.body().clone())));
+        let unrouted = Verifiable::from(Transaction::new(signed.body().clone()));
 
         assert!(
             build_provision_requests(

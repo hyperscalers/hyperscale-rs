@@ -247,7 +247,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     is_fallback: bool,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    transactions: &Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+    transactions: &Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
     certificates: Capped<Vec<Verifiable<Finalization>>, MAX_FINALIZED_TX_PER_BLOCK>,
     local_shard: ShardId,
     chain_origin: WeightedTimestamp,
@@ -419,7 +419,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // block's own transactions, so every reader of the root — the
     // proposer's voters, a replica committing on the certificate alone,
     // a split child following the block — derives the same set.
-    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
+    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &**tx));
     // The drain is the member rows standing after the block: the rows
     // the lines were named over, folded once more with the block as
     // carried, which leaves what the commit's own fold leaves. Read
@@ -454,7 +454,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Lift each `Verified<Transaction>` into `Verifiable` so block
     // construction and per-root compute calls see the form that
     // `Block.transactions` carries.
-    let transactions = transactions.map(|tx| Arc::new(Verifiable::from((**tx).clone())));
+    let transactions = transactions.map(|tx| Verifiable::from(tx.clone()));
 
     let receipts: Vec<StoredReceipt> = certificates
         .iter()
@@ -534,7 +534,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let load = parent_load.unwrap_or(ShardLoad::ZERO).advance(
         fees_over_certificates(&certificates),
         local_work_over(
-            transactions.iter().map(|tx| &***tx),
+            transactions.iter().map(|tx| &**tx),
             topology_snapshot.shard_trie(),
             local_shard,
         ),
@@ -658,12 +658,12 @@ impl Naming<'_> {
     ///
     /// If a transaction is not routed, or declares more accesses than a
     /// member holds: selection offers neither.
-    pub(crate) fn over(&self, transactions: &[Arc<Verified<Transaction>>]) -> Named {
+    pub(crate) fn over(&self, transactions: &[Verified<Transaction>]) -> Named {
         let pending = MemberInputs::deriving(
             self.shard,
             self.height,
             self.anchor,
-            transactions.iter().map(|tx| &***tx),
+            transactions.iter().map(|tx| &**tx),
             MemberSections {
                 certificates: self.certificates,
                 records: self.records,
@@ -673,7 +673,7 @@ impl Naming<'_> {
             derived_terms(
                 self.committee,
                 self.shard,
-                transactions.iter().map(|tx| &***tx),
+                transactions.iter().map(|tx| &**tx),
             ),
         );
         let mut rows = self.parent.clone();
@@ -737,7 +737,7 @@ impl Naming<'_> {
     /// no heavier than the drop left. A dropped transaction stays pooled.
     pub(crate) fn within_terms_budget(
         &self,
-        transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+        transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
     ) -> Named {
         let named = self.over(transactions);
         let dropped = named.past_terms_budget(transactions, self.committee);
@@ -756,7 +756,7 @@ impl Named {
     /// that reach no further than this shard.
     fn past_terms_budget(
         &self,
-        transactions: &[Arc<Verified<Transaction>>],
+        transactions: &[Verified<Transaction>],
         committee: &TopologySnapshot,
     ) -> BTreeSet<TxHash> {
         let named: BTreeMap<TxHash, bool> = self
@@ -2764,7 +2764,7 @@ mod tests {
     // ─── root verifiers ─────────────────────────────────────────────────
 
     /// A block carrying `txs` whose header commits them.
-    fn block_carrying(txs: &[Arc<Verifiable<Transaction>>]) -> Block {
+    fn block_carrying(txs: &[Verifiable<Transaction>]) -> Block {
         let draft = |header| Block::Live {
             header,
             transactions: Arc::new(
@@ -2811,7 +2811,7 @@ mod tests {
             WeightedTimestamp::from_millis(1_000),
         );
         install_stub_protocol_statics();
-        let expired = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
+        let expired = block_carrying(&[(Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(1)],
             1_000,
@@ -2828,7 +2828,7 @@ mod tests {
 
         // The anchor inside the range — verification passes.
         let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
-        let valid = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
+        let valid = block_carrying(&[(Verifiable::from(stub_transaction(
             test_principal(2),
             &[test_prefix(2)],
             1_000,
@@ -2852,7 +2852,7 @@ mod tests {
             anchor.plus(Duration::from_mins(10)),
         );
         install_stub_protocol_statics();
-        let block = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
+        let block = block_carrying(&[(Verifiable::from(stub_transaction(
             test_principal(3),
             &[test_prefix(3)],
             1_000,

@@ -23,7 +23,6 @@
 
 mod support;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_scenarios::query::{committee_size, scheduled_terminal_epoch};
@@ -74,7 +73,7 @@ fn split_completes_with_wiped_members(seed: u64, wiped: usize) -> bool {
     // Activity through the parent's final window, as the lifecycle
     // scenario gives it: it coasts to its crossing and the fold seeds
     // both children from the terminal contribution.
-    c.submit(Arc::new(build_probe_transfer_tx(validity_around(c.now()))));
+    c.submit(build_probe_transfer_tx(validity_around(c.now())));
 
     let strength = committee_size(&c, root).expect("the root committee is seated");
     let hosts = c.committee_hosts(root);

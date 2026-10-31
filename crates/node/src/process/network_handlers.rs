@@ -1413,7 +1413,7 @@ mod tests {
     const PEER: Provenance = Provenance::Peer(PeerId::new(1));
 
     fn gossip(seed: u8) -> TransactionGossip {
-        TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(seed))]))
+        TransactionGossip::new(Capped::from_array([(test_transaction(seed))]))
     }
 
     /// `gossip` as a peer's copy reaches the registry: as wire bytes.

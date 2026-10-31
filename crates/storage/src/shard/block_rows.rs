@@ -195,13 +195,9 @@ pub fn reconstruct_block(
         .collect::<Option<_>>()
         .ok_or(Unbuilt::MissingReceipt)?;
 
-    let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
+    let transactions: Vec<Verifiable<Transaction>> = transactions
         .into_iter()
-        .map(|tx| {
-            Arc::new(Verifiable::from(Verified::<Transaction>::from_persisted(
-                tx,
-            )))
-        })
+        .map(|tx| Verifiable::from(Verified::<Transaction>::from_persisted(tx)))
         .collect();
 
     let block = Block::Sealed {

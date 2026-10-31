@@ -633,7 +633,7 @@ impl Harness {
     pub fn submit_transaction(&self, idx: usize, tx: &Transaction) -> bool {
         self.hosts[idx]
             .handle()
-            .is_some_and(|handle| handle.submit(Arc::new(Transaction::new(tx.body().clone()))))
+            .is_some_and(|handle| handle.submit(Transaction::new(tx.body().clone())))
     }
 
     /// The status host `idx`'s process recorded for `hash`, with the

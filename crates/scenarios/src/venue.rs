@@ -17,7 +17,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::slice;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
@@ -383,7 +382,7 @@ fn all_accepted<C: Cluster>(c: &mut C, txs: Vec<Transaction>, context: &str) {
         .into_iter()
         .map(|tx| {
             let hash = tx.hash();
-            c.submit(Arc::new(tx));
+            c.submit(tx);
             hash
         })
         .collect();
@@ -418,7 +417,7 @@ const APPLIED_WITHIN_BLOCKS: u64 = 8;
 /// Submit `tx` and hold the run to its acceptance.
 pub fn accepted<C: Cluster>(c: &mut C, tx: Transaction, context: &str) {
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     let status = await_tx_terminal(c, hash, epochs(12));
     assert!(
         matches!(

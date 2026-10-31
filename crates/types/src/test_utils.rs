@@ -172,7 +172,7 @@ pub fn test_transaction_running(seed: u8, packages: &[Hash]) -> Transaction {
 ///
 /// Use at any test call site that needs a pre-validated transaction
 /// (mempool admission API, event payloads carrying
-/// `Arc<Verified<Transaction>>`).
+/// `Verified<Transaction>`).
 #[must_use]
 pub fn verified_test_transaction(seed: u8) -> Verified<Transaction> {
     Verified::new_unchecked_for_test(test_transaction(seed))
@@ -396,7 +396,7 @@ impl TestCommittee {
 /// [`Verified::<Transaction>::from_persisted`]) and for storage
 /// fixtures. The pre-vote path (`validate_block_for_vote`) refuses to vote
 /// on blocks with any un-`Verified` entry; tests targeting that path must
-/// construct `Block` directly with `Vec<Arc<Verifiable<Transaction>>>`
+/// construct `Block` directly with `Vec<Verifiable<Transaction>>`
 /// holding `Verified` entries.
 ///
 /// # Panics
@@ -408,7 +408,7 @@ pub fn make_live_block(
     height: BlockHeight,
     timestamp_ms: u64,
     proposer: ValidatorId,
-    transactions: Vec<Arc<Transaction>>,
+    transactions: Vec<Transaction>,
     certificates: Vec<Verifiable<Finalization>>,
 ) -> Block {
     let header = BlockHeader::new(BlockHeaderParts {
@@ -431,10 +431,8 @@ pub fn make_live_block(
         },
         ..Default::default()
     });
-    let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
-        .into_iter()
-        .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
-        .collect();
+    let transactions: Vec<Verifiable<Transaction>> =
+        transactions.into_iter().map(Verifiable::from).collect();
     Block::Live {
         header,
         transactions: Arc::new(Capped::new(transactions).expect("a list written out in a test")),

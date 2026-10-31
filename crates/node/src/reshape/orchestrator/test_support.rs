@@ -405,7 +405,7 @@ pub fn carrying_an_underived_transaction(block: Block) -> Block {
     };
     Block::Live {
         header,
-        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(decoded))])),
+        transactions: Arc::new(Capped::from_array([Verifiable::from(decoded)])),
         certificates,
         provisions,
         abandonment_records,

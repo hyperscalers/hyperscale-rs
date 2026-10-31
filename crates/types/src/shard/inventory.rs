@@ -85,8 +85,7 @@ impl Inventory {
 ///
 /// One row per transaction the block carries: its hash, and its body
 /// where the serve kept one.
-type ElidedTransactions =
-    Capped<Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>, MAX_TXS_PER_BLOCK>;
+type ElidedTransactions = Capped<Vec<(TxHash, Option<Verifiable<Transaction>>)>, MAX_TXS_PER_BLOCK>;
 
 /// One row per finalization, on the same terms as [`ElidedTransactions`].
 type ElidedCertificates =
@@ -177,7 +176,7 @@ impl ElidedCertifiedBlock {
     /// rehydration share the same allocations as the local mempool /
     /// pending-block stores rather than deep-cloning every body.
     #[must_use]
-    pub fn transactions(&self) -> &Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)> {
+    pub fn transactions(&self) -> &Vec<(TxHash, Option<Verifiable<Transaction>>)> {
         &self.transactions
     }
 
@@ -220,7 +219,7 @@ impl ElidedCertifiedBlock {
             let body = if matches_filter(inventory.tx_have.as_ref(), &hash) {
                 None
             } else {
-                Some(Arc::clone(tx))
+                Some(tx.clone())
             };
             (hash, body)
         });
@@ -345,7 +344,7 @@ impl ElidedCertifiedBlock {
         mut provision_lookup: FProv,
     ) -> Result<CertifiedBlock, RehydrateError>
     where
-        FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
+        FTx: FnMut(&TxHash) -> Option<Verifiable<Transaction>>,
         FCert: FnMut(&FinalizationHash) -> Option<Verifiable<Finalization>>,
         FProv: FnMut(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     {
@@ -551,7 +550,7 @@ mod tests {
                 timestamp: ProposerTimestamp::from_millis(1_234_567_890),
                 ..Default::default()
             }),
-            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))])),
+            transactions: Arc::new(Capped::from_array([Verifiable::from(tx)])),
             certificates: Arc::new(Capped::empty()),
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
@@ -706,7 +705,7 @@ mod tests {
     fn rehydrate_from_lookup_restores_full_block() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let tx_arc = Arc::clone(&block.transactions()[0]);
+        let tx_arc = block.transactions()[0].clone();
         let tx_hash = tx_arc.hash();
         let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(16, 0.01).unwrap();
         bf.insert(&tx_hash);
@@ -720,7 +719,7 @@ mod tests {
             .try_rehydrate(
                 |h| {
                     if *h == tx_hash {
-                        Some(Arc::clone(&tx_arc))
+                        Some(tx_arc.clone())
                     } else {
                         None
                     }
@@ -799,7 +798,7 @@ mod tests {
         // caller fetches the body and retries with an augmented lookup.
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let tx_arc = Arc::clone(&block.transactions()[0]);
+        let tx_arc = block.transactions()[0].clone();
         let tx_hash = tx_arc.hash();
         let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(16, 0.01).unwrap();
         bf.insert(&tx_hash);
@@ -818,12 +817,12 @@ mod tests {
         };
         assert_eq!(miss.missing_tx, vec![tx_hash]);
 
-        let topup_tx = Arc::clone(&tx_arc);
+        let topup_tx = tx_arc;
         let recovered = elided
             .try_rehydrate(
                 |h| {
                     if *h == tx_hash {
-                        Some(Arc::clone(&topup_tx))
+                        Some(topup_tx.clone())
                     } else {
                         None
                     }
@@ -871,7 +870,7 @@ mod tests {
         let live = create_test_block_stating_terms();
         assert_eq!(live.terms().len(), 1);
         let stated = hbor_to_vec(live.terms()).unwrap();
-        let tx = Arc::clone(&live.transactions()[0]);
+        let tx = live.transactions()[0].clone();
         let tx_hash = tx.hash();
         let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(16, 0.01).unwrap();
         bf.insert(&tx_hash);
@@ -889,7 +888,7 @@ mod tests {
                     hbor_from_slice(&hbor_to_vec(&served).unwrap()).unwrap();
                 let rehydrated = received
                     .try_rehydrate(
-                        |hash| (*hash == tx_hash).then(|| Arc::clone(&tx)),
+                        |hash| (*hash == tx_hash).then(|| tx.clone()),
                         |_| None,
                         |_| None,
                     )
@@ -1022,9 +1021,7 @@ mod tests {
         let mut buf = hbor_to_vec(&header).unwrap();
         buf.extend_from_slice(&hbor_to_vec(&qc).unwrap());
         // Empty transactions.
-        buf.extend_from_slice(
-            &hbor_to_vec(&Vec::<(TxHash, Option<Arc<Transaction>>)>::new()).unwrap(),
-        );
+        buf.extend_from_slice(&hbor_to_vec(&Vec::<(TxHash, Option<Transaction>)>::new()).unwrap());
         // Oversized certificates claim.
         varint::write(&mut buf, MAX_FINALIZED_TX_PER_BLOCK + 1).unwrap();
         buf.extend(std::iter::repeat_n(
@@ -1048,9 +1045,7 @@ mod tests {
 
         let mut buf = hbor_to_vec(&header).unwrap();
         buf.extend_from_slice(&hbor_to_vec(&qc).unwrap());
-        buf.extend_from_slice(
-            &hbor_to_vec(&Vec::<(TxHash, Option<Arc<Transaction>>)>::new()).unwrap(),
-        );
+        buf.extend_from_slice(&hbor_to_vec(&Vec::<(TxHash, Option<Transaction>)>::new()).unwrap());
         buf.extend_from_slice(
             &hbor_to_vec(&Vec::<(FinalizationHash, Option<Finalization>)>::new()).unwrap(),
         );

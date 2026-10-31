@@ -7,7 +7,6 @@
 //! runs in the first ticks after that fold — the ticks whose baseline has
 //! to carry the credit on every replica alike.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_scenarios::query::vault_balance;
@@ -108,13 +107,13 @@ fn a_recipient_spends_as_a_payment_lands(processing: ProcessingTimes, from: Shar
         SimCluster::with_grown_accounts_and_processing(&config(), SEED, &accounts, processing);
     let sink_before = vault_balance(&c, HOME, sink.1);
 
-    let delivery = Arc::new(build_transfer_tx(
+    let delivery = build_transfer_tx(
         &payer.0,
         payer.1,
         recipient.1,
         DELIVERY,
         validity_around(c.now()),
-    ));
+    );
     let delivery_hash = delivery.hash();
     c.submit(delivery);
     // The credit lands once the payer's shard has committed the payment,
@@ -135,13 +134,13 @@ fn a_recipient_spends_as_a_payment_lands(processing: ProcessingTimes, from: Shar
             "the cluster stopped after {index} spends",
         );
         let amount = least + index;
-        let spend = Arc::new(build_transfer_tx(
+        let spend = build_transfer_tx(
             &recipient.0,
             recipient.1,
             sink.1,
             amount,
             validity_around(c.now()),
-        ));
+        );
         spends.push((spend.hash(), amount));
         c.submit(spend);
     }

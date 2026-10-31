@@ -286,7 +286,7 @@ impl PendingBlocks {
         header: BlockHeader,
         manifest: BlockManifest,
         now: LocalTimestamp,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
+        lookup_tx: impl Fn(&TxHash) -> Option<Verifiable<Transaction>>,
         lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) {
@@ -294,7 +294,7 @@ impl PendingBlocks {
 
         // Borrow the manifest only long enough to collect locally-available
         // Arcs, releasing it before the mutable `add_*` calls below.
-        let txs: Vec<Arc<Verifiable<Transaction>>> = pending
+        let txs: Vec<Verifiable<Transaction>> = pending
             .manifest()
             .tx_hashes()
             .iter()
@@ -373,12 +373,12 @@ impl PendingBlocks {
 
     /// Record an arrived transaction against any pending block that needs it.
     /// Returns the hashes of blocks that became complete as a result.
-    pub fn receive_transaction(&mut self, tx: &Arc<Verifiable<Transaction>>) -> Vec<BlockHash> {
+    pub fn receive_transaction(&mut self, tx: &Verifiable<Transaction>) -> Vec<BlockHash> {
         let tx_hash = tx.hash();
         self.fold_arrival(
             |pending| pending.needs_transaction(&tx_hash),
             |pending| {
-                pending.add_transaction(Arc::clone(tx));
+                pending.add_transaction(tx.clone());
             },
         )
     }
@@ -511,8 +511,8 @@ pub struct PendingBlock {
     /// Block contents manifest (transaction hashes, certificates, etc.)
     manifest: BlockManifest,
 
-    /// Map of transaction hash -> Arc<Verifiable<Transaction>> (for received transactions).
-    received_transactions: HashMap<TxHash, Arc<Verifiable<Transaction>>>,
+    /// Map of transaction hash -> Verifiable<Transaction> (for received transactions).
+    received_transactions: HashMap<TxHash, Verifiable<Transaction>>,
 
     /// Set of transaction hashes we're still waiting for.
     missing_transaction_hashes: BTreeSet<TxHash>,
@@ -650,9 +650,7 @@ impl PendingBlock {
         };
         // Fill in all transactions
         for tx in block.transactions().iter() {
-            pending
-                .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
+            pending.received_transactions.insert(tx.hash(), tx.clone());
         }
         // Fill in all finalizations
         for fw in finalizations {
@@ -664,7 +662,7 @@ impl PendingBlock {
     /// Add a received transaction.
     ///
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
-    pub fn add_transaction(&mut self, tx: Arc<Verifiable<Transaction>>) -> bool {
+    pub fn add_transaction(&mut self, tx: Verifiable<Transaction>) -> bool {
         let hash = tx.hash();
         if self.missing_transaction_hashes.remove(&hash) {
             self.received_transactions.insert(hash, tx);
@@ -801,7 +799,7 @@ impl PendingBlock {
         }
 
         // Build transactions in the ORIGINAL order from the gossip message.
-        let transactions: Vec<Arc<Verifiable<Transaction>>> = self
+        let transactions: Vec<Verifiable<Transaction>> = self
             .manifest
             .tx_hashes()
             .iter()
@@ -1107,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_block_needs_transactions_and_finalizations() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let tx_hash = tx.hash();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
@@ -1175,11 +1173,11 @@ mod tests {
     /// the body it gathered.
     #[test]
     fn a_pending_block_assembles_its_terms() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let proposed = rebound(stating(
             Block::Live {
                 header: make_header(BlockHeight::new(1)),
-                transactions: Arc::new(Capped::from_array([Arc::clone(&tx)])),
+                transactions: Arc::new(Capped::from_array([tx.clone()])),
                 certificates: Arc::new(Capped::empty()),
                 provisions: Arc::new(Capped::empty()),
                 abandonment_records: Arc::new(Capped::empty()),

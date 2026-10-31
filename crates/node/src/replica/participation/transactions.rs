@@ -12,8 +12,6 @@
 //! Raw gossip arrivals enter `NodeHost` as `ShardScopedInput::TransactionGossipReceived`
 //! and never reach the state machine; the validated form does.
 
-use std::sync::Arc;
-
 use hyperscale_core::Action;
 use hyperscale_types::{TopologySchedule, Transaction, Verified};
 
@@ -30,7 +28,7 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_transactions_admitted(
         &mut self,
         sched: &TopologySchedule,
-        txs: &[Arc<Verified<Transaction>>],
+        txs: &[Verified<Transaction>],
     ) -> Vec<Action> {
         let mut actions = self.shard_coordinator.on_transactions_admitted(sched, txs);
         actions.extend(self.scan_precut_queries());
@@ -47,7 +45,7 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_transaction_validated(
         &mut self,
         sched: &TopologySchedule,
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
         submitted_locally: bool,
     ) -> Vec<Action> {
         if !sched.head().involves_shard(self.local_shard, &tx) {
@@ -72,7 +70,7 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_transactions_fetched(
         &mut self,
         sched: &TopologySchedule,
-        txs: Vec<Arc<Verified<Transaction>>>,
+        txs: Vec<Verified<Transaction>>,
     ) -> Vec<Action> {
         if txs.is_empty() {
             return vec![];
@@ -84,8 +82,6 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use hyperscale_core::{ProtocolEvent, StateMachine};
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_prefixes};
     use hyperscale_types::{LocalTimestamp, Verified};
@@ -100,12 +96,10 @@ mod tests {
     fn transaction_validated_drops_tx_with_no_local_shard_involvement() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let tx = Arc::new(Verified::new_unchecked_for_test(
-            test_transaction_with_prefixes(
-                b"empty-shards-xyz",
-                /* read_nodes */ &[],
-                /* write_nodes */ &[],
-            ),
+        let tx = Verified::new_unchecked_for_test(test_transaction_with_prefixes(
+            b"empty-shards-xyz",
+            /* read_nodes */ &[],
+            /* write_nodes */ &[],
         ));
 
         let actions = node.handle(
@@ -130,9 +124,7 @@ mod tests {
     #[test]
     fn transaction_validated_routes_local_shard_tx_to_mempool() {
         let TestNode { mut node, .. } = TestNode::new();
-        let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
-            /* seed */ 1,
-        )));
+        let tx = Verified::new_unchecked_for_test(test_transaction(/* seed */ 1));
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
@@ -161,12 +153,8 @@ mod tests {
     fn transactions_received_admits_fetched_batch_to_mempool() {
         let TestNode { mut node, .. } = TestNode::new();
         let txs = vec![
-            Arc::new(Verified::new_unchecked_for_test(test_transaction(
-                /* seed */ 1,
-            ))),
-            Arc::new(Verified::new_unchecked_for_test(test_transaction(
-                /* seed */ 2,
-            ))),
+            (Verified::new_unchecked_for_test(test_transaction(/* seed */ 1))),
+            (Verified::new_unchecked_for_test(test_transaction(/* seed */ 2))),
         ];
 
         let _ = node.handle(

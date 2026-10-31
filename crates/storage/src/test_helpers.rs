@@ -2044,7 +2044,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
 }
 
 /// Attach `txs` to a live block, preserving everything else.
-fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Block {
+fn with_transactions(block: Block, txs: Vec<Verifiable<Transaction>>) -> Block {
     match block {
         Block::Live {
             header,
@@ -2556,7 +2556,7 @@ fn reserving_chain(first: u64) -> Reserving {
     Reserving {
         blocks: [
             with_member_sections(
-                with_transactions(at(first), vec![Arc::new(Verifiable::from(tx))]),
+                with_transactions(at(first), vec![(Verifiable::from(tx))]),
                 Vec::new(),
                 vec![stated],
             ),
@@ -4203,11 +4203,11 @@ where
     );
     let block = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(tx))],
+        vec![(Verifiable::from(tx))],
     );
     let creations = committed_tx_cells(
         block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
+        block.transactions().iter().map(Verifiable::as_unverified),
     );
 
     let parent_root = storage.state_root();
@@ -4265,7 +4265,7 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
     let tx = test_transaction(1);
     let block = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(tx.clone()))],
+        vec![(Verifiable::from(tx.clone()))],
     );
     let creations = committed_tx_cells(ShardId::ROOT, [&tx]);
     let rows = committed_here(ShardId::ROOT, WeightedTimestamp::ZERO, [&tx]);
@@ -4425,11 +4425,11 @@ where
     let tx = test_transaction(1);
     let block = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(tx))],
+        vec![(Verifiable::from(tx))],
     );
     let creations = committed_tx_cells(
         block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
+        block.transactions().iter().map(Verifiable::as_unverified),
     );
     let (spec_root, _, prepared) = storage.prepare_block_commit(
         ParentAnchor {
@@ -4732,8 +4732,8 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
     let committing = with_transactions(
         make_test_block(BlockHeight::new(2)),
         vec![
-            Arc::new(Verifiable::from(resolved.clone())),
-            Arc::new(Verifiable::from(open.clone())),
+            (Verifiable::from(resolved.clone())),
+            (Verifiable::from(open.clone())),
         ],
     );
     commit_settled_at(
@@ -4907,7 +4907,7 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
     // open one commits at 4; the tick's finalization commits at 5.
     let committing = with_transactions(
         make_test_block(BlockHeight::new(2)),
-        vec![Arc::new(Verifiable::from(settled.clone()))],
+        vec![(Verifiable::from(settled.clone()))],
     );
     commit_settled_at(
         storage,
@@ -4920,7 +4920,7 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
     commit_settled_at(storage, &seating, &[], &[], &witness);
     let owing = with_transactions(
         make_test_block(BlockHeight::new(4)),
-        vec![Arc::new(Verifiable::from(open))],
+        vec![(Verifiable::from(open))],
     );
     commit_settled_at(storage, &make_test_certified(owing), &[], &[], &witness);
     let settling = push_certificate(
@@ -5087,7 +5087,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
     commit_empty_blocks_below(storage, BlockHeight::new(1));
     let committing = with_transactions(
         make_test_block_with_anchor_wt(BlockHeight::new(1), committed_ms),
-        vec![Arc::new(Verifiable::from(leg.clone()))],
+        vec![(Verifiable::from(leg.clone()))],
     );
     commit_settled_at(
         storage,
@@ -5157,7 +5157,7 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
     // certificate resolves, exactly what would hold the floor down.
     let below = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(inherited))],
+        vec![(Verifiable::from(inherited))],
     );
     commit_settled_at(
         storage,
@@ -5168,7 +5168,7 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
     );
     let above = with_transactions(
         make_test_block(BlockHeight::new(2)),
-        vec![Arc::new(Verifiable::from(own))],
+        vec![(Verifiable::from(own))],
     );
     commit_settled_at(
         storage,
@@ -5221,7 +5221,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
     commit_empty_blocks_below(storage, BlockHeight::new(1));
     let committing = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(leg.clone()))],
+        vec![(Verifiable::from(leg.clone()))],
     );
     commit_settled_at(
         storage,
@@ -5434,9 +5434,7 @@ fn block_with_a_settled_transaction(height: BlockHeight, seed: u8) -> Block {
     let tx_hash = tx.hash();
     let block = with_transactions(
         make_test_block(height),
-        vec![Arc::new(Verifiable::from(
-            Verified::<Transaction>::from_persisted(tx),
-        ))],
+        vec![(Verifiable::from(Verified::<Transaction>::from_persisted(tx)))],
     );
     push_certificate(
         block,
@@ -6046,7 +6044,7 @@ fn block_carrying(height: u64, txs: &[&Transaction]) -> Block {
         with_transactions(
             make_test_block(BlockHeight::new(height)),
             txs.iter()
-                .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+                .map(|tx| Verifiable::from((*tx).clone()))
                 .collect(),
         ),
         txs.iter()

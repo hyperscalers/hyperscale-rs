@@ -125,11 +125,11 @@ mod tests {
     fn test_compute_provision_tx_roots_single_shard_excluded() {
         let topology_snapshot = two_shard_topology();
         let local_prefix = prefix_on_shard(&topology_snapshot, ShardId::leaf(1, 0));
-        let tx = Arc::new(Verifiable::from(test_transaction_with_prefixes(
+        let tx = Verifiable::from(test_transaction_with_prefixes(
             &[1, 2, 3],
             &[local_prefix],
             &[local_prefix],
-        )));
+        ));
         let map = Verified::<ProvisionTxRootsMap>::compute(
             ShardId::leaf(1, 0),
             &topology_snapshot,
@@ -146,16 +146,16 @@ mod tests {
         let remote_prefix = prefix_on_shard(&topology_snapshot, ShardId::leaf(1, 1));
 
         // Cross-shard tx: writes span local shard 0 and remote shard 1.
-        let tx_a = Arc::new(Verifiable::from(test_transaction_with_prefixes(
+        let tx_a = Verifiable::from(test_transaction_with_prefixes(
             &[1, 2, 3],
             &[],
             &[local_prefix, remote_prefix],
-        )));
-        let tx_b = Arc::new(Verifiable::from(test_transaction_with_prefixes(
+        ));
+        let tx_b = Verifiable::from(test_transaction_with_prefixes(
             &[4, 5, 6],
             &[],
             &[local_prefix, remote_prefix],
-        )));
+        ));
 
         let roots = Verified::<ProvisionTxRootsMap>::compute(
             ShardId::leaf(1, 0),

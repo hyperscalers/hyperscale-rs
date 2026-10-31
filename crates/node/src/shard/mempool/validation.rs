@@ -46,7 +46,7 @@ const TX_GOSSIP_BYTE_BUDGET: usize = MAX_FETCH_RESPONSE_BYTES;
 /// One envelope's verdict: the envelope, how it reached admission, its
 /// verified form where it passed, and what a derivation gap wanted.
 struct Verdict {
-    tx: Arc<Transaction>,
+    tx: Transaction,
     origin: Origin,
     verified: Option<Verified<Transaction>>,
     wanted: Unresolved,
@@ -87,7 +87,7 @@ fn report_validation_outcomes(
     local_shard: ShardId,
     verdicts: Vec<Verdict>,
 ) {
-    let mut received: Vec<Arc<Verified<Transaction>>> = Vec::new();
+    let mut received: Vec<Verified<Transaction>> = Vec::new();
     let mut wanted: Vec<DeferredTransaction> = Vec::new();
     let mut failed_hashes: Vec<TxHash> = Vec::new();
     for verdict in verdicts {
@@ -95,9 +95,9 @@ fn report_validation_outcomes(
             (Some(v), Origin::Unbidden) => push_shard_input(
                 event_tx,
                 local_shard,
-                ShardScopedInput::TransactionValidated { tx: Arc::new(v) },
+                ShardScopedInput::TransactionValidated { tx: v },
             ),
-            (Some(v), Origin::Asked) => received.push(Arc::new(v)),
+            (Some(v), Origin::Asked) => received.push(v),
             (None, origin) if !verdict.wanted.is_empty() => wanted.push(
                 DeferredTransaction::offered(verdict.tx, verdict.wanted, origin),
             ),
@@ -147,7 +147,7 @@ where
     ///
     /// [`TxStore`]: hyperscale_mempool::TxStore
     /// [`MempoolCoordinator::on_transaction_gossip`]: hyperscale_mempool::MempoolCoordinator
-    pub(crate) fn handle_transaction_validated(&mut self, tx: Arc<Verified<Transaction>>) {
+    pub(crate) fn handle_transaction_validated(&mut self, tx: Verified<Transaction>) {
         self.settle_validated(&tx);
         let submitted_locally = self.io.mempool.locally_submitted.remove(&tx.hash());
         self.dispatch_event(ProtocolEvent::TransactionValidated {
@@ -160,7 +160,7 @@ where
     /// tracking and hand the batch to the fetch-delivery admission path.
     pub(crate) fn handle_transactions_received(
         &mut self,
-        transactions: Vec<Arc<Verified<Transaction>>>,
+        transactions: Vec<Verified<Transaction>>,
     ) {
         for tx in &transactions {
             self.settle_validated(tx);
@@ -201,7 +201,7 @@ where
     /// `locally_submitted` on a single shard per node keeps the
     /// finalization metric from double-counting txs whose touched set
     /// spans multiple hosted shards.
-    pub(crate) fn handle_admit_transaction(&mut self, tx: Arc<Transaction>) {
+    pub(crate) fn handle_admit_transaction(&mut self, tx: Transaction) {
         self.admit(tx, Origin::Unbidden);
     }
 
@@ -214,11 +214,11 @@ where
     /// (hosted or not) gets the tx appended.
     pub(crate) fn handle_admit_and_gossip_transaction(
         &mut self,
-        tx: Arc<Transaction>,
+        tx: Transaction,
         touched_shards: &[ShardId],
     ) {
         for dst in touched_shards {
-            self.enqueue_tx_for_gossip(*dst, Arc::clone(&tx));
+            self.enqueue_tx_for_gossip(*dst, tx.clone());
         }
         let tx_hash = tx.hash();
         if self.admit(tx, Origin::Unbidden) {
@@ -233,17 +233,17 @@ where
     /// touched set and won't see it in mempool.
     pub(crate) fn handle_gossip_transaction(
         &mut self,
-        tx: &Arc<Transaction>,
+        tx: &Transaction,
         touched_shards: &[ShardId],
     ) {
         for dst in touched_shards {
-            self.enqueue_tx_for_gossip(*dst, Arc::clone(tx));
+            self.enqueue_tx_for_gossip(*dst, tx.clone());
         }
     }
 
     /// Intercept a gossip-received transaction before it reaches the state
     /// machine and offer it to validation as unbidden.
-    pub(crate) fn handle_gossip_received_tx_for_validation(&mut self, tx: Arc<Transaction>) {
+    pub(crate) fn handle_gossip_received_tx_for_validation(&mut self, tx: Transaction) {
         self.admit(tx, Origin::Unbidden);
     }
 
@@ -252,7 +252,7 @@ where
     /// rather than waiting out the batch window a block is stalled
     /// behind. The response boundary has already retired the delivered
     /// ids, whatever validation makes of them.
-    pub(crate) fn handle_fetched_txs_for_validation(&mut self, batch: Vec<Arc<Transaction>>) {
+    pub(crate) fn handle_fetched_txs_for_validation(&mut self, batch: Vec<Transaction>) {
         if batch.is_empty() {
             return;
         }
@@ -260,7 +260,7 @@ where
         // Each shard's fetch responses decode fresh instances;
         // canonicalizing lets co-hosted shards share one validation
         // verdict.
-        let batch: Vec<Arc<Transaction>> = batch
+        let batch: Vec<Transaction> = batch
             .into_iter()
             .map(|tx| self.process.canonical_txs.canonicalize(&tx))
             .collect();
@@ -281,7 +281,7 @@ where
     /// copy in the pipeline can still be refused by the filters and the
     /// ceiling an asked one is exempt from, and the block that asked
     /// would be left without it.
-    pub(crate) fn admit(&mut self, tx: Arc<Transaction>, origin: Origin) -> bool {
+    pub(crate) fn admit(&mut self, tx: Transaction, origin: Origin) -> bool {
         let tx_hash = tx.hash();
         if origin == Origin::Unbidden
             && (self.io.mempool.pending_validation.contains(&tx_hash)
@@ -301,7 +301,7 @@ where
     /// [`NodeHost::flush_expired_batches`]. The accumulator lives on the
     /// "source" `ShardLoop` (this one) — when the gossip flushes it
     /// publishes to the destination shard's topic.
-    pub(crate) fn enqueue_tx_for_gossip(&mut self, dst: ShardId, tx: Arc<Transaction>) {
+    pub(crate) fn enqueue_tx_for_gossip(&mut self, dst: ShardId, tx: Transaction) {
         let now = self.now;
         let max = self.io.mempool.tx_gossip_max;
         let window = self.io.mempool.tx_gossip_window;
@@ -350,7 +350,7 @@ where
     /// Queue a transaction for batch validation on this shard, beside
     /// the origin its verdict is reported through. The caller holds the
     /// dedup guard for it.
-    pub(crate) fn queue_validation(&mut self, tx: Arc<Transaction>, origin: Origin) {
+    pub(crate) fn queue_validation(&mut self, tx: Transaction, origin: Origin) {
         let now = self.now;
         if self.io.mempool.validation_batch.push((tx, origin), now) {
             self.flush_validation_batch();
@@ -410,7 +410,7 @@ where
     /// require a `&mut NodeHost`.
     ///
     /// [`ProcessIo::compute_submit_fanout`]: crate::process::ProcessIo::compute_submit_fanout
-    pub(crate) fn handle_submit_transaction(&mut self, tx: &Arc<Transaction>) {
+    pub(crate) fn handle_submit_transaction(&mut self, tx: &Transaction) {
         // Seed the canonical-instance cache so gossip echoes of this tx
         // arriving on other hosted shards' topics share its validation
         // verdict.
@@ -423,13 +423,13 @@ where
             } => {
                 self.shard_loop_mut(source.shard).step(
                     ShardScopedInput::AdmitAndGossipTransaction {
-                        tx: Arc::clone(tx),
+                        tx: tx.clone(),
                         touched_shards,
                     },
                 );
                 for route in passive {
                     self.shard_loop_mut(route.shard)
-                        .step(ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) });
+                        .step(ShardScopedInput::AdmitTransaction { tx: tx.clone() });
                 }
             }
             SubmitFanout::GossipOnly {
@@ -438,14 +438,14 @@ where
             } => {
                 self.shard_loop_mut(host.shard)
                     .step(ShardScopedInput::GossipTransaction {
-                        tx: Arc::clone(tx),
+                        tx: tx.clone(),
                         touched_shards,
                     });
             }
             SubmitFanout::WantsRecords { wanted } => {
                 self.beacon
                     .dispatch_event(BeaconScopedInput::SubmissionWantsRecords {
-                        deferred: DeferredTransaction::new(Arc::clone(tx), wanted),
+                        deferred: DeferredTransaction::new(tx.clone(), wanted),
                     });
             }
             SubmitFanout::PublishDirect { touched_shards } => {
@@ -585,7 +585,7 @@ mod tests {
         let mut host = fixture.host(BlockHeight::GENESIS);
         let shard_loop = loop_of(&mut host);
         let dst = ShardId::leaf(1, 1);
-        shard_loop.enqueue_tx_for_gossip(dst, Arc::new(test_transaction(5)));
+        shard_loop.enqueue_tx_for_gossip(dst, test_transaction(5));
         assert!(
             shard_loop
                 .io
@@ -606,12 +606,10 @@ mod tests {
         let fixture = Fixture::new();
         let (mut host, events) = fixture.host_with_events(BlockHeight::GENESIS);
         let shard_loop = loop_of(&mut host);
-        let tx = Arc::new(test_transaction(7));
+        let tx = test_transaction(7);
 
         for _ in 0..3 {
-            shard_loop.step(ShardScopedInput::TransactionGossipReceived {
-                tx: Arc::clone(&tx),
-            });
+            shard_loop.step(ShardScopedInput::TransactionGossipReceived { tx: tx.clone() });
         }
         shard_loop.flush_validation_batch();
 
@@ -625,12 +623,12 @@ mod tests {
         let fixture = Fixture::new();
         let mut host = fixture.host(BlockHeight::GENESIS);
         let shard_loop = loop_of(&mut host);
-        let tx = Arc::new(test_transaction(8));
+        let tx = test_transaction(8);
         let wanted = Unresolved {
             instances: vec![test_prefix(0xA1)],
             packages: Vec::new(),
         };
-        shard_loop.defer_for_records(vec![DeferredTransaction::new(Arc::clone(&tx), wanted)]);
+        shard_loop.defer_for_records(vec![DeferredTransaction::new(tx.clone(), wanted)]);
 
         shard_loop.step(ShardScopedInput::TransactionGossipReceived { tx });
 
@@ -645,14 +643,14 @@ mod tests {
         let fixture = Fixture::new();
         let mut host = fixture.host(BlockHeight::GENESIS);
         let shard_loop = loop_of(&mut host);
-        let tx = Arc::new(test_transaction(9));
+        let tx = test_transaction(9);
         let record = test_prefix(0xA1);
         let wanted = Unresolved {
             instances: vec![record],
             packages: Vec::new(),
         };
         shard_loop.defer_for_records(vec![DeferredTransaction::offered(
-            Arc::clone(&tx),
+            tx.clone(),
             wanted,
             Origin::Asked,
         )]);
@@ -673,9 +671,9 @@ mod tests {
         let (event_tx, events) = unbounded();
         let unbidden = test_transaction(1);
         let asked = test_transaction(2);
-        let gapped = Arc::new(test_transaction(3));
+        let gapped = test_transaction(3);
         let verdict = |tx: &Transaction, origin| Verdict {
-            tx: Arc::new(tx.clone()),
+            tx: tx.clone(),
             origin,
             verified: Some(Verified::new_unchecked_for_test(tx.clone())),
             wanted: Unresolved::default(),
@@ -687,7 +685,7 @@ mod tests {
                 verdict(&unbidden, Origin::Unbidden),
                 verdict(&asked, Origin::Asked),
                 Verdict {
-                    tx: Arc::clone(&gapped),
+                    tx: gapped.clone(),
                     origin: Origin::Asked,
                     verified: None,
                     wanted: Unresolved {

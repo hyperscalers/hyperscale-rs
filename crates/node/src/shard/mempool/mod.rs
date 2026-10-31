@@ -17,7 +17,6 @@ mod transaction_serve;
 mod validation;
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 pub use deferred::{DeferredForRecords, DeferredTransaction, Orphaned};
@@ -73,7 +72,7 @@ pub struct MempoolState {
 
     /// Envelopes awaiting batched verification, each beside how it
     /// reached admission.
-    pub(crate) validation_batch: BatchAccumulator<(Arc<Transaction>, Origin)>,
+    pub(crate) validation_batch: BatchAccumulator<(Transaction, Origin)>,
 
     /// Envelopes this node cannot derive yet, waiting on the component
     /// records a fetch is out for. Entries stay in
@@ -87,7 +86,7 @@ pub struct MempoolState {
     /// fills until its count cap or time window expires, then flushes
     /// as a single batched gossip message published to the destination
     /// shard's topic.
-    pub(crate) outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Arc<Transaction>>>,
+    pub(crate) outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Transaction>>,
 
     /// Size cap for new tx-gossip accumulators.
     pub(crate) tx_gossip_max: usize,

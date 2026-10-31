@@ -139,7 +139,7 @@ where
     /// lock, and every change to that map or to the topology re-routes
     /// what is held after the change, so a submission is never parked
     /// behind a change that has already released the queue.
-    parked_submissions: Mutex<VecDeque<Arc<Transaction>>>,
+    parked_submissions: Mutex<VecDeque<Transaction>>,
 }
 
 /// How many submissions a host holds while it seats a reshape successor:
@@ -294,7 +294,7 @@ where
     /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
     /// hosted shard, but no shard admits or takes ownership — or, on a
     /// host seated nowhere, [`SubmitFanout::PublishDirect`].
-    pub(crate) fn compute_submit_fanout(&self, tx: &Arc<Transaction>) -> SubmitFanout {
+    pub(crate) fn compute_submit_fanout(&self, tx: &Transaction) -> SubmitFanout {
         // Ingress bytes are unverified, and routing is a derivation the
         // envelope has to earn: asking an envelope that derives no
         // routing which shards it touches is asking for an answer it
@@ -351,7 +351,7 @@ where
     /// one is. Both are read under the parking lock, so a change that
     /// releases the queue either finds this submission in it or is seen by
     /// this read.
-    fn route_or_park(&self, tx: &Arc<Transaction>) -> Option<(ShardSenders, Vec<ShardId>)> {
+    fn route_or_park(&self, tx: &Transaction) -> Option<(ShardSenders, Vec<ShardId>)> {
         let mut parked = self
             .parked_submissions
             .lock()
@@ -373,7 +373,7 @@ where
                 "Dropping a parked submission: the queue is full"
             );
         }
-        parked.push_back(Arc::clone(tx));
+        parked.push_back(tx.clone());
         None
     }
 }
@@ -418,8 +418,8 @@ where
     /// Publish `tx` to each of `touched_shards` as gossip of its own, for a
     /// host seated nowhere: no shard loop batches it, and the receiving
     /// committees verify it as any gossip.
-    pub(crate) fn publish_direct(&self, tx: &Arc<Transaction>, touched_shards: &[ShardId]) {
-        let gossip = TransactionGossip::new(Capped::from_array([Arc::clone(tx)]));
+    pub(crate) fn publish_direct(&self, tx: &Transaction, touched_shards: &[ShardId]) {
+        let gossip = TransactionGossip::new(Capped::from_array([tx.clone()]));
         for &dst in touched_shards {
             self.network.broadcast_to_shard(dst, &gossip);
         }
@@ -435,7 +435,7 @@ where
     /// threads can invoke this concurrently with each other and with a
     /// shard's detach, because the fanout routes from one load of the
     /// sender map and carries the senders it picked.
-    pub fn submit_transaction(&self, tx: &Arc<Transaction>) -> bool {
+    pub fn submit_transaction(&self, tx: &Transaction) -> bool {
         // Seed the canonical-instance cache so gossip echoes of this tx
         // arriving on other hosted shards' topics share its validation
         // verdict.
@@ -446,7 +446,7 @@ where
 
     /// Carry out `fanout` for `tx`. Returns `false` only on shutdown (a
     /// closed channel) or for an envelope that derives no routing.
-    pub(crate) fn apply_submit_fanout(&self, tx: &Arc<Transaction>, fanout: SubmitFanout) -> bool {
+    pub(crate) fn apply_submit_fanout(&self, tx: &Transaction, fanout: SubmitFanout) -> bool {
         let mut ok = true;
         match fanout {
             SubmitFanout::Admit {
@@ -457,7 +457,7 @@ where
                 let env = HostEvent::shard(
                     source.shard,
                     ShardScopedInput::AdmitAndGossipTransaction {
-                        tx: Arc::clone(tx),
+                        tx: tx.clone(),
                         touched_shards,
                     },
                 );
@@ -467,7 +467,7 @@ where
                 for route in passive {
                     let env = HostEvent::shard(
                         route.shard,
-                        ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) },
+                        ShardScopedInput::AdmitTransaction { tx: tx.clone() },
                     );
                     if route.sender.send(env).is_err() {
                         ok = false;
@@ -481,7 +481,7 @@ where
                 let env = HostEvent::shard(
                     host.shard,
                     ShardScopedInput::GossipTransaction {
-                        tx: Arc::clone(tx),
+                        tx: tx.clone(),
                         touched_shards,
                     },
                 );
@@ -494,7 +494,7 @@ where
             }
             SubmitFanout::WantsRecords { wanted } => {
                 let env = HostEvent::Beacon(BeaconScopedInput::SubmissionWantsRecords {
-                    deferred: DeferredTransaction::new(Arc::clone(tx), wanted),
+                    deferred: DeferredTransaction::new(tx.clone(), wanted),
                 });
                 if self.beacon_event_sender.send(env).is_err() {
                     ok = false;

@@ -81,7 +81,7 @@ impl NodeHandle {
     /// Sends a transaction into the network; `false` if the host did not
     /// take it.
     #[must_use]
-    pub fn submit(&self, transaction: Arc<Transaction>) -> bool {
+    pub fn submit(&self, transaction: Transaction) -> bool {
         self.with(|calls| (calls.submit)(transaction))
             .unwrap_or(false)
     }

@@ -5,7 +5,6 @@
 //! API is caught here rather than by inline tests that can reach into
 //! private fields.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
@@ -115,11 +114,7 @@ fn submit_then_ready_round_trips_a_transaction() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(
-        &topology_snapshot,
-        Arc::new(verified(tx)),
-        LocalTimestamp::ZERO,
-    );
+    coord.on_submit_transaction(&topology_snapshot, verified(tx), LocalTimestamp::ZERO);
 
     assert!(coord.has_transaction(&tx_hash));
     assert_eq!(coord.status(&tx_hash), Some(TransactionStatus::Pending));
@@ -143,7 +138,7 @@ fn on_block_committed_transitions_pending_to_committed() {
     let tx_hash = tx.hash();
     coord.on_submit_transaction(
         &topology_snapshot,
-        Arc::new(verified(tx.clone())),
+        verified(tx.clone()),
         LocalTimestamp::ZERO,
     );
 
@@ -152,7 +147,7 @@ fn on_block_committed_transitions_pending_to_committed() {
         BlockHeight::new(1),
         1_000,
         ValidatorId::new(0),
-        vec![Arc::new(tx)],
+        vec![tx],
         vec![],
     );
     coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
@@ -172,7 +167,7 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
     let tx_hash = tx.hash();
     coord.on_submit_transaction(
         &topology_snapshot,
-        Arc::new(verified(tx.clone())),
+        verified(tx.clone()),
         LocalTimestamp::ZERO,
     );
 
@@ -184,7 +179,7 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
         BlockHeight::new(1),
         1_000,
         ValidatorId::new(0),
-        vec![Arc::new(tx.clone())],
+        vec![tx.clone()],
         vec![fw.into()],
     );
     coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
@@ -194,11 +189,8 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
     assert!(coord.status(&tx_hash).is_none());
     assert!(coord.is_tombstoned(&tx_hash));
 
-    let actions = coord.on_transaction_gossip(
-        &topology_snapshot,
-        Arc::new(verified(tx)),
-        LocalTimestamp::ZERO,
-    );
+    let actions =
+        coord.on_transaction_gossip(&topology_snapshot, verified(tx), LocalTimestamp::ZERO);
     assert!(actions.is_empty(), "tombstoned tx must not be re-accepted");
     assert!(!coord.has_transaction(&tx_hash));
 }

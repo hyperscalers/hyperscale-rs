@@ -1,7 +1,5 @@
 //! Transaction fetch response.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Transaction};
@@ -13,8 +11,7 @@ use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Transaction};
 #[derive(Debug, Clone, Hbor)]
 pub struct GetTransactionsResponse {
     /// The requested transactions that were found.
-    /// Uses Arc to avoid copying transaction data.
-    pub(crate) transactions: Capped<Vec<Arc<Transaction>>, MAX_TXS_PER_BLOCK>,
+    pub(crate) transactions: Capped<Vec<Transaction>, MAX_TXS_PER_BLOCK>,
 }
 
 impl GetTransactionsResponse {
@@ -24,7 +21,7 @@ impl GetTransactionsResponse {
     ///
     /// Panics if `transactions.len() > MAX_TXS_PER_BLOCK`.
     #[must_use]
-    pub const fn new(transactions: Capped<Vec<Arc<Transaction>>, MAX_TXS_PER_BLOCK>) -> Self {
+    pub const fn new(transactions: Capped<Vec<Transaction>, MAX_TXS_PER_BLOCK>) -> Self {
         Self { transactions }
     }
 
@@ -50,7 +47,7 @@ impl GetTransactionsResponse {
 
     /// Consume and return the transactions.
     #[must_use]
-    pub fn into_transactions(self) -> Vec<Arc<Transaction>> {
+    pub fn into_transactions(self) -> Vec<Transaction> {
         self.transactions.into_inner()
     }
 }
@@ -90,8 +87,8 @@ mod tests {
 
     #[test]
     fn test_get_transactions_response() {
-        let tx1 = Arc::new(test_transaction(1));
-        let tx2 = Arc::new(test_transaction(2));
+        let tx1 = test_transaction(1);
+        let tx2 = test_transaction(2);
 
         let response = GetTransactionsResponse::new(Capped::from_array([tx1, tx2]));
         assert_eq!(response.count(), 2);
@@ -107,8 +104,8 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip() {
-        let tx1 = Arc::new(test_transaction(1));
-        let tx2 = Arc::new(test_transaction(2));
+        let tx1 = test_transaction(1);
+        let tx2 = test_transaction(2);
 
         let response = GetTransactionsResponse::new(Capped::from_array([tx1, tx2]));
 

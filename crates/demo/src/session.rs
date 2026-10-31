@@ -1,7 +1,6 @@
 //! The simulation session and its event derivation.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
@@ -551,7 +550,6 @@ impl Session {
             }
         }
         let hash = tx.hash();
-        let tx = Arc::new(tx);
         self.runner.schedule_initial_event(
             0,
             Duration::from_millis(1),

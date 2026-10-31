@@ -17,7 +17,6 @@
 //! grew.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Arc;
 
 use hyperscale_engine::Executor;
 use hyperscale_types::{Address, Hash, MAX_TXS_PER_BLOCK, Transaction, TxHash, Unresolved};
@@ -38,7 +37,7 @@ pub const MAX_DEFERRED_FOR_RECORDS: usize = MAX_TXS_PER_BLOCK;
 #[derive(Debug, Clone)]
 pub struct DeferredTransaction {
     /// The envelope, unverified — nothing about it has been judged.
-    pub tx: Arc<Transaction>,
+    pub tx: Transaction,
     /// What its derivation could not resolve, in the forms a fetch asks
     /// for.
     pub(crate) wanted: Unresolved,
@@ -55,13 +54,13 @@ impl DeferredTransaction {
     /// Hold an unbidden `tx` for `wanted`, indexing the wait by the
     /// addresses that name it.
     #[must_use]
-    pub(crate) fn new(tx: Arc<Transaction>, wanted: Unresolved) -> Self {
+    pub(crate) fn new(tx: Transaction, wanted: Unresolved) -> Self {
         Self::offered(tx, wanted, Origin::Unbidden)
     }
 
     /// Hold `tx`, which reached admission from `origin`, for `wanted`.
     #[must_use]
-    pub(crate) fn offered(tx: Arc<Transaction>, wanted: Unresolved, origin: Origin) -> Self {
+    pub(crate) fn offered(tx: Transaction, wanted: Unresolved, origin: Origin) -> Self {
         let awaited = wanted.awaited(|package| Executor::package_artifact_key(package).owner);
         Self {
             tx,
@@ -249,7 +248,7 @@ impl DeferredForRecords {
     /// its other asks stand, because admission has not said yet whether
     /// it wants them — only that it is no longer waiting here, which is
     /// what leaving the index says.
-    pub(crate) fn release(&mut self, arrived: &[Address]) -> Vec<Arc<Transaction>> {
+    pub(crate) fn release(&mut self, arrived: &[Address]) -> Vec<Transaction> {
         self.release_offers(arrived)
             .into_iter()
             .map(|(tx, _)| tx)
@@ -258,10 +257,7 @@ impl DeferredForRecords {
 
     /// [`Self::release`], beside the origin each envelope is offered
     /// back through.
-    pub(crate) fn release_offers(
-        &mut self,
-        arrived: &[Address],
-    ) -> Vec<(Arc<Transaction>, Origin)> {
+    pub(crate) fn release_offers(&mut self, arrived: &[Address]) -> Vec<(Transaction, Origin)> {
         let mut released = Vec::new();
         for name in arrived {
             let Some(hashes) = self.waiting.remove(name) else {
@@ -275,7 +271,7 @@ impl DeferredForRecords {
                     continue;
                 }
                 held.reoffered = true;
-                released.push((Arc::clone(&held.deferred.tx), held.deferred.origin));
+                released.push((held.deferred.tx.clone(), held.deferred.origin));
             }
         }
         self.forget_dropped();
@@ -361,8 +357,8 @@ mod tests {
     use super::*;
 
     /// An envelope valid until `end_ms`, distinguished by `seed`.
-    fn envelope(seed: u8, end_ms: u64) -> Arc<Transaction> {
-        Arc::new(stub_transaction(
+    fn envelope(seed: u8, end_ms: u64) -> Transaction {
+        stub_transaction(
             PrincipalAddr::new([seed; 31]),
             &[test_prefix(seed)],
             1_000,
@@ -370,14 +366,14 @@ mod tests {
                 WeightedTimestamp::from_millis(0),
                 WeightedTimestamp::from_millis(end_ms),
             ),
-        ))
+        )
     }
 
     fn instance(byte: u8) -> Address {
         test_prefix(byte)
     }
 
-    fn deferred(tx: Arc<Transaction>, instances: Vec<Address>) -> DeferredTransaction {
+    fn deferred(tx: Transaction, instances: Vec<Address>) -> DeferredTransaction {
         DeferredTransaction::new(
             tx,
             Unresolved {
@@ -418,8 +414,8 @@ mod tests {
         let mut wait = DeferredForRecords::new();
         let first = envelope(1, u64::MAX);
         let second = envelope(2, u64::MAX);
-        wait.defer(deferred(Arc::clone(&first), vec![instance(0xA1)]));
-        wait.defer(deferred(Arc::clone(&second), vec![instance(0xB2)]));
+        wait.defer(deferred(first.clone(), vec![instance(0xA1)]));
+        wait.defer(deferred(second.clone(), vec![instance(0xB2)]));
 
         let released = wait.release(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
@@ -438,10 +434,7 @@ mod tests {
     fn one_of_several_records_releases_the_envelope() {
         let mut wait = DeferredForRecords::new();
         let tx = envelope(3, u64::MAX);
-        wait.defer(deferred(
-            Arc::clone(&tx),
-            vec![instance(0xA1), instance(0xB2)],
-        ));
+        wait.defer(deferred(tx, vec![instance(0xA1), instance(0xB2)]));
 
         assert_eq!(wait.release(&[instance(0xB2)]).len(), 1);
         assert!(
@@ -457,7 +450,7 @@ mod tests {
             ..DeferredForRecords::new()
         };
         let first = envelope(1, u64::MAX);
-        wait.defer(deferred(Arc::clone(&first), vec![instance(0xA1)]));
+        wait.defer(deferred(first.clone(), vec![instance(0xA1)]));
         wait.defer(deferred(envelope(2, u64::MAX), vec![instance(0xA1)]));
         let (evicted, orphaned) = wait.defer(deferred(envelope(3, u64::MAX), vec![instance(0xA1)]));
 
@@ -480,7 +473,7 @@ mod tests {
     fn the_last_envelope_waiting_on_a_record_orphans_it() {
         let mut wait = DeferredForRecords::new();
         let expiring = envelope(1, 5_000);
-        wait.defer(deferred(Arc::clone(&expiring), vec![instance(0xA1)]));
+        wait.defer(deferred(expiring.clone(), vec![instance(0xA1)]));
 
         let (expired, orphaned) = wait.sweep_expired(10_000);
         assert_eq!(expired, vec![expiring.hash()]);
@@ -494,10 +487,7 @@ mod tests {
     fn a_record_another_envelope_waits_on_is_not_orphaned() {
         let mut wait = DeferredForRecords::new();
         let expiring = envelope(1, 5_000);
-        wait.defer(deferred(
-            Arc::clone(&expiring),
-            vec![instance(0xA1), instance(0xB2)],
-        ));
+        wait.defer(deferred(expiring, vec![instance(0xA1), instance(0xB2)]));
         wait.defer(deferred(envelope(2, 50_000), vec![instance(0xB2)]));
 
         let (_, orphaned) = wait.sweep_expired(10_000);
@@ -513,8 +503,8 @@ mod tests {
         let mut wait = DeferredForRecords::new();
         let expiring = envelope(1, 5_000);
         let lasting = envelope(2, 50_000);
-        wait.defer(deferred(Arc::clone(&expiring), vec![instance(0xA1)]));
-        wait.defer(deferred(Arc::clone(&lasting), vec![instance(0xA1)]));
+        wait.defer(deferred(expiring.clone(), vec![instance(0xA1)]));
+        wait.defer(deferred(lasting.clone(), vec![instance(0xA1)]));
 
         let (expired, orphaned) = wait.sweep_expired(10_000);
         assert_eq!(expired, vec![expiring.hash()]);
@@ -534,10 +524,7 @@ mod tests {
     fn an_envelope_that_fails_admission_again_orphans_what_it_wanted() {
         let mut wait = DeferredForRecords::new();
         let tx = envelope(3, u64::MAX);
-        wait.defer(deferred(
-            Arc::clone(&tx),
-            vec![instance(0xA1), instance(0xB2)],
-        ));
+        wait.defer(deferred(tx.clone(), vec![instance(0xA1), instance(0xB2)]));
 
         assert_eq!(wait.release(&[instance(0xB2)]).len(), 1);
         let orphaned = wait.settle(&[tx.hash()]);
@@ -552,13 +539,10 @@ mod tests {
     fn an_envelope_that_defers_again_keeps_its_asks() {
         let mut wait = DeferredForRecords::new();
         let tx = envelope(3, u64::MAX);
-        wait.defer(deferred(
-            Arc::clone(&tx),
-            vec![instance(0xA1), instance(0xB2)],
-        ));
+        wait.defer(deferred(tx.clone(), vec![instance(0xA1), instance(0xB2)]));
 
         assert_eq!(wait.release(&[instance(0xB2)]).len(), 1);
-        let (evicted, orphaned) = wait.defer(deferred(Arc::clone(&tx), vec![instance(0xA1)]));
+        let (evicted, orphaned) = wait.defer(deferred(tx.clone(), vec![instance(0xA1)]));
         assert!(evicted.is_empty());
         assert!(orphaned.is_empty());
 
@@ -585,11 +569,11 @@ mod tests {
             packages: Vec::new(),
         };
         wait.defer(DeferredTransaction::offered(
-            Arc::clone(&tx),
+            tx.clone(),
             wanted,
             Origin::Asked,
         ));
-        wait.defer(deferred(Arc::clone(&tx), vec![instance(0xA1)]));
+        wait.defer(deferred(tx.clone(), vec![instance(0xA1)]));
 
         let released = wait.release_offers(&[instance(0xA1)]);
         assert_eq!(released.len(), 1);
@@ -604,11 +588,8 @@ mod tests {
         let mut wait = DeferredForRecords::new();
         let offered = envelope(1, 50_000);
         let expiring = envelope(2, 5_000);
-        wait.defer(deferred(
-            Arc::clone(&offered),
-            vec![instance(0xA1), instance(0xB2)],
-        ));
-        wait.defer(deferred(Arc::clone(&expiring), vec![instance(0xB2)]));
+        wait.defer(deferred(offered, vec![instance(0xA1), instance(0xB2)]));
+        wait.defer(deferred(expiring.clone(), vec![instance(0xB2)]));
 
         assert_eq!(wait.release(&[instance(0xA1)]).len(), 1);
         let second = wait.release(&[instance(0xB2)]);

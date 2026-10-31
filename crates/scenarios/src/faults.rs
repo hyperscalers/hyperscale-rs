@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -381,13 +380,7 @@ pub fn halted_shard_recovery_replays_a_sweep_its_suffix_walked<C: FaultableClust
         validity_around(c.now()).start_timestamp_inclusive,
         WeightedTimestamp::from_millis(validity_end),
     );
-    let tx = Arc::new(build_transfer_tx(
-        key,
-        *from,
-        *to,
-        STRADDLER_PAYMENT,
-        validity,
-    ));
+    let tx = build_transfer_tx(key, *from, *to, STRADDLER_PAYMENT, validity);
     let cell = committed_tx_cell_key(halted, tx.hash(), validity.end_timestamp_exclusive);
     c.submit(tx);
     let held = |c: &C| c.substate(halted, cell.owner, cell.local.0).is_some();
@@ -731,7 +724,7 @@ pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
             );
         }
         offered.insert(route.hash());
-        c.submit(Arc::new(route));
+        c.submit(route);
     }
 
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
@@ -775,7 +768,7 @@ pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
             validity_around(c.now()),
         );
         let hash = control.hash();
-        c.submit(Arc::new(control));
+        c.submit(control);
         let status = await_tx_terminal(c, hash, epochs(2));
         assert!(
             matches!(
@@ -866,7 +859,7 @@ pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mu
             window,
         );
         offered.insert(route.hash());
-        c.submit(Arc::new(route));
+        c.submit(route);
     }
 
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
@@ -902,7 +895,7 @@ pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mu
             validity_around(c.now()),
         );
         let hash = control.hash();
-        c.submit(Arc::new(control));
+        c.submit(control);
         let status = await_tx_terminal(c, hash, epochs(2));
         assert!(
             matches!(
@@ -927,7 +920,7 @@ pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mu
         validity_around(c.now()),
     );
     let hash = fresh.hash();
-    c.submit(Arc::new(fresh));
+    c.submit(fresh);
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(

@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
-/// can hold their own owner without deep-cloning the per-tx `Arc` array.
+/// can hold their own owner without copying the per-tx array.
 ///
 /// Elements are wrapped in [`Verifiable`] so a locally-built block (whose
 /// txs were admission-validated through `MempoolCoordinator`) preserves
@@ -30,7 +30,7 @@ use crate::{
 /// construction; wire-decoded blocks land at `Verifiable::Unverified`
 /// because HBOR decode is a transparent passthrough into that variant.
 /// Same rationale as [`SharedCertificates`].
-pub type SharedTransactions = Arc<Capped<Vec<Arc<Verifiable<Transaction>>>, MAX_TXS_PER_BLOCK>>;
+pub type SharedTransactions = Arc<Capped<Vec<Verifiable<Transaction>>, MAX_TXS_PER_BLOCK>>;
 
 /// Derive every transaction of a committed `block` through this node's
 /// `derivation`, so the routed facts its handlers read are there to
@@ -211,16 +211,13 @@ pub struct TerminalRef {
     pub height: BlockHeight,
 }
 
-// Manual PartialEq - compare transaction/certificate content, not Arc pointers.
+// Manual PartialEq - compare transaction/certificate content.
 // Provisions are excluded from equality: the header's body root already
 // commits to them, and a Live and Sealed form of the same block should compare
 // equal for content purposes.
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
-        fn tx_lists_equal(
-            a: &[Arc<Verifiable<Transaction>>],
-            b: &[Arc<Verifiable<Transaction>>],
-        ) -> bool {
+        fn tx_lists_equal(a: &[Verifiable<Transaction>], b: &[Verifiable<Transaction>]) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
         fn cert_lists_equal(

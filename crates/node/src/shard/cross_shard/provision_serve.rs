@@ -140,7 +140,7 @@ mod tests {
         };
         let block = Block::Live {
             header,
-            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(decoded))])),
+            transactions: Arc::new(Capped::from_array([Verifiable::from(decoded)])),
             certificates,
             provisions,
             abandonment_records,

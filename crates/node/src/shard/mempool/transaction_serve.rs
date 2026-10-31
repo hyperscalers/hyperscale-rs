@@ -1,12 +1,10 @@
 //! Inbound transaction-fetch request handling.
 
-use std::sync::Arc;
-
 use hyperscale_mempool::TxStore;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::network::response::GetTransactionsResponse;
-use hyperscale_types::{MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, Transaction};
+use hyperscale_types::{MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, Transaction, Verified};
 use tracing::{debug, trace};
 
 use crate::serve::Answer;
@@ -17,10 +15,7 @@ use crate::serve::Answer;
 /// and cannot know what it asked for weighs: fifty maximal envelopes
 /// would overrun the frame however few they are. What is cut is simply
 /// not answered, and the requester asks for it again.
-fn answer_of(
-    asked: usize,
-    found: Vec<Arc<Transaction>>,
-) -> Answer<Arc<Transaction>, MAX_TXS_PER_BLOCK> {
+fn answer_of(asked: usize, found: Vec<Transaction>) -> Answer<Transaction, MAX_TXS_PER_BLOCK> {
     let mut answer = Answer::of(asked).within(MAX_FETCH_RESPONSE_BYTES);
     answer.offer_all(found, |tx| tx.serialized_bytes().len());
     answer
@@ -52,11 +47,11 @@ pub fn serve_transaction_request<S: ShardStorage>(
         "Handling transaction fetch request"
     );
 
-    let mut found: Vec<Arc<Transaction>> = Vec::with_capacity(requested_count);
+    let mut found: Vec<Transaction> = Vec::with_capacity(requested_count);
     let mut missing = Vec::new();
     for hash in req.tx_hashes.iter() {
         if let Some(tx) = tx_store.get(hash) {
-            found.push(Arc::new((**tx).clone()));
+            found.push(tx.into_inner());
         } else {
             missing.push(*hash);
         }
@@ -66,7 +61,7 @@ pub fn serve_transaction_request<S: ShardStorage>(
             pending_chain
                 .transactions_batch(&missing)
                 .into_iter()
-                .map(|tx| Arc::new(tx.into_inner())),
+                .map(Verified::into_inner),
         );
     }
 
@@ -90,8 +85,8 @@ mod tests {
 
     /// A transaction whose body is at the wire cap: a publish carrying
     /// the largest artifact an envelope admits.
-    fn maximal(seed: u8) -> Arc<Transaction> {
-        Arc::new(Transaction::new(TransactionEnvelope {
+    fn maximal(seed: u8) -> Transaction {
+        Transaction::new(TransactionEnvelope {
             tree: Bytes::from_array([seed]),
             terms: Terms {
                 fee_payer: PrincipalAddr::new([seed; 31]),
@@ -102,7 +97,7 @@ mod tests {
             },
             artifact: Some(vec![seed; MAX_ARTIFACT_BYTES].try_into().unwrap()),
             signatures: Capped::empty(),
-        }))
+        })
     }
 
     /// Fifty maximal transactions do not fit one response: the budget
@@ -111,7 +106,7 @@ mod tests {
     /// whole message.
     #[test]
     fn a_response_is_cut_at_the_byte_budget() {
-        let found: Vec<Arc<Transaction>> = (0..50u8).map(maximal).collect();
+        let found: Vec<Transaction> = (0..50u8).map(maximal).collect();
         let kept = answer_of(found.len(), found.clone()).finish();
         assert!(
             kept.len() < found.len(),
@@ -122,10 +117,10 @@ mod tests {
         assert!(bytes <= MAX_FETCH_RESPONSE_BYTES);
         assert!(bytes < MAX_WIRE_MESSAGE_BYTES);
         assert_eq!(
-            kept.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+            kept.iter().map(Transaction::hash).collect::<Vec<_>>(),
             found[..kept.len()]
                 .iter()
-                .map(|tx| tx.hash())
+                .map(Transaction::hash)
                 .collect::<Vec<_>>(),
             "the prefix is kept in the order asked"
         );

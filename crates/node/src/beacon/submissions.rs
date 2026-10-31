@@ -8,8 +8,6 @@
 //! transaction and may close while it waits. When what it named arrives,
 //! it goes back through the fan-out it never got.
 
-use std::sync::Arc;
-
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -54,10 +52,10 @@ where
         }
     }
 
-    fn route_submission(&mut self, tx: &Arc<Transaction>) {
+    fn route_submission(&mut self, tx: &Transaction) {
         match self.process.compute_submit_fanout(tx) {
             SubmitFanout::WantsRecords { wanted } => {
-                self.hold_submission(DeferredTransaction::new(Arc::clone(tx), wanted));
+                self.hold_submission(DeferredTransaction::new(tx.clone(), wanted));
             }
             fanout => {
                 let _ = self.process.apply_submit_fanout(tx, fanout);

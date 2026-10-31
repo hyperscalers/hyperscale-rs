@@ -504,12 +504,7 @@ where
     ) -> Result<CertifiedBlock, RehydrateError> {
         let caches = &self.io.caches;
         elided.try_rehydrate(
-            |h| {
-                caches
-                    .tx_store
-                    .get(h)
-                    .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
-            },
+            |h| caches.tx_store.get(h).map(Verifiable::from),
             |id| caches.finalization_store.get(id),
             // `provision_store` holds raw bodies; lift into the unverified
             // transport shape — the tick-cert linkage gates trust on the
@@ -1162,7 +1157,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_transactions_section_mismatch() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let h = header_with(
             &header(),
             &SectionRoots {
@@ -1191,7 +1186,7 @@ mod tests {
 
     #[test]
     fn validate_passes_when_the_transactions_section_matches() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let h = header_with(
             &header(),
             &SectionRoots {
@@ -1222,7 +1217,7 @@ mod tests {
     /// be conditioned on the list the peer chose to send.
     #[test]
     fn validate_rejects_stripped_transactions() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let h = header_with(
             &header(),
             &SectionRoots {

@@ -21,7 +21,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{
     awaited_core, crossings_consumed, member_of, staged_past_cap,
@@ -34,7 +33,7 @@ use hyperscale_types::{
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
     Provisions, Reshaping, Settlement, ShardId, ShardTrie, StandingToward, StateClaim, SubstateKey,
-    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
+    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
     WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
     evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
@@ -1033,6 +1032,8 @@ pub fn admit_finalization_over(
     frontier: BlockHeight,
     fw: &Finalization,
 ) -> Result<(), String> {
+    use std::sync::Arc;
+
     use hyperscale_types::{Epoch, StateRoot, WindowLookup};
 
     let schedule = TopologySchedule::new(
@@ -1619,11 +1620,6 @@ pub(crate) fn admit_each<S: Section, T>(
         })
         .collect();
     (kept, refused)
-}
-
-/// The shared shape of a section's items behind an `Arc<Verifiable<_>>`.
-pub(crate) fn unwrapped<T>(item: &Arc<Verifiable<T>>) -> &T {
-    item
 }
 
 #[cfg(test)]

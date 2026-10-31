@@ -6,8 +6,6 @@
 //! `FetchBinding` trait, and the shared [`SolicitedAnswer`] response
 //! boundary live in [`crate::fetch`].
 
-use std::sync::Arc;
-
 use hyperscale_core::FetchIds;
 use hyperscale_hbor::Capped;
 use hyperscale_network::Network;
@@ -52,7 +50,7 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for TransactionBinding {
 /// for and its ids retire as it lands; the bodies then go to validation.
 impl SolicitedAnswer for TransactionBinding {
     type Request = GetTransactionsRequest;
-    type Item = Arc<Transaction>;
+    type Item = Transaction;
     type Input = ShardScopedInput;
 
     const SETTLES: Settles = Settles::OnAnswer;
@@ -63,15 +61,15 @@ impl SolicitedAnswer for TransactionBinding {
         )
     }
 
-    fn items(response: GetTransactionsResponse) -> Vec<Arc<Transaction>> {
+    fn items(response: GetTransactionsResponse) -> Vec<Transaction> {
         response.into_transactions()
     }
 
-    fn answers_for(tx: &Arc<Transaction>) -> impl IntoIterator<Item = TxHash> + use<> {
+    fn answers_for(tx: &Transaction) -> impl IntoIterator<Item = TxHash> + use<> {
         [tx.hash()]
     }
 
-    fn deliver(batch: Vec<Arc<Transaction>>) -> Vec<ShardScopedInput> {
+    fn deliver(batch: Vec<Transaction>) -> Vec<ShardScopedInput> {
         vec![ShardScopedInput::TransactionsFetched { batch }]
     }
 }

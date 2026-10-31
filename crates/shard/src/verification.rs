@@ -40,7 +40,7 @@ use crate::read_fence::read_fence;
 pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
     committed_tx_cells(
         block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
+        block.transactions().iter().map(Verifiable::as_unverified),
     )
 }
 
@@ -1753,7 +1753,7 @@ impl VerificationPipeline {
         let creations = committed_here(
             block.header().shard_id(),
             chain.chain_origin().cut(),
-            block.transactions().iter().map(|tx| tx.as_unverified()),
+            block.transactions().iter().map(Verifiable::as_unverified),
         );
         Some(StateRootCheck {
             block_hash: pending.block_hash,
@@ -2209,7 +2209,7 @@ mod tests {
         height: BlockHeight,
         parent_block_hash: BlockHash,
         in_flight: u32,
-        transactions: Vec<Arc<Verifiable<Transaction>>>,
+        transactions: Vec<Verifiable<Transaction>>,
     ) -> Block {
         block_claiming(height, parent_block_hash, in_flight, transactions, None)
     }
@@ -2218,7 +2218,7 @@ mod tests {
         height: BlockHeight,
         parent_block_hash: BlockHash,
         in_flight: u32,
-        transactions: Vec<Arc<Verifiable<Transaction>>>,
+        transactions: Vec<Verifiable<Transaction>>,
         substate_bytes: Option<u64>,
     ) -> Block {
         Block::Live {
@@ -2475,7 +2475,7 @@ mod tests {
             BlockHeight::GENESIS,
             ChainOrigin::root(WeightedTimestamp::ZERO),
         );
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let standing = Some(TxsInFlight::new(2));
         let classify = |vp: &mut VerificationPipeline, block: &Block| {
             vp.classify_vote_terms(
@@ -2487,12 +2487,7 @@ mod tests {
             )
         };
 
-        let honest = block_with(
-            BlockHeight::new(1),
-            BlockHash::ZERO,
-            2,
-            vec![Arc::clone(&tx)],
-        );
+        let honest = block_with(BlockHeight::new(1), BlockHash::ZERO, 2, vec![tx.clone()]);
         assert!(matches!(classify(&mut vp, &honest), InFlightCheck::Proceed));
 
         // Overstating or understating it would let a shard hold places
@@ -2503,7 +2498,7 @@ mod tests {
                 BlockHeight::new(1),
                 BlockHash::ZERO,
                 claimed,
-                vec![Arc::clone(&tx)],
+                vec![tx.clone()],
             );
             assert!(
                 matches!(classify(&mut vp, &misstated), InFlightCheck::Abort),

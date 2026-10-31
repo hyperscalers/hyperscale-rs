@@ -783,12 +783,7 @@ mod tests {
             WeightedTimestamp::from_millis(500),
             WeightedTimestamp::from_millis(60_000),
         );
-        let tx = Arc::new(stub_transaction(
-            test_principal(1),
-            &[test_prefix(1)],
-            1_000,
-            validity,
-        ));
+        let tx = stub_transaction(test_principal(1), &[test_prefix(1)], 1_000, validity);
         let marker = committed_tx_cell_key(parent, tx.hash(), validity.end_timestamp_exclusive);
         let block = make_live_block(
             right,

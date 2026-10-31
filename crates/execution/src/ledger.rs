@@ -20,7 +20,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::Arc;
 
 use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
@@ -418,7 +417,7 @@ impl Part {
     /// under, and the replay re-freezes both. A shard only ever holds an
     /// entry for a transaction it commits, so a divided one here is a
     /// core member or a leg.
-    fn of(local: ShardId, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) -> Self {
+    fn of(local: ShardId, tx: &Verifiable<Transaction>, classified: &Classified) -> Self {
         if !classified.decomposed() {
             return Self::whole();
         }
@@ -436,7 +435,7 @@ impl Part {
 /// counterparts answer at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
-    pub(crate) body: Arc<Verified<Transaction>>,
+    pub(crate) body: Verified<Transaction>,
     /// The classification the committing block froze, which every cell
     /// the entry asks about and every scope a settlement runs under is
     /// read off.
@@ -452,9 +451,9 @@ impl Kept {
     /// BFT-transitive trust that gates the containing block. Honest
     /// live-consensus blocks already carry `Verified` entries.
     pub(crate) fn of(tx: &Verifiable<Transaction>, classified: &Classified) -> Self {
-        let body: Arc<Verified<Transaction>> = match tx.clone().into_verified() {
-            Ok(verified) => Arc::new(verified),
-            Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
+        let body: Verified<Transaction> = match tx.clone().into_verified() {
+            Ok(verified) => verified,
+            Err(raw) => Verified::<Transaction>::from_persisted(raw),
         };
         Self {
             body,
@@ -668,7 +667,7 @@ impl Ledger {
         &mut self,
         committed: CommittedAt,
         prices: &PriceTable,
-        members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
+        members: impl IntoIterator<Item = (&'a Verifiable<Transaction>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
             if self.owed.contains_key(&tx.hash()) {
@@ -1532,7 +1531,7 @@ mod tests {
     }
 
     /// The committed cell `shard` writes for `tx`.
-    fn core_cell(shard: ShardId, tx: &Arc<Verifiable<Transaction>>) -> SubstateKey {
+    fn core_cell(shard: ShardId, tx: &Verifiable<Transaction>) -> SubstateKey {
         committed_tx_cell_key(
             shard,
             tx.hash(),
@@ -1620,18 +1619,21 @@ mod tests {
 
     /// A transaction paying from `payer` and touching `also`, both given
     /// as the byte an address repeats.
-    fn tx_over(payer: u8, also: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+    fn tx_over(payer: u8, also: u8, end_ms: u64) -> Verifiable<Transaction> {
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(end_ms),
         );
-        Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-            stub_transaction(test_principal(payer), &[test_prefix(also)], 1_000, validity),
+        Verifiable::from(Verified::new_unchecked_for_test(stub_transaction(
+            test_principal(payer),
+            &[test_prefix(also)],
+            1_000,
+            validity,
         )))
     }
 
     /// A straddler: payer here, the rest of it away.
-    fn tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+    fn tx(seed: u8, end_ms: u64) -> Verifiable<Transaction> {
         tx_over(HERE, AWAY.wrapping_add(seed) | 0x80, end_ms)
     }
 
@@ -1645,19 +1647,19 @@ mod tests {
         EpochWindows::new(0, EPOCH_DURATION.as_secs() * 1000).terminal_evidence_expiry(cut)
     }
 
-    fn commit(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>) {
+    fn commit(ledger: &mut Ledger, tx: &Verifiable<Transaction>) {
         commit_as(ledger, tx, &Classified::whole());
     }
 
     /// Commit `tx` frozen as `classified`, which is what fixes the part
     /// this shard plays and every cell its entry asks about.
-    fn commit_as(ledger: &mut Ledger, tx: &Arc<Verifiable<Transaction>>, classified: &Classified) {
+    fn commit_as(ledger: &mut Ledger, tx: &Verifiable<Transaction>, classified: &Classified) {
         ledger.register_committed(committed_at(tx), &PriceTable::GENESIS, [(tx, classified)]);
     }
 
     /// Where the fixtures commit `tx`: well inside its window, at a
     /// height of no consequence.
-    fn committed_at(tx: &Arc<Verifiable<Transaction>>) -> CommittedAt {
+    fn committed_at(tx: &Verifiable<Transaction>) -> CommittedAt {
         let anchor = tx
             .validity_range()
             .end_timestamp_exclusive
@@ -1671,7 +1673,7 @@ mod tests {
 
     /// A record's name for `tx`, stating the terms a committing block
     /// would have registered for it.
-    fn names(tx: &Arc<Verifiable<Transaction>>) -> UnsettledTx {
+    fn names(tx: &Verifiable<Transaction>) -> UnsettledTx {
         UnsettledTx {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
@@ -1689,12 +1691,12 @@ mod tests {
     }
 
     /// What abandoning `tx` states, as the ledger hands it to a tick.
-    fn abandons(tx: &Arc<Verifiable<Transaction>>) -> UnsettledTx {
+    fn abandons(tx: &Verifiable<Transaction>) -> UnsettledTx {
         names(tx)
     }
 
     /// The burn an abort of `tx` settles.
-    fn charge(tx: &Arc<Verifiable<Transaction>>) -> AbortCharge {
+    fn charge(tx: &Verifiable<Transaction>) -> AbortCharge {
         UnsettledTx::for_transaction(
             tx,
             committed_at(tx),
@@ -3065,7 +3067,7 @@ mod tests {
                 two_shard_core(),
                 issuing(),
             ];
-            let txs: Vec<Arc<Verifiable<Transaction>>> = (0..6u8)
+            let txs: Vec<Verifiable<Transaction>> = (0..6u8)
                 .map(|seed| tx(seed, 60_000 + u64::from(seed) * 1_000))
                 .collect();
             let records: Vec<SubstateKey> = shapes

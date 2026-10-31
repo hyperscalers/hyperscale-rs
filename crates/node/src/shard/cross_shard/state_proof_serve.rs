@@ -301,8 +301,8 @@ mod tests {
                 provision_tx_roots: Capped::default(),
                 ..Default::default()
             });
-            let txs: Vec<Arc<Verifiable<Transaction>>> = if height == 1 {
-                vec![Arc::new(Verifiable::from(test_transaction(1)))]
+            let txs: Vec<Verifiable<Transaction>> = if height == 1 {
+                vec![(Verifiable::from(test_transaction(1)))]
             } else {
                 Vec::new()
             };
@@ -319,7 +319,7 @@ mod tests {
             };
             let mut creations = committed_tx_cells(
                 SHARD,
-                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.transactions().iter().map(Verifiable::as_unverified),
             );
             if height == 1 {
                 creations.extend(extra.iter().cloned());

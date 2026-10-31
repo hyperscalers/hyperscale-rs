@@ -1,7 +1,6 @@
 //! Per-target-shard [`ProvisionTxRoot`] verification.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
 use thiserror::Error;
@@ -27,7 +26,7 @@ pub struct ProvisionTxRootsContext<'a> {
     /// shards each cross-shard tx contributes to.
     pub topology_snapshot: &'a TopologySnapshot,
     /// The block's transactions in block order.
-    pub transactions: &'a [Arc<Verifiable<Transaction>>],
+    pub transactions: &'a [Verifiable<Transaction>],
     /// The shards that commit each transaction, which are the only ones
     /// a bundle goes to.
     pub committing: CommittingShards<'a>,
@@ -87,7 +86,7 @@ impl Verified<ProvisionTxRootsMap> {
     pub fn compute(
         local_shard: ShardId,
         topology_snapshot: &TopologySnapshot,
-        transactions: &[Arc<Verifiable<Transaction>>],
+        transactions: &[Verifiable<Transaction>],
         committing: CommittingShards<'_>,
     ) -> Self {
         let mut per_target: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
@@ -176,19 +175,17 @@ mod tests {
     };
     use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp};
 
-    fn cross_shard_tx(payer: PrincipalAddr) -> Arc<Verifiable<Transaction>> {
+    fn cross_shard_tx(payer: PrincipalAddr) -> Verifiable<Transaction> {
         install_stub_protocol_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(100_000),
         );
-        Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-            stub_transaction(
-                payer,
-                &[test_prefix(0x01), test_prefix(0x81)],
-                1_000,
-                validity,
-            ),
+        Verifiable::from(Verified::new_unchecked_for_test(stub_transaction(
+            payer,
+            &[test_prefix(0x01), test_prefix(0x81)],
+            1_000,
+            validity,
         )))
     }
 

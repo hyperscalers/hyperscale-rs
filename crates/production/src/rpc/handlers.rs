@@ -20,7 +20,6 @@
 //! breach. Each rejection reason emits a Prometheus counter so
 //! operators can distinguish capacity from sync-state stalls.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -218,11 +217,9 @@ pub async fn submit_transaction_handler(
     if let Some(rejection) = check_validity_reach(&transaction, &hash) {
         return rejection;
     }
-    let tx_arc = Arc::new(transaction);
-
     // Compute the touched-shard fanout on this tokio worker and push
     // admit envelopes directly onto each touched shard's event channel.
-    if !state.node.submit(tx_arc) {
+    if !state.node.submit(transaction) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitTransactionResponse {

@@ -2358,9 +2358,9 @@ mod tests {
         else {
             unreachable!("make_test_block returns a Live block")
         };
-        let txs: Vec<Arc<Verifiable<Transaction>>> = seeds
+        let txs: Vec<Verifiable<Transaction>> = seeds
             .iter()
-            .map(|&seed| Arc::new(Verifiable::from(test_transaction(seed))))
+            .map(|&seed| Verifiable::from(test_transaction(seed)))
             .collect();
         let block = Block::Live {
             header,

@@ -367,7 +367,7 @@ pub struct ShardCoordinatorSim {
     /// pool; `try_propose_for` threads it into the proposer's
     /// `ready_txs`; `on_block_header` reads it through the
     /// `lookup_tx` data-availability closure.
-    tx_pools: Vec<HashMap<TxHash, Arc<Verified<Transaction>>>>,
+    tx_pools: Vec<HashMap<TxHash, Verified<Transaction>>>,
     /// Identity-agnostic topology shared by every replica. A single-committee
     /// schedule — the sim runs within one epoch, so every weighted timestamp
     /// resolves to the same committee.
@@ -753,9 +753,8 @@ impl ShardCoordinatorSim {
     ) {
         let idx = self.idx_of(replica);
         let pool = &self.tx_pools[idx];
-        let lookup_tx = |hash: &TxHash| -> Option<Arc<Verifiable<Transaction>>> {
-            pool.get(hash)
-                .map(|tx| Arc::new(Verifiable::from((**tx).clone())))
+        let lookup_tx = |hash: &TxHash| -> Option<Verifiable<Transaction>> {
+            pool.get(hash).map(|tx| Verifiable::from(tx.clone()))
         };
         let actions = self.coordinators[idx].on_block_header(
             &self.topology_schedule,
@@ -899,9 +898,9 @@ impl ShardCoordinatorSim {
     /// Admit `tx` into every replica's local pool. See
     /// [`Self::admit_transaction_on`] for the per-replica variant
     /// used to model partial-availability tests.
-    pub fn admit_transaction(&mut self, tx: &Arc<Verified<Transaction>>) {
+    pub fn admit_transaction(&mut self, tx: &Verified<Transaction>) {
         for idx in 0..self.n() {
-            self.admit_transaction_on(idx, Arc::clone(tx));
+            self.admit_transaction_on(idx, tx.clone());
         }
     }
 
@@ -909,9 +908,9 @@ impl ShardCoordinatorSim {
     /// `on_transactions_admitted` + the latched proposal retry on
     /// that replica only. Used to model partial-availability
     /// faults where a single replica's DA gate matters.
-    pub fn admit_transaction_on(&mut self, idx: usize, tx: Arc<Verified<Transaction>>) {
+    pub fn admit_transaction_on(&mut self, idx: usize, tx: Verified<Transaction>) {
         let hash = tx.hash();
-        let tx_slice = [Arc::clone(&tx)];
+        let tx_slice = [tx.clone()];
         self.tx_pools[idx].insert(hash, tx);
         let actions =
             self.coordinators[idx].on_transactions_admitted(&self.topology_schedule, &tx_slice);
@@ -1027,8 +1026,7 @@ impl ShardCoordinatorSim {
     /// pool as `ready_txs`. Tx-only equivalent of the production
     /// gather (no finalizations, no provisions).
     fn try_propose_for(&mut self, idx: usize) -> Vec<Action> {
-        let ready_txs: Vec<Arc<Verified<Transaction>>> =
-            self.tx_pools[idx].values().cloned().collect();
+        let ready_txs: Vec<Verified<Transaction>> = self.tx_pools[idx].values().cloned().collect();
         let state_claims = self.offered_claims.clone();
         self.coordinators[idx].try_propose(&self.topology_schedule, |_| ProposalInputs {
             ready_txs,
@@ -1292,9 +1290,8 @@ impl ShardCoordinatorSim {
         // touch only the coordinator, so re-bind locally below.
         if let SimEvent::BlockHeader { header, manifest } = env.event {
             let pool = &self.tx_pools[to_idx];
-            let lookup_tx = |hash: &TxHash| -> Option<Arc<Verifiable<Transaction>>> {
-                pool.get(hash)
-                    .map(|tx| Arc::new(Verifiable::from((**tx).clone())))
+            let lookup_tx = |hash: &TxHash| -> Option<Verifiable<Transaction>> {
+                pool.get(hash).map(|tx| Verifiable::from(tx.clone()))
             };
             return self.coordinators[to_idx].on_block_header(
                 &self.topology_schedule,

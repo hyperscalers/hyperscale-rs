@@ -8,7 +8,6 @@
 //! extends.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_execution::{ExecutionCoordinator, Offers};
@@ -75,7 +74,7 @@ impl ProposalSources<'_> {
         // offered is the drain's count and the block's caps inside
         // `ready_transactions`.
         let riding = Self::riding_this_proposal(&queued);
-        let engaged = |tx: &Arc<Verified<Transaction>>| {
+        let engaged = |tx: &Verified<Transaction>| {
             ask.engagement_held(tx, |payer, tx_hash| riding.contains(&(payer, tx_hash)))
         };
         let ready_txs =

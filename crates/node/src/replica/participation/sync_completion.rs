@@ -335,7 +335,7 @@ mod tests {
                 BlockHeight::new(height),
                 height * 1_000,
                 ValidatorId::new(0),
-                vec![Arc::new(test_transaction(u8::try_from(height).unwrap()))],
+                vec![(test_transaction(u8::try_from(height).unwrap()))],
                 vec![],
             );
             tip = block.hash();

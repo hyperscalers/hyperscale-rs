@@ -13,7 +13,6 @@
 
 mod support;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -124,7 +123,7 @@ fn restart_and_advance(restarted: usize, seed: u64) {
             10,
             validity_around(cluster.now()),
         );
-        cluster.submit(Arc::new(tx));
+        cluster.submit(tx);
     }
     assert!(
         cluster.run_until(epochs(8), |c| c
@@ -188,7 +187,7 @@ fn a_crashed_member_catches_up_on_its_disk(seed: u64) {
     let (payer, from) = sender(0);
     let transfer = |c: &mut SimCluster, index: u8| {
         let tx = build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
-        c.submit(Arc::new(tx));
+        c.submit(tx);
     };
 
     for index in 0..4u8 {
@@ -405,7 +404,7 @@ fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: Processi
         let transfer = |c: &mut SimCluster, index: u8| {
             let tx =
                 build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
-            c.submit(Arc::new(tx));
+            c.submit(tx);
         };
         for index in 0..4u8 {
             transfer(&mut cluster, index);
@@ -544,7 +543,7 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
             let tx = build_leg_payment_tx(leg, 100, validity_around(c.now()));
             submitted.push(tx.hash());
-            c.submit(Arc::new(tx));
+            c.submit(tx);
         }
         let held = submitted[0];
         assert!(
@@ -742,7 +741,7 @@ fn a_tick_in_flight_survives(restarted: usize, seed: u64) {
             10,
             validity_around(cluster.now()),
         );
-        cluster.submit(Arc::new(tx));
+        cluster.submit(tx);
     }
     assert!(
         cluster.run_until(epochs(8), |c| a_tick_in_flight(c, shard).is_some()),
@@ -858,7 +857,7 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
             validity_around(cluster.now()),
         );
         submitted.push(tx.hash());
-        cluster.submit(Arc::new(tx));
+        cluster.submit(tx);
     }
     let held = submitted[0];
     assert!(
@@ -973,7 +972,7 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
     let price = declared_price(&cluster, &refused);
     let funded = vault_balance(&cluster, SWAPPER_SHARD, caller);
     let hash = refused.hash();
-    cluster.submit(Arc::new(refused));
+    cluster.submit(refused);
 
     // The leg has paid and certified: its own finalization is on the
     // caller's chain, naming a transaction it does not decide. The venue's
@@ -1068,7 +1067,7 @@ fn a_restarted_or_snap_synced_replica_folds_the_same_reclaim() {
     );
     let price = declared_price(&cluster, &refused);
     let funded = vault_balance(&cluster, SWAPPER_SHARD, caller);
-    cluster.submit(Arc::new(refused));
+    cluster.submit(refused);
     assert!(
         cluster.run_until(epochs(12), |c| vault_balance(c, SWAPPER_SHARD, caller)
             == funded - SWAP_INPUT - price),
@@ -1154,7 +1153,7 @@ fn commit_overdrawing_transfer(
         validity_around(cluster.now()),
     );
     let hash = tx.hash();
-    cluster.submit(Arc::new(tx));
+    cluster.submit(tx);
     assert!(
         cluster.run_until(epochs(4), |c| c.chain_fate(ShardId::ROOT, hash).0.is_some()),
         "transfer to recipient {recipient_index} must commit",
@@ -1416,7 +1415,7 @@ fn a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved() {
         validity_around(cluster.now()),
     );
     let first_hash = first.hash();
-    cluster.submit(Arc::new(first));
+    cluster.submit(first);
 
     let legs_owed = |c: &SimCluster| legs_owed(c, peer, shard, first_hash);
     assert!(
@@ -1613,7 +1612,7 @@ fn stated_beside_a_silent_sponsor() -> (SimCluster, Vec<usize>, TxHash) {
         validity_around(cluster.now()),
     );
     let tx = swap.hash();
-    cluster.submit(Arc::new(swap));
+    cluster.submit(swap);
     assert!(
         cluster.run_until(epochs(8), |c| matches!(
             stated_on(c, hosts[1], shard, tx).0,
@@ -1761,7 +1760,7 @@ fn a_replica_restarted_past_replay_reach_accepts_a_stated_row() {
         validity_around(cluster.now()),
     );
     let tx = swap.hash();
-    cluster.submit(Arc::new(swap));
+    cluster.submit(swap);
     let stated = |c: &SimCluster| match stated_on(c, peer, shard, tx).0 {
         Some(RowState::Stated { tick, .. }) => Some(tick),
         _ => None,
@@ -1834,7 +1833,7 @@ fn commit_transfer(
 ) -> (TxHash, BlockHeight) {
     let tx = build_transfer_tx(key, payer, to, amount, validity_around(c.now()));
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     assert!(
         c.run_until(epochs(4), |c| c.chain_fate(shard, hash).0.is_some()),
         "the transfer to {to:?} must commit",
@@ -1924,7 +1923,7 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
         validity_around(cluster.now()),
     );
     let first_hash = first.hash();
-    cluster.submit(Arc::new(first));
+    cluster.submit(first);
     assert!(
         cluster.run_until(epochs(8), |c| legs_owed(c, peer, shard, first_hash)
             .is_some()),
@@ -2089,7 +2088,7 @@ mod a_commit_past_the_replay {
             validity_around(c.now()),
         );
         let hash = swap.hash();
-        c.submit(Arc::new(swap));
+        c.submit((swap));
         let peer = c.committee_hosts(HOME)[0];
         assert!(
             run_cut_until(c, 2, |c| legs_owed(c, peer, HOME, hash).is_some()),

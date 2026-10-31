@@ -110,7 +110,7 @@ use crate::vote_tracker::VoteTracker;
 /// is one more place that answer can drift from the member's.
 #[derive(Clone)]
 struct CommittedMember {
-    tx: Arc<Verifiable<Transaction>>,
+    tx: Verifiable<Transaction>,
     member: Member,
 }
 
@@ -120,7 +120,7 @@ struct CommittedMember {
 fn committed_members(
     classification: &TopologySnapshot,
     local_shard: ShardId,
-    transactions: &[Arc<Verifiable<Transaction>>],
+    transactions: &[Verifiable<Transaction>],
 ) -> Vec<CommittedMember> {
     let trie = classification.shard_trie();
     // A transaction this node could not route takes no part here. Where
@@ -129,10 +129,10 @@ fn committed_members(
     // certified block is committed by every replica alike — including
     // one that has never been where those records are seated. The commit
     // asks for them; nothing is booked on a shape nobody derived.
-    let routed: Vec<Arc<Verifiable<Transaction>>> = transactions
+    let routed: Vec<Verifiable<Transaction>> = transactions
         .iter()
         .filter(|tx| tx.as_unverified().is_routed())
-        .map(Arc::clone)
+        .cloned()
         .collect();
     assign_participants(classification, &routed)
         .into_iter()
@@ -1077,7 +1077,7 @@ impl ExecutionCoordinator {
         &mut self,
         classification: &TopologySnapshot,
         block: &CommittingBlock,
-        transactions: &[Arc<Verifiable<Transaction>>],
+        transactions: &[Verifiable<Transaction>],
     ) {
         let local_shard = self.local_shard;
         let members = committed_members(classification, local_shard, transactions);
@@ -1114,9 +1114,9 @@ impl ExecutionCoordinator {
             // BFT-transitive trust that gates the containing block. Honest
             // live-consensus blocks already carry `Verified` entries (the
             // `.into_verified()` arm short-circuits without re-validating).
-            let verified: Arc<Verified<Transaction>> = match (*tx).clone().into_verified() {
-                Ok(v) => Arc::new(v),
-                Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
+            let verified: Verified<Transaction> = match tx.into_verified() {
+                Ok(v) => v,
+                Err(raw) => Verified::<Transaction>::from_persisted(raw),
             };
             self.candidates.register(
                 verified,
@@ -5145,7 +5145,7 @@ mod tests {
     fn tick_holding(
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
-        txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)>,
+        txs: Vec<(Verified<Transaction>, BTreeSet<ShardId>)>,
     ) -> TickState {
         let mut state = TickState::new(
             tick_id,
@@ -5164,8 +5164,8 @@ mod tests {
     }
 
     /// Lift a test transaction into the verified form a tick holds.
-    fn verified_arc(tx: &Arc<Transaction>) -> Arc<Verified<Transaction>> {
-        Arc::new(Verified::new_unchecked_for_test((**tx).clone()))
+    fn verified_tx(tx: &Transaction) -> Verified<Transaction> {
+        Verified::new_unchecked_for_test(tx.clone())
     }
 
     /// Three of four signers: the quorum the admission gate holds a
@@ -5231,7 +5231,7 @@ mod tests {
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
     ) -> Block {
         helpers_make_live_block(
             ShardId::ROOT,
@@ -5248,7 +5248,7 @@ mod tests {
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
     ) -> Block {
         helpers_make_live_block(shard, height, timestamp_ms, proposer, transactions, vec![])
     }
@@ -5264,12 +5264,7 @@ mod tests {
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
 
         // Block committed with transaction
         let actions = state
@@ -5316,12 +5311,7 @@ mod tests {
 
         let tx = test_transaction_running(1, &[package]);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let actions = state
             .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
             .actions;
@@ -5395,7 +5385,7 @@ mod tests {
                     BlockHeight::new(1),
                     1000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 )),
                 Naming::Composed,
             )
@@ -5468,12 +5458,7 @@ mod tests {
         let topology_schedule = make_test_topology();
 
         let tx = test_transaction_running(1, &[Hash::from_bytes(b"code this node holds")]);
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let actions = state
             .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
             .actions;
@@ -5526,12 +5511,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(&schedule, &test_certify(block, 1_000), Naming::Composed);
 
         let tick_id = state
@@ -5599,12 +5579,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            5_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 5_000, ValidatorId::new(0), vec![tx]);
         // The commit folds under the window it is classified in; only the
         // vote's routing reads the schedule afterwards.
         state.commit_block_carrying(&resolved, &test_certify(block, 5_000), Naming::Composed);
@@ -5653,7 +5628,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
 
         // Commit the block as validator 0 to discover the tick_id.
@@ -5674,7 +5649,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let mut state_leader = make_test_state_for(leader);
         state_leader.commit_block_carrying(&topo_leader, &certify(block_leader), Naming::Composed);
@@ -5686,12 +5661,7 @@ mod tests {
         // A non-leader should NOT have a VoteTracker.
         let non_leader_id = *committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology();
-        let block_non = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block_non = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state_non = make_test_state_for(non_leader_id);
         state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
         assert!(
@@ -5709,7 +5679,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let mut state = make_test_state();
         state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
@@ -5725,12 +5695,7 @@ mod tests {
         // If we're the leader, this test doesn't apply — find a non-leader topology.
         let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology();
-        let block_non = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block_non = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state_non = make_test_state_for(*non_leader_id);
         state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
 
@@ -6214,7 +6179,7 @@ mod tests {
         let height = BlockHeight::new(1);
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![Arc::new(tx)]);
+        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(schedule, &test_certify(block, 1_000), Naming::Composed);
         let tick_id = state
             .ticks
@@ -6440,7 +6405,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(5);
@@ -6463,12 +6428,7 @@ mod tests {
         let tx = test_transaction(1);
         let topo = make_topology();
         let committee = topo.head().committee_for_shard(ShardId::ROOT).to_vec();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state = make_test_state();
         state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
         let tick_id = state
@@ -6771,7 +6731,7 @@ mod tests {
         let topo = make_test_topology();
 
         let mut state = make_test_state();
-        let tx = Arc::new(test_transaction(3));
+        let tx = test_transaction(3);
         let participating: BTreeSet<ShardId> =
             [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
         state.ticks.insert_tick(
@@ -6779,7 +6739,7 @@ mod tests {
             tick_holding(
                 tick_id,
                 WeightedTimestamp::ZERO,
-                vec![(verified_arc(&tx), participating)],
+                vec![(verified_tx(&tx), participating)],
             ),
         );
 
@@ -6848,7 +6808,7 @@ mod tests {
             validators,
         )));
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = Arc::new(test_transaction(3));
+        let tx = test_transaction(3);
         let outcomes = vec![TxOutcome::new(tx.hash(), ExecutionOutcome::Aborted)];
         let cert = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
@@ -6870,7 +6830,7 @@ mod tests {
                 tick_holding(
                     tick_id,
                     WeightedTimestamp::ZERO,
-                    vec![(verified_arc(&tx), participating)],
+                    vec![(verified_tx(&tx), participating)],
                 ),
             );
             state
@@ -6963,8 +6923,8 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let shared = Arc::new(test_transaction(3));
-        let ours = Arc::new(test_transaction(4));
+        let shared = test_transaction(3);
+        let ours = test_transaction(4);
         state.ticks.insert_tick(
             tick_id,
             tick_holding(
@@ -6972,13 +6932,10 @@ mod tests {
                 WeightedTimestamp::ZERO,
                 vec![
                     (
-                        verified_arc(&shared),
+                        verified_tx(&shared),
                         [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect(),
                     ),
-                    (
-                        verified_arc(&ours),
-                        std::iter::once(ShardId::ROOT).collect(),
-                    ),
+                    (verified_tx(&ours), std::iter::once(ShardId::ROOT).collect()),
                 ],
             ),
         );
@@ -8416,7 +8373,7 @@ mod tests {
             BlockHeight::new(1),
             ED,
             ValidatorId::new(4),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         coord.commit_block_carrying(&schedule, &test_certify(block, ED), Naming::Composed);
         let tick_id = coord
@@ -8497,7 +8454,7 @@ mod tests {
             BlockHeight::new(1),
             1,
             ValidatorId::new(4),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         coord.commit_block_carrying(&schedule, &test_certify(block, 1), Naming::Composed);
         let tick_id = coord
@@ -8641,13 +8598,13 @@ mod tests {
     /// [`make_ready_local_tick`] at a chosen tick height.
     fn make_ready_local_tick_at(height: BlockHeight, tx_seeds: &[u8]) -> (TickId, TickState) {
         let tick_id = TickId::new(ShardId::ROOT, height);
-        let txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)> = tx_seeds
+        let txs: Vec<(Verified<Transaction>, BTreeSet<ShardId>)> = tx_seeds
             .iter()
             .map(|s| {
                 let mut participating = BTreeSet::new();
                 participating.insert(ShardId::ROOT);
                 (
-                    Arc::new(Verified::new_unchecked_for_test(test_transaction(*s))),
+                    (Verified::new_unchecked_for_test(test_transaction(*s))),
                     participating,
                 )
             })
@@ -8736,9 +8693,8 @@ mod tests {
         }
         let hold = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
-            let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
-                u8::try_from(height).unwrap(),
-            )));
+            let tx =
+                Verified::new_unchecked_for_test(test_transaction(u8::try_from(height).unwrap()));
             state.ticks.insert_tick(
                 tick_id,
                 tick_holding(
@@ -8846,7 +8802,7 @@ mod tests {
     ) -> TickId {
         let tx = test_transaction(u8::try_from(height.inner()).unwrap());
         let tx_hash = tx.hash();
-        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![Arc::new(tx)]);
+        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(schedule, &test_certify(block, anchor_ms), Naming::Composed);
         let tick_id = state
             .ticks
@@ -8905,7 +8861,7 @@ mod tests {
                     BlockHeight::new(1),
                     1000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 )),
                 Naming::Composed,
             )
@@ -8980,7 +8936,7 @@ mod tests {
                     BlockHeight::new(2),
                     2000,
                     ValidatorId::new(0),
-                    vec![Arc::new(test_transaction_running(1, &[package]))],
+                    vec![(test_transaction_running(1, &[package]))],
                 )),
                 Naming::Composed,
             )
@@ -9102,7 +9058,7 @@ mod tests {
         outcome: ExecutionOutcome,
     ) -> (TickId, GlobalReceiptRoot, Vec<TxOutcome>) {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let tx = Verified::new_unchecked_for_test(test_transaction(7));
         let tx_hash = tx.hash();
         let mut tick = tick_holding(
             tick_id,
@@ -9424,7 +9380,7 @@ mod tests {
     fn the_fold_offers_every_half_it_holds() {
         let mut state = make_test_state();
         let owed_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let owed_tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let owed_tx = Verified::new_unchecked_for_test(test_transaction(7));
         // Executed, its certificate still owed.
         state.ticks.insert_tick(
             owed_id,
@@ -9822,7 +9778,7 @@ mod tests {
             BlockHeight::new(1),
             500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let actions = state
             .commit_block_carrying(&sched, &certify(block), Naming::Composed)
@@ -9888,12 +9844,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -9956,12 +9907,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -10007,7 +9953,7 @@ mod tests {
                     BlockHeight::new(1),
                     1_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 ),
                 1_000,
             ),
@@ -10070,12 +10016,8 @@ mod tests {
         let schedule = make_test_topology();
         let held = test_transaction(2);
         let held_hash = held.hash();
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
         let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(2), held_hash, TransactionDecision::Accept)
                 .into();
@@ -10132,7 +10074,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(named_tx.clone()), Arc::new(unnamed_tx.clone())],
+            vec![named_tx.clone(), unnamed_tx.clone()],
         );
         let lines = vec![TickLine::Member {
             staged: 0,
@@ -10196,7 +10138,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         )
         .into_sealed();
         let effects = state.commit_block_carrying(
@@ -10273,7 +10215,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(held_tx.clone())],
+            vec![held_tx.clone()],
         )
         .into_sealed();
         state.commit_block_carrying(
@@ -10285,7 +10227,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -10499,7 +10441,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            txs.iter().map(|&tx| Arc::new(tx.clone())).collect(),
+            txs.iter().map(|&tx| tx.clone()).collect(),
         )
         .into_sealed();
         state.commit_block_carrying(
@@ -10619,7 +10561,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -10705,7 +10647,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -10783,7 +10725,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             schedule,
@@ -11059,7 +11001,7 @@ mod tests {
                 BlockHeight::new(height),
                 height * 1_000,
                 ValidatorId::new(0),
-                vec![Arc::new(tx.clone())],
+                vec![tx.clone()],
             );
             let block = naming(&test_certify(block, height * 1_000), vec![alone(&tx)]);
             state
@@ -11133,7 +11075,7 @@ mod tests {
             BlockHeight::new(4),
             4_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -11211,7 +11153,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(abandoned.clone()), Arc::new(mate.clone())],
+            vec![abandoned.clone(), mate.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -11293,7 +11235,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let resumed = make_live_block(BlockHeight::new(3), resumed_ms, ValidatorId::new(0), vec![]);
         let aborting = TickLine::Member {
@@ -11456,12 +11398,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let held_deadline = Deadline::of_transaction(&held);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
         let above = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
         // The committing block names its own transaction, ready at once.
         let committing = Verified::<CertifiedBlock>::from_persisted(naming(
@@ -11552,7 +11490,7 @@ mod tests {
                     BlockHeight::new(2),
                     2_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(settled.clone())],
+                    vec![settled.clone()],
                 ),
                 2_000,
             ),
@@ -11637,12 +11575,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
 
         // The replica that was seated when the block committed.
         let mut seated = make_test_state();
@@ -11898,12 +11832,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
 
         // A replica that never went down: its tick at height 2 takes the
         // transaction and holds it until a finalization resolves it.
@@ -11982,7 +11912,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(2))],
+            vec![(test_transaction(2))],
         );
         live.commit_block_carrying(
             &schedule,
@@ -12014,12 +11944,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -12108,7 +12033,7 @@ mod tests {
             BlockHeight::new(1),
             500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -12130,7 +12055,7 @@ mod tests {
             BlockHeight::new(2),
             1_500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(2))],
+            vec![(test_transaction(2))],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -12179,9 +12104,8 @@ mod tests {
     /// terminal leaves — and it is what the drain alone does not cover.
     #[test]
     fn a_terminated_chain_composes_no_further_tick() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
         // BASELINE: the same commit on a live chain composes a tick.
@@ -12283,7 +12207,7 @@ mod tests {
             BlockHeight::new(2),
             50_500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         assert!(!schedule.past_terminal(ShardId::ROOT, WeightedTimestamp::from_millis(50_500)));
         let effects = state.commit_block_carrying(
@@ -12342,7 +12266,7 @@ mod tests {
                     BlockHeight::new(height),
                     ms,
                     ValidatorId::new(0),
-                    vec![Arc::new(test_transaction(seed))],
+                    vec![(test_transaction(seed))],
                 ),
                 ms,
             )
@@ -12374,7 +12298,7 @@ mod tests {
             BlockHeight::new(4),
             1_800,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let mut restarted = restarted_over(vec![replayable(past, 1_800)], 4, 1_500);
 
@@ -12403,7 +12327,7 @@ mod tests {
             BlockHeight::new(5),
             1_800,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let effects =
             seated.commit_block_carrying(&schedule, &test_certify(first, 1_800), Naming::Composed);
@@ -12420,9 +12344,8 @@ mod tests {
     fn commit_block_reports_a_reclaim_as_the_abort_and_releases_it() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -12465,9 +12388,8 @@ mod tests {
     fn an_undispatched_member_joins_on_the_shards_holding_its_keyspace() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -12521,9 +12443,8 @@ mod tests {
     fn a_record_covering_a_leg_seats_nothing() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let past_deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -12596,9 +12517,8 @@ mod tests {
     /// certificates never combined is abandoned all the same.
     #[test]
     fn a_cores_certificate_is_no_verdict_of_a_leg() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         for outcome in [
             ExecutionOutcome::Failed,
@@ -12651,7 +12571,7 @@ mod tests {
     /// fixes how many shards the core spans, and so whether its
     /// committed cell is ever asked about.
     fn leg_state(
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
@@ -12849,9 +12769,8 @@ mod tests {
     #[test]
     fn a_core_member_asks_the_siblings_it_waits_on() {
         let schedule = two_shard_core_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(
             &transaction,
@@ -12926,7 +12845,7 @@ mod tests {
 
     /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
     /// with the committed clock at the deadline.
-    fn claimed_leg_state(transaction: &Arc<Verifiable<Transaction>>) -> ExecutionCoordinator {
+    fn claimed_leg_state(transaction: &Verifiable<Transaction>) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -13006,9 +12925,8 @@ mod tests {
         producer: ShardId,
         consumer: ShardId,
     ) -> (SubstateKey, SubstateKey, CrossingCell) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let id = CrossingId {
             producer: committed_tx_cell_key(producer, transaction.hash(), validity_end).owner,
@@ -13081,9 +12999,8 @@ mod tests {
         let validity_end_ms = 400_000;
         let (record_key, claim, cell) = owned_record();
         if owed_here {
-            let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-                Verified::new_unchecked_for_test(straddling_transaction(1)),
-            ));
+            let transaction: Verifiable<Transaction> =
+                Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
             state.counterparts.ledger.register_committed(
                 test_committed(),
                 &PriceTable::GENESIS,
@@ -13207,9 +13124,8 @@ mod tests {
     fn a_record_beside_another_transactions_entry_is_still_asked_about() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let second: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let second: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let (record_key, claim, issued) = owned_record();
         let first = CrossingCell {
             tx: TxHash::from(Hash::from_bytes(b"the first transaction")),
@@ -13322,7 +13238,7 @@ mod tests {
         shard: ShardId,
         height: u64,
         ts_ms: u64,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
         claims: Vec<StateClaim>,
     ) -> CertifiedBlock {
         let Block::Live {
@@ -13381,9 +13297,8 @@ mod tests {
     #[test]
     fn a_never_in_a_discarded_suffix_takes_nothing_back() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let mut state = leg_state(&transaction, &leg_classified());
         let (record_key, _, cell) = owned_record();
@@ -13425,19 +13340,18 @@ mod tests {
     #[test]
     fn a_reclaim_is_untouched_by_a_discard_of_the_tick_at_its_height() {
         let schedule = two_shard_topology();
-        let leg: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let leg: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let mut state = leg_state(&leg, &leg_classified());
         let (record_key, _, cell) = owned_record();
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
 
-        let beside = Arc::new(straddling_transaction(2));
+        let beside = straddling_transaction(2);
         let returning = block_reading(
             HOME,
             2,
             past_the_horizon(),
-            vec![Arc::clone(&beside)],
+            vec![beside],
             taking_back(record_key, &cell, 2),
         );
         let actions = state
@@ -13536,7 +13450,7 @@ mod tests {
             vec![returned_at_the_root(1)],
         );
         let tx = test_transaction(1);
-        let next = block_reading(ShardId::ROOT, 2, 2_000, vec![Arc::new(tx.clone())], vec![]);
+        let next = block_reading(ShardId::ROOT, 2, 2_000, vec![tx.clone()], vec![]);
         let restored = |dispatch_from: u64| {
             let recovered = RecoveredState {
                 committed_height: BlockHeight::new(1),
@@ -13627,13 +13541,12 @@ mod tests {
     #[test]
     fn a_pending_leg_past_its_dead_core_runs_and_is_taken_back() {
         let schedule = two_shard_topology();
-        let leg: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let leg: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = leg.hash();
         let mut state = leg_state(&leg, &leg_classified());
         state.candidates.register(
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
             BTreeSet::from([HOME, PEER]),
             WeightedTimestamp::ZERO,
             PriceTable::GENESIS,
@@ -13867,7 +13780,7 @@ mod tests {
         // The candidate the want is filed for, which is what keeps the
         // want standing across the commits the tests make.
         state.candidates.register_member(
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
             Member::whole(HOME),
             now,
             PriceTable::GENESIS,
@@ -14329,14 +14242,13 @@ mod tests {
     /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
     /// with the transaction, its figures and the claim key beside it.
     fn consumer_claim_fixture() -> (
-        Arc<Verifiable<Transaction>>,
+        Verifiable<Transaction>,
         UnsettledTx,
         SubstateKey,
         ExecutionCoordinator,
     ) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
@@ -14446,12 +14358,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14489,12 +14396,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14528,12 +14430,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14966,17 +14863,15 @@ mod tests {
         let (local, partner) = (HOME, PEER);
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         let tick_id = TickId::new(local, BlockHeight::new(1));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(seed)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                    seed,
-                ))),
+                (Verified::new_unchecked_for_test(straddling_transaction(seed))),
                 [local, partner].into_iter().collect(),
             )],
         );
@@ -15062,17 +14957,15 @@ mod tests {
     ) -> (ExecutionCoordinator, TickId, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(two_sided_transaction(seed)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(two_sided_transaction(
-                    seed,
-                ))),
+                (Verified::new_unchecked_for_test(two_sided_transaction(seed))),
                 [HOME, UPPER, LOWER].into_iter().collect(),
             )],
         );
@@ -15403,25 +15296,22 @@ mod tests {
     fn state_holding_a_shared_verdict(seed: u8) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(seed)),
+        let shared: Verifiable<Transaction> = Verifiable::from(Verified::new_unchecked_for_test(
+            straddling_transaction(seed),
         ));
-        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(seed + 1)),
-        ));
+        let alone: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(seed + 1)));
         let (t, x) = (shared.hash(), alone.hash());
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![
                 (
-                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                        seed,
-                    ))),
+                    (Verified::new_unchecked_for_test(straddling_transaction(seed))),
                     BTreeSet::from([HOME, PEER]),
                 ),
                 (
-                    Arc::new(Verified::new_unchecked_for_test(test_transaction(seed + 1))),
+                    (Verified::new_unchecked_for_test(test_transaction(seed + 1))),
                     BTreeSet::from([HOME]),
                 ),
             ],
@@ -15511,11 +15401,7 @@ mod tests {
     fn state_running_two_legs() -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let shared = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let (near, far) = (shared(1).hash(), shared(2).hash());
         let mut tick = tick_holding(
             tick_id,
@@ -15684,11 +15570,7 @@ mod tests {
     fn seated_awaiting_its_batch(seeds: &[u8]) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let shared = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
@@ -15816,11 +15698,7 @@ mod tests {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let local = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let local = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
@@ -16221,9 +16099,8 @@ mod tests {
     #[test]
     fn a_release_through_an_abandoned_sibling_keeps_the_member_a_counterpart_can_settle() {
         let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(1);
-        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
-        ));
+        let alone: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(2)));
         assert_eq!(alone.hash(), x);
         state
             .counterparts
@@ -16290,7 +16167,7 @@ mod tests {
     /// the block that commits it at [`test_committed`] states it:
     /// reaching `reach`, at the genesis prices, answering `crossings`.
     fn aborting(
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
         reach: &[ShardId],
         crossings: Crossings,
@@ -16362,9 +16239,8 @@ mod tests {
     /// build.
     #[test]
     fn an_abort_named_past_the_abandon_window_is_seated() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let x = transaction.hash();
         let sched = two_shard_topology();
         let trie = sched.head().shard_trie().clone();
@@ -16463,9 +16339,8 @@ mod tests {
     /// successors.
     #[test]
     fn an_abort_after_its_reach_reshaped_names_the_committing_placement() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let x = transaction.hash();
         let (left, right) = PEER.children();
         let reshaped = ShardTrie::from_leaves([HOME, left, right]);
@@ -16495,9 +16370,9 @@ mod tests {
     fn a_record_before_the_commit_leaves_the_abort_its_nevers() {
         let schedule = two_shard_topology();
         let trie = schedule.head().shard_trie().clone();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let x = transaction.hash();
         let classified = peer_fed_core_classified();
         let never = never_of(&transaction);
@@ -16608,7 +16483,7 @@ mod tests {
     /// has taken, frozen as `classified`.
     fn core_state(
         shard: ShardId,
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), shard);
@@ -16623,7 +16498,7 @@ mod tests {
     /// The one `Never` [`HOME`] writes for `transaction` under
     /// [`peer_fed_core_classified`]: the crossing the leg on [`PEER`]
     /// hands the core.
-    fn never_of(transaction: &Arc<Verifiable<Transaction>>) -> (SubstateKey, Vec<u8>) {
+    fn never_of(transaction: &Verifiable<Transaction>) -> (SubstateKey, Vec<u8>) {
         let classified = peer_fed_core_classified();
         let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
         assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
@@ -16638,7 +16513,7 @@ mod tests {
     }
 
     /// The deadline of `transaction` as committed at [`test_committed`].
-    fn deadline_of(transaction: &Arc<Verifiable<Transaction>>) -> WeightedTimestamp {
+    fn deadline_of(transaction: &Verifiable<Transaction>) -> WeightedTimestamp {
         UnsettledTx::for_transaction(
             transaction,
             test_committed(),
@@ -16658,9 +16533,9 @@ mod tests {
     #[test]
     fn an_uncertified_abandonment_answers_on_the_shard_holding_the_decline() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let never = never_of(&transaction);
@@ -16707,9 +16582,9 @@ mod tests {
     #[test]
     fn a_discarded_abandonment_is_composed_again() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
@@ -16775,9 +16650,8 @@ mod tests {
         // Paying from this shard, so the charge is settled here and a
         // receipt carrying the charge alone is told from one carrying a
         // `Never` beside it.
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
@@ -16794,7 +16668,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
                 vec![(
-                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                    (Verified::new_unchecked_for_test(straddling_transaction(1))),
                     BTreeSet::from([HOME, PEER]),
                 )],
             ),
@@ -17233,9 +17107,8 @@ mod tests {
 
         // A second member of the same tick, reaching only into keyspace
         // nobody has left — so its own counterpart is still live.
-        let sibling: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
-        ));
+        let sibling: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(2)));
         let sibling_hash = sibling.hash();
         state.ticks.assign_tx(sibling_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -17345,7 +17218,7 @@ mod tests {
     fn state_abandoning(
         topology_schedule: &TopologySchedule,
         local: ShardId,
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
@@ -17373,9 +17246,8 @@ mod tests {
             &[],
             &[(PEER, Some(Epoch::new(0)))],
         ));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(7)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(7)));
         let tx_hash = transaction.hash();
         let mut state = state_abandoning(&stamped, HOME, &transaction);
         state
@@ -17442,12 +17314,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -17750,16 +17617,14 @@ mod tests {
             state.detach_signer(ValidatorId::new(0));
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
             let shared = BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)]);
-            let txs: Vec<Arc<Verified<Transaction>>> = [7, 8]
+            let txs: Vec<Verified<Transaction>> = [7, 8]
                 .into_iter()
-                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(seed))))
+                .map(|seed| Verified::new_unchecked_for_test(test_transaction(seed)))
                 .collect();
             let mut tick = tick_holding(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
-                txs.iter()
-                    .map(|tx| (Arc::clone(tx), shared.clone()))
-                    .collect(),
+                txs.iter().map(|tx| (tx.clone(), shared.clone())).collect(),
             );
             for tx in &txs {
                 tick.record_execution_result(tx.hash(), ExecutionOutcome::Failed);

@@ -43,7 +43,7 @@ pub struct RpcPublishers {
 /// threads — internally it computes the touched-shard fanout from a
 /// lock-free topology snapshot and pushes admit/admit-and-gossip
 /// envelopes onto the relevant per-shard event channels.
-pub type TxSubmissionSender = Arc<dyn Fn(Arc<Transaction>) -> bool + Send + Sync + 'static>;
+pub type TxSubmissionSender = Arc<dyn Fn(Transaction) -> bool + Send + Sync + 'static>;
 
 /// Ask the runner what a transaction would do, without submitting it.
 ///

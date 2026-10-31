@@ -953,12 +953,8 @@ mod tests {
                 ..Default::default()
             }),
             transactions: Arc::new(
-                Capped::new(
-                    txs.into_iter()
-                        .map(|tx| Arc::new(Verifiable::from(tx)))
-                        .collect(),
-                )
-                .expect("a block written out in a test"),
+                Capped::new(txs.into_iter().map(Verifiable::from).collect())
+                    .expect("a block written out in a test"),
             ),
             certificates,
             provisions: Arc::new(Capped::empty()),

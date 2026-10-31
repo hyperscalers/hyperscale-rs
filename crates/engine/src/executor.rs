@@ -1469,7 +1469,7 @@ fn cap_staged_yes(folded: &mut BTreeMap<TxHash, ExecutedTx>, abortable: impl Fn(
 /// body it runs over.
 struct BatchMember {
     tx_hash: TxHash,
-    body: Arc<Verified<Transaction>>,
+    body: Verified<Transaction>,
     /// The table this member's committing block anchored to: what its
     /// fee is weighed at, carried per member because that is the grain
     /// the anchor has.
@@ -1496,7 +1496,7 @@ impl Executor {
             .iter()
             .map(|i| BatchMember {
                 tx_hash: i.tx_hash,
-                body: Arc::clone(i.transaction),
+                body: i.transaction.clone(),
                 prices: i.prices,
             })
             .collect();
@@ -1975,7 +1975,7 @@ impl Executor {
         ctx: &TickBatchContext<'_>,
         prices: PriceTable,
         snapshot: &(dyn Substates + Sync),
-        transactions: &[Arc<Verified<Transaction>>],
+        transactions: &[Verified<Transaction>],
     ) -> Result<Vec<ExecutedTx>, CodeUnavailable> {
         // Every member runs whole on its own shard and reads the
         // context's own clock: one block committed them all, so one
