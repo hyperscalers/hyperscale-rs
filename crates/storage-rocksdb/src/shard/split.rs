@@ -873,6 +873,20 @@ mod tests {
         assert_eq!(child.substate_bytes_at_version(10), Some(0));
     }
 
+    /// A pin at `height` lands exactly when the store's tree stands there,
+    /// and then captures the tree as it stands. A follower whose half the
+    /// last followed block missed is below that block, so its older state
+    /// is never labelled with the block's height.
+    fn assert_pins_only_at_its_tree(store: &RocksDbShardStorage, height: BlockHeight) {
+        let tree = store.read_jmt_metadata();
+        let pinned = store.pin_boundary(height).is_ok();
+        assert_eq!(pinned, tree.0 == height.inner());
+        if pinned {
+            let boundary = store.open_boundary(height).expect("pinned");
+            assert_eq!(boundary.read_jmt_metadata(), tree);
+        }
+    }
+
     /// Partition independence over follows: two child stores each
     /// following only their half of a chain's block writes assemble
     /// exactly the two child subtrees of a root store fed the same
@@ -950,6 +964,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
+            assert_pins_only_at_its_tree(store, BlockHeight::new(8));
             let terminal = Block::genesis(
                 ShardId::ROOT,
                 ValidatorId::new(0),
@@ -976,6 +991,7 @@ mod tests {
             assert_eq!(recovered.committed_height, BlockHeight::new(9));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert!(recovered.latest_qc.is_none());
+            assert_pins_only_at_its_tree(store, BlockHeight::new(9));
             // Idempotent: a re-run lands on the same values.
             assert_eq!(
                 store
