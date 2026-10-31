@@ -411,10 +411,25 @@ impl CheckpointRing {
     pub(crate) fn trim(&self, retention: BoundaryRetention) {
         let entries = self.entries();
         let evicted = retention.evicted(entries.iter().map(|(height, _)| *height));
+        Self::remove(
+            entries
+                .into_iter()
+                .filter(|(height, _)| evicted.binary_search(height).is_ok()),
+        );
+    }
+
+    /// Remove every entry below `height`, logging a failed removal as
+    /// [`Self::trim`] does.
+    pub(crate) fn evict_below(&self, height: BlockHeight) {
+        Self::remove(
+            self.entries()
+                .into_iter()
+                .filter(|(pinned, _)| *pinned < height),
+        );
+    }
+
+    fn remove(entries: impl IntoIterator<Item = (BlockHeight, PathBuf)>) {
         for (height, path) in entries {
-            if evicted.binary_search(&height).is_err() {
-                continue;
-            }
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(%height, path = %path.display(), error = %e, "checkpoint eviction failed");
             }
@@ -816,6 +831,7 @@ mod tests {
         test_a_receipt_and_an_owed_credit_fill_a_vault_on_every_path,
         test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
         test_a_split_follower_drops_a_late_write_beside_a_reclaim,
+        test_an_adoption_evicts_the_pins_beneath_its_genesis,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -997,6 +1013,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
         test_boundary_unpinned_height_not_served(&storage);
+    }
+
+    #[test]
+    fn an_adoption_evicts_the_pins_beneath_its_genesis() {
+        let temp = TempDir::new().unwrap();
+        let storage =
+            RocksDbShardStorage::open(temp.path(), shard_prefix_path(ShardId::ROOT.children().1))
+                .unwrap();
+        test_an_adoption_evicts_the_pins_beneath_its_genesis(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved

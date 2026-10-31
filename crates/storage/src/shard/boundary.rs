@@ -466,6 +466,8 @@ pub trait BoundaryStore {
     /// Install a reshape successor's derived `genesis` as this store's
     /// chain origin and committed tip, returning the adopted state root:
     /// [`adopt_plan`] decided over this store's vintage, then applied.
+    /// Every pin beneath the genesis is evicted: it is a predecessor's
+    /// boundary, which no joiner of this chain is sent to.
     ///
     /// Idempotent: a re-run over an already-adopted store returns the
     /// recorded adoption.

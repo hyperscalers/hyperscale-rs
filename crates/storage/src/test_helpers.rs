@@ -54,15 +54,15 @@ use crate::shard::vote_registers::carry_signed_rounds;
 use crate::tree::Jmt;
 use crate::tree::proofs::generate_proof;
 use crate::{
-    Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
-    ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow, PackageArtifactStore,
-    ParentAnchor, PendingChain, RecoveredState, RecoveryAnchor, RowState, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateStore, SubstateView, Substates, SweepIndex,
-    TickChain, TickOutput, TickResolution, VerdictChange, VersionedStore, WitnessSeed,
-    colliding_committed_cell, committed_here, committed_tx_cell_key, committed_tx_cells,
-    entry_leaf_value, filter_state_writes_to_prefix, held_total, holds_state, key_under_prefix,
-    member_row_leaf, reserved_total, verdict_changes,
+    AdoptSource, Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore,
+    ChainEntry, ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit,
+    ImportCursor, ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow,
+    PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState, RecoveryAnchor, RowState,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, SubstateView,
+    Substates, SweepIndex, TickChain, TickOutput, TickResolution, VerdictChange, VersionedStore,
+    WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
+    committed_tx_cells, entry_leaf_value, filter_state_writes_to_prefix, held_total, holds_state,
+    key_under_prefix, member_row_leaf, reserved_total, verdict_changes,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1104,6 +1104,60 @@ pub fn test_boundary_retention_keeps_the_attested_anchor<S: BoundaryStore + Test
 pub fn test_boundary_unpinned_height_not_served<S: BoundaryStore + TestStore>(storage: &S) {
     commit_one(storage, 1);
     assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
+}
+
+/// Shared adoption test: an adopted store keeps no pin beneath its
+/// genesis.
+///
+/// `storage` is an empty store rooted at the trie root's right child,
+/// imported here at its parent's boundary as a split observer's is. A
+/// pin at the genesis outlives a re-run of the adoption.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_adoption_evicts_the_pins_beneath_its_genesis<S: BoundaryStore>(storage: &S) {
+    let boundary = BlockHeight::new(3);
+    let root = import_boundary_state(
+        storage,
+        boundary,
+        &[crossing_record_leaf(0x82)],
+        WitnessSeed::default(),
+    )
+    .unwrap();
+    assert_eq!(storage.oldest_pin(), Some(boundary));
+
+    let origin = ChainOrigin {
+        genesis_height: BlockHeight::new(5),
+        anchor_wt: WeightedTimestamp::from_millis(42_000),
+    };
+    let terminal = Block::genesis(
+        ShardId::ROOT,
+        ValidatorId::new(0),
+        StateRoot::ZERO,
+        ChainOrigin {
+            genesis_height: BlockHeight::new(4),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
+    );
+    let genesis = Block::split_child_genesis(
+        ShardId::ROOT.children().1,
+        root,
+        terminal.header(),
+        origin.anchor_wt,
+    );
+    let adopted = storage
+        .adopt_genesis(origin, &genesis, AdoptSource::FollowedTip)
+        .unwrap();
+    assert_eq!(adopted, root);
+    assert_eq!(storage.oldest_pin(), None);
+    assert!(storage.open_boundary(boundary).is_none());
+
+    storage.pin_boundary(origin.genesis_height).unwrap();
+    storage
+        .adopt_genesis(origin, &genesis, AdoptSource::FollowedTip)
+        .unwrap();
+    assert_eq!(storage.oldest_pin(), Some(origin.genesis_height));
 }
 
 /// The entry pipeline both backends serve identically.

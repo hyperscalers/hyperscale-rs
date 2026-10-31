@@ -89,16 +89,36 @@ impl RocksDbShardStorage {
     }
 
     /// Install a reshape successor's derived `genesis` as this store's
-    /// chain origin and committed tip: [`adopt_plan`] decided over this
-    /// store's vintage under the commit lock, then applied in one atomic
-    /// batch, so a crash at any later point recovers the store as a
-    /// committed chain at its genesis.
+    /// chain origin and committed tip, then evict every pin beneath the
+    /// genesis.
+    ///
+    /// Those pins are the predecessor's boundaries — an observer's import
+    /// pins the parent's anchor it assembled at — and no joiner of this
+    /// chain is sent to one. Kept, the oldest of them would stand as the
+    /// store's oldest pin, which the chain floor discards as beneath the
+    /// origin, holding the floor at the genesis until retention evicted
+    /// it. The eviction follows the adoption's write, so a re-run after a
+    /// crash between the two still performs it.
     ///
     /// # Errors
     ///
     /// What [`adopt_plan`] refused, or a store that cannot yield the
     /// subtree it named.
     pub(crate) fn adopt_genesis(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+        source: AdoptSource,
+    ) -> Result<StateRoot, StorageError> {
+        let adopted = self.apply_adoption(origin, genesis, source)?;
+        self.checkpoints.evict_below(origin.genesis_height);
+        Ok(adopted)
+    }
+
+    /// [`adopt_plan`] decided over this store's vintage under the commit
+    /// lock, then applied in one atomic batch, so a crash at any later
+    /// point recovers the store as a committed chain at its genesis.
+    fn apply_adoption(
         &self,
         origin: ChainOrigin,
         genesis: &Block,

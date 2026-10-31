@@ -52,16 +52,35 @@ impl SimShardStorage {
     }
 
     /// Install a reshape successor's derived `genesis` as this store's
-    /// chain origin and committed tip: [`adopt_plan`] decided over this
-    /// store's vintage, then applied — the same decision the production
-    /// backend applies, so the two harnesses cannot diverge on what an
-    /// adoption admits.
+    /// chain origin and committed tip, then evict every pin beneath the
+    /// genesis: the predecessor's boundaries, which the production
+    /// backend's adoption evicts on the same rule.
     ///
     /// # Errors
     ///
     /// What [`adopt_plan`] refused, or a store that cannot yield the
     /// subtree it named.
     pub(crate) fn adopt_genesis(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+        source: AdoptSource,
+    ) -> Result<StateRoot, String> {
+        let adopted = self.apply_adoption(origin, genesis, source)?;
+        crash_point::write();
+        let mut pins = write_or_recover(&self.boundary_pins);
+        let beneath: Vec<_> = pins.range(..origin.genesis_height).copied().collect();
+        for height in beneath {
+            pins.remove(&height);
+        }
+        drop(pins);
+        Ok(adopted)
+    }
+
+    /// [`adopt_plan`] decided over this store's vintage, then applied —
+    /// the same decision the production backend applies, so the two
+    /// harnesses cannot diverge on what an adoption admits.
+    fn apply_adoption(
         &self,
         origin: ChainOrigin,
         genesis: &Block,

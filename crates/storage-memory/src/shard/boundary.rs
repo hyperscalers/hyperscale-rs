@@ -374,6 +374,7 @@ mod tests {
         test_a_receipt_and_an_owed_credit_fill_a_vault_on_every_path,
         test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
         test_a_split_follower_drops_a_late_write_beside_a_reclaim,
+        test_an_adoption_evicts_the_pins_beneath_its_genesis,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -501,6 +502,12 @@ mod tests {
     fn unpinned_height_is_not_served() {
         let storage = SimShardStorage::default();
         test_boundary_unpinned_height_not_served(&storage);
+    }
+
+    #[test]
+    fn an_adoption_evicts_the_pins_beneath_its_genesis() {
+        let storage = SimShardStorage::new(shard_prefix_path(ShardId::ROOT.children().1));
+        test_an_adoption_evicts_the_pins_beneath_its_genesis(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved
